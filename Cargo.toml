@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/boruix-kernel",
+    "crates/kernel",
     "crates/klib",
-    "crates/arch",
-    "crates/arch-x86_64",
+    "crates/arch/arch",
+    "crates/arch/arch-x86_64",
 ]
 
 [workspace.package]

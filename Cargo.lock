@@ -14,7 +14,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "boruix-kernel"
+name = "flanterm_rust"
+version = "0.1.0"
+
+[[package]]
+name = "kernel"
 version = "0.1.0"
 dependencies = [
  "arch",
@@ -23,10 +27,6 @@ dependencies = [
  "klib",
  "limine",
 ]
-
-[[package]]
-name = "flanterm_rust"
-version = "0.1.0"
 
 [[package]]
 name = "klib"

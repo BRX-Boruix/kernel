@@ -1,5 +1,5 @@
 [package]
-name = "boruix-kernel"
+name = "kernel"
 version.workspace = true
 edition.workspace = true
 
@@ -9,5 +9,5 @@ edition.workspace = true
 limine = "0.1"
 flanterm_rust = { path = "../../vendor/flanterm_rust" }
 klib = { path = "../klib" }
-arch = { path = "../arch" }
-arch-x86_64 = { path = "../arch-x86_64" }
+arch = { path = "../arch/arch" }
+arch-x86_64 = { path = "../arch/arch-x86_64" }
