@@ -30,6 +30,11 @@ unsafe extern "C" fn kmain() -> ! {
     klib::serial::set_output(CurrentArch::serial_write as fn(u8));
     logln!("[kmain] serial initialized (arch={})", CurrentArch::name());
 
+    // 初始化内存管理（LazyBuddy 物理页帧分配器）
+    mm::init();
+    // 验证物理页帧分配/释放
+    test_frame_alloc();
+
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
     if let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() {
         logln!("[kmain] framebuffer response received");
@@ -50,4 +55,53 @@ unsafe extern "C" fn kmain() -> ! {
 
     logln!("[kmain] reached idle loop");
     CurrentArch::halt();
+}
+
+/// 验证物理页帧分配器的分配/释放基本逻辑。
+fn test_frame_alloc() {
+    // 统计初始状态
+    let s0 = mm::frame_stats();
+    logln!(
+        "[test-pmm] init: allocated={} alloc_calls={} fail={}",
+        s0.allocated_frames, s0.alloc_calls, s0.alloc_fail
+    );
+
+    // 分配 3 个帧
+    let f1 = mm::allocate_frame().expect("frame 1 alloc failed");
+    let f2 = mm::allocate_frame().expect("frame 2 alloc failed");
+    let f3 = mm::allocate_frame().expect("frame 3 alloc failed");
+    logln!(
+        "[test-pmm] allocated: f1={:?} f2={:?} f3={:?}",
+        f1.start_address(),
+        f2.start_address(),
+        f3.start_address()
+    );
+
+    let s1 = mm::frame_stats();
+    logln!(
+        "[test-pmm] after alloc: allocated={} alloc_calls={} hit_uninit={} fail={}",
+        s1.allocated_frames, s1.alloc_calls, s1.alloc_hit_uninit, s1.alloc_fail
+    );
+
+    // 释放一个，再分配，验证可重用
+    mm::deallocate_frame(f2);
+    logln!("[test-pmm] freed f2");
+    let f2b = mm::allocate_frame().expect("re-alloc failed");
+    logln!(
+        "[test-pmm] re-allocated f2b={:?} (expect equals freed f2={:?})",
+        f2b.start_address(),
+        f2.start_address()
+    );
+
+    // 清理
+    mm::deallocate_frame(f1);
+    mm::deallocate_frame(f2b);
+    mm::deallocate_frame(f3);
+    logln!("[test-pmm] all frames freed");
+
+    let s2 = mm::frame_stats();
+    logln!(
+        "[test-pmm] final: allocated={} alloc_calls={} fail={}",
+        s2.allocated_frames, s2.alloc_calls, s2.alloc_fail
+    );
 }

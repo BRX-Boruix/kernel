@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/kernel",
     "crates/klib",
+    "crates/mm",
     "crates/arch/arch",
     "crates/arch/arch-x86_64",
 ]
