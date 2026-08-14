@@ -1,0 +1,6 @@
+[package]
+name = "arch-x86_64"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,10 +1,11 @@
-[package]
-name = "kernel"
+[workspace]
+resolver = "2"
+members = [
+    "crates/boruix-kernel",
+    "crates/klib",
+    "crates/arch-x86_64",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[build-dependencies]
-
-[dependencies]
-limine = "0.1"
-flanterm_rust = { path = "vendor/flanterm_rust" }

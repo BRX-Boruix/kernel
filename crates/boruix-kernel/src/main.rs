@@ -1,9 +1,7 @@
 #![no_std]
 #![no_main]
 
-mod allocator;
-mod serial;
-
+use klib::logln;
 use limine::FramebufferRequest;
 
 // 请求 framebuffer（limine 0.1 用 #[no_mangle] static + get_response()）
@@ -15,7 +13,7 @@ static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new(0);
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain() -> ! {
     // 先初始化串口，尽早输出日志
-    serial::init();
+    klib::serial::init();
     logln!("[kmain] serial initialized");
 
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
