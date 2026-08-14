@@ -1,4 +1,5 @@
-OUTPUT_FORMAT(elf64-x86-64)
+/* aarch64 内核链接脚本（已归档，当前不参与构建） */
+OUTPUT_FORMAT(elf64-littleaarch64)
 ENTRY(kmain)
 
 PHDRS
@@ -33,10 +34,6 @@ SECTIONS
     .bss : {
         *(.bss .bss.*)
         *(COMMON)
-    } :data
-
-    .requests : {
-        KEEP(*(.requests))
     } :data
 
     .dynamic : {

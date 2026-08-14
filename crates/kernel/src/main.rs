@@ -2,23 +2,27 @@
 #![no_main]
 
 use arch::Platform;
-use arch_x86_64::X86_64Arch;
 use klib::logln;
-use limine::FramebufferRequest;
+use limine::{BaseRevision, FramebufferRequest};
 
-// 请求 framebuffer（limine 0.1 用 #[no_mangle] static + get_response()）
-#[unsafe(no_mangle)]
-#[used]
+use arch_x86_64::X86_64Arch as CurrentArch;
+
+// 声明 BaseRevision。用 limine_tag 放入 .limine_reqs 段，确保 Limine 完整识别请求。
+#[limine::limine_tag]
+static BASE_REVISION: BaseRevision = BaseRevision::new(6);
+
+// 请求 framebuffer
+#[limine::limine_tag]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new(0);
 
 /// 内核入口（由 Limine 引导器跳转）
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain() -> ! {
     // 初始化架构（串口等）
-    X86_64Arch::init();
+    CurrentArch::init();
     // 把架构的串口输出注入到 klib 的全局输出器
-    klib::serial::set_output(X86_64Arch::serial_write as fn(u8));
-    logln!("[kmain] serial initialized");
+    klib::serial::set_output(CurrentArch::serial_write as fn(u8));
+    logln!("[kmain] serial initialized (arch={})", CurrentArch::name());
 
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
     if let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() {
@@ -39,7 +43,7 @@ unsafe extern "C" fn kmain() -> ! {
     }
 
     logln!("[kmain] reached idle loop");
-    X86_64Arch::halt();
+    CurrentArch::halt();
 }
 
 /// 用 flanterm 初始化终端并在屏幕上打印文本
@@ -66,7 +70,7 @@ fn init_terminal(fb: &limine::Framebuffer) {
         "[terminal] init fb={:#x} {}x{} pitch={} bpp={}",
         fb_ptr as usize, width, height, pitch, fb.bpp
     );
-    // 初始化 flanterm framebuffer 后端（参数与参考项目 kernel_driver_hub::terminal::init 一致）
+    // 初始化 flanterm framebuffer 后端
     let ctx = unsafe {
         flanterm_rust::flanterm_fb_init(
             fb_ptr, width, height, pitch,
@@ -88,7 +92,7 @@ fn init_terminal(fb: &limine::Framebuffer) {
     logln!("[terminal] flanterm_fb_init done, ctx.is_some={}", ctx.is_some());
 
     if let Some(mut ctx) = ctx {
-        // 写入文本（参考项目：\n 转 \r\n）
+        // 写入文本
         flanterm_rust::flanterm_write(&mut ctx, b"Hello, BORUIX!\r\n");
         flanterm_rust::flanterm_write(&mut ctx, b"Kernel M0 is running.\r\n");
         logln!("[terminal] wrote text done");
@@ -100,5 +104,5 @@ fn init_terminal(fb: &limine::Framebuffer) {
 /// Panic handler
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    X86_64Arch::halt();
+    CurrentArch::halt();
 }

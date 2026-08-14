@@ -6,7 +6,7 @@ edition.workspace = true
 [build-dependencies]
 
 [dependencies]
-limine = "0.1"
+limine = { version = "0.1", features = ["requests-section"] }
 flanterm_rust = { path = "../../vendor/flanterm_rust" }
 klib = { path = "../klib" }
 arch = { path = "../arch/arch" }
