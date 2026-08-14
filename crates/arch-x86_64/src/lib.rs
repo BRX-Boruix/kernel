@@ -1,9 +1,38 @@
-//! x86-64 架构支持。
+//! x86-64 架构实现。
 //!
-//! 目前 M0 阶段仅含链接脚本与基础架构标识。
-//! 后续在此实现 arch 抽象层的 x86-64 薄实现（页表、中断、上下文切换等）。
+//! 实现 `arch::Platform`，提供 CPU 停机、串口等基础操作。
 
 #![no_std]
 
-/// x86-64 架构标识
-pub const NAME: &str = "x86_64";
+pub mod serial;
+
+use arch::Platform;
+
+/// x86-64 架构平台
+pub struct X86_64Arch;
+
+impl Platform for X86_64Arch {
+    fn name() -> &'static str {
+        "x86_64"
+    }
+
+    fn init() {
+        serial::init();
+    }
+
+    fn halt() -> ! {
+        loop {
+            unsafe {
+                core::arch::asm!("hlt", options(nomem, nostack));
+            }
+        }
+    }
+
+    fn serial_write(byte: u8) {
+        serial::write_byte(byte);
+    }
+
+    fn serial_read() -> Option<u8> {
+        serial::read_byte()
+    }
+}

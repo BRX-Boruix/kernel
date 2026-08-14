@@ -3,13 +3,21 @@
 version = 4
 
 [[package]]
+name = "arch"
+version = "0.1.0"
+
+[[package]]
 name = "arch-x86_64"
 version = "0.1.0"
+dependencies = [
+ "arch",
+]
 
 [[package]]
 name = "boruix-kernel"
 version = "0.1.0"
 dependencies = [
+ "arch",
  "arch-x86_64",
  "flanterm_rust",
  "klib",

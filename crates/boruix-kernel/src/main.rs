@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+use arch::Platform;
+use arch_x86_64::X86_64Arch;
 use klib::logln;
 use limine::FramebufferRequest;
 
@@ -12,8 +14,10 @@ static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new(0);
 /// 内核入口（由 Limine 引导器跳转）
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain() -> ! {
-    // 先初始化串口，尽早输出日志
-    klib::serial::init();
+    // 初始化架构（串口等）
+    X86_64Arch::init();
+    // 把架构的串口输出注入到 klib 的全局输出器
+    klib::serial::set_output(X86_64Arch::serial_write as fn(u8));
     logln!("[kmain] serial initialized");
 
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
@@ -35,7 +39,7 @@ unsafe extern "C" fn kmain() -> ! {
     }
 
     logln!("[kmain] reached idle loop");
-    hcf();
+    X86_64Arch::halt();
 }
 
 /// 用 flanterm 初始化终端并在屏幕上打印文本
@@ -93,18 +97,8 @@ fn init_terminal(fb: &limine::Framebuffer) {
     }
 }
 
-/// CPU 停机
-fn hcf() -> ! {
-    loop {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack));
-        }
-    }
-}
-
 /// Panic handler
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    hcf();
+    X86_64Arch::halt();
 }

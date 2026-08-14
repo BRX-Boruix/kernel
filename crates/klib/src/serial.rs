@@ -1,72 +1,46 @@
-//! 简单的 COM1 串口输出，用于内核引导日志。
+//! 串口日志与格式化输出。
+//!
+//! 底层的字节 I/O 通过一个可注入的输出函数完成，由入口 crate 在初始化时
+//! 绑定到具体架构的实现，从而保持本模块架构无关。
 
 use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-const COM1: u16 = 0x3F8;
+/// 全局输出函数指针（由入口 crate 注入，绑定具体架构的串口写）
+type OutputFn = fn(u8);
+static OUTPUT: AtomicUsize = AtomicUsize::new(0);
 
-/// 向串口发送一个字节
-fn send(byte: u8) {
-    unsafe {
-        // 等待发送保持寄存器空（LSR bit 5）
-        while inb(COM1 + 5) & 0x20 == 0 {}
-        outb(COM1, byte);
-    }
+/// 默认空输出（未注入前不输出任何内容）
+fn no_output(_b: u8) {}
+
+/// 绑定串口输出函数（应在内核早期初始化时调用）
+pub fn set_output(f: OutputFn) {
+    OUTPUT.store(f as usize, Ordering::SeqCst);
 }
 
-/// 读取 port（inb）
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-    let result: u8;
-    unsafe {
-        core::arch::asm!(
-            "in al, dx",
-            out("al") result,
-            in("dx") port,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    result
-}
-
-/// 写入 port（outb）
-#[inline]
-unsafe fn outb(port: u16, byte: u8) {
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") port,
-            in("al") byte,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-}
-
-/// 初始化 COM1 串口（38400 波特，8N1）
-pub fn init() {
-    unsafe {
-        outb(COM1 + 1, 0x00); // 禁用中断
-        outb(COM1 + 3, 0x80); // DLAB 开，设置波特率
-        outb(COM1 + 0, 0x03); // 除数低字节 (38400)
-        outb(COM1 + 1, 0x00); // 除数高字节
-        outb(COM1 + 3, 0x03); // 8 位数据，无校验，1 停止位
-        outb(COM1 + 2, 0xC7); // 启用 FIFO，清空
-        outb(COM1 + 4, 0x0B); // IRQ 使能，RTS/DSR
+fn output() -> OutputFn {
+    let v = OUTPUT.load(Ordering::SeqCst);
+    if v == 0 {
+        no_output
+    } else {
+        unsafe { core::mem::transmute::<usize, OutputFn>(v) }
     }
 }
 
 /// 写字符串到串口（\n 自动转 \r\n）
 pub fn write_str(s: &str) {
+    let out = output();
     for &b in s.as_bytes() {
         if b == b'\n' {
-            send(b'\r');
+            out(b'\r');
         }
-        send(b);
+        out(b);
     }
 }
 
 /// 格式化写入串口
 pub fn print(args: fmt::Arguments) {
-    use core::fmt::Write as _;
+    use fmt::Write as _;
     let mut w = SerialWriter;
     let _ = w.write_fmt(args);
 }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/boruix-kernel",
     "crates/klib",
+    "crates/arch",
     "crates/arch-x86_64",
 ]
 
