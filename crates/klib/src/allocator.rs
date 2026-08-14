@@ -1,61 +1,34 @@
-//! 简单的 boot 堆分配器（bump allocator）。
+//! 内核堆分配器。
 //!
-//! M0 阶段先提供一个最简堆，供 flanterm 的 `alloc`（Box/Vec）使用。
-//! 不回收内存（引导阶段 flanterm 几乎不释放），后续用 ADR-009 的 lazybuddy 替换。
+//! 基于 `buddy_system_allocator` 的 `LockedHeap`，支持分配与释放（可重用），
+//! 替换了早期不回收的 boot bump allocator。
+//!
+//! 当前用静态数组作为堆存储（暂不依赖虚拟内存映射）；M1 虚拟内存落地后，
+//! 可改为按需映射物理页的动态堆。
 
-use core::alloc::{GlobalAlloc, Layout};
+use buddy_system_allocator::LockedHeap;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// 堆大小（4MB，供 flanterm 初始化使用；M0 阶段静态分配）
+/// 堆大小（4MB，够 flanterm 初始化与早期内核使用）
 const HEAP_SIZE: usize = 4 * 1024 * 1024;
-const HEAP_ALIGN: usize = 16;
-
-/// bump 分配器的当前偏移
-static OFFSET: AtomicUsize = AtomicUsize::new(0);
 
 /// 堆存储 wrapper（提供内部可变性并标记 Sync）
 struct HeapStorage(UnsafeCell<[u8; HEAP_SIZE]>);
 unsafe impl Sync for HeapStorage {}
 
 /// 静态堆存储
-static HEAP: HeapStorage = HeapStorage(UnsafeCell::new([0; HEAP_SIZE]));
+static HEAP_SPACE: HeapStorage = HeapStorage(UnsafeCell::new([0; HEAP_SIZE]));
 
-/// Boot 堆分配器（bump，不回收）
-pub struct BootAllocator;
-
-unsafe impl Sync for BootAllocator {}
-
-impl BootAllocator {
-    fn heap_ptr(&self) -> *mut u8 {
-        HEAP.0.get() as *mut u8
-    }
-}
-
-unsafe impl GlobalAlloc for BootAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let align = layout.align().max(HEAP_ALIGN);
-        let size = layout.size();
-
-        // 对齐偏移
-        let offset = OFFSET.load(Ordering::SeqCst);
-        let aligned = (offset + align - 1) & !(align - 1);
-
-        if aligned + size > HEAP_SIZE {
-            // 堆耗尽
-            return core::ptr::null_mut();
-        }
-
-        // 原子更新偏移
-        OFFSET.store(aligned + size, Ordering::SeqCst);
-
-        unsafe { self.heap_ptr().add(aligned) }
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // bump 分配器不回收（简化）；后续 lazybuddy 接管
-    }
-}
-
+/// 全局堆分配器（buddy，支持释放重用）
 #[global_allocator]
-static GLOBAL_ALLOCATOR: BootAllocator = BootAllocator;
+static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
+
+/// 初始化堆：把静态存储区域交给分配器。
+///
+/// 必须在任何堆分配发生前调用（kernel 入口早期）。
+pub fn init() {
+    let start = HEAP_SPACE.0.get() as usize;
+    unsafe {
+        HEAP_ALLOCATOR.lock().add_to_heap(start, start + HEAP_SIZE);
+    }
+}

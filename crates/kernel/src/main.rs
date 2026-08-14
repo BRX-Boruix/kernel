@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod panic;
 mod terminal;
 
@@ -23,6 +25,9 @@ static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new(0);
 unsafe extern "C" fn kmain() -> ! {
     // 初始化 panic 子系统（注入架构名和停机函数，尽早）
     panic::init(CurrentArch::name(), CurrentArch::halt);
+
+    // 初始化堆分配器（buddy，支持释放重用）——必须在任何 alloc 前
+    klib::allocator::init();
 
     // 初始化架构（串口等）
     CurrentArch::init();
@@ -53,8 +58,38 @@ unsafe extern "C" fn kmain() -> ! {
         logln!("[kmain] ERROR: no framebuffer response");
     }
 
+    // 验证堆分配器（支持释放/重用）
+    test_heap();
+
     logln!("[kmain] reached idle loop");
     CurrentArch::halt();
+}
+
+/// 验证堆分配器的分配/释放/重用逻辑。
+fn test_heap() {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
+    // Box 分配 + 解引用
+    let b = Box::new(42u32);
+    logln!("[test-heap] Box::new -> {}", *b);
+    drop(b);
+
+    // Vec 分配多个元素（会多次扩容，测试分配器稳定性）
+    let mut v = Vec::new();
+    for i in 0..100 {
+        v.push(i);
+    }
+    let sum: i32 = v.iter().sum();
+    logln!("[test-heap] Vec sum = {}", sum);
+    drop(v);
+
+    // 字符串（通过 alloc 的 String）
+    let s = alloc::string::String::from("hello heap");
+    logln!("[test-heap] String = {}", s);
+    drop(s);
+
+    logln!("[test-heap] heap tests passed");
 }
 
 /// 验证物理页帧分配器的分配/释放基本逻辑。
