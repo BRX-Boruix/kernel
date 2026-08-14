@@ -4,26 +4,12 @@
 mod allocator;
 mod serial;
 
-use limine::request::FramebufferRequest;
-use limine::{RequestsEndMarker, RequestsStartMarker};
+use limine::FramebufferRequest;
 
-// 请求 framebuffer，用于图形输出
-static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
-
-// 请求列表的起始/结束标记，供 Limine 扫描
-static START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
-static END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
-
-// 将请求放入特定段，引导器才能定位到它们
+// 请求 framebuffer（limine 0.1 用 #[no_mangle] static + get_response()）
+#[unsafe(no_mangle)]
 #[used]
-#[unsafe(link_section = ".requests")]
-static START_MARKER_SECTION: &RequestsStartMarker = &START_MARKER;
-#[used]
-#[unsafe(link_section = ".requests")]
-static FRAMEBUFFER_REQUEST_SECTION: &FramebufferRequest = &FRAMEBUFFER_REQUEST;
-#[used]
-#[unsafe(link_section = ".requests")]
-static END_MARKER_SECTION: &RequestsEndMarker = &END_MARKER;
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new(0);
 
 /// 内核入口（由 Limine 引导器跳转）
 #[unsafe(no_mangle)]
@@ -32,27 +18,22 @@ unsafe extern "C" fn kmain() -> ! {
     serial::init();
     logln!("[kmain] serial initialized");
 
-    // 获取 framebuffer
-    match FRAMEBUFFER_REQUEST.response() {
-        Some(resp) => {
-            logln!("[kmain] framebuffer response received");
-            if let Some(fb) = resp.framebuffers().first() {
-                logln!(
-                    "[kmain] framebuffer {}x{} pitch={} bpp={}",
-                    fb.width,
-                    fb.height,
-                    fb.pitch,
-                    fb.bpp
-                );
-                unsafe { init_terminal(fb) };
-                logln!("[kmain] terminal init returned");
-            } else {
-                logln!("[kmain] ERROR: no framebuffer");
-            }
+    // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
+    if let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() {
+        logln!("[kmain] framebuffer response received");
+        if let Some(fb) = resp.framebuffers().first() {
+            let fb = &**fb; // NonNullPtr<Framebuffer> -> Framebuffer
+            logln!(
+                "[kmain] framebuffer {}x{} pitch={} bpp={}",
+                fb.width, fb.height, fb.pitch, fb.bpp
+            );
+            init_terminal(fb);
+            logln!("[kmain] terminal init returned");
+        } else {
+            logln!("[kmain] ERROR: no framebuffer");
         }
-        None => {
-            logln!("[kmain] ERROR: no framebuffer response");
-        }
+    } else {
+        logln!("[kmain] ERROR: no framebuffer response");
     }
 
     logln!("[kmain] reached idle loop");
@@ -60,9 +41,13 @@ unsafe extern "C" fn kmain() -> ! {
 }
 
 /// 用 flanterm 初始化终端并在屏幕上打印文本
-unsafe fn init_terminal(fb: &limine::framebuffer::Framebuffer) {
+fn init_terminal(fb: &limine::Framebuffer) {
     // framebuffer 地址（u32*）与参数
-    let fb_ptr = fb.address() as *mut u32;
+    let Some(addr) = fb.address.as_ptr() else {
+        logln!("[terminal] ERROR: framebuffer address is null");
+        return;
+    };
+    let fb_ptr = addr as *mut u32;
     let width = fb.width as usize;
     let height = fb.height as usize;
     let pitch = fb.pitch as usize;
@@ -75,7 +60,7 @@ unsafe fn init_terminal(fb: &limine::framebuffer::Framebuffer) {
     let bms = fb.blue_mask_size;
     let bsh = fb.blue_mask_shift;
 
-        logln!(
+    logln!(
         "[terminal] init fb={:#x} {}x{} pitch={} bpp={}",
         fb_ptr as usize, width, height, pitch, fb.bpp
     );
@@ -101,12 +86,10 @@ unsafe fn init_terminal(fb: &limine::framebuffer::Framebuffer) {
     logln!("[terminal] flanterm_fb_init done, ctx.is_some={}", ctx.is_some());
 
     if let Some(mut ctx) = ctx {
-        // 写入文本（flanterm 需要 \r\n 换行）
+        // 写入文本（参考项目：\n 转 \r\n）
         flanterm_rust::flanterm_write(&mut ctx, b"Hello, BORUIX!\r\n");
         flanterm_rust::flanterm_write(&mut ctx, b"Kernel M0 is running.\r\n");
-        // 刷新
-        flanterm_rust::flanterm_flush(&mut ctx);
-        logln!("[terminal] wrote text + flush done");
+        logln!("[terminal] wrote text done");
     } else {
         logln!("[terminal] ERROR: flanterm_fb_init returned None");
     }

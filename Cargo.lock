@@ -16,6 +16,6 @@ dependencies = [
 
 [[package]]
 name = "limine"
-version = "0.6.5"
+version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29363c0f37e66e18575fadf7141c56ee7ea04ae5fecbeb25eff303f77af203a9"
+checksum = "02034f8f6b3e7bf050f310fbaf6db0018b8e54b75598d0a4c97172054752fede"
