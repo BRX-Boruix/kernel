@@ -3,4 +3,8 @@ name = "kernel"
 version = "0.1.0"
 edition = "2024"
 
+[build-dependencies]
+
 [dependencies]
+limine = "0.6.5"
+flanterm_rust = { path = "vendor/flanterm_rust" }
