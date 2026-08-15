@@ -6,7 +6,7 @@
 
 use klib::logln;
 
-use arch::{PageFlags, PageSize, PhysAddr, PhysFrame, VirtAddr};
+use arch::{PageFlags, PageSize, PageTable, PhysAddr, PhysFrame, VirtAddr};
 use arch_x86_64::paging::X86PageTable;
 
 /// 验证虚拟内存页表：4KB 映射 + 2MB 大页映射 + 真实内存读写（经 HHDM 写入，
