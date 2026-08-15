@@ -11,8 +11,8 @@ pub const KCODE: u16 = 0x08;
 pub const KDATA: u16 = 0x10;
 pub const TSS_SEL: u16 = 0x18;
 
-/// 内核栈大小（4KB），供 ring0 中断/异常使用。
-const KSTACK_SIZE: usize = 0x1000;
+/// 内核栈大小（64KB），供 ring0 中断/异常与早期初始化使用。
+const KSTACK_SIZE: usize = 0x20000;
 
 /// TSS 结构（x86-64，共 104 字节）。
 #[repr(C)]

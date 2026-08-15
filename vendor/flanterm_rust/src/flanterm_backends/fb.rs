@@ -1234,7 +1234,6 @@ pub unsafe fn flanterm_fb_init(
     } else {
         (*fb).plot_mode = PlotMode::ScaledCanvas;
     }
-
     flanterm_context_reinit(&mut *ctx);
     flanterm_fb_full_refresh(&mut *ctx);
 
