@@ -56,8 +56,8 @@ unsafe fn kmain_body() -> ! {
 
     // 初始化架构（串口等）
     CurrentArch::init();
-    // 把架构的串口输出注入到 klib 的全局输出器
-    klib::serial::set_output(CurrentArch::serial_write as fn(u8));
+    // 把架构的串口整串输出注入到 klib 的全局输出器（一次调用整串原子写）
+    klib::serial::set_output(arch_x86_64::serial::write_str as fn(&str));
     logln!("[kmain] serial initialized (arch={})", CurrentArch::name());
 
     // 初始化内存管理（LazyBuddy 物理页帧分配器）
@@ -103,10 +103,12 @@ unsafe fn kmain_body() -> ! {
     // 让 mm 的 per-CPU 缓存用真实的 LAPIC id 作为 CPU id
     mm::frame_allocator::set_cpu_id_reader(|| arch_x86_64::lapic::current_lapic_id() as usize);
 
-    // 初始化多核 SMP：启动所有 AP
+    // 初始化多核 SMP：启动所有 AP，并等待全部上线
     logln!("[kmain] initializing SMP");
     arch_x86_64::smp::init();
-    logln!("[kmain] SMP done, {} cpus online", arch_x86_64::smp::cpu_count());
+    let total = arch_x86_64::smp::total_cpus();
+    let online = arch_x86_64::smp::wait_all_online(total, 1_000_000);
+    logln!("[kmain] SMP done, {} cpus online (target {})", online, total);
 
     logln!("[kmain] reached idle loop");
     CurrentArch::halt();

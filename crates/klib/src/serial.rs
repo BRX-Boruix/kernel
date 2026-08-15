@@ -6,12 +6,14 @@
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// 全局输出函数指针（由入口 crate 注入，绑定具体架构的串口写）
-type OutputFn = fn(u8);
+/// 全局输出函数指针（由入口 crate 注入，绑定具体架构的串口写）。
+/// 接收整个字符串（含 \n，由架构层负责 \r\n 转换），一次调用完成整串输出，
+/// 从而在架构层持锁整串原子写入，避免多核交错。
+type OutputFn = fn(&str);
 static OUTPUT: AtomicUsize = AtomicUsize::new(0);
 
 /// 默认空输出（未注入前不输出任何内容）
-fn no_output(_b: u8) {}
+fn no_output(_s: &str) {}
 
 /// 绑定串口输出函数（应在内核早期初始化时调用）
 pub fn set_output(f: OutputFn) {
@@ -27,15 +29,9 @@ fn output() -> OutputFn {
     }
 }
 
-/// 写字符串到串口（\n 自动转 \r\n）
+/// 写字符串到串口（\n 自动转 \r\n）。整串一次调用，原子输出。
 pub fn write_str(s: &str) {
-    let out = output();
-    for &b in s.as_bytes() {
-        if b == b'\n' {
-            out(b'\r');
-        }
-        out(b);
-    }
+    output()(s);
 }
 
 /// 格式化写入串口

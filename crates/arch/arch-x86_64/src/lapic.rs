@@ -110,6 +110,9 @@ pub fn init(phys_offset: u64, bus_freq: u64) {
     // 5. 注册 IRQ 处理（vector 0x20 → irq 0）
     interrupts::register_irq(0, lapic_timer_handler);
 
+    // 标记 LAPIC 已可用（串口锁依赖 LAPIC id 做多核 owner 判断）
+    serial::set_lapic_ready();
+
     serial::write_str("[lapic] LAPIC timer initialized\r\n");
 }
 
