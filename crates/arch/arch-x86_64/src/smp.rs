@@ -4,7 +4,10 @@
 //! 停在 `goto_address = 0`。BSP 初始化时，为每个 AP 写入 `goto_address`，
 //! 使 AP 跳转到 `ap_entry`，进入自己的 GDT/TSS/内核栈并空转。
 //!
-//! 每 CPU 拥有独立的 GDT/TSS/内核栈（静态数组，由 CPU 的 LAPIC id 索引）。
+//! 每 CPU 拥有独立的 GDT/TSS/内核栈（静态数组）。
+//! 槽位索引由 BSP 按"启动顺序"分配紧凑唯一值，写入每个 AP 的
+//! `SmpInfo::extra_argument`，而不是用 LAPIC id 直接索引——因为真实
+//! 硬件上 LAPIC id 可能稀疏（0,8,16,…）甚至超过槽位上限，直接用会冲突。
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -56,12 +59,22 @@ pub fn total_cpus() -> usize {
 ///
 /// 注意：`goto_address` 必须指向一个 `extern "C" fn(*const SmpInfo) -> !`。
 /// Limine 会给 AP 一个 64KB 栈，并在 RDI 传入 SmpInfo 指针。
+/// 槽位索引由 BSP 在 `extra_argument` 中指定（紧凑唯一，从 1 开始）。
 #[unsafe(no_mangle)]
-extern "C" fn ap_entry(_info: *const limine::SmpInfo) -> ! {
-    // 取出本 CPU 的 LAPIC id
+extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
+    // 从 extra_argument 取得 BSP 分配的唯一槽位索引
+    let idx = unsafe { (*info).extra_argument as usize };
+
+    // 防御：索引越界则停机，避免访问静态数组越界
+    if idx >= MAX_AP_SLOTS {
+        klib::log_dec!("[smp] AP slot out of range: ", idx as u64);
+        loop {
+            crate::interrupts::halt();
+        }
+    }
+
+    // 取出本 CPU 的 LAPIC id（仅用于日志）
     let lapic_id = lapic::current_lapic_id();
-    // 用槽位上限取模，避免 LAPIC id 超过数组长度时越界
-    let idx = lapic_id as usize % MAX_AP_SLOTS;
 
     // 配置并加载本 CPU 的 GDT/TSS（每 CPU 独立内核栈）
     let (kstack_top, gdt_ptr, tss_ptr) = unsafe {
@@ -124,13 +137,28 @@ pub fn init() {
             resp.cpu_count as usize,
         )
     };
+
+    // 为每个 AP 分配紧凑唯一槽位。0 预留给 BSP（BSP 用自己的静态栈）。
+    // 关键：不用 LAPIC id 直接做索引，因为真机上 LAPIC id 可能稀疏
+    // （0,8,16,…）或超过槽位上限，直接取模会让多个 CPU 共享同一槽位，
+    // 造成 GDT/TSS/内核栈冲突。
+    let mut next_slot = 1usize;
     for ptr in cpu_slice.iter_mut() {
         let info: &mut limine::SmpInfo = unsafe { &mut *ptr.as_ptr() };
         let this_lapic = info.lapic_id;
         if this_lapic == bsp_lapic {
             continue; // 跳过 BSP
         }
-        // 写入 goto_address，使 AP 跳转到 ap_entry
+        // 分配唯一槽位
+        let slot = next_slot;
+        next_slot += 1;
+        if slot >= MAX_AP_SLOTS {
+            klib::log_dec!("[smp] skipping AP lapic_id=", this_lapic);
+            klib::logln!("[smp] slot limit ({}) reached", MAX_AP_SLOTS);
+            continue;
+        }
+        // 把槽位传给 AP（extra_argument），并写入 goto_address
+        info.extra_argument = slot as u64;
         info.goto_address = ap_entry;
         klib::log_dec!("[smp] fired AP lapic_id=", this_lapic);
     }
