@@ -149,6 +149,8 @@ impl LazyBuddyAllocator {
         }
 
         // Align to 4KB
+        // total_frames 覆盖整个地址跨度（含空洞），因为 buddy 索引以 pfn 计，
+        // 任意可分配帧的元数据都必须可寻址。但 metadata 池只需覆盖实际 usable 内存。
         let total_frames = (max_phys_addr as usize + 4095) / 4096;
 
         // Calculate block parameters
@@ -157,11 +159,35 @@ impl LazyBuddyAllocator {
 
         let metadata_map_len = (total_frames + frames_per_block - 1) / frames_per_block;
 
+        // 计算实际需要分配的 metadata block 数：遍历每个 usable 区域，
+        // 统计其覆盖的 block 范围。这样在稀疏内存布局下，metadata 池只按
+        // 真实内存量增长，而不是按最大物理地址跨度，避免大内存/空洞机器
+        // 上元数据过大导致放不进单个 usable 区域而 panic。
+        let block_size = frames_per_block * 4096; // 每个 metadata block 覆盖的字节数
+        let mut needed_blocks = 0usize;
+        for entry in entries_iter.clone() {
+            if entry.typ != MemoryMapEntryType::Usable {
+                continue;
+            }
+            let start = entry.base as usize;
+            let end = (entry.base + entry.len) as usize;
+            if end <= start {
+                continue;
+            }
+            let first = start / block_size;
+            let last = (end - 1) / block_size;
+            // 累加该区域覆盖的 block 数（cap 到 metadata_map_len 上界）
+            needed_blocks = needed_blocks
+                .saturating_add((last - first + 1).min(metadata_map_len.saturating_sub(first)));
+        }
+
         // Calculate sizes for arrays
         let metadata_map_size = metadata_map_len * size_of::<usize>(); // pointer size
         let max_uninit_regions = usable_regions_count * 2 + PADDING_REGIONS;
         let uninit_regions_size = max_uninit_regions * size_of::<Option<UninitRegion>>();
-        let metadata_pool_size = metadata_map_len * 4096; // one 4K block per metadata block
+        // metadata 池只按实际 usable 内存覆盖的 block 数分配（含少量上浮余量）
+        let metadata_pool_blocks = needed_blocks + PADDING_REGIONS;
+        let metadata_pool_size = metadata_pool_blocks * 4096; // one 4K block per metadata block
         let counts_size = total_frames * size_of::<core::sync::atomic::AtomicU16>();
 
         logln!(
@@ -223,7 +249,7 @@ impl LazyBuddyAllocator {
         let mut region_idx = 0;
         let mut metadata_pool = MetadataPool {
             base: (phys_offset + pool_paddr as u64) as *mut u8,
-            blocks: metadata_map_len,
+            blocks: metadata_pool_blocks,
             next: 0,
             block_size: 4096,
         };

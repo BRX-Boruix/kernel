@@ -62,29 +62,15 @@ pub fn write_cr3(val: u64) {
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) val, options(nostack)) };
 }
 
-/// 沿页表从 `table_phys` 下降一层：读取 `index` 项，若 present 返回下一级
-/// 表/页的物理地址，否则返回 `None`。
-///
-/// 供 `map_lapic` 等多层页表下降逻辑复用。
-#[inline]
-fn descend(table_phys: u64, index: usize) -> Option<u64> {
-    let entry = unsafe { read_u64(phys_to_virt(table_phys) + index as u64 * 8) };
-    if entry & FLAG_PRESENT == 0 {
-        None
-    } else {
-        Some(entry & ADDR_MASK)
-    }
-}
-
 /// 把物理地址 `phys`（须 2MB 对齐）映射到虚拟地址 `virt`（须 2MB 对齐），
 /// 使用当前 CR3 页表，建立 2MB 大页。
 ///
 /// 通过 `arch::phys_to_virt` 把页表所在的物理页换算为可访问虚拟地址。
-/// 若中间页表页不存在，会复用已存在的（假定 Limine 已建立高半区顶层页表，
-/// 映射正好落到同一目录下即可；LAPIC 虚拟地址选在 0xffff8000fee00000）。
+/// 逐级下降时若某中间页表页缺失，会**主动分配**并清零，而不是假定 Limine
+/// 已建立对应层级——因此不依赖特定内存布局（修复原"复用已存在页表页"的假设）。
 ///
 /// 支持 LA57：层数由 `page_levels()` 动态决定，2MB 大页落在 PD 层
-/// （其层序号 = `levels - 2`），从而避免把 CR3 指向的顶层表误当 4 级用。
+/// （其层序号 = `levels - 2`）。
 pub fn map_lapic(phys: u64, virt: u64) -> bool {
     // 物理地址须 2MB 对齐
     if phys & (PAGE_2M - 1) != 0 || virt & (PAGE_2M - 1) != 0 {
@@ -96,13 +82,29 @@ pub fn map_lapic(phys: u64, virt: u64) -> bool {
     // 2MB 大页所在层 = PD = 最低层往上一级 = levels - 2
     let pd_level = levels - 2;
 
-    // 从当前 CR3 的顶层逐级下降至 PD 层（复用统一下降逻辑）
+    // 从当前 CR3 的顶层逐级下降至 PD 层。中间层缺失时主动分配。
     let mut table_phys = cr3() & !0xFFF;
     for lvl in 0..pd_level {
         let idx = index_at(lvl, levels, virt);
-        let Some(next) = descend(table_phys, idx) else {
-            klib::logln!("[mmio] level {} index {} not present", lvl, idx);
-            return false;
+        let entry = unsafe { read_u64(phys_to_virt(table_phys) + idx as u64 * 8) };
+        let next = if entry & FLAG_PRESENT != 0 {
+            entry & ADDR_MASK
+        } else {
+            // 分配新页表页并清零
+            let Some(new) = crate::paging::alloc_frame() else {
+                klib::logln!("[mmio] level {} no frame for page table", lvl);
+                return false;
+            };
+            unsafe {
+                // 清零 512 项
+                core::ptr::write_bytes(phys_to_virt(new) as *mut u8, 0, 4096);
+                // 连接：present | writable（子表本身）
+                write_u64(
+                    phys_to_virt(table_phys) + idx as u64 * 8,
+                    (new & ADDR_MASK) | FLAG_PRESENT | FLAG_WRITABLE,
+                );
+            }
+            new
         };
         table_phys = next;
     }

@@ -108,7 +108,8 @@ unsafe fn kmain_body() -> ! {
     logln!("[kmain] initializing SMP");
     arch_x86_64::smp::init();
     let total = arch_x86_64::smp::total_cpus();
-    let online = arch_x86_64::smp::wait_all_online(total, 1_000_000);
+    // 等待所有 AP 上线，超时 2 秒（基于 LAPIC 定时器真实时间）
+    let online = arch_x86_64::smp::wait_all_online(total, 2_000);
     logln!("[kmain] SMP done, {} cpus online (target {})", online, total);
 
     logln!("[kmain] reached idle loop");

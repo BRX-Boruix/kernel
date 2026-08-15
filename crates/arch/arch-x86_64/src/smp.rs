@@ -171,11 +171,20 @@ pub fn init() {
 
 /// 等待所有 AP 上线，返回最终在线 CPU 数。
 ///
-/// 轮询 `CPU_COUNT`（Acquire）直到达到目标数，或超过超时。
-pub fn wait_all_online(target: usize, timeout_iters: usize) -> usize {
-    let mut iters = 0;
-    while cpu_count() < target && iters < timeout_iters {
-        iters += 1;
+/// 轮询 `CPU_COUNT` 直到达到目标数，或超过 `timeout_ms`（毫秒）。
+///
+/// 用 LAPIC 定时器（100Hz，每 tick = 10ms）作为真实时间源，而不是
+/// 机器相关的自旋迭代次数——后者在不同 CPU 速度的机器上语义完全不同，
+/// 慢 CPU 上 AP 可能根本起不来就被误判为超时。
+pub fn wait_all_online(target: usize, timeout_ms: usize) -> usize {
+    // LAPIC 定时器已初始化为 100Hz，每 tick 10ms。
+    let start_ticks = crate::lapic::ticks();
+    let timeout_ticks = (timeout_ms.div_ceil(10)) as u64; // 换算成 tick 数
+    while cpu_count() < target {
+        let elapsed = crate::lapic::ticks().saturating_sub(start_ticks);
+        if elapsed >= timeout_ticks {
+            break;
+        }
         core::hint::spin_loop();
     }
     cpu_count()

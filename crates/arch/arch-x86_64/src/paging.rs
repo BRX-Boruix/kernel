@@ -27,7 +27,9 @@ pub fn init(alloc: extern "C" fn() -> u64, phys_offset: u64) {
 }
 
 /// 分配一个物理帧并返回其物理地址（0 表示失败）。
-fn alloc_frame() -> Option<u64> {
+///
+/// `pub(crate)` 供 `mmio::map_lapic` 在中间页表页缺失时主动分配。
+pub(crate) fn alloc_frame() -> Option<u64> {
     let p = FRAME_ALLOC.get().map(|f| f())?;
     if p == 0 {
         None
