@@ -20,9 +20,33 @@ static BASE_REVISION: BaseRevision = BaseRevision::new(6);
 #[limine::limine_tag]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new(0);
 
-/// 内核入口（由 Limine 引导器跳转）
+/// 内核主栈大小（1MB）。kmain 及后续所有调用都在此栈上运行，
+/// 避免 Limine 提供的初始引导栈过小导致深调用（如 flanterm）溢出。
+const KMAIN_STACK_SIZE: usize = 1024 * 1024;
+
+/// 内核主栈（静态分配，位于 .bss）。
+static mut KMAIN_STACK: [u8; KMAIN_STACK_SIZE] = [0; KMAIN_STACK_SIZE];
+
+/// 真正的内核入口：先切换到自己的大栈，再进入 kmain 主体。
+/// Limine 跳转到的 `kmain`（见下方 no_mangle 函数）会做栈切换。
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain() -> ! {
+    // 切换到我们自己的大栈（栈顶）。
+    // 用汇编把 rsp 切换到 KMAIN_STACK 顶部，同时保留返回地址以便切换后正常执行。
+    unsafe {
+        core::arch::asm!(
+            "mov {stack}, rsp",
+            "mov rsp, {stack_top}",
+            stack = out(reg) _,
+            stack_top = in(reg) (&raw mut KMAIN_STACK).cast::<u8>().add(KMAIN_STACK_SIZE) as usize,
+            options(nostack),
+        );
+    }
+    unsafe { kmain_body() }
+}
+
+/// kmain 主体（在自备大栈上运行）。
+unsafe fn kmain_body() -> ! {
     // 初始化 panic 子系统（注入架构名和停机函数，尽早）
     panic::init(CurrentArch::name(), CurrentArch::halt);
 
