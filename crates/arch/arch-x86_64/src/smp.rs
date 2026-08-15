@@ -26,13 +26,16 @@ static TOTAL_CPUS: AtomicUsize = AtomicUsize::new(1);
 /// 这里仅提供一个更小的中断栈（TSS.rsp0）用于中断上下文。
 const AP_STACK_SIZE: usize = 16 * 1024;
 
+/// AP 槽位上限。静态数组编译期大小固定，这里取一个足够大的值
+/// （对齐常见多核配置的上限）。若实际 CPU 数超过该值会拒绝启动超出部分。
+const MAX_AP_SLOTS: usize = 64;
+
 /// 每个 CPU 一个内核栈（AP 用）。BSP 用自己的静态栈。
-/// 只用实际 CPU 数（MAX_AP_SLOTS 个槽，QEMU 测试 4 核足够）。
-static mut AP_KSTACKS: [[u8; AP_STACK_SIZE]; 8] = [[0; AP_STACK_SIZE]; 8];
+static mut AP_KSTACKS: [[u8; AP_STACK_SIZE]; MAX_AP_SLOTS] = [[0; AP_STACK_SIZE]; MAX_AP_SLOTS];
 
 /// 每个 CPU 一个 GDT/TSS。
-static mut AP_GDT: [gdt::Gdt; 8] = [const { gdt::Gdt::new() }; 8];
-static mut AP_TSS: [gdt::Tss; 8] = [const { gdt::Tss::new() }; 8];
+static mut AP_GDT: [gdt::Gdt; MAX_AP_SLOTS] = [const { gdt::Gdt::new() }; MAX_AP_SLOTS];
+static mut AP_TSS: [gdt::Tss; MAX_AP_SLOTS] = [const { gdt::Tss::new() }; MAX_AP_SLOTS];
 
 /// 输出"p1 + v1 + p2 + v2"（单次串口写）。
 fn klog_combined(p1: &str, v1: u32, p2: &str, v2: u64) {
@@ -57,7 +60,8 @@ pub fn total_cpus() -> usize {
 extern "C" fn ap_entry(_info: *const limine::SmpInfo) -> ! {
     // 取出本 CPU 的 LAPIC id
     let lapic_id = lapic::current_lapic_id();
-    let idx = lapic_id as usize % 8;
+    // 用槽位上限取模，避免 LAPIC id 超过数组长度时越界
+    let idx = lapic_id as usize % MAX_AP_SLOTS;
 
     // 配置并加载本 CPU 的 GDT/TSS（每 CPU 独立内核栈）
     let (kstack_top, gdt_ptr, tss_ptr) = unsafe {
@@ -96,7 +100,15 @@ pub fn init() {
 
     let bsp_lapic = resp.bsp_lapic_id;
     let total = resp.cpu_count;
-    TOTAL_CPUS.store(total as usize, Ordering::Relaxed);
+    if total as usize > MAX_AP_SLOTS {
+        klib::logln!(
+            "[smp] WARNING: {} cpus exceed MAX_AP_SLOTS={}, only first {} will start",
+            total,
+            MAX_AP_SLOTS,
+            MAX_AP_SLOTS
+        );
+    }
+    TOTAL_CPUS.store((total as usize).min(MAX_AP_SLOTS), Ordering::Relaxed);
     // 一次 write_str 完整打印 BSP 信息，避免交错
     klog_combined("[smp] BSP lapic_id=", bsp_lapic, ", total cpus=", total);
 

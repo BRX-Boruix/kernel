@@ -4,7 +4,7 @@ use core::sync::atomic::Ordering;
 
 use klib::logln;
 
-use crate::PhysFrame;
+use arch::PhysFrame;
 
 use super::allocator_core::{FrameState, MAX_ORDER, ORDER_4K};
 use super::{current_cpu_id, LazyBuddyAllocator};

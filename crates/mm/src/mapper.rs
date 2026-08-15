@@ -19,5 +19,5 @@ pub extern "C" fn mm_alloc_frame() -> u64 {
 /// 释放一个物理帧。FFI 安全。
 #[unsafe(no_mangle)]
 pub extern "C" fn mm_dealloc_frame(paddr: u64) {
-    frame_allocator::deallocate_frame(crate::PhysFrame::from_paddr_raw(paddr));
+    frame_allocator::deallocate_frame(arch::PhysFrame::from_paddr_raw(paddr));
 }

@@ -190,7 +190,7 @@ impl LazyBuddyAllocator {
         let pool_end = pool_paddr + metadata_pool_size;
 
         // Initialize pointers
-        let phys_offset = match crate::PHYS_OFFSET.get() {
+        let phys_offset = match arch::PHYS_OFFSET.get() {
             Some(v) => *v,
             None => return,
         };

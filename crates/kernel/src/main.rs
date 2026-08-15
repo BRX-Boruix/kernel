@@ -67,7 +67,7 @@ unsafe fn kmain_body() -> ! {
     tests::test_frame_alloc();
 
     // 注入页表页分配器与 HHDM 偏移（虚拟内存层使用）
-    let phys_offset = mm::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let phys_offset = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
     arch_x86_64::paging::init(mm::mapper::mm_alloc_frame, phys_offset);
     // 验证虚拟内存页表映射
     tests::test_paging();
@@ -95,7 +95,7 @@ unsafe fn kmain_body() -> ! {
 
     // 初始化 Local APIC 定时器（Limine 已启用 LAPIC，硬件中断走 APIC）
     logln!("[kmain] enabling interrupts (LAPIC timer ~100Hz)");
-    arch_x86_64::lapic::init(1_000_000_000); // 假设总线频率约 1GHz
+    arch_x86_64::lapic::init(arch_x86_64::lapic::DEFAULT_BUS_FREQ_HZ);
     arch_x86_64::interrupts::enable();
 
     // 短暂等待验证时钟中断确实触发

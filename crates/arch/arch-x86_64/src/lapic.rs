@@ -35,6 +35,12 @@ const TIMER_VECTOR: u32 = 0x20;
 /// LAPIC ID 寄存器偏移。
 const LAPIC_ID: usize = 0x20;
 
+/// 默认 LAPIC 总线频率（Hz）。
+///
+/// QEMU 下典型值约 1GHz。这是对总线频率的假设值，若需精确应实测
+/// （例如用 PIT 校准或读取 CPUID 0x16）。可传入 `init` 覆盖。
+pub const DEFAULT_BUS_FREQ_HZ: u64 = 1_000_000_000;
+
 /// 全局 tick 计数。
 static TICKS: AtomicU64 = AtomicU64::new(0);
 

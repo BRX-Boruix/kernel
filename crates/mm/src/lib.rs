@@ -5,7 +5,7 @@
 //! - 虚拟内存：页表抽象（经 arch 层）与地址空间
 //!
 //! 地址类型（`PhysAddr`/`VirtAddr`/`PhysFrame`）定义在 `arch` 抽象层，
-//! 这里 re-export 以兼容旧路径。
+//! 使用方请从 `arch` 直接引入。
 
 #![no_std]
 
@@ -14,8 +14,6 @@ extern crate alloc;
 pub mod frame_allocator;
 pub mod mapper;
 pub mod memory_set;
-
-pub use arch::{PhysAddr, PhysFrame, VirtAddr};
 
 pub use frame_allocator::{
     allocate_frame, allocate_frames, compact_now, deallocate_frame, frag_stats, init as init_frame,
@@ -29,11 +27,6 @@ use limine::{HhdmRequest, MemmapRequest};
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new(0);
 #[limine::limine_tag]
 static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new(0);
-
-/// HHDM 偏移（物理地址 → 虚拟地址的偏移），由 Limine 提供。
-///
-/// 实际存储于 `arch::hhdm`，这里 re-export 以兼容旧路径。
-pub use arch::PHYS_OFFSET;
 
 /// 初始化内存管理子系统。
 ///
