@@ -134,6 +134,12 @@ static mut BSP_GDT: Gdt = Gdt::new();
 static mut BSP_TSS: Tss = Tss::new();
 static mut BSP_KSTACK: [u8; KSTACK_SIZE] = [0; KSTACK_SIZE];
 
+/// 计算内核栈顶地址：栈起始地址 + 字节长度。
+#[inline]
+pub fn stack_top(addr: *const u8, len: usize) -> u64 {
+    addr as u64 + len as u64
+}
+
 /// 为某个 CPU 配置并加载其 GDT/TSS。
 ///
 /// `gdt` 与 `tss` 指向该 CPU 的 GDT/TSS，`kstack_top` 为该 CPU 的内核栈顶（写入 TSS.rsp0）。
@@ -150,7 +156,7 @@ pub fn setup_cpu(gdt: *mut Gdt, tss: *mut Tss, kstack_top: u64) {
 ///
 /// 必须在允许使用全局静态变量的早期（堆初始化前即可）调用。
 pub fn init() {
-    let kstack_top = core::ptr::addr_of!(BSP_KSTACK) as u64 + KSTACK_SIZE as u64;
+    let kstack_top = stack_top(core::ptr::addr_of!(BSP_KSTACK) as *const u8, KSTACK_SIZE);
     let gdt_ptr = core::ptr::addr_of_mut!(BSP_GDT);
     let tss_ptr = core::ptr::addr_of_mut!(BSP_TSS);
     setup_cpu(gdt_ptr, tss_ptr, kstack_top);

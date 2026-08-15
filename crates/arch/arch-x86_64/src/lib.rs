@@ -38,11 +38,7 @@ impl Platform for X86_64Arch {
     }
 
     fn halt() -> ! {
-        loop {
-            unsafe {
-                core::arch::asm!("hlt", options(nomem, nostack));
-            }
-        }
+        crate::interrupts::halt_forever()
     }
 
     fn serial_write(byte: u8) {

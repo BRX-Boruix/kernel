@@ -50,8 +50,8 @@ impl fmt::Write for SerialWriter {
     }
 }
 
-/// 以十六进制写 `value`（不含 0x 前缀，固定宽度，由调用方决定）。
-fn write_hex_raw(value: u64) {
+/// 以十六进制写 `value`（不含 0x 前缀，固定 16 位宽度）。
+pub fn write_hex_raw(value: u64) {
     write_str(core::str::from_utf8(&crate::format::hex_bytes(value)).unwrap());
 }
 

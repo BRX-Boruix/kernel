@@ -14,7 +14,7 @@ use limine::{MemmapEntry, MemoryMapEntryType, NonNullPtr};
 use klib::logln;
 use spin::{Mutex, Once};
 
-use crate::{PhysAddr, PhysFrame};
+use crate::PhysFrame;
 
 use super::percpu_cache::{FreeList, FreeListTable, ReserveList};
 use super::{current_cpu_id, FREE_LISTS, PER_CPU};
@@ -76,6 +76,12 @@ fn set_flag(flags: &mut u8, mask: u8, on: bool) {
     } else {
         *flags &= !mask;
     }
+}
+
+/// 向上对齐到 4KB 边界。
+#[inline]
+pub(crate) const fn align_4k(v: usize) -> usize {
+    (v + 4095) & !4095
 }
 
 /// 遍历所有全局空闲链表（每个 order/shard），对已加锁的 `FreeList` 调用 `f(order, shard, &mut list)`。
@@ -234,6 +240,22 @@ impl LazyBuddyAllocator {
         frame.prev = None;
     }
 
+    /// 把一个帧标记为 `state` 状态并链入链表（`next` 为链头）。
+    ///
+    /// 供 `push_to_global`、`percpu_push_raw`、`reserve_push` 复用，
+    /// 统一"写 order/state/migratable/next/prev"五连操作。
+    #[inline]
+    unsafe fn link_frame_as(&self, pfn: usize, order: u8, state: FrameState, next: Option<usize>) {
+        unsafe {
+            let frame = self.get_frame(pfn);
+            frame.order = order;
+            frame.state = state;
+            set_flag(&mut frame.flags, BF_MIGRATABLE, true);
+            frame.next = next;
+            frame.prev = None;
+        }
+    }
+
     /// 取得某 order 下指定 shard 的全局链表锁，并计入一次全局链表操作。
     fn lock_global_list(&self, order: usize, shard: usize) -> spin::MutexGuard<'_, FreeList> {
         let lists = FREE_LISTS.get().expect("PMM free lists not initialized");
@@ -252,13 +274,12 @@ impl LazyBuddyAllocator {
         const MIN_METADATA_BASE: usize = 0x0010_0000; // 1MiB guard to avoid low memory/HHDM corner cases
         let entries = mmap.iter().map(|e| unsafe { &*e.as_ptr() });
 
-        let align = |v: usize| (v + 4095) & !4095;
-        let total_size = align(metadata_map_size)
-            + align(uninit_regions_size)
-            + align(counts_size)
-            + align(metadata_pool_size);
+        let total_size = align_4k(metadata_map_size)
+            + align_4k(uninit_regions_size)
+            + align_4k(counts_size)
+            + align_4k(metadata_pool_size);
         let map_uninit_size =
-            align(metadata_map_size) + align(uninit_regions_size) + align(counts_size);
+            align_4k(metadata_map_size) + align_4k(uninit_regions_size) + align_4k(counts_size);
 
         let mut best_total: Option<(usize, usize)> = None;
         let mut best_pool: Option<(usize, usize)> = None;
@@ -273,7 +294,7 @@ impl LazyBuddyAllocator {
             if base < MIN_METADATA_BASE {
                 continue;
             }
-            let aligned_base = align(base);
+            let aligned_base = align_4k(base);
             let avail = len.saturating_sub(aligned_base.saturating_sub(base));
 
             if avail >= total_size {
@@ -294,10 +315,10 @@ impl LazyBuddyAllocator {
         }
 
         if let Some((base, avail)) = best_total {
-            let map_paddr = align(base);
-            let uninit_paddr = align(map_paddr + metadata_map_size);
-            let counts_paddr = align(uninit_paddr + uninit_regions_size);
-            let pool_paddr = align(counts_paddr + counts_size);
+            let map_paddr = align_4k(base);
+            let uninit_paddr = align_4k(map_paddr + metadata_map_size);
+            let counts_paddr = align_4k(uninit_paddr + uninit_regions_size);
+            let pool_paddr = align_4k(counts_paddr + counts_size);
             let end = pool_paddr + metadata_pool_size;
             if end > base + avail {
                 panic!("PMM: metadata placement exceeds region bounds");
@@ -322,7 +343,7 @@ impl LazyBuddyAllocator {
                 }
                 let base = entry.base as usize;
                 let len = entry.len as usize;
-                let aligned_base = align(base);
+                let aligned_base = align_4k(base);
                 let avail = len.saturating_sub(aligned_base.saturating_sub(base));
                 if base == pool_base || avail < map_uninit_size {
                     continue;
@@ -338,14 +359,14 @@ impl LazyBuddyAllocator {
             map_avail = alt.1;
         }
 
-        let map_paddr = align(map_base);
-        let uninit_paddr = align(map_paddr + metadata_map_size);
-        let counts_paddr = align(uninit_paddr + uninit_regions_size);
+        let map_paddr = align_4k(map_base);
+        let uninit_paddr = align_4k(map_paddr + metadata_map_size);
+        let counts_paddr = align_4k(uninit_paddr + uninit_regions_size);
         let map_end = counts_paddr + counts_size;
         if map_end > map_base + map_avail {
             panic!("PMM: metadata map/uninit placement exceeds region bounds");
         }
-        let pool_paddr = align(pool_base);
+        let pool_paddr = align_4k(pool_base);
 
         (map_paddr, uninit_paddr, pool_paddr, counts_paddr)
     }
@@ -485,7 +506,7 @@ impl LazyBuddyAllocator {
                         // Advance past reserved block
                         current = core::cmp::max(current, *r_end);
                         // Align
-                        current = (current + 4095) & !4095;
+                        current = align_4k(current);
                     }
                 }
 
@@ -531,7 +552,7 @@ impl LazyBuddyAllocator {
     ) { unsafe {
         let mut current = start;
         // Align start to 4KB
-        current = (current + 4095) & !4095;
+        current = align_4k(current);
 
         let cfg = self.config();
         let block_size = cfg.frames_per_block * 4096;
@@ -627,12 +648,7 @@ impl LazyBuddyAllocator {
         let shard = Self::shard_for_pfn(pfn);
         let mut list = self.lock_global_list(order, shard);
         unsafe {
-            let frame = self.get_frame(pfn);
-            frame.order = order as u8;
-            frame.state = FrameState::FreeGlobal;
-            set_flag(&mut frame.flags, BF_MIGRATABLE, true);
-            frame.next = list.head;
-            frame.prev = None;
+            self.link_frame_as(pfn, order as u8, FrameState::FreeGlobal, list.head);
         }
         if let Some(head_idx) = list.head {
             unsafe {
@@ -802,12 +818,7 @@ impl LazyBuddyAllocator {
     fn percpu_push_raw(&self, cpu: usize, pfn: usize, order: usize) {
         PER_CPU.with_cache(cpu, |cache| {
             unsafe {
-                let frame = self.get_frame(pfn);
-                frame.order = order as u8;
-                frame.state = FrameState::FreePerCpu;
-                set_flag(&mut frame.flags, BF_MIGRATABLE, true);
-                frame.next = cache.heads[order];
-                frame.prev = None;
+                self.link_frame_as(pfn, order as u8, FrameState::FreePerCpu, cache.heads[order]);
             }
             cache.heads[order] = Some(pfn);
             cache.counts[order] = cache.counts[order].saturating_add(1);
@@ -944,12 +955,7 @@ impl LazyBuddyAllocator {
     fn reserve_push(&self, pfn: usize) {
         let mut list = self.reserve_list.lock();
         unsafe {
-            let frame = self.get_frame(pfn);
-            frame.order = ORDER_4K as u8;
-            frame.state = FrameState::Allocated;
-            set_flag(&mut frame.flags, BF_MIGRATABLE, true);
-            frame.next = list.head;
-            frame.prev = None;
+            self.link_frame_as(pfn, ORDER_4K as u8, FrameState::Allocated, list.head);
         }
         list.head = Some(pfn);
         self.reserve_count.fetch_add(1, Ordering::Relaxed);
@@ -995,9 +1001,7 @@ impl LazyBuddyAllocator {
         {
             self.allocated_frames
                 .fetch_add(1 << order, Ordering::Relaxed);
-            return Some(PhysFrame::containing_address(PhysAddr::new(
-                (idx * 4096) as u64,
-            )));
+            return Some(PhysFrame::from_paddr_raw((idx * 4096) as u64));
         }
 
         // Auto-compact on higher-order failure with throttling.
@@ -1013,9 +1017,7 @@ impl LazyBuddyAllocator {
                     if let Some(idx) = self.alloc_global(order, cpu) {
                         self.allocated_frames
                             .fetch_add(1 << order, Ordering::Relaxed);
-                        return Some(PhysFrame::containing_address(PhysAddr::new(
-                            (idx * 4096) as u64,
-                        )));
+                        return Some(PhysFrame::from_paddr_raw((idx * 4096) as u64));
                     }
                 }
             }
@@ -1028,7 +1030,7 @@ impl LazyBuddyAllocator {
 
     pub fn deallocate(&self, frame: PhysFrame) {
         self.dealloc_calls.fetch_add(1, Ordering::Relaxed);
-        let pfn = frame.start_address().as_u64() as usize / 4096;
+        let pfn = frame.start_paddr() as usize / 4096;
         let cfg = self.config();
 
         if pfn >= cfg.total_frames {

@@ -68,9 +68,21 @@ impl PhysFrame {
         }
     }
 
+    /// 从裸 `u64` 物理地址构造页帧（自动对齐到 4KB 页起始）。
+    pub const fn from_paddr_raw(paddr: u64) -> Self {
+        Self {
+            start: PhysAddr::new(paddr).containing_page(),
+        }
+    }
+
     /// 返回页帧的起始物理地址。
     pub const fn start_address(self) -> PhysAddr {
         self.start
+    }
+
+    /// 返回页帧起始物理地址的裸 `u64` 值。
+    pub const fn start_paddr(self) -> u64 {
+        self.start.as_u64()
     }
 
     /// 从物理地址构造页帧，要求已按 4KB 对齐（否则 panic）。

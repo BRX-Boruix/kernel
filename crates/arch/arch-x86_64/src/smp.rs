@@ -36,13 +36,6 @@ static mut AP_KSTACKS: [[u8; AP_STACK_SIZE]; 8] = [[0; AP_STACK_SIZE]; 8];
 static mut AP_GDT: [gdt::Gdt; 8] = [const { gdt::Gdt::new() }; 8];
 static mut AP_TSS: [gdt::Tss; 8] = [const { gdt::Tss::new() }; 8];
 
-/// 输出"前缀 + 十进制数字 + \r\n"（单次串口写，避免多核交错）。
-fn klog_num(prefix: &str, val: u32) {
-    serial::write_str(prefix);
-    diag::write_dec(val as u128);
-    serial::write_str("\r\n");
-}
-
 /// 输出"p1 + v1 + p2 + v2 + \r\n"（单次串口写）。
 fn klog_combined(p1: &str, v1: u32, p2: &str, v2: u64) {
     serial::write_str(p1);
@@ -75,7 +68,7 @@ extern "C" fn ap_entry(_info: *const limine::SmpInfo) -> ! {
     // 配置并加载本 CPU 的 GDT/TSS（每 CPU 独立内核栈）
     let (kstack_top, gdt_ptr, tss_ptr) = unsafe {
         (
-            core::ptr::addr_of!(AP_KSTACKS[idx]) as u64 + AP_STACK_SIZE as u64,
+            gdt::stack_top(core::ptr::addr_of!(AP_KSTACKS[idx]) as *const u8, AP_STACK_SIZE),
             core::ptr::addr_of_mut!(AP_GDT[idx]),
             core::ptr::addr_of_mut!(AP_TSS[idx]),
         )
@@ -89,7 +82,7 @@ extern "C" fn ap_entry(_info: *const limine::SmpInfo) -> ! {
     CPU_COUNT.fetch_add(1, Ordering::AcqRel);
 
     // 一次 write_str 完整打印，避免与其他 CPU 交错
-    klog_num("[smp] AP online, lapic_id=", lapic_id);
+    klib::log_dec!("[smp] AP online, lapic_id=", lapic_id);
 
     // AP 空闲循环
     loop {
@@ -133,7 +126,7 @@ pub fn init() {
         }
         // 写入 goto_address，使 AP 跳转到 ap_entry
         info.goto_address = ap_entry;
-        klog_num("[smp] fired AP lapic_id=", this_lapic);
+        klib::log_dec!("[smp] fired AP lapic_id=", this_lapic);
     }
 }
 

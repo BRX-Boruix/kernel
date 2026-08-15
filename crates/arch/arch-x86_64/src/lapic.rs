@@ -7,7 +7,6 @@
 //! 该物理地址不在 Limine 的 HHDM RAM 映射内，需先用 `mmio::map_lapic`
 //! 以 2MB 大页映射到高半区虚拟地址，再访问。
 
-use crate::diag;
 use crate::interrupts;
 use crate::mmio;
 use crate::serial;
@@ -62,6 +61,13 @@ fn lapic_write(reg: usize, val: u32) {
     unsafe { mmio::write_u32(LAPIC_VIRT + reg as u64, val) };
 }
 
+/// 对 LAPIC 寄存器做"读-改-写"：清除 `clear_bits`，置位 `set_bits`。
+#[inline]
+fn lapic_rmw(reg: usize, clear_bits: u32, set_bits: u32) {
+    let v = lapic_read(reg);
+    lapic_write(reg, (v & !clear_bits) | set_bits);
+}
+
 /// 发送 EOI 给 LAPIC。
 fn end_of_interrupt() {
     lapic_write(LAPIC_EOI, 0);
@@ -79,21 +85,17 @@ extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
 
 /// 初始化 Local APIC 定时器。
 ///
-/// `phys_offset` 为 Limine 的 HHDM 偏移，用于映射 LAPIC MMIO。
 /// `bus_freq` 为 LAPIC 总线频率（Hz），QEMU 下典型约 1GHz。
-pub fn init(phys_offset: u64, bus_freq: u64) {
+pub fn init(bus_freq: u64) {
     // 0. 把 LAPIC 物理地址映射到高半区虚拟地址
-    if !mmio::map_lapic(phys_offset, LAPIC_PHYS, LAPIC_VIRT) {
+    if !mmio::map_lapic(LAPIC_PHYS, LAPIC_VIRT) {
         serial::write_str("[lapic] map failed\r\n");
         return;
     }
-    serial::write_str("[lapic] mapped to ");
-    diag::write_hex(LAPIC_VIRT);
-    serial::write_str("\r\n");
+    klib::log_hex!("[lapic] mapped to ", LAPIC_VIRT);
 
     // 1. 使能 LAPIC（SVR，向量 0xFF）
-    let svr = lapic_read(LAPIC_SVR);
-    lapic_write(LAPIC_SVR, (svr & !0x100) | 0x100 | 0xFF);
+    lapic_rmw(LAPIC_SVR, 0x100, 0x100 | 0xFF);
 
     // 2. 配置定时器分频（divide by 1 → 0x0B）
     lapic_write(LAPIC_TIMER_DIV, 0x0B);

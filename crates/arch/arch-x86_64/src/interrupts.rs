@@ -327,8 +327,7 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         serial::write_str("\r\n");
         if vector == 14 {
             // 页错误：打印 CR2
-            let cr2: u64;
-            unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2) };
+            let cr2 = crate::mmio::cr2();
             serial::write_str("  cr2:    0x");
             diag::write_hex_u64(cr2);
             serial::write_str("\r\n");

@@ -94,7 +94,7 @@ unsafe fn kmain_body() -> ! {
 
     // 初始化 Local APIC 定时器（Limine 已启用 LAPIC，硬件中断走 APIC）
     logln!("[kmain] enabling interrupts (LAPIC timer ~100Hz)");
-    arch_x86_64::lapic::init(phys_offset, 1_000_000_000); // 假设总线频率约 1GHz
+    arch_x86_64::lapic::init(1_000_000_000); // 假设总线频率约 1GHz
     arch_x86_64::interrupts::enable();
 
     // 短暂等待验证时钟中断确实触发
@@ -122,21 +122,20 @@ fn test_paging() {
 
     // ---- 1. 4KB 页映射/翻译/解映射（逻辑验证）----
     let mut pt = arch_x86_64::paging::X86PageTable::new_empty().expect("no page table frame");
-    let phys4k = mm::allocate_frame().expect("no 4k frame").start_address().as_u64();
+    let phys4k = mm::allocate_frame().expect("no 4k frame").start_paddr();
     let vaddr4k = VirtAddr::new(0x0000_0000_4000_0000);
     pt.map(vaddr4k, arch::PhysAddr::new(phys4k), PageSize::Size4K, PageFlags::empty().writable())
         .expect("4k map");
     logln!("[test-paging] 4K: mapped {} -> {}", vaddr4k.as_u64(), phys4k);
     logln!("[test-paging] 4K: translate -> {:#x}", pt.translate(vaddr4k).unwrap().as_u64());
     logln!("[test-paging] 4K: unmap -> {:#x}", pt.unmap(vaddr4k).unwrap().as_u64());
-    mm::deallocate_frame(arch::PhysFrame::containing_address(arch::PhysAddr::new(phys4k)));
+    mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(phys4k));
 
     // ---- 2. 2MB 大页映射（逻辑验证）----
     let mut pt2 = arch_x86_64::paging::X86PageTable::new_empty().expect("no page table frame");
     let phys2m = mm::frame_allocator::allocate_frames(mm::frame_allocator::ORDER_2M)
         .expect("no 2M frame")
-        .start_address()
-        .as_u64();
+        .start_paddr();
     let vaddr2m = VirtAddr::new(0x0000_0000_5000_0000); // 2MB 对齐
     pt2.map(vaddr2m, arch::PhysAddr::new(phys2m), PageSize::Size2M, PageFlags::empty().writable())
         .expect("2M map");
@@ -147,16 +146,16 @@ fn test_paging() {
     );
     logln!("[test-paging] 2M: translate -> {:#x}", pt2.translate(vaddr2m).unwrap().as_u64());
     logln!("[test-paging] 2M: unmap -> {:#x}", pt2.unmap(vaddr2m).unwrap().as_u64());
-    mm::deallocate_frame(arch::PhysFrame::containing_address(arch::PhysAddr::new(phys2m)));
+    mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(phys2m));
 
     // ---- 3. MemorySet 地址空间抽象（经 arch 抽象层）----
     let ms = mm::memory_set::MemorySet::<arch_x86_64::paging::X86PageTable>::new();
     let mut pt3 = arch_x86_64::paging::X86PageTable::new_empty().expect("no pt3 frame");
     // 分配 3 个物理帧，映射 3 个 4K 页
     let frames: [u64; 3] = [
-        mm::allocate_frame().expect("f1").start_address().as_u64(),
-        mm::allocate_frame().expect("f2").start_address().as_u64(),
-        mm::allocate_frame().expect("f3").start_address().as_u64(),
+        mm::allocate_frame().expect("f1").start_paddr(),
+        mm::allocate_frame().expect("f2").start_paddr(),
+        mm::allocate_frame().expect("f3").start_paddr(),
     ];
     let start = VirtAddr::new(0x0000_0000_6000_0000);
     let end = VirtAddr::new(0x0000_0000_6000_3000);
@@ -175,7 +174,7 @@ fn test_paging() {
         pt3.translate(VirtAddr::new(0x0000_0000_6000_1000)).unwrap().as_u64()
     );
     for f in frames {
-        mm::deallocate_frame(arch::PhysFrame::containing_address(arch::PhysAddr::new(f)));
+        mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(f));
     }
 
     logln!("[test-paging] PASS");

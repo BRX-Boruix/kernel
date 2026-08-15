@@ -11,7 +11,7 @@ use crate::frame_allocator;
 #[unsafe(no_mangle)]
 pub extern "C" fn mm_alloc_frame() -> u64 {
     match frame_allocator::allocate_frame() {
-        Some(f) => f.start_address().as_u64(),
+        Some(f) => f.start_paddr(),
         None => 0,
     }
 }
@@ -19,5 +19,5 @@ pub extern "C" fn mm_alloc_frame() -> u64 {
 /// 释放一个物理帧。FFI 安全。
 #[unsafe(no_mangle)]
 pub extern "C" fn mm_dealloc_frame(paddr: u64) {
-    frame_allocator::deallocate_frame(crate::PhysFrame::containing_address(crate::PhysAddr::new(paddr)));
+    frame_allocator::deallocate_frame(crate::PhysFrame::from_paddr_raw(paddr));
 }

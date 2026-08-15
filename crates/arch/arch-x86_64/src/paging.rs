@@ -85,9 +85,7 @@ impl X86PageTable {
 
     /// 把本页表切换为活动页表（写 CR3）。
     pub fn activate(&self) {
-        unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) self.pml4, options(nostack));
-        }
+        mmio::write_cr3(self.pml4);
     }
 
     /// 直接读一个虚拟地址处的 u64（物理页表页通过 HHDM 访问）。
