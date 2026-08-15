@@ -6,12 +6,14 @@
 //! CR3 页表，把指定物理地址以 2MB 大页映射到高半区虚拟地址，供访问
 //! LAPIC 等设备寄存器使用。
 
+use crate::diag;
+use crate::paging::level_indices;
 use crate::serial;
 
 /// 2MB 页大小。
 const PAGE_2M: u64 = 0x20_0000;
 
-/// 页表标志
+/// 页表标志（与 `paging` 模块保持一致）。
 const FLAG_PRESENT: u64 = 1 << 0;
 const FLAG_WRITABLE: u64 = 1 << 1;
 const FLAG_LARGE: u64 = 1 << 7;
@@ -44,10 +46,8 @@ pub fn map_lapic(phys_offset: u64, phys: u64, virt: u64) -> bool {
         return false;
     }
 
-    // x86-64 4 级分页索引
-    let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((virt >> 30) & 0x1FF) as usize;
-    let pd_idx = ((virt >> 21) & 0x1FF) as usize;
+    // x86-64 4 级分页索引（复用 `paging` 模块的统一计算）
+    let [pml4_idx, pdpt_idx, pd_idx, _] = level_indices(virt);
 
     // PML4 物理地址
     let pml4_phys = cr3() & !0xFFF;
@@ -58,7 +58,7 @@ pub fn map_lapic(phys_offset: u64, phys: u64, virt: u64) -> bool {
     // 若 PDPT 不存在，返回失败（本实现假定已存在）
     if pml4_entry & FLAG_PRESENT == 0 {
         serial::write_str("[mmio] pml4[");
-        write_dec(pml4_idx);
+        diag::write_dec(pml4_idx as u128);
         serial::write_str("] not present\r\n");
         return false;
     }
@@ -68,7 +68,7 @@ pub fn map_lapic(phys_offset: u64, phys: u64, virt: u64) -> bool {
 
     if pdpt_entry & FLAG_PRESENT == 0 {
         serial::write_str("[mmio] pdpt[");
-        write_dec(pdpt_idx);
+        diag::write_dec(pdpt_idx as u128);
         serial::write_str("] not present\r\n");
         return false;
     }
@@ -82,23 +82,4 @@ pub fn map_lapic(phys_offset: u64, phys: u64, virt: u64) -> bool {
     }
     invlpg(virt);
     true
-}
-
-/// 把十进制数写到串口（诊断用）。
-fn write_dec(mut val: usize) {
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    if val == 0 {
-        serial::write_byte(b'0');
-        return;
-    }
-    while val > 0 {
-        buf[i] = b'0' + (val % 10) as u8;
-        val /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        serial::write_byte(buf[i]);
-    }
 }

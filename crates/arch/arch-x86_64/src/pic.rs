@@ -4,6 +4,7 @@
 //! 尚未建立虚拟内存映射的阶段。将 IRQ0~15 重映射到 IDT 向量 32~47，
 //! 避免与 CPU 异常向量 0~31 冲突。
 
+use crate::port::{inb, outb};
 use crate::serial;
 
 // 8259 端口
@@ -68,32 +69,4 @@ pub fn init() {
     remap();
     set_mask(0xFFFF); // 默认屏蔽所有 IRQ
     serial::write_str("[pic] 8259 remapped to vectors 32-47\r\n");
-}
-
-// ---------- port I/O ----------
-
-#[inline]
-pub fn inb(port: u16) -> u8 {
-    let result: u8;
-    unsafe {
-        core::arch::asm!(
-            "in al, dx",
-            out("al") result,
-            in("dx") port,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    result
-}
-
-#[inline]
-pub fn outb(port: u16, byte: u8) {
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") port,
-            in("al") byte,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
 }

@@ -7,6 +7,7 @@
 
 use core::arch::global_asm;
 
+use crate::diag;
 use crate::serial;
 
 /// 内核代码段选择子（加载 IDT 描述符时使用）。
@@ -319,20 +320,20 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         serial::write_str("\r\n");
         // 打印关键信息
         serial::write_str("  vector: 0x");
-        write_hex_u64(vector);
+        diag::write_hex_u64(vector);
         serial::write_str("\r\n");
         serial::write_str("  rip:    0x");
-        write_hex_u64(frame.rip);
+        diag::write_hex_u64(frame.rip);
         serial::write_str("\r\n");
         if vector == 14 {
             // 页错误：打印 CR2
             let cr2: u64;
             unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2) };
             serial::write_str("  cr2:    0x");
-            write_hex_u64(cr2);
+            diag::write_hex_u64(cr2);
             serial::write_str("\r\n");
             serial::write_str("  error:  P=");
-            write_hex_u64(frame.error_code);
+            diag::write_hex_u64(frame.error_code);
             serial::write_str("\r\n");
         }
         serial::write_str("==================================\r\n");
@@ -347,19 +348,6 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             // 未注册的 IRQ：直接 EOI
             crate::pic::end_of_interrupt(irq);
         }
-    }
-}
-
-/// 把 u64 以十六进制写到串口。
-pub fn write_hex_u64(value: u64) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut buf = [0u8; 16];
-    for i in 0..16 {
-        let shift = (15 - i) * 4;
-        buf[i] = HEX[((value >> shift) & 0xF) as usize];
-    }
-    for &b in &buf {
-        serial::write_byte(b);
     }
 }
 

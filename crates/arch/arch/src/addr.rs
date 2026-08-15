@@ -15,61 +15,41 @@ pub struct PhysAddr(u64);
 #[repr(transparent)]
 pub struct VirtAddr(u64);
 
-impl PhysAddr {
-    /// 从 u64 构造物理地址。
-    pub const fn new(addr: u64) -> Self {
-        Self(addr)
-    }
+/// 为对称的新类型地址（如 `PhysAddr`/`VirtAddr`）生成公共方法。
+macro_rules! impl_newtype_addr {
+    ($ty:ident, $debug_name:literal) => {
+        impl $ty {
+            /// 从 u64 构造该地址。
+            pub const fn new(addr: u64) -> Self {
+                Self(addr)
+            }
 
-    /// 取出裸 u64 值。
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
+            /// 取出裸 u64 值。
+            pub const fn as_u64(self) -> u64 {
+                self.0
+            }
 
-    /// 以该地址为起始、恰好含一个 4KB 物理页。
-    pub const fn containing_page(self) -> Self {
-        Self(self.0 & !0xFFF)
-    }
+            /// 以该地址为起始、恰好含一个 4KB 页。
+            pub const fn containing_page(self) -> Self {
+                Self(self.0 & !0xFFF)
+            }
 
-    /// 是否 4KB 对齐。
-    pub const fn is_aligned_4k(self) -> bool {
-        self.0 & 0xFFF == 0
-    }
+            /// 是否 4KB 对齐。
+            pub const fn is_aligned_4k(self) -> bool {
+                self.0 & 0xFFF == 0
+            }
+        }
+
+        impl core::fmt::Debug for $ty {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, concat!($debug_name, "({:#x})"), self.0)
+            }
+        }
+    };
 }
 
-impl VirtAddr {
-    /// 从 u64 构造虚拟地址。
-    pub const fn new(addr: u64) -> Self {
-        Self(addr)
-    }
-
-    /// 取出裸 u64 值。
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-
-    /// 以该地址为起始、恰好含一个 4KB 虚拟页。
-    pub const fn containing_page(self) -> Self {
-        Self(self.0 & !0xFFF)
-    }
-
-    /// 是否 4KB 对齐。
-    pub const fn is_aligned_4k(self) -> bool {
-        self.0 & 0xFFF == 0
-    }
-}
-
-impl fmt::Debug for PhysAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PhysAddr({:#x})", self.0)
-    }
-}
-
-impl fmt::Debug for VirtAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "VirtAddr({:#x})", self.0)
-    }
-}
+impl_newtype_addr!(PhysAddr, "PhysAddr");
+impl_newtype_addr!(VirtAddr, "VirtAddr");
 
 /// 一个 4KB 物理页帧。
 ///

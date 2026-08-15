@@ -6,7 +6,7 @@
 //! 由于 `arch-x86_64` 不依赖 `mm`（避免循环），页表页的分配通过
 //! 启动时注入的函数指针完成。
 
-use arch::{PageFlags, PageSize, PhysAddr, VirtAddr};
+use arch::{phys_to_virt, PageFlags, PageSize, PhysAddr, VirtAddr};
 use spin::Once;
 
 // ---- 页表页分配注入 ----
@@ -15,13 +15,10 @@ use spin::Once;
 /// 返回 0 表示分配失败。由内核在早期注入（实际调用 `mm::allocate_frame`）。
 static FRAME_ALLOC: Once<extern "C" fn() -> u64> = Once::new();
 
-/// HHDM 偏移（物理 → 虚拟），用于访问物理页表页。
-static PHYS_OFFSET: Once<u64> = Once::new();
-
-/// 注入页表页分配与 HHDM 偏移。
+/// 注入页表页分配。HHDM 偏移由 `arch::hhdm::PHYS_OFFSET` 统一持有。
 pub fn init(alloc: extern "C" fn() -> u64, phys_offset: u64) {
     let _ = FRAME_ALLOC.call_once(|| alloc);
-    let _ = PHYS_OFFSET.call_once(|| phys_offset);
+    let _ = arch::PHYS_OFFSET.call_once(|| phys_offset);
 }
 
 /// 分配一个物理帧并返回其物理地址（0 表示失败）。
@@ -32,12 +29,6 @@ fn alloc_frame() -> Option<u64> {
     } else {
         Some(p)
     }
-}
-
-/// 物理地址 → 可访问的虚拟地址（HHDM）。
-#[inline]
-fn phys_to_virt(paddr: u64) -> u64 {
-    PHYS_OFFSET.get().copied().unwrap_or(0) + paddr
 }
 
 // ---- 页表标志 ----
@@ -226,7 +217,7 @@ impl arch::PageTable for X86PageTable {
 
 /// 计算 4 级页表索引。
 #[inline]
-fn level_indices(vaddr: u64) -> [usize; 4] {
+pub(crate) fn level_indices(vaddr: u64) -> [usize; 4] {
     [
         ((vaddr >> 39) & 0x1FF) as usize, // PML4
         ((vaddr >> 30) & 0x1FF) as usize, // PDPT

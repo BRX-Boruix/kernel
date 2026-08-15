@@ -4,12 +4,14 @@
 
 #![no_std]
 
+pub mod diag;
 pub mod gdt;
 pub mod interrupts;
 pub mod lapic;
 pub mod mmio;
 pub mod paging;
 pub mod pic;
+pub mod port;
 pub mod serial;
 pub mod smp;
 

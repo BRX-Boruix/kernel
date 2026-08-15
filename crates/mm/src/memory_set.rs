@@ -68,7 +68,7 @@ impl<PT: PageTable> MemorySet<PT> {
         flags: PageFlags,
         phys_frames: &[u64],
     ) -> Result<(), PT::Error> {
-        let page = page_size_bytes(size);
+        let page = size.bytes();
         let count = ((end.as_u64() - start.as_u64()) + page - 1) / page;
         debug_assert!(phys_frames.len() as u64 >= count, "not enough frames");
         let mut vaddr = start.as_u64();
@@ -84,14 +84,5 @@ impl<PT: PageTable> MemorySet<PT> {
     /// 当前已注册的区域（用于诊断）。
     pub fn areas(&self) -> usize {
         self.areas.lock().len()
-    }
-}
-
-/// 页大小对应的字节数。
-fn page_size_bytes(size: PageSize) -> u64 {
-    match size {
-        PageSize::Size4K => 0x1000,
-        PageSize::Size2M => 0x20_0000,
-        PageSize::Size1G => 0x4000_0000,
     }
 }

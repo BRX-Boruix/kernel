@@ -7,6 +7,7 @@
 //! 该物理地址不在 Limine 的 HHDM RAM 映射内，需先用 `mmio::map_lapic`
 //! 以 2MB 大页映射到高半区虚拟地址，再访问。
 
+use crate::diag;
 use crate::interrupts;
 use crate::mmio;
 use crate::serial;
@@ -89,7 +90,7 @@ pub fn init(phys_offset: u64, bus_freq: u64) {
         return;
     }
     serial::write_str("[lapic] mapped to ");
-    write_hex(LAPIC_VIRT);
+    diag::write_hex(LAPIC_VIRT);
     serial::write_str("\r\n");
 
     // 1. 使能 LAPIC（SVR，向量 0xFF）
@@ -114,18 +115,4 @@ pub fn init(phys_offset: u64, bus_freq: u64) {
     serial::set_lapic_ready();
 
     serial::write_str("[lapic] LAPIC timer initialized\r\n");
-}
-
-/// 以十六进制写 u64 到串口（诊断用）。
-fn write_hex(val: u64) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    serial::write_str("0x");
-    let mut buf = [0u8; 16];
-    for i in 0..16 {
-        let shift = (15 - i) * 4;
-        buf[i] = HEX[((val >> shift) & 0xF) as usize];
-    }
-    for &b in &buf {
-        serial::write_byte(b);
-    }
 }

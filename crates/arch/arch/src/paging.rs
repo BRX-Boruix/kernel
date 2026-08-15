@@ -16,6 +16,17 @@ pub enum PageSize {
     Size1G,
 }
 
+impl PageSize {
+    /// 该页大小对应的字节数。
+    pub const fn bytes(self) -> u64 {
+        match self {
+            PageSize::Size4K => 0x1000,
+            PageSize::Size2M => 0x20_0000,
+            PageSize::Size1G => 0x4000_0000,
+        }
+    }
+}
+
 /// 页权限标志。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PageFlags(u64);

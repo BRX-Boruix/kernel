@@ -8,6 +8,7 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::diag;
 use crate::gdt;
 use crate::lapic;
 use crate::serial;
@@ -35,104 +36,20 @@ static mut AP_KSTACKS: [[u8; AP_STACK_SIZE]; 8] = [[0; AP_STACK_SIZE]; 8];
 static mut AP_GDT: [gdt::Gdt; 8] = [const { gdt::Gdt::new() }; 8];
 static mut AP_TSS: [gdt::Tss; 8] = [const { gdt::Tss::new() }; 8];
 
-/// 把前缀 + 数字拼成一段字符串（栈缓冲区），并一次性 write_str 输出。
-///
-/// 避免多条 write_str 分次加锁导致日志交错。
+/// 输出"前缀 + 十进制数字 + \r\n"（单次串口写，避免多核交错）。
 fn klog_num(prefix: &str, val: u32) {
-    let mut buf = [0u8; 96];
-    let mut n = 0;
-    for &b in prefix.as_bytes() {
-        if n < buf.len() - 1 {
-            buf[n] = b;
-            n += 1;
-        }
-    }
-    // 十进制 val
-    let mut v = val;
-    let mut tmp = [0u8; 11];
-    let mut i = 0;
-    if v == 0 {
-        tmp[i] = b'0';
-        i += 1;
-    }
-    while v > 0 {
-        tmp[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        if n < buf.len() - 1 {
-            buf[n] = tmp[i];
-            n += 1;
-        }
-    }
-    for &b in b"\r\n" {
-        if n < buf.len() {
-            buf[n] = b;
-            n += 1;
-        }
-    }
-    let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
-    serial::write_str(s);
+    serial::write_str(prefix);
+    diag::write_dec(val as u128);
+    serial::write_str("\r\n");
 }
 
-/// 拼接两段"前缀+数字"并一次性输出（u32 + u64）。
+/// 输出"p1 + v1 + p2 + v2 + \r\n"（单次串口写）。
 fn klog_combined(p1: &str, v1: u32, p2: &str, v2: u64) {
-    let mut buf = [0u8; 128];
-    let mut n = 0;
-    let push = |b: u8, buf: &mut [u8; 128], n: &mut usize| {
-        if *n < buf.len() {
-            buf[*n] = b;
-            *n += 1;
-        }
-    };
-    // u32 十进制写入
-    let mut tmp1 = [0u8; 11];
-    let mut i1 = 0;
-    let mut v1 = v1;
-    if v1 == 0 {
-        tmp1[i1] = b'0';
-        i1 += 1;
-    }
-    while v1 > 0 {
-        tmp1[i1] = b'0' + (v1 % 10) as u8;
-        v1 /= 10;
-        i1 += 1;
-    }
-    // u64 十进制写入
-    let mut tmp2 = [0u8; 21];
-    let mut i2 = 0;
-    let mut v2 = v2;
-    if v2 == 0 {
-        tmp2[i2] = b'0';
-        i2 += 1;
-    }
-    while v2 > 0 {
-        tmp2[i2] = b'0' + (v2 % 10) as u8;
-        v2 /= 10;
-        i2 += 1;
-    }
-    // 输出 p1 + v1 + p2 + v2 + \r\n
-    for &b in p1.as_bytes() {
-        push(b, &mut buf, &mut n);
-    }
-    while i1 > 0 {
-        i1 -= 1;
-        push(tmp1[i1], &mut buf, &mut n);
-    }
-    for &b in p2.as_bytes() {
-        push(b, &mut buf, &mut n);
-    }
-    while i2 > 0 {
-        i2 -= 1;
-        push(tmp2[i2], &mut buf, &mut n);
-    }
-    for &b in b"\r\n" {
-        push(b, &mut buf, &mut n);
-    }
-    let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
-    serial::write_str(s);
+    serial::write_str(p1);
+    diag::write_dec(v1 as u128);
+    serial::write_str(p2);
+    diag::write_dec(v2 as u128);
+    serial::write_str("\r\n");
 }
 
 /// 获取当前已启动的 CPU 数。

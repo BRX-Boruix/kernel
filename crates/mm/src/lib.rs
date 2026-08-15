@@ -23,7 +23,6 @@ pub use frame_allocator::{
 };
 
 use limine::{HhdmRequest, MemmapRequest};
-use spin::Once;
 
 // Limine 请求。用 limine_tag 放入 .limine_reqs 段，确保 Limine 完整识别。
 #[limine::limine_tag]
@@ -32,7 +31,9 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new(0);
 static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new(0);
 
 /// HHDM 偏移（物理地址 → 虚拟地址的偏移），由 Limine 提供。
-pub static PHYS_OFFSET: Once<u64> = Once::new();
+///
+/// 实际存储于 `arch::hhdm`，这里 re-export 以兼容旧路径。
+pub use arch::PHYS_OFFSET;
 
 /// 初始化内存管理子系统。
 ///
@@ -40,7 +41,7 @@ pub static PHYS_OFFSET: Once<u64> = Once::new();
 pub fn init() {
     // 1. Get HHDM offset
     let phys_offset = if let Some(hhdm_resp) = HHDM_REQUEST.get_response().get() {
-        *PHYS_OFFSET.call_once(|| hhdm_resp.offset)
+        *arch::PHYS_OFFSET.call_once(|| hhdm_resp.offset)
     } else {
         panic!("Failed to get HHDM response from Limine");
     };
