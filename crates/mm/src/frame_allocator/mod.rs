@@ -1,6 +1,11 @@
 mod allocator_core;
+mod api;
+mod buddy;
 mod compact;
+mod init;
+mod percpu;
 mod percpu_cache;
+mod reserve;
 mod stats;
 
 use limine::{MemmapEntry, NonNullPtr};
