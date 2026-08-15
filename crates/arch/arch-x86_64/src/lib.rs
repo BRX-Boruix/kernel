@@ -11,6 +11,7 @@ pub mod mmio;
 pub mod paging;
 pub mod pic;
 pub mod serial;
+pub mod smp;
 
 use arch::Platform;
 

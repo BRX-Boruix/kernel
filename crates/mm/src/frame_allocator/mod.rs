@@ -22,11 +22,21 @@ static ALLOCATOR: LazyBuddyAllocator = LazyBuddyAllocator::new();
 static FREE_LISTS: Once<FreeListTable> = Once::new();
 static PER_CPU: PerCpuCacheSet = PerCpuCacheSet::new();
 
+/// 当前 CPU id 的读取器（函数指针，返回当前 LAPIC/CPU id）。
+/// 由 arch 层在 SMP 初始化时注入。单核时默认为 0。
+static CPU_ID_READER: spin::Once<fn() -> usize> = spin::Once::new();
+
+/// 注入当前 CPU id 的读取函数（由 SMP 子系统调用）。
+pub fn set_cpu_id_reader(f: fn() -> usize) {
+    let _ = CPU_ID_READER.call_once(|| f);
+}
+
 /// 获取当前 CPU id。
-///
-/// M0 阶段为单核，暂返回 0。多核/中断管理实现后再接入真实 CPU id。
-fn current_cpu_id() -> usize {
-    0
+pub(crate) fn current_cpu_id() -> usize {
+    match CPU_ID_READER.get() {
+        Some(f) => f(),
+        None => 0,
+    }
 }
 
 unsafe impl Send for LazyBuddyAllocator {}

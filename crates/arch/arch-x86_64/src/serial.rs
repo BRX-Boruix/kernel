@@ -69,3 +69,54 @@ pub fn write_str(s: &str) {
         write_byte(b);
     }
 }
+
+/// 写入一个 u32 的十进制表示到串口。
+pub fn write_dec_u32(mut val: u32) {
+    let mut buf = [0u8; 12];
+    let mut i = 0;
+    if val == 0 {
+        write_byte(b'0');
+        return;
+    }
+    while val > 0 {
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        write_byte(buf[i]);
+    }
+}
+
+/// 写入一个 u64 的十进制表示到串口。
+pub fn write_dec_u64(val: u64) {
+    // 用 u128 避免大数溢出，分高位/低位打印
+    if val > u64::from(u32::MAX) {
+        let hi = (val >> 32) as u32;
+        let lo = (val & 0xFFFF_FFFF) as u32;
+        let base: u128 = u128::from(hi) * 4294967296u128 + u128::from(lo);
+        write_dec_u128(base);
+    } else {
+        write_dec_u32(val as u32);
+    }
+}
+
+/// 写入 u128 十进制（辅助）。
+fn write_dec_u128(mut val: u128) {
+    let mut buf = [0u8; 40];
+    let mut i = 0;
+    if val == 0 {
+        write_byte(b'0');
+        return;
+    }
+    while val > 0 {
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        write_byte(buf[i]);
+    }
+}

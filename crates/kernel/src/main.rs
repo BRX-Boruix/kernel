@@ -24,6 +24,7 @@ static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new(0);
 /// 避免 Limine 提供的初始引导栈过小导致深调用（如 flanterm）溢出。
 const KMAIN_STACK_SIZE: usize = 1024 * 1024;
 
+
 /// 内核主栈（静态分配，位于 .bss）。
 static mut KMAIN_STACK: [u8; KMAIN_STACK_SIZE] = [0; KMAIN_STACK_SIZE];
 
@@ -98,6 +99,14 @@ unsafe fn kmain_body() -> ! {
 
     // 短暂等待验证时钟中断确实触发
     test_timer();
+
+    // 让 mm 的 per-CPU 缓存用真实的 LAPIC id 作为 CPU id
+    mm::frame_allocator::set_cpu_id_reader(|| arch_x86_64::lapic::current_lapic_id() as usize);
+
+    // 初始化多核 SMP：启动所有 AP
+    logln!("[kmain] initializing SMP");
+    arch_x86_64::smp::init();
+    logln!("[kmain] SMP done, {} cpus online", arch_x86_64::smp::cpu_count());
 
     logln!("[kmain] reached idle loop");
     CurrentArch::halt();

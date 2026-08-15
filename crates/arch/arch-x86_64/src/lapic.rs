@@ -32,8 +32,16 @@ const TIMER_PERIODIC: u32 = 0x0002_0000; // 周期性模式
 // 定时器向量（指向 IDT 中的一个中断向量）
 const TIMER_VECTOR: u32 = 0x20;
 
+/// LAPIC ID 寄存器偏移。
+const LAPIC_ID: usize = 0x20;
+
 /// 全局 tick 计数。
 static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// 读取当前 CPU 的 LAPIC ID（0~255）。
+pub fn current_lapic_id() -> u32 {
+    lapic_read(LAPIC_ID) >> 24
+}
 
 /// 当前已运行的 tick 数。
 pub fn ticks() -> u64 {

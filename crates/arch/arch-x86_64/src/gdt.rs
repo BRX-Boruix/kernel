@@ -3,6 +3,8 @@
 //! 手写实现，不依赖外部 crate：
 //! - GDT 含：空段、内核代码段(0x08)、内核数据段(0x10)、TSS 段(0x18)。
 //! - TSS 提供 ring3→ring0 切换时的内核栈（`rsp0`），为后续用户态/系统调用铺路。
+//!
+//! 为支持 SMP，每 CPU 拥有独立的 GDT/TSS/内核栈（`PerCpu` 里持有）。
 
 use core::arch::global_asm;
 
@@ -11,8 +13,8 @@ pub const KCODE: u16 = 0x08;
 pub const KDATA: u16 = 0x10;
 pub const TSS_SEL: u16 = 0x18;
 
-/// 内核栈大小（64KB），供 ring0 中断/异常与早期初始化使用。
-const KSTACK_SIZE: usize = 0x20000;
+/// 单 CPU 内核栈大小（64KB）。BSP 与各 AP 各持一份。
+pub const KSTACK_SIZE: usize = 0x10000;
 
 /// TSS 结构（x86-64，共 104 字节）。
 #[repr(C)]
@@ -30,7 +32,8 @@ pub struct Tss {
 }
 
 impl Tss {
-    const fn new() -> Self {
+    /// 新建一个全零 TSS。
+    pub const fn new() -> Self {
         Self {
             reserved1: 0,
             rsp: [0; 3],
@@ -52,13 +55,20 @@ pub struct Gdt {
 }
 
 impl Gdt {
-    const fn new() -> Self {
+    /// 新建 GDT，初始化内核代码/数据段。
+    pub const fn new() -> Self {
         let mut g = Self { entries: [0; 5] };
         // 内核代码段：present, DPL0, 可读可执行, 64 位 (L=1)
         g.entries[1] = 0x00_A0_9A_00_0000_FFFF;
         // 内核数据段：present, DPL0, 可读写, 展开向上
         g.entries[2] = 0x00_CF_92_00_0000_FFFF;
         g
+    }
+
+    /// 设置 TSS 段描述符（低/高 64 位），base 为 TSS 物理/虚拟地址。
+    pub fn set_tss(&mut self, base: u64) {
+        self.entries[3] = tss_low(base);
+        self.entries[4] = tss_high(base);
     }
 }
 
@@ -78,11 +88,14 @@ fn tss_high(base: u64) -> u64 {
     base >> 32
 }
 
-static mut GDT: Gdt = Gdt::new();
-static mut TSS: Tss = Tss::new();
-static mut KSTACK: [u8; KSTACK_SIZE] = [0; KSTACK_SIZE];
+/// GDTR 结构（lgdt 需要：16 位 limit + 64 位 base）。
+#[repr(C, packed)]
+pub struct Gdtr {
+    pub limit: u16,
+    pub base: u64,
+}
 
-// 加载 GDT 到 GDTR，并重新装载数据段与代码段。
+// 汇编入口（加载 GDT / 装载 TSS）。
 unsafe extern "C" {
     fn x86_64_load_gdt(gdtr: *const Gdtr);
     fn x86_64_load_tss();
@@ -116,31 +129,41 @@ global_asm!(
     ts = const TSS_SEL as usize,
 );
 
-/// GDTR 结构（lgdt 需要：16 位 limit + 64 位 base）。
-#[repr(C, packed)]
-struct Gdtr {
-    limit: u16,
-    base: u64,
-}
+/// BSP（引导核）使用的 GDT/TSS/内核栈。
+static mut BSP_GDT: Gdt = Gdt::new();
+static mut BSP_TSS: Tss = Tss::new();
+static mut BSP_KSTACK: [u8; KSTACK_SIZE] = [0; KSTACK_SIZE];
 
-/// 初始化 GDT 与 TSS。
+/// 初始化 BSP 的 GDT 与 TSS。
 ///
 /// 必须在允许使用全局静态变量的早期（堆初始化前即可）调用。
 pub fn init() {
     unsafe {
         // 配置 TSS.rsp0 = 内核栈顶，供 ring0 使用
-        let kstack_top = (&raw const KSTACK).cast::<u8>() as u64 + KSTACK_SIZE as u64;
-        TSS.rsp[0] = kstack_top;
+        let kstack_top = core::ptr::addr_of!(BSP_KSTACK) as u64 + KSTACK_SIZE as u64;
+        let tss_ptr = core::ptr::addr_of_mut!(BSP_TSS);
+        (*tss_ptr).rsp[0] = kstack_top;
 
-        let base = core::ptr::addr_of!(TSS) as u64;
-        GDT.entries[3] = tss_low(base);
-        GDT.entries[4] = tss_high(base);
+        let base = tss_ptr as u64;
+        let gdt_ptr = core::ptr::addr_of_mut!(BSP_GDT);
+        (*gdt_ptr).set_tss(base);
 
-        let gdtr = Gdtr {
-            limit: (core::mem::size_of::<Gdt>() - 1) as u16,
-            base: core::ptr::addr_of!(GDT) as u64,
-        };
+        load_and_reload(&*gdt_ptr);
+    }
+}
+
+/// 为当前 CPU 加载给定 GDT，并装载 TSS。
+///
+/// 供 BSP 初始化与 AP 启动时调用。`gdt` 需是有效的、含 TSS 段的 GDT。
+pub fn load_and_reload(gdt: &Gdt) {
+    let gdtr = Gdtr {
+        limit: (core::mem::size_of::<Gdt>() - 1) as u16,
+        base: core::ptr::addr_of!(*gdt) as u64,
+    };
+    unsafe {
         x86_64_load_gdt(&gdtr as *const Gdtr);
         x86_64_load_tss();
     }
 }
+
+

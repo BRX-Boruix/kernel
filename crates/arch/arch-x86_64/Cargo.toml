@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 arch = { path = "../arch" }
 spin = "0.9.8"
+limine = { version = "0.1", features = ["requests-section"] }
