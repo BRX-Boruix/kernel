@@ -8,7 +8,7 @@
 
 use arch::phys_to_virt;
 use crate::paging::{
-    flush_tlb, level_indices, ADDR_MASK, FLAG_LARGE, FLAG_PRESENT, FLAG_WRITABLE,
+    flush_tlb, index_at, page_levels, ADDR_MASK, FLAG_LARGE, FLAG_PRESENT, FLAG_WRITABLE,
 };
 
 /// 2MB 页大小。
@@ -80,9 +80,11 @@ fn descend(table_phys: u64, index: usize) -> Option<u64> {
 /// 使用当前 CR3 页表，建立 2MB 大页。
 ///
 /// 通过 `arch::phys_to_virt` 把页表所在的物理页换算为可访问虚拟地址。
-/// 若中间页表页不存在，会复用已存在的（假定 Limine 已建立 0xffff800000000000 处的
-/// PML4[510]/PDPT，映射正好落到同一 PDPT 下即可；LAPIC 虚拟地址选在 0xffff8000fee00000，
-/// 与 HHDM 同属 PML4 索引 510 的 PDPT，无需新分配 PDPT）。
+/// 若中间页表页不存在，会复用已存在的（假定 Limine 已建立高半区顶层页表，
+/// 映射正好落到同一目录下即可；LAPIC 虚拟地址选在 0xffff8000fee00000）。
+///
+/// 支持 LA57：层数由 `page_levels()` 动态决定，2MB 大页落在 PD 层
+/// （其层序号 = `levels - 2`），从而避免把 CR3 指向的顶层表误当 4 级用。
 pub fn map_lapic(phys: u64, virt: u64) -> bool {
     // 物理地址须 2MB 对齐
     if phys & (PAGE_2M - 1) != 0 || virt & (PAGE_2M - 1) != 0 {
@@ -90,23 +92,25 @@ pub fn map_lapic(phys: u64, virt: u64) -> bool {
         return false;
     }
 
-    // x86-64 4 级分页索引（复用 `paging` 模块的统一计算）
-    let [pml4_idx, pdpt_idx, pd_idx, _] = level_indices(virt);
+    let levels = page_levels();
+    // 2MB 大页所在层 = PD = 最低层往上一级 = levels - 2
+    let pd_level = levels - 2;
 
-    // 从当前 CR3 的 PML4 逐级下降至 PD（复用统一下降逻辑）
-    let pml4_phys = cr3() & !0xFFF;
-    let Some(pdpt_phys) = descend(pml4_phys, pml4_idx) else {
-        klib::logln!("[mmio] pml4[{}] not present", pml4_idx);
-        return false;
-    };
-    let Some(pd_phys) = descend(pdpt_phys, pdpt_idx) else {
-        klib::logln!("[mmio] pdpt[{}] not present", pdpt_idx);
-        return false;
-    };
+    // 从当前 CR3 的顶层逐级下降至 PD 层（复用统一下降逻辑）
+    let mut table_phys = cr3() & !0xFFF;
+    for lvl in 0..pd_level {
+        let idx = index_at(lvl, levels, virt);
+        let Some(next) = descend(table_phys, idx) else {
+            klib::logln!("[mmio] level {} index {} not present", lvl, idx);
+            return false;
+        };
+        table_phys = next;
+    }
 
     // 设置 2MB 大页条目：物理地址 + present + writable + large
+    let pd_idx = index_at(pd_level, levels, virt);
     let entry = (phys & !0x1F_FFFF) | FLAG_PRESENT | FLAG_WRITABLE | FLAG_LARGE;
-    unsafe { write_u64(phys_to_virt(pd_phys) + pd_idx as u64 * 8, entry) };
+    unsafe { write_u64(phys_to_virt(table_phys) + pd_idx as u64 * 8, entry) };
     flush_tlb(virt);
     true
 }

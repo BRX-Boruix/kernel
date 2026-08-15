@@ -3,6 +3,9 @@
 //! 实现 `arch::paging::PageTable`。x86-64 使用 4 级页表：
 //! PML4 → PDPT → PD → PT。支持 4KB / 2MB / 1GB 页。
 //!
+//! 支持 LA57（5 级分页）：启动时检测 `CR4.LA57` 位，动态选择 4 级或 5 级
+//! 页表，避免在 LA57 机器上把 CR3 指向的 PML5 误当 PML4 使用导致地址错位。
+//!
 //! 由于 `arch-x86_64` 不依赖 `mm`（避免循环），页表页的分配通过
 //! 启动时注入的函数指针完成。
 
@@ -57,28 +60,86 @@ fn entry_from_flags(flags: PageFlags, large: bool) -> u64 {
     e
 }
 
+// ---- LA57 / 页表层级数 ----
+
+/// 检测当前是否处于 LA57（5 级分页）模式。
+///
+/// 读 CR4 的 LA57 位（bit 12）。
+#[inline]
+fn la57_enabled() -> bool {
+    let cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 & (1 << 12) != 0
+}
+
+/// 当前页表层级数（4 = LA48，5 = LA57）。
+///
+/// 整个系统在同一时刻只会有一种分页模式，故用运行时函数即可，
+/// 无需在 `X86PageTable` 里存字段。
+#[inline]
+pub(crate) fn page_levels() -> usize {
+    if la57_enabled() {
+        5
+    } else {
+        4
+    }
+}
+
+/// 计算虚地址在 `levels` 级页表中第 `level` 层的索引。
+///
+/// `level` 从 0（最顶层，PML4 或 PML5）开始计数，最低层是 PT。
+///
+/// 各层占位域（LA48 为例）：
+/// - 顶层 PML4：位 39..48
+/// - PDPT：位 30..39
+/// - PD：位 21..30
+/// - PT：位 12..21
+///
+/// 通用公式：第 `level` 层的起始位 = `12 + (levels - 1 - level) * 9`。
+#[inline]
+pub(crate) fn index_at(level: usize, levels: usize, vaddr: u64) -> usize {
+    let bit = 12 + (levels - 1 - level) * 9;
+    ((vaddr >> bit) & 0x1FF) as usize
+}
+
+/// 从叶层表项解析物理地址（区分大页与 4KB 页）。
+///
+/// `leaf` 是该叶子所处的层级（从顶层 0 数起），`levels` 为页表层级数。
+/// 大页大小 = 2^(12 + (levels - 1 - leaf) * 9)。
+#[inline]
+fn entry_paddr(entry: u64, leaf: usize, levels: usize) -> u64 {
+    let shift = 12 + (levels - 1 - leaf) * 9;
+    entry & !((1u64 << shift) - 1)
+}
+
+// ---- 页表 ----
+
 /// x86-64 活动页表（持有 CR3 物理地址）。
+///
+/// 注意：`pml4` 字段在 LA57 下实际是最顶层（PML5），名字沿用以便兼容。
 pub struct X86PageTable {
-    /// PML4 的物理地址。
+    /// 最顶层页表的物理地址（LA48 为 PML4，LA57 为 PML5）。
     pml4: u64,
 }
 
 impl X86PageTable {
-    /// 创建一个空的页表：分配一个 PML4 页并清零。
+    /// 创建一个空的页表：分配一个顶层页并清零。
     pub fn new_empty() -> Option<Self> {
-        let pml4 = alloc_frame()?;
-        let pml4_virt = phys_to_virt(pml4) as *mut u64;
+        let top = alloc_frame()?;
+        let top_virt = phys_to_virt(top) as *mut u64;
         // 清零 512 项
-        unsafe { core::ptr::write_bytes(pml4_virt, 0, 512) };
-        Some(Self { pml4 })
+        unsafe { core::ptr::write_bytes(top_virt, 0, 512) };
+        Some(Self { pml4: top })
     }
 
-    /// 从 PML4 物理地址构造（用于包装当前活动页表）。
+    /// 从顶层页表物理地址构造（用于包装当前活动页表）。
     pub fn from_pml4(pml4: u64) -> Self {
         Self { pml4 }
     }
 
-    /// 获取 PML4 物理地址（= CR3 值）。
+    /// 获取顶层页表物理地址（= CR3 值）。
     pub fn pml4_paddr(&self) -> u64 {
         self.pml4
     }
@@ -98,36 +159,27 @@ impl X86PageTable {
         unsafe { mmio::write_u64(phys_to_virt(phys) as u64 + index as u64 * 8, val) }
     }
 
-    /// 沿虚地址从 PML4 逐级下降，返回路径上每层的表项与叶层索引。
+    /// 沿虚地址从顶层逐级下降，返回路径上每层的表项、叶层索引与层级数。
     ///
-    /// 叶层索引 `leaf`：`0..=2` 表示在对应层命中了 2MB/1GB 大页，`3` 表示 4KB 页。
+    /// `leaf` 是命中叶子所在的层（`0..=levels-1`）：非最低层命中代表大页。
     /// 若某层表项不存在（present=0）返回 `None`。
-    unsafe fn walk(&self, vaddr: u64) -> Option<([u64; 4], usize)> {
-        let indices = level_indices(vaddr);
+    unsafe fn walk(&self, vaddr: u64) -> Option<([u64; 5], usize, usize)> {
+        let levels = page_levels();
+        let mut entries = [0u64; 5];
         let mut table_phys = self.pml4;
-        let mut entries = [0u64; 4];
-        for lvl in 0..4 {
-            let entry = unsafe { self.table_at(table_phys, indices[lvl]) };
+        for lvl in 0..levels {
+            let entry = unsafe { self.table_at(table_phys, index_at(lvl, levels, vaddr)) };
             if entry & FLAG_PRESENT == 0 {
                 return None;
             }
             entries[lvl] = entry;
-            if lvl < 3 && entry & FLAG_LARGE != 0 {
-                return Some((entries, lvl));
+            // 除最低层外，命中大页即为叶子
+            if lvl + 1 < levels && entry & FLAG_LARGE != 0 {
+                return Some((entries, lvl, levels));
             }
             table_phys = entry & ADDR_MASK;
         }
-        Some((entries, 3))
-    }
-}
-
-/// 从叶层表项解析物理地址（区分 1GB/2MB 大页与 4KB 页）。
-#[inline]
-fn entry_paddr(entry: u64, leaf: usize) -> u64 {
-    match leaf {
-        1 => entry & !0x3F_FFFF_FFFF, // 1GB
-        2 => entry & !0x1F_FFFF,      // 2MB
-        _ => entry & ADDR_MASK,       // 4KB
+        Some((entries, levels - 1, levels))
     }
 }
 
@@ -135,25 +187,24 @@ impl arch::PageTable for X86PageTable {
     type Error = &'static str;
 
     fn map(&mut self, vaddr: VirtAddr, paddr: PhysAddr, size: PageSize, flags: PageFlags) -> Result<(), Self::Error> {
+        let levels = page_levels();
         let v = vaddr.as_u64();
         let p = paddr.as_u64();
-        let indices = level_indices(v);
+
+        // 页大小决定叶层（从顶层 0 数起）：
+        //   4K -> 最低层 (levels-1)
+        //   2M -> 低二层 (levels-2)
+        //   1G -> 低三层 (levels-3)
+        let leaf_level = match size {
+            PageSize::Size4K => levels - 1,
+            PageSize::Size2M => levels - 2,
+            PageSize::Size1G => levels - 3,
+        };
 
         // 逐级下降，必要时创建中间页表页。
         let mut table_phys = self.pml4;
-        // 页大小决定叶层：
-        //   4K -> 叶层索引 = 3（PT）；需要 3 个中间层（PML4/PDPT/PD）
-        //   2M -> 叶层索引 = 2（PD 大页）；需要 2 个中间层（PML4/PDPT）
-        //   1G -> 叶层索引 = 1（PDPT 大页）；需要 1 个中间层（PML4）
-        let leaf_level = match size {
-            PageSize::Size4K => 3,
-            PageSize::Size2M => 2,
-            PageSize::Size1G => 1,
-        };
-
-        // 创建中间层（lvl 0 .. leaf_level），每层分配子表并连接
         for lvl in 0..leaf_level {
-            let idx = indices[lvl];
+            let idx = index_at(lvl, levels, v);
             let entry = unsafe { self.table_at(table_phys, idx) };
             if entry & FLAG_PRESENT == 0 {
                 let new_child = alloc_frame().ok_or("no frame for page table")?;
@@ -169,14 +220,12 @@ impl arch::PageTable for X86PageTable {
         }
 
         // 在叶层写条目
-        let leaf_idx = indices[leaf_level];
-        let large = leaf_level < 3;
+        let leaf_idx = index_at(leaf_level, levels, v);
+        let large = leaf_level + 1 < levels; // 非最低层即大页
         let base = if large {
-            // 大页：低 21/30 位为页内偏移，需保留对齐
-            match size {
-                PageSize::Size1G => p & !0x3F_FFFF_FFFF,
-                _ => p & !0x1F_FFFF,
-            }
+            // 大页：按页大小对齐物理地址
+            let shift = 12 + (levels - 1 - leaf_level) * 9;
+            p & !((1u64 << shift) - 1)
         } else {
             p & !0xFFF
         };
@@ -187,34 +236,22 @@ impl arch::PageTable for X86PageTable {
 
     fn unmap(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, Self::Error> {
         let v = vaddr.as_u64();
-        let indices = level_indices(v);
-        let (entries, leaf) = unsafe { self.walk(v) }.ok_or("not mapped")?;
-        // 清掉叶层条目：父表 = 上一层的下一级表（PML4 层时为自身）
+        let (entries, leaf, levels) = unsafe { self.walk(v) }.ok_or("not mapped")?;
+        // 清掉叶层条目：父表 = 上一层的下一级表（顶层时为自身）
         let parent_phys = if leaf == 0 {
             self.pml4
         } else {
             entries[leaf - 1] & ADDR_MASK
         };
-        unsafe { self.table_set(parent_phys, indices[leaf], 0) };
+        unsafe { self.table_set(parent_phys, index_at(leaf, levels, v), 0) };
         flush_tlb(v);
-        Ok(PhysAddr::new(entry_paddr(entries[leaf], leaf)))
+        Ok(PhysAddr::new(entry_paddr(entries[leaf], leaf, levels)))
     }
 
     fn translate(&self, vaddr: VirtAddr) -> Option<PhysAddr> {
-        let (entries, leaf) = unsafe { self.walk(vaddr.as_u64()) }?;
-        Some(PhysAddr::new(entry_paddr(entries[leaf], leaf)))
+        let (entries, leaf, levels) = unsafe { self.walk(vaddr.as_u64()) }?;
+        Some(PhysAddr::new(entry_paddr(entries[leaf], leaf, levels)))
     }
-}
-
-/// 计算 4 级页表索引。
-#[inline]
-pub(crate) fn level_indices(vaddr: u64) -> [usize; 4] {
-    [
-        ((vaddr >> 39) & 0x1FF) as usize, // PML4
-        ((vaddr >> 30) & 0x1FF) as usize, // PDPT
-        ((vaddr >> 21) & 0x1FF) as usize, // PD
-        ((vaddr >> 12) & 0x1FF) as usize, // PT
-    ]
 }
 
 /// 刷新 TLB 中一个虚拟地址。
