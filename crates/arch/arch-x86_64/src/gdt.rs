@@ -16,6 +16,20 @@ pub const TSS_SEL: u16 = 0x18;
 /// 单 CPU 内核栈大小（64KB）。BSP 与各 AP 各持一份。
 pub const KSTACK_SIZE: usize = 0x10000;
 
+/// Double Fault 专用中断栈大小（16KB）。
+///
+/// 当 CPU 在异常处理中再次触发异常（例如内核栈溢出导致保护错误）时，
+/// 会触发 Double Fault。若无独立 IST 栈，Double Fault 会再次异常 →
+/// Triple Fault，机器直接重启且无诊断输出。独立 IST 栈可容纳 Double Fault
+/// 处理器打印错误并安全停机。
+pub const DF_STACK_SIZE: usize = 16 * 1024;
+
+/// Double Fault 使用的 IST 索引。
+///
+/// x86-64 TSS 的 IST 数组索引 0 表示"不使用 IST"，故有效索引从 1 开始。
+/// 这里用 1 作为 Double Fault 的 IST 槽位。
+pub const IST_DF: usize = 1;
+
 /// TSS 结构（x86-64，共 104 字节）。
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -42,6 +56,13 @@ impl Tss {
             reserved3: 0,
             reserved4: 0,
             iomap_base: 0,
+        }
+    }
+
+    /// 设置第 `index` 个 IST 栈顶指针（index 有效范围 1..=6，0 表示不使用）。
+    pub fn set_ist(&mut self, index: usize, addr: u64) {
+        if index >= 1 && index <= 6 {
+            self.ist[index] = addr;
         }
     }
 }
@@ -133,6 +154,8 @@ global_asm!(
 static mut BSP_GDT: Gdt = Gdt::new();
 static mut BSP_TSS: Tss = Tss::new();
 static mut BSP_KSTACK: [u8; KSTACK_SIZE] = [0; KSTACK_SIZE];
+/// BSP 的 Double Fault 中断栈。
+static mut BSP_DF_STACK: [u8; DF_STACK_SIZE] = [0; DF_STACK_SIZE];
 
 /// 计算内核栈顶地址：栈起始地址 + 字节长度。
 #[inline]
@@ -142,10 +165,13 @@ pub fn stack_top(addr: *const u8, len: usize) -> u64 {
 
 /// 为某个 CPU 配置并加载其 GDT/TSS。
 ///
-/// `gdt` 与 `tss` 指向该 CPU 的 GDT/TSS，`kstack_top` 为该 CPU 的内核栈顶（写入 TSS.rsp0）。
-pub fn setup_cpu(gdt: *mut Gdt, tss: *mut Tss, kstack_top: u64) {
+/// `gdt` 与 `tss` 指向该 CPU 的 GDT/TSS，`kstack_top` 为该 CPU 的内核栈顶
+/// （写入 TSS.rsp0），`df_stack_top` 为该 CPU 的 Double Fault 中断栈顶
+/// （写入 TSS.IST[IST_DF]）。
+pub fn setup_cpu(gdt: *mut Gdt, tss: *mut Tss, kstack_top: u64, df_stack_top: u64) {
     unsafe {
         (*tss).rsp[0] = kstack_top;
+        (*tss).set_ist(IST_DF, df_stack_top);
         let base = tss as u64;
         (*gdt).set_tss(base);
         load_and_reload(&*gdt);
@@ -157,9 +183,10 @@ pub fn setup_cpu(gdt: *mut Gdt, tss: *mut Tss, kstack_top: u64) {
 /// 必须在允许使用全局静态变量的早期（堆初始化前即可）调用。
 pub fn init() {
     let kstack_top = stack_top(core::ptr::addr_of!(BSP_KSTACK) as *const u8, KSTACK_SIZE);
+    let df_stack_top = stack_top(core::ptr::addr_of!(BSP_DF_STACK) as *const u8, DF_STACK_SIZE);
     let gdt_ptr = core::ptr::addr_of_mut!(BSP_GDT);
     let tss_ptr = core::ptr::addr_of_mut!(BSP_TSS);
-    setup_cpu(gdt_ptr, tss_ptr, kstack_top);
+    setup_cpu(gdt_ptr, tss_ptr, kstack_top, df_stack_top);
 }
 
 /// 为当前 CPU 加载给定 GDT，并装载 TSS。

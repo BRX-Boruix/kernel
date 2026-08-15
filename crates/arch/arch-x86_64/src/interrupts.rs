@@ -8,7 +8,7 @@
 use core::arch::global_asm;
 
 /// 内核代码段选择子（加载 IDT 描述符时使用）。
-use crate::gdt::KCODE;
+use crate::gdt::{IST_DF, KCODE};
 
 // ---------- IDT 结构 ----------
 
@@ -38,13 +38,13 @@ impl IdtEntry {
         }
     }
 
-    fn set_handler(&mut self, handler: u64, flags: u8) {
+    fn set_handler(&mut self, handler: u64, flags: u8, ist: u8) {
         self.offset_low = (handler & 0xFFFF) as u16;
         self.offset_mid = ((handler >> 16) & 0xFFFF) as u16;
         self.offset_high = (handler >> 32) as u32;
         self.selector = KCODE;
         self.flags = flags;
-        self.ist = 0;
+        self.ist = ist;
     }
 }
 
@@ -321,6 +321,11 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             klib::logln!("  cr2:    {:#x}", cr2);
             klib::logln!("  error:  P={:#x}", frame.error_code);
         }
+        if vector == 8 {
+            // Double Fault：打印错误码（0 表示外部中断/软件引起的 DF）
+            klib::logln!("  error:  {:#x}", frame.error_code);
+            klib::logln!("  (Double Fault - possible kernel stack overflow)");
+        }
         klib::logln!("==================================");
         crate::halt_forever();
     } else {
@@ -346,15 +351,17 @@ pub fn init() {
     unsafe {
         let idt_ptr = &raw mut IDT as *mut Idt;
 
-        // 0~31：异常，陷阱门
+        // 0~31：异常，陷阱门。vector 8（Double Fault）使用独立 IST 栈，
+        // 避免异常处理中再次异常导致 Triple Fault 重启。其余不用 IST（0）。
         for vector in 0..32u16 {
             let handler = get_isr_addr(vector);
-            (*idt_ptr).entries[vector as usize].set_handler(handler, IDT_FLAG_TRAP);
+            let ist = if vector == 8 { IST_DF as u8 } else { 0 };
+            (*idt_ptr).entries[vector as usize].set_handler(handler, IDT_FLAG_TRAP, ist);
         }
-        // 32~47：外部中断，中断门
+        // 32~47：外部中断，中断门（不用 IST）
         for vector in 32..48u16 {
             let handler = get_isr_addr(vector);
-            (*idt_ptr).entries[vector as usize].set_handler(handler, IDT_FLAG_INTERRUPT);
+            (*idt_ptr).entries[vector as usize].set_handler(handler, IDT_FLAG_INTERRUPT, 0);
         }
 
         let idtr = Idtr {

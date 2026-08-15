@@ -36,6 +36,10 @@ const MAX_AP_SLOTS: usize = 64;
 /// 每个 CPU 一个内核栈（AP 用）。BSP 用自己的静态栈。
 static mut AP_KSTACKS: [[u8; AP_STACK_SIZE]; MAX_AP_SLOTS] = [[0; AP_STACK_SIZE]; MAX_AP_SLOTS];
 
+/// 每个 CPU 一个 Double Fault 中断栈（AP 用）。
+static mut AP_DF_STACKS: [[u8; gdt::DF_STACK_SIZE]; MAX_AP_SLOTS] =
+    [[0; gdt::DF_STACK_SIZE]; MAX_AP_SLOTS];
+
 /// 每个 CPU 一个 GDT/TSS。
 static mut AP_GDT: [gdt::Gdt; MAX_AP_SLOTS] = [const { gdt::Gdt::new() }; MAX_AP_SLOTS];
 static mut AP_TSS: [gdt::Tss; MAX_AP_SLOTS] = [const { gdt::Tss::new() }; MAX_AP_SLOTS];
@@ -76,15 +80,16 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
     // 取出本 CPU 的 LAPIC id（仅用于日志）
     let lapic_id = lapic::current_lapic_id();
 
-    // 配置并加载本 CPU 的 GDT/TSS（每 CPU 独立内核栈）
-    let (kstack_top, gdt_ptr, tss_ptr) = unsafe {
+    // 配置并加载本 CPU 的 GDT/TSS（每 CPU 独立内核栈 + Double Fault 栈）
+    let (kstack_top, df_stack_top, gdt_ptr, tss_ptr) = unsafe {
         (
             gdt::stack_top(core::ptr::addr_of!(AP_KSTACKS[idx]) as *const u8, AP_STACK_SIZE),
+            gdt::stack_top(core::ptr::addr_of!(AP_DF_STACKS[idx]) as *const u8, gdt::DF_STACK_SIZE),
             core::ptr::addr_of_mut!(AP_GDT[idx]),
             core::ptr::addr_of_mut!(AP_TSS[idx]),
         )
     };
-    gdt::setup_cpu(gdt_ptr, tss_ptr, kstack_top);
+    gdt::setup_cpu(gdt_ptr, tss_ptr, kstack_top, df_stack_top);
 
     // 开启中断
     crate::interrupts::enable();
