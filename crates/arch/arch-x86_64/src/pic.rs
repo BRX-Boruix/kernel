@@ -5,7 +5,6 @@
 //! 避免与 CPU 异常向量 0~31 冲突。
 
 use crate::port::{inb, outb};
-use crate::serial;
 
 // 8259 端口
 const PIC1_COMMAND: u16 = 0x20;
@@ -68,5 +67,5 @@ pub fn end_of_interrupt(irq: u8) {
 pub fn init() {
     remap();
     set_mask(0xFFFF); // 默认屏蔽所有 IRQ
-    serial::write_str("[pic] 8259 remapped to vectors 32-47\r\n");
+    klib::logln!("[pic] 8259 remapped to vectors 32-47");
 }

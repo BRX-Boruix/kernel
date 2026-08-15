@@ -7,11 +7,9 @@
 //! LAPIC 等设备寄存器使用。
 
 use arch::phys_to_virt;
-use crate::diag;
 use crate::paging::{
     flush_tlb, level_indices, ADDR_MASK, FLAG_LARGE, FLAG_PRESENT, FLAG_WRITABLE,
 };
-use crate::serial;
 
 /// 2MB 页大小。
 const PAGE_2M: u64 = 0x20_0000;
@@ -88,7 +86,7 @@ fn descend(table_phys: u64, index: usize) -> Option<u64> {
 pub fn map_lapic(phys: u64, virt: u64) -> bool {
     // 物理地址须 2MB 对齐
     if phys & (PAGE_2M - 1) != 0 || virt & (PAGE_2M - 1) != 0 {
-        serial::write_str("[mmio] unaligned map\r\n");
+        klib::logln!("[mmio] unaligned map");
         return false;
     }
 
@@ -98,15 +96,11 @@ pub fn map_lapic(phys: u64, virt: u64) -> bool {
     // 从当前 CR3 的 PML4 逐级下降至 PD（复用统一下降逻辑）
     let pml4_phys = cr3() & !0xFFF;
     let Some(pdpt_phys) = descend(pml4_phys, pml4_idx) else {
-        serial::write_str("[mmio] pml4[");
-        diag::write_dec(pml4_idx as u128);
-        serial::write_str("] not present\r\n");
+        klib::logln!("[mmio] pml4[{}] not present", pml4_idx);
         return false;
     };
     let Some(pd_phys) = descend(pdpt_phys, pdpt_idx) else {
-        serial::write_str("[mmio] pdpt[");
-        diag::write_dec(pdpt_idx as u128);
-        serial::write_str("] not present\r\n");
+        klib::logln!("[mmio] pdpt[{}] not present", pdpt_idx);
         return false;
     };
 

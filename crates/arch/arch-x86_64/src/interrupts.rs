@@ -7,9 +7,6 @@
 
 use core::arch::global_asm;
 
-use crate::diag;
-use crate::serial;
-
 /// 内核代码段选择子（加载 IDT 描述符时使用）。
 use crate::gdt::KCODE;
 
@@ -313,29 +310,18 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         // CPU 异常：打印并停机
         // 先关中断，避免嵌套
         disable();
-        serial::write_str("\r\n");
-        serial::write_str("========== CPU EXCEPTION ==========\r\n");
-        serial::write_str("exception: ");
-        serial::write_str(exception_name(vector as u8));
-        serial::write_str("\r\n");
-        // 打印关键信息
-        serial::write_str("  vector: 0x");
-        diag::write_hex_u64(vector);
-        serial::write_str("\r\n");
-        serial::write_str("  rip:    0x");
-        diag::write_hex_u64(frame.rip);
-        serial::write_str("\r\n");
+        klib::logln!("");
+        klib::logln!("========== CPU EXCEPTION ==========");
+        klib::logln!("exception: {}", exception_name(vector as u8));
+        klib::logln!("  vector: {:#x}", vector);
+        klib::logln!("  rip:    {:#x}", frame.rip);
         if vector == 14 {
             // 页错误：打印 CR2
             let cr2 = crate::mmio::cr2();
-            serial::write_str("  cr2:    0x");
-            diag::write_hex_u64(cr2);
-            serial::write_str("\r\n");
-            serial::write_str("  error:  P=");
-            diag::write_hex_u64(frame.error_code);
-            serial::write_str("\r\n");
+            klib::logln!("  cr2:    {:#x}", cr2);
+            klib::logln!("  error:  P={:#x}", frame.error_code);
         }
-        serial::write_str("==================================\r\n");
+        klib::logln!("==================================");
         crate::halt_forever();
     } else {
         // 外部中断（32..47 → IRQ0..15）

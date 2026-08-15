@@ -77,7 +77,7 @@ fn end_of_interrupt() {
 extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
     let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if t <= 5 {
-        serial::write_str("[lapic] tick\r\n");
+        klib::logln!("[lapic] tick");
     }
     end_of_interrupt();
     true
@@ -89,7 +89,7 @@ extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
 pub fn init(bus_freq: u64) {
     // 0. 把 LAPIC 物理地址映射到高半区虚拟地址
     if !mmio::map_lapic(LAPIC_PHYS, LAPIC_VIRT) {
-        serial::write_str("[lapic] map failed\r\n");
+        klib::logln!("[lapic] map failed");
         return;
     }
     klib::log_hex!("[lapic] mapped to ", LAPIC_VIRT);
@@ -114,5 +114,5 @@ pub fn init(bus_freq: u64) {
     // 标记 LAPIC 已可用（串口锁依赖 LAPIC id 做多核 owner 判断）
     serial::set_lapic_ready();
 
-    serial::write_str("[lapic] LAPIC timer initialized\r\n");
+    klib::logln!("[lapic] LAPIC timer initialized");
 }

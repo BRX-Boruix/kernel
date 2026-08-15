@@ -8,10 +8,8 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::diag;
 use crate::gdt;
 use crate::lapic;
-use crate::serial;
 use limine::SmpRequest;
 
 /// 请求 Limine 启动 AP。
@@ -36,13 +34,9 @@ static mut AP_KSTACKS: [[u8; AP_STACK_SIZE]; 8] = [[0; AP_STACK_SIZE]; 8];
 static mut AP_GDT: [gdt::Gdt; 8] = [const { gdt::Gdt::new() }; 8];
 static mut AP_TSS: [gdt::Tss; 8] = [const { gdt::Tss::new() }; 8];
 
-/// 输出"p1 + v1 + p2 + v2 + \r\n"（单次串口写）。
+/// 输出"p1 + v1 + p2 + v2"（单次串口写）。
 fn klog_combined(p1: &str, v1: u32, p2: &str, v2: u64) {
-    serial::write_str(p1);
-    diag::write_dec(v1 as u128);
-    serial::write_str(p2);
-    diag::write_dec(v2 as u128);
-    serial::write_str("\r\n");
+    klib::logln!("{}{}{}{}", p1, v1, p2, v2);
 }
 
 /// 获取当前已启动的 CPU 数。
@@ -96,7 +90,7 @@ extern "C" fn ap_entry(_info: *const limine::SmpInfo) -> ! {
 pub fn init() {
     // 获取 SMP 响应
     let Some(resp) = SMP_REQUEST.get_response().get() else {
-        serial::write_str("[smp] no SMP response\r\n");
+        klib::logln!("[smp] no SMP response");
         return;
     };
 

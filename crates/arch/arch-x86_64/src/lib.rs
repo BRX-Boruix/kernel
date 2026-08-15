@@ -4,7 +4,6 @@
 
 #![no_std]
 
-pub mod diag;
 pub mod gdt;
 pub mod interrupts;
 pub mod lapic;
