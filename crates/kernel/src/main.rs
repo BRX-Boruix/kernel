@@ -216,7 +216,8 @@ fn test_timer() {
     let mut rounds: u32 = 0;
     // sti+hlt 等待硬件 LAPIC 定时器中断唤醒。
     while arch_x86_64::lapic::ticks().wrapping_sub(start) < 20 {
-        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+        arch_x86_64::interrupts::enable();
+        arch_x86_64::interrupts::halt();
         rounds += 1;
         if rounds % 50 == 0 {
             logln!("[timer] ... rounds={} ticks={}", rounds, arch_x86_64::lapic::ticks());

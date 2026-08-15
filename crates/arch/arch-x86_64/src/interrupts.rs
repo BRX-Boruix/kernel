@@ -312,7 +312,7 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
     if vector < 32 {
         // CPU 异常：打印并停机
         // 先关中断，避免嵌套
-        unsafe { core::arch::asm!("cli") };
+        disable();
         serial::write_str("\r\n");
         serial::write_str("========== CPU EXCEPTION ==========\r\n");
         serial::write_str("exception: ");
@@ -455,4 +455,18 @@ pub fn enable() {
 /// 禁用中断。
 pub fn disable() {
     unsafe { core::arch::asm!("cli") };
+}
+
+/// CPU 停机（执行一条 `hlt`）。
+#[inline]
+pub fn halt() {
+    unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+}
+
+/// 永久停机：关中断后循环 `hlt`，永不返回。
+pub fn halt_forever() -> ! {
+    loop {
+        disable();
+        halt();
+    }
 }

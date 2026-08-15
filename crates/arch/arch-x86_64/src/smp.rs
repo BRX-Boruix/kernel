@@ -73,16 +73,14 @@ extern "C" fn ap_entry(_info: *const limine::SmpInfo) -> ! {
     let idx = lapic_id as usize % 8;
 
     // 配置并加载本 CPU 的 GDT/TSS（每 CPU 独立内核栈）
-    unsafe {
-        let kstack_top =
-            core::ptr::addr_of!(AP_KSTACKS[idx]) as u64 + AP_STACK_SIZE as u64;
-        let tss_ptr = core::ptr::addr_of_mut!(AP_TSS[idx]);
-        (*tss_ptr).rsp[0] = kstack_top;
-        let tss_base = tss_ptr as u64;
-        let gdt_ptr = core::ptr::addr_of_mut!(AP_GDT[idx]);
-        (*gdt_ptr).set_tss(tss_base);
-        gdt::load_and_reload(&*gdt_ptr);
-    }
+    let (kstack_top, gdt_ptr, tss_ptr) = unsafe {
+        (
+            core::ptr::addr_of!(AP_KSTACKS[idx]) as u64 + AP_STACK_SIZE as u64,
+            core::ptr::addr_of_mut!(AP_GDT[idx]),
+            core::ptr::addr_of_mut!(AP_TSS[idx]),
+        )
+    };
+    gdt::setup_cpu(gdt_ptr, tss_ptr, kstack_top);
 
     // 开启中断
     crate::interrupts::enable();
@@ -95,7 +93,7 @@ extern "C" fn ap_entry(_info: *const limine::SmpInfo) -> ! {
 
     // AP 空闲循环
     loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+        crate::interrupts::halt();
     }
 }
 

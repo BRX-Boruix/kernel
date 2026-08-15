@@ -82,12 +82,17 @@ pub fn init() {
     outb(COM1 + 4, 0x0B); // IRQ 使能，RTS/DSR
 }
 
+/// 等待发送保持寄存器空（LSR bit 5），随后写一个字节。
+#[inline]
+fn putc_wait(byte: u8) {
+    while inb(COM1 + 5) & 0x20 == 0 {}
+    outb(COM1, byte);
+}
+
 /// 发送单个字节（带锁）。
 pub fn write_byte(byte: u8) {
     LOCK.acquire();
-    // 等待发送保持寄存器空（LSR bit 5）
-    while inb(COM1 + 5) & 0x20 == 0 {}
-    outb(COM1, byte);
+    putc_wait(byte);
     LOCK.release();
 }
 
@@ -106,13 +111,9 @@ pub fn write_str(s: &str) {
     LOCK.acquire();
     for &b in s.as_bytes() {
         if b == b'\n' {
-            // 等待发送保持寄存器空
-            while inb(COM1 + 5) & 0x20 == 0 {}
-            outb(COM1, b'\r');
+            putc_wait(b'\r');
         }
-        // 等待发送保持寄存器空
-        while inb(COM1 + 5) & 0x20 == 0 {}
-        outb(COM1, b);
+        putc_wait(b);
     }
     LOCK.release();
 }

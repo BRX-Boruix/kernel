@@ -52,16 +52,14 @@ pub fn ticks() -> u64 {
 /// 读取 LAPIC 寄存器（基于映射后的虚拟地址）。
 #[inline]
 fn lapic_read(reg: usize) -> u32 {
-    let addr = (LAPIC_VIRT + reg as u64) as *const u32;
     // LAPIC 必须 16 字节对齐访问
-    unsafe { core::ptr::read_volatile(addr) }
+    unsafe { mmio::read_u32(LAPIC_VIRT + reg as u64) }
 }
 
 /// 写入 LAPIC 寄存器。
 #[inline]
 fn lapic_write(reg: usize, val: u32) {
-    let addr = (LAPIC_VIRT + reg as u64) as *mut u32;
-    unsafe { core::ptr::write_volatile(addr, val) };
+    unsafe { mmio::write_u32(LAPIC_VIRT + reg as u64, val) };
 }
 
 /// 发送 EOI 给 LAPIC。

@@ -78,6 +78,18 @@ fn set_flag(flags: &mut u8, mask: u8, on: bool) {
     }
 }
 
+/// 遍历所有全局空闲链表（每个 order/shard），对已加锁的 `FreeList` 调用 `f(order, shard, &mut list)`。
+pub(crate) fn for_each_global_list(mut f: impl FnMut(usize, usize, &mut FreeList)) {
+    if let Some(lists) = FREE_LISTS.get() {
+        for order in 0..MAX_ORDER {
+            for shard in 0..SHARD_COUNT {
+                let mut list = lists.orders[order].shards[shard].lock();
+                f(order, shard, &mut list);
+            }
+        }
+    }
+}
+
 /// Represents a region of physical memory that hasn't been initialized into the buddy system yet
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UninitRegion {
@@ -203,6 +215,31 @@ impl LazyBuddyAllocator {
 
         &mut *cache.block_ptr.add(offset)
     }}
+
+    /// 把一个帧标记为已分配，并脱离所有链表（复位 next/prev/order/migratable）。
+    #[inline]
+    unsafe fn reset_frame(&self, pfn: usize, order: u8) {
+        unsafe {
+            self.reset_frame_with(self.get_frame(pfn), order);
+        }
+    }
+
+    /// 复位给定的 `frame` 元数据（调用方已持有帧引用）。
+    #[inline]
+    unsafe fn reset_frame_with(&self, frame: &'static mut BuddyFrame, order: u8) {
+        frame.order = order;
+        frame.state = FrameState::Allocated;
+        set_flag(&mut frame.flags, BF_MIGRATABLE, true);
+        frame.next = None;
+        frame.prev = None;
+    }
+
+    /// 取得某 order 下指定 shard 的全局链表锁，并计入一次全局链表操作。
+    fn lock_global_list(&self, order: usize, shard: usize) -> spin::MutexGuard<'_, FreeList> {
+        let lists = FREE_LISTS.get().expect("PMM free lists not initialized");
+        self.global_list_ops.fetch_add(1, Ordering::Relaxed);
+        lists.orders[order].shards[shard].lock()
+    }
 
     // Helper to find contiguous memory for metadata structures (O(N))
     fn find_metadata_storage(
@@ -571,20 +608,14 @@ impl LazyBuddyAllocator {
     }
 
     fn pop_from_global(&self, order: usize, cpu: usize) -> Option<usize> {
-        let lists = FREE_LISTS.get().expect("PMM free lists not initialized");
         let start = Self::shard_for_cpu(cpu);
         for offset in 0..SHARD_COUNT {
             let shard = (start + offset) % SHARD_COUNT;
-            let mut list = lists.orders[order].shards[shard].lock();
-            self.global_list_ops.fetch_add(1, Ordering::Relaxed);
+            let mut list = self.lock_global_list(order, shard);
             if let Some(idx) = list.head {
                 unsafe {
                     self.remove_from_list_with_list(idx, order, &mut *list);
-                    let frame = self.get_frame(idx);
-                    frame.state = FrameState::Allocated;
-                    set_flag(&mut frame.flags, BF_MIGRATABLE, true);
-                    frame.next = None;
-                    frame.prev = None;
+                    self.reset_frame(idx, order as u8);
                 }
                 return Some(idx);
             }
@@ -593,10 +624,8 @@ impl LazyBuddyAllocator {
     }
 
     fn push_to_global(&self, pfn: usize, order: usize) {
-        let lists = FREE_LISTS.get().expect("PMM free lists not initialized");
         let shard = Self::shard_for_pfn(pfn);
-        let mut list = lists.orders[order].shards[shard].lock();
-        self.global_list_ops.fetch_add(1, Ordering::Relaxed);
+        let mut list = self.lock_global_list(order, shard);
         unsafe {
             let frame = self.get_frame(pfn);
             frame.order = order as u8;
@@ -651,20 +680,10 @@ impl LazyBuddyAllocator {
                 unsafe {
                     for j in (order..higher).rev() {
                         let buddy_idx = idx + (1 << j);
-                        let buddy = self.get_frame(buddy_idx);
-                        buddy.order = j as u8;
-                        buddy.state = FrameState::Allocated;
-                        set_flag(&mut buddy.flags, BF_MIGRATABLE, true);
-                        buddy.next = None;
-                        buddy.prev = None;
+                        self.reset_frame(buddy_idx, j as u8);
                         self.push_to_global(buddy_idx, j);
                     }
-                    let target = self.get_frame(idx);
-                    target.order = order as u8;
-                    target.state = FrameState::Allocated;
-                    set_flag(&mut target.flags, BF_MIGRATABLE, true);
-                    target.next = None;
-                    target.prev = None;
+                    self.reset_frame(idx, order as u8);
                 }
                 return Some(idx);
             }
@@ -702,11 +721,7 @@ impl LazyBuddyAllocator {
                             unsafe {
                                 let mut cache = MetadataCache::new();
                                 let frame = self.get_frame_with_cache(cursor, &mut cache);
-                                frame.order = order_gap as u8;
-                                frame.state = FrameState::Allocated;
-                                set_flag(&mut frame.flags, BF_MIGRATABLE, true);
-                                frame.next = None;
-                                frame.prev = None;
+                                self.reset_frame_with(frame, order_gap as u8);
                             }
                             self.free_and_merge(cursor, order_gap);
 
@@ -740,20 +755,15 @@ impl LazyBuddyAllocator {
                 break;
             }
 
-            let lists = FREE_LISTS.get().expect("PMM free lists not initialized");
             let shard = Self::shard_for_pfn(buddy_pfn);
-            let mut list = lists.orders[order].shards[shard].lock();
-            self.global_list_ops.fetch_add(1, Ordering::Relaxed);
+            let mut list = self.lock_global_list(order, shard);
             unsafe {
                 let buddy = self.get_frame(buddy_pfn);
                 if buddy.state != FrameState::FreeGlobal || buddy.order != order as u8 {
                     break;
                 }
                 self.remove_from_list_with_list(buddy_pfn, order, &mut *list);
-                buddy.state = FrameState::Allocated;
-                set_flag(&mut buddy.flags, BF_MIGRATABLE, true);
-                buddy.next = None;
-                buddy.prev = None;
+                self.reset_frame_with(buddy, order as u8);
             }
             drop(list);
 
@@ -773,10 +783,7 @@ impl LazyBuddyAllocator {
                     let frame = self.get_frame(head);
                     cache.heads[order] = frame.next;
                     cache.counts[order] = cache.counts[order].saturating_sub(1);
-                    frame.next = None;
-                    frame.prev = None;
-                    frame.state = FrameState::Allocated;
-                    set_flag(&mut frame.flags, BF_MIGRATABLE, true);
+                    self.reset_frame_with(frame, order as u8);
                 }
                 return Some(head);
             }
@@ -846,21 +853,16 @@ impl LazyBuddyAllocator {
 
     pub(crate) fn max_free_order(&self) -> usize {
         let mut free_global = [0usize; MAX_ORDER];
-        if let Some(lists) = FREE_LISTS.get() {
-            for order in 0..MAX_ORDER {
-                for shard in 0..SHARD_COUNT {
-                    let list = lists.orders[order].shards[shard].lock();
-                    let mut cur = list.head;
-                    while let Some(pfn) = cur {
-                        free_global[order] += 1;
-                        unsafe {
-                            let frame = self.get_frame(pfn);
-                            cur = frame.next;
-                        }
-                    }
+        for_each_global_list(|order, _shard, list| {
+            let mut cur = list.head;
+            while let Some(pfn) = cur {
+                free_global[order] += 1;
+                unsafe {
+                    let frame = self.get_frame(pfn);
+                    cur = frame.next;
                 }
             }
-        }
+        });
         let mut free_percpu = [0usize; MAX_ORDER];
         for cpu in 0..MAX_CPUS {
             PER_CPU.with_cache(cpu, |cache| {
@@ -918,12 +920,7 @@ impl LazyBuddyAllocator {
         if let Some(idx) = self.alloc_from_uninit(order) {
             self.alloc_hit_uninit.fetch_add(1, Ordering::Relaxed);
             unsafe {
-                let frame = self.get_frame(idx);
-                frame.state = FrameState::Allocated;
-                frame.order = order as u8;
-                set_flag(&mut frame.flags, BF_MIGRATABLE, true);
-                frame.next = None;
-                frame.prev = None;
+                self.reset_frame(idx, order as u8);
             }
             return Some(idx);
         }
@@ -936,10 +933,7 @@ impl LazyBuddyAllocator {
             unsafe {
                 let frame = self.get_frame(head);
                 list.head = frame.next;
-                frame.next = None;
-                frame.prev = None;
-                frame.state = FrameState::Allocated;
-                set_flag(&mut frame.flags, BF_MIGRATABLE, true);
+                self.reset_frame_with(frame, ORDER_4K as u8);
             }
             self.reserve_count.fetch_sub(1, Ordering::Relaxed);
             return Some(head);

@@ -7,16 +7,39 @@
 //! LAPIC 等设备寄存器使用。
 
 use crate::diag;
-use crate::paging::level_indices;
+use crate::paging::{
+    flush_tlb, level_indices, ADDR_MASK, FLAG_LARGE, FLAG_PRESENT, FLAG_WRITABLE,
+};
 use crate::serial;
 
 /// 2MB 页大小。
 const PAGE_2M: u64 = 0x20_0000;
 
-/// 页表标志（与 `paging` 模块保持一致）。
-const FLAG_PRESENT: u64 = 1 << 0;
-const FLAG_WRITABLE: u64 = 1 << 1;
-const FLAG_LARGE: u64 = 1 << 7;
+// ---- MMIO volatile 访问原语（供 lapic、paging 等复用）----
+
+/// 从 `addr` 读取一个 u32（volatile）。
+#[inline]
+pub unsafe fn read_u32(addr: u64) -> u32 {
+    unsafe { core::ptr::read_volatile(addr as *const u32) }
+}
+
+/// 向 `addr` 写一个 u32（volatile）。
+#[inline]
+pub unsafe fn write_u32(addr: u64, val: u32) {
+    unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
+}
+
+/// 从 `addr` 读取一个 u64（volatile）。
+#[inline]
+pub unsafe fn read_u64(addr: u64) -> u64 {
+    unsafe { core::ptr::read_volatile(addr as *const u64) }
+}
+
+/// 向 `addr` 写一个 u64（volatile）。
+#[inline]
+pub unsafe fn write_u64(addr: u64, val: u64) {
+    unsafe { core::ptr::write_volatile(addr as *mut u64, val) };
+}
 
 /// 获取 CR3（PML4 物理地址）。
 #[inline]
@@ -24,12 +47,6 @@ fn cr3() -> u64 {
     let val: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) val, options(nomem, nostack)) };
     val
-}
-
-/// 刷新 TLB 中指定虚拟地址的条目。
-#[inline]
-fn invlpg(virt: u64) {
-    unsafe { core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
 }
 
 /// 把物理地址 `phys`（须 2MB 对齐）映射到虚拟地址 `virt`（须 2MB 对齐），
@@ -62,7 +79,7 @@ pub fn map_lapic(phys_offset: u64, phys: u64, virt: u64) -> bool {
         serial::write_str("] not present\r\n");
         return false;
     }
-    let pdpt_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
+    let pdpt_phys = pml4_entry & ADDR_MASK;
     let pdpt = (phys_offset + pdpt_phys) as *mut u64;
     let pdpt_entry = unsafe { *pdpt.add(pdpt_idx) };
 
@@ -72,14 +89,12 @@ pub fn map_lapic(phys_offset: u64, phys: u64, virt: u64) -> bool {
         serial::write_str("] not present\r\n");
         return false;
     }
-    let pd_phys = pdpt_entry & 0x000F_FFFF_FFFF_F000;
+    let pd_phys = pdpt_entry & ADDR_MASK;
     let pd = (phys_offset + pd_phys) as *mut u64;
 
     // 设置 2MB 大页条目：物理地址 + present + writable + large
     let entry = (phys & !0x1F_FFFF) | FLAG_PRESENT | FLAG_WRITABLE | FLAG_LARGE;
-    unsafe {
-        core::ptr::write_volatile(pd.add(pd_idx), entry);
-    }
-    invlpg(virt);
+    unsafe { write_u64((pd as u64) + pd_idx as u64 * 8, entry) };
+    flush_tlb(virt);
     true
 }

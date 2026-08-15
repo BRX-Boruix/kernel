@@ -52,38 +52,13 @@ impl fmt::Write for SerialWriter {
 
 /// 以十六进制写 `value`（不含 0x 前缀，固定宽度，由调用方决定）。
 fn write_hex_raw(value: u64) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut buf = [0u8; 16];
-    for i in 0..16 {
-        let shift = (15 - i) * 4;
-        buf[i] = HEX[((value >> shift) & 0xF) as usize];
-    }
-    write_str(core::str::from_utf8(&buf).unwrap());
+    write_str(core::str::from_utf8(&crate::format::hex_bytes(value)).unwrap());
 }
 
 /// 以十进制写 `value` 到串口（无前导零，`0` 输出单个 `0`）。
 pub fn write_dec(value: u128) {
-    let mut buf = [0u8; 40];
-    let mut n = 0;
-    let mut v = value;
-    if v == 0 {
-        buf[n] = b'0';
-        n += 1;
-    }
-    while v > 0 {
-        buf[n] = b'0' + (v % 10) as u8;
-        v /= 10;
-        n += 1;
-    }
-    // 逆序后整串输出
-    let mut out = [0u8; 40];
-    let mut o = 0;
-    while n > 0 {
-        n -= 1;
-        out[o] = buf[n];
-        o += 1;
-    }
-    write_str(core::str::from_utf8(&out[..o]).unwrap());
+    let (buf, len) = crate::format::dec_bytes(value);
+    write_str(core::str::from_utf8(&buf[..len]).unwrap());
 }
 
 /// 以十六进制写 `value` 到串口，带 `0x` 前缀，固定 16 位宽度。

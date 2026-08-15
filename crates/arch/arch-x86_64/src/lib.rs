@@ -22,11 +22,7 @@ pub struct X86_64Arch;
 
 /// 永久停机（关闭中断后 hlt 循环）。
 pub fn halt_forever() -> ! {
-    loop {
-        unsafe {
-            core::arch::asm!("cli", "hlt", options(nomem, nostack));
-        }
-    }
+    crate::interrupts::halt_forever()
 }
 
 impl Platform for X86_64Arch {
