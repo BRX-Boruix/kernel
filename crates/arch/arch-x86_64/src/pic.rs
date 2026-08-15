@@ -6,7 +6,8 @@
 
 use crate::port::{inb, outb};
 
-// 8259 端口
+// 8259 端口（x86 硬件标准，非温室假设）。
+// 主片（master）命令/数据端口 0x20/0x21，从片（slave）0xA0/0xA1。
 const PIC1_COMMAND: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
 const PIC2_COMMAND: u16 = 0xA0;
@@ -15,6 +16,29 @@ const PIC2_DATA: u16 = 0xA1;
 // ICW 常量
 const ICW1_INIT: u8 = 0x11; // 初始化 + 级联
 const ICW4_8086: u8 = 0x01; // 8086 模式
+
+/// IA32_APIC_BASE MSR：bit 12 表示 LAPIC 已启用。
+const MSR_APIC_BASE: u32 = 0x1B;
+
+/// 检测 LAPIC 是否已由固件/引导器启用。
+///
+/// 若已启用（现代 UEFI 平台 + APIC 模式），重编程 8259 是多余的，还可能
+/// 干扰 IOAPIC 的中断路径，因此跳过重映射、仅屏蔽即可。
+fn apic_enabled() -> bool {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") MSR_APIC_BASE,
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    let value = ((hi as u64) << 32) | lo as u64;
+    value & (1 << 12) != 0
+}
 
 /// 重新映射 IRQ0~15 到 IDT 向量 32~47。
 pub fn remap() {
@@ -63,9 +87,18 @@ pub fn end_of_interrupt(irq: u8) {
     outb(PIC1_COMMAND, 0x20);
 }
 
-/// 初始化 8259 PIC：重映射到向量 32~47，默认全部屏蔽。
+/// 初始化 8259 PIC，默认全部屏蔽 IRQ。
+///
+/// - 若 LAPIC 已启用（现代平台），8259 不再承担外部中断分发，跳过重映射，
+///   仅屏蔽所有 IRQ，避免干扰 IOAPIC 路径。
+/// - 否则（传统 BIOS/非 APIC 环境）重映射到向量 32~47 并屏蔽。
 pub fn init() {
-    remap();
-    set_mask(0xFFFF); // 默认屏蔽所有 IRQ
-    klib::logln!("[pic] 8259 remapped to vectors 32-47");
+    if apic_enabled() {
+        set_mask(0xFFFF); // 屏蔽所有 IRQ
+        klib::logln!("[pic] APIC enabled, skipping 8259 remap (IRQs masked)");
+    } else {
+        remap();
+        set_mask(0xFFFF);
+        klib::logln!("[pic] 8259 remapped to vectors 32-47");
+    }
 }

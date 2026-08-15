@@ -14,12 +14,36 @@ use crate::serial;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// LAPIC 物理基址。
-const LAPIC_PHYS: u64 = 0xFEE0_0000;
+/// 默认 LAPIC 物理基址（回退值，绝大多数 x86 平台使用 0xFEE00000）。
+///
+/// 实际基址通过 MSR `IA32_APIC_BASE` 读取，仅在读取失败时回退此值。
+/// AMD 及部分特殊平台可能不同，故不能仅依赖硬编码。
+const DEFAULT_LAPIC_PHYS: u64 = 0xFEE0_0000;
 
-/// LAPIC 映射到的虚拟地址（与 HHDM 同 PML4 表项，避免新建 PDPT）。
-/// 0xffff8000_0000_0000 + 0xFEE0_0000 = 0xffff8000fee00000。
-const LAPIC_VIRT: u64 = 0xffff_8000_0000_0000 | LAPIC_PHYS;
+/// IA32_APIC_BASE MSR：bit 12 启用 APIC，低 12 位之上为 LAPIC 物理基址。
+const MSR_APIC_BASE: u32 = 0x1B;
+
+/// 读取 IA32_APIC_BASE MSR，返回 LAPIC 物理基址。
+///
+/// 通过 `rdmsr` 读取。返回值低 12 位被清除，得到 4KB 对齐的基址。
+fn read_apic_base() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") MSR_APIC_BASE,
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// 当前 LAPIC 映射到的虚拟地址（物理基址 + 高半区偏移）。
+/// 由 `init` 在读取 MSR 后写入，读写函数每次读取当前值。
+static LAPIC_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // LAPIC 寄存器偏移
 const LAPIC_SVR: usize = 0xF0;      // Spurious Interrupt Vector
@@ -60,13 +84,15 @@ pub fn ticks() -> u64 {
 #[inline]
 fn lapic_read(reg: usize) -> u32 {
     // LAPIC 必须 16 字节对齐访问
-    unsafe { mmio::read_u32(LAPIC_VIRT + reg as u64) }
+    let virt = LAPIC_VIRT.load(Ordering::Relaxed);
+    unsafe { mmio::read_u32(virt + reg as u64) }
 }
 
 /// 写入 LAPIC 寄存器。
 #[inline]
 fn lapic_write(reg: usize, val: u32) {
-    unsafe { mmio::write_u32(LAPIC_VIRT + reg as u64, val) };
+    let virt = LAPIC_VIRT.load(Ordering::Relaxed);
+    unsafe { mmio::write_u32(virt + reg as u64, val) };
 }
 
 /// 对 LAPIC 寄存器做"读-改-写"：清除 `clear_bits`，置位 `set_bits`。
@@ -137,12 +163,24 @@ fn calibrate_bus_freq() -> u64 {
 /// 总线频率通过 `calibrate_bus_freq` 用 PIT 实测，仅在失败时回退到
 /// `DEFAULT_BUS_FREQ_HZ`。
 pub fn init() {
-    // 0. 把 LAPIC 物理地址映射到高半区虚拟地址
-    if !mmio::map_lapic(LAPIC_PHYS, LAPIC_VIRT) {
+    // 0. 从 MSR IA32_APIC_BASE 读取真实 LAPIC 物理基址，避免硬编码 0xFEE00000。
+    //    若 MSR 报告 LAPIC 已启用（bit 12），使用其基址；否则回退默认值。
+    let apic_base = read_apic_base();
+    let phys = if apic_base & (1 << 12) != 0 {
+        apic_base & !0xFFF
+    } else {
+        DEFAULT_LAPIC_PHYS
+    };
+    // 映射到高半区虚拟地址：基址 + 高半区偏移（复用与 HHDM 相同的顶层索引）。
+    let virt = phys | 0xffff_8000_0000_0000;
+    LAPIC_VIRT.store(virt, Ordering::Relaxed);
+
+    // 把 LAPIC 物理地址映射到高半区虚拟地址
+    if !mmio::map_lapic(phys, virt) {
         klib::logln!("[lapic] map failed");
         return;
     }
-    klib::log_hex!("[lapic] mapped to ", LAPIC_VIRT);
+    klib::log_hex!("[lapic] mapped to ", virt);
 
     // 1. 使能 LAPIC（SVR，向量 0xFF）
     lapic_rmw(LAPIC_SVR, 0x100, 0x100 | 0xFF);

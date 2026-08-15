@@ -6,11 +6,15 @@
 //! - 中断门会自动 `cli`，因此中断上下文与本 CPU 主线程的竞争靠重入计数化解；
 //!   不同 CPU 之间靠自旋互斥。
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
 
 use crate::port::{inb, outb};
 
-const COM1: u16 = 0x3F8;
+/// 标准 COM 端口地址表（COM1~COM4）。
+const COM_PORTS: [u16; 4] = [0x3F8, 0x2F8, 0x3E8, 0x2E8];
+
+/// 当前使用的串口基址。默认 COM1，`init` 时探测后可能改为其他端口。
+static COM_BASE: AtomicU16 = AtomicU16::new(0x3F8);
 
 /// 串口锁：`LOCKED` 表示被某 CPU 占用，`OWNER` 记录占用者 LAPIC id，
 /// `DEPTH` 记录同 CPU 重入深度。
@@ -71,22 +75,58 @@ impl SerialLock {
 
 static LOCK: SerialLock = SerialLock;
 
-/// 初始化 COM1 串口（38400 波特，8N1）
+/// 初始化串口（38400 波特，8N1）。
+///
+/// 探测 COM1~COM4，选择第一个存在的串口，避免真机上 COM1 不存在（例如
+/// 固件把串口映射到其他端口）时输出到空端口行为未定义。
 pub fn init() {
-    outb(COM1 + 1, 0x00); // 禁用中断
-    outb(COM1 + 3, 0x80); // DLAB 开，设置波特率
-    outb(COM1 + 0, 0x03); // 除数低字节 (38400)
-    outb(COM1 + 1, 0x00); // 除数高字节
-    outb(COM1 + 3, 0x03); // 8 位数据，无校验，1 停止位
-    outb(COM1 + 2, 0xC7); // 启用 FIFO，清空
-    outb(COM1 + 4, 0x0B); // IRQ 使能，RTS/DSR
+    let base = probe_serial();
+    COM_BASE.store(base, Ordering::Relaxed);
+
+    let com = COM_BASE.load(Ordering::Relaxed);
+    outb(com + 1, 0x00); // 禁用中断
+    outb(com + 3, 0x80); // DLAB 开，设置波特率
+    outb(com + 0, 0x03); // 除数低字节 (38400)
+    outb(com + 1, 0x00); // 除数高字节
+    outb(com + 3, 0x03); // 8 位数据，无校验，1 停止位
+    outb(com + 2, 0xC7); // 启用 FIFO，清空
+    outb(com + 4, 0x0B); // IRQ 使能，RTS/DSR
+}
+
+/// 探测可用的串口，返回其基址。找不到则回退 COM1。
+///
+/// 经典探测法：写 0xAE 到 SCR（scratch 寄存器，偏移 7），若可读回 0xAE
+/// 说明端口存在；否则写 0x56 再试（部分实现只支持低 7 位）。
+fn probe_serial() -> u16 {
+    for &base in &COM_PORTS {
+        // 用 SCR 寄存器回读检测端口存在性
+        outb(base + 7, 0xAE);
+        let mut ok = inb(base + 7) == 0xAE;
+        if !ok {
+            // 某些 UART 只保留低 7 位
+            outb(base + 7, 0x56);
+            ok = inb(base + 7) == 0x56;
+        }
+        if ok {
+            return base;
+        }
+    }
+    // 未探测到任何串口，回退 COM1（尽力而为）
+    COM_PORTS[0]
+}
+
+/// 当前串口基址。
+#[inline]
+fn com_base() -> u16 {
+    COM_BASE.load(Ordering::Relaxed)
 }
 
 /// 等待发送保持寄存器空（LSR bit 5），随后写一个字节。
 #[inline]
 fn putc_wait(byte: u8) {
-    while inb(COM1 + 5) & 0x20 == 0 {}
-    outb(COM1, byte);
+    let com = com_base();
+    while inb(com + 5) & 0x20 == 0 {}
+    outb(com, byte);
 }
 
 /// 发送单个字节（带锁）。
@@ -98,9 +138,10 @@ pub fn write_byte(byte: u8) {
 
 /// 读取单个字节（无数据返回 None）。
 pub fn read_byte() -> Option<u8> {
+    let com = com_base();
     // LSR bit 0 表示数据就绪
-    if inb(COM1 + 5) & 0x01 != 0 {
-        Some(inb(COM1))
+    if inb(com + 5) & 0x01 != 0 {
+        Some(inb(com))
     } else {
         None
     }
