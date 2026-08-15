@@ -9,6 +9,7 @@
 
 use crate::interrupts;
 use crate::mmio;
+use crate::port::{inb, outb};
 use crate::serial;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +26,7 @@ const LAPIC_SVR: usize = 0xF0;      // Spurious Interrupt Vector
 const LAPIC_TIMER: usize = 0x320;   // LVT Timer
 const LAPIC_TIMER_DIV: usize = 0x3E0; // 分频
 const LAPIC_TIMER_INIT: usize = 0x380; // Initial Count
+const LAPIC_TIMER_CURR: usize = 0x390; // Current Count (只读)
 const LAPIC_EOI: usize = 0xB0;      // End of Interrupt
 
 // LVT Timer 位
@@ -37,8 +39,8 @@ const LAPIC_ID: usize = 0x20;
 
 /// 默认 LAPIC 总线频率（Hz）。
 ///
-/// QEMU 下典型值约 1GHz。这是对总线频率的假设值，若需精确应实测
-/// （例如用 PIT 校准或读取 CPUID 0x16）。可传入 `init` 覆盖。
+/// 仅在校准失败（PIT 不可用等）时作为回退值。正常路径会通过
+/// `calibrate_bus_freq` 用 PIT 实测，不再依赖此硬编码。
 pub const DEFAULT_BUS_FREQ_HZ: u64 = 1_000_000_000;
 
 /// 全局 tick 计数。
@@ -89,10 +91,52 @@ extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
     true
 }
 
-/// 初始化 Local APIC 定时器。
+/// 用 PIT 校准 LAPIC 总线频率。
 ///
-/// `bus_freq` 为 LAPIC 总线频率（Hz），QEMU 下典型约 1GHz。
-pub fn init(bus_freq: u64) {
+/// 原理：PIT 通道 0 的计数频率恒为 1.193182MHz。把 PIT 设为一次性模式
+/// （mode 0）并给定一个计数值（对应一段已知时长），同时让 LAPIC 定时器
+/// 以分频 1、最大初值跑一个一次性周期。等 PIT 计时结束，读取 LAPIC 已
+/// 递减的 tick 数，即可推出总线频率。
+///
+/// 真实硬件的 LAPIC 总线频率随 CPU 不同（通常 100MHz~400MHz，QEMU 约
+/// 1GHz），必须实测而不能硬编码。返回 0 表示校准失败。
+fn calibrate_bus_freq() -> u64 {
+    const PIT_CH0_DATA: u16 = 0x40; // PIT 通道 0 数据端口
+    const PIT_CMD: u16 = 0x43;      // PIT 命令/控制字端口
+    const PIT_PORT_B: u16 = 0x61;   // 0x61：bit4 反映通道 0 输出（反相）
+    const PIT_FREQ: u64 = 1_193_182; // PIT 计数频率（Hz）
+    const PIT_TICKS: u16 = 0xFFFF;   // 最大计数值，约 54.9ms
+
+    // PIT 通道 0：一次性模式 (mode 0)，先低后高字节，二进制计数。
+    outb(PIT_CMD, 0x30);
+    outb(PIT_CH0_DATA, (PIT_TICKS & 0xFF) as u8);
+    outb(PIT_CH0_DATA, (PIT_TICKS >> 8) as u8);
+
+    // LAPIC 定时器：一次性模式（清掉周期性位），分频 1，最大初值。
+    lapic_write(LAPIC_TIMER, TIMER_VECTOR);
+    lapic_write(LAPIC_TIMER_DIV, 0x0B);
+    lapic_write(LAPIC_TIMER_INIT, 0xFFFF_FFFF);
+
+    // 等待 PIT 计时结束：mode 0 下 OUT 从低变高，而 0x61 的 bit4 反相，
+    // 故 bit4=1（输出低）时继续等，直到 bit4 变 0（输出高）。
+    while (inb(PIT_PORT_B) & 0x10) != 0 {
+        core::hint::spin_loop();
+    }
+
+    // 读取 LAPIC 剩余计数，算出本周期内递减的 tick 数。
+    let remaining = lapic_read(LAPIC_TIMER_CURR);
+    let elapsed = 0xFFFF_FFFFu64 - remaining as u64;
+
+    // elapsed 次递减发生在 PIT_TICKS / PIT_FREQ 秒内，
+    // 故 总线频率 = elapsed * PIT_FREQ / PIT_TICKS。
+    elapsed * PIT_FREQ / PIT_TICKS as u64
+}
+
+/// 初始化 Local APIC 定时器（周期模式，100Hz）。
+///
+/// 总线频率通过 `calibrate_bus_freq` 用 PIT 实测，仅在失败时回退到
+/// `DEFAULT_BUS_FREQ_HZ`。
+pub fn init() {
     // 0. 把 LAPIC 物理地址映射到高半区虚拟地址
     if !mmio::map_lapic(LAPIC_PHYS, LAPIC_VIRT) {
         klib::logln!("[lapic] map failed");
@@ -103,18 +147,31 @@ pub fn init(bus_freq: u64) {
     // 1. 使能 LAPIC（SVR，向量 0xFF）
     lapic_rmw(LAPIC_SVR, 0x100, 0x100 | 0xFF);
 
-    // 2. 配置定时器分频（divide by 1 → 0x0B）
+    // 2. 校准 LAPIC 总线频率（用 PIT 实测，而非硬编码）
+    let bus_freq = calibrate_bus_freq();
+    let bus_freq = if bus_freq == 0 {
+        klib::logln!(
+            "[lapic] WARNING: PIT calibration failed, falling back to {} Hz",
+            DEFAULT_BUS_FREQ_HZ
+        );
+        DEFAULT_BUS_FREQ_HZ
+    } else {
+        klib::logln!("[lapic] calibrated LAPIC bus freq = {} Hz", bus_freq);
+        bus_freq
+    };
+
+    // 3. 配置定时器分频（divide by 1 → 0x0B）
     lapic_write(LAPIC_TIMER_DIV, 0x0B);
 
-    // 3. 设置 LVT Timer：周期性，向量 0x20
+    // 4. 设置 LVT Timer：周期性，向量 0x20
     lapic_write(LAPIC_TIMER, TIMER_PERIODIC | TIMER_VECTOR);
 
-    // 4. 设置初始计数：期望 100Hz
+    // 5. 设置初始计数：期望 100Hz
     let target_hz = 100u64;
     let init_count = bus_freq / target_hz;
     lapic_write(LAPIC_TIMER_INIT, init_count as u32);
 
-    // 5. 注册 IRQ 处理（vector 0x20 → irq 0）
+    // 6. 注册 IRQ 处理（vector 0x20 → irq 0）
     interrupts::register_irq(0, lapic_timer_handler);
 
     // 标记 LAPIC 已可用（串口锁依赖 LAPIC id 做多核 owner 判断）

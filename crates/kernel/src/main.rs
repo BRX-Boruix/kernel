@@ -95,7 +95,7 @@ unsafe fn kmain_body() -> ! {
 
     // 初始化 Local APIC 定时器（Limine 已启用 LAPIC，硬件中断走 APIC）
     logln!("[kmain] enabling interrupts (LAPIC timer ~100Hz)");
-    arch_x86_64::lapic::init(arch_x86_64::lapic::DEFAULT_BUS_FREQ_HZ);
+    arch_x86_64::lapic::init();
     arch_x86_64::interrupts::enable();
 
     // 短暂等待验证时钟中断确实触发
