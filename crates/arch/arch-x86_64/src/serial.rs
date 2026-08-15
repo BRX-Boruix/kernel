@@ -57,3 +57,15 @@ pub fn read_byte() -> Option<u8> {
         None
     }
 }
+
+/// 直接写入一串字节到串口（\n 转 \r\n）。
+///
+/// 无锁、不依赖 klib 的全局输出，适合在中断/异常上下文使用。
+pub fn write_str(s: &str) {
+    for &b in s.as_bytes() {
+        if b == b'\n' {
+            write_byte(b'\r');
+        }
+        write_byte(b);
+    }
+}

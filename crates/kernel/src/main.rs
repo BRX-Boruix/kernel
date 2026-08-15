@@ -61,6 +61,15 @@ unsafe extern "C" fn kmain() -> ! {
     // 验证堆分配器（支持释放/重用）
     test_heap();
 
+    // 初始化 Local APIC 定时器（Limine 已启用 LAPIC，硬件中断走 APIC）
+    let phys_offset = mm::PHYS_OFFSET.get().copied().unwrap_or(0);
+    logln!("[kmain] enabling interrupts (LAPIC timer ~100Hz)");
+    arch_x86_64::lapic::init(phys_offset, 1_000_000_000); // 假设总线频率约 1GHz
+    arch_x86_64::interrupts::enable();
+
+    // 短暂等待验证时钟中断确实触发
+    test_timer();
+
     logln!("[kmain] reached idle loop");
     CurrentArch::halt();
 }
@@ -90,6 +99,34 @@ fn test_heap() {
     drop(s);
 
     logln!("[test-heap] heap tests passed");
+}
+
+/// 用 `sti`+`hlt` 等待 LAPIC 时钟中断，验证中断触发。
+fn test_timer() {
+    logln!("[timer] entering test_timer");
+
+    let start = arch_x86_64::lapic::ticks();
+    let mut rounds: u32 = 0;
+    // sti+hlt 等待硬件 LAPIC 定时器中断唤醒。
+    while arch_x86_64::lapic::ticks().wrapping_sub(start) < 20 {
+        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+        rounds += 1;
+        if rounds % 50 == 0 {
+            logln!("[timer] ... rounds={} ticks={}", rounds, arch_x86_64::lapic::ticks());
+        }
+        if rounds > 500 {
+            logln!(
+                "[timer] WARNING: no hw tick (rounds={}, ticks={})",
+                rounds,
+                arch_x86_64::lapic::ticks()
+            );
+            return;
+        }
+    }
+    logln!(
+        "[timer] confirmed: ticks={} (LAPIC timer interrupts OK)",
+        arch_x86_64::lapic::ticks()
+    );
 }
 
 /// 验证物理页帧分配器的分配/释放基本逻辑。
