@@ -6,6 +6,12 @@
 
 #![no_std]
 
+pub mod addr;
+pub mod paging;
+
+pub use addr::{PhysAddr, PhysFrame, VirtAddr};
+pub use paging::{ActivePageTable, PageFlags, PageSize, PageTable};
+
 /// 架构平台抽象。
 ///
 /// 每个具体架构实现一个 `Platform`，提供 CPU 停机、串口等基础操作。

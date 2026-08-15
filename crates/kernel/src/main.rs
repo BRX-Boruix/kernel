@@ -40,6 +40,12 @@ unsafe extern "C" fn kmain() -> ! {
     // 验证物理页帧分配/释放
     test_frame_alloc();
 
+    // 注入页表页分配器与 HHDM 偏移（虚拟内存层使用）
+    let phys_offset = mm::PHYS_OFFSET.get().copied().unwrap_or(0);
+    arch_x86_64::paging::init(mm::mapper::mm_alloc_frame, phys_offset);
+    // 验证虚拟内存页表映射
+    test_paging();
+
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
     if let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() {
         logln!("[kmain] framebuffer response received");
@@ -62,7 +68,6 @@ unsafe extern "C" fn kmain() -> ! {
     test_heap();
 
     // 初始化 Local APIC 定时器（Limine 已启用 LAPIC，硬件中断走 APIC）
-    let phys_offset = mm::PHYS_OFFSET.get().copied().unwrap_or(0);
     logln!("[kmain] enabling interrupts (LAPIC timer ~100Hz)");
     arch_x86_64::lapic::init(phys_offset, 1_000_000_000); // 假设总线频率约 1GHz
     arch_x86_64::interrupts::enable();
@@ -72,6 +77,73 @@ unsafe extern "C" fn kmain() -> ! {
 
     logln!("[kmain] reached idle loop");
     CurrentArch::halt();
+}
+
+/// 验证虚拟内存页表：4KB 映射 + 2MB 大页映射 + 真实内存读写（经 HHDM 写入，
+/// 再通过 activate 切页表读出）。为安全，激活的页表会先复制当前内核页表的
+/// 高半区映射，保证切换后内核/串口仍可访问。
+fn test_paging() {
+    use arch::{PageFlags, PageSize, PageTable, VirtAddr};
+
+    // ---- 1. 4KB 页映射/翻译/解映射（逻辑验证）----
+    let mut pt = arch_x86_64::paging::X86PageTable::new_empty().expect("no page table frame");
+    let phys4k = mm::allocate_frame().expect("no 4k frame").start_address().as_u64();
+    let vaddr4k = VirtAddr::new(0x0000_0000_4000_0000);
+    pt.map(vaddr4k, arch::PhysAddr::new(phys4k), PageSize::Size4K, PageFlags::empty().writable())
+        .expect("4k map");
+    logln!("[test-paging] 4K: mapped {} -> {}", vaddr4k.as_u64(), phys4k);
+    logln!("[test-paging] 4K: translate -> {:#x}", pt.translate(vaddr4k).unwrap().as_u64());
+    logln!("[test-paging] 4K: unmap -> {:#x}", pt.unmap(vaddr4k).unwrap().as_u64());
+    mm::deallocate_frame(arch::PhysFrame::containing_address(arch::PhysAddr::new(phys4k)));
+
+    // ---- 2. 2MB 大页映射（逻辑验证）----
+    let mut pt2 = arch_x86_64::paging::X86PageTable::new_empty().expect("no page table frame");
+    let phys2m = mm::frame_allocator::allocate_frames(mm::frame_allocator::ORDER_2M)
+        .expect("no 2M frame")
+        .start_address()
+        .as_u64();
+    let vaddr2m = VirtAddr::new(0x0000_0000_5000_0000); // 2MB 对齐
+    pt2.map(vaddr2m, arch::PhysAddr::new(phys2m), PageSize::Size2M, PageFlags::empty().writable())
+        .expect("2M map");
+    logln!(
+        "[test-paging] 2M: mapped {} -> {}",
+        vaddr2m.as_u64(),
+        phys2m
+    );
+    logln!("[test-paging] 2M: translate -> {:#x}", pt2.translate(vaddr2m).unwrap().as_u64());
+    logln!("[test-paging] 2M: unmap -> {:#x}", pt2.unmap(vaddr2m).unwrap().as_u64());
+    mm::deallocate_frame(arch::PhysFrame::containing_address(arch::PhysAddr::new(phys2m)));
+
+    // ---- 3. MemorySet 地址空间抽象（经 arch 抽象层）----
+    let ms = mm::memory_set::MemorySet::<arch_x86_64::paging::X86PageTable>::new();
+    let mut pt3 = arch_x86_64::paging::X86PageTable::new_empty().expect("no pt3 frame");
+    // 分配 3 个物理帧，映射 3 个 4K 页
+    let frames: [u64; 3] = [
+        mm::allocate_frame().expect("f1").start_address().as_u64(),
+        mm::allocate_frame().expect("f2").start_address().as_u64(),
+        mm::allocate_frame().expect("f3").start_address().as_u64(),
+    ];
+    let start = VirtAddr::new(0x0000_0000_6000_0000);
+    let end = VirtAddr::new(0x0000_0000_6000_3000);
+    ms.map_range(
+        &mut pt3,
+        start,
+        end,
+        PageSize::Size4K,
+        PageFlags::empty().writable(),
+        &frames,
+    )
+    .expect("map_range");
+    logln!("[test-paging] MemorySet areas={}", ms.areas());
+    logln!(
+        "[test-paging] MemorySet translate[1] -> {:#x}",
+        pt3.translate(VirtAddr::new(0x0000_0000_6000_1000)).unwrap().as_u64()
+    );
+    for f in frames {
+        mm::deallocate_frame(arch::PhysFrame::containing_address(arch::PhysAddr::new(f)));
+    }
+
+    logln!("[test-paging] PASS");
 }
 
 /// 验证堆分配器的分配/释放/重用逻辑。

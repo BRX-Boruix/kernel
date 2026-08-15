@@ -6,7 +6,7 @@ mod stats;
 use limine::{MemmapEntry, NonNullPtr};
 use spin::Once;
 
-use crate::addr::PhysFrame;
+use crate::PhysFrame;
 
 use allocator_core::{LazyBuddyAllocator, ORDER_4K};
 use percpu_cache::{FreeListTable, PerCpuCacheSet};

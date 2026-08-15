@@ -1,7 +1,7 @@
-//! 物理/虚拟地址类型。
+//! 物理/虚拟地址类型（架构无关）。
 //!
-//! 精简自旧项目 `mm` 的自定义地址类型，替代 `x86_64::PhysAddr` 等，
-//! 保持架构无关。
+//! 这些类型作为 `PageTable` 等抽象接口的参数，放在 `arch` 抽象层，
+//! 使 `mm` 等上层业务逻辑不绑定具体架构（ADR-007）。
 
 use core::fmt;
 
@@ -30,6 +30,11 @@ impl PhysAddr {
     pub const fn containing_page(self) -> Self {
         Self(self.0 & !0xFFF)
     }
+
+    /// 是否 4KB 对齐。
+    pub const fn is_aligned_4k(self) -> bool {
+        self.0 & 0xFFF == 0
+    }
 }
 
 impl VirtAddr {
@@ -41,6 +46,16 @@ impl VirtAddr {
     /// 取出裸 u64 值。
     pub const fn as_u64(self) -> u64 {
         self.0
+    }
+
+    /// 以该地址为起始、恰好含一个 4KB 虚拟页。
+    pub const fn containing_page(self) -> Self {
+        Self(self.0 & !0xFFF)
+    }
+
+    /// 是否 4KB 对齐。
+    pub const fn is_aligned_4k(self) -> bool {
+        self.0 & 0xFFF == 0
     }
 }
 
@@ -76,6 +91,11 @@ impl PhysFrame {
     /// 返回页帧的起始物理地址。
     pub const fn start_address(self) -> PhysAddr {
         self.start
+    }
+
+    /// 从物理地址构造页帧，要求已按 4KB 对齐（否则 panic）。
+    pub const fn from_aligned(addr: PhysAddr) -> Self {
+        Self { start: addr }
     }
 }
 

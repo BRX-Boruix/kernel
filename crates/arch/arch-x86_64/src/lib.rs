@@ -8,6 +8,7 @@ pub mod gdt;
 pub mod interrupts;
 pub mod lapic;
 pub mod mmio;
+pub mod paging;
 pub mod pic;
 pub mod serial;
 

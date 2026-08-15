@@ -2,15 +2,21 @@
 //!
 //! 精简自旧项目 `mm`，当前包含：
 //! - 物理页帧分配器（LazyBuddy，惰性初始化 buddy allocator）
+//! - 虚拟内存：页表抽象（经 arch 层）与地址空间
 //!
-//! 后续阶段逐步加入：虚拟内存/页表、堆分配器、地址空间等。
+//! 地址类型（`PhysAddr`/`VirtAddr`/`PhysFrame`）定义在 `arch` 抽象层，
+//! 这里 re-export 以兼容旧路径。
 
 #![no_std]
 
-pub mod addr;
-pub mod frame_allocator;
+extern crate alloc;
 
-pub use addr::{PhysAddr, PhysFrame, VirtAddr};
+pub mod frame_allocator;
+pub mod mapper;
+pub mod memory_set;
+
+pub use arch::{PhysAddr, PhysFrame, VirtAddr};
+
 pub use frame_allocator::{
     allocate_frame, allocate_frames, compact_now, deallocate_frame, frag_stats, init as init_frame,
     stats as frame_stats, reset_frame_stats, FrameAllocatorStats, PmmFragStats,

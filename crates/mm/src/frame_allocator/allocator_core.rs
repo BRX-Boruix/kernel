@@ -14,8 +14,7 @@ use limine::{MemmapEntry, MemoryMapEntryType, NonNullPtr};
 use klib::logln;
 use spin::{Mutex, Once};
 
-use crate::addr::PhysFrame;
-use crate::PhysAddr;
+use crate::{PhysAddr, PhysFrame};
 
 use super::percpu_cache::{FreeList, FreeListTable, ReserveList};
 use super::{current_cpu_id, FREE_LISTS, PER_CPU};
