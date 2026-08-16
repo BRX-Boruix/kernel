@@ -21,6 +21,14 @@ static BASE_REVISION: BaseRevision = BaseRevision::new(6);
 #[limine::limine_tag]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new(0);
 
+/// 内核堆增长源：从物理帧分配器分配连续页并映射到虚拟地址。
+/// 返回 `2^order` 个连续物理页映射后的虚拟地址基址（0 表示失败）。
+fn heap_grow_source(order: u32) -> u64 {
+    mm::frame_allocator::allocate_frames(order as usize)
+        .map(|f| arch::phys_to_virt(f.start_paddr()))
+        .unwrap_or(0)
+}
+
 /// 内核主栈大小（1MB）。kmain 及后续所有调用都在此栈上运行，
 /// 避免 Limine 提供的初始引导栈过小导致深调用（如 flanterm）溢出。
 const KMAIN_STACK_SIZE: usize = 1024 * 1024;
@@ -52,12 +60,8 @@ unsafe fn kmain_body() -> ! {
     // 初始化 panic 子系统（注入架构名和停机函数，尽早）
     panic::init(CurrentArch::name(), CurrentArch::halt);
 
-    // 初始化堆分配器（buddy，支持释放重用）——必须在任何 alloc 前
+    // 初始化堆分配器（按需映射动态堆）——必须在任何 alloc 前
     klib::allocator::init();
-
-    // 依据 Limine SMP 响应预分配 per-CPU 页帧缓存（自适应核数）
-    let total_cpus = arch_x86_64::smp::requested_cpu_count();
-    mm::frame_allocator::init_percpu_caches(total_cpus);
 
     // 初始化架构（串口等）
     CurrentArch::init();
@@ -67,6 +71,14 @@ unsafe fn kmain_body() -> ! {
 
     // 初始化内存管理（LazyBuddy 物理页帧分配器）
     mm::init();
+    // 物理帧分配器就绪后，给堆注入增长源（按需映射动态堆），此后堆可无限增长
+    klib::allocator::set_grow_allocator(heap_grow_source);
+
+    // 依据 Limine SMP 响应预分配 per-CPU 页帧缓存（自适应核数）。
+    // 依赖物理帧分配器，须在 mm::init() 之后调用。
+    let total_cpus = arch_x86_64::smp::requested_cpu_count();
+    mm::frame_allocator::init_percpu_caches(total_cpus);
+
     // 验证物理页帧分配/释放
     tests::test_frame_alloc();
 
