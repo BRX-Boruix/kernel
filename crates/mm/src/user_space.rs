@@ -311,7 +311,7 @@ where
         // 从 hint 起，在排序后的空隙中找第一个能容纳 size 的区间。
         // 候选扫描范围上限：栈区下方（栈区是固定区域，mmap 不进入栈区）。
         let top_limit = USER_STACK_TOP - 8 * 1024 * 1024;
-        let mut candidate = align_up(self.next_mmap, 4096);
+        let candidate = align_up(self.next_mmap, 4096);
         // 遍历空隙：当前候选之前的已用区边界（初始为 hint 起点）。
         let mut prev_end = candidate;
         for (rs, re) in regions.iter() {

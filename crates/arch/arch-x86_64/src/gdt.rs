@@ -1,7 +1,8 @@
 //! x86-64 GDT（全局描述符表）与 TSS（任务状态段）。
 //!
 //! 手写实现，不依赖外部 crate：
-//! - GDT 含：空段、内核代码段(0x08)、内核数据段(0x10)、TSS 段(0x18)。
+//! - GDT 含：空段、内核代码段(0x08)、内核数据段(0x10)、用户代码段(0x28)、
+//!   用户数据段(0x30)、TSS 段(0x18)。
 //! - TSS 提供 ring3→ring0 切换时的内核栈（`rsp0`），为后续用户态/系统调用铺路。
 //!
 //! 为支持 SMP，每 CPU 拥有独立的 GDT/TSS/内核栈（`PerCpu` 里持有）。
@@ -12,6 +13,12 @@ use core::arch::global_asm;
 pub const KCODE: u16 = 0x08;
 pub const KDATA: u16 = 0x10;
 pub const TSS_SEL: u16 = 0x18;
+/// 用户代码段（DPL=3，Ring 3 可执行）。
+/// 选择子 index = 0x28>>3 = 5，对应 GDT entries[5]。
+pub const UCODE: u16 = 0x28;
+/// 用户数据段（DPL=3，Ring 3 可读写）。
+/// 选择子 index = 0x30>>3 = 6，对应 GDT entries[6]。
+pub const UDATA: u16 = 0x30;
 
 /// 单 CPU 内核栈大小（64KB）。BSP 与各 AP 各持一份。
 pub const KSTACK_SIZE: usize = 0x10000;
@@ -31,11 +38,18 @@ pub const DF_STACK_SIZE: usize = 16 * 1024;
 pub const IST_DF: usize = 1;
 
 /// TSS 结构（x86-64，共 104 字节）。
-#[repr(C)]
+///
+/// **必须用 `#[repr(C, packed)]`**：x86-64 硬件要求 RSP0 位于 TSS **offset 4**。
+/// 若用普通 `#[repr(C)]`，`reserved1: u32` 后跟 `rsp: [u64; 3]` 会因 u64 的 8 字节
+/// 对齐而插入 4 字节 padding，使 `rsp[0]` 错位到 offset 8，而硬件读 offset 4 得到的
+/// 是 padding（=0）。用户态中断/软中断（如 `int 0x80`）切栈时用 RSP0=0 压栈到 -8
+/// （非规范地址）→ #GP → #DF → Triple Fault。`packed` 使字段紧密排列，RSP0 落到
+/// offset 4，与硬件布局一致。
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct Tss {
     reserved1: u32,
-    /// 特权级切换时的栈（rsp0/rsp1/rsp2）
+    /// 特权级切换时的栈（rsp0/rsp1/rsp2）。rsp[0] 须位于 offset 4（硬件要求）。
     pub rsp: [u64; 3],
     reserved2: u64,
     /// IST（中断栈表）
@@ -69,21 +83,33 @@ impl Tss {
 
 /// GDT 条目（8 字节，由 u64 表示）。
 ///
-/// 布局：null, KCODE, KDATA, TSS_low, TSS_high
+/// 布局：null, KCODE(1), KDATA(2), TSS_low(3), TSS_high(4), UCODE(5), UDATA(6)
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Gdt {
-    entries: [u64; 5],
+    entries: [u64; 7],
 }
 
 impl Gdt {
-    /// 新建 GDT，初始化内核代码/数据段。
+    /// 新建 GDT，初始化内核/用户代码数据段。
     pub const fn new() -> Self {
-        let mut g = Self { entries: [0; 5] };
+        let mut g = Self { entries: [0; 7] };
         // 内核代码段：present, DPL0, 可读可执行, 64 位 (L=1)
         g.entries[1] = 0x00_A0_9A_00_0000_FFFF;
-        // 内核数据段：present, DPL0, 可读写, 展开向上
-        g.entries[2] = 0x00_CF_92_00_0000_FFFF;
+        // 内核数据段：present, DPL0, 可读写, 展开向上。
+        // byte6 = 0x8C：G=1(bit7), D=0(bit6), L=0(bit5)，标准 64 位数据段。
+        // 关键：不得用 0xCF（其 D=1 表示 32 位段、L=1 表示代码段标志）——
+        // 用户态中断/软中断压帧时 CPU 切到 KDATA（内核栈段），若 KDATA 被标为
+        // 32 位段（D=1）会触发 #GP。
+        g.entries[2] = 0x00_8C_92_00_0000_FFFF;
+        // 用户代码段：present, DPL3, 可读可执行, 64 位 (L=1)
+        g.entries[5] = 0x00_A0_FA_00_0000_FFFF;
+        // 用户数据段：present, DPL3, 可读写, 展开向上。
+        // byte6 = 0x8C：G=1(bit7), D=0(bit6), L=0(bit5), limit[19:16]=0xC(bit3-0)。
+        // 标准 64 位数据段（D=0, L=0）。不得用 0xCF（D=1 表示 32 位段）或 0xC8
+        // （其 bit6=1 使 D=1，仍被标为 32 位段）——iretq 到 Ring3 恢复 SS 时，
+        // 若 SS 被标为 32 位段（D=1）会触发 #SS。
+        g.entries[6] = 0x00_8C_F2_00_0000_FFFF;
         g
     }
 
@@ -95,17 +121,25 @@ impl Gdt {
 }
 
 /// TSS 段描述符低 64 位。
+///
+/// 64 位 TSS 描述符在 GDT 占 16 字节（两个槽位）。低 8 字节（`tss_low`）：
+/// - bit0-15: limit[15:0]
+/// - bit16-31: base[15:0]
+/// - bit32-39: base[23:16]
+/// - bit40-47: access（type=0x9 available 64 位 TSS, P=1, DPL=0, S=0）
+/// - bit48-51: limit[19:16]
+/// - bit52-55: AVL/L/D/G（对 64 位 TSS 全为 0）
+/// - bit56-63: base[31:24]
 fn tss_low(base: u64) -> u64 {
     let limit = (core::mem::size_of::<Tss>() - 1) as u64;
     limit
-        | ((base & 0xFFFF) << 16)
-        | (((base >> 16) & 0xFF) << 32)
-        // access: present, DPL0, 可用 64 位 TSS (type=0x9)
-        | (0x89u64 << 40)
-        | (((base >> 24) & 0xFF) << 56)
+        | ((base & 0xFFFF) << 16)                // base[15:0]
+        | (((base >> 16) & 0xFF) << 32)          // base[23:16]
+        | (0x89u64 << 40)                        // access: type=0x9, P=1, DPL=0, S=0
+        | (((base >> 24) & 0xFF) << 56)          // base[31:24]
 }
 
-/// TSS 段描述符高 64 位（存放 base 的 32~63 位）。
+/// TSS 段描述符高 64 位（存放 base 的 32~63 位，即 base 高 32 位）。
 fn tss_high(base: u64) -> u64 {
     base >> 32
 }

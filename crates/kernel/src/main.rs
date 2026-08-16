@@ -141,6 +141,10 @@ unsafe fn kmain_body() -> ! {
     // 短暂等待验证时钟中断确实触发
     tests::test_timer();
 
+    // M2.5.4：从内核 iretq 进入用户态（Ring 3）执行一段用户代码并返回内核。
+    // 依赖中断使能（int 0x80 软中断）与用户段 GDT，故放在定时器验证之后。
+    tests::test_enter_usermode();
+
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。
     mm::frame_allocator::set_cpu_id_reader(|| {

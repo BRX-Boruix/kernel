@@ -98,7 +98,40 @@ pub extern "C" fn x86_switch_to(prev: &mut TaskContext, next: &mut TaskContext) 
     );
 }
 
-/// 在架构初始化时注入 switch_to 实现。
+/// x86_64 进入用户态（Ring 3）实现。
+///
+/// 给定 `arch::task::TrapFrame`（RIP/CS/RFLAGS/RSP/SS），把它按 iretq 帧顺序
+/// 压入当前内核栈，然后 `iretq` 切换到 Ring 3 执行用户代码。
+///
+/// iretq 帧布局（栈顶到低地址）：RIP, CS, RFLAGS, RSP, SS。
+/// `TrapFrame` 字段顺序恰为 rip/cs/rflags/rsp/ss，故按序压栈后从 `frame` 读。
+///
+/// ABI：`frame` 在 rdi。返回后必然进入用户态，本函数不返回（末尾 `iretq`）。
+///
+/// # Safety
+/// 由 `arch::task::enter_usermode` 调用；`frame` 必须指向有效的 `TrapFrame`，
+/// 其 cs/ss 须为 Ring 3 段选择子，rflags 须含 IF=1。
+#[unsafe(naked)]
+pub extern "C" fn x86_64_enter_usermode(frame: &arch::task::TrapFrame) {
+    core::arch::naked_asm!(
+        // rdi = frame；把四个字段 push（注意栈上 iretq 帧顺序，先压 SS 最后压 RIP）
+        // frame 偏移（repr(C)）：rip=0, cs=8, rflags=16, rsp=24, ss=32
+        "mov rax, [rdi + 32]",  // ss
+        "push rax",
+        "mov rax, [rdi + 24]",  // rsp
+        "push rax",
+        "mov rax, [rdi + 16]",  // rflags
+        "push rax",
+        "mov rax, [rdi + 8]",   // cs
+        "push rax",
+        "mov rax, [rdi + 0]",   // rip
+        "push rax",
+        "iretq",                // 弹出 RIP/CS/RFLAGS/RSP/SS → 切到 Ring 3
+    );
+}
+
+/// 在架构初始化时注入 switch_to / enter_usermode 实现。
 pub fn init() {
     arch::task::set_switch_to(x86_switch_to);
+    arch::task::set_enter_usermode(x86_64_enter_usermode);
 }

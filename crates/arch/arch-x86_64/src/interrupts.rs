@@ -53,6 +53,8 @@ impl IdtEntry {
 const IDT_FLAG_INTERRUPT: u8 = 0x8E;
 /// 陷阱门（从用户态不可访问）
 const IDT_FLAG_TRAP: u8 = 0x8F;
+/// 陷阱门（DPL=3，用户态可触发；供软中断/系统调用使用）
+const IDT_FLAG_TRAP_USER: u8 = 0xEF;
 
 /// IDT（256 个条目）。
 #[repr(C, packed)]
@@ -142,8 +144,8 @@ global_asm!(
         .global isr_\num
         .type isr_\num, @function
     isr_\num:
-        .byte 0x6a, 0          // push 0  (错误码占位)
-        .byte 0x6a, \num       // push 中断号
+        .byte 0x6a, 0              // push 0  (错误码占位)
+        .byte 0x68, \num, 0, 0, 0   // push 中断号 (imm32)
         jmp interrupt_common_stub
     .endm
 
@@ -152,7 +154,7 @@ global_asm!(
         .global isr_\num
         .type isr_\num, @function
     isr_\num:
-        .byte 0x6a, \num       // push 中断号
+        .byte 0x68, \num, 0, 0, 0   // push 中断号 (imm32)
         jmp interrupt_common_stub
     .endm
 
@@ -206,6 +208,9 @@ global_asm!(
     isr_noerr 45
     isr_noerr 46
     isr_noerr 47
+
+    // 软件中断 0x80（无错误码）：用户态软中断/系统调用入口（M2.5.4 / M3）。
+    isr_noerr 128
 
     .global x86_64_load_idt
     x86_64_load_idt:
@@ -325,6 +330,19 @@ pub fn register_page_fault_handler(h: PageFaultHandler) {
     let _ = PAGE_FAULT_HANDLER.call_once(|| h);
 }
 
+/// 软中断（vector 0x80）处理函数。
+///
+/// 由 `int 0x80`（用户态或内核态）触发进入。参数为进入时的中断帧
+/// （含用户/内核的 RIP/CS/RFLAGS/RSP/SS）。返回 `true` 表示已处理并继续
+/// （`iretq` 返回触发点）；`false` 表示未处理（保留停机行为）。
+pub type SoftInterruptHandler = extern "C" fn(&mut InterruptFrame) -> bool;
+static SOFT_INT_HANDLER: spin::Once<SoftInterruptHandler> = spin::Once::new();
+
+/// 注册软中断（vector 0x80）处理回调。
+pub fn register_soft_interrupt_handler(h: SoftInterruptHandler) {
+    let _ = SOFT_INT_HANDLER.call_once(|| h);
+}
+
 /// 分发入口（由汇编 `interrupt_common_stub` 调用）。
 ///
 /// `frame` 指向保存的寄存器区。
@@ -362,6 +380,15 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         }
         klib::logln!("==================================");
         crate::halt_forever();
+    } else if vector == 0x80 {
+        // 软中断：交给已注册的 handler（M2.5.4 进入用户态冒烟 / M3 syscall 雏形）。
+        if let Some(h) = SOFT_INT_HANDLER.get() {
+            if h(frame) {
+                return; // 已处理，iretq 返回触发点
+            }
+        }
+        klib::logln!("========== UNHANDLED SOFT INTERRUPT (0x80) ==========");
+        crate::halt_forever();
     } else {
         // 外部中断（32..47 → IRQ0..15）
         let irq = (vector - 32) as u8;
@@ -385,8 +412,27 @@ unsafe extern "C" {
     fn x86_64_load_idt(idtr: *const Idtr);
 }
 
+/// 启用 FPU/SSE：清除 CR0.TS（Task Switched）。
+///
+/// bootloader（Limine）可能以 lazy-FPU 方式启动，CR0.TS=1。此时任何 x87/MMX/SSE
+/// 指令都会触发 #NM（Device Not Available）异常。内核未实现 FPU 惰性切换，
+/// 这里直接清除 TS，让浮点指令始终可用（单核下无需保存/恢复 FPU 状态）。
+/// 同时置 MP（monitor coprocessor）与 NE（native error），规范 FPU 行为。
+pub fn enable_fpu() {
+    unsafe {
+        let cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+        // 清 TS(bit3)，置 MP(bit1) 与 NE(bit5)
+        let new = (cr0 & !(1 << 3)) | (1 << 1) | (1 << 5);
+        core::arch::asm!("mov cr0, {}", in(reg) new, options(nomem, nostack));
+    }
+}
+
 /// 初始化 IDT：填充 0~47 号向量，然后加载。
 pub fn init() {
+    // 启用 FPU/SSE（清 CR0.TS），避免用户态/内核执行浮点指令时触发 #NM → 级联 #DF。
+    enable_fpu();
+
     unsafe {
         let idt_ptr = &raw mut IDT as *mut Idt;
 
@@ -402,6 +448,10 @@ pub fn init() {
             let handler = get_isr_addr(vector);
             (*idt_ptr).entries[vector as usize].set_handler(handler, IDT_FLAG_INTERRUPT, 0);
         }
+        // 0x80：用户态软中断（M2.5.4 / M3 syscall 入口），DPL=3 陷阱门，
+        // 用户态 `int 0x80` 可触发进入内核。
+        let handler = get_isr_addr(0x80);
+        (*idt_ptr).entries[0x80].set_handler(handler, IDT_FLAG_TRAP_USER, 0);
 
         let idtr = Idtr {
             limit: (core::mem::size_of::<Idt>() - 1) as u16,
@@ -419,6 +469,7 @@ fn get_isr_addr(vector: u16) -> u64 {
     unsafe extern "C" {
         fn isr_0();
         fn isr_1();
+        fn isr_128();
         fn isr_2();
         fn isr_3();
         fn isr_4();
@@ -475,7 +526,11 @@ fn get_isr_addr(vector: u16) -> u64 {
         isr_40, isr_41, isr_42, isr_43, isr_44, isr_45, isr_46, isr_47,
     ];
 
-    HANDLERS[vector as usize] as usize as u64
+    // 软中断向量 0x80 使用独立的 isr_128 入口。
+    if vector == 0x80 {
+        return isr_128 as *const () as usize as u64;
+    }
+    HANDLERS[vector as usize] as *const () as usize as u64
 }
 
 /// 使能中断。
@@ -494,10 +549,15 @@ pub fn halt() {
     unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
 }
 
-/// 永久停机：关中断后循环 `hlt`，永不返回。
+/// 永久停机：关中断后空转，永不返回。
+///
+/// 原实现是 `cli; hlt` 死循环。`hlt` 在关中断时会让 CPU 永久停在 HLT 状态，
+/// QEMU 不再推进指令，导致 gdb 单步/continue 永远等待（死锁）。
+/// 这里改为 `pause`（spin_loop）空转：占满 CPU 但持续执行，gdb 可随时打断，
+/// 且此前由 `interrupt_dispatch` 打印的异常信息仍会先输出到串口。
 pub fn halt_forever() -> ! {
     loop {
         disable();
-        halt();
+        core::hint::spin_loop(); // pause
     }
 }

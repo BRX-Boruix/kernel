@@ -220,6 +220,7 @@ impl X86PageTable {
         }
         Some((entries, levels - 1, levels))
     }
+
 }
 
 impl arch::ActivePageTable for X86PageTable {
@@ -285,8 +286,12 @@ impl arch::PageTable for X86PageTable {
                 let new_child = alloc_frame().ok_or("no frame for page table")?;
                 // 清零子表
                 unsafe { core::ptr::write_bytes(phys_to_virt(new_child) as *mut u64, 0, 512) };
-                // 连接：present | writable（子表本身）
-                let child_entry = new_child & ADDR_MASK | FLAG_PRESENT | FLAG_WRITABLE;
+                // 连接：present | writable |（若叶层映射是用户页，则中间层也须置 USER 位）
+                // 关键：用户态（Ring3）访问时，CPU 会检查每一级条目的 U/S 位。若中间层
+                // 条目没有 USER 位，即使叶层有 USER 位，用户态访问也会 #PF（present 但
+                // 权限不足，错误码 P=1,U/S=1）。故中间层必须继承叶层的 USER 位。
+                let user_bit = flags.bits() & FLAG_USER;
+                let child_entry = new_child & ADDR_MASK | FLAG_PRESENT | FLAG_WRITABLE | user_bit;
                 unsafe { self.table_set(table_phys, idx, child_entry) };
                 table_phys = new_child;
             } else {

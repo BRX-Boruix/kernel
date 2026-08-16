@@ -46,6 +46,46 @@ pub fn set_switch_to(f: SwitchFn) {
     SWITCH_FN.store(f as usize, Ordering::SeqCst);
 }
 
+/// 进入用户态（Ring 3）所需的完整陷阱帧。
+///
+/// 含 `iretq` 弹出的全部字段：RIP/CS/RFLAGS/RSP/SS。
+/// 平台无关抽象（ADR-007）；架构 crate 负责用这些字段构造真实的 iretq 帧。
+///
+/// - `rflags`：须含 `IF=1`（开中断）且 `IOPL=0`（禁 I/O 指令）。
+/// - `cs`/`ss`：Ring 3 段选择子（如 x86_64 的 `UCODE`/`UDATA`）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TrapFrame {
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+/// 进入用户态函数：`fn(&TrapFrame)`。由架构 crate 在早期注入（汇编实现）。
+type EnterUserFn = extern "C" fn(&TrapFrame);
+static ENTER_USER_FN: AtomicUsize = AtomicUsize::new(0);
+
+/// 注入架构的"进入用户态"实现（架构 crate 在初始化时调用）。
+pub fn set_enter_usermode(f: EnterUserFn) {
+    ENTER_USER_FN.store(f as usize, Ordering::SeqCst);
+}
+
+/// 通过 `iretq` 进入用户态执行 `frame` 描述的程序。
+///
+/// 永不返回（用户态退出时通过中断/异常回到内核）。若未注入实现则 panic。
+#[inline(never)]
+pub fn enter_usermode(frame: &TrapFrame) -> ! {
+    let f = ENTER_USER_FN.load(Ordering::SeqCst);
+    if f == 0 {
+        panic!("arch::enter_usermode not injected");
+    }
+    let f: EnterUserFn = unsafe { core::mem::transmute(f) };
+    f(frame);
+    unreachable!("enter_usermode returned")
+}
+
 /// 在两个任务上下文之间切换。
 ///
 /// 保存当前 CPU 状态到 `prev`，恢复 `next` 的状态并继续执行。
