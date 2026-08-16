@@ -18,22 +18,24 @@ const PADDING_REGIONS: usize = 16;
 
 impl LazyBuddyAllocator {
     // Helper to find contiguous memory for metadata structures (O(N))
+    //
+    // 返回 (map_paddr, uninit_paddr, pool_paddr)。
+    // 不再分配 `counts`（每帧 2 字节、按全物理地址跨度预留的数组）——它从未被
+    // 运行时代码读取，纯属预留占位，且在高地址机器上是元数据爆炸的主因之一。
     fn find_metadata_storage(
         mmap: &[NonNullPtr<MemmapEntry>],
         metadata_map_size: usize,
         uninit_regions_size: usize,
         metadata_pool_size: usize,
-        counts_size: usize,
-    ) -> (usize, usize, usize, usize) {
+    ) -> (usize, usize, usize) {
         const MIN_METADATA_BASE: usize = 0x0010_0000; // 1MiB guard to avoid low memory/HHDM corner cases
         let entries = mmap.iter().map(|e| unsafe { &*e.as_ptr() });
 
         let total_size = align_4k(metadata_map_size)
-            + align_4k(uninit_regions_size)
-            + align_4k(counts_size)
-            + align_4k(metadata_pool_size);
+            .saturating_add(align_4k(uninit_regions_size))
+            .saturating_add(align_4k(metadata_pool_size));
         let map_uninit_size =
-            align_4k(metadata_map_size) + align_4k(uninit_regions_size) + align_4k(counts_size);
+            align_4k(metadata_map_size).saturating_add(align_4k(uninit_regions_size));
 
         let mut best_total: Option<(usize, usize)> = None;
         let mut best_pool: Option<(usize, usize)> = None;
@@ -70,14 +72,13 @@ impl LazyBuddyAllocator {
 
         if let Some((base, avail)) = best_total {
             let map_paddr = align_4k(base);
-            let uninit_paddr = align_4k(map_paddr + metadata_map_size);
-            let counts_paddr = align_4k(uninit_paddr + uninit_regions_size);
-            let pool_paddr = align_4k(counts_paddr + counts_size);
-            let end = pool_paddr + metadata_pool_size;
+            let uninit_paddr = align_4k(map_paddr.saturating_add(metadata_map_size));
+            let pool_paddr = align_4k(uninit_paddr.saturating_add(uninit_regions_size));
+            let end = pool_paddr.saturating_add(metadata_pool_size);
             if end > base + avail {
                 panic!("PMM: metadata placement exceeds region bounds");
             }
-            return (map_paddr, uninit_paddr, pool_paddr, counts_paddr);
+            return (map_paddr, uninit_paddr, pool_paddr);
         }
 
         let (pool_base, _pool_len) = best_pool.unwrap_or_else(|| {
@@ -114,15 +115,14 @@ impl LazyBuddyAllocator {
         }
 
         let map_paddr = align_4k(map_base);
-        let uninit_paddr = align_4k(map_paddr + metadata_map_size);
-        let counts_paddr = align_4k(uninit_paddr + uninit_regions_size);
-        let map_end = counts_paddr + counts_size;
+        let uninit_paddr = align_4k(map_paddr.saturating_add(metadata_map_size));
+        let map_end = uninit_paddr.saturating_add(uninit_regions_size);
         if map_end > map_base + map_avail {
             panic!("PMM: metadata map/uninit placement exceeds region bounds");
         }
         let pool_paddr = align_4k(pool_base);
 
-        (map_paddr, uninit_paddr, pool_paddr, counts_paddr)
+        (map_paddr, uninit_paddr, pool_paddr)
     }
 
     /// Initialize the allocator with Limine memory map
@@ -135,8 +135,8 @@ impl LazyBuddyAllocator {
         let entries_iter = mmap.iter().map(|e| &*e.as_ptr());
 
         // 1. Calculate physical memory bounds and count usable regions
-        let mut max_phys_addr = 0;
-        let mut usable_regions_count = 0;
+        let mut max_phys_addr: u64 = 0;
+        let mut usable_regions_count: usize = 0;
 
         for entry in entries_iter.clone() {
             if entry.typ == MemoryMapEntryType::Usable {
@@ -181,14 +181,15 @@ impl LazyBuddyAllocator {
                 .saturating_add((last - first + 1).min(metadata_map_len.saturating_sub(first)));
         }
 
-        // Calculate sizes for arrays
-        let metadata_map_size = metadata_map_len * size_of::<usize>(); // pointer size
-        let max_uninit_regions = usable_regions_count * 2 + PADDING_REGIONS;
-        let uninit_regions_size = max_uninit_regions * size_of::<Option<UninitRegion>>();
+        // Calculate sizes for arrays.
+        // 用 saturating 运算防御极端内存映射下的 usize 溢出。
+        // 注意：不再分配 `counts` 数组（见 find_metadata_storage 注释）。
+        let metadata_map_size = metadata_map_len.saturating_mul(size_of::<usize>()); // pointer size
+        let max_uninit_regions = usable_regions_count.saturating_mul(2) + PADDING_REGIONS;
+        let uninit_regions_size = max_uninit_regions.saturating_mul(size_of::<Option<UninitRegion>>());
         // metadata 池只按实际 usable 内存覆盖的 block 数分配（含少量上浮余量）
         let metadata_pool_blocks = needed_blocks + PADDING_REGIONS;
-        let metadata_pool_size = metadata_pool_blocks * 4096; // one 4K block per metadata block
-        let counts_size = total_frames * size_of::<core::sync::atomic::AtomicU16>();
+        let metadata_pool_size = metadata_pool_blocks.saturating_mul(4096); // one 4K block per metadata block
 
         logln!(
             "PMM: Total RAM: {} MB, Frames: {}, Metadata Pool: {} KB",
@@ -198,12 +199,11 @@ impl LazyBuddyAllocator {
         );
 
         // 2. Allocate metadata map array, uninit regions array, and metadata pool
-        let (map_paddr, uninit_paddr, pool_paddr, counts_paddr) = Self::find_metadata_storage(
+        let (map_paddr, uninit_paddr, pool_paddr) = Self::find_metadata_storage(
             mmap,
             metadata_map_size,
             uninit_regions_size,
             metadata_pool_size,
-            counts_size,
         );
         if map_paddr == 0 {
             panic!("PMM: metadata map placed at paddr 0");
@@ -212,7 +212,6 @@ impl LazyBuddyAllocator {
         // Calculate reserved ranges for metadata structures
         let map_end = map_paddr + metadata_map_size;
         let uninit_end = uninit_paddr + uninit_regions_size;
-        let counts_end = counts_paddr + counts_size;
         let pool_end = pool_paddr + metadata_pool_size;
 
         // Initialize pointers
@@ -232,10 +231,6 @@ impl LazyBuddyAllocator {
         for r in uninit_regions.iter_mut() {
             *r = None;
         }
-
-        // Initialize counts array (保留占位，页面计数留到虚拟内存阶段)
-        let counts_ptr = (phys_offset + counts_paddr as u64) as *mut core::sync::atomic::AtomicU16;
-        core::ptr::write_bytes(counts_ptr, 0, total_frames);
 
         self.config.call_once(|| AllocatorConfig {
             total_frames,
@@ -258,7 +253,6 @@ impl LazyBuddyAllocator {
         let mut reserved = [
             (map_paddr, map_end),
             (uninit_paddr, uninit_end),
-            (counts_paddr, counts_end),
             (pool_paddr, pool_end),
         ];
         reserved.sort_unstable_by_key(|r| r.0);
