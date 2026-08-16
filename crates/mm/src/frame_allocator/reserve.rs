@@ -4,7 +4,7 @@
 
 use core::sync::atomic::Ordering;
 
-use klib::logln;
+use klib::{info, warn};
 
 use super::allocator_core::{FrameState, ORDER_4K};
 use super::LazyBuddyAllocator;
@@ -58,9 +58,9 @@ impl LazyBuddyAllocator {
             }
         }
         if added > 0 {
-            logln!("PMM: Reserved {} emergency pages", added);
+            info!("PMM: Reserved {} emergency pages", added);
         } else {
-            logln!("PMM: WARNING Failed to reserve emergency pages");
+            warn!("PMM: Failed to reserve emergency pages");
         }
     }
 }

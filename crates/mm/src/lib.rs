@@ -63,7 +63,7 @@ pub fn init() {
     } else {
         panic!("Failed to get HHDM response from Limine");
     };
-    klib::logln!("[mm] HHDM offset: {:#x}", phys_offset);
+    klib::info!("[mm] HHDM offset: {:#x}", phys_offset);
 
     // 2. Initialize Frame Allocator
     if let Some(memmap_resp) = MEMMAP_REQUEST.get_response().get() {
@@ -84,5 +84,5 @@ pub fn init() {
     //    否则 `allocate_frame` 会因缓存未初始化而 panic。
     frame_allocator::init_percpu_caches(cpu_count());
 
-    klib::logln!("[mm] memory manager initialized");
+    klib::info!("[mm] memory manager initialized");
 }

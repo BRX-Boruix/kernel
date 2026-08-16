@@ -91,7 +91,7 @@ pub fn requested_cpu_count() -> usize {
 
 /// 输出"p1 + v1 + p2 + v2"（单次串口写）。
 fn klog_combined(p1: &str, v1: u32, p2: &str, v2: u64) {
-    klib::logln!("{}{}{}{}", p1, v1, p2, v2);
+    klib::info!("{}{}{}{}", p1, v1, p2, v2);
 }
 
 /// 获取当前已启动的 CPU 数。
@@ -119,7 +119,7 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
 
     // 防御：槽位非法/越界则停机，避免访问动态资源越界
     if slot == 0 {
-        klib::log_dec!("[smp] AP slot invalid (0): lapic=", lapic_id as u64);
+        klib::info!("[smp] AP slot invalid (0): lapic={}", lapic_id as u64);
         loop {
             crate::interrupts::halt();
         }
@@ -128,13 +128,13 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
 
     let resources = AP_RESOURCES.lock();
     let Some(res) = resources.as_ref() else {
-        klib::logln!("[smp] AP resources not initialized");
+        klib::info!("[smp] AP resources not initialized");
         loop {
             crate::interrupts::halt();
         }
     };
     if arr_idx >= res.kstack_paddrs.len() {
-        klib::log_dec!("[smp] AP slot out of range: ", slot as u64);
+        klib::info!("[smp] AP slot out of range: {}", slot as u64);
         loop {
             crate::interrupts::halt();
         }
@@ -164,7 +164,7 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
     CPU_COUNT.fetch_add(1, Ordering::AcqRel);
 
     // 一次 write_str 完整打印，避免与其他 CPU 交错
-    klib::log_dec!("[smp] AP online, lapic_id=", lapic_id);
+    klib::info!("[smp] AP online, lapic_id={}", lapic_id);
 
     // AP 空闲循环
     loop {
@@ -178,7 +178,7 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
 pub fn init() {
     // 获取 SMP 响应
     let Some(resp) = SMP_REQUEST.get_response().get() else {
-        klib::logln!("[smp] no SMP response");
+        klib::info!("[smp] no SMP response");
         return;
     };
 
@@ -204,7 +204,7 @@ pub fn init() {
         let t = alloc_stack_frames(ONE_FRAME_ORDER);
         if k == 0 || d == 0 || g == 0 || t == 0 {
             // 物理内存不足：打印后仅初始化已分配的部分（记录到 TOTAL_CPUS）
-            klib::logln!("[smp] WARNING: out of physical frames for AP resources");
+            klib::info!("[smp] WARNING: out of physical frames for AP resources");
             break;
         }
         kstack_paddrs.push(k);
@@ -214,8 +214,7 @@ pub fn init() {
     }
     let real_ap = kstack_paddrs.len();
     if real_ap < ap_count {
-        klib::log_dec!("[smp] only ", real_ap as u64);
-        klib::logln!(" AP resources allocated");
+        klib::info!("[smp] only {} AP resources allocated", real_ap as u64);
     }
 
     // 初始化每个 AP 的 GDT/TSS 物理帧（写入初始值，供 AP 使用）。
@@ -271,13 +270,13 @@ pub fn init() {
         next_slot += 1;
         if slot > real_ap {
             // 防御：实际 AP 数超过已分配资源（物理内存不足时可能发生），跳过
-            klib::log_dec!("[smp] skipping AP lapic_id=", this_lapic);
+            klib::info!("[smp] skipping AP lapic_id={}", this_lapic);
             continue;
         }
         // 把槽位传给 AP（extra_argument），并写入 goto_address
         info.extra_argument = slot as u64;
         info.goto_address = ap_entry;
-        klib::log_dec!("[smp] fired AP lapic_id=", this_lapic);
+        klib::info!("[smp] fired AP lapic_id={}", this_lapic);
     }
 }
 

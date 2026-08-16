@@ -161,8 +161,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let mut buf = [0u8; 2048];
     let msg = build_msg(&mut buf, info);
 
-    // 1. 回退串口：绕过 klib OUTPUT，确保早期 panic 可见。
-    //    注意：只走这一条串口通道（不再用 klib::logln），因为两者最终指向同一
+    // 1. 回退串口：绕过 klib console 层，确保早期 panic 可见。
+    //    注意：只走这一条串口通道（不再用 klib::info!），因为两者最终指向同一
     //    串口，重复调用会打印两遍。
     let mut bt = [0u8; 4096];
     let bt = write_backtrace(&mut bt);

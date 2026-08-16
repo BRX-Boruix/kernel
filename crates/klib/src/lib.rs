@@ -11,4 +11,5 @@
 pub mod allocator;
 pub mod console;
 pub mod format;
+pub mod log;
 pub mod serial;

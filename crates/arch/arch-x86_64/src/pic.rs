@@ -95,10 +95,10 @@ pub fn end_of_interrupt(irq: u8) {
 pub fn init() {
     if apic_enabled() {
         set_mask(0xFFFF); // 屏蔽所有 IRQ
-        klib::logln!("[pic] APIC enabled, skipping 8259 remap (IRQs masked)");
+        klib::info!("[pic] APIC enabled, skipping 8259 remap (IRQs masked)");
     } else {
         remap();
         set_mask(0xFFFF);
-        klib::logln!("[pic] 8259 remapped to vectors 32-47");
+        klib::info!("[pic] 8259 remapped to vectors 32-47");
     }
 }

@@ -119,7 +119,7 @@ fn end_of_interrupt() {
 extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
     let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if t <= 5 {
-        klib::logln!("[lapic] tick");
+        klib::info!("[lapic] tick");
     }
     end_of_interrupt();
     true
@@ -185,10 +185,10 @@ pub fn init() {
 
     // 把 LAPIC 物理地址映射到高半区虚拟地址
     if !mmio::map_lapic(phys, virt) {
-        klib::logln!("[lapic] map failed");
+        klib::info!("[lapic] map failed");
         return;
     }
-    klib::log_hex!("[lapic] mapped to ", virt);
+    klib::info!("[lapic] mapped to {:#x}", virt);
 
     // 1. 使能 LAPIC（SVR，向量 0xFF）
     lapic_rmw(LAPIC_SVR, 0x100, 0x100 | 0xFF);
@@ -196,13 +196,13 @@ pub fn init() {
     // 2. 校准 LAPIC 总线频率（用 PIT 实测，而非硬编码）
     let bus_freq = calibrate_bus_freq();
     let bus_freq = if bus_freq == 0 {
-        klib::logln!(
+        klib::info!(
             "[lapic] WARNING: PIT calibration failed, falling back to {} Hz",
             DEFAULT_BUS_FREQ_HZ
         );
         DEFAULT_BUS_FREQ_HZ
     } else {
-        klib::logln!("[lapic] calibrated LAPIC bus freq = {} Hz", bus_freq);
+        klib::info!("[lapic] calibrated LAPIC bus freq = {} Hz", bus_freq);
         bus_freq
     };
 
@@ -223,5 +223,5 @@ pub fn init() {
     // 标记 LAPIC 已可用（串口锁依赖 LAPIC id 做多核 owner 判断）
     serial::set_lapic_ready();
 
-    klib::logln!("[lapic] LAPIC timer initialized");
+    klib::info!("[lapic] LAPIC timer initialized");
 }

@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use flanterm_rust::FlantermContext;
-use klib::logln;
+use klib::{error, info};
 
 /// 全局 framebuffer 终端上下文指针（由 `init` 保存，未初始化时为 0）。
 ///
@@ -21,7 +21,7 @@ static TERMINAL_PTR: AtomicUsize = AtomicUsize::new(0);
 pub fn init(fb: &limine::Framebuffer) {
     // framebuffer 地址（u32*）与参数
     let Some(addr) = fb.address.as_ptr() else {
-        logln!("[terminal] ERROR: framebuffer address is null");
+        error!("[terminal] ERROR: framebuffer address is null");
         return;
     };
     let fb_ptr = addr as *mut u32;
@@ -37,7 +37,7 @@ pub fn init(fb: &limine::Framebuffer) {
     let bms = fb.blue_mask_size;
     let bsh = fb.blue_mask_shift;
 
-    logln!(
+    info!(
         "[terminal] init fb={:#x} {}x{} pitch={} bpp={}",
         fb_ptr as usize, width, height, pitch, fb.bpp
     );
@@ -60,7 +60,7 @@ pub fn init(fb: &limine::Framebuffer) {
             flanterm_rust::FLANTERM_FB_ROTATE_0,
         )
     };
-    logln!("[terminal] flanterm_fb_init done, ctx.is_some={}", ctx.is_some());
+    info!("[terminal] flanterm_fb_init done, ctx.is_some={}", ctx.is_some());
 
     if let Some(ctx) = ctx {
         // leak 为 'static，供 panic 等全局场景使用
@@ -69,9 +69,9 @@ pub fn init(fb: &limine::Framebuffer) {
         // 写入文本
         write_str("Hello, BORUIX!\r\n");
         write_str("Kernel M0 is running.\r\n");
-        logln!("[terminal] wrote text done");
+        info!("[terminal] wrote text done");
     } else {
-        logln!("[terminal] ERROR: flanterm_fb_init returned None");
+        error!("[terminal] ERROR: flanterm_fb_init returned None");
     }
 }
 

@@ -4,7 +4,7 @@
 
 use core::sync::atomic::Ordering;
 
-use klib::logln;
+use klib::warn;
 
 use super::allocator_core::{for_each_global_list, MAX_ORDER};
 use super::{ALLOCATOR, LazyBuddyAllocator, PER_CPU};
@@ -67,7 +67,7 @@ impl LazyBuddyAllocator {
         if after > before {
             self.compact_success.fetch_add(1, Ordering::Relaxed);
         }
-        logln!("PMM: WARNING compact triggered drained={}", drained);
+        warn!("PMM: compact triggered drained={}", drained);
     }
 }
 

@@ -2,7 +2,7 @@
 
 use core::sync::atomic::Ordering;
 
-use klib::logln;
+use klib::warn;
 
 use arch::PhysFrame;
 
@@ -66,14 +66,14 @@ impl LazyBuddyAllocator {
         let cfg = self.config();
 
         if pfn >= cfg.total_frames {
-            logln!("PMM: WARNING Deallocate out of bounds pfn {}", pfn);
+            warn!("PMM: Deallocate out of bounds pfn {}", pfn);
             return;
         }
 
         // 无元数据（孔洞）检查：必须在读取帧元数据前完成，避免空指针解引用。
         let block_idx = pfn / cfg.frames_per_block;
         if unsafe { self.block_ptr(block_idx) }.is_null() {
-            logln!("PMM: WARNING Deallocate frame with no metadata (hole?): pfn {}", pfn);
+            warn!("PMM: Deallocate frame with no metadata (hole?): pfn {}", pfn);
             return;
         }
 
@@ -82,8 +82,8 @@ impl LazyBuddyAllocator {
         let order = match self.deallocate_checked(pfn) {
             Some(order) => order,
             None => {
-                logln!(
-                    "PMM: WARNING Double free or invalid free at pfn {}",
+                warn!(
+                    "PMM: Double free or invalid free at pfn {}",
                     pfn
                 );
                 return;

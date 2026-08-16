@@ -12,6 +12,7 @@
 //!   要求"各自完整"，相互顺序不作强保证。
 //! - 注册只发生在初始化早期，之后只有读操作，无并发写竞争。
 
+use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// 输出 sink：接收整串文本（含 `\n`，`\r\n` 转换由 sink 自行处理）。
@@ -57,5 +58,33 @@ pub fn write_str(s: &str) {
             // 仅初始化期写入了真实函数指针，此处读取安全。
             unsafe { core::mem::transmute::<usize, SinkFn>(v)(s) };
         }
+    }
+}
+
+/// 把 `fmt::Arguments` 格式化后输出到所有 sink。
+///
+/// 用栈缓冲承载格式化结果（`no_std` 友好），超长内容截断。
+/// 日志级别宏（`info!`/`warn!`/`error!`/`debug!`）与 `format_args!`
+/// 调用方都经此转发。
+pub fn write_fmt(args: fmt::Arguments) {
+    let mut buf = [0u8; 1024];
+    let mut w = StackWriter { buf: &mut buf, len: 0 };
+    let _ = fmt::Write::write_fmt(&mut w, args);
+    let len = w.len;
+    write_str(core::str::from_utf8(&buf[..len]).unwrap_or(""));
+}
+
+/// 栈缓冲 `fmt::Write` 实现，供 [`write_fmt`] 使用。
+struct StackWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl fmt::Write for StackWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let n = core::cmp::min(s.len(), self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
     }
 }

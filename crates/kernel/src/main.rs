@@ -10,7 +10,7 @@ mod terminal;
 mod tests;
 
 use arch::Platform;
-use klib::logln;
+use klib::{error, info};
 use limine::{BaseRevision, FramebufferRequest};
 
 use arch_x86_64::X86_64Arch as CurrentArch;
@@ -68,7 +68,7 @@ unsafe fn kmain_body() -> ! {
     // 初始化架构（串口等）
     CurrentArch::init();
     // 注册统一 console 的第一个输出 sink：架构串口（一次调用整串原子写）。
-    // 此后所有内核日志（logln!/kprintln!/log_hex! 等）先汇聚到 console 再转发。
+    // 此后所有内核日志（info!/warn!/error!/kprintln! 等）先汇聚到 console 再转发。
     klib::console::register(arch_x86_64::serial::write_str as fn(&str));
     // 注入 panic 平台辅助：回退串口（独立于 klib console 层，确保早期 panic 可见）、
     // CPU id（LAPIC 未映射时返回 0，避免读未映射寄存器二次 #PF）、屏幕输出。
@@ -77,7 +77,7 @@ unsafe fn kmain_body() -> ! {
         panic_cpu_id,
         terminal::write_str as fn(&str),
     );
-    logln!("[kmain] serial initialized (arch={})", CurrentArch::name());
+    info!("[kmain] serial initialized (arch={})", CurrentArch::name());
 
     // 注册页错误（#PF）处理器：缺页时按需补页（M1.3 demand paging）。
     // 尽早注册（IDT 加载后），确保任何用户态/内核态缺页都能被处理。
@@ -118,10 +118,10 @@ unsafe fn kmain_body() -> ! {
 
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
     if let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() {
-        logln!("[kmain] framebuffer response received");
+        info!("[kmain] framebuffer response received");
         if let Some(fb) = resp.framebuffers().first() {
             let fb = &**fb; // NonNullPtr<Framebuffer> -> Framebuffer
-            logln!(
+            info!(
                 "[kmain] framebuffer {}x{} pitch={} bpp={}",
                 fb.width, fb.height, fb.pitch, fb.bpp
             );
@@ -129,19 +129,19 @@ unsafe fn kmain_body() -> ! {
             // framebuffer 终端就绪后注册为统一 console 的第二个输出 sink，
             // 此后所有内核日志同时输出到串口与屏幕。
             klib::console::register(terminal::write_str as fn(&str));
-            logln!("[kmain] terminal init returned");
+            info!("[kmain] terminal init returned");
         } else {
-            logln!("[kmain] ERROR: no framebuffer");
+            error!("[kmain] no framebuffer");
         }
     } else {
-        logln!("[kmain] ERROR: no framebuffer response");
+        error!("[kmain] no framebuffer response");
     }
 
     // 验证堆分配器（支持释放/重用）
     tests::test_heap();
 
     // 初始化 Local APIC 定时器（Limine 已启用 LAPIC，硬件中断走 APIC）
-    logln!("[kmain] enabling interrupts (LAPIC timer ~100Hz)");
+    info!("[kmain] enabling interrupts (LAPIC timer ~100Hz)");
     arch_x86_64::lapic::init();
     arch_x86_64::interrupts::enable();
 
@@ -169,14 +169,14 @@ unsafe fn kmain_body() -> ! {
     });
 
     // 初始化多核 SMP：启动所有 AP，并等待全部上线
-    logln!("[kmain] initializing SMP");
+    info!("[kmain] initializing SMP");
     arch_x86_64::smp::init();
     let total = arch_x86_64::smp::total_cpus();
     // 等待所有 AP 上线，超时 2 秒（基于 LAPIC 定时器真实时间）
     let online = arch_x86_64::smp::wait_all_online(total, 2_000);
-    logln!("[kmain] SMP done, {} cpus online (target {})", online, total);
+    info!("[kmain] SMP done, {} cpus online (target {})", online, total);
 
-    logln!("[kmain] reached idle loop");
+    info!("[kmain] reached idle loop");
     CurrentArch::halt();
 }
 

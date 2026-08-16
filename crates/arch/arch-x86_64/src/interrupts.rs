@@ -378,11 +378,11 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         }
 
         // 内核态异常（或未注册用户态处理器）：打印并停机
-        klib::logln!("");
-        klib::logln!("========== CPU EXCEPTION ==========");
-        klib::logln!("exception: {}", exception_name(vector as u8));
-        klib::logln!("  vector: {:#x}", vector);
-        klib::logln!("  rip:    {:#x}", frame.rip);
+        klib::info!("");
+        klib::info!("========== CPU EXCEPTION ==========");
+        klib::info!("exception: {}", exception_name(vector as u8));
+        klib::info!("  vector: {:#x}", vector);
+        klib::info!("  rip:    {:#x}", frame.rip);
         if vector == 14 {
             // 页错误：优先交给已注册的 #PF 回调（如按需分页）。
             // 回调约定：`fn(cr2, error_code) -> bool`（虚拟地址在前，错误码在后）。
@@ -393,15 +393,15 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
                 }
             }
             // 未注册或未处理：打印 CR2 并停机
-            klib::logln!("  cr2:    {:#x}", cr2);
-            klib::logln!("  error:  P={:#x}", frame.error_code);
+            klib::info!("  cr2:    {:#x}", cr2);
+            klib::info!("  error:  P={:#x}", frame.error_code);
         }
         if vector == 8 {
             // Double Fault：打印错误码（0 表示外部中断/软件引起的 DF）
-            klib::logln!("  error:  {:#x}", frame.error_code);
-            klib::logln!("  (Double Fault - possible kernel stack overflow)");
+            klib::info!("  error:  {:#x}", frame.error_code);
+            klib::info!("  (Double Fault - possible kernel stack overflow)");
         }
-        klib::logln!("==================================");
+        klib::info!("==================================");
         crate::halt_forever();
     } else if vector == 0x80 {
         // 软中断：交给已注册的 handler（M2.5.4 进入用户态冒烟 / M3 syscall 雏形）。
@@ -410,7 +410,7 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
                 return; // 已处理，iretq 返回触发点
             }
         }
-        klib::logln!("========== UNHANDLED SOFT INTERRUPT (0x80) ==========");
+        klib::info!("========== UNHANDLED SOFT INTERRUPT (0x80) ==========");
         crate::halt_forever();
     } else {
         // 外部中断（32..47 → IRQ0..15）

@@ -7,7 +7,7 @@ use core::mem::size_of;
 use core::slice;
 
 use limine::{MemmapEntry, MemoryMapEntryType, NonNullPtr};
-use klib::logln;
+use klib::{info, warn};
 
 use super::allocator_core::{
     align_4k, AllocatorConfig, BuddyFrame, MetadataPool, UninitRegion, L1_ENTRIES, L1_SHIFT,
@@ -207,7 +207,7 @@ impl LazyBuddyAllocator {
             .saturating_add(l1_len_for_pool.saturating_mul(l2_blocks_per_l1));
         let metadata_pool_size = metadata_pool_blocks.saturating_mul(4096); // one 4K block per metadata block
 
-        logln!(
+        info!(
             "PMM: Total RAM: {} MB, Frames: {}, Metadata Pool: {} KB",
             max_phys_addr / 1024 / 1024,
             total_frames,
@@ -316,12 +316,12 @@ impl LazyBuddyAllocator {
             }
         }
 
-        logln!(
+        info!(
             "PMM: Metadata blocks allocated: {} / {}",
             blocks_allocated,
             metadata_map_len
         );
-        logln!("PMM: Initialized with {} regions (Capacity: {})", region_idx, uninit_len);
+        info!("PMM: Initialized with {} regions (Capacity: {})", region_idx, uninit_len);
 
         {
             let mut uninit = self.uninit.lock();
@@ -402,7 +402,7 @@ impl LazyBuddyAllocator {
                     uninit_regions[*region_idx] = Some(UninitRegion { start_pfn, end_pfn });
                     *region_idx += 1;
                 } else {
-                    logln!("PMM: WARNING Dropping usable memory region (uninit regions full)");
+                    warn!("PMM: Dropping usable memory region (uninit regions full)");
                 }
             }
         }

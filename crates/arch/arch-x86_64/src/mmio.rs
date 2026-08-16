@@ -74,7 +74,7 @@ pub fn write_cr3(val: u64) {
 pub fn map_lapic(phys: u64, virt: u64) -> bool {
     // 物理地址须 2MB 对齐
     if phys & (PAGE_2M - 1) != 0 || virt & (PAGE_2M - 1) != 0 {
-        klib::logln!("[mmio] unaligned map");
+        klib::info!("[mmio] unaligned map");
         return false;
     }
 
@@ -92,7 +92,7 @@ pub fn map_lapic(phys: u64, virt: u64) -> bool {
         } else {
             // 分配新页表页并清零
             let Some(new) = crate::paging::alloc_frame() else {
-                klib::logln!("[mmio] level {} no frame for page table", lvl);
+                klib::info!("[mmio] level {} no frame for page table", lvl);
                 return false;
             };
             unsafe {
