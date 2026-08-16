@@ -10,8 +10,22 @@ use super::percpu_cache::FreeList;
 use super::LazyBuddyAllocator;
 
 impl LazyBuddyAllocator {
+    /// 帧 → shard 的"分组粒度"：同一 (pfn>>SHARD_PFN_SHIFT) 区间内的帧共享同一 shard。
+    ///
+    /// 关键不变量：buddy 对 (pfn, pfn ^ (1<<order)) 仅在 bit `order` 上相异。
+    /// 当 `order < SHARD_PFN_SHIFT` 时，翻转该低位不改变高位 `pfn >> SHARD_PFN_SHIFT`，
+    /// 因此一对 buddy **必然落在同一 shard**。这使 `free_and_merge` 的
+    /// "检查 buddy 状态 → 从链表摘除 → 合并后挂回"能在同一把 shard 锁内原子完成，
+    /// 从根本上消除跨 shard 合并的 TOCTOU 竞态（否则相邻 4K 帧几乎总跨 shard，
+    /// 既引发并发竞态窗口，又令大量 order-0 合并跨锁串行）。
+    ///
+    /// 取 12 覆盖 order 0..11（最高 8MiB 块）的合并始终同 shard；
+    /// order ≥ 12 的超大块理论上仍可跨 shard，但其合并本就安全（仅靠 Freeing 态守卫，
+    /// 不会损坏链表），且极少触发，故无需特殊处理。
+    const SHARD_PFN_SHIFT: usize = 12;
+
     fn shard_for_pfn(pfn: usize) -> usize {
-        pfn % SHARD_COUNT
+        (pfn >> Self::SHARD_PFN_SHIFT) % SHARD_COUNT
     }
 
     fn shard_for_cpu(cpu: usize) -> usize {
@@ -161,6 +175,12 @@ impl LazyBuddyAllocator {
                 break;
             }
 
+            // 由 `shard_for_pfn` 的不变量，当 `order < SHARD_PFN_SHIFT` 时
+            // `shard_for_pfn(buddy_pfn) == shard_for_pfn(pfn)`，本次摘除与最终的
+            // `push_to_global(pfn, order)` 落在同一把 shard 锁内，合并原子、无跨锁竞态。
+            // order ≥ SHARD_PFN_SHIFT 的超大块虽可能跨 shard，但 buddy 摘除与挂回均各自
+            // 在对应列表锁保护下完成，且被释放帧处于 `Freeing` 瞬态（见 `deallocate_checked`），
+            // 不会损坏链表、亦不会被并发路径误合并。
             let shard = Self::shard_for_pfn(buddy_pfn);
             let mut list = self.lock_global_list(order, shard);
             unsafe {
