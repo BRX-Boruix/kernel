@@ -6,6 +6,7 @@
 //! - 支持注册外部中断处理函数（当前提供定时器 PIT 的中断）。
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// 内核代码段选择子（加载 IDT 描述符时使用）。
 use crate::gdt::{IST_DF, KCODE};
@@ -288,13 +289,24 @@ pub struct InterruptFrame {
 /// 外部中断处理函数（IRQ）。返回 `true` 表示已处理。
 pub type IrqHandler = extern "C" fn(u8) -> bool;
 
-static IRQ_HANDLERS: spin::Mutex<[Option<IrqHandler>; 16]> =
-    spin::Mutex::new([None; 16]);
+/// 外部中断处理函数表（IRQ0~15）。
+///
+/// 采用无锁的原子函数指针表，而非 `spin::Mutex`：因为 `interrupt_dispatch`
+/// 运行于**中断上下文**，若某 IRQ 打断同 CPU 正在持有该锁的代码，非可重入的
+/// 自旋锁会永远自旋 → 死锁。原子表以 `load(Acquire)` 读、`store(Release)` 写，
+/// 处理函数均为 `'static` 且只在中断使能前注册一次，故安全无锁。
+///
+/// 取值为 0 表示未注册；合法函数地址不可能为 0，因此可兼作“空”标记。
+static IRQ_HANDLERS: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 
 /// 注册外部中断（IRQ0~15）的处理函数。
+///
+/// 处理函数须为 `'static`（当前为 `extern "C"` 静态函数），且永不注销，
+/// 以保证中断上下文无锁读取时指针始终有效。
 pub fn register_irq(irq: u8, handler: IrqHandler) {
     if irq < 16 {
-        IRQ_HANDLERS.lock()[irq as usize] = Some(handler);
+        let ptr = handler as usize; // x86_64 下函数指针与 usize 等宽
+        IRQ_HANDLERS[irq as usize].store(ptr, Ordering::Release);
     }
 }
 
@@ -353,9 +365,14 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
     } else {
         // 外部中断（32..47 → IRQ0..15）
         let irq = (vector - 32) as u8;
-        let handled = IRQ_HANDLERS.lock()[irq as usize]
-            .map(|h| h(irq))
-            .unwrap_or(false);
+        let handler_ptr = IRQ_HANDLERS[irq as usize].load(Ordering::Acquire);
+        let handled = if handler_ptr == 0 {
+            false
+        } else {
+            // 指针来自 register_irq 写入的合法 'static 函数地址，读回安全。
+            let h = unsafe { core::mem::transmute::<usize, IrqHandler>(handler_ptr) };
+            h(irq)
+        };
         if !handled {
             // 未注册的 IRQ：直接 EOI
             crate::pic::end_of_interrupt(irq);
