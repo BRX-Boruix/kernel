@@ -300,7 +300,7 @@ pub fn register_irq(irq: u8, handler: IrqHandler) {
 
 /// 页错误（#PF, 14 号异常）回调。
 ///
-/// 参数为 (错误码, CR2 线性地址)。返回 `true` 表示已处理（如按需补页后），
+/// 参数为 (CR2 线性地址, 错误码)。返回 `true` 表示已处理（如按需补页后），
 /// 继续执行；返回 `false` 表示未处理（内核态缺页/非法访问），保持原停机行为。
 ///
 /// 由虚拟内存/进程子系统注册（M1.3 按需分页）。`arch` 层只提供钩子，
@@ -332,9 +332,10 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         klib::logln!("  rip:    {:#x}", frame.rip);
         if vector == 14 {
             // 页错误：优先交给已注册的 #PF 回调（如按需分页）。
+            // 回调约定：`fn(cr2, error_code) -> bool`（虚拟地址在前，错误码在后）。
             let cr2 = crate::mmio::cr2();
             if let Some(h) = PAGE_FAULT_HANDLER.get() {
-                if h(frame.error_code, cr2) {
+                if h(cr2, frame.error_code) {
                     return; // 已处理（如补页成功），返回用户态/内核态继续
                 }
             }

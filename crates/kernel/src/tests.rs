@@ -146,6 +146,92 @@ pub fn test_user_address_space() {
     logln!("[test-user-space] PASS");
 }
 
+// ---- M1.3 按需分页测试 ----
+
+/// 当前测试用户地址空间指针（M1 简化：单地址空间，M3 后改为进程结构）。
+static TEST_FAULT_US: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// #PF 回调：转发给当前测试用户地址空间的 `handle_page_fault`。
+extern "C" fn test_fault_handler(vaddr: u64, error_code: u64) -> bool {
+    let ptr = TEST_FAULT_US.load(core::sync::atomic::Ordering::SeqCst);
+    if ptr == 0 {
+        return false;
+    }
+    let us = unsafe { &mut *(ptr as *mut mm::user_space::UserAddressSpace<X86PageTable>) };
+    us.handle_page_fault(vaddr, error_code)
+}
+
+/// 空 #PF 回调（测试结束清理用）。
+extern "C" fn noop_fault_handler(_vaddr: u64, _error_code: u64) -> bool {
+    false
+}
+
+/// M1.3：验证按需分页（demand paging）。
+///
+/// 流程：
+/// 1. 创建用户地址空间，`reserve_user` 声明一段**预留但未映射**区域（present=0）。
+/// 2. 注册 #PF 回调（指向该地址空间），激活其页表。
+/// 3. **真实访问预留地址触发 #PF** → #PF 入口 → `handle_page_fault` 按需补页 → 重试成功。
+/// 4. 验证翻译命中、内容可写；非法访问（未预留）返回 false。
+pub fn test_demand_paging() {
+    use core::sync::atomic::Ordering;
+
+    let mut us = mm::user_space::UserAddressSpace::<X86PageTable>::new().expect("new us");
+    // 预留一段 4 页区域（present=0，访问时补页）
+    let start = VirtAddr::new(0x0000_0000_6000_0000);
+    let end = VirtAddr::new(0x0000_0000_6000_4000);
+    us.reserve_user(start, end, PageSize::Size4K, PageFlags::empty().writable())
+        .expect("reserve_user");
+    logln!(
+        "[test-demand] reserved {}..{} areas={} (unmapped)",
+        start.as_u64(),
+        end.as_u64(),
+        us.area_count()
+    );
+
+    // 预留区域尚未映射
+    assert!(us.translate(start).is_none(), "reserved page should be unmapped");
+
+    // 设置当前地址空间 + 注册 #PF 回调
+    let us_ptr = &mut us as *mut mm::user_space::UserAddressSpace<X86PageTable> as usize;
+    TEST_FAULT_US.store(us_ptr, Ordering::SeqCst);
+    mm::user_space::set_page_fault_handler(test_fault_handler);
+
+    // 激活用户页表，真实访问预留地址 → 触发 #PF → 按需补页
+    us.activate();
+    logln!("[test-demand] accessing reserved addr (will #PF -> demand map)...");
+    // 读预留页：present=0 → #PF → handler 补页 → 重试成功，读到 0
+    let val = unsafe { core::ptr::read_volatile(start.as_u64() as *const u32) };
+    logln!("[test-demand] read reserved addr -> {:#x} (mapped on demand)", val);
+    assert_eq!(val, 0);
+
+    // 翻译应命中
+    let phys = us.translate(start).expect("translated after demand map");
+    logln!("[test-demand] translate -> {:#x}", phys.as_u64());
+
+    // 可写
+    unsafe { core::ptr::write_volatile(start.as_u64() as *mut u32, 0xCAFE) };
+    let v2 = unsafe { core::ptr::read_volatile(start.as_u64() as *const u32) };
+    assert_eq!(v2, 0xCAFE);
+    logln!("[test-demand] write/read -> {:#x}", v2);
+
+    // 非法访问（未预留地址）：handler 应返回 false
+    let bad = 0x0000_0000_7000_0000u64;
+    let ok = mm::user_space::page_fault_entry(bad, 0);
+    logln!("[test-demand] illegal access handled? {}", ok);
+    assert!(!ok, "unreserved access must be rejected");
+
+    // 切回内核页表
+    X86PageTable::current().activate();
+    mm::user_space::set_page_fault_handler(noop_fault_handler);
+    TEST_FAULT_US.store(0, Ordering::SeqCst);
+
+    // 回收按需分页补的页
+    us.unmap_area_pages(0);
+    logln!("[test-demand] PASS");
+}
+
 /// 验证堆分配器的分配/释放/重用逻辑。
 pub fn test_heap() {
     use alloc::boxed::Box;

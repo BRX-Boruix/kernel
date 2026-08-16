@@ -69,6 +69,10 @@ unsafe fn kmain_body() -> ! {
     klib::serial::set_output(arch_x86_64::serial::write_str as fn(&str));
     logln!("[kmain] serial initialized (arch={})", CurrentArch::name());
 
+    // 注册页错误（#PF）处理器：缺页时按需补页（M1.3 demand paging）。
+    // 尽早注册（IDT 加载后），确保任何用户态/内核态缺页都能被处理。
+    arch_x86_64::interrupts::register_page_fault_handler(mm::user_space::page_fault_entry);
+
     // 注入系统 CPU 数读取器（供 mm 初始化 per-CPU 缓存；必须在 mm::init 前）。
     // 注：mm 自身不声明 Limine SMP 请求，避免与 arch-x86_64 的 SMP_REQUEST 冲突
     // 导致 Limine "Conflict detected for request ID" panic。
@@ -93,6 +97,8 @@ unsafe fn kmain_body() -> ! {
     tests::test_paging();
     // M1：验证用户地址空间（独立页表 + 用户映射 + 切换）
     tests::test_user_address_space();
+    // M1.3：验证按需分页（demand paging：#PF → 补页）
+    tests::test_demand_paging();
 
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
     if let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() {
