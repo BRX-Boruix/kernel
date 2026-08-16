@@ -176,8 +176,11 @@ where
     /// 若 `vaddr` 落在某个 `demand_paging=true` 的预留区域内，则分配一个物理页、
     /// 建立映射（present=1），返回 `true`（补页成功，CPU 重试）。
     ///
+    /// `error_code` 用于校验访问权限：bit1(W) 置位表示写访问，对**只读**预留区域
+    /// 的写故障会被拒绝，防止对不可写页反复补页导致的物理帧泄漏。
+    ///
     /// 非法访问（未预留 / 越界 / 越权）返回 `false`，由上层终止进程。
-    pub fn handle_page_fault(&mut self, vaddr: u64, _error_code: u64) -> bool {
+    pub fn handle_page_fault(&mut self, vaddr: u64, error_code: u64) -> bool {
         let areas = self.areas.lock();
         let Some(idx) = areas.iter().position(|a| {
             a.demand_paging
@@ -187,6 +190,13 @@ where
             return false; // 未预留区域 → 非法访问
         };
         let area = areas[idx];
+
+        // 校验访问权限：error_code 的 bit1(W) 表示本次为写访问。若区域不可写，
+        // 拒绝写故障，避免"映射出不可写页 → CPU 重试仍写失败 → 再次 #PF → 再分配
+        // 新帧覆盖旧 PTE"的无限循环与物理帧泄漏。
+        if error_code & 0b10 != 0 && area.flags.bits() & (1 << 1) == 0 {
+            return false;
+        }
 
         // 分配物理页
         let frame = match allocate_frame() {
@@ -229,6 +239,37 @@ where
                     break;
                 }
                 deallocate_frame(PhysFrame::from_paddr_raw(phys.as_u64()));
+            }
+            v += page;
+        }
+    }
+
+    /// 解映射并释放虚拟区间 `[lo, hi)` 内**已补页**的物理页（未映射的页跳过）。
+    ///
+    /// 供 `brk` 收缩等场景回收已映射内存。`lo`/`hi` 须页对齐。
+    /// 步进大小取自覆盖该区间的区域页大小（缺省 4KB）。
+    fn unmap_range(&mut self, lo: u64, hi: u64) {
+        if lo >= hi {
+            return;
+        }
+        let page = self
+            .areas
+            .lock()
+            .iter()
+            .find_map(|a| {
+                if lo >= a.start.as_u64() && hi <= a.end.as_u64() {
+                    Some(a.size.bytes())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(4096);
+        let mut v = lo;
+        while v < hi {
+            if let Some(phys) = self.pt.translate(VirtAddr::new(v)) {
+                if self.pt.unmap(VirtAddr::new(v)).is_ok() {
+                    deallocate_frame(PhysFrame::from_paddr_raw(phys.as_u64()));
+                }
             }
             v += page;
         }
@@ -304,11 +345,13 @@ where
         Ok(top)
     }
 
-    /// `brk` 雏形：调整堆断点（当前仅扩展/收缩记录，不立即映射）。
+    /// `brk` 雏形：调整堆断点。
     ///
     /// - 传入 `0`：仅查询当前断点。
     /// - 传入新断点：若在 `[USER_HEAP_BASE, 栈底)` 内则更新（可收缩），返回新断点。
-    /// - 扩展后访问堆区由 `handle_page_fault` 按需补页。
+    /// - 扩展：记录新断点，访问新堆区由 `handle_page_fault` 按需补页。
+    /// - 收缩：收窄堆区域的 `end`，并解映射/释放 `[new_break, 旧断点)` 内已补页，
+    ///   保证进程无法访问"已归还"的堆内存。
     pub fn brk(&mut self, new_break: u64) -> Result<u64, PT::Error> {
         if new_break == 0 {
             return Ok(self.heap_break);
@@ -317,10 +360,20 @@ where
             return Err("brk out of range".into());
         }
         let new_break = align_up(new_break, 4096);
-        // 收缩：不立即释放已补页（简化；M3 进程退出统一回收）。
-        // 扩展：只需记录，访问时按需补页。
-        if new_break > self.heap_break {
-            // 扩展堆区域：把 [heap_base, new_break) 声明为按需分页区。
+        if new_break < self.heap_break {
+            // 收缩：收窄堆区域的 end，并解映射/释放 [new_break, heap_break) 内已补页，
+            // 避免进程访问"已归还"的堆内存（越权读写/信息泄露）。
+            let mut areas = self.areas.lock();
+            if let Some(a) = areas
+                .iter_mut()
+                .find(|a| a.start.as_u64() == USER_HEAP_BASE)
+            {
+                a.end = VirtAddr::new(new_break);
+            }
+            drop(areas);
+            self.unmap_range(new_break, self.heap_break);
+        } else if new_break > self.heap_break {
+            // 扩展：把 [heap_base, new_break) 声明为按需分页区。
             // 若之前从未声明堆区，创建；否则更新现有堆区的 end。
             let mut areas = self.areas.lock();
             let mut found = false;
