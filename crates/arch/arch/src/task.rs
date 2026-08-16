@@ -48,11 +48,14 @@ pub fn set_switch_to(f: SwitchFn) {
 
 /// 进入用户态（Ring 3）所需的完整陷阱帧。
 ///
-/// 含 `iretq` 弹出的全部字段：RIP/CS/RFLAGS/RSP/SS。
-/// 平台无关抽象（ADR-007）；架构 crate 负责用这些字段构造真实的 iretq 帧。
+/// 含 `iretq` 弹出的全部字段（RIP/CS/RFLAGS/RSP/SS），外加进程用户页表基址 `cr3`。
+/// 平台无关抽象（ADR-007）；架构 crate 负责用这些字段构造真实的 iretq 帧，
+/// 并在 `iretq` 前装载 `cr3`（切到进程页表）。
 ///
 /// - `rflags`：须含 `IF=1`（开中断）且 `IOPL=0`（禁 I/O 指令）。
 /// - `cs`/`ss`：Ring 3 段选择子（如 x86_64 的 `UCODE`/`UDATA`）。
+/// - `cr3`：用户进程页表物理基址（`PageTable::paddr()`）。非 0 时架构实现
+///   在 `iretq` 前写 CR3；0 表示沿用当前页表（不切换）。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TrapFrame {
@@ -61,6 +64,8 @@ pub struct TrapFrame {
     pub rflags: u64,
     pub rsp: u64,
     pub ss: u64,
+    /// 用户进程页表物理基址（CR3 值）；0 = 不切换页表。
+    pub cr3: u64,
 }
 
 /// 进入用户态函数：`fn(&TrapFrame)`。由架构 crate 在早期注入（汇编实现）。

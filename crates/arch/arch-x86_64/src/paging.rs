@@ -375,6 +375,10 @@ impl arch::PageTable for X86PageTable {
         let (entries, leaf, levels) = unsafe { self.walk(vaddr.as_u64()) }?;
         Some(PhysAddr::new(entry_paddr(entries[leaf], leaf, levels)))
     }
+
+    fn paddr(&self) -> u64 {
+        self.pml4
+    }
 }
 
 /// 刷新 TLB 中一个虚拟地址。

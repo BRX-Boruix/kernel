@@ -166,6 +166,13 @@ where
         self.pt.activate();
     }
 
+    /// 顶层页表物理基址（= 装载到 CR3 的值）。
+    ///
+    /// 供进程进入用户态（`TrapFrame::cr3`）与调度切换时使用。
+    pub fn page_table_paddr(&self) -> u64 {
+        self.pt.paddr()
+    }
+
     /// 已声明的用户区域数（诊断用）。
     pub fn area_count(&self) -> usize {
         self.areas.lock().len()

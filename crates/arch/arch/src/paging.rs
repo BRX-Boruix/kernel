@@ -88,6 +88,14 @@ pub trait PageTable {
 
     /// 翻译虚拟地址 → 物理地址。
     fn translate(&self, vaddr: VirtAddr) -> Option<PhysAddr>;
+
+    /// 顶层页表物理基址（= 装载到 CR3 等页表寄存器的值）。
+    ///
+    /// 用于进程进入用户态/调度切换时装载进程自己的页表（M2.1 扩展 TrapFrame
+    /// 的 `cr3` 字段）。默认返回 0；架构实现应返回真实页表物理基址。
+    fn paddr(&self) -> u64 {
+        0
+    }
 }
 
 /// 当前活动的页表（活动地址空间）。

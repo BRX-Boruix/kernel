@@ -87,13 +87,20 @@ impl<PT: PageTable> Process<PT> {
 
     /// 启动进程：设置状态为 Running，并从内核 `iretq` 进入用户态。
     ///
-    /// 永不返回（用户态经中断/异常回到内核；进程退出时由内核停机/回收）。
+    /// `enter_usermode` 会先装载本进程页表（`cr3`），再 iretq 进用户态；
+    /// 调用方无需预先 `activate()`。永不返回（用户态经中断/异常回到内核；
+    /// 进程退出时由内核停机/回收）。
     ///
     /// 注：cs/ss 用当前平台（x86_64）的 Ring3 段选择子并带 RPL=3。
     /// 多平台化时应改为 `arch` 抽象层提供的用户段常量或注入函数（ADR-007）。
-    pub fn launch(&mut self) -> ! {
+    pub fn launch(&mut self) -> !
+    where
+        PT::Error: From<&'static str>,
+    {
         use arch::task::TrapFrame;
         self.state = TaskState::Running;
+        // 进程页表物理基址：装载到 CR3，使 iretq 在进程自己的地址空间运行
+        let cr3 = self.addr_space.page_table_paddr();
         let frame = TrapFrame {
             rip: self.entry_rip,
             cs: (arch_x86_64::gdt::UCODE | 3) as u64,
@@ -101,6 +108,7 @@ impl<PT: PageTable> Process<PT> {
             rflags: 0x0000_0000_0000_0202,
             rsp: self.user_stack_top,
             ss: (arch_x86_64::gdt::UDATA | 3) as u64,
+            cr3,
         };
         arch::task::enter_usermode(&frame);
     }
@@ -181,7 +189,10 @@ impl<PT: PageTable> ProcessTable<PT> {
     ///
     /// 永不返回（进入用户态后由用户代码/中断决定控制流）。
     /// 若 pid 不存在则 panic。
-    pub fn run(&mut self, pid: usize) -> ! {
+    pub fn run(&mut self, pid: usize) -> !
+    where
+        PT::Error: From<&'static str>,
+    {
         let proc = self
             .get_mut(pid)
             .expect("process to run does not exist");

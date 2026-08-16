@@ -100,33 +100,40 @@ pub extern "C" fn x86_switch_to(prev: &mut TaskContext, next: &mut TaskContext) 
 
 /// x86_64 进入用户态（Ring 3）实现。
 ///
-/// 给定 `arch::task::TrapFrame`（RIP/CS/RFLAGS/RSP/SS），把它按 iretq 帧顺序
-/// 压入当前内核栈，然后 `iretq` 切换到 Ring 3 执行用户代码。
+/// 给定 `arch::task::TrapFrame`（RIP/CS/RFLAGS/RSP/SS/CR3），先装载 `cr3`
+/// （切到进程页表，若非 0），再把 iretq 帧按序压入当前内核栈，然后 `iretq`
+/// 切换到 Ring 3 执行用户代码。
 ///
 /// iretq 帧布局（栈顶到低地址）：RIP, CS, RFLAGS, RSP, SS。
-/// `TrapFrame` 字段顺序恰为 rip/cs/rflags/rsp/ss，故按序压栈后从 `frame` 读。
+/// `TrapFrame` 字段顺序恰为 rip/cs/rflags/rsp/ss/cr3，故按偏移读。
 ///
 /// ABI：`frame` 在 rdi。返回后必然进入用户态，本函数不返回（末尾 `iretq`）。
 ///
 /// # Safety
 /// 由 `arch::task::enter_usermode` 调用；`frame` 必须指向有效的 `TrapFrame`，
-/// 其 cs/ss 须为 Ring 3 段选择子，rflags 须含 IF=1。
+/// 其 cs/ss 须为 Ring 3 段选择子，rflags 须含 IF=1；`cr3` 若非 0 须为有效页表基址。
 #[unsafe(naked)]
 pub extern "C" fn x86_64_enter_usermode(frame: &arch::task::TrapFrame) {
     core::arch::naked_asm!(
-        // rdi = frame；把四个字段 push（注意栈上 iretq 帧顺序，先压 SS 最后压 RIP）
-        // frame 偏移（repr(C)）：rip=0, cs=8, rflags=16, rsp=24, ss=32
-        "mov rax, [rdi + 32]",  // ss
+        // rdi = frame；把 iretq 帧的五个字段 push（先压 SS 最后压 RIP）
+        // frame 偏移（repr(C)）：rip=0, cs=8, rflags=16, rsp=24, ss=32, cr3=40
+        // 先装载 CR3（若 cr3 != 0 则写 CR3 切到进程页表）
+        "mov rax, [rdi + 40]",          // cr3
+        "test rax, rax",
+        "jz 0f",                        // cr3 == 0 → 不切换页表
+        "mov cr3, rax",                 // 写 CR3（切到进程用户页表）
+        "0:",
+        "mov rax, [rdi + 32]",          // ss
         "push rax",
-        "mov rax, [rdi + 24]",  // rsp
+        "mov rax, [rdi + 24]",          // rsp
         "push rax",
-        "mov rax, [rdi + 16]",  // rflags
+        "mov rax, [rdi + 16]",          // rflags
         "push rax",
-        "mov rax, [rdi + 8]",   // cs
+        "mov rax, [rdi + 8]",           // cs
         "push rax",
-        "mov rax, [rdi + 0]",   // rip
+        "mov rax, [rdi + 0]",           // rip
         "push rax",
-        "iretq",                // 弹出 RIP/CS/RFLAGS/RSP/SS → 切到 Ring 3
+        "iretq",                        // 弹出 RIP/CS/RFLAGS/RSP/SS → 切到 Ring 3
     );
 }
 
