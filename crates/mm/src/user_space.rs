@@ -252,10 +252,14 @@ where
         if size == 0 {
             return Err("mmap size is zero".into());
         }
-        // 从 hint 起单调向上找不与已有区域重叠的空闲区间
+        // 从 hint 起单调向上找不与已有区域重叠的空闲区间。
+        // 采用"翻倍步进"探测：在碎片化地址空间（大量小区域）下，固定 `size` 步长
+        // 逐段扫描会退化为接近 USER_TOP/4096 ≈ 2^47 次迭代（近乎死循环）；
+        // 翻倍步进可在 ~64 次迭代内覆盖整个 128TiB 用户空间，且仍返回合法的空闲区间。
         let mut candidate = align_up(self.next_mmap, 4096);
-        // 最多尝试一段上限，避免死循环（128TiB 用户空间）
-        while candidate + size <= USER_TOP {
+        let mut step = size;
+        let mut tries = 0u32;
+        while candidate + size <= USER_TOP && tries < 64 {
             if !self.overlaps(candidate, candidate + size) {
                 self.reserve_user(
                     VirtAddr::new(candidate),
@@ -266,7 +270,10 @@ where
                 self.next_mmap = candidate + size;
                 return Ok(candidate);
             }
-            candidate += size;
+            // 跳过密集已用区：以翻倍步长快速推进候选地址（saturating 防 u64 溢出）。
+            candidate = align_up(candidate.saturating_add(step), 4096);
+            step = step.saturating_mul(2);
+            tries += 1;
             // 保护：跳过栈区（USER_STACK_TOP 以下 8MiB 内不做 mmap）
             if candidate >= USER_STACK_TOP - 8 * 1024 * 1024 {
                 break;
