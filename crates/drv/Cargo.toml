@@ -1,0 +1,7 @@
+[package]
+name = "drv"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+klib = { path = "../klib" }

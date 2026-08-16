@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod drivers;
 mod panic;
 mod process;
 mod symbols;
@@ -79,6 +80,9 @@ unsafe fn kmain_body() -> ! {
     );
     info!("[kmain] serial initialized (arch={})", CurrentArch::name());
 
+    // T5：初始化设备/驱动框架（ADR-008）：注册串口设备 + 驱动并探测。
+    drivers::init();
+
     // T4：探测 CPU 特性（CPUID/vendor/brand；BSP 单线程阶段，结果缓存到静态）。
     arch_x86_64::cpu::init();
     // 注入硬件熵源（RDRAND/RDSEED，无硬件时混合时钟垫底）并初始化熵池/全局 RNG。
@@ -135,6 +139,8 @@ unsafe fn kmain_body() -> ! {
             // framebuffer 终端就绪后注册为统一 console 的第二个输出 sink，
             // 此后所有内核日志同时输出到串口与屏幕。
             klib::console::register_console(&terminal::TERMINAL_CONSOLE);
+            // T5：把 framebuffer 登记为框架设备并绑定 framebuffer 驱动。
+            drivers::register_framebuffer();
             info!("[kmain] terminal init returned");
         } else {
             error!("[kmain] no framebuffer");

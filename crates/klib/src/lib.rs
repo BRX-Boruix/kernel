@@ -8,10 +8,13 @@
 #[cfg(test)]
 extern crate std;
 
-// 内核堆分配器（含 `#[global_allocator]`）仅在非测试构建下编译：
-// 单测环境下它从未被 `init()` 初始化，而 test harness（std 初始化）
-// 需要堆分配，会因走未初始化的内核堆而崩溃。故测试构建使用系统分配器。
-#[cfg(not(test))]
+// 内核堆分配器（含 `#[global_allocator]`）仅在真实内核目标上编译：
+// - 宿主测试构建（`cargo test`，target_os = windows/linux/...）使用 std
+//   自带的系统分配器，避免未初始化的内核堆接管 test harness 的分配
+//   （klib 自身与依赖 klib 的 crate 的单元测试都依赖这一点）；
+// - 内核交叉编译目标（x86_64-unknown-none，target_os = "none"）才编译
+//   本模块，提供 `#[global_allocator]`。
+#[cfg(all(not(test), target_os = "none"))]
 pub mod allocator;
 pub mod collections;
 pub mod console;
