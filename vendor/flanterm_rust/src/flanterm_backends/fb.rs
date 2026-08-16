@@ -183,10 +183,15 @@ unsafe fn plot_char_scaled_canvas(
     let x = fb.offset_x + x * fb.glyph_width;
     let y = fb.offset_y + y * fb.glyph_height;
 
-    let glyph = fb
-        .font_bool
-        .as_ptr()
-        .add(c.c as usize * fb.font_height * fb.font_width);
+    // 防御：字符码越界时按空格处理，避免 `font_bool` 越界访问导致偶发崩溃
+    let glyph_idx = c.c as usize;
+    let glyph = if glyph_idx < FLANTERM_FB_FONT_GLYPHS {
+        fb.font_bool
+            .as_ptr()
+            .add(glyph_idx * fb.font_height * fb.font_width)
+    } else {
+        fb.font_bool.as_ptr()
+    };
     let canvas_ptr = fb.canvas.as_ref().unwrap().as_ptr();
 
     let mut dest: *mut u32;
@@ -352,10 +357,15 @@ unsafe fn plot_char_unscaled_canvas(
     let x = fb.offset_x + x * fb.glyph_width;
     let y = fb.offset_y + y * fb.glyph_height;
 
-    let glyph = fb
-        .font_bool
-        .as_ptr()
-        .add(c.c as usize * fb.font_height * fb.font_width);
+    // 防御：字符码越界时按空格处理，避免 `font_bool` 越界访问导致偶发崩溃
+    let glyph_idx = c.c as usize;
+    let glyph = if glyph_idx < FLANTERM_FB_FONT_GLYPHS {
+        fb.font_bool
+            .as_ptr()
+            .add(glyph_idx * fb.font_height * fb.font_width)
+    } else {
+        fb.font_bool.as_ptr()
+    };
     let canvas_ptr = fb.canvas.as_ref().unwrap().as_ptr();
 
     let mut dest: *mut u32;
