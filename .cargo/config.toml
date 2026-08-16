@@ -1,0 +1,6 @@
+[build]
+# 为裸机目标设置 RUSTFLAGS：启用帧指针，使内核 panic 栈回溯（基于 rbp 帧链）
+# 真正生效。参考 `kernel/src/panic.rs` 的 `print_backtrace`。
+# 代价：每个函数多保留 rbp（少量栈/寄存器开销），对内核可接受。
+[target.x86_64-unknown-none]
+rustflags = ["-C", "force-frame-pointers=yes"]

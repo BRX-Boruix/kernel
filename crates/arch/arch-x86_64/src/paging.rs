@@ -126,10 +126,14 @@ pub(crate) fn index_at(level: usize, levels: usize, vaddr: u64) -> usize {
 ///
 /// `leaf` 是该叶子所处的层级（从顶层 0 数起），`levels` 为页表层级数。
 /// 大页大小 = 2^(12 + (levels - 1 - leaf) * 9)。
+///
+/// 必须与 `ADDR_MASK` 相与以排除 NX（bit63）等高位标志位——否则启用 NX 后
+/// `translate`/`unmap` 会把 NX 位误当作物理地址的一部分返回（见回归修复）。
 #[inline]
 fn entry_paddr(entry: u64, leaf: usize, levels: usize) -> u64 {
     let shift = 12 + (levels - 1 - leaf) * 9;
-    entry & !((1u64 << shift) - 1)
+    // ADDR_MASK 排除 bit63/NX 及其它标志位；再按页大小对齐掩掉低位。
+    entry & ADDR_MASK & !((1u64 << shift) - 1)
 }
 
 // ---- 页表 ----

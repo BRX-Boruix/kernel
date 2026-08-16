@@ -1,12 +1,23 @@
 //! framebuffer 终端（flanterm）初始化与输出。
 //!
 //! 负责从 Limine 提供的 framebuffer 创建 flanterm 终端上下文，并在屏幕上打印文本。
+//! 上下文被全局持有（`'static`），供 `panic` 等场景在任意时刻向屏幕输出。
 
+use alloc::boxed::Box;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use flanterm_rust::FlantermContext;
 use klib::logln;
+
+/// 全局 framebuffer 终端上下文指针（由 `init` 保存，未初始化时为 0）。
+///
+/// 用 `AtomicUsize` 存裸地址，避免要求 `FlantermContext: Sync`；
+/// 访问均在串口已停机/单核的 panic 场景进行，无并发竞争。
+static TERMINAL_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// 用 flanterm 初始化终端并在屏幕上打印文本。
 ///
-/// `fb` 是 Limine 提供的 framebuffer。
+/// `fb` 是 Limine 提供的 framebuffer。成功后上下文被 leak 为 `'static` 并全局持有。
 pub fn init(fb: &limine::Framebuffer) {
     // framebuffer 地址（u32*）与参数
     let Some(addr) = fb.address.as_ptr() else {
@@ -51,12 +62,37 @@ pub fn init(fb: &limine::Framebuffer) {
     };
     logln!("[terminal] flanterm_fb_init done, ctx.is_some={}", ctx.is_some());
 
-    if let Some(mut ctx) = ctx {
+    if let Some(ctx) = ctx {
+        // leak 为 'static，供 panic 等全局场景使用
+        let ctx: &'static mut FlantermContext = Box::leak(ctx);
+        TERMINAL_PTR.store(ctx as *mut FlantermContext as usize, Ordering::Release);
         // 写入文本
-        flanterm_rust::flanterm_write(&mut ctx, b"Hello, BORUIX!\r\n");
-        flanterm_rust::flanterm_write(&mut ctx, b"Kernel M0 is running.\r\n");
+        write_str("Hello, BORUIX!\r\n");
+        write_str("Kernel M0 is running.\r\n");
         logln!("[terminal] wrote text done");
     } else {
         logln!("[terminal] ERROR: flanterm_fb_init returned None");
+    }
+}
+
+/// 向 framebuffer 终端写文本（`\n` 自动转 `\r\n`）。未初始化则静默。
+pub fn write_str(s: &str) {
+    let p = TERMINAL_PTR.load(Ordering::Acquire);
+    if p == 0 {
+        return;
+    }
+    let ctx = unsafe { &mut *(p as *mut FlantermContext) };
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    for i in 0..=bytes.len() {
+        if i == bytes.len() || bytes[i] == b'\n' {
+            if i > start {
+                flanterm_rust::flanterm_write(ctx, &bytes[start..i]);
+            }
+            if i < bytes.len() {
+                flanterm_rust::flanterm_write(ctx, b"\r\n");
+            }
+            start = i + 1;
+        }
     }
 }

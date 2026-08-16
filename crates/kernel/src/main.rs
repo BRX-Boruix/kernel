@@ -67,6 +67,13 @@ unsafe fn kmain_body() -> ! {
     CurrentArch::init();
     // 把架构的串口整串输出注入到 klib 的全局输出器（一次调用整串原子写）
     klib::serial::set_output(arch_x86_64::serial::write_str as fn(&str));
+    // 注入 panic 平台辅助：回退串口（独立于 klib OUTPUT，确保早期 panic 可见）、
+    // CPU id（LAPIC 未映射时返回 0，避免读未映射寄存器二次 #PF）、屏幕输出。
+    panic::set_panic_output(
+        arch_x86_64::serial::write_str as fn(&str),
+        panic_cpu_id,
+        terminal::write_str as fn(&str),
+    );
     logln!("[kmain] serial initialized (arch={})", CurrentArch::name());
 
     // 注册页错误（#PF）处理器：缺页时按需补页（M1.3 demand paging）。
@@ -157,4 +164,13 @@ unsafe fn kmain_body() -> ! {
 
     logln!("[kmain] reached idle loop");
     CurrentArch::halt();
+}
+
+/// panic 时的 CPU id 读取器：LAPIC 已映射才读，否则返回 0（早期未就绪安全）。
+fn panic_cpu_id() -> u32 {
+    if arch_x86_64::lapic::is_mapped() {
+        arch_x86_64::lapic::current_lapic_id()
+    } else {
+        0
+    }
 }

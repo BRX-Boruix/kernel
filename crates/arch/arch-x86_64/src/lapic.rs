@@ -80,6 +80,14 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// LAPIC 是否已映射（init 成功写入 LAPIC_VIRT 后为 true）。
+///
+/// 供 panic 等场景安全读取 CPU id：未映射时调用 `current_lapic_id` 会访问
+/// 虚拟地址 0 附近触发二次页错误，需先经此检查。
+pub fn is_mapped() -> bool {
+    LAPIC_VIRT.load(Ordering::Relaxed) != 0
+}
+
 /// 读取 LAPIC 寄存器（基于映射后的虚拟地址）。
 #[inline]
 fn lapic_read(reg: usize) -> u32 {
