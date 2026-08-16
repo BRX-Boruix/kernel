@@ -175,14 +175,23 @@ impl LazyBuddyAllocator {
                 break;
             }
 
-            // 由 `shard_for_pfn` 的不变量，当 `order < SHARD_PFN_SHIFT` 时
-            // `shard_for_pfn(buddy_pfn) == shard_for_pfn(pfn)`，本次摘除与最终的
-            // `push_to_global(pfn, order)` 落在同一把 shard 锁内，合并原子、无跨锁竞态。
-            // order ≥ SHARD_PFN_SHIFT 的超大块虽可能跨 shard，但 buddy 摘除与挂回均各自
-            // 在对应列表锁保护下完成，且被释放帧处于 `Freeing` 瞬态（见 `deallocate_checked`），
-            // 不会损坏链表、亦不会被并发路径误合并。
-            let shard = Self::shard_for_pfn(buddy_pfn);
-            let mut list = self.lock_global_list(order, shard);
+            let pfn_shard = Self::shard_for_pfn(pfn);
+            let buddy_shard = Self::shard_for_pfn(buddy_pfn);
+
+            // 守卫：仅当 buddy 与当前被释放块处于**同一 shard** 时才尝试合并。
+            // 这样本轮摘除（`lock_global_list(order, buddy_shard)`）与末尾的
+            // `push_to_global(pfn, order)`（锁 `shard_for_pfn(pfn)`）必然落在同一把
+            // shard 锁内，整个合并对其它 CPU 原子可见，彻底消除跨 shard 合并的
+            // TOCTOU / 双重摘链竞态。
+            //
+            // `shard_for_pfn` 已保证 `order < SHARD_PFN_SHIFT` 时 buddy 必与 pfn 同 shard，
+            // 故 order 0..11 的合并（最常见）永不触发此 break；仅 order 12..14 且恰好跨
+            // shard 边界时放弃合并（最多损失一个 8/16/32 MiB 块的合并，属良性碎片，极罕见）。
+            if pfn_shard != buddy_shard {
+                break;
+            }
+
+            let mut list = self.lock_global_list(order, buddy_shard);
             unsafe {
                 let buddy = self.frame_ptr(buddy_pfn);
                 if (*buddy).state != FrameState::FreeGlobal || (*buddy).order != order as u8 {
