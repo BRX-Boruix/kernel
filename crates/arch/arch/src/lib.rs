@@ -7,12 +7,14 @@
 #![no_std]
 
 pub mod addr;
+pub mod cpu;
 pub mod hhdm;
 pub mod paging;
 pub mod task;
 pub mod timer;
 
 pub use addr::{PhysAddr, PhysFrame, VirtAddr};
+pub use cpu::{Cpu, CpuFeature};
 pub use hhdm::{phys_to_virt, virt_to_phys, PHYS_OFFSET};
 pub use paging::{ActivePageTable, PageFlags, PageSize, PageTable};
 pub use task::{switch_to, TaskContext};

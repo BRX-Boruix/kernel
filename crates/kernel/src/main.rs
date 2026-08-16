@@ -79,6 +79,12 @@ unsafe fn kmain_body() -> ! {
     );
     info!("[kmain] serial initialized (arch={})", CurrentArch::name());
 
+    // T4：探测 CPU 特性（CPUID/vendor/brand；BSP 单线程阶段，结果缓存到静态）。
+    arch_x86_64::cpu::init();
+    // 注入硬件熵源（RDRAND/RDSEED，无硬件时混合时钟垫底）并初始化熵池/全局 RNG。
+    klib::random::set_entropy_source(arch_x86_64::cpu::entropy_u64);
+    klib::random::reseed();
+
     // 注册页错误（#PF）处理器：缺页时按需补页（M1.3 demand paging）。
     // 尽早注册（IDT 加载后），确保任何用户态/内核态缺页都能被处理。
     arch_x86_64::interrupts::register_page_fault_handler(mm::user_space::page_fault_entry);
@@ -147,6 +153,11 @@ unsafe fn kmain_body() -> ! {
 
     // 短暂等待验证时钟中断确实触发
     tests::test_timer();
+
+    // T4：验证 CPU 特性探测（CPUID/vendor/brand）与熵池/PRNG（RDRAND/RDSEED）。
+    // 不依赖 LAPIC tick（熵源与时钟垫底在 serial init 后已就绪），放在
+    // time 测试之前，避免 QEMU/TCG 偶发的 LAPIC 校准偏差阻塞本梯队验收。
+    tests::test_cpu_entropy();
 
     // 时钟源已注入：验证单调时钟换算 + 打印 RTC 墙钟（真实年月日时分秒）。
     let rtc = arch_x86_64::rtc::read_time();

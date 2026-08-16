@@ -747,3 +747,75 @@ pub fn test_spawn_user_fault() {
     table.get(pid).unwrap().addr_space().activate();
     table.run(pid);
 }
+
+// ---- T4：CPU 特性与熵 ----
+
+/// T4：验证 CPU 特性探测（CPUID/vendor/brand）与熵池/PRNG（RDRAND/RDSEED）。
+///
+/// 前置：`arch_x86_64::cpu::init()` 已探测缓存，熵源已注入并 `reseed`。
+pub fn test_cpu_entropy() {
+    use arch::cpu::Cpu as _;
+    use arch_x86_64::cpu::X8664Cpu;
+
+    info!("[cpu] === T4: cpu features & entropy ===");
+    info!("[cpu] vendor: {}", X8664Cpu::vendor_id());
+    info!("[cpu] brand: {}", X8664Cpu::brand_string());
+    info!(
+        "[cpu] max basic leaf: {:#x} (max ext: {:#x})",
+        X8664Cpu::max_basic_leaf(),
+        arch_x86_64::cpu::max_extended_leaf()
+    );
+
+    // 打印支持的特性列表。
+    let mut names = alloc::string::String::new();
+    for f in arch::cpu::CpuFeature::ALL {
+        if X8664Cpu::has_feature(f) {
+            if !names.is_empty() {
+                names.push(' ');
+            }
+            names.push_str(f.name());
+        }
+    }
+    info!("[cpu] features: {}", names);
+
+    // 硬件熵：特性探测 + 实际读取。
+    let rdrand = X8664Cpu::has_feature(arch::cpu::CpuFeature::Rdrand);
+    let rdseed = X8664Cpu::has_feature(arch::cpu::CpuFeature::Rdseed);
+    info!("[cpu] rdrand={} rdseed={}", rdrand, rdseed);
+    let s1 = X8664Cpu::rdrand64().unwrap_or(0);
+    let s2 = X8664Cpu::rdrand64().unwrap_or(0);
+    info!("[cpu] rdrand64 samples: {:016x} {:016x}", s1, s2);
+    if rdrand {
+        assert!(X8664Cpu::rdrand64().is_some(), "rdrand should succeed");
+    }
+    let e1 = X8664Cpu::rdseed64().unwrap_or(0);
+    info!("[cpu] rdseed64 sample: {:016x}", e1);
+
+    // 熵池与全局 RNG（熵源已注入）。
+    info!(
+        "[cpu] entropy source ready: {} (estimate {})",
+        klib::random::entropy_source_ready(),
+        klib::random::entropy_estimate()
+    );
+    let before = klib::random::rand_u64();
+    let got = klib::random::collect_entropy(8);
+    klib::random::seed_global_rng();
+    let after = klib::random::rand_u64();
+    info!(
+        "[cpu] reseed: collected {} rounds, rng before={:016x} after={:016x}",
+        got, before, after
+    );
+    assert!(got >= 1, "entropy source must be collectible after reseed");
+
+    // 区间/字节 API。
+    let r = klib::random::rand_range(100, 200);
+    info!("[cpu] rand_range(100,200) = {}", r);
+    assert!((100..200).contains(&r), "rand_range out of bounds");
+    let mut buf = [0u8; 32];
+    klib::random::rand_bytes(&mut buf);
+    let nonzero = buf.iter().any(|&b| b != 0);
+    info!("[cpu] rand_bytes(32) nonzero={}", nonzero);
+    assert!(nonzero, "rand_bytes must not be all zero");
+
+    info!("[cpu] CPU/entropy tests PASS");
+}

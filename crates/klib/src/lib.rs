@@ -17,6 +17,7 @@ pub mod collections;
 pub mod console;
 pub mod format;
 pub mod log;
+pub mod random;
 pub mod serial;
 pub mod sync;
 pub mod time;

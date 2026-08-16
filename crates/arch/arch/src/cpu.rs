@@ -1,0 +1,142 @@
+//! CPU 特性与熵源架构抽象（ADR-007）。
+//!
+//! 通用内核代码只依赖本 trait，由各具体架构实现：
+//! - `vendor_id`/`brand_string`/`max_basic_leaf`：厂商与型号识别；
+//! - `has_feature`：运行时特性探测（x86 走 CPUID，RISC-V 走 misa/isa
+//!   字符串，AArch64 走 ID 寄存器），实现方负责把探测结果缓存；
+//! - `rdrand64`/`rdseed64`/`entropy_u64`：硬件熵读取（供 `klib::random`
+//!   熵池混合），无硬件熵源的架构实现 `entropy_u64` 可混合自身噪声。
+//!
+//! 探测结果建议在 `init()`（BSP 单线程阶段）缓存，后续查询走缓存，
+//! 避免反复执行慢指令（如 x86 CPUID/RDSEED）。
+
+/// 跨架构通用的 CPU 特性位。
+///
+/// 各架构实现把"自己的探测方式"（CPUID 位 / CSR 位 / ID 寄存器位）映射到
+/// 本枚举的索引；索引即特征位号（`1u64 << (feature as u32)`）。
+/// 无法探测的特性返回 `false`，不影响正确性。
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CpuFeature {
+    Mmx = 0,
+    Sse = 1,
+    Sse2 = 2,
+    Sse3 = 3,
+    Ssse3 = 4,
+    Sse41 = 5,
+    Sse42 = 6,
+    Popcnt = 7,
+    Fma = 8,
+    Avx = 9,
+    Avx2 = 10,
+    Xsave = 11,
+    Aes = 12,
+    Pclmulqdq = 13,
+    Rdrand = 14,
+    Rdseed = 15,
+    Adx = 16,
+    Bmi1 = 17,
+    Bmi2 = 18,
+    Sha = 19,
+    Syscall = 20,
+    Nx = 21,
+    Abm = 22,
+    Sse4a = 23,
+}
+
+impl CpuFeature {
+    /// 特性名（调试打印用）。
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Mmx => "mmx",
+            Self::Sse => "sse",
+            Self::Sse2 => "sse2",
+            Self::Sse3 => "sse3",
+            Self::Ssse3 => "ssse3",
+            Self::Sse41 => "sse4.1",
+            Self::Sse42 => "sse4.2",
+            Self::Popcnt => "popcnt",
+            Self::Fma => "fma",
+            Self::Avx => "avx",
+            Self::Avx2 => "avx2",
+            Self::Xsave => "xsave",
+            Self::Aes => "aes",
+            Self::Pclmulqdq => "pclmulqdq",
+            Self::Rdrand => "rdrand",
+            Self::Rdseed => "rdseed",
+            Self::Adx => "adx",
+            Self::Bmi1 => "bmi1",
+            Self::Bmi2 => "bmi2",
+            Self::Sha => "sha",
+            Self::Syscall => "syscall",
+            Self::Nx => "nx",
+            Self::Abm => "abm",
+            Self::Sse4a => "sse4a",
+        }
+    }
+
+    /// 本枚举覆盖的全部特性（按索引顺序，可遍历打印/探测）。
+    pub const ALL: [CpuFeature; 24] = [
+        Self::Mmx,
+        Self::Sse,
+        Self::Sse2,
+        Self::Sse3,
+        Self::Ssse3,
+        Self::Sse41,
+        Self::Sse42,
+        Self::Popcnt,
+        Self::Fma,
+        Self::Avx,
+        Self::Avx2,
+        Self::Xsave,
+        Self::Aes,
+        Self::Pclmulqdq,
+        Self::Rdrand,
+        Self::Rdseed,
+        Self::Adx,
+        Self::Bmi1,
+        Self::Bmi2,
+        Self::Sha,
+        Self::Syscall,
+        Self::Nx,
+        Self::Abm,
+        Self::Sse4a,
+    ];
+}
+
+/// CPU 特性/熵抽象接口（全静态方法，风格与 [`crate::Platform`] 一致）。
+pub trait Cpu {
+    /// 探测并缓存 CPU 特性（应在 BSP 单线程阶段调用一次）。
+    fn init();
+
+    /// 厂商 ID 字符串（如 "GenuineIntel"、"AuthenticAMD"）。
+    fn vendor_id() -> &'static str;
+
+    /// 品牌/型号字符串（如 "Intel(R) Core(TM) i7-9700K"）。
+    fn brand_string() -> &'static str;
+
+    /// 基础特性探测最大 leaf（调试/兼容用，x86 CPUID leaf 0）。
+    fn max_basic_leaf() -> u32;
+
+    /// 是否支持指定特性。
+    fn has_feature(feature: CpuFeature) -> bool;
+
+    /// 从硬件真随机数发生器读 64 位（指令不可用或失败时 `None`）。
+    fn rdrand64() -> Option<u64>;
+
+    /// 从硬件种子发生器读 64 位（`RDSEED`；指令不可用或失败时 `None`）。
+    fn rdseed64() -> Option<u64>;
+
+    /// 尽力从硬件熵源取 64 位（rdseed 优先，其次 rdrand；均不可用返回 0）。
+    ///
+    /// 熵池注入用此接口；无硬件熵源的架构可覆盖为混合自身噪声。
+    fn entropy_u64() -> u64 {
+        if let Some(v) = Self::rdseed64() {
+            return v;
+        }
+        if let Some(v) = Self::rdrand64() {
+            return v;
+        }
+        0
+    }
+}
