@@ -88,15 +88,16 @@ static LOG_RING: IrqSpinLock<RingBuffer<[u8; LINE_CAP], RING_LINES>> =
 /// 1. 无论是否达到输出阈值，先把格式化结果记录进环形缓冲（崩溃回读需要）；
 /// 2. 达到阈值才转发到统一 console。
 pub fn __log(level: LogLevel, args: fmt::Arguments) {
-    // 格式化并记录进环形缓冲（截断到 LINE_CAP，保留末字节放 `\n`）。
+    // 格式化进栈缓冲。行总是以 `\n` 结尾（内容过长时截断，
+    // 为换行符保留 1 字节）；环形缓冲与 console 输出共用这份数据。
     let mut buf = [0u8; LINE_CAP];
     let mut w = crate::console::StackWriter {
         buf: &mut buf,
         len: 0,
     };
     let _ = fmt::Write::write_fmt(&mut w, args);
-    // 行总是以 `\n` 结尾（内容过长时截断，为换行符保留 1 字节）。
     let n = w.len.min(LINE_CAP - 1);
+    buf[n] = b'\n';
 
     {
         let ring = LOG_RING.lock();
@@ -104,13 +105,16 @@ pub fn __log(level: LogLevel, args: fmt::Arguments) {
             let _ = ring.pop(); // 淘汰最旧一条，保留最后 N 条
         }
         let mut line = [0u8; LINE_CAP];
-        line[..n].copy_from_slice(&buf[..n]);
-        line[n] = b'\n';
+        line[..=n].copy_from_slice(&buf[..=n]);
         let _ = ring.push(line);
     }
 
     if enabled(level) {
-        crate::console::write_fmt(args);
+        // 输出到统一 console：复用已格式化的行（`buf[..=n]` 含 `\n`），
+        // 避免二次格式化。注意不能直接用 `write_fmt(args)`——那会丢失
+        // 行尾换行（T2 回归，串口日志全部挤成一行）。
+        let s = core::str::from_utf8(&buf[..=n]).unwrap_or("");
+        crate::console::write_str(s);
     }
 }
 
