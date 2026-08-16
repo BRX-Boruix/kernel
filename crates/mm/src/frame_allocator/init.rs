@@ -9,7 +9,10 @@ use core::slice;
 use limine::{MemmapEntry, MemoryMapEntryType, NonNullPtr};
 use klib::logln;
 
-use super::allocator_core::{align_4k, AllocatorConfig, BuddyFrame, MetadataPool, UninitRegion};
+use super::allocator_core::{
+    align_4k, AllocatorConfig, BuddyFrame, MetadataPool, UninitRegion, L1_ENTRIES, L1_SHIFT,
+    L2_ENTRIES, L2_MASK,
+};
 use super::percpu_cache::FreeListTable;
 use super::{LazyBuddyAllocator, FREE_LISTS};
 
@@ -184,11 +187,24 @@ impl LazyBuddyAllocator {
         // Calculate sizes for arrays.
         // 用 saturating 运算防御极端内存映射下的 usize 溢出。
         // 注意：不再分配 `counts` 数组（见 find_metadata_storage 注释）。
-        let metadata_map_size = metadata_map_len.saturating_mul(size_of::<usize>()); // pointer size
+        //
+        // metadata_map 改为两级稀疏页表：只分配固定大小的一级表（L1），
+        // 每个条目覆盖 L1_ENTRIES 个 block。二级表（每块覆盖 L1_ENTRIES 个 block
+        // 的 `*mut BuddyFrame` 数组）仅在 process_range 触及相应 L1 项时按需分配。
+        // 这样 L1 体积恒定（8KB），不再随最高物理地址跨度膨胀。
+        let l1_len = (metadata_map_len.saturating_add(L1_ENTRIES - 1)) / L1_ENTRIES;
+        let metadata_map_size = l1_len.saturating_mul(size_of::<usize>()); // L1 表（指针数组）
         let max_uninit_regions = usable_regions_count.saturating_mul(2) + PADDING_REGIONS;
         let uninit_regions_size = max_uninit_regions.saturating_mul(size_of::<Option<UninitRegion>>());
-        // metadata 池只按实际 usable 内存覆盖的 block 数分配（含少量上浮余量）
-        let metadata_pool_blocks = needed_blocks + PADDING_REGIONS;
+        // metadata 池只按实际 usable 内存覆盖的 block 数分配（含少量上浮余量）。
+        // 此外需预留两级页表的二级表空间：每个被触及的 L1 区间需要
+        // L2_BLOCKS 个 block（L2_ENTRIES 个指针 / 每 block 指针数）。
+        let l2_blocks_per_l1 = (L2_ENTRIES * size_of::<*mut BuddyFrame>()).div_ceil(4096);
+        // 最多触及的 L1 区间数不超过 metadata_map 的 L1 项数（l1_len）
+        let l1_len_for_pool = (metadata_map_len.saturating_add(L1_ENTRIES - 1)) / L1_ENTRIES;
+        let metadata_pool_blocks = needed_blocks
+            .saturating_add(PADDING_REGIONS)
+            .saturating_add(l1_len_for_pool.saturating_mul(l2_blocks_per_l1));
         let metadata_pool_size = metadata_pool_blocks.saturating_mul(4096); // one 4K block per metadata block
 
         logln!(
@@ -219,9 +235,10 @@ impl LazyBuddyAllocator {
             Some(v) => *v,
             None => return,
         };
-        let metadata_map = (phys_offset + map_paddr as u64) as *mut *mut BuddyFrame;
-        // Initialize metadata map to null (handling sparse memory)
-        core::ptr::write_bytes(metadata_map, 0, metadata_map_len);
+        // 一级表（L1）：`*mut *mut BuddyFrame` 数组，初始全 null。
+        // 二级表在 process_range 触及对应 L1 项时按需分配。
+        let metadata_l1 = (phys_offset + map_paddr as u64) as *mut *mut *mut BuddyFrame;
+        core::ptr::write_bytes(metadata_l1, 0, l1_len);
 
         let uninit_regions_ptr = (phys_offset + uninit_paddr as u64) as *mut Option<UninitRegion>;
         let uninit_regions = slice::from_raw_parts_mut(uninit_regions_ptr, max_uninit_regions);
@@ -234,7 +251,7 @@ impl LazyBuddyAllocator {
 
         self.config.call_once(|| AllocatorConfig {
             total_frames,
-            metadata_map,
+            metadata_l1,
             metadata_map_len,
             frames_per_block,
         });
@@ -338,13 +355,29 @@ impl LazyBuddyAllocator {
         let first_block = current / block_size;
         let last_block = (end - 1) / block_size;
 
-        // Ensure metadata exists for all blocks covered by this range
+        // Ensure metadata exists for all blocks covered by this range.
+        // 通过两级稀疏页表定位：L1[block_idx >> L1_SHIFT] 指向一个二级表，
+        // 二级表按需分配（仅在触及该 L1 区间时），从而让索引随真实内存按需生长。
         for block_idx in first_block..=last_block {
             if block_idx >= cfg.metadata_map_len {
                 break;
             }
 
-            let entry_ptr = cfg.metadata_map.add(block_idx);
+            let l1_idx = block_idx >> L1_SHIFT;
+            let l2_idx = block_idx & L2_MASK;
+
+            // 若该 L1 区间尚无二级表，则分配并清零（L2_ENTRIES 个指针 = L2_BLOCKS 个 block）
+            let l1 = cfg.metadata_l1;
+            if (*l1.add(l1_idx)).is_null() {
+                let l2_bytes = L2_ENTRIES * size_of::<*mut BuddyFrame>();
+                let l2_blocks = l2_bytes.div_ceil(metadata_pool.block_size);
+                let l2_base = metadata_pool.alloc_blocks(l2_blocks);
+                core::ptr::write_bytes(l2_base, 0, l2_blocks * metadata_pool.block_size);
+                *l1.add(l1_idx) = l2_base as *mut *mut BuddyFrame;
+            }
+            let l2 = *l1.add(l1_idx);
+
+            let entry_ptr = l2.add(l2_idx);
             if (*entry_ptr).is_null() {
                 let block_ptr = metadata_pool.alloc_block();
                 *entry_ptr = block_ptr;

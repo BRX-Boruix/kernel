@@ -72,7 +72,7 @@ impl LazyBuddyAllocator {
 
         let order = unsafe {
             let block_idx = pfn / cfg.frames_per_block;
-            if (*cfg.metadata_map.add(block_idx)).is_null() {
+            if self.block_ptr(block_idx).is_null() {
                 logln!("PMM: WARNING Deallocate frame with no metadata (hole?): pfn {}", pfn);
                 return;
             }

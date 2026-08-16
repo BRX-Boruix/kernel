@@ -101,10 +101,23 @@ pub(crate) struct UninitRegion {
 
 pub(crate) struct AllocatorConfig {
     pub(crate) total_frames: usize,
-    pub(crate) metadata_map: *mut *mut BuddyFrame,
-    pub(crate) metadata_map_len: usize,
+    /// 两级稀疏页表（L1）。
+    /// L1[block_idx >> L1_SHIFT] 指向一个二级表（`*mut BuddyFrame` 数组，长度 L2_ENTRIES），
+    /// L2[block_idx & L2_MASK] 指向实际 `BuddyFrame` block。
+    /// 二级表仅在 `process_range` 触及相应 L1 项时才按需分配，从而真正稀疏。
+    pub(crate) metadata_l1: *mut *mut *mut BuddyFrame,
+    pub(crate) metadata_map_len: usize, // 逻辑 block 数（上界），用于边界检查
     pub(crate) frames_per_block: usize,
 }
+
+/// 一级表每个条目覆盖的 block 数（2^L1_SHIFT）。
+pub(crate) const L1_SHIFT: usize = 10;
+/// 一级表条目数 = 2^L1_SHIFT = 1024。
+pub(crate) const L1_ENTRIES: usize = 1 << L1_SHIFT;
+/// 二级表条目数 = 2^L1_SHIFT = 1024。
+pub(crate) const L2_ENTRIES: usize = 1 << L1_SHIFT;
+/// 用于索引二级表的掩码。
+pub(crate) const L2_MASK: usize = L2_ENTRIES - 1;
 
 pub(crate) struct UninitState {
     pub(crate) regions: &'static mut [Option<UninitRegion>],
@@ -135,6 +148,17 @@ impl MetadataPool {
         }
         let ptr = unsafe { self.base.add(self.next * self.block_size) } as *mut BuddyFrame;
         self.next += 1;
+        ptr
+    }
+
+    /// 分配 `count` 个连续 block（供二级表等需要连续内存的结构使用）。
+    /// 返回首 block 的裸字节指针（长度 = count * block_size）。
+    pub(crate) fn alloc_blocks(&mut self, count: usize) -> *mut u8 {
+        if self.next.saturating_add(count) > self.blocks {
+            panic!("PMM: metadata pool exhausted");
+        }
+        let ptr = unsafe { self.base.add(self.next * self.block_size) };
+        self.next += count;
         ptr
     }
 }
@@ -192,12 +216,24 @@ impl LazyBuddyAllocator {
         self.config.get().expect("PMM not initialized")
     }
 
+    // 通过两级稀疏页表定位 block 指针（*mut BuddyFrame）。
+    // 未建 block 的 L2 项为 null；调用方须保证 block 已由 process_range 建立。
+    #[inline]
+    pub(crate) unsafe fn block_ptr(&self, block_idx: usize) -> *mut BuddyFrame { unsafe {
+        let cfg = self.config();
+        let l1 = cfg.metadata_l1;
+        let l1_idx = block_idx >> L1_SHIFT;
+        let l2 = *l1.add(l1_idx);
+        let l2_idx = block_idx & L2_MASK;
+        *l2.add(l2_idx)
+    }}
+
     // Helper to access frame metadata
     pub(crate) unsafe fn get_frame(&self, pfn: usize) -> &'static mut BuddyFrame { unsafe {
         let cfg = self.config();
         let block_idx = pfn / cfg.frames_per_block;
         let offset = pfn % cfg.frames_per_block;
-        let block_ptr = *cfg.metadata_map.add(block_idx);
+        let block_ptr = self.block_ptr(block_idx);
         &mut *block_ptr.add(offset)
     }}
 
@@ -212,7 +248,7 @@ impl LazyBuddyAllocator {
         let offset = pfn % cfg.frames_per_block;
 
         if block_idx != cache.block_idx {
-            cache.block_ptr = *cfg.metadata_map.add(block_idx);
+            cache.block_ptr = self.block_ptr(block_idx);
             cache.block_idx = block_idx;
         }
 
