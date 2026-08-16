@@ -232,13 +232,13 @@ impl arch::PageTable for X86PageTable {
         unsafe { core::ptr::write_bytes(top_virt, 0, 512) };
 
         // 2. 复制当前内核页表的高半区顶层条目（所有进程共享内核映射）。
-        //    高半区 = 顶层索引 >= 2^(levels-1) 的项（bit63 为 1 的地址范围）。
-        //    用户半区（低半区顶层项）保持为空，实现"独立用户地址空间"。
-        let levels = page_levels();
-        let half = 1usize << (levels - 1); // LA48:256, LA57:512
+        //    用户/内核分界在顶层条目 256 处（线性地址的最高位，bit47/bit56 决定，
+        //    对应顶层 9 位索引的最高位），与页表层级数（LA48/LA57）无关。
+        //    用户半区（顶层条目 0..255）保持为空，实现"独立用户地址空间"。
+        const KERNEL_HALF_START: usize = 256; // entries[256..512] 为内核高半区
         // CR3 返回的是 PML4 的物理地址，须经 HHDM 映射为虚拟地址才能解引用。
         let cur_top = phys_to_virt(mmio::cr3() & !0xFFF) as *const u64;
-        for i in half..512 {
+        for i in KERNEL_HALF_START..512 {
             let entry = unsafe { *cur_top.add(i) };
             if entry != 0 {
                 unsafe { *top_virt.add(i) = entry };
