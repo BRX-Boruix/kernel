@@ -112,6 +112,13 @@ unsafe fn kmain_body() -> ! {
         arch_x86_64::smp::slot_of_lapic(lapic_id)
     });
 
+    // 注入 AP 栈的物理帧分配器（arch 层经函数指针调用 mm，避免循环依赖）
+    arch_x86_64::smp::set_frame_allocator(|order| {
+        mm::frame_allocator::allocate_frames(order as usize)
+            .map(|f| f.start_paddr())
+            .unwrap_or(0)
+    });
+
     // 初始化多核 SMP：启动所有 AP，并等待全部上线
     logln!("[kmain] initializing SMP");
     arch_x86_64::smp::init();

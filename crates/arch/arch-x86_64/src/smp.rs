@@ -12,8 +12,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use spin::Mutex;
+use spin::{Mutex, Once};
 
+use arch::phys_to_virt;
 use crate::gdt;
 use crate::lapic;
 use limine::SmpRequest;
@@ -33,16 +34,39 @@ static TOTAL_CPUS: AtomicUsize = AtomicUsize::new(1);
 const AP_STACK_SIZE: usize = 16 * 1024;
 
 /// 每个 AP 的 GDT/TSS/内核栈/Double Fault 栈资源。
-/// 由 `init` 依据实际 CPU 数动态分配，移除固定的 64 槽位上限制。
+///
+/// 内核栈与 DF 栈使用**物理帧分配器**分配（经 HHDM 映射为可访问虚拟地址），
+/// 而非内核堆，从而不占用有限的 4MB 内核堆、也不受核数导致的堆容量限制。
+/// GDT/TSS 很小（各 ~150B），用堆即可。
 struct ApResources {
-    kstacks: Vec<[u8; AP_STACK_SIZE]>,
-    df_stacks: Vec<[u8; gdt::DF_STACK_SIZE]>,
+    /// 每个 AP 内核栈的物理基址（长度 = AP 数，每块 AP_STACK_SIZE）。
+    kstack_paddrs: Vec<u64>,
+    /// 每个 AP Double Fault 栈的物理基址（每块 DF_STACK_SIZE）。
+    df_stack_paddrs: Vec<u64>,
     gdts: Vec<gdt::Gdt>,
     tsss: Vec<gdt::Tss>,
 }
 
 /// 动态分配的 AP 资源（懒初始化，由 BSP 在 `init` 时填入）。
 static AP_RESOURCES: Mutex<Option<ApResources>> = Mutex::new(None);
+
+/// 物理帧分配器注入点：`fn(order) -> paddr`，返回 `1 << order` 个连续 4KB 帧的
+/// 起始物理地址，失败返回 0。由内核在 `smp::init` 前注入（实际调用 `mm` 分配器）。
+/// 用 Rust ABI（非 extern "C"），调用方与实现方均在同一个内核进程内，无需 FFI。
+static FRAME_ALLOC: Once<fn(u32) -> u64> = Once::new();
+
+/// 注入物理帧分配器（内核在 mm 初始化后、SMP 启动前调用）。
+pub fn set_frame_allocator(f: fn(u32) -> u64) {
+    let _ = FRAME_ALLOC.call_once(|| f);
+}
+
+/// 分配 `1 << order` 个连续 4KB 帧，返回物理基址（0 表示失败）。
+fn alloc_stack_frames(order: u32) -> u64 {
+    match FRAME_ALLOC.get() {
+        Some(f) => f(order),
+        None => 0,
+    }
+}
 
 /// LAPIC id → 紧凑 CPU 槽位 映射。x86 LAPIC id 为 0..255。
 /// BSP 槽位 0，AP 按启动顺序分配 1..n。per-CPU 帧缓存用该紧凑槽位做索引，
@@ -107,17 +131,20 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
             crate::interrupts::halt();
         }
     };
-    if arr_idx >= res.kstacks.len() {
+    if arr_idx >= res.kstack_paddrs.len() {
         klib::log_dec!("[smp] AP slot out of range: ", slot as u64);
         loop {
             crate::interrupts::halt();
         }
     }
 
+    // 把物理栈基址经 HHDM 映射为可访问虚拟地址，计算栈顶（TSS.rsp0 / IST）。
     // 配置并加载本 CPU 的 GDT/TSS（每 CPU 独立内核栈 + Double Fault 栈）
+    let kstack_virt = phys_to_virt(res.kstack_paddrs[arr_idx]);
+    let df_virt = phys_to_virt(res.df_stack_paddrs[arr_idx]);
     let (kstack_top, df_stack_top, gdt_ptr, tss_ptr) = (
-        gdt::stack_top(res.kstacks[arr_idx].as_ptr() as *const u8, AP_STACK_SIZE),
-        gdt::stack_top(res.df_stacks[arr_idx].as_ptr() as *const u8, gdt::DF_STACK_SIZE),
+        gdt::stack_top(kstack_virt as *const u8, AP_STACK_SIZE),
+        gdt::stack_top(df_virt as *const u8, gdt::DF_STACK_SIZE),
         core::ptr::addr_of!(res.gdts[arr_idx]) as *mut gdt::Gdt,
         core::ptr::addr_of!(res.tsss[arr_idx]) as *mut gdt::Tss,
     );
@@ -158,17 +185,41 @@ pub fn init() {
 
     // 自适应：依据实际 CPU 数动态分配 AP 资源，不再受固定槽位上限制。
     let ap_count = total.saturating_sub(1); // 去掉 BSP
-    {
-        let mut res_guard = AP_RESOURCES.lock();
-        *res_guard = Some(ApResources {
-            kstacks: vec![[0u8; AP_STACK_SIZE]; ap_count],
-            df_stacks: vec![[0u8; gdt::DF_STACK_SIZE]; ap_count],
-            gdts: vec![gdt::Gdt::new(); ap_count],
-            tsss: vec![gdt::Tss::new(); ap_count],
-        });
+
+    // 内核栈 / DF 栈各 AP 一块，从物理帧分配器分配（order：AP_STACK_SIZE 与
+    // DF_STACK_SIZE 均为 16KB = 4 个 4KB 帧 = order 2）。不占内核堆。
+    const STACK_ORDER: u32 = 2; // 2^2 * 4KB = 16KB
+    let mut kstack_paddrs = Vec::with_capacity(ap_count);
+    let mut df_paddrs = Vec::with_capacity(ap_count);
+    for _ in 0..ap_count {
+        let k = alloc_stack_frames(STACK_ORDER);
+        let d = alloc_stack_frames(STACK_ORDER);
+        if k == 0 || d == 0 {
+            // 物理内存不足：打印后仅初始化已分配的部分（记录到 TOTAL_CPUS）
+            klib::logln!("[smp] WARNING: out of physical frames for AP stacks");
+            break;
+        }
+        kstack_paddrs.push(k);
+        df_paddrs.push(d);
+    }
+    let real_ap = kstack_paddrs.len();
+    if real_ap < ap_count {
+        klib::log_dec!("[smp] only ", real_ap as u64);
+        klib::logln!(" AP stacks allocated");
     }
 
-    TOTAL_CPUS.store(total, Ordering::Relaxed);
+    let mut res_guard = AP_RESOURCES.lock();
+    *res_guard = Some(ApResources {
+        kstack_paddrs,
+        df_stack_paddrs: df_paddrs,
+        gdts: vec![gdt::Gdt::new(); real_ap],
+        tsss: vec![gdt::Tss::new(); real_ap],
+    });
+    drop(res_guard);
+
+    // 总 CPU 数 = BSP + 实际分配成功的 AP 数
+    let effective_total = real_ap + 1;
+    TOTAL_CPUS.store(effective_total, Ordering::Relaxed);
     // 一次 write_str 完整打印 BSP 信息，避免交错
     klog_combined("[smp] BSP lapic_id=", bsp_lapic, ", total cpus=", total as u64);
 
@@ -200,8 +251,8 @@ pub fn init() {
         }
         let slot = next_slot;
         next_slot += 1;
-        if slot > ap_count {
-            // 防御：实际 AP 数超过已分配资源（正常不会发生），跳过
+        if slot > real_ap {
+            // 防御：实际 AP 数超过已分配资源（物理内存不足时可能发生），跳过
             klib::log_dec!("[smp] skipping AP lapic_id=", this_lapic);
             continue;
         }
