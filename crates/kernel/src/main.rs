@@ -55,6 +55,10 @@ unsafe fn kmain_body() -> ! {
     // 初始化堆分配器（buddy，支持释放重用）——必须在任何 alloc 前
     klib::allocator::init();
 
+    // 依据 Limine SMP 响应预分配 per-CPU 页帧缓存（自适应核数）
+    let total_cpus = arch_x86_64::smp::requested_cpu_count();
+    mm::frame_allocator::init_percpu_caches(total_cpus);
+
     // 初始化架构（串口等）
     CurrentArch::init();
     // 把架构的串口整串输出注入到 klib 的全局输出器（一次调用整串原子写）
@@ -101,8 +105,12 @@ unsafe fn kmain_body() -> ! {
     // 短暂等待验证时钟中断确实触发
     tests::test_timer();
 
-    // 让 mm 的 per-CPU 缓存用真实的 LAPIC id 作为 CPU id
-    mm::frame_allocator::set_cpu_id_reader(|| arch_x86_64::lapic::current_lapic_id() as usize);
+    // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
+    // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。
+    mm::frame_allocator::set_cpu_id_reader(|| {
+        let lapic_id = arch_x86_64::lapic::current_lapic_id();
+        arch_x86_64::smp::slot_of_lapic(lapic_id)
+    });
 
     // 初始化多核 SMP：启动所有 AP，并等待全部上线
     logln!("[kmain] initializing SMP");

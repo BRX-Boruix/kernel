@@ -9,7 +9,10 @@
 //! `SmpInfo::extra_argument`，而不是用 LAPIC id 直接索引——因为真实
 //! 硬件上 LAPIC id 可能稀疏（0,8,16,…）甚至超过槽位上限，直接用会冲突。
 
+use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use spin::Mutex;
 
 use crate::gdt;
 use crate::lapic;
@@ -29,20 +32,36 @@ static TOTAL_CPUS: AtomicUsize = AtomicUsize::new(1);
 /// 这里仅提供一个更小的中断栈（TSS.rsp0）用于中断上下文。
 const AP_STACK_SIZE: usize = 16 * 1024;
 
-/// AP 槽位上限。静态数组编译期大小固定，这里取一个足够大的值
-/// （对齐常见多核配置的上限）。若实际 CPU 数超过该值会拒绝启动超出部分。
-const MAX_AP_SLOTS: usize = 64;
+/// 每个 AP 的 GDT/TSS/内核栈/Double Fault 栈资源。
+/// 由 `init` 依据实际 CPU 数动态分配，移除固定的 64 槽位上限制。
+struct ApResources {
+    kstacks: Vec<[u8; AP_STACK_SIZE]>,
+    df_stacks: Vec<[u8; gdt::DF_STACK_SIZE]>,
+    gdts: Vec<gdt::Gdt>,
+    tsss: Vec<gdt::Tss>,
+}
 
-/// 每个 CPU 一个内核栈（AP 用）。BSP 用自己的静态栈。
-static mut AP_KSTACKS: [[u8; AP_STACK_SIZE]; MAX_AP_SLOTS] = [[0; AP_STACK_SIZE]; MAX_AP_SLOTS];
+/// 动态分配的 AP 资源（懒初始化，由 BSP 在 `init` 时填入）。
+static AP_RESOURCES: Mutex<Option<ApResources>> = Mutex::new(None);
 
-/// 每个 CPU 一个 Double Fault 中断栈（AP 用）。
-static mut AP_DF_STACKS: [[u8; gdt::DF_STACK_SIZE]; MAX_AP_SLOTS] =
-    [[0; gdt::DF_STACK_SIZE]; MAX_AP_SLOTS];
+/// LAPIC id → 紧凑 CPU 槽位 映射。x86 LAPIC id 为 0..255。
+/// BSP 槽位 0，AP 按启动顺序分配 1..n。per-CPU 帧缓存用该紧凑槽位做索引，
+/// 避免真机上稀疏 LAPIC id 对固定数取模产生冲突。
+static LAPIC_TO_SLOT: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
 
-/// 每个 CPU 一个 GDT/TSS。
-static mut AP_GDT: [gdt::Gdt; MAX_AP_SLOTS] = [const { gdt::Gdt::new() }; MAX_AP_SLOTS];
-static mut AP_TSS: [gdt::Tss; MAX_AP_SLOTS] = [const { gdt::Tss::new() }; MAX_AP_SLOTS];
+/// 查询 LAPIC id 对应的紧凑 CPU 槽位。
+pub fn slot_of_lapic(lapic_id: u32) -> usize {
+    LAPIC_TO_SLOT[(lapic_id & 0xFF) as usize].load(Ordering::Relaxed)
+}
+
+/// 从 Limine SMP 响应读取系统总 CPU 数（可在 `init` 前调用，用于预分配 per-CPU 结构）。
+pub fn requested_cpu_count() -> usize {
+    SMP_REQUEST
+        .get_response()
+        .get()
+        .map(|r| r.cpu_count as usize)
+        .unwrap_or(1)
+}
 
 /// 输出"p1 + v1 + p2 + v2"（单次串口写）。
 fn klog_combined(p1: &str, v1: u32, p2: &str, v2: u64) {
@@ -66,29 +85,47 @@ pub fn total_cpus() -> usize {
 /// 槽位索引由 BSP 在 `extra_argument` 中指定（紧凑唯一，从 1 开始）。
 #[unsafe(no_mangle)]
 extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
-    // 从 extra_argument 取得 BSP 分配的唯一槽位索引
-    let idx = unsafe { (*info).extra_argument as usize };
+    // 从 extra_argument 取得 BSP 分配的唯一槽位索引（>=1）
+    let slot = unsafe { (*info).extra_argument as usize };
 
-    // 防御：索引越界则停机，避免访问静态数组越界
-    if idx >= MAX_AP_SLOTS {
-        klib::log_dec!("[smp] AP slot out of range: ", idx as u64);
+    // 取出本 CPU 的 LAPIC id（用于日志 + 更新映射）
+    let lapic_id = lapic::current_lapic_id();
+
+    // 防御：槽位非法/越界则停机，避免访问动态资源越界
+    if slot == 0 {
+        klib::log_dec!("[smp] AP slot invalid (0): lapic=", lapic_id as u64);
+        loop {
+            crate::interrupts::halt();
+        }
+    }
+    let arr_idx = slot - 1;
+
+    let resources = AP_RESOURCES.lock();
+    let Some(res) = resources.as_ref() else {
+        klib::logln!("[smp] AP resources not initialized");
+        loop {
+            crate::interrupts::halt();
+        }
+    };
+    if arr_idx >= res.kstacks.len() {
+        klib::log_dec!("[smp] AP slot out of range: ", slot as u64);
         loop {
             crate::interrupts::halt();
         }
     }
 
-    // 取出本 CPU 的 LAPIC id（仅用于日志）
-    let lapic_id = lapic::current_lapic_id();
-
     // 配置并加载本 CPU 的 GDT/TSS（每 CPU 独立内核栈 + Double Fault 栈）
-    let (kstack_top, df_stack_top, gdt_ptr, tss_ptr) = unsafe {
-        (
-            gdt::stack_top(core::ptr::addr_of!(AP_KSTACKS[idx]) as *const u8, AP_STACK_SIZE),
-            gdt::stack_top(core::ptr::addr_of!(AP_DF_STACKS[idx]) as *const u8, gdt::DF_STACK_SIZE),
-            core::ptr::addr_of_mut!(AP_GDT[idx]),
-            core::ptr::addr_of_mut!(AP_TSS[idx]),
-        )
-    };
+    let (kstack_top, df_stack_top, gdt_ptr, tss_ptr) = (
+        gdt::stack_top(res.kstacks[arr_idx].as_ptr() as *const u8, AP_STACK_SIZE),
+        gdt::stack_top(res.df_stacks[arr_idx].as_ptr() as *const u8, gdt::DF_STACK_SIZE),
+        core::ptr::addr_of!(res.gdts[arr_idx]) as *mut gdt::Gdt,
+        core::ptr::addr_of!(res.tsss[arr_idx]) as *mut gdt::Tss,
+    );
+    drop(resources);
+
+    // 记录本 CPU 的 LAPIC id → 槽位映射（供帧缓存索引）
+    LAPIC_TO_SLOT[(lapic_id & 0xFF) as usize].store(slot, Ordering::Release);
+
     gdt::setup_cpu(gdt_ptr, tss_ptr, kstack_top, df_stack_top);
 
     // 开启中断
@@ -117,18 +154,26 @@ pub fn init() {
     };
 
     let bsp_lapic = resp.bsp_lapic_id;
-    let total = resp.cpu_count;
-    if total as usize > MAX_AP_SLOTS {
-        klib::logln!(
-            "[smp] WARNING: {} cpus exceed MAX_AP_SLOTS={}, only first {} will start",
-            total,
-            MAX_AP_SLOTS,
-            MAX_AP_SLOTS
-        );
+    let total = resp.cpu_count as usize;
+
+    // 自适应：依据实际 CPU 数动态分配 AP 资源，不再受固定槽位上限制。
+    let ap_count = total.saturating_sub(1); // 去掉 BSP
+    {
+        let mut res_guard = AP_RESOURCES.lock();
+        *res_guard = Some(ApResources {
+            kstacks: vec![[0u8; AP_STACK_SIZE]; ap_count],
+            df_stacks: vec![[0u8; gdt::DF_STACK_SIZE]; ap_count],
+            gdts: vec![gdt::Gdt::new(); ap_count],
+            tsss: vec![gdt::Tss::new(); ap_count],
+        });
     }
-    TOTAL_CPUS.store((total as usize).min(MAX_AP_SLOTS), Ordering::Relaxed);
+
+    TOTAL_CPUS.store(total, Ordering::Relaxed);
     // 一次 write_str 完整打印 BSP 信息，避免交错
-    klog_combined("[smp] BSP lapic_id=", bsp_lapic, ", total cpus=", total);
+    klog_combined("[smp] BSP lapic_id=", bsp_lapic, ", total cpus=", total as u64);
+
+    // BSP 槽位 0（默认即 0，显式置位以便清晰）
+    LAPIC_TO_SLOT[(bsp_lapic & 0xFF) as usize].store(0, Ordering::Release);
 
     // BSP 计入（Release：保证后续 goto_address 写入对 AP 可见）
     CPU_COUNT.store(1, Ordering::Release);
@@ -143,10 +188,9 @@ pub fn init() {
         )
     };
 
-    // 为每个 AP 分配紧凑唯一槽位。0 预留给 BSP（BSP 用自己的静态栈）。
-    // 关键：不用 LAPIC id 直接做索引，因为真机上 LAPIC id 可能稀疏
-    // （0,8,16,…）或超过槽位上限，直接取模会让多个 CPU 共享同一槽位，
-    // 造成 GDT/TSS/内核栈冲突。
+    // 为每个 AP 分配紧凑唯一槽位 1..=ap_count。
+    // 不用 LAPIC id 直接做索引，因为真机上 LAPIC id 可能稀疏，取模会让
+    // 多个 CPU 共享同一槽位，造成 GDT/TSS/内核栈冲突。
     let mut next_slot = 1usize;
     for ptr in cpu_slice.iter_mut() {
         let info: &mut limine::SmpInfo = unsafe { &mut *ptr.as_ptr() };
@@ -154,12 +198,11 @@ pub fn init() {
         if this_lapic == bsp_lapic {
             continue; // 跳过 BSP
         }
-        // 分配唯一槽位
         let slot = next_slot;
         next_slot += 1;
-        if slot >= MAX_AP_SLOTS {
+        if slot > ap_count {
+            // 防御：实际 AP 数超过已分配资源（正常不会发生），跳过
             klib::log_dec!("[smp] skipping AP lapic_id=", this_lapic);
-            klib::logln!("[smp] slot limit ({}) reached", MAX_AP_SLOTS);
             continue;
         }
         // 把槽位传给 AP（extra_argument），并写入 goto_address

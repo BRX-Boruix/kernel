@@ -12,8 +12,11 @@ use arch::PhysFrame;
 use limine::{MemmapEntry, NonNullPtr};
 use spin::Once;
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 use allocator_core::{LazyBuddyAllocator, ORDER_4K};
-use percpu_cache::{FreeListTable, PerCpuCacheSet};
+use percpu_cache::{FreeListTable, PerCpuCache, PerCpuCacheSet};
 
 pub use allocator_core::{ORDER_1G, ORDER_2M};
 pub use compact::compact_now;
@@ -41,6 +44,18 @@ pub(crate) fn current_cpu_id() -> usize {
         Some(f) => f(),
         None => 0,
     }
+}
+
+/// 依据实际 CPU 数初始化 per-CPU 页帧缓存（自适应核数）。
+/// 须在任何 AP 使用帧分配前调用（内核在 SMP 启动前按 Limine 响应注入 CPU 数）。
+pub fn init_percpu_caches(cpu_count: usize) {
+    let count = cpu_count.max(1);
+    let caches: &'static [PerCpuCache] = {
+        let mut v: Vec<PerCpuCache> = Vec::with_capacity(count);
+        v.resize_with(count, PerCpuCache::new);
+        Box::leak(v.into_boxed_slice())
+    };
+    PER_CPU.init(caches);
 }
 
 unsafe impl Send for LazyBuddyAllocator {}

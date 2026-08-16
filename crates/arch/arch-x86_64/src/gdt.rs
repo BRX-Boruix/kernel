@@ -71,6 +71,7 @@ impl Tss {
 ///
 /// 布局：null, KCODE, KDATA, TSS_low, TSS_high
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Gdt {
     entries: [u64; 5],
 }

@@ -1,6 +1,6 @@
 use core::sync::atomic::Ordering;
 
-use super::allocator_core::{for_each_global_list, MAX_CPUS, MAX_ORDER};
+use super::allocator_core::{for_each_global_list, MAX_ORDER};
 use super::{ALLOCATOR, PER_CPU};
 
 #[derive(Debug, Clone, Copy)]
@@ -90,7 +90,7 @@ pub fn frag_stats() -> PmmFragStats {
         }
     });
 
-    for cpu in 0..MAX_CPUS {
+    for cpu in 0..PER_CPU.cpu_count() {
         PER_CPU.with_cache(cpu, |cache| {
             for order in 0..MAX_ORDER {
                 free_percpu[order] += cache.counts[order] as usize;

@@ -18,8 +18,6 @@ use super::FREE_LISTS;
 pub(crate) const MAX_ORDER: usize = 19;
 /// Lock sharding count for each order
 pub(crate) const SHARD_COUNT: usize = 8;
-/// Max CPUs for per-CPU caches
-pub(crate) const MAX_CPUS: usize = 64;
 
 /// Standard page size order
 pub const ORDER_4K: usize = 0;

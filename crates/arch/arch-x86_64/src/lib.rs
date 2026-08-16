@@ -4,6 +4,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod gdt;
 pub mod interrupts;
 pub mod lapic;

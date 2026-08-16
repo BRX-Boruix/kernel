@@ -6,13 +6,13 @@ use core::sync::atomic::Ordering;
 
 use klib::logln;
 
-use super::allocator_core::{for_each_global_list, MAX_CPUS, MAX_ORDER};
+use super::allocator_core::{for_each_global_list, MAX_ORDER};
 use super::{ALLOCATOR, LazyBuddyAllocator, PER_CPU};
 
 impl LazyBuddyAllocator {
     fn drain_percpu_all(&self) -> usize {
         let mut drained = 0usize;
-        for cpu in 0..MAX_CPUS {
+        for cpu in 0..PER_CPU.cpu_count() {
             for order in 0..MAX_ORDER {
                 loop {
                     let pfn = self.percpu_pop_raw(cpu, order);
@@ -41,7 +41,7 @@ impl LazyBuddyAllocator {
             }
         });
         let mut free_percpu = [0usize; MAX_ORDER];
-        for cpu in 0..MAX_CPUS {
+        for cpu in 0..PER_CPU.cpu_count() {
             PER_CPU.with_cache(cpu, |cache| {
                 for order in 0..MAX_ORDER {
                     free_percpu[order] += cache.counts[order] as usize;
