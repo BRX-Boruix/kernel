@@ -13,6 +13,7 @@ extern crate std;
 // 需要堆分配，会因走未初始化的内核堆而崩溃。故测试构建使用系统分配器。
 #[cfg(not(test))]
 pub mod allocator;
+pub mod collections;
 pub mod console;
 pub mod format;
 pub mod log;
