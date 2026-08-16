@@ -452,6 +452,63 @@ pub fn test_timer() {
     );
 }
 
+/// 软件定时器回调状态（fn 指针无捕获，用全局原子收集）。
+static TIMEOUT_FIRED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn timeout_cb(_arg: usize) {
+    TIMEOUT_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// 验证 `arch::Timer`（X8664Timer）抽象：单调时钟换算、sleep、软件定时器。
+pub fn test_time_abstraction() {
+    use core::sync::atomic::Ordering;
+
+    info!("[time] entering test_time_abstraction");
+    TIMEOUT_FIRED.store(0, Ordering::Relaxed);
+
+    use arch::Timer as _;
+    use arch_x86_64::timer::X8664Timer;
+
+    // 1. 单调时钟：等 5 个 tick，验证 now_millis 确实增长。
+    let m0 = X8664Timer::now_millis();
+    let t0 = arch_x86_64::lapic::ticks();
+    while arch_x86_64::lapic::ticks().wrapping_sub(t0) < 5 {
+        arch_x86_64::interrupts::enable();
+        arch_x86_64::interrupts::halt();
+    }
+    let m1 = X8664Timer::now_millis();
+    info!(
+        "[time] monotonic: {}ms -> {}ms (+{}ms, 5 ticks @100Hz = ~50ms)",
+        m0, m1, m1.saturating_sub(m0)
+    );
+    // 5 tick @100Hz ≈ 50ms，允许 ±30ms 抖动（QEMU/真机差异）。
+    assert!(m1.saturating_sub(m0) >= 20 && m1.saturating_sub(m0) <= 200);
+
+    // 2. 软件定时器：注册 100ms 回调，等 tick 驱动 poll_timeouts 触发。
+    //    LAPIC tick handler 已接 klib::time::poll_timeouts。
+    let ok = X8664Timer::set_timeout(100_000_000, timeout_cb, 0);
+    assert!(ok.is_some());
+    let t1 = arch_x86_64::lapic::ticks();
+    while arch_x86_64::lapic::ticks().wrapping_sub(t1) < 30 {
+        arch_x86_64::interrupts::enable();
+        arch_x86_64::interrupts::halt();
+    }
+    assert_eq!(
+        TIMEOUT_FIRED.load(Ordering::Relaxed),
+        1,
+        "software timer callback should have fired once"
+    );
+
+    // 3. sleep_us：忙等 20ms，验证期间时间确实流逝。
+    let t2 = arch_x86_64::lapic::ticks();
+    X8664Timer::sleep_us(20_000); // 20ms
+    let elapsed_ticks = arch_x86_64::lapic::ticks().wrapping_sub(t2);
+    info!("[time] sleep_us(20ms) cost {} ticks (~{}ms)", elapsed_ticks, elapsed_ticks * 10);
+    assert!(elapsed_ticks >= 1 && elapsed_ticks <= 20, "sleep_us drifted");
+
+    info!("[time] time abstraction tests passed");
+}
+
 /// 验证物理页帧分配器的分配/释放基本逻辑。
 pub fn test_frame_alloc() {
     // 统计初始状态

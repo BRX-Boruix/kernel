@@ -148,6 +148,20 @@ unsafe fn kmain_body() -> ! {
     // 短暂等待验证时钟中断确实触发
     tests::test_timer();
 
+    // 时钟源已注入：验证单调时钟换算 + 打印 RTC 墙钟（真实年月日时分秒）。
+    let rtc = arch_x86_64::rtc::read_time();
+    info!(
+        "[kmain] RTC wall clock {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        rtc.year, rtc.month, rtc.day, rtc.hour, rtc.minute, rtc.second
+    );
+    info!(
+        "[kmain] monotonic clock ready: now={} ns ({} ms since boot)",
+        klib::time::now_nanos(),
+        klib::time::now_millis()
+    );
+    // 验证 arch::Timer 抽象（now/sleep/set_timeout），依赖 LAPIC tick 驱动。
+    tests::test_time_abstraction();
+
     // M2.5.4：从内核 iretq 进入用户态（Ring 3）执行一段用户代码并返回内核。
     // 依赖中断使能（int 0x80 软中断）与用户段 GDT，故放在定时器验证之后。
     // M3.2/M3.3：通过进程对象 spawn + 进入用户态；用户态异常被"进程终止"处理。

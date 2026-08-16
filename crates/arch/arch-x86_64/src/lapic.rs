@@ -115,12 +115,14 @@ fn end_of_interrupt() {
     lapic_write(LAPIC_EOI, 0);
 }
 
-/// IRQ 处理函数（定时器）：递增 tick 并 EOI。
+/// IRQ 处理函数（定时器）：递增 tick、驱动软件定时器队列并 EOI。
 extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
     let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if t <= 5 {
         klib::info!("[lapic] tick");
     }
+    // 软件定时器队列到期检查（回调在锁外执行，中断上下文安全）。
+    klib::time::poll_timeouts();
     end_of_interrupt();
     true
 }
@@ -219,6 +221,10 @@ pub fn init() {
 
     // 6. 注册 IRQ 处理（vector 0x20 → irq 0）
     interrupts::register_irq(0, lapic_timer_handler);
+
+    // 6. 把 LAPIC tick 源注入 klib 单调时钟（100Hz），此后
+    //    `klib::time::now_nanos`/`sleep_us`/`set_timeout` 可用。
+    klib::time::set_clock_source(ticks, target_hz);
 
     // 标记 LAPIC 已可用（串口锁依赖 LAPIC id 做多核 owner 判断）
     serial::set_lapic_ready();

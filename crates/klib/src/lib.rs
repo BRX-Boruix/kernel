@@ -19,3 +19,4 @@ pub mod format;
 pub mod log;
 pub mod serial;
 pub mod sync;
+pub mod time;

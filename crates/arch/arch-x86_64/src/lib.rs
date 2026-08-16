@@ -13,9 +13,11 @@ pub mod mmio;
 pub mod paging;
 pub mod pic;
 pub mod port;
+pub mod rtc;
 pub mod serial;
 pub mod smp;
 pub mod task;
+pub mod timer;
 
 use arch::Platform;
 
