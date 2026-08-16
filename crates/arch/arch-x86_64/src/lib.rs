@@ -15,6 +15,7 @@ pub mod pic;
 pub mod port;
 pub mod serial;
 pub mod smp;
+pub mod task;
 
 use arch::Platform;
 
@@ -36,6 +37,7 @@ impl Platform for X86_64Arch {
         gdt::init();
         interrupts::init();
         pic::init();
+        task::init(); // 注入上下文切换实现
     }
 
     fn halt() -> ! {

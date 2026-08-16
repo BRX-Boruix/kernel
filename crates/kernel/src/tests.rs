@@ -315,6 +315,87 @@ pub fn test_address_space_alloc() {
     logln!("[test-alloc] PASS");
 }
 
+// ---- M2 上下文切换测试 ----
+
+/// 任务栈大小（16KB）。
+const TASK_STACK_SIZE: usize = 16 * 1024;
+
+// 静态任务栈（BSS 段，不占内核堆）
+static mut TASK_STACK_A: [u8; TASK_STACK_SIZE] = [0; TASK_STACK_SIZE];
+static mut TASK_STACK_B: [u8; TASK_STACK_SIZE] = [0; TASK_STACK_SIZE];
+
+// 静态任务上下文
+static mut TASK_CTX_A: arch::task::TaskContext = arch::task::TaskContext::empty();
+static mut TASK_CTX_B: arch::task::TaskContext = arch::task::TaskContext::empty();
+
+/// 主上下文（测试结束切回用）。
+static mut MAIN_CTX: arch::task::TaskContext = arch::task::TaskContext::empty();
+
+/// 切换轮次计数。
+static SWITCH_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 任务 A 入口：循环打印并切到任务 B；第 4 次后切回主上下文结束。
+extern "C" fn task_a_main() {
+    use core::sync::atomic::Ordering;
+    loop {
+        let n = SWITCH_COUNT.fetch_add(1, Ordering::SeqCst);
+        logln!("[test-switch] task A run #{} (stack intact)", n);
+        // 通过 addr_of_mut 取上下文引用（避免 static_mut_refs lint）
+        let ctx_a = unsafe { &mut *core::ptr::addr_of_mut!(TASK_CTX_A) };
+        if n >= 4 {
+            // 达到阈值：切回主上下文（结束测试）
+            let main_ctx = unsafe { &mut *core::ptr::addr_of_mut!(MAIN_CTX) };
+            arch::switch_to(ctx_a, main_ctx);
+        } else {
+            let ctx_b = unsafe { &mut *core::ptr::addr_of_mut!(TASK_CTX_B) };
+            arch::switch_to(ctx_a, ctx_b);
+        }
+        // 从 switch_to 恢复后回到 loop 开头，不会自然返回（避免 ret 到垃圾栈）
+    }
+}
+
+/// 任务 B 入口：循环打印并切到任务 A。
+extern "C" fn task_b_main() {
+    use core::sync::atomic::Ordering;
+    loop {
+        let n = SWITCH_COUNT.load(Ordering::SeqCst);
+        logln!("[test-switch] task B run (count={})", n);
+        let ctx_b = unsafe { &mut *core::ptr::addr_of_mut!(TASK_CTX_B) };
+        let ctx_a = unsafe { &mut *core::ptr::addr_of_mut!(TASK_CTX_A) };
+        arch::switch_to(ctx_b, ctx_a);
+        // 从 switch_to 恢复后回到 loop 开头
+    }
+}
+
+/// M2：验证上下文切换。
+///
+/// 两个任务（A/B）通过 `switch_to` 交替执行，各用独立栈。
+/// 验证寄存器/栈正确保存恢复，无崩溃。
+pub fn test_context_switch() {
+    use core::sync::atomic::Ordering;
+
+    // 任务 A/B 上下文：入口 + 独立栈顶部
+    let stack_a_top = core::ptr::addr_of!(TASK_STACK_A) as usize + TASK_STACK_SIZE;
+    let stack_b_top = core::ptr::addr_of!(TASK_STACK_B) as usize + TASK_STACK_SIZE;
+    let ctx_a = unsafe { &mut *core::ptr::addr_of_mut!(TASK_CTX_A) };
+    let ctx_b = unsafe { &mut *core::ptr::addr_of_mut!(TASK_CTX_B) };
+    arch_x86_64::task::init_context(ctx_a, task_a_main, stack_a_top as u64);
+    arch_x86_64::task::init_context(ctx_b, task_b_main, stack_b_top as u64);
+
+    SWITCH_COUNT.store(0, Ordering::SeqCst);
+    logln!("[test-switch] starting context switch...");
+
+    // 从主切到任务 A（保存主上下文到 MAIN_CTX）
+    let main_ctx = unsafe { &mut *core::ptr::addr_of_mut!(MAIN_CTX) };
+    arch::switch_to(main_ctx, ctx_a);
+    // 当任务 A 第 4 次切回 MAIN_CTX 时，控制流回到这里
+
+    let n = SWITCH_COUNT.load(Ordering::SeqCst);
+    logln!("[test-switch] back to main after {} switches", n);
+    assert!(n >= 4, "expected >=4 switches, got {}", n);
+    logln!("[test-switch] PASS");
+}
+
 /// 验证堆分配器的分配/释放/重用逻辑。
 pub fn test_heap() {
     use alloc::boxed::Box;

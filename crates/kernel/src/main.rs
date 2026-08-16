@@ -101,6 +101,8 @@ unsafe fn kmain_body() -> ! {
     tests::test_demand_paging();
     // M1.4：验证进程地址空间内部分配器（栈/mmap/brk）
     tests::test_address_space_alloc();
+    // M2：验证 CPU 上下文切换（switch_to 交替执行）
+    tests::test_context_switch();
 
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
     if let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() {

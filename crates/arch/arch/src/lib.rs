@@ -9,10 +9,12 @@
 pub mod addr;
 pub mod hhdm;
 pub mod paging;
+pub mod task;
 
 pub use addr::{PhysAddr, PhysFrame, VirtAddr};
 pub use hhdm::{phys_to_virt, virt_to_phys, PHYS_OFFSET};
 pub use paging::{ActivePageTable, PageFlags, PageSize, PageTable};
+pub use task::{switch_to, TaskContext};
 
 /// 架构平台抽象。
 ///
