@@ -24,8 +24,22 @@ impl LazyBuddyAllocator {
         None
     }
 
+    /// 紧急预留池容量上限（单位：4K 页）。
+    ///
+    /// 固定上限保证 reserve 池只保留少量兜底页，不会随反复 churn 无限增长。
+    const RESERVE_CAP: usize = 32;
+
     pub(crate) fn reserve_push(&self, pfn: usize) {
         let mut list = self.reserve_list.lock();
+        // 把"容量判断"与"入池"收敛到同一临界区内：多 CPU 并发释放时，
+        // 不会出现都通过 `< RESERVE_CAP` 检查、从而令 reserve_count 超出上限的情况。
+        if self.reserve_count.load(Ordering::Relaxed) >= Self::RESERVE_CAP {
+            // 池已满：先释放 reserve 锁，再回收到全局 buddy（可参与后续合并），
+            // 避免这些 4K 帧被 reserve 池独占、永不合并而加剧碎片化。
+            drop(list);
+            self.free_and_merge(pfn, ORDER_4K);
+            return;
+        }
         unsafe {
             self.link_frame_as(pfn, ORDER_4K as u8, FrameState::Allocated, list.head);
         }

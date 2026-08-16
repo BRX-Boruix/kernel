@@ -90,8 +90,9 @@ impl LazyBuddyAllocator {
             }
         };
 
-        if order == ORDER_4K && self.reserve_count.load(Ordering::Relaxed) < 32 {
-            // reserve_push 会把状态改写回 Allocated 并挂入预留池。
+        if order == ORDER_4K {
+            // reserve_push 内部在 reserve_list 锁下判断是否入池（上限 32）；
+            // 池满时它会把该 4K 帧回收到全局 buddy（可参与合并）。
             self.reserve_push(pfn);
         } else {
             let cpu = current_cpu_id();
