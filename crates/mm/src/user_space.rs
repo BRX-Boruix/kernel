@@ -300,21 +300,25 @@ where
         let mut candidate = align_up(self.next_mmap, 4096);
         let mut step = size;
         let mut tries = 0u32;
-        while candidate + size <= USER_TOP && tries < 64 {
-            if !self.overlaps(candidate, candidate + size) {
+        // 用 checked_add 计算区间端点：candidate 接近 u64::MAX 时避免加法溢出回绕，
+        // 从而绕过 USER_TOP 边界检查产生非法地址。
+        let mut end = candidate.checked_add(size).unwrap_or(u64::MAX);
+        while end <= USER_TOP && tries < 64 {
+            if !self.overlaps(candidate, end) {
                 self.reserve_user(
                     VirtAddr::new(candidate),
-                    VirtAddr::new(candidate + size),
+                    VirtAddr::new(end),
                     PageSize::Size4K,
                     flags,
                 )?;
-                self.next_mmap = candidate + size;
+                self.next_mmap = end;
                 return Ok(candidate);
             }
-            // 跳过密集已用区：以翻倍步长快速推进候选地址（saturating 防 u64 溢出）。
-            candidate = align_up(candidate.saturating_add(step), 4096);
+            // 跳过密集已用区：以翻倍步长快速推进候选地址。用 saturating 防 u64 溢出。
+            candidate = saturating_align_up(candidate.saturating_add(step), 4096);
             step = step.saturating_mul(2);
             tries += 1;
+            end = candidate.checked_add(size).unwrap_or(u64::MAX);
             // 保护：跳过栈区（USER_STACK_TOP 以下 8MiB 内不做 mmap）
             if candidate >= USER_STACK_TOP - 8 * 1024 * 1024 {
                 break;
@@ -408,6 +412,13 @@ where
 /// 向上对齐到页（4KB）。
 fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
+}
+
+/// 向上对齐到页（4KB），在 `v` 逼近 `u64::MAX` 时饱和到 `u64::MAX`，避免溢出回绕。
+fn saturating_align_up(v: u64, align: u64) -> u64 {
+    v.checked_add(align - 1)
+        .map(|x| x & !(align - 1))
+        .unwrap_or(u64::MAX)
 }
 
 // ---- 全局"当前用户地址空间"（M1.3 按需分页的 #PF 入口）----
