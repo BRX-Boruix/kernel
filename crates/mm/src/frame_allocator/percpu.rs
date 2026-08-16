@@ -33,8 +33,8 @@ impl LazyBuddyAllocator {
         PER_CPU.with_cache(cpu, |cache| {
             if let Some(head) = cache.heads[order] {
                 unsafe {
-                    let frame = self.get_frame(head);
-                    cache.heads[order] = frame.next;
+                    let frame = self.frame_ptr(head);
+                    cache.heads[order] = (*frame).next;
                     cache.counts[order] = cache.counts[order].saturating_sub(1);
                     self.reset_frame_with(frame, order as u8);
                 }

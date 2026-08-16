@@ -14,8 +14,8 @@ impl LazyBuddyAllocator {
         let mut list = self.reserve_list.lock();
         if let Some(head) = list.head {
             unsafe {
-                let frame = self.get_frame(head);
-                list.head = frame.next;
+                let frame = self.frame_ptr(head);
+                list.head = (*frame).next;
                 self.reset_frame_with(frame, ORDER_4K as u8);
             }
             self.reserve_count.fetch_sub(1, Ordering::Relaxed);

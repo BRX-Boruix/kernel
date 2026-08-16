@@ -35,8 +35,8 @@ impl LazyBuddyAllocator {
             while let Some(pfn) = cur {
                 free_global[order] += 1;
                 unsafe {
-                    let frame = self.get_frame(pfn);
-                    cur = frame.next;
+                    let frame = self.frame_ptr(pfn);
+                    cur = (*frame).next;
                 }
             }
         });

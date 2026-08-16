@@ -235,21 +235,28 @@ impl LazyBuddyAllocator {
         *l2.add(l2_idx)
     }}
 
-    // Helper to access frame metadata
-    pub(crate) unsafe fn get_frame(&self, pfn: usize) -> &'static mut BuddyFrame { unsafe {
+    // 返回帧元数据裸指针（**非** `&'static mut`）。
+    //
+    // 元数据由 shard 链表锁保护，调用方须在持锁临界区内通过裸指针访问。
+    // 之所以不返回 `&'static mut`：多 CPU 并发对“同一底层内存”取 `&mut`
+    // 即构成别名/noalias 未定义行为（LLVM 可借 noalias 做激进优化而对同一
+    // 元数据字节产生交错写）；裸指针不携带独占所有权假设，可安全用于此场景。
+    #[inline]
+    pub(crate) unsafe fn frame_ptr(&self, pfn: usize) -> *mut BuddyFrame { unsafe {
         let cfg = self.config();
         let block_idx = pfn / cfg.frames_per_block;
         let offset = pfn % cfg.frames_per_block;
         let block_ptr = self.block_ptr(block_idx);
-        &mut *block_ptr.add(offset)
+        block_ptr.add(offset)
     }}
 
-    // Optimized helper with cache
-    pub(crate) unsafe fn get_frame_with_cache(
+    // 带缓存的等价版本（同一 block 内连续访问时复用 block 指针）。
+    #[inline]
+    pub(crate) unsafe fn frame_ptr_with_cache(
         &self,
         pfn: usize,
         cache: &mut MetadataCache,
-    ) -> &'static mut BuddyFrame { unsafe {
+    ) -> *mut BuddyFrame { unsafe {
         let cfg = self.config();
         let block_idx = pfn / cfg.frames_per_block;
         let offset = pfn % cfg.frames_per_block;
@@ -259,25 +266,27 @@ impl LazyBuddyAllocator {
             cache.block_idx = block_idx;
         }
 
-        &mut *cache.block_ptr.add(offset)
+        cache.block_ptr.add(offset)
     }}
 
     /// 把一个帧标记为已分配，并脱离所有链表（复位 next/prev/order/migratable）。
     #[inline]
     pub(crate) unsafe fn reset_frame(&self, pfn: usize, order: u8) {
         unsafe {
-            self.reset_frame_with(self.get_frame(pfn), order);
+            self.reset_frame_with(self.frame_ptr(pfn), order);
         }
     }
 
-    /// 复位给定的 `frame` 元数据（调用方已持有帧引用）。
+    /// 复位给定的 `frame` 元数据（调用方已持有帧裸指针，须在持锁临界区内）。
     #[inline]
-    pub(crate) unsafe fn reset_frame_with(&self, frame: &'static mut BuddyFrame, order: u8) {
-        frame.order = order;
-        frame.state = FrameState::Allocated;
-        set_flag(&mut frame.flags, BF_MIGRATABLE, true);
-        frame.next = None;
-        frame.prev = None;
+    pub(crate) unsafe fn reset_frame_with(&self, frame: *mut BuddyFrame, order: u8) {
+        unsafe {
+            (*frame).order = order;
+            (*frame).state = FrameState::Allocated;
+            set_flag(&mut (*frame).flags, BF_MIGRATABLE, true);
+            (*frame).next = None;
+            (*frame).prev = None;
+        }
     }
 
     /// 把一个帧标记为 `state` 状态并链入链表（`next` 为链头）。
@@ -286,13 +295,13 @@ impl LazyBuddyAllocator {
     /// 统一"写 order/state/migratable/next/prev"五连操作。
     #[inline]
     pub(crate) unsafe fn link_frame_as(&self, pfn: usize, order: u8, state: FrameState, next: Option<usize>) {
+        let frame = unsafe { self.frame_ptr(pfn) };
         unsafe {
-            let frame = self.get_frame(pfn);
-            frame.order = order;
-            frame.state = state;
-            set_flag(&mut frame.flags, BF_MIGRATABLE, true);
-            frame.next = next;
-            frame.prev = None;
+            (*frame).order = order;
+            (*frame).state = state;
+            set_flag(&mut (*frame).flags, BF_MIGRATABLE, true);
+            (*frame).next = next;
+            (*frame).prev = None;
         }
     }
 

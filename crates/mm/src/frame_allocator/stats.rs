@@ -84,8 +84,8 @@ pub fn frag_stats() -> PmmFragStats {
         while let Some(pfn) = cur {
             free_global[order] += 1;
             unsafe {
-                let frame = ALLOCATOR.get_frame(pfn);
-                cur = frame.next;
+                let frame = ALLOCATOR.frame_ptr(pfn);
+                cur = (*frame).next;
             }
         }
     });

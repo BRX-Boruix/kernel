@@ -42,8 +42,8 @@ impl LazyBuddyAllocator {
         }
         if let Some(head_idx) = list.head {
             unsafe {
-                let head_frame = self.get_frame(head_idx);
-                head_frame.prev = Some(pfn);
+                let head_frame = self.frame_ptr(head_idx);
+                (*head_frame).prev = Some(pfn);
             }
         }
         list.head = Some(pfn);
@@ -51,24 +51,24 @@ impl LazyBuddyAllocator {
 
     unsafe fn remove_from_list_with_list(&self, pfn: usize, order: usize, list: &mut FreeList) { unsafe {
         let (prev_idx, next_idx) = {
-            let frame = self.get_frame(pfn);
-            let prev = frame.prev;
-            let next = frame.next;
-            frame.next = None;
-            frame.prev = None;
+            let frame = self.frame_ptr(pfn);
+            let prev = (*frame).prev;
+            let next = (*frame).next;
+            (*frame).next = None;
+            (*frame).prev = None;
             (prev, next)
         };
 
         if let Some(prev) = prev_idx {
-            let prev_frame = self.get_frame(prev);
-            prev_frame.next = next_idx;
+            let prev_frame = self.frame_ptr(prev);
+            (*prev_frame).next = next_idx;
         } else {
             list.head = next_idx;
         }
 
         if let Some(next) = next_idx {
-            let next_frame = self.get_frame(next);
-            next_frame.prev = prev_idx;
+            let next_frame = self.frame_ptr(next);
+            (*next_frame).prev = prev_idx;
         }
 
         let _ = order; // keep signature parity
@@ -126,7 +126,7 @@ impl LazyBuddyAllocator {
 
                             unsafe {
                                 let mut cache = MetadataCache::new();
-                                let frame = self.get_frame_with_cache(cursor, &mut cache);
+                                let frame = self.frame_ptr_with_cache(cursor, &mut cache);
                                 self.reset_frame_with(frame, order_gap as u8);
                             }
                             self.free_and_merge(cursor, order_gap);
@@ -164,8 +164,8 @@ impl LazyBuddyAllocator {
             let shard = Self::shard_for_pfn(buddy_pfn);
             let mut list = self.lock_global_list(order, shard);
             unsafe {
-                let buddy = self.get_frame(buddy_pfn);
-                if buddy.state != FrameState::FreeGlobal || buddy.order != order as u8 {
+                let buddy = self.frame_ptr(buddy_pfn);
+                if (*buddy).state != FrameState::FreeGlobal || (*buddy).order != order as u8 {
                     break;
                 }
                 self.remove_from_list_with_list(buddy_pfn, order, &mut *list);
@@ -197,15 +197,15 @@ impl LazyBuddyAllocator {
         // 以该 shard 的 order-0 链表锁作为该 shard 内所有帧元数据的保护锁。
         let meta_guard = self.lock_global_list(0, shard);
         let order = unsafe {
-            let frame_meta = self.get_frame(pfn);
-            if frame_meta.state != FrameState::Allocated {
+            let frame_meta = self.frame_ptr(pfn);
+            if (*frame_meta).state != FrameState::Allocated {
                 // 双重释放或无效释放：元数据锁保护下判定，杜绝并发重复释放。
                 return None;
             }
             // 认领该帧：置为瞬态 Freeing，防止元数据锁释放后、状态被改写前的
             // 窗口中被另一个 CPU 重复释放。
-            frame_meta.state = FrameState::Freeing;
-            frame_meta.order as usize
+            (*frame_meta).state = FrameState::Freeing;
+            (*frame_meta).order as usize
         };
         drop(meta_guard);
         Some(order)
