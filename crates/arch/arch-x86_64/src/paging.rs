@@ -236,7 +236,8 @@ impl arch::PageTable for X86PageTable {
         //    用户半区（低半区顶层项）保持为空，实现"独立用户地址空间"。
         let levels = page_levels();
         let half = 1usize << (levels - 1); // LA48:256, LA57:512
-        let cur_top = (mmio::cr3() & !0xFFF) as *const u64;
+        // CR3 返回的是 PML4 的物理地址，须经 HHDM 映射为虚拟地址才能解引用。
+        let cur_top = phys_to_virt(mmio::cr3() & !0xFFF) as *const u64;
         for i in half..512 {
             let entry = unsafe { *cur_top.add(i) };
             if entry != 0 {

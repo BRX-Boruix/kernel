@@ -64,7 +64,12 @@ pub fn init_percpu_caches(cpu_count: usize) {
         (bits - 1 - (need_frames - 1).leading_zeros() as usize).min(MAX_ORDER - 1)
     };
 
-    let start = allocate_frames(order).expect("failed to allocate per-CPU cache frames");
+    // 注意：这里不能走公共 `allocate_frames`（会先查 per-CPU 缓存，而缓存此时
+    // 尚未初始化 → panic）。直接走全局空闲列表分配缓存数组本身的物理帧。
+    let idx = ALLOCATOR
+        .alloc_global(order, 0)
+        .expect("failed to allocate per-CPU cache frames");
+    let start = PhysFrame::from_paddr_raw((idx * 4096) as u64);
     let base = phys_to_virt(start.start_paddr()) as *mut u8;
 
     // 清零整个分配区

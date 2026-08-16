@@ -69,15 +69,15 @@ unsafe fn kmain_body() -> ! {
     klib::serial::set_output(arch_x86_64::serial::write_str as fn(&str));
     logln!("[kmain] serial initialized (arch={})", CurrentArch::name());
 
-    // 初始化内存管理（LazyBuddy 物理页帧分配器）
+    // 注入系统 CPU 数读取器（供 mm 初始化 per-CPU 缓存；必须在 mm::init 前）。
+    // 注：mm 自身不声明 Limine SMP 请求，避免与 arch-x86_64 的 SMP_REQUEST 冲突
+    // 导致 Limine "Conflict detected for request ID" panic。
+    mm::set_cpu_count_reader(arch_x86_64::smp::requested_cpu_count);
+
+    // 初始化内存管理（LazyBuddy 物理页帧分配器 + per-CPU 缓存）
     mm::init();
     // 物理帧分配器就绪后，给堆注入增长源（按需映射动态堆），此后堆可无限增长
     klib::allocator::set_grow_allocator(heap_grow_source);
-
-    // 依据 Limine SMP 响应预分配 per-CPU 页帧缓存（自适应核数）。
-    // 依赖物理帧分配器，须在 mm::init() 之后调用。
-    let total_cpus = arch_x86_64::smp::requested_cpu_count();
-    mm::frame_allocator::init_percpu_caches(total_cpus);
 
     // 验证物理页帧分配/释放
     tests::test_frame_alloc();

@@ -238,7 +238,8 @@ impl LazyBuddyAllocator {
         // 一级表（L1）：`*mut *mut BuddyFrame` 数组，初始全 null。
         // 二级表在 process_range 触及对应 L1 项时按需分配。
         let metadata_l1 = (phys_offset + map_paddr as u64) as *mut *mut *mut BuddyFrame;
-        core::ptr::write_bytes(metadata_l1, 0, l1_len);
+        // write_bytes 的第三个参数是字节数：l1_len 个 8 字节指针。
+        core::ptr::write_bytes(metadata_l1, 0, l1_len * size_of::<*mut *mut BuddyFrame>());
 
         let uninit_regions_ptr = (phys_offset + uninit_paddr as u64) as *mut Option<UninitRegion>;
         let uninit_regions = slice::from_raw_parts_mut(uninit_regions_ptr, max_uninit_regions);
