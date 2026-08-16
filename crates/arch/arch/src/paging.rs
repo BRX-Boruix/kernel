@@ -68,6 +68,15 @@ pub trait PageTable {
     /// 错误类型（架构相关，如"页表层级已满"）。
     type Error: core::fmt::Debug;
 
+    /// 新建一个独立的页表：**继承当前内核半区映射**（所有进程共享内核映射），
+    /// **用户半区为空**（每个进程独立的用户地址空间）。
+    ///
+    /// 用于进程地址空间：`spawn`（ADR-003）时从内核页表派生出新进程页表，
+    /// 但不复制父进程的用户区。
+    fn new() -> Result<Self, Self::Error>
+    where
+        Self: Sized;
+
     /// 把物理页 `paddr` 以 `size` 大小映射到虚拟地址 `vaddr`。
     fn map(&mut self, vaddr: VirtAddr, paddr: PhysAddr, size: PageSize, flags: PageFlags) -> Result<(), Self::Error>;
 

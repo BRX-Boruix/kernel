@@ -298,6 +298,21 @@ pub fn register_irq(irq: u8, handler: IrqHandler) {
     }
 }
 
+/// 页错误（#PF, 14 号异常）回调。
+///
+/// 参数为 (错误码, CR2 线性地址)。返回 `true` 表示已处理（如按需补页后），
+/// 继续执行；返回 `false` 表示未处理（内核态缺页/非法访问），保持原停机行为。
+///
+/// 由虚拟内存/进程子系统注册（M1.3 按需分页）。`arch` 层只提供钩子，
+/// 不实现具体策略（ADR-007）。
+pub type PageFaultHandler = extern "C" fn(u64, u64) -> bool;
+static PAGE_FAULT_HANDLER: spin::Once<PageFaultHandler> = spin::Once::new();
+
+/// 注册页错误处理回调。
+pub fn register_page_fault_handler(h: PageFaultHandler) {
+    let _ = PAGE_FAULT_HANDLER.call_once(|| h);
+}
+
 /// 分发入口（由汇编 `interrupt_common_stub` 调用）。
 ///
 /// `frame` 指向保存的寄存器区。
@@ -316,8 +331,14 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         klib::logln!("  vector: {:#x}", vector);
         klib::logln!("  rip:    {:#x}", frame.rip);
         if vector == 14 {
-            // 页错误：打印 CR2
+            // 页错误：优先交给已注册的 #PF 回调（如按需分页）。
             let cr2 = crate::mmio::cr2();
+            if let Some(h) = PAGE_FAULT_HANDLER.get() {
+                if h(frame.error_code, cr2) {
+                    return; // 已处理（如补页成功），返回用户态/内核态继续
+                }
+            }
+            // 未注册或未处理：打印 CR2 并停机
             klib::logln!("  cr2:    {:#x}", cr2);
             klib::logln!("  error:  P={:#x}", frame.error_code);
         }

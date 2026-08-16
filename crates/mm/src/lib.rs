@@ -14,6 +14,7 @@ extern crate alloc;
 pub mod frame_allocator;
 pub mod mapper;
 pub mod memory_set;
+pub mod user_space;
 
 pub use frame_allocator::{
     allocate_frame, allocate_frames, compact_now, deallocate_frame, frag_stats, init as init_frame,

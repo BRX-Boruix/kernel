@@ -208,8 +208,44 @@ impl X86PageTable {
     }
 }
 
+impl arch::ActivePageTable for X86PageTable {
+    /// 获取当前活动页表（包装当前 CR3）。
+    fn current() -> Self {
+        Self {
+            pml4: mmio::cr3() & !0xFFF,
+        }
+    }
+
+    /// 切换活动页表（写 CR3）。
+    fn activate(&self) {
+        mmio::write_cr3(self.pml4);
+    }
+}
+
 impl arch::PageTable for X86PageTable {
     type Error = &'static str;
+
+    fn new() -> Result<Self, Self::Error> {
+        // 1. 分配新顶层页表页并清零
+        let top = alloc_frame().ok_or("no frame for new page table")?;
+        let top_virt = phys_to_virt(top) as *mut u64;
+        unsafe { core::ptr::write_bytes(top_virt, 0, 512) };
+
+        // 2. 复制当前内核页表的高半区顶层条目（所有进程共享内核映射）。
+        //    高半区 = 顶层索引 >= 2^(levels-1) 的项（bit63 为 1 的地址范围）。
+        //    用户半区（低半区顶层项）保持为空，实现"独立用户地址空间"。
+        let levels = page_levels();
+        let half = 1usize << (levels - 1); // LA48:256, LA57:512
+        let cur_top = (mmio::cr3() & !0xFFF) as *const u64;
+        for i in half..512 {
+            let entry = unsafe { *cur_top.add(i) };
+            if entry != 0 {
+                unsafe { *top_virt.add(i) = entry };
+            }
+        }
+
+        Ok(Self { pml4: top })
+    }
 
     fn map(&mut self, vaddr: VirtAddr, paddr: PhysAddr, size: PageSize, flags: PageFlags) -> Result<(), Self::Error> {
         let levels = page_levels();

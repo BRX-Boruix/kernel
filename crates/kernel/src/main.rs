@@ -91,6 +91,8 @@ unsafe fn kmain_body() -> ! {
     );
     // 验证虚拟内存页表映射
     tests::test_paging();
+    // M1：验证用户地址空间（独立页表 + 用户映射 + 切换）
+    tests::test_user_address_space();
 
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
     if let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() {

@@ -6,7 +6,7 @@
 
 use klib::logln;
 
-use arch::{PageFlags, PageSize, PageTable, PhysAddr, PhysFrame, VirtAddr};
+use arch::{ActivePageTable, PageFlags, PageSize, PageTable, PhysAddr, PhysFrame, VirtAddr};
 use arch_x86_64::paging::X86PageTable;
 
 /// 验证虚拟内存页表：4KB 映射 + 2MB 大页映射 + 真实内存读写（经 HHDM 写入，
@@ -71,6 +71,79 @@ pub fn test_paging() {
     }
 
     logln!("[test-paging] PASS");
+}
+
+/// M1：验证用户地址空间（UserAddressSpace）。
+///
+/// 覆盖：
+/// 1. 从内核页表派生独立用户页表（`UserAddressSpace::new`）。
+/// 2. 用户区映射（带 user 标志）、翻译、解映射。
+/// 3. 切换活动页表后内核仍可访问（内核半区被继承）。
+pub fn test_user_address_space() {
+    use mm::user_space::UserAddressSpace;
+
+    logln!("[test-user-space] creating user address space...");
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+
+    // 映射 2 个用户页
+    let f1 = mm::allocate_frame().expect("f1").start_paddr();
+    let f2 = mm::allocate_frame().expect("f2").start_paddr();
+    let start = VirtAddr::new(0x0000_0000_4000_0000);
+    let end = VirtAddr::new(0x0000_0000_4000_2000);
+    us.map_user(
+        start,
+        end,
+        PageSize::Size4K,
+        PageFlags::empty().writable(),
+        &[f1, f2],
+    )
+    .expect("map_user");
+    logln!(
+        "[test-user-space] mapped {}..{} areas={}",
+        start.as_u64(),
+        end.as_u64(),
+        us.area_count()
+    );
+
+    // 翻译验证
+    let t1 = us.translate(start).expect("translate page0");
+    logln!(
+        "[test-user-space] translate({:#x}) -> {:#x} (expect {:#x})",
+        start.as_u64(),
+        t1.as_u64(),
+        f1
+    );
+    assert_eq!(t1.as_u64(), f1);
+
+    // 切换活动页表：切到用户地址空间后，内核半区仍可访问（串口能继续打印）
+    us.activate();
+    logln!("[test-user-space] activated user page table, kernel still reachable");
+
+    // 验证用户页可经 HHDM 写入、经激活页表读到（通过 translate 得到物理地址）
+    let phys = us.translate(start).unwrap().as_u64();
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    unsafe {
+        core::ptr::write_volatile((phys + off) as *mut u32, 0xDEAD);
+        let v = core::ptr::read_volatile((phys + off) as *const u32);
+        logln!("[test-user-space] write/read phys {:#x} = {:#x}", phys, v);
+        assert_eq!(v, 0xDEAD);
+    }
+
+    // 切回内核页表（当前活动页表）
+    X86PageTable::current().activate();
+    logln!("[test-user-space] switched back to kernel page table");
+
+    // 解映射并释放
+    let unp0 = us.unmap_user(start).expect("unmap page0");
+    logln!("[test-user-space] unmap page0 -> {:#x}", unp0.as_u64());
+    let unp1 = us
+        .unmap_user(VirtAddr::new(0x0000_0000_4000_1000))
+        .expect("unmap page1");
+    logln!("[test-user-space] unmap page1 -> {:#x}", unp1.as_u64());
+    mm::deallocate_frame(PhysFrame::from_paddr_raw(f1));
+    mm::deallocate_frame(PhysFrame::from_paddr_raw(f2));
+
+    logln!("[test-user-space] PASS");
 }
 
 /// 验证堆分配器的分配/释放/重用逻辑。
