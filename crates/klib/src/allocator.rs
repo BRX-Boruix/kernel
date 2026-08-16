@@ -35,57 +35,7 @@ pub fn set_grow_allocator(f: fn(u32) -> u64) {
     GROW_ALLOC.store(f as usize, Ordering::SeqCst);
 }
 
-/// 自旋锁包装，避免依赖 `spin` crate（klib 保持零额外依赖）。
-struct SpinMutex<T> {
-    locked: core::sync::atomic::AtomicBool,
-    data: UnsafeCell<T>,
-}
-
-unsafe impl<T: Send> Sync for SpinMutex<T> {}
-unsafe impl<T: Send> Send for SpinMutex<T> {}
-
-impl<T> SpinMutex<T> {
-    const fn new(data: T) -> Self {
-        Self {
-            locked: core::sync::atomic::AtomicBool::new(false),
-            data: UnsafeCell::new(data),
-        }
-    }
-
-    fn lock(&self) -> SpinMutexGuard<'_, T> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        SpinMutexGuard { mutex: self }
-    }
-}
-
-struct SpinMutexGuard<'a, T> {
-    mutex: &'a SpinMutex<T>,
-}
-
-impl<T> core::ops::Deref for SpinMutexGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        unsafe { &*self.mutex.data.get() }
-    }
-}
-
-impl<T> core::ops::DerefMut for SpinMutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.mutex.data.get() }
-    }
-}
-
-impl<T> Drop for SpinMutexGuard<'_, T> {
-    fn drop(&mut self) {
-        self.mutex.locked.store(false, Ordering::Release);
-    }
-}
+use crate::sync::spin::SpinMutex;
 
 /// 全局堆：内部持有 buddy `Heap`，OOM 时按需增长。
 struct KernelHeap {

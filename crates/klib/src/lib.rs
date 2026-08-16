@@ -4,6 +4,10 @@
 
 #![no_std]
 
+// 单测环境（std test harness）需要 std；no_std crate 需显式声明。
+#[cfg(test)]
+extern crate std;
+
 // 内核堆分配器（含 `#[global_allocator]`）仅在非测试构建下编译：
 // 单测环境下它从未被 `init()` 初始化，而 test harness（std 初始化）
 // 需要堆分配，会因走未初始化的内核堆而崩溃。故测试构建使用系统分配器。
@@ -13,3 +17,4 @@ pub mod console;
 pub mod format;
 pub mod log;
 pub mod serial;
+pub mod sync;
