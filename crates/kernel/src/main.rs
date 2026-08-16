@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod drivers;
 mod panic;
+mod pci;
 mod process;
 mod symbols;
 mod terminal;
@@ -82,6 +83,10 @@ unsafe fn kmain_body() -> ! {
 
     // T5：初始化设备/驱动框架（ADR-008）：注册串口设备 + 驱动并探测。
     drivers::init();
+
+    // T6.1：枚举 PCI 总线（bus 0），把发现的设备登记到驱动框架。
+    // 早于具体设备驱动使用；框架就绪后即可。
+    pci::enumerate();
 
     // T4：探测 CPU 特性（CPUID/vendor/brand；BSP 单线程阶段，结果缓存到静态）。
     arch_x86_64::cpu::init();

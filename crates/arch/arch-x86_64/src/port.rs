@@ -29,3 +29,31 @@ pub fn outb(port: u16, byte: u8) {
         );
     }
 }
+
+/// 读取 port（inl，32 位）
+#[inline]
+pub fn inl(port: u16) -> u32 {
+    let result: u32;
+    unsafe {
+        core::arch::asm!(
+            "in eax, dx",
+            out("eax") result,
+            in("dx") port,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    result
+}
+
+/// 写入 port（outl，32 位）
+#[inline]
+pub fn outl(port: u16, value: u32) {
+    unsafe {
+        core::arch::asm!(
+            "out dx, eax",
+            in("dx") port,
+            in("eax") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}

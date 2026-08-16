@@ -6,10 +6,15 @@
 
 #![no_std]
 
+// 单测环境（std test harness）需要 std；no_std crate 需显式声明。
+#[cfg(test)]
+extern crate std;
+
 pub mod addr;
 pub mod cpu;
 pub mod hhdm;
 pub mod paging;
+pub mod pci;
 pub mod task;
 pub mod timer;
 
@@ -17,6 +22,7 @@ pub use addr::{PhysAddr, PhysFrame, VirtAddr};
 pub use cpu::{Cpu, CpuFeature};
 pub use hhdm::{phys_to_virt, virt_to_phys, PHYS_OFFSET};
 pub use paging::{ActivePageTable, PageFlags, PageSize, PageTable};
+pub use pci::{Pci, PciDeviceInfo};
 pub use task::{switch_to, TaskContext};
 pub use timer::{Timer, TimerCallback};
 

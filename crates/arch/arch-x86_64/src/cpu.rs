@@ -29,18 +29,18 @@ pub struct CpuIdResult {
 pub fn cpuid(leaf: u32, subleaf: u32) -> CpuIdResult {
     let mut eax = leaf;
     let mut ecx = subleaf;
-    let mut tmp: u64;
     let mut ebx: u32;
     let edx: u32;
     unsafe {
         core::arch::asm!(
             // rbx 是 LLVM 保留寄存器，不能直接作操作数。先把它转存到通用
             // 寄存器（LLVM 分配时自动避开 rbx），CPUID 后再取出结果并恢复。
+            // `tmp` 只是中转，值不读 → 用 `_` 丢弃输出。
             "mov {tmp}, rbx",
             "cpuid",
             "mov {ebx:e}, ebx",
             "mov rbx, {tmp}",
-            tmp = out(reg) tmp,
+            tmp = out(reg) _,
             ebx = out(reg) ebx,
             inout("eax") eax,
             inout("ecx") ecx,
