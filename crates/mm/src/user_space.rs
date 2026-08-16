@@ -288,40 +288,65 @@ where
     ///
     /// 返回区间起始地址（页对齐）。仅在地址空间中保留（present=0），
     /// 访问时由 `handle_page_fault` 补页。`size` 向上取整到页。
+    ///
+    /// 采用**确定性线性扫描**（非翻倍步进）：收集所有已声明区域，排序后从
+    /// `next_mmap` 起逐个空隙寻找能容纳 `size` 的区间。这样保证**穷尽**——
+    /// 只要存在足够大的空隙就一定能找到，不会像翻倍步进那样跳过大段空闲区间
+    /// 而误报"no free mmap region"。扫描区间数即已声明区域数，规模很小（远小于
+    /// 虚拟页数），不会退化死循环。
     pub fn mmap_user(&mut self, size: u64, flags: PageFlags) -> Result<u64, PT::Error> {
         let size = align_up(size, 4096);
         if size == 0 {
             return Err("mmap size is zero".into());
         }
-        // 从 hint 起单调向上找不与已有区域重叠的空闲区间。
-        // 采用"翻倍步进"探测：在碎片化地址空间（大量小区域）下，固定 `size` 步长
-        // 逐段扫描会退化为接近 USER_TOP/4096 ≈ 2^47 次迭代（近乎死循环）；
-        // 翻倍步进可在 ~64 次迭代内覆盖整个 128TiB 用户空间，且仍返回合法的空闲区间。
+        // 收集所有已声明区域的 [start, end) 并排序（含栈区/堆区/mmap 区）。
+        let mut regions: Vec<(u64, u64)> = self
+            .areas
+            .lock()
+            .iter()
+            .map(|a| (a.start.as_u64(), a.end.as_u64()))
+            .collect();
+        regions.sort_unstable();
+
+        // 从 hint 起，在排序后的空隙中找第一个能容纳 size 的区间。
+        // 候选扫描范围上限：栈区下方（栈区是固定区域，mmap 不进入栈区）。
+        let top_limit = USER_STACK_TOP - 8 * 1024 * 1024;
         let mut candidate = align_up(self.next_mmap, 4096);
-        let mut step = size;
-        let mut tries = 0u32;
-        // 用 checked_add 计算区间端点：candidate 接近 u64::MAX 时避免加法溢出回绕，
-        // 从而绕过 USER_TOP 边界检查产生非法地址。
-        let mut end = candidate.checked_add(size).unwrap_or(u64::MAX);
-        while end <= USER_TOP && tries < 64 {
-            if !self.overlaps(candidate, end) {
+        // 遍历空隙：当前候选之前的已用区边界（初始为 hint 起点）。
+        let mut prev_end = candidate;
+        for (rs, re) in regions.iter() {
+            let rs = align_up(*rs, 4096);
+            // 本空隙 = [max(candidate, prev_end), rs)。
+            let gap_start = candidate.max(prev_end);
+            if gap_start < rs {
+                // 空隙足够容纳 size 且不越过栈区上限 → 命中
+                let end = gap_start.checked_add(size).unwrap_or(u64::MAX);
+                if end <= rs && end <= top_limit {
+                    self.reserve_user(
+                        VirtAddr::new(gap_start),
+                        VirtAddr::new(end),
+                        PageSize::Size4K,
+                        flags,
+                    )?;
+                    self.next_mmap = end;
+                    return Ok(gap_start);
+                }
+            }
+            prev_end = prev_end.max(*re);
+        }
+        // 最后一个已用区之后（到 top_limit 之前）的空隙
+        let gap_start = candidate.max(prev_end);
+        if gap_start < top_limit {
+            let end = gap_start.checked_add(size).unwrap_or(u64::MAX);
+            if end <= top_limit {
                 self.reserve_user(
-                    VirtAddr::new(candidate),
+                    VirtAddr::new(gap_start),
                     VirtAddr::new(end),
                     PageSize::Size4K,
                     flags,
                 )?;
                 self.next_mmap = end;
-                return Ok(candidate);
-            }
-            // 跳过密集已用区：以翻倍步长快速推进候选地址。用 saturating 防 u64 溢出。
-            candidate = saturating_align_up(candidate.saturating_add(step), 4096);
-            step = step.saturating_mul(2);
-            tries += 1;
-            end = candidate.checked_add(size).unwrap_or(u64::MAX);
-            // 保护：跳过栈区（USER_STACK_TOP 以下 8MiB 内不做 mmap）
-            if candidate >= USER_STACK_TOP - 8 * 1024 * 1024 {
-                break;
+                return Ok(gap_start);
             }
         }
         Err("no free mmap region".into())
@@ -412,13 +437,6 @@ where
 /// 向上对齐到页（4KB）。
 fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
-}
-
-/// 向上对齐到页（4KB），在 `v` 逼近 `u64::MAX` 时饱和到 `u64::MAX`，避免溢出回绕。
-fn saturating_align_up(v: u64, align: u64) -> u64 {
-    v.checked_add(align - 1)
-        .map(|x| x & !(align - 1))
-        .unwrap_or(u64::MAX)
 }
 
 // ---- 全局"当前用户地址空间"（M1.3 按需分页的 #PF 入口）----

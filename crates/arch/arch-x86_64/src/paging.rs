@@ -58,6 +58,12 @@ pub(crate) const FLAG_USER: u64 = 1 << 2;
 pub(crate) const FLAG_LARGE: u64 = 1 << 7;
 pub(crate) const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
+/// 顶层页表条目 256..512 为内核高半区（线性地址最高位 bit47/bit56 决定，与层级数无关）。
+///
+/// 内核高半区页表页**跨地址空间共享**（每个进程 `new()` 时复制这些顶层条目），
+/// 因此这些页表页不能由单个用户地址空间回收/释放——否则会破坏其它进程的内核映射。
+pub const KERNEL_HALF_START: usize = 256;
+
 /// 由 `PageFlags` 与页大小构造 4KB 页表条目。
 fn entry_from_flags(flags: PageFlags, large: bool) -> u64 {
     let mut e = 0u64;
@@ -243,8 +249,7 @@ impl arch::PageTable for X86PageTable {
         //    用户/内核分界在顶层条目 256 处（线性地址的最高位，bit47/bit56 决定，
         //    对应顶层 9 位索引的最高位），与页表层级数（LA48/LA57）无关。
         //    用户半区（顶层条目 0..255）保持为空，实现"独立用户地址空间"。
-        const KERNEL_HALF_START: usize = 256; // entries[256..512] 为内核高半区
-        // CR3 返回的是 PML4 的物理地址，须经 HHDM 映射为虚拟地址才能解引用。
+        //    CR3 返回的是 PML4 的物理地址，须经 HHDM 映射为虚拟地址才能解引用。
         let cur_top = phys_to_virt(mmio::cr3() & !0xFFF) as *const u64;
         for i in KERNEL_HALF_START..512 {
             let entry = unsafe { *cur_top.add(i) };
@@ -320,6 +325,15 @@ impl arch::PageTable for X86PageTable {
         // 回收中间页表页：仅当映射的是 4KB 页（leaf == levels-1）时才存在
         // 其下方的页表页链。逐级向上检查，若某级页表页全空则释放该页并清掉
         // 父层对应条目，直到某级不空或到达顶层（顶层/大页永不释放）。
+        //
+        // 地址空间隔离（ADR-007）：`new()` 派生页表时复制了内核高半区顶层条目，
+        // 其指向的中间页表页**跨地址空间共享**。因此只有**用户半区**的页表页是
+        // 本地址空间私有的、可回收；内核半区页表页绝不能在此释放（否则破坏其它
+        // 进程的内核映射）。用户地址空间也不应解映射内核半区，这里一并拒绝。
+        let top_idx = index_at(0, levels, v);
+        if top_idx >= KERNEL_HALF_START {
+            return Err("cannot unmap kernel-half address from user space");
+        }
         if leaf == levels - 1 && levels >= 3 {
             // 从 PT 的父层（leaf-1）开始，逐级向上；不回收顶层（level 0）
             let mut cur_level = leaf - 1;
