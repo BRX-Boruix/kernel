@@ -33,6 +33,8 @@ impl Platform for X86_64Arch {
     }
 
     fn init() {
+        // 注入中断状态保存/恢复函数（供 klib 中断安全锁使用；须在任何日志输出前）。
+        klib::sync::irq::set_irq_guard(interrupts::irq_save, interrupts::irq_restore);
         serial::init();
         gdt::init();
         interrupts::init();

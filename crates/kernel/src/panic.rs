@@ -174,6 +174,11 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         f("==================================\n");
     });
 
+    // 2. 崩溃回读：把环形日志缓冲中的最后 N 条日志输出到统一 console
+    //    （串口 + 屏幕，按已注册 sink 顺序）。console 未注册 sink（早期
+    //    panic）时为空操作，不影响诊断。
+    klib::log::dump_crash_log();
+
     // 3. 屏幕输出：串口输出完后，在 framebuffer 上再打印，防止用户看不到
     if let Some(f) = screen_write() {
         f("========== KERNEL PANIC ==========\r\n");

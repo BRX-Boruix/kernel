@@ -67,9 +67,9 @@ unsafe fn kmain_body() -> ! {
 
     // 初始化架构（串口等）
     CurrentArch::init();
-    // 注册统一 console 的第一个输出 sink：架构串口（一次调用整串原子写）。
+    // 注册统一 console 的第一个输出 sink：架构串口（Console trait 实现）。
     // 此后所有内核日志（info!/warn!/error!/kprintln! 等）先汇聚到 console 再转发。
-    klib::console::register(arch_x86_64::serial::write_str as fn(&str));
+    klib::console::register_console(&arch_x86_64::serial::SERIAL_CONSOLE);
     // 注入 panic 平台辅助：回退串口（独立于 klib console 层，确保早期 panic 可见）、
     // CPU id（LAPIC 未映射时返回 0，避免读未映射寄存器二次 #PF）、屏幕输出。
     panic::set_panic_output(
@@ -128,7 +128,7 @@ unsafe fn kmain_body() -> ! {
             terminal::init(fb);
             // framebuffer 终端就绪后注册为统一 console 的第二个输出 sink，
             // 此后所有内核日志同时输出到串口与屏幕。
-            klib::console::register(terminal::write_str as fn(&str));
+            klib::console::register_console(&terminal::TERMINAL_CONSOLE);
             info!("[kmain] terminal init returned");
         } else {
             error!("[kmain] no framebuffer");

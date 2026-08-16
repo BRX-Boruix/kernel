@@ -96,3 +96,24 @@ pub fn write_str(s: &str) {
         }
     }
 }
+
+/// framebuffer 终端控制台：`klib::console::Console` 的实现
+/// （统一 console 的屏幕 sink，可与其他 sink 并存）。
+pub struct TerminalConsole;
+
+/// 全局终端控制台实例（供 `klib::console::register_console` 注册）。
+pub static TERMINAL_CONSOLE: TerminalConsole = TerminalConsole;
+
+impl klib::console::Console for TerminalConsole {
+    fn name(&self) -> &'static str {
+        "framebuffer"
+    }
+    fn write_str(&self, s: &str) {
+        write_str(s);
+    }
+    fn write_byte(&self, b: u8) {
+        let s = core::str::from_utf8(core::slice::from_ref(&b)).unwrap_or("\u{FFFD}");
+        write_str(s);
+    }
+    fn flush(&self) {}
+}

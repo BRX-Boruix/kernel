@@ -1,43 +1,122 @@
 //! 统一控制台输出层。
 //!
 //! 内核所有日志输出（串口、framebuffer 终端等）最终汇聚到这里。
-//! 各架构/设备在初始化早期把各自的 `fn(&str)` 输出端注册为 sink，
+//! 各架构/设备在初始化早期把各自的 `Console` 实现注册为 sink，
 //! 之后每次写操作把整串文本转发给所有已注册 sink。
 //!
 //! 设计约束：
-//! - `no_std`、无堆分配：sink 表用静态定长数组存储。
-//! - **不引入额外全局锁**：每个 sink 必须自行保证 `fn(&str)` 内部原子
+//! - `no_std`、无堆分配：sink 表用静态定长数组存储（`&'static dyn Console`
+//!   为胖指针，拆成 data + vtable 两个 `usize` 原子槽）。
+//! - **不引入额外全局锁**：每个 sink 必须自行保证 `write_str` 内部原子
 //!   （架构层串口写、flanterm 终端已各自持锁整串写入）。若在此再加一把
 //!   简单自旋锁，中断上下文重入时会自旋等自己而死锁。多 sink 之间只
 //!   要求"各自完整"，相互顺序不作强保证。
 //! - 注册只发生在初始化早期，之后只有读操作，无并发写竞争。
+//! - [`Console`] trait 允许各设备按接口实现；对简单的 `fn(&str)` 输出端
+//!   保留 [`register`] 便捷注册（内部包装为 [`FnConsole`]）。
 
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// 输出 sink：接收整串文本（含 `\n`，`\r\n` 转换由 sink 自行处理）。
+/// 控制台输出接口：每种输出设备（串口、framebuffer 终端…）实现一份。
+pub trait Console {
+    /// 设备名（调试/统计用）。
+    fn name(&self) -> &'static str;
+
+    /// 输出整串文本（含 `\n`，`\r\n` 转换由实现自行处理）。
+    fn write_str(&self, s: &str);
+
+    /// 输出单个原始字节（默认按 UTF-8 单字节文本转发）。
+    fn write_byte(&self, b: u8) {
+        let s = core::str::from_utf8(core::slice::from_ref(&b)).unwrap_or("\u{FFFD}");
+        self.write_str(s);
+    }
+
+    /// 冲刷（对带缓冲设备有用；默认空操作）。
+    fn flush(&self) {}
+}
+
+/// 兼容旧 API：把 `fn(&str)` 输出端包装为 [`Console`]。
+#[derive(Clone, Copy)]
+pub struct FnConsole(pub fn(&str));
+
+impl Console for FnConsole {
+    fn name(&self) -> &'static str {
+        "fn-sink"
+    }
+    fn write_str(&self, s: &str) {
+        (self.0)(s)
+    }
+}
+
+/// 旧的输出函数指针类型（兼容别名）。
 pub type SinkFn = fn(&str);
 
 /// sink 表容量上限（串口 + 屏幕 + 未来扩展，8 个足够）。
 pub const MAX_SINKS: usize = 8;
 
-/// 已注册的 sink（存裸函数指针，0 表示空槽）。
-static SINKS: [AtomicUsize; MAX_SINKS] = [const { AtomicUsize::new(0) }; MAX_SINKS];
+/// 单个 sink 槽：`&'static dyn Console` 拆为 data + vtable 两个原子字。
+/// `data == 0` 表示空槽。
+struct SinkSlot {
+    data: AtomicUsize,
+    vtable: AtomicUsize,
+}
+
+const EMPTY_SLOT: SinkSlot = SinkSlot {
+    data: AtomicUsize::new(0),
+    vtable: AtomicUsize::new(0),
+};
+
+/// 已注册的 sink 表。
+static SINKS: [SinkSlot; MAX_SINKS] = [EMPTY_SLOT; MAX_SINKS];
 
 /// 已注册 sink 数量。
 static SINK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// 注册一个输出 sink。表满时返回 `false` 且不注册。
+/// `register(fn(&str))` 使用的静态包装池（初始化早期写入，之后只读）。
+struct FnPool {
+    slots: [core::cell::UnsafeCell<FnConsole>; MAX_SINKS],
+}
+unsafe impl Sync for FnPool {}
+
+fn noop_sink(_: &str) {}
+
+static FN_POOL: FnPool = FnPool {
+    slots: [const { core::cell::UnsafeCell::new(FnConsole(noop_sink)) }; MAX_SINKS],
+};
+
+/// 注册一个 [`Console`] 输出端。表满时返回 `false` 且不注册。
 ///
 /// 应在内核初始化早期调用（如架构串口就绪后、framebuffer 终端初始化后）。
-pub fn register(f: SinkFn) -> bool {
+pub fn register_console(c: &'static dyn Console) -> bool {
     let idx = SINK_COUNT.fetch_add(1, Ordering::SeqCst);
     if idx >= MAX_SINKS {
         // 表满，回滚计数
         SINK_COUNT.fetch_sub(1, Ordering::SeqCst);
         return false;
     }
-    SINKS[idx].store(f as usize, Ordering::SeqCst);
+    let (data, vtable) = unsafe { core::mem::transmute::<&'static dyn Console, (usize, usize)>(c) };
+    SINKS[idx].data.store(data, Ordering::SeqCst);
+    SINKS[idx].vtable.store(vtable, Ordering::SeqCst);
+    true
+}
+
+/// 注册一个 `fn(&str)` 输出端（兼容便捷版，内部包装为 [`FnConsole`]）。
+pub fn register(f: SinkFn) -> bool {
+    let idx = SINK_COUNT.fetch_add(1, Ordering::SeqCst);
+    if idx >= MAX_SINKS {
+        SINK_COUNT.fetch_sub(1, Ordering::SeqCst);
+        return false;
+    }
+    unsafe { *FN_POOL.slots[idx].get() = FnConsole(f) };
+    let c: &'static dyn Console = unsafe {
+        // 池槽在注册后不再被写入，可安全提升为 'static。
+        &*(&FN_POOL.slots[idx] as *const core::cell::UnsafeCell<FnConsole>).cast::<FnConsole>()
+    };
+    let (data, vtable) =
+        unsafe { core::mem::transmute::<&'static dyn Console, (usize, usize)>(c) };
+    SINKS[idx].data.store(data, Ordering::SeqCst);
+    SINKS[idx].vtable.store(vtable, Ordering::SeqCst);
     true
 }
 
@@ -53,10 +132,13 @@ pub fn sink_count() -> usize {
 pub fn write_str(s: &str) {
     let n = SINK_COUNT.load(Ordering::Acquire);
     for i in 0..n {
-        let v = SINKS[i].load(Ordering::Acquire);
-        if v != 0 {
-            // 仅初始化期写入了真实函数指针，此处读取安全。
-            unsafe { core::mem::transmute::<usize, SinkFn>(v)(s) };
+        let data = SINKS[i].data.load(Ordering::Acquire);
+        if data != 0 {
+            let vtable = SINKS[i].vtable.load(Ordering::Acquire);
+            // 仅初始化期写入了真实指针，此处读取安全。
+            let c: &'static dyn Console =
+                unsafe { core::mem::transmute::<(usize, usize), &'static dyn Console>((data, vtable)) };
+            c.write_str(s);
         }
     }
 }
@@ -75,9 +157,9 @@ pub fn write_fmt(args: fmt::Arguments) {
 }
 
 /// 栈缓冲 `fmt::Write` 实现，供 [`write_fmt`] 使用。
-struct StackWriter<'a> {
-    buf: &'a mut [u8],
-    len: usize,
+pub struct StackWriter<'a> {
+    pub buf: &'a mut [u8],
+    pub len: usize,
 }
 
 impl fmt::Write for StackWriter<'_> {

@@ -158,3 +158,22 @@ pub fn write_str(s: &str) {
     }
     LOCK.release();
 }
+
+/// 串口控制台：`klib::console::Console` 的实现（统一 console 的串口 sink）。
+pub struct SerialConsole;
+
+/// 全局串口控制台实例（供 `klib::console::register_console` 注册）。
+pub static SERIAL_CONSOLE: SerialConsole = SerialConsole;
+
+impl klib::console::Console for SerialConsole {
+    fn name(&self) -> &'static str {
+        "serial"
+    }
+    fn write_str(&self, s: &str) {
+        crate::serial::write_str(s);
+    }
+    fn write_byte(&self, b: u8) {
+        crate::serial::write_byte(b);
+    }
+    fn flush(&self) {}
+}

@@ -451,6 +451,39 @@ pub fn enable_fpu() {
     }
 }
 
+/// 保存当前 RFLAGS（含 IF）并关中断，返回保存的旧 RFLAGS。
+///
+/// 注入给 [`klib::sync::irq::set_irq_guard`]，供中断安全锁保存/恢复中断状态。
+#[inline]
+pub fn irq_save() -> usize {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            out(reg) flags,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+    flags as usize
+}
+
+/// 恢复此前保存的 RFLAGS（还原 IF 状态，可能重新打开中断）。
+#[inline]
+pub fn irq_restore(flags: usize) {
+    unsafe {
+        core::arch::asm!(
+            "push {}",
+            "popfq",
+            in(reg) flags as u64,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
 /// 初始化 IDT：填充 0~47 号向量，然后加载。
 pub fn init() {
     // 启用 FPU/SSE（清 CR0.TS），避免用户态/内核执行浮点指令时触发 #NM → 级联 #DF。
