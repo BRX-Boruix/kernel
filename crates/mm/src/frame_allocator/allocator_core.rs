@@ -14,8 +14,13 @@ use spin::{Mutex, Once};
 use super::percpu_cache::{FreeList, ReserveList};
 use super::FREE_LISTS;
 
-/// Max order for buddy system (2^19 * 4KB = 2GB blocks covers 1GB huge pages)
-pub(crate) const MAX_ORDER: usize = 19;
+/// Buddy 系统的 order 数（order 0..MAX_ORDER-1 有效）。
+///
+/// 最大可用 order = MAX_ORDER-1，单次最大连续分配 = 2^(MAX_ORDER-1) × 4KB。
+/// 取 41 使 order 0..40 覆盖到 x86-64 物理地址空间理论上限 4PB
+/// （2^40 × 4KB = 4PB），从而不再限制大内存机器上的大连续块分配/合并。
+/// （原值 19 把单次分配上限限制在 order 18 = 1GB，仅为容纳 1GB 大页。）
+pub(crate) const MAX_ORDER: usize = 41;
 /// Lock sharding count for each order
 pub(crate) const SHARD_COUNT: usize = 8;
 
