@@ -6,7 +6,7 @@ use klib::logln;
 
 use arch::PhysFrame;
 
-use super::allocator_core::{FrameState, MAX_ORDER, ORDER_4K};
+use super::allocator_core::{MAX_ORDER, ORDER_4K};
 use super::{current_cpu_id, LazyBuddyAllocator};
 
 impl LazyBuddyAllocator {
@@ -70,28 +70,32 @@ impl LazyBuddyAllocator {
             return;
         }
 
-        let order = unsafe {
-            let block_idx = pfn / cfg.frames_per_block;
-            if self.block_ptr(block_idx).is_null() {
-                logln!("PMM: WARNING Deallocate frame with no metadata (hole?): pfn {}", pfn);
-                return;
-            }
+        // 无元数据（孔洞）检查：必须在读取帧元数据前完成，避免空指针解引用。
+        let block_idx = pfn / cfg.frames_per_block;
+        if unsafe { self.block_ptr(block_idx) }.is_null() {
+            logln!("PMM: WARNING Deallocate frame with no metadata (hole?): pfn {}", pfn);
+            return;
+        }
 
-            let frame_meta = self.get_frame(pfn);
-            if frame_meta.state != FrameState::Allocated {
+        // 在元数据锁保护下校验状态并读取 order（消除无锁读取的 TOCTOU 数据竞争）：
+        // 同时把帧标记为瞬态 Freeing，防止释放完成前被并发重复释放。
+        let order = match self.deallocate_checked(pfn) {
+            Some(order) => order,
+            None => {
                 logln!(
-                    "PMM: WARNING Double free or invalid free at pfn {} state {:?}",
-                    pfn, frame_meta.state
+                    "PMM: WARNING Double free or invalid free at pfn {}",
+                    pfn
                 );
                 return;
             }
-            frame_meta.order as usize
         };
 
         if order == ORDER_4K && self.reserve_count.load(Ordering::Relaxed) < 32 {
+            // reserve_push 会把状态改写回 Allocated 并挂入预留池。
             self.reserve_push(pfn);
         } else {
             let cpu = current_cpu_id();
+            // percpu_push 把状态改写为 FreePerCpu，溢出后再由合并路径置为 FreeGlobal。
             self.percpu_push(cpu, pfn, order);
         }
 

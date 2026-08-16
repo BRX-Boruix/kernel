@@ -181,4 +181,33 @@ impl LazyBuddyAllocator {
 
         self.push_to_global(pfn, order);
     }
+
+    /// 在持有帧所属 shard 的 order-0 元数据锁期间完成状态校验与 order 读取，
+    /// 并把帧状态置为瞬态 `Freeing`，从而消除 `deallocate` 无锁读取元数据带来的
+    /// TOCTOU 数据竞争（double-free / order 漂移）。
+    ///
+    /// 返回该帧被释放时的 order；若帧非 `Allocated`（double-free 或无效释放）
+    /// 返回 `None`。调用方随后应通过 `reserve_push` / `percpu_push` 把状态改写为
+    /// `Allocated` / `FreePerCpu`，最终由合并路径置为 `FreeGlobal`。
+    ///
+    /// 锁序说明：此处仅短暂持有 `orders[0].shards[shard]`，校验并标记后立即释放，
+    /// 不会与 `free_and_merge` 内部持有的 order>0 链表锁形成嵌套，故无死锁/自死锁。
+    pub(crate) fn deallocate_checked(&self, pfn: usize) -> Option<usize> {
+        let shard = Self::shard_for_pfn(pfn);
+        // 以该 shard 的 order-0 链表锁作为该 shard 内所有帧元数据的保护锁。
+        let meta_guard = self.lock_global_list(0, shard);
+        let order = unsafe {
+            let frame_meta = self.get_frame(pfn);
+            if frame_meta.state != FrameState::Allocated {
+                // 双重释放或无效释放：元数据锁保护下判定，杜绝并发重复释放。
+                return None;
+            }
+            // 认领该帧：置为瞬态 Freeing，防止元数据锁释放后、状态被改写前的
+            // 窗口中被另一个 CPU 重复释放。
+            frame_meta.state = FrameState::Freeing;
+            frame_meta.order as usize
+        };
+        drop(meta_guard);
+        Some(order)
+    }
 }

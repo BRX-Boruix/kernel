@@ -34,9 +34,16 @@ pub const ORDER_1G: usize = 18;
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FrameState {
+    /// 已分配（也在未初始化内存的零值语义下成立，故必须为 0）。
     Allocated = 0,
+    /// 空闲且挂在全局 buddy 链表上。
     FreeGlobal = 1,
+    /// 空闲且挂在 per-CPU 缓存链表上。
     FreePerCpu = 2,
+    /// 释放进行中的瞬态：已被 `deallocate` 认领（通过元数据锁校验），
+    /// 但尚未来得及挂入空闲链表。既非 `Allocated`（防止并发重复释放），
+    /// 也非 `FreeGlobal`（防止被分配/被误当作合并伙伴）。
+    Freeing = 3,
 }
 
 /// Metadata for a physical frame
