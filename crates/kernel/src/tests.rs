@@ -232,6 +232,89 @@ pub fn test_demand_paging() {
     logln!("[test-demand] PASS");
 }
 
+/// M1.4：验证进程地址空间内部分配器（栈区 / mmap / brk）。
+///
+/// 覆盖：
+/// 1. `setup_stack`：在固定栈顶下方预留栈区。
+/// 2. `mmap_user`：在用户半区分配按需分页区间（不重叠）。
+/// 3. `brk`：查询/扩展堆断点，堆区访问按需补页。
+pub fn test_address_space_alloc() {
+    use core::sync::atomic::Ordering;
+    use mm::user_space::{
+        USER_HEAP_BASE, USER_STACK_TOP, DEFAULT_STACK_SIZE,
+    };
+
+    let mut us = mm::user_space::UserAddressSpace::<X86PageTable>::new().expect("new us");
+    logln!("[test-alloc] created user address space");
+
+    // 1. 栈区
+    let stack_top = us.setup_stack(DEFAULT_STACK_SIZE).expect("setup_stack");
+    logln!(
+        "[test-alloc] stack top={:#x}, size={}MiB (area 0)",
+        stack_top,
+        DEFAULT_STACK_SIZE / (1024 * 1024)
+    );
+    assert_eq!(stack_top, USER_STACK_TOP);
+    assert_eq!(us.area_count(), 1);
+
+    // 2. mmap 两段，验证不重叠且不与栈重叠
+    let m1 = us.mmap_user(64 * 1024, arch::PageFlags::empty().writable()).expect("mmap1");
+    let m2 = us.mmap_user(128 * 1024, arch::PageFlags::empty().writable()).expect("mmap2");
+    logln!(
+        "[test-alloc] mmap1={:#x}..{:#x}, mmap2={:#x}..{:#x}",
+        m1,
+        m1 + 64 * 1024,
+        m2,
+        m2 + 128 * 1024
+    );
+    assert!(m1 + 64 * 1024 <= m2, "mmap regions must not overlap");
+    assert!(m2 + 128 * 1024 < USER_STACK_TOP, "mmap must be below stack");
+    assert_eq!(us.area_count(), 3);
+
+    // 3. brk：查询 → 扩展 → 再查询
+    let b0 = us.brk(0).expect("brk query");
+    assert_eq!(b0, USER_HEAP_BASE);
+    let b1 = us.brk(USER_HEAP_BASE + 32 * 1024).expect("brk extend");
+    logln!(
+        "[test-alloc] brk {:#x} -> {:#x}",
+        b0,
+        b1
+    );
+    assert_eq!(b1, USER_HEAP_BASE + 32 * 1024);
+    assert_eq!(us.heap_break(), b1);
+
+    // 4. 访问栈区触发 #PF 按需补页（复用全局 handler 机制）
+    let us_ptr = &mut us as *mut mm::user_space::UserAddressSpace<X86PageTable> as usize;
+    TEST_FAULT_US.store(us_ptr, Ordering::SeqCst);
+    mm::user_space::set_page_fault_handler(test_fault_handler);
+    us.activate();
+
+    // 栈底附近写（栈顶向下 4KiB 内）
+    let sp = USER_STACK_TOP - 8;
+    unsafe { core::ptr::write_volatile((sp - 4) as *mut u32, 0xBEEF) };
+    let sv = unsafe { core::ptr::read_volatile((sp - 4) as *const u32) };
+    logln!("[test-alloc] stack write/read -> {:#x}", sv);
+    assert_eq!(sv, 0xBEEF);
+
+    // mmap 区访问补页
+    unsafe { core::ptr::write_volatile(m1 as *mut u32, 0x1234) };
+    let mv = unsafe { core::ptr::read_volatile(m1 as *const u32) };
+    logln!("[test-alloc] mmap write/read -> {:#x}", mv);
+    assert_eq!(mv, 0x1234);
+
+    // 堆区访问补页
+    unsafe { core::ptr::write_volatile((USER_HEAP_BASE + 0x1000) as *mut u32, 0x5678) };
+    let hv = unsafe { core::ptr::read_volatile((USER_HEAP_BASE + 0x1000) as *const u32) };
+    logln!("[test-alloc] heap write/read -> {:#x}", hv);
+    assert_eq!(hv, 0x5678);
+
+    // 切回内核页表，清理
+    X86PageTable::current().activate();
+    mm::user_space::set_page_fault_handler(noop_fault_handler);
+    TEST_FAULT_US.store(0, Ordering::SeqCst);
+    logln!("[test-alloc] PASS");
+}
+
 /// 验证堆分配器的分配/释放/重用逻辑。
 pub fn test_heap() {
     use alloc::boxed::Box;

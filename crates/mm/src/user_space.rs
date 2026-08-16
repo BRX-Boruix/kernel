@@ -22,6 +22,22 @@ use crate::{allocate_frame, deallocate_frame};
 pub const USER_BASE: u64 = 0x0000_0000_0000_0000;
 pub const USER_TOP: u64 = 0x0000_8000_0000_0000; // 128TiB，x86-64 低半区边界
 
+/// 用户栈顶（低半区高地址）。栈向下增长，固定栈顶便于 `_start` 组装参数。
+pub const USER_STACK_TOP: u64 = 0x0000_7fff_0000_0000;
+/// 用户堆基址（`brk` 的初始断点）。
+pub const USER_HEAP_BASE: u64 = 0x0000_0001_0000_0000;
+/// 默认用户栈大小（预留区域，按需分页）。
+pub const DEFAULT_STACK_SIZE: u64 = 4 * 1024 * 1024; // 4MiB
+
+/// mmap 虚拟地址区间（预留区，按需分页）。
+#[derive(Clone, Copy)]
+pub struct MmapRegion {
+    /// 起始虚拟地址。
+    pub start: u64,
+    /// 结束虚拟地址（不含）。
+    pub end: u64,
+}
+
 /// 用户区映射记录（按需分页 / 统计用）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UserArea {
@@ -43,6 +59,10 @@ pub struct UserAddressSpace<PT: PageTable> {
     pt: PT,
     /// 已声明的用户区域。
     areas: spin::Mutex<Vec<UserArea>>,
+    /// 下一次 `mmap` 分配的候选虚拟地址（hint，单调向上增长）。
+    next_mmap: u64,
+    /// 当前堆断点（`brk` 管理；初始为 `USER_HEAP_BASE`）。
+    heap_break: u64,
 }
 
 impl<PT> UserAddressSpace<PT>
@@ -56,6 +76,9 @@ where
         Ok(Self {
             pt,
             areas: spin::Mutex::new(Vec::new()),
+            // mmap hint 从堆区上方的低地址开始增长（避开栈/堆的固定区）
+            next_mmap: USER_HEAP_BASE + 16 * 1024 * 1024,
+            heap_break: USER_HEAP_BASE,
         })
     }
 
@@ -210,6 +233,121 @@ where
             v += page;
         }
     }
+
+    /// 检查虚拟区间 `[start, end)` 是否与任何已声明区域重叠。
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.areas.lock().iter().any(|a| {
+            let as_ = a.start.as_u64();
+            let ae = a.end.as_u64();
+            !(end <= as_ || start >= ae) // 区间相交
+        })
+    }
+
+    /// `mmap` 雏形：在用户半区分配一块**预留（按需分页）**虚拟地址区间。
+    ///
+    /// 返回区间起始地址（页对齐）。仅在地址空间中保留（present=0），
+    /// 访问时由 `handle_page_fault` 补页。`size` 向上取整到页。
+    pub fn mmap_user(&mut self, size: u64, flags: PageFlags) -> Result<u64, PT::Error> {
+        let size = align_up(size, 4096);
+        if size == 0 {
+            return Err("mmap size is zero".into());
+        }
+        // 从 hint 起单调向上找不与已有区域重叠的空闲区间
+        let mut candidate = align_up(self.next_mmap, 4096);
+        // 最多尝试一段上限，避免死循环（128TiB 用户空间）
+        while candidate + size <= USER_TOP {
+            if !self.overlaps(candidate, candidate + size) {
+                self.reserve_user(
+                    VirtAddr::new(candidate),
+                    VirtAddr::new(candidate + size),
+                    PageSize::Size4K,
+                    flags,
+                )?;
+                self.next_mmap = candidate + size;
+                return Ok(candidate);
+            }
+            candidate += size;
+            // 保护：跳过栈区（USER_STACK_TOP 以下 8MiB 内不做 mmap）
+            if candidate >= USER_STACK_TOP - 8 * 1024 * 1024 {
+                break;
+            }
+        }
+        Err("no free mmap region".into())
+    }
+
+    /// 在固定栈顶下方预留用户栈区（向下增长，按需分页）。
+    ///
+    /// 返回栈顶虚拟地址（高地址端）。栈区起点 = 栈顶 - 栈大小。
+    pub fn setup_stack(&mut self, size: u64) -> Result<u64, PT::Error> {
+        let size = align_up(size, 4096);
+        let top = USER_STACK_TOP;
+        let bottom = top - size;
+        if bottom < USER_BASE {
+            return Err("stack too large".into());
+        }
+        if self.overlaps(bottom, top) {
+            return Err("stack region overlaps".into());
+        }
+        self.reserve_user(
+            VirtAddr::new(bottom),
+            VirtAddr::new(top),
+            PageSize::Size4K,
+            PageFlags::empty().writable(),
+        )?;
+        Ok(top)
+    }
+
+    /// `brk` 雏形：调整堆断点（当前仅扩展/收缩记录，不立即映射）。
+    ///
+    /// - 传入 `0`：仅查询当前断点。
+    /// - 传入新断点：若在 `[USER_HEAP_BASE, 栈底)` 内则更新（可收缩），返回新断点。
+    /// - 扩展后访问堆区由 `handle_page_fault` 按需补页。
+    pub fn brk(&mut self, new_break: u64) -> Result<u64, PT::Error> {
+        if new_break == 0 {
+            return Ok(self.heap_break);
+        }
+        if new_break < USER_HEAP_BASE || new_break >= USER_STACK_TOP {
+            return Err("brk out of range".into());
+        }
+        let new_break = align_up(new_break, 4096);
+        // 收缩：不立即释放已补页（简化；M3 进程退出统一回收）。
+        // 扩展：只需记录，访问时按需补页。
+        if new_break > self.heap_break {
+            // 扩展堆区域：把 [heap_base, new_break) 声明为按需分页区。
+            // 若之前从未声明堆区，创建；否则更新现有堆区的 end。
+            let mut areas = self.areas.lock();
+            let mut found = false;
+            for a in areas.iter_mut() {
+                if a.start.as_u64() == USER_HEAP_BASE {
+                    a.end = VirtAddr::new(new_break);
+                    a.flags = PageFlags::empty().writable().user();
+                    found = true;
+                    break;
+                }
+            }
+            drop(areas);
+            if !found {
+                self.reserve_user(
+                    VirtAddr::new(USER_HEAP_BASE),
+                    VirtAddr::new(new_break),
+                    PageSize::Size4K,
+                    PageFlags::empty().writable(),
+                )?;
+            }
+        }
+        self.heap_break = new_break;
+        Ok(self.heap_break)
+    }
+
+    /// 当前堆断点。
+    pub fn heap_break(&self) -> u64 {
+        self.heap_break
+    }
+}
+
+/// 向上对齐到页（4KB）。
+fn align_up(v: u64, align: u64) -> u64 {
+    (v + align - 1) & !(align - 1)
 }
 
 // ---- 全局"当前用户地址空间"（M1.3 按需分页的 #PF 入口）----
