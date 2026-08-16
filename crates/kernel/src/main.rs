@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod panic;
+mod symbols;
 mod terminal;
 mod tests;
 

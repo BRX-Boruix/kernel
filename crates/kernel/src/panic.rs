@@ -5,10 +5,9 @@
 //! 架构相关的信息（架构名、停机方式、回退串口、CPU id、屏幕输出）由入口
 //! crate 通过 `init`/`set_panic_output` 注入，保持本模块架构无关。
 
-use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use klib::logln;
+use crate::symbols;
 
 /// 停机函数（由入口注入，绑定具体架构的 halt）
 type HaltFn = fn() -> !;
@@ -99,29 +98,10 @@ fn screen_write() -> Option<fn(&str)> {
     }
 }
 
-/// 写进固定缓冲的 `fmt::Write`。
-struct BufWriter<'a> {
-    buf: &'a mut [u8],
-    len: usize,
-}
-
-impl fmt::Write for BufWriter<'_> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let space = self.buf.len().saturating_sub(self.len);
-        if space == 0 {
-            return Err(fmt::Error);
-        }
-        let n = s.len().min(space);
-        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
-        self.len += n;
-        Ok(())
-    }
-}
-
 /// 把 panic 信息（架构、CPU、消息、位置）格式化为单条消息。
 fn build_msg<'a>(buf: &'a mut [u8], info: &core::panic::PanicInfo) -> &'a str {
     use core::fmt::Write as _;
-    let mut w = BufWriter { buf, len: 0 };
+    let mut w = symbols::BufWriter { buf, len: 0 };
     let _ = write!(w, "arch: {}\n", arch_name());
     let _ = write!(w, "cpu:  {}\n", cpu_id());
     let _ = write!(w, "message: {}", info.message());
@@ -133,12 +113,15 @@ fn build_msg<'a>(buf: &'a mut [u8], info: &core::panic::PanicInfo) -> &'a str {
     core::str::from_utf8(&buf[..len]).unwrap_or("<invalid panic message>")
 }
 
-/// x86_64 栈回溯：沿 rbp 帧指针链遍历并打印返回地址。
+/// x86_64 栈回溯：沿 rbp 帧指针链遍历，把回溯写进 `out`（栈上缓冲）。
 ///
 /// 注意：要求编译开启帧指针（`-C force-frame-pointers=yes`，见 .cargo/config.toml），
 /// 否则链可能不完整。
 /// 防御：帧指针必须严格向上增长且不为 0，避免栈损坏时无限循环。
-fn print_backtrace() {
+/// 全程零堆分配，panic 发生在堆分配器初始化之前也能安全回溯。
+fn write_backtrace(out: &mut [u8]) -> &str {
+    use core::fmt::Write as _;
+    let mut w = symbols::BufWriter { buf: out, len: 0 };
     let mut rbp: usize;
     unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack)); }
     let mut valid = 0usize;
@@ -149,9 +132,14 @@ fn print_backtrace() {
             next = core::ptr::read_volatile(rbp as *const usize);
             ret = core::ptr::read_volatile((rbp as *const usize).add(1));
         }
-        // 仅打印合理的内核高半区返回地址，过滤垃圾帧
+        // 仅处理合理的内核高半区返回地址，过滤垃圾帧
         if (ret >> 48) == 0xffff {
-            logln!("  #{:02}  {:#018x}", i, ret);
+            let _ = write!(w, "  #{:02}  {:#018x}  ", i, ret);
+            // 符号化写入临时缓冲后追加（避免借用冲突）
+            let mut sym = [0u8; 128];
+            let s = symbols::symbolize(ret as u64, &mut sym);
+            let _ = w.write_str(s);
+            let _ = w.write_str("\n");
             valid += 1;
         }
         if next == 0 || next <= rbp {
@@ -160,8 +148,11 @@ fn print_backtrace() {
         rbp = next;
     }
     if valid == 0 {
-        logln!("  (empty backtrace - frame pointers may be disabled)");
+        let _ = w.write_str("  (empty backtrace - frame pointers may be disabled)\n");
     }
+    let len = w.len;
+    drop(w); // 结束对 out 的可变借用
+    core::str::from_utf8(&out[..len]).unwrap_or("")
 }
 
 /// Panic handler：打印诊断信息到串口与屏幕，然后停机。
@@ -170,24 +161,20 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let mut buf = [0u8; 2048];
     let msg = build_msg(&mut buf, info);
 
-    // 1. klib 串口输出（尽力；早期 OUTPUT 未注入时可能静默）
-    logln!("");
-    logln!("========== KERNEL PANIC ==========");
-    logln!("{}", msg);
-
-    // 2. 回退串口：绕过 klib OUTPUT，确保早期 panic 可见
-    if let Some(f) = serial_write() {
+    // 1. 回退串口：绕过 klib OUTPUT，确保早期 panic 可见。
+    //    注意：只走这一条串口通道（不再用 klib::logln），因为两者最终指向同一
+    //    串口，重复调用会打印两遍。
+    let mut bt = [0u8; 4096];
+    let bt = write_backtrace(&mut bt);
+    serial_write().map(|f| {
         f("========== KERNEL PANIC ==========\n");
         f(msg);
-        f("\n");
-    }
+        f("\nstack backtrace:\n");
+        f(bt);
+        f("==================================\n");
+    });
 
-    // 3. 栈回溯（串口）
-    logln!("stack backtrace:");
-    print_backtrace();
-    logln!("==================================");
-
-    // 4. 屏幕输出：串口都输出完后，在 framebuffer 上再打印，防止用户看不到
+    // 3. 屏幕输出：串口输出完后，在 framebuffer 上再打印，防止用户看不到
     if let Some(f) = screen_write() {
         f("========== KERNEL PANIC ==========\r\n");
         f(msg);
