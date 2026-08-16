@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod panic;
+mod process;
 mod symbols;
 mod terminal;
 mod tests;
@@ -111,6 +112,8 @@ unsafe fn kmain_body() -> ! {
     tests::test_address_space_alloc();
     // M2：验证 CPU 上下文切换（switch_to 交替执行）
     tests::test_context_switch();
+    // M3.1：验证进程结构与进程表（PCB + pid 分配/回收）
+    tests::test_process_table();
 
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
     if let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() {
@@ -143,7 +146,9 @@ unsafe fn kmain_body() -> ! {
 
     // M2.5.4：从内核 iretq 进入用户态（Ring 3）执行一段用户代码并返回内核。
     // 依赖中断使能（int 0x80 软中断）与用户段 GDT，故放在定时器验证之后。
-    tests::test_enter_usermode();
+    // M3.2/M3.3：通过进程对象 spawn + 进入用户态；用户态异常被"进程终止"处理。
+    // （M3.2 的正常 int 0x80 退出流程已单独验证，此处演进为异常上抛场景。）
+    tests::test_spawn_user_fault();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。

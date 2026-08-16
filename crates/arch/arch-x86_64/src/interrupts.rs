@@ -343,6 +343,18 @@ pub fn register_soft_interrupt_handler(h: SoftInterruptHandler) {
     let _ = SOFT_INT_HANDLER.call_once(|| h);
 }
 
+/// 用户态异常（#PF/#GP/#UD 等，CPL=3）处理器。
+///
+/// 由进程层注册（M3.3）：当用户态进程触发异常时，不再当作内核崩溃停机，
+/// 而是终止/回收该进程。处理器应不返回（停机或恢复调度）；若返回则兜底停机。
+pub type UserExceptionHandler = extern "C" fn(&mut InterruptFrame);
+static USER_EXCEPTION_HANDLER: spin::Once<UserExceptionHandler> = spin::Once::new();
+
+/// 注册用户态异常处理器（M3.3）。
+pub fn register_user_exception_handler(h: UserExceptionHandler) {
+    let _ = USER_EXCEPTION_HANDLER.call_once(|| h);
+}
+
 /// 分发入口（由汇编 `interrupt_common_stub` 调用）。
 ///
 /// `frame` 指向保存的寄存器区。
@@ -352,9 +364,20 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
     let vector = frame.vector;
 
     if vector < 32 {
-        // CPU 异常：打印并停机
-        // 先关中断，避免嵌套
+        // CPU 异常：先关中断，避免嵌套
         disable();
+
+        // M3.3：若异常来自用户态（CS.RPL==3），交给进程层终止该进程，
+        // 而非当作内核崩溃。处理器应不返回（停机/恢复调度）；返回则兜底停机。
+        if frame.cs & 3 == 3 {
+            if let Some(h) = USER_EXCEPTION_HANDLER.get() {
+                h(frame);
+                // 处理器返回了：兜底停机
+                crate::halt_forever();
+            }
+        }
+
+        // 内核态异常（或未注册用户态处理器）：打印并停机
         klib::logln!("");
         klib::logln!("========== CPU EXCEPTION ==========");
         klib::logln!("exception: {}", exception_name(vector as u8));

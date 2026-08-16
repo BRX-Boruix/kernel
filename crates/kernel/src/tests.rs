@@ -512,89 +512,138 @@ mod usermode {
     pub const CODE_ADDR: u64 = 0x0000_0000_9000_0000;
     pub const MAGIC_ADDR: u64 = 0x0000_0000_9500_0000;
     pub const MAGIC: u64 = 0xDEADBEEF;
-    /// 软中断 handler 是否已执行（0=未执行，1=已执行）。
-    pub static CALLED: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
 }
 
-/// 用户态机器码：`mov rax, MAGIC` → `mov [MAGIC_ADDR], rax` → `int 0x80` → 死循环。
+/// M3.1：验证进程结构与进程表（PCB + pid 分配/回收）。
 ///
-/// 编码（x86-64）：
-///   mov rax, imm64 : 48 B8 <imm64>
-///   mov [moffs64], rax : 48 A3 <imm64>   （A3 = MOV moffs64, rax）
-///   int 0x80 : CD 80
-///   jmp $ : EB FE   （死循环；soft handler 返回后 iretq 回用户态，在此停住）
-fn usermode_code() -> [u8; 26] {
+/// 验证点：
+/// 1. `spawn` 装配进程（入口/用户栈顶/内核栈顶/地址空间），pid 单调递增。
+/// 2. `get` / `get_mut` 访问进程字段与状态切换。
+/// 3. `terminate` 回收 pid，再 `spawn` 复用该 pid。
+pub fn test_process_table() {
+    use crate::process::{ProcessTable, TaskState};
+    use mm::user_space::UserAddressSpace;
+
+    logln!("[test-process] === M3.1: process table + pid mgmt ===");
+
+    let mut table = ProcessTable::<X86PageTable>::new();
+
+    // 1. spawn 两个进程，pid 递增（1, 2）
+    let us1 = UserAddressSpace::<X86PageTable>::new().expect("us1");
+    let pid1 = table
+        .spawn(0x9000_0000, 0x4000_0000, 0xffff_ffff_801b_0000, us1)
+        .expect("spawn1");
+    let us2 = UserAddressSpace::<X86PageTable>::new().expect("us2");
+    let pid2 = table
+        .spawn(0x9000_1000, 0x4000_2000, 0xffff_ffff_801c_0000, us2)
+        .expect("spawn2");
+    assert_eq!(pid1, 1, "first pid should be 1");
+    assert_eq!(pid2, 2, "second pid should be 2");
+    assert_eq!(table.len(), 2, "two live processes");
+    assert_eq!(table.count_state(TaskState::Ready), 2, "both ready");
+
+    // 2. get / get_mut 访问进程字段
+    let p = table.get(pid1).expect("get pid1");
+    assert_eq!(p.entry_rip(), 0x9000_0000);
+    assert_eq!(p.user_stack_top(), 0x4000_0000);
+    assert_eq!(p.kernel_stack_top(), 0xffff_ffff_801b_0000);
+    assert_eq!(p.state(), TaskState::Ready);
+    logln!(
+        "[test-process] spawned pid1={} rip={:#x} user_sp={:#x} ksp={:#x} state={:?}",
+        pid1,
+        p.entry_rip(),
+        p.user_stack_top(),
+        p.kernel_stack_top(),
+        p.state()
+    );
+
+    // 状态切换：Ready -> Running -> Blocked
+    {
+        let pm = table.get_mut(pid1).expect("get_mut pid1");
+        pm.set_state(TaskState::Running);
+    }
+    assert_eq!(table.count_state(TaskState::Running), 1);
+    {
+        let pm = table.get_mut(pid1).expect("get_mut pid1");
+        pm.set_state(TaskState::Blocked);
+    }
+    assert_eq!(table.count_state(TaskState::Blocked), 1);
+
+    // 3. terminate 回收 pid，再 spawn 复用
+    assert!(table.terminate(pid1), "terminate pid1");
+    assert!(!table.get(pid1).is_some(), "pid1 slot freed");
+    assert_eq!(table.len(), 1, "one process left");
+
+    let us3 = UserAddressSpace::<X86PageTable>::new().expect("us3");
+    let pid3 = table
+        .spawn(0x9000_2000, 0x4000_3000, 0xffff_ffff_801d_0000, us3)
+        .expect("spawn3");
+    assert_eq!(pid3, pid1, "pid1 reused after terminate");
+
+    // 终止不存在的 pid 返回 false；终止存在的 pid2 返回 true
+    assert!(!table.terminate(999), "terminate nonexistent pid");
+    assert!(table.terminate(pid2), "terminate pid2");
+
+    logln!(
+        "[test-process] final len={} (pid reuse verified: pid3={}==pid1={})",
+        table.len(),
+        pid3,
+        pid1
+    );
+    logln!("[test-process] PASS");
+}
+
+/// 触发异常的用户态机器码：`mov rax, MAGIC` → `mov [MAGIC_ADDR], rax` → `ud2`。
+///
+/// `ud2`（0F 0B）是非法指令，用户态执行触发 #UD（vector 6）——用于 M3.3 验证
+/// 用户态异常被"进程终止"处理，而非当作内核崩溃。
+fn usermode_fault_code() -> [u8; 26] {
     use usermode::{MAGIC, MAGIC_ADDR};
     let mut c = [0u8; 26];
     c[0] = 0x48; c[1] = 0xB8; // mov rax, imm64
     c[2..10].copy_from_slice(&MAGIC.to_le_bytes());
     c[10] = 0x48; c[11] = 0xA3; // mov [moffs64], rax
     c[12..20].copy_from_slice(&MAGIC_ADDR.to_le_bytes());
-    c[20] = 0xCD; c[21] = 0x80; // int 0x80
-    // int 0x80 后 iretq 回用户态。末尾用 jmp $ 死循环而非 hlt：
-    // hlt 是特权指令（仅 Ring0），用户态执行会触发 #GP。
-    c[22] = 0xEB; c[23] = 0xFE; // jmp $（无限自跳，2 字节）
-    c[24] = 0x90; c[25] = 0x90; // nop 填充
+    c[20] = 0x0F; c[21] = 0x0B; // ud2（非法指令 → #UD）
+    c[22..].fill(0x90); // nop 填充
     c
 }
 
-/// 软中断（int 0x80）回调：从用户态进入内核后被调用。
+/// M3.3 用户态异常处理器：用户态进程触发异常时终止该进程。
 ///
-/// 验证用户代码写入的 magic，若正确则标记 CALLED 并打印 PASS。
-/// 返回 `true` 表示已处理（`iretq` 返回用户态继续）。
-extern "C" fn usermode_soft_handler(frame: &mut arch_x86_64::interrupts::InterruptFrame) -> bool {
-    use core::sync::atomic::Ordering;
-    let code = usermode::CALLED.load(Ordering::SeqCst);
-    if code == 1 {
-        // 第二次进入：iretq 返回用户态后用户代码 hlt，不会再来；这里兜底停机。
-        klib::logln!("[test-usermode] soft int again (should not happen), halting");
-        arch_x86_64::interrupts::disable();
-        loop {
-            arch_x86_64::interrupts::halt();
-        }
-    }
-    // 从用户态进入：frame.cs 应为用户代码段（0x20），frame.ss 为用户数据段（0x28）
+/// 不再当作内核崩溃（不 panic、不打印 CPU EXCEPTION），而是标记"用户进程异常终止"，
+/// 单进程场景下停机。
+extern "C" fn user_fault_handler(frame: &mut arch_x86_64::interrupts::InterruptFrame) {
     klib::logln!(
-        "[test-usermode] entered kernel via int 0x80 (user cs={:#x}, ss={:#x})",
-        frame.cs,
-        frame.ss
+        "[test-fault] user process terminated by exception: vector={:#x} rip={:#x} cs={:#x}",
+        frame.vector,
+        frame.rip,
+        frame.cs
     );
-    // 读用户代码写入的 magic（当前活动页表 = 用户页表，0x9500_0000 已映射）
-    let val = unsafe { core::ptr::read_volatile(usermode::MAGIC_ADDR as *const u64) };
-    klib::logln!("[test-usermode] user wrote magic={:#x} (expect {:#x})", val, usermode::MAGIC);
-    assert_eq!(val, usermode::MAGIC);
-    usermode::CALLED.store(1, Ordering::SeqCst);
-    klib::logln!("[test-usermode] PASS");
-    true // iretq 返回用户态
+    // 进程终止：单进程场景下停机（不 panic、不 iretq 回用户态）。
+    arch_x86_64::interrupts::disable();
+    loop {
+        arch_x86_64::interrupts::halt();
+    }
 }
 
-/// M2.5.4：从内核 iretq 进入用户态（Ring 3）执行一段用户代码并返回内核。
+/// M3.3：用户态进程触发异常（#UD）时，异常被"进程终止"处理而非内核崩溃。
 ///
-/// 流程：
-/// 1. 构造用户地址空间，立即映射用户代码页（可执行）、用户栈（可写）、magic 页（可写）。
-/// 2. 注册软中断（int 0x80）回调，激活用户页表。
-/// 3. 构造 `TrapFrame`（rip=用户代码, cs=UCODE, rflags=IF=1, rsp=用户栈顶, ss=UDATA）。
-/// 4. `arch::enter_usermode` → iretq 进用户态执行用户代码。
-/// 5. 用户代码写 magic 到 MAGIC_ADDR，`int 0x80` → 内核 handler 验证并返回。
-pub fn test_enter_usermode() {
-    use core::sync::atomic::Ordering;
+/// 用户代码写 magic 后执行 `ud2` → #UD（用户态）→ `register_user_exception_handler`
+/// 注册的处理器被调用 → 打印"用户进程异常终止"并停机。
+pub fn test_spawn_user_fault() {
+    use crate::process::ProcessTable;
     use mm::user_space::UserAddressSpace;
     use usermode::{CODE_ADDR, MAGIC_ADDR};
 
-    logln!("[test-usermode] === M2.5.4: enter usermode (Ring 3) smoke ===");
+    logln!("[test-fault] === M3.3: user exception terminates process ===");
 
     let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
-
-    // 1. 立即映射用户页：代码页（可执行）、magic 页（可写）、栈页（可写）。
-    //    注意：iretq 后首次访问用户栈即需 present=1，故必须立即映射，非按需。
     let code_frame = mm::allocate_frame().expect("code frame").start_paddr();
     let magic_frame = mm::allocate_frame().expect("magic frame").start_paddr();
     let stack_frame = mm::allocate_frame().expect("stack frame").start_paddr();
-
-    // 拷贝用户机器码到代码页（经 HHDM 写入物理页）
     let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
-    let code = usermode_code();
+    let code = usermode_fault_code();
     unsafe {
         core::ptr::copy_nonoverlapping(
             code.as_ptr(),
@@ -602,7 +651,6 @@ pub fn test_enter_usermode() {
             code.len(),
         );
     }
-
     us.map_user(
         VirtAddr::new(CODE_ADDR),
         VirtAddr::new(CODE_ADDR + 0x1000),
@@ -610,7 +658,7 @@ pub fn test_enter_usermode() {
         PageFlags::empty().writable().executable().user(),
         &[code_frame],
     )
-    .expect("map code page");
+    .expect("map code");
     us.map_user(
         VirtAddr::new(MAGIC_ADDR),
         VirtAddr::new(MAGIC_ADDR + 0x1000),
@@ -618,11 +666,8 @@ pub fn test_enter_usermode() {
         PageFlags::empty().writable().user(),
         &[magic_frame],
     )
-    .expect("map magic page");
-    // 用户栈：放 4GB 内（0x40000000 附近），避开 SS 段（UDATA）limit 为 4GB 的
-    // 问题——用户栈若在 0x7fff00000000（>4GB），64 位模式下部分实现仍会因超出
-    // SS 段 limit 触发 #SS（栈段错误）。这里放在 UDATA 段限长（4GB）内。
-    let stack_top = 0x4000_0000u64; // 1GB 处，栈顶
+    .expect("map magic");
+    let stack_top = 0x4000_0000u64;
     us.map_user(
         VirtAddr::new(stack_top - 0x1000),
         VirtAddr::new(stack_top),
@@ -630,29 +675,18 @@ pub fn test_enter_usermode() {
         PageFlags::empty().writable().user(),
         &[stack_frame],
     )
-    .expect("map user stack");
+    .expect("map stack");
 
-    // 2. 注册软中断回调 + 激活用户页表
-    arch_x86_64::interrupts::register_soft_interrupt_handler(usermode_soft_handler);
-    usermode::CALLED.store(0, Ordering::SeqCst);
-    us.activate();
+    let mut table = ProcessTable::<X86PageTable>::new();
+    let pid = table
+        .spawn(CODE_ADDR, stack_top, 0xffff_ffff_801b_6910, us)
+        .expect("spawn process");
+    logln!("[test-fault] spawned pid={} (code: write magic then ud2)", pid);
 
-    // 3. 构造 TrapFrame：进入用户态执行用户代码
-    // 注意：iretq 从 Ring0 降到 Ring3 时，目标 CS/SS 的 RPL 必须是 3（bit0-1），
-    // 否则 CPU 判定特权级转换非法而抛 #GP（General Protection Fault）。
-    // 故选择子用 `UCODE|3` / `UDATA|3`（RPL=3），仍索引到同一用户段描述符。
-    let frame = arch::task::TrapFrame {
-        rip: CODE_ADDR,
-        cs: (arch_x86_64::gdt::UCODE | 3) as u64,
-        // RFLAGS: IF=1（bit9 开中断），IOPL=0（禁 I/O），保留位 1 恒为 1
-        rflags: 0x0000_0000_0000_0202,
-        rsp: stack_top,
-        ss: (arch_x86_64::gdt::UDATA | 3) as u64,
-    };
-    klib::logln!(
-        "[test-usermode] iretq -> rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x}",
-        frame.rip, frame.cs, frame.rflags, frame.rsp, frame.ss
-    );
-    // 永不返回：`enter_usermode` 返回 `!`（iretq 进用户态后由软中断 handler 完成验证）。
-    arch::task::enter_usermode(&frame);
+    // 注册用户态异常处理器：终止崩溃进程。
+    arch_x86_64::interrupts::register_user_exception_handler(user_fault_handler);
+
+    // 进入用户态执行（永不返回；用户态 ud2 异常被终止）。
+    table.get(pid).unwrap().addr_space().activate();
+    table.run(pid);
 }
