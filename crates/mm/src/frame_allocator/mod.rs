@@ -8,14 +8,13 @@ mod percpu_cache;
 mod reserve;
 mod stats;
 
-use arch::PhysFrame;
+use core::mem::size_of;
+
+use arch::{phys_to_virt, PhysFrame};
 use limine::{MemmapEntry, NonNullPtr};
 use spin::Once;
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
-
-use allocator_core::{LazyBuddyAllocator, ORDER_4K};
+use allocator_core::{LazyBuddyAllocator, MAX_ORDER, ORDER_4K};
 use percpu_cache::{FreeListTable, PerCpuCache, PerCpuCacheSet};
 
 pub use allocator_core::{ORDER_1G, ORDER_2M};
@@ -47,14 +46,37 @@ pub(crate) fn current_cpu_id() -> usize {
 }
 
 /// 依据实际 CPU 数初始化 per-CPU 页帧缓存（自适应核数）。
+///
+/// 缓存数组从**物理帧分配器**分配连续帧，经 HHDM 映射为 `&'static mut [PerCpuCache]`，
+/// 而非从有限的内核堆分配，从而不占用 4MB 堆、也不受核数导致的堆容量限制。
 /// 须在任何 AP 使用帧分配前调用（内核在 SMP 启动前按 Limine 响应注入 CPU 数）。
 pub fn init_percpu_caches(cpu_count: usize) {
     let count = cpu_count.max(1);
-    let caches: &'static [PerCpuCache] = {
-        let mut v: Vec<PerCpuCache> = Vec::with_capacity(count);
-        v.resize_with(count, PerCpuCache::new);
-        Box::leak(v.into_boxed_slice())
+
+    // 计算所需连续帧数与可容纳的最小 order（2^order 个 4KB 帧）。
+    // order 上限 MAX_ORDER-1：buddy 能分配的最大块（2^(MAX_ORDER-1) 帧）。
+    let bytes = count * size_of::<PerCpuCache>();
+    let need_frames = bytes.div_ceil(4096);
+    let order = if need_frames <= 1 {
+        0
+    } else {
+        let bits = usize::BITS as usize; // 64
+        (bits - 1 - (need_frames - 1).leading_zeros() as usize).min(MAX_ORDER - 1)
     };
+
+    let start = allocate_frames(order).expect("failed to allocate per-CPU cache frames");
+    let base = phys_to_virt(start.start_paddr()) as *mut u8;
+
+    // 清零整个分配区
+    unsafe { core::ptr::write_bytes(base, 0, (1 << order) * 4096) };
+
+    // 映射为可写 slice（每个槽位一个 PerCpuCache）
+    let caches: &'static mut [PerCpuCache] =
+        unsafe { core::slice::from_raw_parts_mut(base as *mut PerCpuCache, count) };
+    for c in caches.iter_mut() {
+        *c = PerCpuCache::new();
+    }
+
     PER_CPU.init(caches);
 }
 

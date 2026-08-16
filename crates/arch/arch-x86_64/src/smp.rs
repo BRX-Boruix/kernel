@@ -9,7 +9,6 @@
 //! `SmpInfo::extra_argument`，而不是用 LAPIC id 直接索引——因为真实
 //! 硬件上 LAPIC id 可能稀疏（0,8,16,…）甚至超过槽位上限，直接用会冲突。
 
-use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::{Mutex, Once};
@@ -35,16 +34,19 @@ const AP_STACK_SIZE: usize = 16 * 1024;
 
 /// 每个 AP 的 GDT/TSS/内核栈/Double Fault 栈资源。
 ///
-/// 内核栈与 DF 栈使用**物理帧分配器**分配（经 HHDM 映射为可访问虚拟地址），
-/// 而非内核堆，从而不占用有限的 4MB 内核堆、也不受核数导致的堆容量限制。
-/// GDT/TSS 很小（各 ~150B），用堆即可。
+/// 全部使用**物理帧分配器**分配（经 HHDM 映射为可访问虚拟地址），而非内核堆，
+/// 从而不占用有限的 4MB 内核堆、也不受核数导致的堆容量限制。
+///
+/// GDT/TSS 各占一个独立 4KB 帧（实际只用几十字节，但以帧为单位分配简单安全）。
 struct ApResources {
     /// 每个 AP 内核栈的物理基址（长度 = AP 数，每块 AP_STACK_SIZE）。
     kstack_paddrs: Vec<u64>,
     /// 每个 AP Double Fault 栈的物理基址（每块 DF_STACK_SIZE）。
     df_stack_paddrs: Vec<u64>,
-    gdts: Vec<gdt::Gdt>,
-    tsss: Vec<gdt::Tss>,
+    /// 每个 AP 的 GDT 帧物理基址（各 4KB）。
+    gdt_paddrs: Vec<u64>,
+    /// 每个 AP 的 TSS 帧物理基址（各 4KB）。
+    tss_paddrs: Vec<u64>,
 }
 
 /// 动态分配的 AP 资源（懒初始化，由 BSP 在 `init` 时填入）。
@@ -138,15 +140,15 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
         }
     }
 
-    // 把物理栈基址经 HHDM 映射为可访问虚拟地址，计算栈顶（TSS.rsp0 / IST）。
-    // 配置并加载本 CPU 的 GDT/TSS（每 CPU 独立内核栈 + Double Fault 栈）
+    // 把物理基址经 HHDM 映射为可访问虚拟地址：栈算栈顶（TSS.rsp0 / IST），
+    // GDT/TSS 帧作为可写指针交给 setup_cpu 填充。
     let kstack_virt = phys_to_virt(res.kstack_paddrs[arr_idx]);
     let df_virt = phys_to_virt(res.df_stack_paddrs[arr_idx]);
     let (kstack_top, df_stack_top, gdt_ptr, tss_ptr) = (
         gdt::stack_top(kstack_virt as *const u8, AP_STACK_SIZE),
         gdt::stack_top(df_virt as *const u8, gdt::DF_STACK_SIZE),
-        core::ptr::addr_of!(res.gdts[arr_idx]) as *mut gdt::Gdt,
-        core::ptr::addr_of!(res.tsss[arr_idx]) as *mut gdt::Tss,
+        phys_to_virt(res.gdt_paddrs[arr_idx]) as *mut gdt::Gdt,
+        phys_to_virt(res.tss_paddrs[arr_idx]) as *mut gdt::Tss,
     );
     drop(resources);
 
@@ -187,33 +189,49 @@ pub fn init() {
     let ap_count = total.saturating_sub(1); // 去掉 BSP
 
     // 内核栈 / DF 栈各 AP 一块，从物理帧分配器分配（order：AP_STACK_SIZE 与
-    // DF_STACK_SIZE 均为 16KB = 4 个 4KB 帧 = order 2）。不占内核堆。
+    // DF_STACK_SIZE 均为 16KB = 4 个 4KB 帧 = order 2）。GDT/TSS 各一个 4KB 帧
+    // （order 0）。全部不占内核堆。
     const STACK_ORDER: u32 = 2; // 2^2 * 4KB = 16KB
+    const ONE_FRAME_ORDER: u32 = 0; // 1 个 4KB 帧
     let mut kstack_paddrs = Vec::with_capacity(ap_count);
     let mut df_paddrs = Vec::with_capacity(ap_count);
+    let mut gdt_paddrs = Vec::with_capacity(ap_count);
+    let mut tss_paddrs = Vec::with_capacity(ap_count);
     for _ in 0..ap_count {
         let k = alloc_stack_frames(STACK_ORDER);
         let d = alloc_stack_frames(STACK_ORDER);
-        if k == 0 || d == 0 {
+        let g = alloc_stack_frames(ONE_FRAME_ORDER);
+        let t = alloc_stack_frames(ONE_FRAME_ORDER);
+        if k == 0 || d == 0 || g == 0 || t == 0 {
             // 物理内存不足：打印后仅初始化已分配的部分（记录到 TOTAL_CPUS）
-            klib::logln!("[smp] WARNING: out of physical frames for AP stacks");
+            klib::logln!("[smp] WARNING: out of physical frames for AP resources");
             break;
         }
         kstack_paddrs.push(k);
         df_paddrs.push(d);
+        gdt_paddrs.push(g);
+        tss_paddrs.push(t);
     }
     let real_ap = kstack_paddrs.len();
     if real_ap < ap_count {
         klib::log_dec!("[smp] only ", real_ap as u64);
-        klib::logln!(" AP stacks allocated");
+        klib::logln!(" AP resources allocated");
+    }
+
+    // 初始化每个 AP 的 GDT/TSS 物理帧（写入初始值，供 AP 使用）。
+    for i in 0..real_ap {
+        unsafe {
+            core::ptr::write(phys_to_virt(gdt_paddrs[i]) as *mut gdt::Gdt, gdt::Gdt::new());
+            core::ptr::write(phys_to_virt(tss_paddrs[i]) as *mut gdt::Tss, gdt::Tss::new());
+        }
     }
 
     let mut res_guard = AP_RESOURCES.lock();
     *res_guard = Some(ApResources {
         kstack_paddrs,
         df_stack_paddrs: df_paddrs,
-        gdts: vec![gdt::Gdt::new(); real_ap],
-        tsss: vec![gdt::Tss::new(); real_ap],
+        gdt_paddrs,
+        tss_paddrs,
     });
     drop(res_guard);
 
