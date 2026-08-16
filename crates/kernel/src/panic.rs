@@ -17,7 +17,7 @@ static HALT_FN: AtomicUsize = AtomicUsize::new(0);
 static ARCH_NAME_PTR: AtomicUsize = AtomicUsize::new(0);
 static ARCH_NAME_LEN: AtomicUsize = AtomicUsize::new(0);
 
-/// 回退串口写函数 `fn(&str)`（绕过 klib 的 OUTPUT 注入，保证早期 panic 可见）。
+/// 回退串口写函数 `fn(&str)`（绕过 klib 的 console 层，保证早期 panic 可见）。
 static SERIAL_WRITE: AtomicUsize = AtomicUsize::new(0);
 /// 当前 CPU id 读取器 `fn() -> u32`（未注入/未就绪时返回 0）。
 static CPU_ID_READER: AtomicUsize = AtomicUsize::new(0);
@@ -40,7 +40,7 @@ pub fn init(arch_name: &'static str, halt: HaltFn) {
 
 /// 注入 panic 时的平台辅助：回退串口、CPU id、屏幕输出。
 ///
-/// 回退串口独立于 `klib::set_output`，确保在 OUTPUT 尚未注入时 panic 依然可见。
+/// 回退串口独立于 `klib` 的 console 层，确保在 console 尚未注册 sink 时 panic 依然可见。
 /// `cpu_id` 返回当前 CPU 的 LAPIC id（未就绪时须自行返回 0，避免读未映射寄存器）。
 /// `screen` 向 framebuffer 输出（未初始化时可安全空操作）。
 pub fn set_panic_output(serial: fn(&str), cpu_id: fn() -> u32, screen: fn(&str)) {
