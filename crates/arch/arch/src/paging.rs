@@ -50,8 +50,11 @@ impl PageFlags {
     }
 
     /// 是否可执行（内核页通常需要）。
-    pub const fn executable(self) -> Self {
-        // 若开了 NX，需要在条目里清 bit63；默认实现保持可执行。
+    ///
+    /// 默认页**不可执行**（架构实现据此置 NX=bit63）；仅当调用此方法显式授予
+    /// 执行权限时才可执行，从而强制 W^X 保护。
+    pub const fn executable(mut self) -> Self {
+        self.0 |= 1 << 63;
         self
     }
 

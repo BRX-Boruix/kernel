@@ -68,6 +68,10 @@ fn entry_from_flags(flags: PageFlags, large: bool) -> u64 {
     if flags.bits() & (1 << 2) != 0 {
         e |= FLAG_USER;
     }
+    // NX：未显式授予执行权限（PageFlags::executable，bit 63）的页一律不可执行
+    if flags.bits() & (1 << 63) == 0 {
+        e |= 1 << 63;
+    }
     if large {
         e |= FLAG_LARGE;
     }
