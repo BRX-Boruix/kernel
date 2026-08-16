@@ -82,9 +82,13 @@ unsafe fn kmain_body() -> ! {
     // 验证物理页帧分配/释放
     tests::test_frame_alloc();
 
-    // 注入页表页分配器与 HHDM 偏移（虚拟内存层使用）
+    // 注入页表页分配器/释放器与 HHDM 偏移（虚拟内存层使用）
     let phys_offset = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
-    arch_x86_64::paging::init(mm::mapper::mm_alloc_frame, phys_offset);
+    arch_x86_64::paging::init(
+        mm::mapper::mm_alloc_frame,
+        mm::mapper::mm_dealloc_frame,
+        phys_offset,
+    );
     // 验证虚拟内存页表映射
     tests::test_paging();
 

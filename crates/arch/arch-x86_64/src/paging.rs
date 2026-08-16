@@ -14,15 +14,20 @@ use spin::Once;
 
 use crate::mmio;
 
-// ---- 页表页分配注入 ----
+// ---- 页表页分配 / 释放注入 ----
 
 /// 分配一个物理页帧作为页表页，返回其物理地址（4KB 对齐）。
 /// 返回 0 表示分配失败。由内核在早期注入（实际调用 `mm::allocate_frame`）。
 static FRAME_ALLOC: Once<extern "C" fn() -> u64> = Once::new();
 
-/// 注入页表页分配。HHDM 偏移由 `arch::hhdm::PHYS_OFFSET` 统一持有。
-pub fn init(alloc: extern "C" fn() -> u64, phys_offset: u64) {
+/// 释放一个物理页帧（用于回收不再使用的中间页表页）。
+/// 由内核注入（实际调用 `mm` 的释放接口）。
+static FRAME_DEALLOC: Once<extern "C" fn(u64)> = Once::new();
+
+/// 注入页表页分配与释放。HHDM 偏移由 `arch::hhdm::PHYS_OFFSET` 统一持有。
+pub fn init(alloc: extern "C" fn() -> u64, dealloc: extern "C" fn(u64), phys_offset: u64) {
     let _ = FRAME_ALLOC.call_once(|| alloc);
+    let _ = FRAME_DEALLOC.call_once(|| dealloc);
     let _ = arch::PHYS_OFFSET.call_once(|| phys_offset);
 }
 
@@ -35,6 +40,13 @@ pub(crate) fn alloc_frame() -> Option<u64> {
         None
     } else {
         Some(p)
+    }
+}
+
+/// 释放一个物理页帧（页表页回收用）。
+pub(crate) fn dealloc_frame(paddr: u64) {
+    if let Some(f) = FRAME_DEALLOC.get() {
+        f(paddr);
     }
 }
 
@@ -165,6 +177,17 @@ impl X86PageTable {
     ///
     /// `leaf` 是命中叶子所在的层（`0..=levels-1`）：非最低层命中代表大页。
     /// 若某层表项不存在（present=0）返回 `None`。
+    /// 检查一个页表页（512 项）是否全空（present=0）。
+    unsafe fn is_table_empty(&self, phys: u64) -> bool {
+        let virt = phys_to_virt(phys) as *const u64;
+        for i in 0..512 {
+            if unsafe { *virt.add(i) } & FLAG_PRESENT != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
     unsafe fn walk(&self, vaddr: u64) -> Option<([u64; 5], usize, usize)> {
         let levels = page_levels();
         let mut entries = [0u64; 5];
@@ -245,8 +268,42 @@ impl arch::PageTable for X86PageTable {
         } else {
             entries[leaf - 1] & ADDR_MASK
         };
-        unsafe { self.table_set(parent_phys, index_at(leaf, levels, v), 0) };
+        let leaf_idx = index_at(leaf, levels, v);
+        unsafe { self.table_set(parent_phys, leaf_idx, 0) };
         flush_tlb(v);
+
+        // 回收中间页表页：仅当映射的是 4KB 页（leaf == levels-1）时才存在
+        // 其下方的页表页链。逐级向上检查，若某级页表页全空则释放该页并清掉
+        // 父层对应条目，直到某级不空或到达顶层（顶层/大页永不释放）。
+        if leaf == levels - 1 && levels >= 3 {
+            // 从 PT 的父层（leaf-1）开始，逐级向上；不回收顶层（level 0）
+            let mut cur_level = leaf - 1;
+            while cur_level >= 1 {
+                // 当前空页表页的物理地址 = entries[cur_level] & ADDR_MASK
+                // （它位于第 cur_level+1 层）
+                let table_phys = entries[cur_level] & ADDR_MASK;
+                if table_phys == 0 {
+                    break;
+                }
+                if !unsafe { self.is_table_empty(table_phys) } {
+                    break; // 该层还有其它映射，停止回收
+                }
+                // 清掉父层（第 cur_level 层）指向该空表的条目。
+                // 第 cur_level 层的父表：cur_level==1 时是顶层表自身，否则是
+                // entries[cur_level-1] & ADDR_MASK。
+                let parent_phys = if cur_level == 1 {
+                    self.pml4
+                } else {
+                    entries[cur_level - 1] & ADDR_MASK
+                };
+                unsafe { self.table_set(parent_phys, index_at(cur_level, levels, v), 0) };
+                flush_tlb(v);
+                dealloc_frame(table_phys);
+                // 继续向上
+                cur_level -= 1;
+            }
+        }
+
         Ok(PhysAddr::new(entry_paddr(entries[leaf], leaf, levels)))
     }
 
