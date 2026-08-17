@@ -11,6 +11,9 @@ kernel-tests = []
 # 接管并停机（验收后停，不返回主流程）。因会卡住后续启动，默认关闭；
 # SDK 的 `--test-m3.3` 显式启用。隐含 kernel-tests。
 kernel-test-m33 = ["kernel-tests"]
+# M4.1 syscall 停机验收：用户代码经 `int 0x80` 调用 write/now/exit 等，
+# 验证 syscall ABI 全链路（验收后停，不返回主流程）。隐含 kernel-tests。
+kernel-test-m41 = ["kernel-tests"]
 
 [build-dependencies]
 

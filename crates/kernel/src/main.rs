@@ -13,6 +13,10 @@ mod terminal;
 // 只在 `kernel-tests` feature 下编译，避免非测试构建的 dead_code 警告。
 #[cfg(feature = "kernel-tests")]
 mod process;
+// syscall 机制（M4.1）依赖进程模型（经 `current_proc_mut` 访问进程内存/退出），
+// 与 `mod process` 同步 gate：生产化在调度器/init 落地后解除。
+#[cfg(feature = "kernel-tests")]
+mod syscall;
 // 自检测试仅在 `kernel-tests` feature 下编译（SDK `build/br --test`）。
 #[cfg(feature = "kernel-tests")]
 mod tests;
@@ -220,6 +224,17 @@ unsafe fn kmain_body() -> ! {
     // feature 门控：仅 SDK `--test-m3.3` 显式启用时才执行。
     #[cfg(feature = "kernel-test-m33")]
     tests::test_spawn_user_fault();
+
+    // M4.1：注册 syscall 软中断入口（用户态 `int 0x80` → 内核 syscall 分发）。
+    // 用 spin::Once 单次注册；M3.3 测试不触发 syscall，注册无副作用。
+    // 与 `mod syscall` 同步 gate：生产构建（无 kernel-tests）不编译 syscall 机制。
+    #[cfg(feature = "kernel-tests")]
+    arch_x86_64::interrupts::register_soft_interrupt_handler(syscall::syscall_entry);
+
+    // M4.1 syscall 验收：用户代码经 `int 0x80` 调用 write/exit 等（停机验收，
+    // 不返回主流程），故单独用 kernel-test-m41 feature 门控。
+    #[cfg(feature = "kernel-test-m41")]
+    tests::test_syscall();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。

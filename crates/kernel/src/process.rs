@@ -10,11 +10,42 @@
 //! 进程持有 `UserAddressSpace<PT>`（M1 的独立地址空间），内核栈由调用方提供
 //! （M3 单核简单模型下可共用全局内核栈，M4 调度时再独立分配）。
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use arch::task::TaskContext;
 use arch::PageTable;
+use arch_x86_64::paging::X86PageTable;
 use mm::user_space::UserAddressSpace;
+
+// M4.1：当前运行进程的裸指针（syscall 经它访问进程地址空间/退出）。
+// 采用"进程被 `run` 从表取出并 `Box::leak` 为 `'static`，再记录地址"模型：
+// - 运行期间不持有 `PROCESS_TABLE` 锁（避免 syscall 中断重入表锁死锁）；
+// - 进程生命周期 = 内核生命周期（单进程停机模型下泄漏无害，M4.2 调度器再改为正式持有/回收）。
+static CURRENT_PROC: AtomicUsize = AtomicUsize::new(0);
+
+/// 记录当前运行进程（`run` 进入用户态前设置）。
+pub fn set_current_proc(p: *mut Process<X86PageTable>) {
+    CURRENT_PROC.store(p as usize, Ordering::Release);
+}
+
+/// 清除当前进程记录（进程退出时）。
+pub fn clear_current_proc() {
+    CURRENT_PROC.store(0, Ordering::Release);
+}
+
+/// 当前运行进程的可变引用（syscall 在中断上下文访问，单进程无并发）。
+///
+/// 进程对象由 `Box::leak` 保证 `'static` 存活，返回 `&'static mut` 安全。
+pub fn current_proc_mut() -> Option<&'static mut Process<X86PageTable>> {
+    let p = CURRENT_PROC.load(Ordering::Acquire);
+    if p == 0 {
+        None
+    } else {
+        Some(unsafe { &mut *(p as *mut Process<X86PageTable>) })
+    }
+}
 
 /// 进程状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +128,6 @@ impl<PT: PageTable> Process<PT> {
     /// 多平台化时应改为 `arch` 抽象层提供的用户段常量或注入函数（ADR-007）。
     ///
     /// 目前仅 M3.3 停机验收会真正运行进程，随 `kernel-test-m33` feature 编译。
-    #[cfg(feature = "kernel-test-m33")]
     pub fn launch(&mut self) -> !
     where
         PT::Error: From<klib::error::Error>,
@@ -134,7 +164,7 @@ pub struct ProcessTable<PT: PageTable> {
 
 impl<PT: PageTable> ProcessTable<PT> {
     /// 新建空进程表。
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             processes: Vec::new(),
             free: Vec::new(),
@@ -190,23 +220,6 @@ impl<PT: PageTable> ProcessTable<PT> {
         Ok(pid)
     }
 
-    /// 启动（运行）指定 pid 的进程：进入用户态执行。
-    ///
-    /// 永不返回（进入用户态后由用户代码/中断决定控制流）。
-    /// 若 pid 不存在则 panic。
-    ///
-    /// 目前仅 M3.3 停机验收会真正运行进程，随 `kernel-test-m33` feature 编译。
-    #[cfg(feature = "kernel-test-m33")]
-    pub fn run(&mut self, pid: usize) -> !
-    where
-        PT::Error: From<klib::error::Error>,
-    {
-        let proc = self
-            .get_mut(pid)
-            .expect("process to run does not exist");
-        proc.launch();
-    }
-
     /// 只读访问进程。
     pub fn get(&self, pid: usize) -> Option<&Process<PT>> {
         self.processes.get(pid).and_then(|p| p.as_ref())
@@ -249,5 +262,25 @@ impl<PT: PageTable> ProcessTable<PT> {
             .iter()
             .filter(|p| matches!(p.as_ref(), Some(proc) if proc.state() == s))
             .count()
+    }
+}
+
+impl ProcessTable<X86PageTable> {
+    /// 启动（运行）指定 pid 的进程：进入用户态执行。
+    ///
+    /// 从表取出进程并 `Box::leak` 到全局 [`CURRENT_PROC`]，使 syscall 在中断
+    /// 上下文访问进程时**不重入进程表锁**（避免 `run` 持锁进用户态 → syscall
+    /// 再锁死锁）。进程生命周期 = 内核生命周期（单进程停机模型泄漏无害；
+    /// M4.2 调度器改为正式持有/回收）。永不返回。
+    ///
+    /// 若 pid 不存在则 panic。
+    pub fn run(&mut self, pid: usize) -> ! {
+        let proc = self.processes[pid]
+            .take()
+            .expect("process to run does not exist");
+        // leak 为 'static：进程存活到内核结束（停机），syscall 经指针访问安全。
+        let leaked: &'static mut Process<X86PageTable> = Box::leak(Box::new(proc));
+        set_current_proc(leaked as *mut Process<X86PageTable>);
+        leaked.launch();
     }
 }

@@ -581,6 +581,157 @@ mod usermode {
     pub const MAGIC: u64 = 0xDEADBEEF;
 }
 
+/// M4.1 用户态 syscall 测试的常量地址（随 `kernel-test-m41` feature 编译）。
+#[cfg(feature = "kernel-test-m41")]
+mod usermode_syscall {
+    pub const CODE_ADDR: u64 = 0x0000_0000_9000_0000;
+    /// 消息数据页（"Hello from syscall!"）。
+    pub const MSG_ADDR: u64 = 0x0000_0000_9500_0000;
+    /// 保存区页：存各 syscall 返回值（now/write/info/brk 各 8 字节）。
+    pub const SAVE_ADDR: u64 = 0x0000_0000_9500_1000;
+    pub const STACK_TOP: u64 = 0x0000_0000_4000_0000;
+    pub const MSG: &[u8] = b"Hello from syscall!\n";
+}
+
+/// M4.1：手写用户态机器码，连续调用 5 个域的 syscall
+/// （TIME/IO/SYSTEM/MEMORY/PROCESS，演示"域+操作"二维编码）。
+#[cfg(feature = "kernel-test-m41")]
+fn syscall_user_code() -> [u8; 200] {
+    use usermode_syscall::*;
+    let mut c = [0x90u8; 200]; // nop 填充
+    let mut i = 0;
+    macro_rules! emit {
+        ($($b:expr),*) => {
+            $( c[i] = $b; i += 1; )*
+        };
+    }
+    macro_rules! reg64 {
+        ($op:expr, $v:expr) => {{
+            emit!(0x48, $op);
+            c[i..i + 8].copy_from_slice(&($v as u64).to_le_bytes());
+            i += 8;
+        }};
+    }
+    macro_rules! int80 {
+        () => { emit!(0xCD, 0x80); };
+    }
+    macro_rules! store_rax {
+        ($a:expr) => {{
+            emit!(0x48, 0xA3);
+            c[i..i + 8].copy_from_slice(&($a as u64).to_le_bytes());
+            i += 8;
+        }};
+    }
+    // SYS_NOW (0x3001)：now()，存结果
+    reg64!(0xB8, 0x3001u32);
+    int80!();
+    store_rax!(SAVE_ADDR + 0);
+    // SYS_WRITE (0x2002)：write(1, MSG, len)，存返回字节数
+    reg64!(0xB8, 0x2002u32);
+    reg64!(0xBF, 1);
+    reg64!(0xBE, MSG_ADDR);
+    reg64!(0xBA, MSG.len());
+    int80!();
+    store_rax!(SAVE_ADDR + 8);
+    // SYS_INFO (0xF005)：info(0)，存版本号
+    reg64!(0xB8, 0xF005u32);
+    reg64!(0xBF, 0);
+    int80!();
+    store_rax!(SAVE_ADDR + 16);
+    // SYS_BRK (0x1005)：brk(0) 查询当前断点，存结果
+    reg64!(0xB8, 0x1005u32);
+    reg64!(0xBF, 0);
+    int80!();
+    store_rax!(SAVE_ADDR + 24);
+    // SYS_EXIT (0x0003)：exit(42)，停机（不返回）
+    reg64!(0xB8, 0x0003u32);
+    reg64!(0xBF, 42);
+    int80!();
+    emit!(0x0F, 0x0B); // ud2（不应到达）
+    c
+}
+
+/// M4.1：用户态经 `int 0x80` 调用 syscall 的停机验收。
+///
+/// syscall 入口已在 kmain 注册。用户代码连续调用 now/write/info/brk/exit，
+/// 验证 syscall ABI 全链路（中断进入 → 查表分发 → 执行 → 返回值写回 rax）。
+/// 验收依据（串口日志可见）：write 输出文本、`[syscall]` 分发/返回日志、
+/// exit 打印后停机。
+#[cfg(feature = "kernel-test-m41")]
+pub fn test_syscall() {
+    use crate::process::ProcessTable;
+    use arch::VirtAddr;
+    use arch_x86_64::paging::X86PageTable;
+    use mm::user_space::UserAddressSpace;
+    use usermode_syscall::*;
+
+    info!("[syscall-test] === M4.1: syscall via int 0x80 ===");
+
+    let code = syscall_user_code();
+    let msg = MSG;
+
+    // 分配物理帧（code / msg / save / stack）
+    let code_frame = mm::allocate_frame().expect("code frame").start_paddr();
+    let msg_frame = mm::allocate_frame().expect("msg frame").start_paddr();
+    let save_frame = mm::allocate_frame().expect("save frame").start_paddr();
+    let stack_frame = mm::allocate_frame().expect("stack frame").start_paddr();
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+
+    // 写入用户代码与消息数据（经 HHDM 虚拟地址）
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), (code_frame + off) as *mut u8, code.len());
+        core::ptr::copy_nonoverlapping(msg.as_ptr(), (msg_frame + off) as *mut u8, msg.len());
+    }
+
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+    // 代码页（可执行）
+    us.map_user(
+        VirtAddr::new(CODE_ADDR),
+        VirtAddr::new(CODE_ADDR + 0x1000),
+        PageSize::Size4K,
+        PageFlags::empty().writable().executable().user(),
+        &[code_frame],
+    )
+    .expect("map code");
+    // 消息数据页
+    us.map_user(
+        VirtAddr::new(MSG_ADDR),
+        VirtAddr::new(MSG_ADDR + 0x1000),
+        PageSize::Size4K,
+        PageFlags::empty().writable().user(),
+        &[msg_frame],
+    )
+    .expect("map msg");
+    // 保存区页（存各 syscall 返回值）
+    us.map_user(
+        VirtAddr::new(SAVE_ADDR),
+        VirtAddr::new(SAVE_ADDR + 0x1000),
+        PageSize::Size4K,
+        PageFlags::empty().writable().user(),
+        &[save_frame],
+    )
+    .expect("map save");
+    // 栈页
+    us.map_user(
+        VirtAddr::new(STACK_TOP - 0x1000),
+        VirtAddr::new(STACK_TOP),
+        PageSize::Size4K,
+        PageFlags::empty().writable().user(),
+        &[stack_frame],
+    )
+    .expect("map stack");
+
+    let mut table = ProcessTable::<X86PageTable>::new();
+    let pid = table
+        .spawn(CODE_ADDR, STACK_TOP, 0xffff_ffff_801b_6910, us)
+        .expect("spawn process");
+    info!("[syscall-test] spawned pid={}", pid);
+    // 激活用户页表并进入用户态（永不返回：`run` 从表取出进程 leak 到
+    // CURRENT_PROC 后 launch；用户代码调 exit 停机）。
+    table.get_mut(pid).unwrap().addr_space_mut().activate();
+    table.run(pid);
+}
+
 /// M3.1：验证进程结构与进程表（PCB + pid 分配/回收）。
 ///
 /// 验证点：
