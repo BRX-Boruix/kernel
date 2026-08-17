@@ -19,7 +19,7 @@ pub trait ModuleLoader: Sync {
     ///
     /// `name`：模块名（诊断用）；`data`：模块镜像字节。
     /// 返回 `Ok` 表示加载成功（驱动已注册）。
-    fn load(&self, name: &str, data: &[u8]) -> Result<(), &'static str>;
+    fn load(&self, name: &str, data: &[u8]) -> Result<(), klib::error::Error>;
 }
 
 /// 全局加载器槽（静态链接阶段为空；动态化时由内核注册）。
@@ -36,11 +36,11 @@ pub fn loader_registered() -> bool {
 }
 
 /// 加载并初始化一个模块（动态化入口；未注册加载器时返回错误）。
-pub fn load_module(name: &str, data: &[u8]) -> Result<(), &'static str> {
+pub fn load_module(name: &str, data: &[u8]) -> Result<(), klib::error::Error> {
     let l = LOADER.lock();
     match *l {
         Some(loader) => loader.load(name, data),
-        None => Err("module loader not registered (static-linked kernel)"),
+        None => Err(klib::error::Error::NotFound),
     }
 }
 
@@ -52,7 +52,7 @@ mod tests {
 
     struct DummyLoader;
     impl ModuleLoader for DummyLoader {
-        fn load(&self, _name: &str, _data: &[u8]) -> Result<(), &'static str> {
+        fn load(&self, _name: &str, _data: &[u8]) -> Result<(), klib::error::Error> {
             Ok(())
         }
     }

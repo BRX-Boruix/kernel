@@ -3,8 +3,8 @@
 use crate::device::Device;
 use crate::id::DeviceId;
 
-/// 驱动操作结果的错误类型（`Err` 为可读错误描述）。
-pub type DrvResult = Result<(), &'static str>;
+/// 驱动操作结果的错误类型（统一错误码，ADR-010）。
+pub type DrvResult = Result<(), klib::error::Error>;
 
 /// 设备驱动：声明支持哪些设备，并实现其生命周期。
 ///

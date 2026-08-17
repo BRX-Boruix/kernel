@@ -69,7 +69,9 @@ impl PageFlags {
 /// 实现方操作真实硬件页表（如 x86 的 CR3/PML4）。
 pub trait PageTable {
     /// 错误类型（架构相关，如"页表层级已满"）。
-    type Error: core::fmt::Debug;
+    /// 须可从 `klib::error::Error` 构造，保证上层（`mm`/`kernel`）经统一错误码
+    /// 传递（ADR-010），架构差异不泄漏成不同错误类型（ADR-007）。
+    type Error: core::fmt::Debug + From<klib::error::Error>;
 
     /// 新建一个独立的页表：**继承当前内核半区映射**（所有进程共享内核映射），
     /// **用户半区为空**（每个进程独立的用户地址空间）。

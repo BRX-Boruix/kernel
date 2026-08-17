@@ -18,6 +18,7 @@ extern crate std;
 pub mod allocator;
 pub mod collections;
 pub mod console;
+pub mod error;
 pub mod format;
 pub mod log;
 pub mod random;

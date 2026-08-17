@@ -95,7 +95,7 @@ impl<PT: PageTable> Process<PT> {
     /// 多平台化时应改为 `arch` 抽象层提供的用户段常量或注入函数（ADR-007）。
     pub fn launch(&mut self) -> !
     where
-        PT::Error: From<&'static str>,
+        PT::Error: From<klib::error::Error>,
     {
         use arch::task::TrapFrame;
         self.state = TaskState::Running;
@@ -161,7 +161,7 @@ impl<PT: PageTable> ProcessTable<PT> {
         user_stack_top: u64,
         kernel_stack_top: u64,
         addr_space: UserAddressSpace<PT>,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, klib::error::Error> {
         let pid = self.alloc_pid();
         let proc = Process {
             pid,
@@ -191,7 +191,7 @@ impl<PT: PageTable> ProcessTable<PT> {
     /// 若 pid 不存在则 panic。
     pub fn run(&mut self, pid: usize) -> !
     where
-        PT::Error: From<&'static str>,
+        PT::Error: From<klib::error::Error>,
     {
         let proc = self
             .get_mut(pid)

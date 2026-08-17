@@ -7,7 +7,7 @@
 //! - M1.3 按需分页：支持"预留区域（present=0）"语义，缺页时按需补页。
 //!
 //! 泛型 `PT: PageTable` 使其不绑定具体架构（ADR-007）。
-//! `PT::Error` 需可从 `&'static str` 构造（x86 实现 `Error = &'static str` 满足）。
+//! `PT::Error` 需可从 `klib::error::Error` 构造（ADR-010，统一错误码）。
 
 use alloc::vec::Vec;
 
@@ -15,6 +15,8 @@ use arch::{
     phys_to_virt, ActivePageTable, PageFlags, PageSize, PhysAddr, PhysFrame, PageTable, VirtAddr,
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+use klib::error::Error;
 
 use crate::{allocate_frame, deallocate_frame};
 
@@ -68,7 +70,7 @@ pub struct UserAddressSpace<PT: PageTable> {
 impl<PT> UserAddressSpace<PT>
 where
     PT: PageTable,
-    PT::Error: From<&'static str>,
+    PT::Error: From<Error>,
 {
     /// 新建一个用户地址空间：从当前内核页表派生独立页表（ADR-003 纯 spawn）。
     pub fn new() -> Result<Self, PT::Error> {
@@ -97,14 +99,14 @@ where
         let s = start.as_u64();
         let e = end.as_u64();
         if s < USER_BASE || e > USER_TOP || e <= s {
-            return Err("user region out of range".into());
+            return Err(Error::OutOfRange.into());
         }
         // 强制带 user 标志，保证用户态可访问
         let uflags = flags.user();
         let page = size.bytes();
         let count = ((e - s) + page - 1) / page;
         if (phys_frames.len() as u64) < count {
-            return Err("not enough phys frames".into());
+            return Err(Error::InvalidParam.into());
         }
         let mut vaddr = s;
         for &phys in phys_frames.iter().take(count as usize) {
@@ -135,7 +137,7 @@ where
         let s = start.as_u64();
         let e = end.as_u64();
         if s < USER_BASE || e > USER_TOP || e <= s {
-            return Err("user region out of range".into());
+            return Err(Error::OutOfRange.into());
         }
         let uflags = flags.user();
         self.areas.lock().push(UserArea {
@@ -304,7 +306,7 @@ where
     pub fn mmap_user(&mut self, size: u64, flags: PageFlags) -> Result<u64, PT::Error> {
         let size = align_up(size, 4096);
         if size == 0 {
-            return Err("mmap size is zero".into());
+            return Err(Error::InvalidParam.into());
         }
         // 收集所有已声明区域的 [start, end) 并排序（含栈区/堆区/mmap 区）。
         let mut regions: Vec<(u64, u64)> = self
@@ -356,7 +358,7 @@ where
                 return Ok(gap_start);
             }
         }
-        Err("no free mmap region".into())
+        Err(Error::NoSpace.into())
     }
 
     /// 在固定栈顶下方预留用户栈区（向下增长，按需分页）。
@@ -367,10 +369,10 @@ where
         let top = USER_STACK_TOP;
         let bottom = top - size;
         if bottom < USER_BASE {
-            return Err("stack too large".into());
+            return Err(Error::OutOfRange.into());
         }
         if self.overlaps(bottom, top) {
-            return Err("stack region overlaps".into());
+            return Err(Error::AlreadyExists.into());
         }
         self.reserve_user(
             VirtAddr::new(bottom),
@@ -393,7 +395,7 @@ where
             return Ok(self.heap_break);
         }
         if new_break < USER_HEAP_BASE || new_break >= USER_STACK_TOP {
-            return Err("brk out of range".into());
+            return Err(Error::OutOfRange.into());
         }
         let new_break = align_up(new_break, 4096);
         if new_break < self.heap_break {

@@ -238,11 +238,11 @@ impl arch::ActivePageTable for X86PageTable {
 }
 
 impl arch::PageTable for X86PageTable {
-    type Error = &'static str;
+    type Error = klib::error::Error;
 
     fn new() -> Result<Self, Self::Error> {
         // 1. 分配新顶层页表页并清零
-        let top = alloc_frame().ok_or("no frame for new page table")?;
+        let top = alloc_frame().ok_or(klib::error::Error::OutOfMemory)?;
         let top_virt = phys_to_virt(top) as *mut u64;
         unsafe { core::ptr::write_bytes(top_virt, 0, 512) };
 
@@ -283,7 +283,7 @@ impl arch::PageTable for X86PageTable {
             let idx = index_at(lvl, levels, v);
             let entry = unsafe { self.table_at(table_phys, idx) };
             if entry & FLAG_PRESENT == 0 {
-                let new_child = alloc_frame().ok_or("no frame for page table")?;
+                let new_child = alloc_frame().ok_or(klib::error::Error::OutOfMemory)?;
                 // 清零子表
                 unsafe { core::ptr::write_bytes(phys_to_virt(new_child) as *mut u64, 0, 512) };
                 // 连接：present | writable |（若叶层映射是用户页，则中间层也须置 USER 位）
@@ -316,7 +316,7 @@ impl arch::PageTable for X86PageTable {
 
     fn unmap(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, Self::Error> {
         let v = vaddr.as_u64();
-        let (entries, leaf, levels) = unsafe { self.walk(v) }.ok_or("not mapped")?;
+        let (entries, leaf, levels) = unsafe { self.walk(v) }.ok_or(klib::error::Error::NotFound)?;
         // 清掉叶层条目：父表 = 上一层的下一级表（顶层时为自身）
         let parent_phys = if leaf == 0 {
             self.pml4
@@ -337,7 +337,7 @@ impl arch::PageTable for X86PageTable {
         // 进程的内核映射）。用户地址空间也不应解映射内核半区，这里一并拒绝。
         let top_idx = index_at(0, levels, v);
         if top_idx >= KERNEL_HALF_START {
-            return Err("cannot unmap kernel-half address from user space");
+            return Err(klib::error::Error::InvalidParam);
         }
         if leaf == levels - 1 && levels >= 3 {
             // 从 PT 的父层（leaf-1）开始，逐级向上；不回收顶层（level 0）

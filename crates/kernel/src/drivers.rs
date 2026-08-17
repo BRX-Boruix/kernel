@@ -60,14 +60,14 @@ impl Driver for SerialUartDriver {
         let lsr = port_for(dev).map(arch_x86_64::port::inb);
         match lsr {
             Some(_) => Ok(()),
-            None => Err("unsupported com port"),
+            None => Err(klib::error::Error::NotFound),
         }
     }
     fn init(&self, dev: &dyn Device) -> DrvResult {
         let base = port_for(dev).unwrap_or(0x3F8);
         // 正式接管输出：注册统一 console 的串口 sink。
         if !klib::console::register_console(&arch_x86_64::serial::SERIAL_CONSOLE) {
-            return Err("console table full");
+            return Err(klib::error::Error::NoSpace);
         }
         info!("[drv] serial-uart init: COM{} base={:#x} (sink registered)", dev.id().device, base);
         Ok(())
@@ -94,14 +94,14 @@ impl Driver for FramebufferDriver {
     fn init(&self, dev: &dyn Device) -> DrvResult {
         let p = FRAMEBUFFER_PTR.load(Ordering::Acquire);
         if p == 0 {
-            return Err("framebuffer not provided by bootloader");
+            return Err(klib::error::Error::NotFound);
         }
         // SAFETY: `register_framebuffer` 写入的是合法 `&limine::Framebuffer` 指针，
         // 生命周期与 bootloader 提供的一致（内核运行期有效）。
         let fb: &limine::Framebuffer = unsafe { &*(p as *const limine::Framebuffer) };
         crate::terminal::init(fb);
         if !klib::console::register_console(&crate::terminal::TERMINAL_CONSOLE) {
-            return Err("console table full");
+            return Err(klib::error::Error::NoSpace);
         }
         info!("[drv] framebuffer init: '{}' (sink registered)", dev.name());
         Ok(())

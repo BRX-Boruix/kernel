@@ -6,6 +6,7 @@ version = 4
 name = "arch"
 version = "0.1.0"
 dependencies = [
+ "klib",
  "spin",
 ]
 

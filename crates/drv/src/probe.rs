@@ -209,7 +209,7 @@ mod tests {
         }
         fn probe(&self, _dev: &dyn Device) -> DrvResult {
             PROBE_FAIL.fetch_add(1, Ordering::SeqCst);
-            Err("hw absent")
+            Err(klib::error::Error::Io)
         }
         fn init(&self, _dev: &dyn Device) -> DrvResult {
             Ok(())
