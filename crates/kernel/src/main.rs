@@ -10,6 +10,8 @@ mod pci;
 mod process;
 mod symbols;
 mod terminal;
+// 自检测试仅在 `kernel-tests` feature 下编译（SDK `build/br --test`）。
+#[cfg(feature = "kernel-tests")]
 mod tests;
 
 use arch::Platform;
@@ -113,6 +115,7 @@ unsafe fn kmain_body() -> ! {
     acpi::init();
 
     // 验证物理页帧分配/释放
+    #[cfg(feature = "kernel-tests")]
     tests::test_frame_alloc();
 
     // 注入页表页分配器/释放器与 HHDM 偏移（虚拟内存层使用）
@@ -136,16 +139,22 @@ unsafe fn kmain_body() -> ! {
         arch_x86_64::hpet::init(hpet_base, hpet_period);
     }
     // 验证虚拟内存页表映射
+    #[cfg(feature = "kernel-tests")]
     tests::test_paging();
     // M1：验证用户地址空间（独立页表 + 用户映射 + 切换）
+    #[cfg(feature = "kernel-tests")]
     tests::test_user_address_space();
     // M1.3：验证按需分页（demand paging：#PF → 补页）
+    #[cfg(feature = "kernel-tests")]
     tests::test_demand_paging();
     // M1.4：验证进程地址空间内部分配器（栈/mmap/brk）
+    #[cfg(feature = "kernel-tests")]
     tests::test_address_space_alloc();
     // M2：验证 CPU 上下文切换（switch_to 交替执行）
+    #[cfg(feature = "kernel-tests")]
     tests::test_context_switch();
     // M3.1：验证进程结构与进程表（PCB + pid 分配/回收）
+    #[cfg(feature = "kernel-tests")]
     tests::test_process_table();
 
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
@@ -170,6 +179,7 @@ unsafe fn kmain_body() -> ! {
     }
 
     // 验证堆分配器（支持释放/重用）
+    #[cfg(feature = "kernel-tests")]
     tests::test_heap();
 
     // 初始化 Local APIC 定时器（Limine 已启用 LAPIC，硬件中断走 APIC）
@@ -178,11 +188,13 @@ unsafe fn kmain_body() -> ! {
     arch_x86_64::interrupts::enable();
 
     // 短暂等待验证时钟中断确实触发
+    #[cfg(feature = "kernel-tests")]
     tests::test_timer();
 
     // T4：验证 CPU 特性探测（CPUID/vendor/brand）与熵池/PRNG（RDRAND/RDSEED）。
     // 不依赖 LAPIC tick（熵源与时钟垫底在 serial init 后已就绪），放在
     // time 测试之前，避免 QEMU/TCG 偶发的 LAPIC 校准偏差阻塞本梯队验收。
+    #[cfg(feature = "kernel-tests")]
     tests::test_cpu_entropy();
 
     // 时钟源已注入：验证单调时钟换算 + 打印 RTC 墙钟（真实年月日时分秒）。
@@ -197,24 +209,29 @@ unsafe fn kmain_body() -> ! {
         klib::time::now_millis()
     );
     // 验证 arch::Timer 抽象（now/sleep/set_timeout），依赖 LAPIC tick 驱动。
+    #[cfg(feature = "kernel-tests")]
     tests::test_time_abstraction();
 
     // T3：验证 HPET 高精度事件定时器（备选时钟源）：计数器推进/周期换算/
     // 单调性/与 LAPIC tick 对齐。HPET 已在 paging::init 后初始化。
+    #[cfg(feature = "kernel-tests")]
     tests::test_hpet();
 
     // T7：验证通用 IRQ 注册/分配（共享中断）：IRQ0 上已有 LAPIC 定时器 handler，
     // 再注册观察者共享同一 IRQ，验证多 handler 分发互不干扰。依赖 tick 运行。
+    #[cfg(feature = "kernel-tests")]
     tests::test_shared_irq();
 
     // T7：验证嵌套控制与优先级：每 IRQ 软件优先级 + 全局嵌套开关，
     // 高优先级可打断低优先级处理、低优先级不能打断高优先级。依赖 tick 运行。
+    #[cfg(feature = "kernel-tests")]
     tests::test_nested_irq_priority();
 
     // M2.5.4：从内核 iretq 进入用户态（Ring 3）执行一段用户代码并返回内核。
     // 依赖中断使能（int 0x80 软中断）与用户段 GDT，故放在定时器验证之后。
     // M3.2/M3.3：通过进程对象 spawn + 进入用户态；用户态异常被"进程终止"处理。
     // （M3.2 的正常 int 0x80 退出流程已单独验证，此处演进为异常上抛场景。）
+    #[cfg(feature = "kernel-tests")]
     tests::test_spawn_user_fault();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
