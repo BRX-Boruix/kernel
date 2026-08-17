@@ -190,6 +190,10 @@ unsafe fn kmain_body() -> ! {
     // 验证 arch::Timer 抽象（now/sleep/set_timeout），依赖 LAPIC tick 驱动。
     tests::test_time_abstraction();
 
+    // T7：验证通用 IRQ 注册/分配（共享中断）：IRQ0 上已有 LAPIC 定时器 handler，
+    // 再注册观察者共享同一 IRQ，验证多 handler 分发互不干扰。依赖 tick 运行。
+    tests::test_shared_irq();
+
     // M2.5.4：从内核 iretq 进入用户态（Ring 3）执行一段用户代码并返回内核。
     // 依赖中断使能（int 0x80 软中断）与用户段 GDT，故放在定时器验证之后。
     // M3.2/M3.3：通过进程对象 spawn + 进入用户态；用户态异常被"进程终止"处理。

@@ -116,7 +116,9 @@ fn end_of_interrupt() {
 }
 
 /// IRQ 处理函数（定时器）：递增 tick、驱动软件定时器队列并 EOI。
-extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
+///
+/// `pub`：供共享中断测试（`tests.rs`）引用以调整注册顺序。
+pub extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
     let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if t <= 5 {
         klib::info!("[lapic] tick");

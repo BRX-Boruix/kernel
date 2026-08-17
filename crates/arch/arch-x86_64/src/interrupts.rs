@@ -289,30 +289,89 @@ pub struct InterruptFrame {
     pub ss: u64,
 }
 
-// ---------- 外部中断处理函数表 ----------
+// ---------- 外部中断处理函数表（共享中断） ----------
 
 /// 外部中断处理函数（IRQ）。返回 `true` 表示已处理。
 pub type IrqHandler = extern "C" fn(u8) -> bool;
 
-/// 外部中断处理函数表（IRQ0~15）。
+/// 每个 IRQ 最多可注册的处理函数数（共享中断）。
+///
+/// 同一 IRQ 线上的多个设备（如两个网卡共享一根 IRQ）各自注册一个 handler，
+/// 分发时依次调用，任一返回 `true` 即视为已处理。4 个槽位对典型 PC 足够。
+pub const MAX_HANDLERS_PER_IRQ: usize = 4;
+
+/// 外部中断处理函数表（IRQ0~15，每 IRQ 多个共享槽位）。
 ///
 /// 采用无锁的原子函数指针表，而非 `spin::Mutex`：因为 `interrupt_dispatch`
 /// 运行于**中断上下文**，若某 IRQ 打断同 CPU 正在持有该锁的代码，非可重入的
-/// 自旋锁会永远自旋 → 死锁。原子表以 `load(Acquire)` 读、`store(Release)` 写，
-/// 处理函数均为 `'static` 且只在中断使能前注册一次，故安全无锁。
+/// 自旋锁会永远自旋 → 死锁。原子表以 `load(Acquire)` 读、`compare_exchange`
+/// 写，处理函数均为 `'static` 且只在中断使能前注册，故安全无锁。
 ///
-/// 取值为 0 表示未注册；合法函数地址不可能为 0，因此可兼作“空”标记。
-static IRQ_HANDLERS: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+/// 取值为 0 表示空槽；合法函数地址不可能为 0，因此可兼作"空"标记。
+static IRQ_HANDLERS: [[AtomicUsize; MAX_HANDLERS_PER_IRQ]; 16] =
+    [const { [const { AtomicUsize::new(0) }; MAX_HANDLERS_PER_IRQ] }; 16];
 
-/// 注册外部中断（IRQ0~15）的处理函数。
+/// 注册外部中断（IRQ0~15）的处理函数（支持共享：同一 IRQ 可注册多个）。
 ///
-/// 处理函数须为 `'static`（当前为 `extern "C"` 静态函数），且永不注销，
-/// 以保证中断上下文无锁读取时指针始终有效。
-pub fn register_irq(irq: u8, handler: IrqHandler) {
-    if irq < 16 {
-        let ptr = handler as usize; // x86_64 下函数指针与 usize 等宽
-        IRQ_HANDLERS[irq as usize].store(ptr, Ordering::Release);
+/// - 处理函数须为 `'static`（当前为 `extern "C"` 静态函数），且永不注销，
+///   以保证中断上下文无锁读取时指针始终有效；
+/// - 重复注册同一 handler 返回 `false`（幂等，不产生重复分发）；
+/// - 该 IRQ 槽位已满返回 `false`。
+///
+/// 返回 `true` 表示注册成功。
+pub fn register_irq(irq: u8, handler: IrqHandler) -> bool {
+    if irq >= 16 {
+        return false;
     }
+    let slot = &IRQ_HANDLERS[irq as usize];
+    let ptr = handler as usize; // x86_64 下函数指针与 usize 等宽
+    for entry in slot {
+        let cur = entry.load(Ordering::Acquire);
+        if cur == ptr {
+            return false; // 已注册，去重
+        }
+        if cur == 0 {
+            // 竞争写入：仅当槽仍为空时占位。
+            if entry
+                .compare_exchange(0, ptr, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+            // 竞争失败：换下一个槽重试。
+        }
+    }
+    false // 槽满
+}
+
+/// 注销外部中断处理函数（共享中断下移除一个 handler）。
+///
+/// 返回 `true` 表示确实存在并已移除。中断上下文中该 handler 可能正在执行，
+/// 调用方须保证注销后不再依赖它（当前无动态卸载场景，仅供完整性提供）。
+pub fn unregister_irq(irq: u8, handler: IrqHandler) -> bool {
+    if irq >= 16 {
+        return false;
+    }
+    let slot = &IRQ_HANDLERS[irq as usize];
+    let ptr = handler as usize;
+    for entry in slot {
+        if entry.load(Ordering::Acquire) == ptr {
+            entry.store(0, Ordering::Release);
+            return true;
+        }
+    }
+    false
+}
+
+/// 查询某 IRQ 已注册的 handler 数。
+pub fn irq_handler_count(irq: u8) -> usize {
+    if irq >= 16 {
+        return 0;
+    }
+    IRQ_HANDLERS[irq as usize]
+        .iter()
+        .filter(|e| e.load(Ordering::Relaxed) != 0)
+        .count()
 }
 
 /// 页错误（#PF, 14 号异常）回调。
@@ -413,18 +472,25 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         klib::info!("========== UNHANDLED SOFT INTERRUPT (0x80) ==========");
         crate::halt_forever();
     } else {
-        // 外部中断（32..47 → IRQ0..15）
+        // 外部中断（32..47 → IRQ0..15）。共享中断：依次调用该 IRQ 的全部
+        // handler，任一返回 `true` 即视为已处理并停止；全部未处理则 EOI。
         let irq = (vector - 32) as u8;
-        let handler_ptr = IRQ_HANDLERS[irq as usize].load(Ordering::Acquire);
-        let handled = if handler_ptr == 0 {
-            false
-        } else {
+        let slot = &IRQ_HANDLERS[irq as usize];
+        let mut handled = false;
+        for entry in slot {
+            let handler_ptr = entry.load(Ordering::Acquire);
+            if handler_ptr == 0 {
+                continue;
+            }
             // 指针来自 register_irq 写入的合法 'static 函数地址，读回安全。
             let h = unsafe { core::mem::transmute::<usize, IrqHandler>(handler_ptr) };
-            h(irq)
-        };
+            if h(irq) {
+                handled = true;
+                break;
+            }
+        }
         if !handled {
-            // 未注册的 IRQ：直接 EOI
+            // 无 handler 或全部未处理：直接 EOI
             crate::pic::end_of_interrupt(irq);
         }
     }
