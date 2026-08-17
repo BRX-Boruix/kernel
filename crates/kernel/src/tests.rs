@@ -935,6 +935,91 @@ pub fn test_process_table() {
     info!("[test-process] PASS");
 }
 
+/// M5：写时复制（COW）地址空间派生。
+///
+/// 验证点（纯内存逻辑，不进入用户态）：
+/// 1. 父映射一可写数据页并预填内容；
+/// 2. `clone_cow` 派生子地址空间：子与父**共享同一物理帧**，双方页只读，
+///    引用计数 1→2；
+/// 3. 子写触发 COW（模拟 #PF 写故障 → `handle_page_fault`）：分配新帧拷贝内容、
+///    子页独立可写，父帧引用计数回到 1、内容不变（父子隔离）；
+/// 4. 父写触发父侧 COW：父子物理帧完全分离。
+#[cfg(feature = "kernel-test-m5")]
+pub fn test_cow_clone() {
+    use mm::user_space::UserAddressSpace;
+    info!("[cow-test] === M5: copy-on-write address space clone ===");
+
+    const DATA: u64 = 0x0000_0000_1000_0000; // 用户数据页（页对齐）
+    let mut parent = UserAddressSpace::<X86PageTable>::new().expect("parent space");
+
+    // 1. 父映射一可写数据页并预填内容。
+    let data_frame = mm::allocate_frame().expect("data frame").start_paddr();
+    unsafe { core::ptr::write_volatile(arch::phys_to_virt(data_frame) as *mut u64, 0xDEAD_BEEFu64) };
+    parent
+        .map_user(
+            VirtAddr::new(DATA),
+            VirtAddr::new(DATA + 0x1000),
+            PageSize::Size4K,
+            PageFlags::empty().writable().user(),
+            &[data_frame],
+        )
+        .expect("map parent data");
+    info!(
+        "[cow-test] parent data phys={:#x} value={:#x}",
+        data_frame,
+        unsafe { core::ptr::read_volatile(arch::phys_to_virt(data_frame) as *const u64) }
+    );
+
+    // 2. clone_cow：子共享同一物理帧，双方页只读，引用计数 1→2。
+    let mut child = parent.clone_cow().expect("clone cow");
+    let child_phys = child.translate(VirtAddr::new(DATA)).expect("child translate").as_u64();
+    assert_eq!(child_phys, data_frame, "child initially shares parent frame");
+    assert_eq!(mm::frame_refcount(data_frame), 2, "shared frame refcount=2");
+    info!(
+        "[cow-test] after clone: parent={:#x} child={:#x} refcount={}",
+        data_frame,
+        child_phys,
+        mm::frame_refcount(data_frame)
+    );
+
+    // 3. 子写触发 COW：模拟 #PF 写故障（error_code bit1=W）→ handle_page_fault 复制。
+    let handled = child.handle_page_fault(DATA, 0b10);
+    assert!(handled, "child write fault handled by COW");
+    let child_new = child.translate(VirtAddr::new(DATA)).expect("child after cow translate").as_u64();
+    assert_ne!(child_new, data_frame, "child page copied to new frame");
+    assert_eq!(
+        unsafe { core::ptr::read_volatile(arch::phys_to_virt(child_new) as *const u64) },
+        0xDEAD_BEEFu64,
+        "copied content preserved"
+    );
+    // 子私有写不影响父。
+    unsafe { core::ptr::write_volatile(arch::phys_to_virt(child_new) as *mut u64, 0xCAFEu64) };
+    assert_eq!(
+        unsafe { core::ptr::read_volatile(arch::phys_to_virt(data_frame) as *const u64) },
+        0xDEAD_BEEFu64,
+        "parent unchanged after child write"
+    );
+    assert_eq!(mm::frame_refcount(data_frame), 1, "parent frame refcount back to 1");
+    info!(
+        "[cow-test] child copied to phys={:#x} value={:#x}; parent still={:#x}",
+        child_new,
+        unsafe { core::ptr::read_volatile(arch::phys_to_virt(child_new) as *const u64) },
+        unsafe { core::ptr::read_volatile(arch::phys_to_virt(data_frame) as *const u64) }
+    );
+
+    // 4. 父写触发父侧 COW（父页也变只读）：父子物理帧完全分离。
+    let handled_p = parent.handle_page_fault(DATA, 0b10);
+    assert!(handled_p, "parent write fault handled by COW");
+    let parent_new = parent.translate(VirtAddr::new(DATA)).expect("parent after cow translate").as_u64();
+    assert_ne!(parent_new, child_new, "parent and child pages fully separated");
+
+    info!(
+        "[cow-test] final: parent={:#x} child={:#x} (fully separated)",
+        parent_new, child_new
+    );
+    info!("[cow-test] PASS");
+}
+
 /// 触发异常的用户态机器码：`mov rax, MAGIC` → `mov [MAGIC_ADDR], rax` → `ud2`。
 ///
 /// `ud2`（0F 0B）是非法指令，用户态执行触发 #UD（vector 6）——用于 M3.3 验证

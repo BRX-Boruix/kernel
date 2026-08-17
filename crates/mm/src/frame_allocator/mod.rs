@@ -5,6 +5,7 @@ mod compact;
 mod init;
 mod percpu;
 mod percpu_cache;
+mod refcount;
 mod reserve;
 mod stats;
 
@@ -19,6 +20,7 @@ use percpu_cache::{FreeListTable, PerCpuCache, PerCpuCacheSet};
 
 pub use allocator_core::{ORDER_1G, ORDER_2M};
 pub use compact::compact_now;
+pub use refcount::{count as frame_refcount, decref as frame_decref, incref as frame_incref};
 pub use stats::reset_stats as reset_frame_stats;
 pub use stats::{frag_stats, reset_stats, stats, FrameAllocatorStats, PmmFragStats};
 
@@ -100,10 +102,21 @@ pub fn allocate_frame() -> Option<PhysFrame> {
 
 /// Allocate physical frames with specific order
 pub fn allocate_frames(order: usize) -> Option<PhysFrame> {
-    ALLOCATOR.allocate(order)
+    let f = ALLOCATOR.allocate(order)?;
+    // 登记该块内每帧的引用计数为 1（COW 共享会在此基础上 incref）。
+    // 仅登记 4K 帧粒度；块内未单独释放的残留登记由下次 init 覆盖，无碍。
+    let n = 1usize << order;
+    for i in 0..n {
+        refcount::init(f.start_paddr() + (i * 4096) as u64);
+    }
+    Some(f)
 }
 
 /// Deallocate a physical frame
+///
+/// 先递减引用计数；仅当引用降到 0 才真正归还物理帧分配器（COW 安全）。
 pub fn deallocate_frame(frame: PhysFrame) {
-    ALLOCATOR.deallocate(frame);
+    if refcount::decref(frame.start_paddr()) {
+        ALLOCATOR.deallocate(frame);
+    }
 }

@@ -55,6 +55,21 @@ pub struct UserArea {
     pub demand_paging: bool,
 }
 
+/// 写时复制（COW）共享页记账：一个已映射但被多个地址空间共享、只读的叶页。
+///
+/// `clone_cow` 把父用户区叶帧共享给子地址空间时记录在此；任一方对该页写入
+/// 触发 #PF，`handle_page_fault` 据此分配新帧复制内容、改回可写独立映射，
+/// 并从记账移除（该页此后归本地址空间私有）。
+#[derive(Clone, Copy)]
+pub struct CowPage {
+    /// 虚拟地址（页对齐）。
+    pub vaddr: u64,
+    /// 当前共享的物理帧地址。
+    pub phys: u64,
+    /// 该页完整权限（含可写位，COW 复制后恢复）。
+    pub flags: PageFlags,
+}
+
 /// 用户地址空间：持有独立页表 `PT`，管理用户区。
 pub struct UserAddressSpace<PT: PageTable> {
     /// 独立页表（继承内核映射 + 独立用户区）。
@@ -65,6 +80,8 @@ pub struct UserAddressSpace<PT: PageTable> {
     next_mmap: u64,
     /// 当前堆断点（`brk` 管理；初始为 `USER_HEAP_BASE`）。
     heap_break: u64,
+    /// 写时复制共享页记账（M5 COW）。
+    cow_pages: spin::Mutex<Vec<CowPage>>,
 }
 
 impl<PT> UserAddressSpace<PT>
@@ -81,6 +98,7 @@ where
             // mmap hint 从堆区上方的低地址开始增长（避开栈/堆的固定区）
             next_mmap: USER_HEAP_BASE + 16 * 1024 * 1024,
             heap_break: USER_HEAP_BASE,
+            cow_pages: spin::Mutex::new(Vec::new()),
         })
     }
 
@@ -190,6 +208,15 @@ where
     ///
     /// 非法访问（未预留 / 越界 / 越权）返回 `false`，由上层终止进程。
     pub fn handle_page_fault(&mut self, vaddr: u64, error_code: u64) -> bool {
+        // COW 写故障（优先于按需分页）：命中共享页记账且本次为写访问 → 写时复制。
+        if error_code & 0b10 != 0 {
+            let hit = self.cow_pages.lock().iter().position(|c| {
+                vaddr >= c.vaddr && vaddr < c.vaddr + 0x1000
+            });
+            if let Some(idx) = hit {
+                return self.cow_fault(idx);
+            }
+        }
         let areas = self.areas.lock();
         let Some(idx) = areas.iter().position(|a| {
             a.demand_paging
@@ -232,6 +259,105 @@ where
         }
         drop(areas);
         true
+    }
+
+    /// 写时复制（COW）页：把当前共享页复制为私有可写页（供 #PF 写故障调用）。
+    ///
+    /// 流程：先 `unmap` 清掉当前 PTE 并 flush TLB（COW 改映射必须 flush，否则 TLB
+    /// 残留"只读→旧帧"条目导致重试仍 #PF、反复复制泄漏）→ 分配新帧并拷贝旧帧
+    /// 内容 → 按完整权限（含可写位）重映射为独立页 → 释放对旧共享帧的引用
+    /// （refcount 决定是否真正归还，因父子可能仍共享）→ 从 COW 记账移除本页。
+    fn cow_fault(&mut self, idx: usize) -> bool {
+        let cow = self.cow_pages.lock()[idx];
+        let vaddr = VirtAddr::new(cow.vaddr);
+        // unmap 清 PTE + flush TLB，返回当前共享物理帧。
+        let old_phys = match self.pt.unmap(vaddr) {
+            Ok(p) => p.as_u64(),
+            Err(_) => return false,
+        };
+        // 分配新帧并拷贝旧帧内容。
+        let Some(frame) = allocate_frame() else {
+            // 物理内存耗尽：恢复原只读共享映射。
+            let _ = self.pt.map(vaddr, PhysAddr::new(old_phys), PageSize::Size4K, cow.flags);
+            return false;
+        };
+        let new_phys = frame.start_paddr();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                phys_to_virt(old_phys) as *const u8,
+                phys_to_virt(new_phys) as *mut u8,
+                4096,
+            );
+        }
+        // 按完整权限（含可写）重映射为独立页。
+        if self.pt
+            .map(vaddr, PhysAddr::new(new_phys), PageSize::Size4K, cow.flags)
+            .is_err()
+        {
+            // 罕见：映射失败，归还新帧，恢复原共享映射。
+            deallocate_frame(frame);
+            let _ = self.pt.map(vaddr, PhysAddr::new(old_phys), PageSize::Size4K, cow.flags);
+            return false;
+        }
+        // 释放对旧共享帧的引用（可能仍有其它地址空间引用，由 refcount 决定是否归还）。
+        deallocate_frame(PhysFrame::from_paddr_raw(old_phys));
+        // 本页此后归本地址空间私有，移出 COW 记账。
+        self.cow_pages.lock().remove(idx);
+        true
+    }
+
+    /// 写时复制（COW）派生一个**共享用户区**的子地址空间（M5）。
+    ///
+    /// 这是 ADR-003 纯 `spawn` 的补充能力：当需要"从父地址空间派生新进程用户区"
+    /// 时，不做深拷贝（不复制每个物理帧），而是**浅拷贝页表、共享同一批物理
+    /// 数据帧**并把双方对应 PTE 改为只读、记录 COW 记账。任一方后续写某页会
+    /// 触发 #PF → [`cow_fault`] 按需复制该页，从而规避"复制父地址空间"的开销
+    /// （ADR-003 路线下纯 spawn 本就深拷贝/独立建，COW 提供高效共享变体）。
+    ///
+    /// - 父、子各自持有**独立页表树**（中间页表页私有，unmap 互不干扰）；
+    /// - 仅 **4KB 叶数据帧**被共享，引用计数在 [`crate::frame_allocator`] 统一管理，
+    ///   保证任一方解映射不会令另一方悬空；
+    /// - 调用后父进程对应用户页变为只读（后续写由父侧 COW 复制）。
+    pub fn clone_cow(&mut self) -> Result<UserAddressSpace<PT>, PT::Error> {
+        // 1. 收集父所有已映射用户叶页 (vaddr, phys, 完整 flags)。
+        let mut shares: Vec<(u64, u64, PageFlags)> = Vec::new();
+        {
+            let areas = self.areas.lock();
+            for a in areas.iter() {
+                let page = a.size.bytes();
+                let mut v = a.start.as_u64();
+                while v < a.end.as_u64() {
+                    if let Some(phys) = self.pt.translate(VirtAddr::new(v)) {
+                        shares.push((v, phys.as_u64(), a.flags));
+                    }
+                    v += page;
+                }
+            }
+        }
+        // 2. 新建子地址空间（继承内核半区，用户区空），复制布局状态。
+        let mut child = UserAddressSpace::<PT>::new()?;
+        child.next_mmap = self.next_mmap;
+        child.heap_break = self.heap_break;
+        *child.areas.lock() = self.areas.lock().clone();
+        // 3. 逐页 COW：父改只读 + 子映射共享帧只读 + 共享帧 incref + 双方记账。
+        let mut child_cow = Vec::new();
+        for (v, phys, flags) in shares {
+            let ro = readonly_flags(flags);
+            // 父 PTE 改只读（unmap 清 TLB + 重建只读，保留共享物理帧）。
+            if self.pt.unmap(VirtAddr::new(v)).is_err() {
+                continue;
+            }
+            self.pt.map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)?;
+            // 子映射共享帧只读。
+            child.pt.map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)?;
+            // 共享帧引用计数 +1（父 + 子各持一份引用）。
+            crate::frame_allocator::frame_incref(phys);
+            let cow = CowPage { vaddr: v, phys, flags };
+            self.cow_pages.lock().push(cow);
+            child_cow.push(cow);
+        }
+        *child.cow_pages.lock() = child_cow;
+        Ok(child)
     }
 
     /// 释放某个按需分页区域已映射的物理页（供进程退出/区域删除时回收）。
@@ -446,6 +572,21 @@ where
 /// 向上对齐到页（4KB）。
 fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
+}
+
+/// 构造只读页标志：保留 user / executable，清除 writable（COW 共享页用）。
+///
+/// `PageFlags` 字段私有、无 `from_bits`，故用公开构造器逐位还原除 writable 外
+/// 的语义位（bit2 user、bit63 executable）。
+fn readonly_flags(flags: PageFlags) -> PageFlags {
+    let mut f = PageFlags::empty();
+    if flags.bits() & (1 << 2) != 0 {
+        f = f.user();
+    }
+    if flags.bits() & (1 << 63) != 0 {
+        f = f.executable();
+    }
+    f
 }
 
 // ---- 全局"当前用户地址空间"（M1.3 按需分页的 #PF 入口）----

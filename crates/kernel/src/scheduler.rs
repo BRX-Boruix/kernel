@@ -17,6 +17,7 @@
 //! - **首次运行**：进程 `spawn` 时构造"初始帧"（`initial_frame`），故首次调度也走
 //!   "从 saved 恢复"，调度逻辑统一；内核 idle 主循环 [`start`] 经 `enter_usermode`
 //!   进入第一个就绪进程。
+#![allow(dead_code)]
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;

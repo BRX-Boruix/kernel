@@ -266,6 +266,11 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-test-m44")]
     tests::test_userspace_elf();
 
+    // M5 写时复制（COW）：`clone_cow` 派生共享用户区的子地址空间（纯内存
+    // 逻辑验收，不进入用户态、不依赖 tick，返回主流程继续启动）。单独 gate。
+    #[cfg(feature = "kernel-test-m5")]
+    tests::test_cow_clone();
+
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。
     mm::frame_allocator::set_cpu_id_reader(|| {
