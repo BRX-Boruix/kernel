@@ -79,6 +79,9 @@ unsafe fn kmain_body() -> ! {
         panic_cpu_id,
         terminal::write_str as fn(&str),
     );
+    // 显示前置要素（堆分配器 + Limine framebuffer + 驱动框架）均已就绪：
+    // 立即启动 framebuffer 终端，比任何 test 都靠前，方便屏幕实时看日志。
+    init_display();
     // T5/T6：初始化设备/驱动框架（ADR-008）：注册串口设备 + 驱动并探测。
     // 串口驱动 `init` 在此完成统一 console 串口 sink 的注册（不再手动接线），
     // 此后所有内核日志先汇聚到 console 再转发。
@@ -156,27 +159,6 @@ unsafe fn kmain_body() -> ! {
     // M3.1：验证进程结构与进程表（PCB + pid 分配/回收）
     #[cfg(feature = "kernel-tests")]
     tests::test_process_table();
-
-    // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
-    if let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() {
-        info!("[kmain] framebuffer response received");
-        if let Some(fb) = resp.framebuffers().first() {
-            let fb = &**fb; // NonNullPtr<Framebuffer> -> Framebuffer
-            info!(
-                "[kmain] framebuffer {}x{} pitch={} bpp={}",
-                fb.width, fb.height, fb.pitch, fb.bpp
-            );
-            // T6：把 framebuffer 登记为框架设备并绑定 framebuffer 驱动；
-            // 驱动 init 在此完成 flanterm 终端初始化与屏幕 sink 注册
-            // （不再手动接线）。
-            drivers::register_framebuffer(fb);
-            info!("[kmain] terminal init returned");
-        } else {
-            error!("[kmain] no framebuffer");
-        }
-    } else {
-        error!("[kmain] no framebuffer response");
-    }
 
     // 验证堆分配器（支持释放/重用）
     #[cfg(feature = "kernel-tests")]
@@ -256,8 +238,46 @@ unsafe fn kmain_body() -> ! {
     let online = arch_x86_64::smp::wait_all_online(total, 2_000);
     info!("[kmain] SMP done, {} cpus online (target {})", online, total);
 
+    // 内核全部组件加载完成（测试若开启也已全部通过）：打印版本横幅。
+    info!("============================================================");
+    info!("BORUIX KERNEL v.{}", env!("CARGO_PKG_VERSION"));
+    info!("Git Commit: {}", env!("BORUIX_GIT_COMMIT"));
+    info!("Build Timestamp: {}", env!("BORUIX_BUILD_TIMESTAMP"));
+    info!("============================================================");
+
     info!("[kmain] reached idle loop");
     CurrentArch::halt();
+}
+
+/// 尽早启动 framebuffer 终端显示（显示前置要素就绪后立即调用，早于一切测试）。
+///
+/// 前置要素（均已在调用前完成）：
+/// - `klib::allocator::init()`：flanterm 上下文需要堆分配；
+/// - Limine framebuffer 请求：bootloader 已将 framebuffer 映射进页表，可直接写；
+/// - 驱动框架（`drv` 静态注册表）：无需额外初始化；
+/// - `panic::set_panic_output`：早期 panic 的屏幕输出已接线。
+///
+/// 成功初始化后，屏幕 sink 注册进 console，后续所有内核日志同时输出到串口与屏幕。
+fn init_display() {
+    // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
+    let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() else {
+        error!("[display] no framebuffer response");
+        return;
+    };
+    info!("[display] framebuffer response received");
+    let Some(fb) = resp.framebuffers().first() else {
+        error!("[display] no framebuffer");
+        return;
+    };
+    let fb = &**fb; // NonNullPtr<Framebuffer> -> Framebuffer
+    info!(
+        "[display] framebuffer {}x{} pitch={} bpp={}",
+        fb.width, fb.height, fb.pitch, fb.bpp
+    );
+    // T6：把 framebuffer 登记为框架设备并绑定 framebuffer 驱动；
+    // 驱动 init 在此完成 flanterm 终端初始化与屏幕 sink 注册（不再手动接线）。
+    drivers::register_framebuffer(fb);
+    info!("[display] terminal init returned");
 }
 
 /// panic 时的 CPU id 读取器：LAPIC 已映射才读，否则返回 0（早期未就绪安全）。
