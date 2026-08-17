@@ -6,7 +6,7 @@
 //! - 支持注册外部中断处理函数（当前提供定时器 PIT 的中断）。
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 /// 内核代码段选择子（加载 IDT 描述符时使用）。
 use crate::gdt::{IST_DF, KCODE};
@@ -374,6 +374,81 @@ pub fn irq_handler_count(irq: u8) -> usize {
         .count()
 }
 
+// ---------- 嵌套控制与优先级（T7） ----------
+
+/// IRQ 优先级范围：0（最低）~ 15（最高）。
+pub const IRQ_PRIO_MIN: u8 = 0;
+pub const IRQ_PRIO_MAX: u8 = 15;
+/// 不在任何中断上下文时 `current_irq_priority()` 的返回值。
+pub const IRQ_PRIO_NONE: u8 = 0xFF;
+
+/// 每 IRQ 的软件优先级（默认 0 最低）。
+///
+/// 优先级决定嵌套关系：嵌套开启时，**更高优先级**的中断可以打断当前正在
+/// 处理的中断；同优先级或更低优先级不可。中断上下文外读取安全（原子）。
+static IRQ_PRIORITIES: [AtomicU8; 16] = [const { AtomicU8::new(IRQ_PRIO_MIN) }; 16];
+
+/// 全局嵌套开关。默认关闭（与历史行为一致：中断门已自动关中断，处理期间
+/// 不可被打断）；开启后高优先级中断可打断低优先级处理。
+static NESTED_IRQ: AtomicBool = AtomicBool::new(false);
+
+/// 当前正在处理的中断优先级（`IRQ_PRIO_NONE` = 不在中断上下文）。
+///
+/// 进入外部中断分发时原子替换为自身优先级，返回前恢复旧值。仅软件语义，
+/// 用于嵌套判断（`prio > prev`）；单核下无需 per-CPU 数组。
+static CURRENT_IRQ_PRIO: AtomicU8 = AtomicU8::new(IRQ_PRIO_NONE);
+
+/// 设置某 IRQ 的优先级（0~15）。越界返回 `false`。
+pub fn set_irq_priority(irq: u8, prio: u8) -> bool {
+    if irq >= 16 || prio > IRQ_PRIO_MAX {
+        return false;
+    }
+    IRQ_PRIORITIES[irq as usize].store(prio, Ordering::Relaxed);
+    true
+}
+
+/// 查询某 IRQ 的优先级。越界返回 `IRQ_PRIO_MIN`。
+pub fn irq_priority(irq: u8) -> u8 {
+    if irq >= 16 {
+        return IRQ_PRIO_MIN;
+    }
+    IRQ_PRIORITIES[irq as usize].load(Ordering::Relaxed)
+}
+
+/// 开启/关闭中断嵌套（默认关闭）。
+///
+/// 开启后，外部中断分发时若自身优先级高于当前处理中的中断优先级，会临时
+/// 使能中断（`sti`）允许更高优先级打断，返回前恢复。优先级抑制仍然生效：
+/// 更低/同级优先级的中断即使硬件到达，也不会在当前处理中嵌套（进入时中断
+/// 门保持关中断）。
+pub fn set_nested_irq(enabled: bool) {
+    NESTED_IRQ.store(enabled, Ordering::Relaxed);
+}
+
+/// 当前嵌套开关状态。
+pub fn nested_irq_enabled() -> bool {
+    NESTED_IRQ.load(Ordering::Relaxed)
+}
+
+/// 当前正在处理的中断优先级；不在中断上下文返回 `IRQ_PRIO_NONE`（0xFF）。
+pub fn current_irq_priority() -> u8 {
+    CURRENT_IRQ_PRIO.load(Ordering::Relaxed)
+}
+
+/// 当前中断是否使能（读 RFLAGS.IF）。
+pub fn interrupts_enabled() -> bool {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            out(reg) flags,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    flags & (1 << 9) != 0
+}
+
 /// 页错误（#PF, 14 号异常）回调。
 ///
 /// 参数为 (CR2 线性地址, 错误码)。返回 `true` 表示已处理（如按需补页后），
@@ -474,7 +549,21 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
     } else {
         // 外部中断（32..47 → IRQ0..15）。共享中断：依次调用该 IRQ 的全部
         // handler，任一返回 `true` 即视为已处理并停止；全部未处理则 EOI。
+        //
+        // 嵌套与优先级（T7）：每 IRQ 一个软件优先级（0 最低 ~ 15 最高）。
+        // - 嵌套关闭（默认）：中断门已自动关中断，处理期间不可被打断；
+        // - 嵌套开启：若本 IRQ 优先级高于"当前正在处理的中断"优先级，则
+        //   临时 `sti` 允许更高优先级中断打断（返回前 `cli` 并恢复状态）。
+        //   否则保持关中断——更低/同级优先级的中断无法打断当前处理。
+        // `CURRENT_IRQ_PRIO` 进入时原子替换、返回前恢复，供嵌套判断与
+        // handler 内查询（`current_irq_priority`）。
         let irq = (vector - 32) as u8;
+        let prio = irq_priority(irq);
+        let prev = CURRENT_IRQ_PRIO.swap(prio, Ordering::Relaxed);
+        let nested = NESTED_IRQ.load(Ordering::Relaxed) && prio > prev;
+        if nested {
+            enable();
+        }
         let slot = &IRQ_HANDLERS[irq as usize];
         let mut handled = false;
         for entry in slot {
@@ -489,6 +578,10 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
                 break;
             }
         }
+        if nested {
+            disable();
+        }
+        CURRENT_IRQ_PRIO.store(prev, Ordering::Relaxed);
         if !handled {
             // 无 handler 或全部未处理：直接 EOI
             crate::pic::end_of_interrupt(irq);

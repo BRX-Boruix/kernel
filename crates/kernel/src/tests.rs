@@ -922,3 +922,160 @@ pub fn test_shared_irq() {
 
     info!("[irq] shared IRQ tests PASS");
 }
+
+// ---- T7：嵌套控制与优先级 ----
+
+/// IRQ1（prio=12）探针：记录进入时的 IF 与当前优先级，再触发 IRQ2（prio=1，更低）。
+static NEST_IRQ1_IF: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static NEST_IRQ1_PRIO: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+extern "C" fn nested_probe_irq1(_irq: u8) -> bool {
+    use arch_x86_64::interrupts::{current_irq_priority, interrupts_enabled};
+    NEST_IRQ1_IF.store(
+        interrupts_enabled(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    NEST_IRQ1_PRIO.store(current_irq_priority(), core::sync::atomic::Ordering::Relaxed);
+    // 处理中再触发 IRQ2（prio=1 < IRQ1 的 12）：应不能打断（IF 保持关）。
+    unsafe { core::arch::asm!("int $0x22"); }
+    true // 认领，避免对 LAPIC in-service 误 EOI
+}
+
+/// IRQ2（prio=1）探针：记录进入时的 IF 与当前优先级。
+static NEST_IRQ2_IF: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static NEST_IRQ2_PRIO: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+extern "C" fn nested_probe_irq2(_irq: u8) -> bool {
+    use arch_x86_64::interrupts::{current_irq_priority, interrupts_enabled};
+    NEST_IRQ2_IF.store(
+        interrupts_enabled(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    NEST_IRQ2_PRIO.store(current_irq_priority(), core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// IRQ0 观察者：LAPIC tick 分发时触发 IRQ1（int 0x21），驱动嵌套链。
+extern "C" fn nested_trigger(_irq: u8) -> bool {
+    unsafe { core::arch::asm!("int $0x21"); }
+    false // 不认领，LAPIC handler 继续
+}
+
+/// T7：验证嵌套控制与优先级。
+///
+/// 验证方法（利用 `int` 指令从内核态直接触发向量，模拟第二/第三中断源）：
+/// - IRQ0（LAPIC tick）prio=3，IRQ1 prio=12，IRQ2 prio=1；
+/// - 观察者（IRQ0 slot 0）每次 tick 触发 `int 0x21` → IRQ1 探针；
+///   IRQ1 探针内触发 `int 0x22` → IRQ2 探针；
+/// - 嵌套关闭：IRQ1 探针内 IF=0（不打断）；
+/// - 嵌套开启：IRQ1（更高优先级）打断 IRQ0 → IF=1；IRQ2（更低优先级）
+///   在 IRQ1 处理中不能打断 → IF=0。
+pub fn test_nested_irq_priority() {
+    use core::sync::atomic::Ordering;
+    use arch_x86_64::interrupts::{
+        irq_handler_count, irq_priority, nested_irq_enabled, register_irq, set_irq_priority,
+        set_nested_irq, unregister_irq, IRQ_PRIO_MAX, IRQ_PRIO_NONE,
+    };
+
+    info!("[irq] === T7: nested IRQ & priority ===");
+
+    // 0. 初始状态：嵌套默认关闭，非中断上下文优先级为 NONE。
+    assert!(!nested_irq_enabled(), "nested off by default");
+    assert_eq!(
+        arch_x86_64::interrupts::current_irq_priority(),
+        IRQ_PRIO_NONE,
+        "not in interrupt context"
+    );
+
+    // 1. API：设置/查询/越界拒绝。
+    assert!(set_irq_priority(0, 3));
+    assert!(set_irq_priority(1, 12));
+    assert!(set_irq_priority(2, 1));
+    assert_eq!(irq_priority(0), 3);
+    assert_eq!(irq_priority(1), 12);
+    assert_eq!(irq_priority(2), 1);
+    assert!(!set_irq_priority(16, 5), "irq out of range");
+    assert!(!set_irq_priority(0, IRQ_PRIO_MAX + 1), "prio out of range");
+
+    // 2. 共享表安排：观察者进 IRQ0 slot 0（先于 LAPIC），探针进 IRQ1/IRQ2。
+    assert!(unregister_irq(0, arch_x86_64::lapic::lapic_timer_handler));
+    assert!(register_irq(0, nested_trigger));
+    assert!(register_irq(0, arch_x86_64::lapic::lapic_timer_handler));
+    assert!(register_irq(1, nested_probe_irq1));
+    assert!(register_irq(2, nested_probe_irq2));
+
+    // 等若干 tick 驱动一轮（重置记录后由 LAPIC tick 触发观察者链）。
+    let wait_one = |label: &str| {
+        NEST_IRQ1_IF.store(false, Ordering::Relaxed);
+        NEST_IRQ2_IF.store(false, Ordering::Relaxed);
+        NEST_IRQ1_PRIO.store(0, Ordering::Relaxed);
+        NEST_IRQ2_PRIO.store(0, Ordering::Relaxed);
+        let t0 = arch_x86_64::lapic::ticks();
+        let mut rounds = 0u32;
+        while arch_x86_64::lapic::ticks().wrapping_sub(t0) < 3 {
+            arch_x86_64::interrupts::enable();
+            arch_x86_64::interrupts::halt();
+            rounds += 1;
+            if rounds > 500 {
+                info!("[irq] {}: WARNING no ticks", label);
+                return;
+            }
+        }
+        info!("[irq] {}: done", label);
+    };
+
+    // 3. 嵌套关闭：更高优先级（IRQ1=12 > IRQ0=3）到达也不打断（IF=0），
+    //    但分发仍发生，优先级记录正确。
+    wait_one("nested=off");
+    assert!(
+        !NEST_IRQ1_IF.load(Ordering::Relaxed),
+        "nested off: IRQ1 should NOT preempt (IF=0)"
+    );
+    assert_eq!(NEST_IRQ1_PRIO.load(Ordering::Relaxed), 12, "IRQ1 prio recorded");
+    assert_eq!(NEST_IRQ2_PRIO.load(Ordering::Relaxed), 1, "IRQ2 prio recorded");
+
+    // 4. 嵌套开启：高优先级（IRQ1=12）打断 IRQ0 处理（IF=1）；更低优先级
+    //    （IRQ2=1）在 IRQ1 处理中不能打断（IF=0）。
+    set_nested_irq(true);
+    assert!(nested_irq_enabled());
+    wait_one("nested=on");
+    assert!(
+        NEST_IRQ1_IF.load(Ordering::Relaxed),
+        "nested on: higher prio preempts (IF=1)"
+    );
+    assert_eq!(
+        NEST_IRQ1_PRIO.load(Ordering::Relaxed),
+        12,
+        "IRQ1 prio during preempt"
+    );
+    assert!(
+        !NEST_IRQ2_IF.load(Ordering::Relaxed),
+        "lower prio cannot preempt (IF=0)"
+    );
+    assert_eq!(
+        NEST_IRQ2_PRIO.load(Ordering::Relaxed),
+        1,
+        "IRQ2 prio stays low"
+    );
+
+    // 5. 清理：关嵌套、恢复优先级、注销探针、IRQ0 恢复单 handler。
+    set_nested_irq(false);
+    set_irq_priority(0, 0);
+    set_irq_priority(1, 0);
+    set_irq_priority(2, 0);
+    assert!(unregister_irq(1, nested_probe_irq1));
+    assert!(unregister_irq(2, nested_probe_irq2));
+    assert!(unregister_irq(0, nested_trigger));
+    assert!(unregister_irq(0, arch_x86_64::lapic::lapic_timer_handler));
+    assert!(register_irq(0, arch_x86_64::lapic::lapic_timer_handler));
+    assert_eq!(irq_handler_count(0), 1, "IRQ0 back to single handler");
+    assert_eq!(
+        arch_x86_64::interrupts::current_irq_priority(),
+        IRQ_PRIO_NONE,
+        "back to non-interrupt context"
+    );
+
+    info!("[irq] nested IRQ & priority tests PASS");
+}

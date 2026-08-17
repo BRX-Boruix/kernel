@@ -194,6 +194,10 @@ unsafe fn kmain_body() -> ! {
     // 再注册观察者共享同一 IRQ，验证多 handler 分发互不干扰。依赖 tick 运行。
     tests::test_shared_irq();
 
+    // T7：验证嵌套控制与优先级：每 IRQ 软件优先级 + 全局嵌套开关，
+    // 高优先级可打断低优先级处理、低优先级不能打断高优先级。依赖 tick 运行。
+    tests::test_nested_irq_priority();
+
     // M2.5.4：从内核 iretq 进入用户态（Ring 3）执行一段用户代码并返回内核。
     // 依赖中断使能（int 0x80 软中断）与用户段 GDT，故放在定时器验证之后。
     // M3.2/M3.3：通过进程对象 spawn + 进入用户态；用户态异常被"进程终止"处理。
