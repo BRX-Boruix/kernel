@@ -122,6 +122,10 @@ unsafe fn kmain_body() -> ! {
         mm::mapper::mm_dealloc_frame,
         phys_offset,
     );
+    // T7：验证 4KB 页级通用 MMIO 映射（PCI BAR 等任意对齐小块设备寄存器用）。
+    // 映射 VGA 文本缓冲（物理 0xB8000，4KB 对齐）到高半区虚拟地址并读写确认。
+    // 需在 paging::init 之后（依赖页表页分配器注入）。
+    arch_x86_64::mmio::test_map_phys_4k();
     // 验证虚拟内存页表映射
     tests::test_paging();
     // M1：验证用户地址空间（独立页表 + 用户映射 + 切换）
