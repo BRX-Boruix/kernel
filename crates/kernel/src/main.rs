@@ -257,6 +257,11 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-test-m43")]
     tests::test_elf_loader();
 
+    // M4.4 真实用户程序验收：加载 libsys+init 编译出的真实 ELF（停机验收，
+    // 不返回主流程），单独 gate。
+    #[cfg(feature = "kernel-test-m44")]
+    tests::test_userspace_elf();
+
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。
     mm::frame_allocator::set_cpu_id_reader(|| {

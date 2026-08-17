@@ -1586,3 +1586,37 @@ pub fn test_elf_loader() {
     // 启动调度器（永不返回：用户程序 write 后 exit 停机）。
     scheduler::start();
 }
+
+/// M4.4：验证真实用户程序（libsys + init 编译出的 ELF）的完整链路。
+///
+/// SDK 构建时先编译 `libsys` + `init` 用户程序，把 ELF 复制到
+/// `crates/kernel/init.elf`；本测试用 `include_bytes!` 在编译期嵌入，
+/// 再经 `elf::load` 加载、`scheduler::spawn` 运行。init 用 Rust 调 libsys
+/// 薄封装（write/info/brk/exit），验证「真实用户程序工具链 + libsys」全链路。
+/// 验收依据（串口日志）：`[init] Hello from real userspace ...`、
+/// kernel version / heap break 十六进制输出、`exit(code=0)` 停机。
+#[cfg(feature = "kernel-test-m44")]
+pub fn test_userspace_elf() {
+    use crate::{elf, scheduler};
+    use arch_x86_64::paging::X86PageTable;
+    use mm::user_space::UserAddressSpace;
+
+    info!("[userspace] === M4.4: real userspace binary (libsys + init) ===");
+
+    // 编译期嵌入 init.elf（SDK 构建时由 libsys+init 编译生成）。
+    let elf_bytes = include_bytes!("../init.elf");
+    info!("[userspace] embedded init.elf ({} bytes)", elf_bytes.len());
+
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+    let loaded = elf::load(elf_bytes, &mut us).expect("load init.elf");
+    info!(
+        "[userspace] loaded entry={:#x} stack_top={:#x}",
+        loaded.entry, loaded.user_stack_top
+    );
+
+    let pid = scheduler::spawn(loaded.entry, loaded.user_stack_top, us).expect("spawn");
+    info!("[userspace] spawned pid={} from init.elf", pid);
+
+    // 启动调度器（永不返回：init 打印信息后 exit 停机）。
+    scheduler::start();
+}
