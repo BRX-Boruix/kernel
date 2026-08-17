@@ -1,1 +1,7 @@
 /target
+
+# 用户程序 ELF 构建产物（SDK 编译生成，不提交）
+/crates/kernel/init.elf
+/crates/kernel/shell.elf
+# 内核符号表生成文件（SDK 二次编译生成，不提交）
+/crates/kernel/src/symbols_generated.rs

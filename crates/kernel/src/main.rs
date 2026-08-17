@@ -336,6 +336,17 @@ fn init_display() {
     info!("[display] terminal init returned");
 }
 
+/// 嵌入的用户程序 ELF 池（SDK 构建时由 `libsys` + `init`/`shell` 编译生成，
+/// 经 `include_bytes!` 在编译期嵌入）。`exec` 系统调用按索引加载运行。
+///
+/// 索引与 libsys `nr::PROG_*` 对齐：0 = init（PID 1），1 = shell（PID 2）。
+static PROGRAMS: &[&[u8]] = &[include_bytes!("../init.elf"), include_bytes!("../shell.elf")];
+
+/// 取嵌入程序池中第 `idx` 个 ELF（越界返回 `None`）。
+pub fn program_elf(idx: usize) -> Option<&'static [u8]> {
+    PROGRAMS.get(idx).copied()
+}
+
 /// panic 时的 CPU id 读取器：LAPIC 已映射才读，否则返回 0（早期未就绪安全）。
 fn panic_cpu_id() -> u32 {
     if arch_x86_64::lapic::is_mapped() {

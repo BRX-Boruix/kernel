@@ -59,9 +59,8 @@ const fn nr(d: u32, o: u32) -> u32 {
 }
 
 pub const SYS_WRITE: u32 = nr(domain::IO, op::WRITE); // 0x2002 write(fd, buf, len) -> n
-/// 预留 ABI 槽（后续实现 read）。
-#[allow(dead_code)]
 pub const SYS_READ: u32 = nr(domain::IO, op::READ); // 0x2001 read(fd, buf, len) -> n
+pub const SYS_EXEC: u32 = nr(domain::PROCESS, op::CREATE); // 0x0000 exec(prog) -> pid
 pub const SYS_MMAP: u32 = nr(domain::MEMORY, op::CREATE); // 0x1000 mmap(size) -> addr
 /// 预留 ABI 槽（后续实现 munmap）。
 #[allow(dead_code)]
@@ -149,6 +148,67 @@ fn sys_write(frame: &mut InterruptFrame) -> u64 {
         off += n;
     }
     pack_ok(len)
+}
+
+/// `read(fd, buf, len)`：从 fd 读字节到用户缓冲（0=stdin 键盘）。
+///
+/// 当前（阶段 A）键盘驱动未接入：读 stdin 返回 `WouldBlock`（用户态可据此
+/// 处理"暂无输入"）；阶段 B 接入 PS/2 键盘 + 输入缓冲后，此处改为从内核
+/// 输入队列取字节（SMAP 下用 `copy_to_user` 写到用户缓冲）。
+fn sys_read(frame: &mut InterruptFrame) -> u64 {
+    let fd = frame.rdi;
+    if fd != 0 {
+        return pack_err(Error::InvalidParam);
+    }
+    let buf = frame.rsi;
+    let len = frame.rdx;
+    if len == 0 {
+        return pack_ok(0);
+    }
+    // 校验 [buf, buf+len) 落在用户半区。
+    let Some(end) = buf.checked_add(len) else {
+        return pack_err(Error::OutOfRange);
+    };
+    if buf < USER_BASE || end > USER_TOP {
+        return pack_err(Error::OutOfRange);
+    }
+    // 阶段 A：键盘未接入，返回 WouldBlock（无可读数据）。阶段 B 接入输入缓冲。
+    let _ = (buf, len);
+    pack_err(Error::WouldBlock)
+}
+
+/// `exec(prog)`：加载内核嵌入的用户程序（`prog` 为嵌入池索引）为新进程并运行。
+///
+/// 复用 `elf::load` + `scheduler::spawn`（与启动 init 相同路径），返回新进程
+/// pid。`prog` 越界或加载失败返回对应错误。新进程独立地址空间、独立内核栈，
+/// 由调度器 RR 轮转调度（与 init 并存）。
+fn sys_exec(frame: &mut InterruptFrame) -> u64 {
+    let idx = frame.rdi as usize;
+    let Some(elf_bytes) = crate::program_elf(idx) else {
+        return pack_err(Error::InvalidParam);
+    };
+    let Ok(mut us) = mm::user_space::UserAddressSpace::<
+        arch_x86_64::paging::X86PageTable,
+    >::new()
+    else {
+        return pack_err(Error::OutOfMemory);
+    };
+    let loaded = match crate::elf::load(elf_bytes, &mut us) {
+        Ok(l) => l,
+        Err(e) => return pack_err(e),
+    };
+    match crate::scheduler::spawn(loaded.entry, loaded.user_stack_top, us) {
+        Ok(pid) => {
+            klib::info!(
+                "[syscall] exec prog={} -> pid={} entry={:#x}",
+                idx,
+                pid,
+                loaded.entry
+            );
+            pack_ok(pid as u64)
+        }
+        Err(e) => pack_err(e),
+    }
 }
 
 /// `mmap(size)`：在当前进程用户空间预留一段按需分页区，返回起始地址。
@@ -298,7 +358,9 @@ fn sys_exit(frame: &mut InterruptFrame) -> ! {
 /// 按系统调用号分发到具体实现。返回打包后的结果（写回 `frame.rax`）。
 fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
     match nr as u32 {
+        SYS_READ => sys_read(frame),
         SYS_WRITE => sys_write(frame),
+        SYS_EXEC => sys_exec(frame),
         SYS_MMAP => sys_mmap(frame),
         SYS_BRK => sys_brk(frame),
         SYS_NOW => sys_now(),
