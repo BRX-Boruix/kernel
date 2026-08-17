@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! 进程控制块（PCB）与进程表（M3.1）。
 //!
 //! M3 引入"进程模型"。本模块提供：
@@ -9,6 +11,10 @@
 //! 架构抽象（ADR-007）：`PT: PageTable` 泛型使进程逻辑不绑定具体架构。
 //! 进程持有 `UserAddressSpace<PT>`（M1 的独立地址空间），内核栈由调用方提供
 //! （M3 单核简单模型下可共用全局内核栈，M4 调度时再独立分配）。
+//!
+//! 生产化（boot→init）后本模块无条件编译；`ProcessTable`（泛型表）当前主要
+//! 供测试使用，调度器自建 `ProcEntry` 池不依赖它——部分成员在生产侧无调用方，
+//! 用文件级 `allow(dead_code)` 与 scheduler/elf/signals 保持一致（避免警告）。
 
 // Box 仅 `run`（M3.3/M4.1 单进程停机模型）使用。
 #[cfg(any(feature = "kernel-test-m33", feature = "kernel-test-m41"))]

@@ -9,27 +9,18 @@ mod panic;
 mod pci;
 mod symbols;
 mod terminal;
-// 进程模型（M3）目前仅在自检中使用：与 `mod tests` 一样，
-// 只在 `kernel-tests` feature 下编译，避免非测试构建的 dead_code 警告。
-#[cfg(feature = "kernel-tests")]
+// 进程模型（M3）：生产化后（boot→init）无条件编译。所有进程模块已从
+// `kernel-tests` gate 解除——生产构建（无该 feature）也会加载并运行 init。
 mod process;
-// syscall 机制（M4.1）依赖进程模型（经 `current_proc_mut` 访问进程内存/退出），
-// 与 `mod process` 同步 gate：生产化在调度器/init 落地后解除。
-#[cfg(feature = "kernel-tests")]
+// syscall 机制（M4.1）：依赖进程模型（经 `current_proc_mut` 访问进程内存/退出）。
 mod syscall;
-// 调度器（M4.2）依赖进程模型 + syscall，同样 gate 在 kernel-tests 下。
-#[cfg(feature = "kernel-tests")]
+// 调度器（M4.2）：依赖进程模型 + syscall，多进程 RR 轮转。
 mod scheduler;
-// 静态 ELF 加载器（M4.3）：把 ELF 镜像加载到用户地址空间。目前仅测试使用，
-// 与进程/调度同步 gate；生产化（init 拉用户程序）时解除 gate。
-#[cfg(feature = "kernel-tests")]
+// 静态 ELF 加载器（M4.3）：把 ELF 镜像（init.elf）加载到用户地址空间。
 mod elf;
-// 简单信号机制雏形（M3.3）：信号号 + CPU 异常→信号映射，供用户态异常处理器
-// 归类打印（SIGSEGV/SIGILL 等）。完整信号框架（派发/handler 回调）留待 M5。
-#[cfg(feature = "kernel-tests")]
+// 简单信号机制雏形（M3.3）：信号号 + CPU 异常→信号映射。
 mod signals;
 // IPC（M5）：共享内存 + 管道。依赖进程/调度（阻塞唤醒）与 syscall 分发。
-#[cfg(feature = "kernel-tests")]
 mod ipc;
 // 自检测试仅在 `kernel-tests` feature 下编译（SDK `build/br --test`）。
 #[cfg(feature = "kernel-tests")]
@@ -246,7 +237,6 @@ unsafe fn kmain_body() -> ! {
     // M4.1：注册 syscall 软中断入口（用户态 `int 0x80` → 内核 syscall 分发）。
     // 用 spin::Once 单次注册；M3.3 测试不触发 syscall，注册无副作用。
     // 与 `mod syscall` 同步 gate：生产构建（无 kernel-tests）不编译 syscall 机制。
-    #[cfg(feature = "kernel-tests")]
     arch_x86_64::interrupts::register_soft_interrupt_handler(syscall::syscall_entry);
 
     // M4.1 syscall 验收：用户代码经 `int 0x80` 调用 write/exit 等（停机验收，
@@ -255,8 +245,7 @@ unsafe fn kmain_body() -> ! {
     tests::test_syscall();
 
     // M4.2：注册调度器 tick（LAPIC IRQ0 每 10ms 触发 → RR 轮转）。
-    // 与 `mod scheduler` 同步 gate；仅在 BSP 上生效（arch 层过滤）。
-    #[cfg(feature = "kernel-tests")]
+    // 生产化后无条件注册（用户进程依赖 tick 轮转）；仅在 BSP 上生效（arch 层过滤）。
     arch_x86_64::interrupts::register_scheduler_tick(scheduler::tick);
 
     // M4.2 调度验收：多进程 RR 轮转（停机验收，不返回主流程），单独 gate。
@@ -311,8 +300,9 @@ unsafe fn kmain_body() -> ! {
     info!("Build Timestamp: {}", env!("BORUIX_BUILD_TIMESTAMP"));
     info!("============================================================");
 
-    info!("[kmain] reached idle loop");
-    CurrentArch::halt();
+    // 生产化：进入用户态 init（PID 1），而非内核 idle 停机。加载 init.elf →
+    // spawn → `scheduler::start` 永不返回；init 经 syscall 与内核交互、退出。
+    start_init();
 }
 
 /// 尽早启动 framebuffer 终端显示（显示前置要素就绪后立即调用，早于一切测试）。
@@ -353,4 +343,52 @@ fn panic_cpu_id() -> u32 {
     } else {
         0
     }
+}
+
+/// 生产化启动：加载 init 用户程序（PID 1）并进入调度器，永不返回。
+///
+/// init.elf 由 SDK 在构建时编译 `libsys` + `init` 生成，经 `include_bytes!`
+/// 在编译期嵌入。流程：解析 ELF → 装载到用户地址空间 → `scheduler::spawn`
+/// 创建 PID 1 → `scheduler::start` 进入 init 用户态（tick 轮转，init 经 syscall
+/// 交互/退出）。init 加载/生成任一环节失败则回退到内核 idle 循环停机（错误
+/// 可见，不 panic）——保证启动失败时行为可观测、不静默。
+fn start_init() -> ! {
+    use arch_x86_64::paging::X86PageTable;
+    use mm::user_space::UserAddressSpace;
+
+    info!("[kmain] booting user init (PID 1) ...");
+    // 编译期嵌入 init.elf（SDK 构建时由 libsys+init 编译生成）。
+    let elf_bytes = include_bytes!("../init.elf");
+
+    let mut us = match UserAddressSpace::<X86PageTable>::new() {
+        Ok(us) => us,
+        Err(e) => {
+            error!("[kmain] init: new user address space failed: {:?}", e);
+            info!("[kmain] reached idle loop");
+            CurrentArch::halt();
+        }
+    };
+    let loaded = match elf::load(elf_bytes, &mut us) {
+        Ok(l) => l,
+        Err(e) => {
+            error!("[kmain] init: load init.elf failed: {:?}", e);
+            info!("[kmain] reached idle loop");
+            CurrentArch::halt();
+        }
+    };
+    info!(
+        "[kmain] init: entry={:#x} stack_top={:#x}",
+        loaded.entry, loaded.user_stack_top
+    );
+    let pid = match scheduler::spawn(loaded.entry, loaded.user_stack_top, us) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("[kmain] init: spawn failed: {:?}", e);
+            info!("[kmain] reached idle loop");
+            CurrentArch::halt();
+        }
+    };
+    info!("[kmain] init: spawned pid={} from init.elf", pid);
+    // 启动调度器（永不返回）：进入 init 用户态，tick 轮转，init 经 syscall 退出。
+    scheduler::start();
 }
