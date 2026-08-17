@@ -732,6 +732,109 @@ pub fn test_syscall() {
     table.run(pid);
 }
 
+/// M4.2 调度器验收测试的常量地址（随 `kernel-test-m42` feature 编译）。
+#[cfg(feature = "kernel-test-m42")]
+mod usermode_sched {
+    /// 用户代码页（共享机器码：循环 `write` 打印自己的标记字符）。
+    pub const CODE_ADDR: u64 = 0x0000_0000_9000_0000;
+    /// 消息页（每进程独立物理帧，预填标记字符 'A'/'B'/'C'）。
+    pub const MSG_ADDR: u64 = 0x0000_0000_9500_0000;
+    pub const STACK_TOP: u64 = 0x0000_0000_4000_0000;
+}
+
+/// M4.2：生成用户态死循环代码——`write(1, MSG_ADDR, 1); jmp $`。
+///
+/// 每次循环经 `int 0x80` 调 syscall 打印自己的标记字符，然后死循环；
+/// 进程被 tick 中断打断时由调度器轮转。
+#[cfg(feature = "kernel-test-m42")]
+fn sched_user_code() -> [u8; 64] {
+    use usermode_sched::MSG_ADDR;
+    let mut c = [0x90u8; 64];
+    let mut i = 0;
+    macro_rules! emit {
+        ($($b:expr),*) => { $( c[i] = $b; i += 1; )* };
+    }
+    // mov rax, SYS_WRITE(0x2002)
+    emit!(0x48, 0xB8); c[i..i + 8].copy_from_slice(&0x2002u64.to_le_bytes()); i += 8;
+    // mov rdi, 1 (fd=stdout)
+    emit!(0x48, 0xBF); c[i..i + 8].copy_from_slice(&1u64.to_le_bytes()); i += 8;
+    // mov rsi, MSG_ADDR
+    emit!(0x48, 0xBE); c[i..i + 8].copy_from_slice(&MSG_ADDR.to_le_bytes()); i += 8;
+    // mov rdx, 1 (len)
+    emit!(0x48, 0xBA); c[i..i + 8].copy_from_slice(&1u64.to_le_bytes()); i += 8;
+    // int 0x80
+    emit!(0xCD, 0x80);
+    // jmp $（死循环）
+    emit!(0xEB, 0xFE);
+    c
+}
+
+/// M4.2：多进程 RR 轮转停机验收。
+///
+/// spawn 三个用户进程（标记 A/B/C，各自死循环 `write` 打印自己的字符），
+/// 启动调度器。用户进程被 LAPIC tick（100Hz）周期性打断，调度器 RR 轮转，
+/// 串口应看到 A/B/C 交替打印（穿插顺序可非严格周期，但三个都出现）。
+#[cfg(feature = "kernel-test-m42")]
+pub fn test_scheduler() {
+    use crate::scheduler;
+    use arch::VirtAddr;
+    use arch_x86_64::paging::X86PageTable;
+    use mm::user_space::UserAddressSpace;
+    use usermode_sched::*;
+
+    info!("[sched-test] === M4.2: multi-process RR scheduling ===");
+
+    let code = sched_user_code();
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+
+    // 为三个进程各建独立地址空间（代码页共享机器码，消息页预填各自标记）。
+    for ch in [b'A', b'B', b'C'] {
+        // 分配物理帧：代码 / 消息 / 栈
+        let code_frame = mm::allocate_frame().expect("code frame").start_paddr();
+        let msg_frame = mm::allocate_frame().expect("msg frame").start_paddr();
+        let stack_frame = mm::allocate_frame().expect("stack frame").start_paddr();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                code.as_ptr(),
+                (code_frame + off) as *mut u8,
+                code.len(),
+            );
+            // 消息页预填标记字符
+            *((msg_frame + off) as *mut u8) = ch;
+        }
+        let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+        us.map_user(
+            VirtAddr::new(CODE_ADDR),
+            VirtAddr::new(CODE_ADDR + 0x1000),
+            PageSize::Size4K,
+            PageFlags::empty().writable().executable().user(),
+            &[code_frame],
+        )
+        .expect("map code");
+        us.map_user(
+            VirtAddr::new(MSG_ADDR),
+            VirtAddr::new(MSG_ADDR + 0x1000),
+            PageSize::Size4K,
+            PageFlags::empty().writable().user(),
+            &[msg_frame],
+        )
+        .expect("map msg");
+        us.map_user(
+            VirtAddr::new(STACK_TOP - 0x1000),
+            VirtAddr::new(STACK_TOP),
+            PageSize::Size4K,
+            PageFlags::empty().writable().user(),
+            &[stack_frame],
+        )
+        .expect("map stack");
+        let pid = scheduler::spawn(CODE_ADDR, STACK_TOP, us).expect("scheduler spawn");
+        info!("[sched-test] spawned pid={} tag={}", pid, ch as char);
+    }
+
+    // 启动调度器（永不返回：进入用户态后由 tick 轮转）。
+    scheduler::start();
+}
+
 /// M3.1：验证进程结构与进程表（PCB + pid 分配/回收）。
 ///
 /// 验证点：

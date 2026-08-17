@@ -10,6 +10,28 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
 
 use crate::port::{inb, outb};
 
+/// 保存当前中断状态并关中断（写串口期间禁用本 CPU 中断）。
+///
+/// 防止"主线程写串口被 IRQ0 打断 → 中断处理也写串口"的竞争导致主线程饿死：
+/// 写串口全程关中断，中断上下文（已 cli）重入时保存/恢复不变，安全。
+#[inline]
+fn irq_save() -> u64 {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}", out(reg) flags, options(nomem, nostack));
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
+    flags
+}
+
+/// 恢复中断状态（`popfq` 恢复 RFLAGS，含 IF）。
+#[inline]
+fn irq_restore(flags: u64) {
+    unsafe {
+        core::arch::asm!("push {}; popfq", in(reg) flags, options(nomem, nostack));
+    }
+}
+
 /// 标准 COM 端口地址表（COM1~COM4）。
 const COM_PORTS: [u16; 4] = [0x3F8, 0x2F8, 0x3E8, 0x2E8];
 
@@ -129,11 +151,13 @@ fn putc_wait(byte: u8) {
     outb(com, byte);
 }
 
-/// 发送单个字节（带锁）。
+/// 发送单个字节（带锁 + 关中断，防中断上下文重入死锁）。
 pub fn write_byte(byte: u8) {
+    let saved = irq_save();
     LOCK.acquire();
     putc_wait(byte);
     LOCK.release();
+    irq_restore(saved);
 }
 
 /// 读取单个字节（无数据返回 None）。
@@ -147,8 +171,9 @@ pub fn read_byte() -> Option<u8> {
     }
 }
 
-/// 直接写入一串字节到串口（\n 转 \r\n）。
+/// 直接写入一串字节到串口（\n 转 \r\n）。带锁 + 关中断。
 pub fn write_str(s: &str) {
+    let saved = irq_save();
     LOCK.acquire();
     for &b in s.as_bytes() {
         if b == b'\n' {
@@ -157,6 +182,7 @@ pub fn write_str(s: &str) {
         putc_wait(b);
     }
     LOCK.release();
+    irq_restore(saved);
 }
 
 /// 串口控制台：`klib::console::Console` 的实现（统一 console 的串口 sink）。

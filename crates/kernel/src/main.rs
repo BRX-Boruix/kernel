@@ -17,6 +17,9 @@ mod process;
 // 与 `mod process` 同步 gate：生产化在调度器/init 落地后解除。
 #[cfg(feature = "kernel-tests")]
 mod syscall;
+// 调度器（M4.2）依赖进程模型 + syscall，同样 gate 在 kernel-tests 下。
+#[cfg(feature = "kernel-tests")]
+mod scheduler;
 // 自检测试仅在 `kernel-tests` feature 下编译（SDK `build/br --test`）。
 #[cfg(feature = "kernel-tests")]
 mod tests;
@@ -235,6 +238,15 @@ unsafe fn kmain_body() -> ! {
     // 不返回主流程），故单独用 kernel-test-m41 feature 门控。
     #[cfg(feature = "kernel-test-m41")]
     tests::test_syscall();
+
+    // M4.2：注册调度器 tick（LAPIC IRQ0 每 10ms 触发 → RR 轮转）。
+    // 与 `mod scheduler` 同步 gate；仅在 BSP 上生效（arch 层过滤）。
+    #[cfg(feature = "kernel-tests")]
+    arch_x86_64::interrupts::register_scheduler_tick(scheduler::tick);
+
+    // M4.2 调度验收：多进程 RR 轮转（停机验收，不返回主流程），单独 gate。
+    #[cfg(feature = "kernel-test-m42")]
+    tests::test_scheduler();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。

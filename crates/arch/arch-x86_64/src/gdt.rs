@@ -224,6 +224,17 @@ pub fn init() {
     setup_cpu(gdt_ptr, tss_ptr, kstack_top, df_stack_top);
 }
 
+/// 更新 BSP TSS 的 RSP0（ring3→ring0 中断切栈的内核栈顶）。
+///
+/// M4.2 调度器在进程切换时调用：把 TSS.RSP0 指向**目标进程的独立内核栈**，
+/// 使该进程下一次从用户态中断/异常/软中断进入内核时切到自己的栈。仅 BSP
+/// （M4.2 单核调度模型）；AP 的 TSS 不在此管理。
+pub fn set_rsp0(kstack_top: u64) {
+    unsafe {
+        BSP_TSS.rsp[0] = kstack_top;
+    }
+}
+
 /// 为当前 CPU 加载给定 GDT，并装载 TSS。
 ///
 /// 供 BSP 初始化与 AP 启动时调用。`gdt` 需是有效的、含 TSS 段的 GDT。

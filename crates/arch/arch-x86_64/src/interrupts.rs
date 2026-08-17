@@ -259,7 +259,10 @@ fn exception_name(vector: u8) -> &'static str {
 }
 
 /// CPU 压栈形成的帧（保存的寄存器 + 中断号 + 错误码 + 处理器状态）。
+///
+/// `Copy`：全部字段为 u64，调度器（M4.2）需整体拷贝以在进程间迁移中断帧。
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct InterruptFrame {
     /// 15 个通用寄存器（由公共 stub 压栈）
     pub r15: u64,
@@ -489,6 +492,22 @@ pub fn register_user_exception_handler(h: UserExceptionHandler) {
     let _ = USER_EXCEPTION_HANDLER.call_once(|| h);
 }
 
+/// 调度器 tick 回调（M4.2）：每次 LAPIC 定时器中断（IRQ0）后调用。
+///
+/// 由调度器注册（kernel 层）。回调持有 `&mut InterruptFrame`，可**整体改写**
+/// 中断帧（寄存器 + iretq 帧）为另一进程的保存帧，并切换 CR3/TSS.RSP0；
+/// `interrupt_common_stub` 返回后 iretq 即进入目标进程用户态。返回 void，
+/// 若调度器未切换（无其他就绪进程），帧保持不变，原进程继续执行。
+///
+/// 仅在 BSP（CPU0）上调用（M4.2 单核调度模型）。
+pub type SchedulerTickHandler = extern "C" fn(&mut InterruptFrame);
+static SCHEDULER_TICK: AtomicUsize = AtomicUsize::new(0);
+
+/// 注册调度器 tick 回调（M4.2）。用原子槽单次注册（与软中断 handler 同模式）。
+pub fn register_scheduler_tick(h: SchedulerTickHandler) {
+    SCHEDULER_TICK.store(h as usize, Ordering::SeqCst);
+}
+
 /// 分发入口（由汇编 `interrupt_common_stub` 调用）。
 ///
 /// `frame` 指向保存的寄存器区。
@@ -585,6 +604,16 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         if !handled {
             // 无 handler 或全部未处理：直接 EOI
             crate::pic::end_of_interrupt(irq);
+        }
+        // M4.2：IRQ0（LAPIC 定时器）之后调用调度器 tick，允许在中断帧上做
+        // 进程切换（改写 frame → 返回时 iretq 到目标进程）。仅 BSP 调度。
+        if irq == 0 {
+            let f = SCHEDULER_TICK.load(Ordering::Acquire);
+            if f != 0 {
+                let h: SchedulerTickHandler =
+                    unsafe { core::mem::transmute::<usize, SchedulerTickHandler>(f) };
+                h(frame);
+            }
         }
     }
 }

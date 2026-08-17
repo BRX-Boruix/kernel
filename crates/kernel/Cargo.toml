@@ -14,6 +14,8 @@ kernel-test-m33 = ["kernel-tests"]
 # M4.1 syscall 停机验收：用户代码经 `int 0x80` 调用 write/now/exit 等，
 # 验证 syscall ABI 全链路（验收后停，不返回主流程）。隐含 kernel-tests。
 kernel-test-m41 = ["kernel-tests"]
+# M4.2 调度器停机验收：多进程 RR 轮转（验收后停，不返回主流程）。隐含 kernel-tests。
+kernel-test-m42 = ["kernel-tests"]
 
 [build-dependencies]
 

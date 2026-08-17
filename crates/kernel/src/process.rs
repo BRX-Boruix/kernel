@@ -10,6 +10,8 @@
 //! 进程持有 `UserAddressSpace<PT>`（M1 的独立地址空间），内核栈由调用方提供
 //! （M3 单核简单模型下可共用全局内核栈，M4 调度时再独立分配）。
 
+// Box 仅 `run`（M3.3/M4.1 单进程停机模型）使用。
+#[cfg(any(feature = "kernel-test-m33", feature = "kernel-test-m41"))]
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -79,6 +81,28 @@ pub struct Process<PT: PageTable> {
 }
 
 impl<PT: PageTable> Process<PT> {
+    /// 构造一个初始为 `Ready` 的进程（M4.2 调度器直接使用）。
+    ///
+    /// `kernel_stack_top` 为该进程**独立内核栈**顶（TSS.RSP0 切换用；
+    /// 用户态中断/软中断进入内核时切到此栈）。
+    pub fn new(
+        pid: usize,
+        entry_rip: u64,
+        user_stack_top: u64,
+        kernel_stack_top: u64,
+        addr_space: UserAddressSpace<PT>,
+    ) -> Self {
+        Process {
+            pid,
+            state: TaskState::Ready,
+            context: TaskContext::empty(),
+            addr_space,
+            kernel_stack_top,
+            entry_rip,
+            user_stack_top,
+        }
+    }
+
     /// 进程 id。
     pub fn pid(&self) -> usize {
         self.pid
@@ -127,7 +151,9 @@ impl<PT: PageTable> Process<PT> {
     /// 注：cs/ss 用当前平台（x86_64）的 Ring3 段选择子并带 RPL=3。
     /// 多平台化时应改为 `arch` 抽象层提供的用户段常量或注入函数（ADR-007）。
     ///
-    /// 目前仅 M3.3 停机验收会真正运行进程，随 `kernel-test-m33` feature 编译。
+    /// **M4.1 单进程停机模型遗留**：M4.2 起由调度器（`scheduler`）接管进程
+    /// 运行，本方法仅 M3.3/M4.1 停机验收使用，随对应 feature 编译。
+    #[cfg(any(feature = "kernel-test-m33", feature = "kernel-test-m41"))]
     pub fn launch(&mut self) -> !
     where
         PT::Error: From<klib::error::Error>,
@@ -273,7 +299,9 @@ impl ProcessTable<X86PageTable> {
     /// 再锁死锁）。进程生命周期 = 内核生命周期（单进程停机模型泄漏无害；
     /// M4.2 调度器改为正式持有/回收）。永不返回。
     ///
-    /// 若 pid 不存在则 panic。
+    /// **M4.1 单进程停机模型遗留**：M4.2 起由调度器接管，本方法仅 M3.3/M4.1
+    /// 停机验收使用。若 pid 不存在则 panic。
+    #[cfg(any(feature = "kernel-test-m33", feature = "kernel-test-m41"))]
     pub fn run(&mut self, pid: usize) -> ! {
         let proc = self.processes[pid]
             .take()
