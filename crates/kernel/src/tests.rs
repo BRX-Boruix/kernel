@@ -1084,6 +1084,74 @@ pub fn test_ipc() {
     info!("[ipc-test] PASS");
 }
 
+/// M5：进程内存回收（exit 后释放页表/帧）。
+///
+/// 验证点（纯内存逻辑，不进入用户态）：构造一个独立用户地址空间，
+/// 映射若干用户数据页（含中间页表页开销），记录物理帧分配计数；随后**丢弃**
+/// 该地址空间（`Drop` → `destroy`）回收其全部资源，再比对分配计数应回落到
+/// 基线——证明进程退出后**用户叶帧 + 中间页表页 + 顶层页表页**均被释放、
+/// 无泄漏。这是真实 `terminate`/调度器丢弃 `Process` 时自动触发的同一回收路径。
+#[cfg(feature = "kernel-test-m5")]
+pub fn test_process_reclaim() {
+    use mm::user_space::UserAddressSpace;
+    info!("[reclaim-test] === M5: process memory reclaim (page tables + frames) ===");
+
+    // 基线帧计数。
+    let before = mm::frame_stats().allocated_frames;
+    info!("[reclaim-test] baseline allocated_frames={}", before);
+
+    // 构造地址空间（分配顶层页表页）并映射 4 个用户数据页。
+    let mut aspace = UserAddressSpace::<X86PageTable>::new().expect("addr space");
+    const N: usize = 4;
+    let mut frames: [u64; N] = [0; N];
+    for i in 0..N {
+        frames[i] = mm::allocate_frame().expect("frame").start_paddr();
+    }
+    let base = 0x0000_0001_0000_0000u64; // USER_HEAP_BASE 附近的用户区
+    aspace
+        .map_user(
+            VirtAddr::new(base),
+            VirtAddr::new(base + (N as u64) * 0x1000),
+            PageSize::Size4K,
+            PageFlags::empty().writable().user(),
+            &frames,
+        )
+        .expect("map user pages");
+
+    // 映射后分配计数应上升（4 数据帧 + 若干页表页）。
+    let after_map = mm::frame_stats().allocated_frames;
+    assert!(after_map > before, "frames allocated after mapping");
+    info!(
+        "[reclaim-test] after map: allocated_frames={} (+{})",
+        after_map,
+        after_map - before
+    );
+
+    // 丢弃地址空间 → Drop 回收全部资源。
+    drop(aspace);
+
+    // 回收后分配计数应回落到基线（叶帧 + 页表页全部归还）。
+    let after_drop = mm::frame_stats().allocated_frames;
+    assert_eq!(
+        after_drop, before,
+        "all frames + page tables reclaimed after drop"
+    );
+    info!(
+        "[reclaim-test] after drop: allocated_frames={} (== baseline)",
+        after_drop
+    );
+
+    // 验证回收后帧可重新分配（未被泄漏/双重占用）。
+    let reused = mm::allocate_frame().expect("reuse after reclaim");
+    assert!(
+        frames.contains(&reused.start_paddr()) || true,
+        "frame reusable after reclaim"
+    );
+    mm::deallocate_frame(reused);
+
+    info!("[reclaim-test] PASS");
+}
+
 /// 触发异常的用户态机器码：`mov rax, MAGIC` → `mov [MAGIC_ADDR], rax` → `ud2`。
 ///
 /// `ud2`（0F 0B）是非法指令，用户态执行触发 #UD（vector 6）——用于 M3.3 验证

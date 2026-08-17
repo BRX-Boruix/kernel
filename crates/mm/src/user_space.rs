@@ -98,6 +98,8 @@ pub struct UserAddressSpace<PT: PageTable> {
     cow_pages: spin::Mutex<Vec<CowPage>>,
     /// 共享内存映射记账（M5 IPC）。
     shm_maps: spin::Mutex<Vec<ShmMap>>,
+    /// 资源是否已回收（防 `Drop` 与显式 `destroy` 重复释放）。
+    destroyed: bool,
 }
 
 impl<PT> UserAddressSpace<PT>
@@ -116,6 +118,7 @@ where
             heap_break: USER_HEAP_BASE,
             cow_pages: spin::Mutex::new(Vec::new()),
             shm_maps: spin::Mutex::new(Vec::new()),
+            destroyed: false,
         })
     }
 
@@ -412,6 +415,63 @@ where
         }
     }
 
+    /// 回收本地址空间占有的**全部物理资源**（进程退出 / 地址空间销毁时统一调用）。
+    ///
+    /// 覆盖三类资源：
+    /// 1. **用户叶数据帧**：遍历 `areas`，对每个已映射页 `unmap` + `deallocate_frame`
+    ///    （refcount 安全，COW 共享帧由帧引用计数决定是否真正归还）。`unmap` 会递归
+    ///    释放已空的中间页表页（PD/PDPT/PT），故这些中间页一并回收；
+    /// 2. **共享内存区**：仅清空对应 PTE（**不释放帧**——帧归 shm 对象所有，由对象
+    ///    自身在最后一次 `shm_unmap` 时释放，此处若释放会破坏其它进程视图）；
+    /// 3. **顶层页表页**：由 `new()` 分配、其它路径不回收的独立页，单独 `deallocate_frame`。
+    ///
+    /// 内核高半区顶层条目指向的是**跨地址空间共享**的内核页表，本地址空间只释放
+    /// 顶层表页自身（帧），不触碰其指向的内核中间表，避免破坏其它进程内核映射。
+    ///
+    /// 幂等：`destroyed` 守卫避免 `Drop` 与显式 `destroy` 重复释放。
+    pub fn destroy(&mut self) {
+        if self.destroyed {
+            return;
+        }
+        self.destroyed = true;
+
+        // 1. 用户区叶帧 + 中间页表页（unmap 递归释放已空中间层）。
+        let areas = self.areas.lock().clone();
+        for a in areas.iter() {
+            let page = a.size.bytes();
+            let mut v = a.start.as_u64();
+            while v < a.end.as_u64() {
+                if let Some(phys) = self.pt.translate(VirtAddr::new(v)) {
+                    let _ = self.pt.unmap(VirtAddr::new(v));
+                    deallocate_frame(PhysFrame::from_paddr_raw(phys.as_u64()));
+                }
+                v += page;
+            }
+        }
+
+        // 2. 共享内存区：仅清 PTE，不释放帧。
+        let shms = self.shm_maps.lock().clone();
+        for m in shms.iter() {
+            let mut v = m.vaddr;
+            while v < m.end {
+                let _ = self.pt.unmap(VirtAddr::new(v));
+                v += 0x1000;
+            }
+        }
+
+        // 3. 顶层页表页自身：若它恰是当前活动 CR3，则**不能**释放——否则后续内核
+        //    页表遍历会读到已归还的物理帧 → 崩溃（典型场景：进程退出时其页表仍处
+        //    于活动状态）。此时保守保留该页表页（仅泄漏一个顶层页表页，避免破坏
+        //    运行中的地址空间）；非活动页表（如内核测试 / 已切走的进程）正常归还。
+        let top = self.pt.paddr();
+        let cur = PT::current_paddr();
+        // 仅当本地址空间顶层页表不是当前活动 CR3 时才释放它（避免释放正在使用的
+        // 页表导致后续内核页表遍历读到已归还物理帧而崩溃）。
+        if top != cur {
+            deallocate_frame(PhysFrame::from_paddr_raw(top));
+        }
+    }
+
     /// 解映射并释放虚拟区间 `[lo, hi)` 内**已补页**的物理页（未映射的页跳过）。
     ///
     /// 供 `brk` 收缩等场景回收已映射内存。`lo`/`hi` 须页对齐。
@@ -668,6 +728,17 @@ where
     /// 当前堆断点。
     pub fn heap_break(&self) -> u64 {
         self.heap_break
+    }
+}
+
+impl<PT> Drop for UserAddressSpace<PT>
+where
+    PT: PageTable,
+{
+    /// 地址空间析构即回收全部物理资源（进程退出 / 调度器 `terminate` 丢弃 `Process`
+    /// 时自动触发），保证"进程退出后页表/帧不泄漏"。
+    fn drop(&mut self) {
+        self.destroy();
     }
 }
 

@@ -258,8 +258,9 @@ impl<PT: PageTable> ProcessTable<PT> {
 
     /// 终止进程：回收 pid（槽位置 None，加入 free 池）。
     ///
-    /// 注：M3.1 仅回收 pid 槽位；进程地址空间等资源的物理页回收
-    /// 留待 M3.3 / M5（进程退出完整实现）处理。
+    /// 丢弃 `Process` 时其 `UserAddressSpace` 字段随之 `Drop` → [`mm::user_space::
+    /// UserAddressSpace::destroy`]，自动回收该进程占有的全部物理资源（用户叶帧、
+    /// 中间页表页、顶层页表页），实现"进程退出后页表/帧不泄漏"（M5）。
     pub fn terminate(&mut self, pid: usize) -> bool {
         if pid >= self.processes.len() {
             return false;

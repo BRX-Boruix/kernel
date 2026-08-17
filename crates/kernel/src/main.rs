@@ -275,6 +275,8 @@ unsafe fn kmain_body() -> ! {
     tests::test_cow_clone();
     #[cfg(feature = "kernel-test-m5")]
     tests::test_ipc();
+    #[cfg(feature = "kernel-test-m5")]
+    tests::test_process_reclaim();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。

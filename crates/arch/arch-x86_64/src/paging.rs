@@ -340,30 +340,32 @@ impl arch::PageTable for X86PageTable {
             return Err(klib::error::Error::InvalidParam);
         }
         if leaf == levels - 1 && levels >= 3 {
-            // 从 PT 的父层（leaf-1）开始，逐级向上；不回收顶层（level 0）
-            let mut cur_level = leaf - 1;
-            while cur_level >= 1 {
-                // 当前空页表页的物理地址 = entries[cur_level] & ADDR_MASK
-                // （它位于第 cur_level+1 层）
-                let table_phys = entries[cur_level] & ADDR_MASK;
-                if table_phys == 0 {
-                    break;
+            // 从 PT 的父层（leaf-1）开始，逐级向上回收已空的中间页表页；
+            // 一直收到 level 1（PDPT），但**不回收顶层页表页**（level 0 / PML4）——
+            // 顶层由 `UserAddressSpace::destroy` 统一释放，此处若释放会破坏同地址
+            // 空间内仍存在的其它映射。用 `isize` 以便 `cur_level` 递减到 -1 自然退出。
+            let mut cur_level = leaf as isize - 1;
+            while cur_level >= 0 {
+                let cl = cur_level as usize;
+                // 当前层指向的（下一级）空页表页物理地址 = entries[cl] & ADDR_MASK。
+                let table_phys = entries[cl] & ADDR_MASK;
+                if table_phys == 0 || table_phys == self.pml4 {
+                    break; // 空表或顶层页表页本身（顶层由 destroy 回收），停止
                 }
                 if !unsafe { self.is_table_empty(table_phys) } {
                     break; // 该层还有其它映射，停止回收
                 }
-                // 清掉父层（第 cur_level 层）指向该空表的条目。
-                // 第 cur_level 层的父表：cur_level==1 时是顶层表自身，否则是
-                // entries[cur_level-1] & ADDR_MASK。
-                let parent_phys = if cur_level == 1 {
+                // 清掉父层指向该空表的条目：父表为上一层（cl-1）的表，
+                // 当 cl==0 时父表即顶层表自身。
+                let parent_phys = if cl == 0 {
                     self.pml4
                 } else {
-                    entries[cur_level - 1] & ADDR_MASK
+                    entries[cl - 1] & ADDR_MASK
                 };
-                unsafe { self.table_set(parent_phys, index_at(cur_level, levels, v), 0) };
+                unsafe { self.table_set(parent_phys, index_at(cl, levels, v), 0) };
                 flush_tlb(v);
                 dealloc_frame(table_phys);
-                // 继续向上
+                // 继续向上（直到 PDPT / 顶层边界）
                 cur_level -= 1;
             }
         }
@@ -378,6 +380,11 @@ impl arch::PageTable for X86PageTable {
 
     fn paddr(&self) -> u64 {
         self.pml4
+    }
+
+    /// 当前活动页表的顶层物理基址（= CR3 & ~0xFFF）。
+    fn current_paddr() -> u64 {
+        mmio::cr3() & !0xFFF
     }
 }
 
