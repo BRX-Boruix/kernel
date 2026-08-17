@@ -220,6 +220,57 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
     set_current_proc(proc_ptr);
 }
 
+/// `yield()`：当前进程**主动**让出 CPU，切换到下一个就绪进程。
+///
+/// 与 [`tick`] 的被动时间片切换不同，这是进程主动请求让出：保存当前帧并把
+/// 进程放回就绪队列尾，取下一个就绪进程切换。若就绪队列里只有当前进程
+/// （无可让出），则恢复 Running 继续运行——`yield` 对调用进程等价于空操作。
+/// 返回 `true` 表示已切换（frame 已被改写为下一进程帧）；`false` 表示未切换。
+///
+/// `yield` 的返回值 `0` 写回当前进程帧再保存，故进程下次恢复时 `rax=0`，
+/// 用户态 `yield()` 正确返回 0。
+pub fn yield_now(frame: &mut InterruptFrame) -> bool {
+    let mut s = SCHED.lock();
+    let Some(cur_pid) = s.current else {
+        return false; // 内核 idle/主线程不参与让出
+    };
+
+    // 写回 yield 返回值 0，随 saved 保存；进程下次恢复时 rax=0。
+    frame.rax = 0;
+    if let Some(slot) = s.procs[cur_pid].as_mut() {
+        slot.saved = *frame;
+        slot.proc.set_state(TaskState::Ready);
+        s.ready.push_back(cur_pid);
+    }
+
+    // 从就绪队列取下一个。
+    let Some(next_pid) = s.ready.pop_front() else {
+        return false; // 无可调度进程（不应发生）
+    };
+
+    if cur_pid == next_pid {
+        // 仅当前进程自身：无可让出，恢复 Running 继续。
+        if let Some(slot) = s.procs[next_pid].as_mut() {
+            slot.proc.set_state(TaskState::Running);
+        }
+        return false;
+    }
+
+    // 切换到 next 进程（与 tick 相同的切换逻辑）。
+    let slot = s.procs[next_pid].as_mut().expect("ready proc exists");
+    slot.proc.set_state(TaskState::Running);
+    *frame = slot.saved;
+    let cr3 = slot.proc.addr_space_mut().page_table_paddr();
+    let ktop = slot.kstack_top;
+    let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
+    s.current = Some(next_pid);
+    klib::info!("[sched] yield {} -> {}", cur_pid, next_pid);
+    arch_x86_64::mmio::write_cr3(cr3);
+    gdt::set_rsp0(ktop);
+    set_current_proc(proc_ptr);
+    true
+}
+
 /// 启动调度器（内核 idle 主循环）：取第一个就绪进程，经 `enter_usermode` 进入
 /// 其用户态。进程在用户态被 tick 打断后由 [`tick`] 轮转。永不返回。
 pub fn start() -> ! {

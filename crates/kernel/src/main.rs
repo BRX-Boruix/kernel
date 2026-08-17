@@ -24,6 +24,10 @@ mod scheduler;
 // 与进程/调度同步 gate；生产化（init 拉用户程序）时解除 gate。
 #[cfg(feature = "kernel-tests")]
 mod elf;
+// 简单信号机制雏形（M3.3）：信号号 + CPU 异常→信号映射，供用户态异常处理器
+// 归类打印（SIGSEGV/SIGILL 等）。完整信号框架（派发/handler 回调）留待 M5。
+#[cfg(feature = "kernel-tests")]
+mod signals;
 // 自检测试仅在 `kernel-tests` feature 下编译（SDK `build/br --test`）。
 #[cfg(feature = "kernel-tests")]
 mod tests;

@@ -7,6 +7,7 @@
 //! 依赖 `mm::user_space::UserAddressSpace` 提供独立用户页表与映射能力。
 //! 与 `scheduler`/`process` 一致，M4 阶段先用 `X86PageTable` 具体类型
 //! （ADR-007 抽象层之上），生产化再泛型化。
+#![allow(dead_code)]
 
 use alloc::vec::Vec;
 

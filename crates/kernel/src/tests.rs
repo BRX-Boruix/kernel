@@ -742,14 +742,15 @@ mod usermode_sched {
     pub const STACK_TOP: u64 = 0x0000_0000_4000_0000;
 }
 
-/// M4.2：生成用户态死循环代码——`write(1, MSG_ADDR, 1); jmp $`。
+/// M4.2：生成用户态死循环代码——`write(1, MSG_ADDR, 1); yield(); jmp $`。
 ///
-/// 每次循环经 `int 0x80` 调 syscall 打印自己的标记字符，然后死循环；
-/// 进程被 tick 中断打断时由调度器轮转。
+/// 每次循环经 `int 0x80` 调 syscall 打印自己的标记字符，随后**主动 yield 让出**
+/// CPU 给下一个就绪进程，然后死循环；既验证 RR 轮转，也验证 `yield` 原语。
+/// tick 时间片切换仍作为兜底（进程若占用过长仍会被强制切走）。
 #[cfg(feature = "kernel-test-m42")]
-fn sched_user_code() -> [u8; 64] {
+fn sched_user_code() -> [u8; 96] {
     use usermode_sched::MSG_ADDR;
-    let mut c = [0x90u8; 64];
+    let mut c = [0x90u8; 96];
     let mut i = 0;
     macro_rules! emit {
         ($($b:expr),*) => { $( c[i] = $b; i += 1; )* };
@@ -762,7 +763,11 @@ fn sched_user_code() -> [u8; 64] {
     emit!(0x48, 0xBE); c[i..i + 8].copy_from_slice(&MSG_ADDR.to_le_bytes()); i += 8;
     // mov rdx, 1 (len)
     emit!(0x48, 0xBA); c[i..i + 8].copy_from_slice(&1u64.to_le_bytes()); i += 8;
-    // int 0x80
+    // int 0x80 (write)
+    emit!(0xCD, 0x80);
+    // mov rax, SYS_YIELD(0x0004)：主动让出
+    emit!(0x48, 0xB8); c[i..i + 8].copy_from_slice(&0x0004u64.to_le_bytes()); i += 8;
+    // int 0x80 (yield)
     emit!(0xCD, 0x80);
     // jmp $（死循环）
     emit!(0xEB, 0xFE);
@@ -949,12 +954,15 @@ fn usermode_fault_code() -> [u8; 26] {
 
 /// M3.3 用户态异常处理器：用户态进程触发异常时终止该进程。
 ///
-/// 不再当作内核崩溃（不 panic、不打印 CPU EXCEPTION），而是标记"用户进程异常终止"，
+/// 不再当作内核崩溃（不 panic、不打印 CPU EXCEPTION），而是把异常归类为
+/// 信号（雏形，`signals::signal_for_exception`），标记"进程因信号终止"，
 /// 单进程场景下停机。
 #[cfg(feature = "kernel-test-m33")]
 extern "C" fn user_fault_handler(frame: &mut arch_x86_64::interrupts::InterruptFrame) {
+    let sig = crate::signals::signal_for_exception(frame.vector);
     klib::info!(
-        "[test-fault] user process terminated by exception: vector={:#x} rip={:#x} cs={:#x}",
+        "[signal] user process terminated by {} (vector={:#x}) at rip={:#x} cs={:#x}",
+        crate::signals::signal_name(sig),
         frame.vector,
         frame.rip,
         frame.cs

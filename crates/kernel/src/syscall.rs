@@ -64,6 +64,8 @@ pub const SYS_MMAP: u32 = nr(domain::MEMORY, op::CREATE); // 0x1000 mmap(size) -
 pub const SYS_MUNMAP: u32 = nr(domain::MEMORY, op::CLOSE); // 0x1003 munmap(addr, size)
 pub const SYS_BRK: u32 = nr(domain::MEMORY, op::QUERY); // 0x1005 brk(new) -> break（0=查）
 pub const SYS_EXIT: u32 = nr(domain::PROCESS, op::CLOSE); // 0x0003 exit(code) -> !
+/// `yield()`：当前进程主动让出 CPU（切到下一个就绪进程）。
+pub const SYS_YIELD: u32 = nr(domain::PROCESS, op::CONTROL); // 0x0004 yield()
 pub const SYS_NOW: u32 = nr(domain::TIME, op::READ); // 0x3001 now() -> ns
 pub const SYS_SLEEP: u32 = nr(domain::TIME, op::WRITE); // 0x3002 sleep(ns)
 /// 预留 ABI 槽（后续实现 random 填充）。
@@ -162,6 +164,16 @@ fn sys_sleep(frame: &mut InterruptFrame) -> u64 {
     pack_ok(0)
 }
 
+/// `yield()`：当前进程主动让出 CPU（切到下一个就绪进程；仅当前进程则立即返回）。
+///
+/// `scheduler::yield_now` 若切换了进程，会把 `frame` 整体改写为下一进程的保存帧；
+/// 返回后 `syscall_entry` 把返回值 0 写回（对已让出的进程在下一次恢复时生效，
+/// 对当前切换目标进程的 rax 置 0 无副作用）。`iretq` 即进入目标进程用户态。
+fn sys_yield(frame: &mut InterruptFrame) -> u64 {
+    crate::scheduler::yield_now(frame);
+    pack_ok(0)
+}
+
 /// `info(what)`：查询内核信息。
 fn sys_info(frame: &mut InterruptFrame) -> u64 {
     match frame.rdi {
@@ -194,6 +206,7 @@ fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
         SYS_BRK => sys_brk(frame),
         SYS_NOW => sys_now(),
         SYS_SLEEP => sys_sleep(frame),
+        SYS_YIELD => sys_yield(frame),
         SYS_INFO => sys_info(frame),
         SYS_EXIT => sys_exit(frame),
         _ => {
