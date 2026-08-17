@@ -77,6 +77,8 @@ impl<PT: PageTable> Process<PT> {
         &mut self.context
     }
     /// 只读访问用户地址空间。
+    /// 仅 M3.3 停机验收使用，随 `kernel-test-m33` feature 编译。
+    #[cfg(feature = "kernel-test-m33")]
     pub fn addr_space(&self) -> &UserAddressSpace<PT> {
         &self.addr_space
     }
@@ -93,6 +95,9 @@ impl<PT: PageTable> Process<PT> {
     ///
     /// 注：cs/ss 用当前平台（x86_64）的 Ring3 段选择子并带 RPL=3。
     /// 多平台化时应改为 `arch` 抽象层提供的用户段常量或注入函数（ADR-007）。
+    ///
+    /// 目前仅 M3.3 停机验收会真正运行进程，随 `kernel-test-m33` feature 编译。
+    #[cfg(feature = "kernel-test-m33")]
     pub fn launch(&mut self) -> !
     where
         PT::Error: From<klib::error::Error>,
@@ -189,6 +194,9 @@ impl<PT: PageTable> ProcessTable<PT> {
     ///
     /// 永不返回（进入用户态后由用户代码/中断决定控制流）。
     /// 若 pid 不存在则 panic。
+    ///
+    /// 目前仅 M3.3 停机验收会真正运行进程，随 `kernel-test-m33` feature 编译。
+    #[cfg(feature = "kernel-test-m33")]
     pub fn run(&mut self, pid: usize) -> !
     where
         PT::Error: From<klib::error::Error>,

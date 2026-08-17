@@ -216,7 +216,9 @@ unsafe fn kmain_body() -> ! {
     // 依赖中断使能（int 0x80 软中断）与用户段 GDT，故放在定时器验证之后。
     // M3.2/M3.3：通过进程对象 spawn + 进入用户态；用户态异常被"进程终止"处理。
     // （M3.2 的正常 int 0x80 退出流程已单独验证，此处演进为异常上抛场景。）
-    #[cfg(feature = "kernel-tests")]
+    // M3.3 为停机验收（跑完即停、不返回主流程），故单独用 kernel-test-m33
+    // feature 门控：仅 SDK `--test-m3.3` 显式启用时才执行。
+    #[cfg(feature = "kernel-test-m33")]
     tests::test_spawn_user_fault();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，

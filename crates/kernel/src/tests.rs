@@ -572,6 +572,9 @@ pub fn test_frame_alloc() {
 /// - 用户代码页：`0x0000_0000_9000_0000`（可执行，立即映射）。
 /// - 用户栈：`USER_STACK_TOP`（0x7fff_0000_0000，立即映射）。
 /// - magic 地址：`0x0000_0000_9500_0000`（可写，立即映射）。
+///
+/// 仅 M3.3 使用；随 `kernel-test-m33` feature 编译。
+#[cfg(feature = "kernel-test-m33")]
 mod usermode {
     pub const CODE_ADDR: u64 = 0x0000_0000_9000_0000;
     pub const MAGIC_ADDR: u64 = 0x0000_0000_9500_0000;
@@ -677,6 +680,7 @@ pub fn test_process_table() {
 ///
 /// `ud2`（0F 0B）是非法指令，用户态执行触发 #UD（vector 6）——用于 M3.3 验证
 /// 用户态异常被"进程终止"处理，而非当作内核崩溃。
+#[cfg(feature = "kernel-test-m33")]
 fn usermode_fault_code() -> [u8; 26] {
     use usermode::{MAGIC, MAGIC_ADDR};
     let mut c = [0u8; 26];
@@ -693,6 +697,7 @@ fn usermode_fault_code() -> [u8; 26] {
 ///
 /// 不再当作内核崩溃（不 panic、不打印 CPU EXCEPTION），而是标记"用户进程异常终止"，
 /// 单进程场景下停机。
+#[cfg(feature = "kernel-test-m33")]
 extern "C" fn user_fault_handler(frame: &mut arch_x86_64::interrupts::InterruptFrame) {
     klib::info!(
         "[test-fault] user process terminated by exception: vector={:#x} rip={:#x} cs={:#x}",
@@ -710,7 +715,8 @@ extern "C" fn user_fault_handler(frame: &mut arch_x86_64::interrupts::InterruptF
 /// M3.3：用户态进程触发异常（#UD）时，异常被"进程终止"处理而非内核崩溃。
 ///
 /// 用户代码写 magic 后执行 `ud2` → #UD（用户态）→ `register_user_exception_handler`
-/// 注册的处理器被调用 → 打印"用户进程异常终止"并停机。
+/// 注册的处理器被调用 → 打印"用户进程异常终止"并停机（验收后停，不返回主流程）。
+#[cfg(feature = "kernel-test-m33")]
 pub fn test_spawn_user_fault() {
     use crate::process::ProcessTable;
     use mm::user_space::UserAddressSpace;
