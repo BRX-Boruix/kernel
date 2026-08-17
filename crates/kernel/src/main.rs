@@ -69,9 +69,6 @@ unsafe fn kmain_body() -> ! {
 
     // 初始化架构（串口等）
     CurrentArch::init();
-    // 注册统一 console 的第一个输出 sink：架构串口（Console trait 实现）。
-    // 此后所有内核日志（info!/warn!/error!/kprintln! 等）先汇聚到 console 再转发。
-    klib::console::register_console(&arch_x86_64::serial::SERIAL_CONSOLE);
     // 注入 panic 平台辅助：回退串口（独立于 klib console 层，确保早期 panic 可见）、
     // CPU id（LAPIC 未映射时返回 0，避免读未映射寄存器二次 #PF）、屏幕输出。
     panic::set_panic_output(
@@ -79,10 +76,11 @@ unsafe fn kmain_body() -> ! {
         panic_cpu_id,
         terminal::write_str as fn(&str),
     );
-    info!("[kmain] serial initialized (arch={})", CurrentArch::name());
-
-    // T5：初始化设备/驱动框架（ADR-008）：注册串口设备 + 驱动并探测。
+    // T5/T6：初始化设备/驱动框架（ADR-008）：注册串口设备 + 驱动并探测。
+    // 串口驱动 `init` 在此完成统一 console 串口 sink 的注册（不再手动接线），
+    // 此后所有内核日志先汇聚到 console 再转发。
     drivers::init();
+    info!("[kmain] serial initialized (arch={})", CurrentArch::name());
 
     // T6.1：枚举 PCI 总线（bus 0），把发现的设备登记到驱动框架。
     // 早于具体设备驱动使用；框架就绪后即可。
@@ -140,12 +138,10 @@ unsafe fn kmain_body() -> ! {
                 "[kmain] framebuffer {}x{} pitch={} bpp={}",
                 fb.width, fb.height, fb.pitch, fb.bpp
             );
-            terminal::init(fb);
-            // framebuffer 终端就绪后注册为统一 console 的第二个输出 sink，
-            // 此后所有内核日志同时输出到串口与屏幕。
-            klib::console::register_console(&terminal::TERMINAL_CONSOLE);
-            // T5：把 framebuffer 登记为框架设备并绑定 framebuffer 驱动。
-            drivers::register_framebuffer();
+            // T6：把 framebuffer 登记为框架设备并绑定 framebuffer 驱动；
+            // 驱动 init 在此完成 flanterm 终端初始化与屏幕 sink 注册
+            // （不再手动接线）。
+            drivers::register_framebuffer(fb);
             info!("[kmain] terminal init returned");
         } else {
             error!("[kmain] no framebuffer");
