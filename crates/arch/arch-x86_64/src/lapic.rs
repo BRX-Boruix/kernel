@@ -111,7 +111,7 @@ fn lapic_rmw(reg: usize, clear_bits: u32, set_bits: u32) {
 }
 
 /// 发送 EOI 给 LAPIC。
-fn end_of_interrupt() {
+pub fn end_of_interrupt() {
     lapic_write(LAPIC_EOI, 0);
 }
 

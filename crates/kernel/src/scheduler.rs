@@ -31,7 +31,7 @@ use klib::error::Error;
 use klib::sync::irq::IrqSpinLock;
 use mm::user_space::UserAddressSpace;
 
-use crate::process::{set_current_proc, Process, TaskState};
+use crate::process::{clear_current_proc, set_current_proc, Process, TaskState};
 
 /// 每进程独立内核栈大小（16 帧 = 64K）。
 ///
@@ -315,6 +315,48 @@ pub fn block_current(frame: &mut InterruptFrame) -> bool {
     gdt::set_rsp0(ktop);
     set_current_proc(proc_ptr);
     true
+}
+
+/// 终止当前进程（`exit` syscall）：回收其槽位并切换到下一个就绪进程。
+///
+/// 当前进程置 `Exit` 并从就绪队列/进程池移除（其 `UserAddressSpace` 随
+/// `ProcEntry` drop 自动回收物理资源）。若还有就绪进程，改写 `frame` 为队首
+/// 进程的保存帧，返回后由 `syscall_entry` 的 iretq 进入目标进程用户态（与
+/// `tick`/`yield` 相同机制）；否则停机（系统空转）。注意调用后当前进程不再
+/// 被调度，但函数**正常返回**（不 `!`），由中断返回路径完成切换。
+pub fn exit_current(frame: &mut InterruptFrame) {
+    let mut s = SCHED.lock();
+    let cur_pid = s.current.expect("exit called outside process");
+    // 回收当前进程槽位。
+    if let Some(slot) = s.procs[cur_pid].as_mut() {
+        slot.proc.set_state(TaskState::Exit);
+    }
+    s.procs[cur_pid] = None;
+    s.current = None;
+    clear_current_proc();
+
+    // 取下一个就绪进程。
+    let Some(next_pid) = s.ready.pop_front() else {
+        drop(s);
+        // 无进程可调度：停机（系统空转）。
+        klib::info!("[sched] all processes exited, halting");
+        arch_x86_64::interrupts::disable();
+        loop {
+            arch_x86_64::interrupts::halt();
+        }
+    };
+    let slot = s.procs[next_pid].as_mut().expect("ready proc exists");
+    slot.proc.set_state(TaskState::Running);
+    *frame = slot.saved;
+    let cr3 = slot.proc.addr_space_mut().page_table_paddr();
+    let ktop = slot.kstack_top;
+    let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
+    s.current = Some(next_pid);
+    klib::info!("[sched] exit {} -> {}", cur_pid, next_pid);
+    drop(s);
+    arch_x86_64::mmio::write_cr3(cr3);
+    gdt::set_rsp0(ktop);
+    set_current_proc(proc_ptr);
 }
 
 /// 唤醒一个阻塞的进程（IPC 写/读端完成时调用）：置 `Ready` 并入就绪队列。

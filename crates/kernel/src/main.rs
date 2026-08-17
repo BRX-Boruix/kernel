@@ -300,6 +300,13 @@ unsafe fn kmain_body() -> ! {
     info!("Build Timestamp: {}", env!("BORUIX_BUILD_TIMESTAMP"));
     info!("============================================================");
 
+    // 阶段 B：使能外部中断路由（IOAPIC 把键盘 IRQ1 送到 vector 33）并初始化
+    // PS/2 8042 键盘驱动（注册 IRQ1 handler → 扫描码译码 → 输入缓冲）。
+    // 放在所有测试之后（避免干扰 LAPIC tick 时序测试）、进入 init 之前，
+    // 使 shell REPL 能接收键盘输入。
+    arch_x86_64::ioapic::init();
+    arch_x86_64::keyboard::init();
+
     // 生产化：进入用户态 init（PID 1），而非内核 idle 停机。加载 init.elf →
     // spawn → `scheduler::start` 永不返回；init 经 syscall 与内核交互、退出。
     start_init();

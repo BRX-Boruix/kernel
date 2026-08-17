@@ -11,6 +11,8 @@ pub mod cpu;
 pub mod gdt;
 pub mod hpet;
 pub mod interrupts;
+pub mod ioapic;
+pub mod keyboard;
 pub mod lapic;
 pub mod mmio;
 pub mod paging;
