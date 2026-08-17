@@ -9,7 +9,8 @@
 use core::mem::size_of;
 
 use arch::acpi::{
-    checksum_valid, entry_count, parse_rsdp, parse_sdt_header, SDT_HEADER_LEN, SdtHeader,
+    checksum_valid, entry_count, parse_hpet, parse_rsdp, parse_sdt_header, Hpet, SDT_HEADER_LEN,
+    SdtHeader,
 };
 use arch::phys_to_virt;
 
@@ -32,6 +33,8 @@ pub struct AcpiInfo {
     pub pm1b_cnt: u16,
     /// ACPI reset 寄存器信息（FADT offset 116 处的 GAS + 值）。
     pub reset_reg: Option<(u8, u16, u32)>, // (address_space, port, value)
+    /// HPET 表关键字段（`None` = 未找到/无效，见 `arch::acpi::parse_hpet`）。
+    pub hpet: Option<Hpet>,
 }
 
 /// 初始化 ACPI：从 limine 获取 RSDP → 校验 → 遍历 RSDT/XSDT → 找 FADT。
@@ -71,8 +74,9 @@ pub fn init() -> Option<AcpiInfo> {
         return None;
     };
 
-    // 逐个查找 FACP（FADT）。
+    // 逐个查找 FACP（FADT）与 HPET 表。FADT 必需；HPET 可选。
     let mut fadt_addr: u64 = 0;
+    let mut hpet: Option<Hpet> = None;
     for i in 0..n_entries {
         // SAFETY: 表条目数组在 XSDT 表内（表长已验证）。
         let entry: u64 = unsafe {
@@ -93,7 +97,24 @@ pub fn init() -> Option<AcpiInfo> {
         if let Some(hdr) = sdt_at(va) {
             if hdr.is(b"FACP") {
                 fadt_addr = addr;
-                break;
+            } else if hdr.is(b"HPET") {
+                // 读取 HPET 表关键字段（基址/周期/比较器数）。
+                // SAFETY: `va` 指向已验证的 HPET 表（表长已由 sdt_at 校验）。
+                let buf = unsafe { core::slice::from_raw_parts(va as *const u8, hdr.length as usize) };
+                hpet = parse_hpet(buf);
+                if hpet.is_none() {
+                    // 诊断：打印表长与关键偏移字节（Event Timer Block ID、
+                    // 周期、QEMU 布局基址、GAS），便于排查布局差异。
+                    let at = |i: usize| if i < buf.len() { buf[i] } else { 0 };
+                    klib::warn!(
+                        "[acpi] HPET table present but invalid: len={} id={:#x} period={:#x} base48={:#x} base56={:#x}",
+                        buf.len(),
+                        u32::from_le_bytes([at(36), at(37), at(38), at(39)]),
+                        u32::from_le_bytes([at(44), at(45), at(46), at(47)]),
+                        u64::from_le_bytes([at(48), at(49), at(50), at(51), at(52), at(53), at(54), at(55)]),
+                        u64::from_le_bytes([at(56), at(57), at(58), at(59), at(60), at(61), at(62), at(63)]),
+                    );
+                }
             }
         }
     }
@@ -103,6 +124,18 @@ pub fn init() -> Option<AcpiInfo> {
         return None;
     }
     klib::info!("[acpi] FADT at {:#x}", fadt_addr);
+    if let Some(h) = &hpet {
+        klib::info!(
+            "[acpi] HPET: base={:#x} period={}fs comparators={} rev={:#x} page_protect={}",
+            h.base_addr,
+            h.counter_clock_period_fs,
+            h.comparator_count,
+            h.hardware_rev_id,
+            h.page_protect
+        );
+    } else {
+        klib::info!("[acpi] HPET: not present");
+    }
 
     // 解析 FADT 关键字段。
     let fadt_va = phys_to_virt(fadt_addr);
@@ -122,6 +155,7 @@ pub fn init() -> Option<AcpiInfo> {
         pm1a_cnt: fadt.pm1a_cnt,
         pm1b_cnt: fadt.pm1b_cnt,
         reset_reg: fadt.reset_reg,
+        hpet,
     })
 }
 

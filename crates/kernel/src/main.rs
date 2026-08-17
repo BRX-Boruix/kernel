@@ -126,6 +126,15 @@ unsafe fn kmain_body() -> ! {
     // 映射 VGA 文本缓冲（物理 0xB8000，4KB 对齐）到高半区虚拟地址并读写确认。
     // 需在 paging::init 之后（依赖页表页分配器注入）。
     arch_x86_64::mmio::test_map_phys_4k();
+
+    // T3：初始化 HPET（高精度事件定时器）——ACPI 探测（基址/周期）+ 4KB MMIO
+    // 映射 + 使能计数器，提供微秒级高精度单调时钟补充。ACPI 表在
+    // acpi::init() 已解析（hpet_info）；映射依赖页表页分配器（paging::init）。
+    // HPET 为备选：主时钟源仍是 LAPIC 100Hz，无 HPET 时优雅降级。
+    {
+        let (hpet_base, hpet_period) = acpi::hpet_info();
+        arch_x86_64::hpet::init(hpet_base, hpet_period);
+    }
     // 验证虚拟内存页表映射
     tests::test_paging();
     // M1：验证用户地址空间（独立页表 + 用户映射 + 切换）
@@ -189,6 +198,10 @@ unsafe fn kmain_body() -> ! {
     );
     // 验证 arch::Timer 抽象（now/sleep/set_timeout），依赖 LAPIC tick 驱动。
     tests::test_time_abstraction();
+
+    // T3：验证 HPET 高精度事件定时器（备选时钟源）：计数器推进/周期换算/
+    // 单调性/与 LAPIC tick 对齐。HPET 已在 paging::init 后初始化。
+    tests::test_hpet();
 
     // T7：验证通用 IRQ 注册/分配（共享中断）：IRQ0 上已有 LAPIC 定时器 handler，
     // 再注册观察者共享同一 IRQ，验证多 handler 分发互不干扰。依赖 tick 运行。

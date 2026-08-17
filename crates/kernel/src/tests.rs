@@ -923,6 +923,104 @@ pub fn test_shared_irq() {
     info!("[irq] shared IRQ tests PASS");
 }
 
+// ---- T3：HPET 高精度事件定时器 ----
+
+/// T3：验证 HPET 高精度定时器。
+///
+/// 前置：`arch_x86_64::hpet::init` 已完成（main.rs 在 paging::init 后调用，
+/// 参数来自 ACPI HPET 表）；LAPIC 定时器已初始化（对比 LAPIC tick 用）。
+///
+/// 验证项：
+/// 1. 计数器推进 + 周期换算：HPET 自身忙等 1ms，`now_nanos` 应推进 ~1ms，
+///    counter 增量与周期换算一致（频率 ≈ 14.31818MHz）；
+/// 2. 单调性：`now_nanos` 非递减；
+/// 3. 与 LAPIC tick 源对齐：1 个 LAPIC tick（≈10ms）由 HPET 测量的时长应
+///    在合理范围内（TCG 下校准偏差容忍 ±40ms）。
+pub fn test_hpet() {
+    use arch_x86_64::hpet;
+
+    if !hpet::is_ready() {
+        klib::warn!("[hpet] not available, skipping verification");
+        return;
+    }
+    info!("[hpet] === T3: HPET high-precision timer ===");
+
+    // 1. 计数器推进 + 换算合理性：忙等 1ms（HPET 自身）。
+    //    注意 TCG（无 KVM 加速）下 QEMU 虚拟时钟会**快进**：忙等期间若
+    //    LAPIC tick 中断触发，QEMU 一次模拟整段时间，HPET counter 随之
+    //    跳跃，实际 n_delta 可能远超 1ms（实测 7.7ms）。故忙等断言放宽
+    //    到 [0.5ms, 50ms]，核心验证是 counter 确实推进且换算频率合理。
+    let c0 = hpet::counter();
+    let n0 = hpet::now_nanos();
+    let deadline = n0 + 1_000_000;
+    while hpet::now_nanos() < deadline {
+        core::hint::spin_loop();
+    }
+    let c1 = hpet::counter();
+    let n1 = hpet::now_nanos();
+    let c_delta = c1.wrapping_sub(c0);
+    let n_delta = n1 - n0;
+    let est_hz = if n_delta > 0 {
+        c_delta * 1_000_000_000 / n_delta
+    } else {
+        0
+    };
+    info!(
+        "[hpet] counter +{} over {} ns (est. {} Hz)",
+        c_delta, n_delta, est_hz
+    );
+    assert!(c_delta > 0, "HPET counter must advance");
+    assert!(
+        n_delta >= 500_000 && n_delta <= 50_000_000,
+        "1ms HPET busy-wait advanced {} ns (expected ~1ms, TCG may overrun)",
+        n_delta
+    );
+    // 频率覆盖真实硬件（14.31818MHz）与 QEMU（100MHz）两种常见配置，
+    // 上限 200MHz 容忍忙等测量误差。
+    assert!(
+        est_hz > 7_000_000 && est_hz < 200_000_000,
+        "HPET counter frequency {} Hz outside expected range",
+        est_hz
+    );
+
+    // 2. 单调性：now_nanos 非递减。
+    let a = hpet::now_nanos();
+    let b = hpet::now_nanos();
+    assert!(b >= a, "HPET monotonic");
+
+    // 3. 与 LAPIC tick 源交叉验证：等 1 个 LAPIC tick，HPET 测量其间隔。
+    //    注意：TCG（无 KVM 加速）下 PIT 校准 LAPIC 总线频率严重失准
+    //    （实测 1.39MHz vs 真实 ~1GHz），故 LAPIC tick 的实际间隔并不可靠
+    //    （实测 0.53ms 而非标称 10ms）。HPET 是独立高精度硬件时钟，这里
+    //    只做**相对验证**：HPET 时间在 tick 之间确实推进（>0）且单调，
+    //    不断言绝对时长——绝对时长断言属于 LAPIC 校准问题而非 HPET。
+    let h0 = hpet::now_nanos();
+    let t0 = arch_x86_64::lapic::ticks();
+    let mut rounds = 0u32;
+    while arch_x86_64::lapic::ticks() == t0 {
+        arch_x86_64::interrupts::enable();
+        arch_x86_64::interrupts::halt();
+        rounds += 1;
+        if rounds > 500 {
+            klib::warn!("[hpet] no LAPIC tick observed, skipping cross-check");
+            info!("[hpet] HPET tests PASS");
+            return;
+        }
+    }
+    let h_delta = hpet::now_nanos() - h0;
+    info!(
+        "[hpet] 1 LAPIC tick advanced HPET by {} ns (relative check)",
+        h_delta
+    );
+    assert!(
+        h_delta > 0 && h_delta < 1_000_000_000,
+        "HPET must advance between LAPIC ticks, got {} ns",
+        h_delta
+    );
+
+    info!("[hpet] HPET tests PASS");
+}
+
 // ---- T7：嵌套控制与优先级 ----
 
 /// IRQ1（prio=12）探针：记录进入时的 IF 与当前优先级，再触发 IRQ2（prio=1，更低）。

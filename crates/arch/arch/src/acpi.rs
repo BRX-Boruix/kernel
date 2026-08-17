@@ -4,7 +4,8 @@
 //! - [`parse_rsdp`]：RSDP（Root System Description Pointer）表头解析；
 //! - [`parse_sdt_header`]：SDT（System Description Table）公共表头解析；
 //! - [`checksum_valid`]：ACPI 校验和验证（表内所有字节和 ≡ 0 mod 256）；
-//! - [`entry_count`]：RSDT/XSDT 中的表条目数。
+//! - [`entry_count`]：RSDT/XSDT 中的表条目数；
+//! - [`parse_hpet`]：HPET 表关键字段解析（高精度事件定时器）。
 //!
 //! 具体的内存访问（limine RSDP 请求、HHDM 物理映射）由架构实现
 //! （`arch-x86_64::acpi`）负责，本模块输入字节切片即可单测。
@@ -121,6 +122,102 @@ pub fn entry_count(header: &SdtHeader, entry_size: usize) -> usize {
     (header.length as usize - SDT_HEADER_LEN) / entry_size
 }
 
+// ---------- HPET 表 ----------
+
+/// HPET 表关键字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hpet {
+    /// 硬件修订 ID + 能力标志（bit15 = LEGACY_REPLACEMENT_IRQ_ROUTING）。
+    pub hardware_rev_id: u32,
+    /// 比较器个数（表中存 N-1，此处为实际 N）。
+    pub comparator_count: u8,
+    /// 计数器时钟周期（飞秒，fs）。14.31818MHz → 约 69_841_192 fs。
+    /// 0 = 无效（QEMU 某些配置）。
+    pub counter_clock_period_fs: u32,
+    /// 硬件寄存器基址（System Memory 空间，如 0xFED00000）。
+    pub base_addr: u64,
+    /// 页保护属性（0 = 无保护，1 = 4KB 页，2 = 64KB 页）。
+    pub page_protect: u8,
+}
+
+/// 解析 HPET 表（输入须 ≥ 60 字节）。
+///
+/// HPET 表存在两种主要布局：
+/// - **旧式布局**（HPET 1.0 / QEMU，表长 60）：
+///   - offset 36: Event Timer Block ID（4 字节，含修订号/厂商）；
+///   - offset 40: Base Address（**8 字节裸地址**，如 0xFED00000）；
+///   - offset 48: HPET Sequence Number（4 字节）；
+///   - offset 52: Main Counter Minimum Clock Ticks（4 字节）；
+///   - offset 56: Page Protection and OEM Attribute（4 字节）。
+/// - **ACPI 3.0+ 布局**（真机常见，表长 76）：
+///   - offset 36: Hardware Rev ID（4 字节）；
+///   - offset 40: Comparator Count（4 字节，N-1）；
+///   - offset 44: Counter Clock Period（4 字节，飞秒）；
+///   - offset 48: Reserved（4 字节）；
+///   - offset 52: 基址 GAS（12 字节：address_space 1B + bit_width 1B +
+///     bit_offset 1B + access_size 1B + address 8B）；
+///   - offset 64: HPET Sequence Number（4 字节）；
+///   - offset 68: Minimum Clock Ticks Periodic Interrupt（4 字节）；
+///   - offset 72: Page Protection and OEM Attribute（4 字节）。
+///
+/// 两种布局的**时钟周期均可能缺失/为 0**（QEMU 不填），真实周期放在
+/// 硬件寄存器 `General Capabilities and ID Register`（offset 0x00）的
+/// bit 32-63，由驱动读取。本函数不要求周期非 0。
+///
+/// 基址探测：先取旧式布局 offset 40 的 8 字节裸地址；为 0 时再取
+/// ACPI 3.0+ GAS（offset 52 address_space=0 时 offset 56 的地址）。
+pub fn parse_hpet(buf: &[u8]) -> Option<Hpet> {
+    // 最小 52 字节：足以覆盖 QEMU 布局（表长 56，基址在 offset 44..52）。
+    if buf.len() < 52 {
+        return None;
+    }
+    let hardware_rev_id = u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]);
+    let comparator_count = u8::from_le_bytes([buf[40]]) + 1; // 表中存 N-1
+    let counter_clock_period_fs = u32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]);
+
+    // 基址探测。按表长区分布局：
+    // - **ACPI 3.0+ 布局**（表长 ≥ 76）：offset 52 为 GAS 的 address_space
+    //   （0 = System Memory），地址在 offset 56（8 字节）；
+    // - **QEMU 布局**（实测表长 56）：offset 44 为 8 字节裸基址
+    //   （实测 0xfed00000）；
+    // - **旧式 HPET 1.0 布局**（表长 60）：offset 40 为 8 字节裸基址。
+    // 后两种均无 GAS。QEMU 布局的 offset 44 优先（其 offset 40-43 是
+    // 保留/低地址字段恒 0），为 0 时回退旧式 offset 40。
+    let mut base_addr: u64 = 0;
+    if buf.len() >= 76 && buf[52] == 0 {
+        // ACPI 3.0+：GAS 在 offset 52，地址在 offset 56。
+        base_addr = u64::from_le_bytes([
+            buf[56], buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63],
+        ]);
+    }
+    if base_addr == 0 && buf.len() >= 52 {
+        // QEMU 布局：offset 44 起 8 字节裸基址。
+        base_addr = u64::from_le_bytes([
+            buf[44], buf[45], buf[46], buf[47], buf[48], buf[49], buf[50], buf[51],
+        ]);
+    }
+    if base_addr == 0 {
+        // 旧式 HPET 1.0：offset 40 起 8 字节裸基址。
+        base_addr = u64::from_le_bytes([
+            buf[40], buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47],
+        ]);
+    }
+    let page_protect = if buf.len() >= 76 { buf[72] & 0x03 } else { 0 };
+
+    // 基址必须非 0。时钟周期允许为 0（驱动从硬件寄存器读取）。
+    if base_addr == 0 {
+        return None;
+    }
+
+    Some(Hpet {
+        hardware_rev_id,
+        comparator_count,
+        counter_clock_period_fs,
+        base_addr,
+        page_protect,
+    })
+}
+
 // ---------- 单元测试 ----------
 
 #[cfg(test)]
@@ -206,5 +303,94 @@ mod tests {
         let h = parse_sdt_header(&buf).unwrap();
         assert_eq!(entry_count(&h, 8), 3);
         assert_eq!(entry_count(&h, 4), 6);
+    }
+
+    #[test]
+    fn hpet_parse_standard_layout() {
+        // 标准布局：GAS 在 offset 52，周期字段在 offset 44。
+        let mut buf = [0u8; 76];
+        buf[0..4].copy_from_slice(b"HPET");
+        buf[4..8].copy_from_slice(&76u32.to_le_bytes());
+        buf[8] = 1; // revision
+        // offset 36: Hardware Rev ID（bit15 = legacy routing capable）
+        buf[36..40].copy_from_slice(&0x8001u32.to_le_bytes());
+        // offset 40: Comparator Count（N-1 = 2 → 3 个比较器）
+        buf[40] = 2;
+        // offset 44: Counter Clock Period = 69_841_192 fs（14.31818MHz）
+        buf[44..48].copy_from_slice(&69_841_192u32.to_le_bytes());
+        // offset 52: GAS address_space = 0（System Memory）
+        buf[52] = 0;
+        // offset 56: GAS address = 0xFED00000
+        buf[56..64].copy_from_slice(&0xFED0_0000u64.to_le_bytes());
+        // offset 72: page protect = 0（无保护）
+        buf[72] = 0;
+
+        let h = parse_hpet(&buf).unwrap();
+        assert_eq!(h.hardware_rev_id, 0x8001);
+        assert_eq!(h.comparator_count, 3);
+        assert_eq!(h.counter_clock_period_fs, 69_841_192);
+        assert_eq!(h.base_addr, 0xFED0_0000);
+        assert_eq!(h.page_protect, 0);
+    }
+
+    #[test]
+    fn hpet_parse_qemu_layout() {
+        // QEMU 布局（实测）：表长 56，offset 44 为 8 字节裸基址，
+        // 无周期字段（恒 0，周期由硬件寄存器提供）。
+        let mut buf = [0u8; 56];
+        buf[0..4].copy_from_slice(b"HPET");
+        buf[4..8].copy_from_slice(&56u32.to_le_bytes());
+        buf[8] = 1;
+        // offset 36: Event Timer Block ID（实测 0x8086a201：Intel vendor）
+        buf[36..40].copy_from_slice(&0x8086_a201u32.to_le_bytes());
+        // offset 44: 8 字节裸基址（offset 44-47 恰是基址低 32 位，
+        // 会被 `counter_clock_period_fs` 字段读到——QEMU 表无周期字段，
+        // 该值无意义，驱动从硬件寄存器读取真实周期）。
+        buf[44..52].copy_from_slice(&0xFED0_0000u64.to_le_bytes());
+
+        let h = parse_hpet(&buf).unwrap();
+        assert_eq!(h.base_addr, 0xFED0_0000);
+        // 表内无周期字段（offset 44-47 被基址占用），周期由硬件提供。
+        assert_eq!(h.counter_clock_period_fs as u64, 0xFED0_0000);
+        assert_eq!(h.page_protect, 0);
+    }
+
+    #[test]
+    fn hpet_parse_legacy_layout() {
+        // 旧式 HPET 1.0 布局：表长 60，offset 40 为 8 字节裸基址。
+        let mut buf = [0u8; 60];
+        buf[0..4].copy_from_slice(b"HPET");
+        buf[4..8].copy_from_slice(&60u32.to_le_bytes());
+        buf[8] = 1;
+        // offset 36: Event Timer Block ID
+        buf[36..40].copy_from_slice(&0x8001u32.to_le_bytes());
+        // offset 40: 8 字节裸基址（offset 44 为高 32 位，故 offset 44 起 8 字节为 0，
+        // 应回退到 offset 40）
+        buf[40..48].copy_from_slice(&0xFED0_0000u64.to_le_bytes());
+
+        let h = parse_hpet(&buf).unwrap();
+        assert_eq!(h.base_addr, 0xFED0_0000);
+        assert_eq!(h.counter_clock_period_fs, 0);
+        assert_eq!(h.page_protect, 0);
+    }
+
+    #[test]
+    fn hpet_rejects_bad_input() {
+        // 过短
+        assert!(parse_hpet(&[0u8; 40]).is_none());
+        // 完整表但基址为 0 → None
+        let mut buf = [0u8; 76];
+        buf[0..4].copy_from_slice(b"HPET");
+        buf[4..8].copy_from_slice(&76u32.to_le_bytes());
+        buf[8] = 1;
+        buf[52] = 0;
+        buf[56..64].copy_from_slice(&0u64.to_le_bytes());
+        assert!(parse_hpet(&buf).is_none());
+        // 旧式布局但 offset 40 基址为 0 → None
+        let mut buf = [0u8; 60];
+        buf[0..4].copy_from_slice(b"HPET");
+        buf[4..8].copy_from_slice(&60u32.to_le_bytes());
+        buf[8] = 1;
+        assert!(parse_hpet(&buf).is_none());
     }
 }

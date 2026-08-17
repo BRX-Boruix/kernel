@@ -24,6 +24,18 @@ impl Device for AcpiDevice {
 }
 static ACPI_DEVICE: AcpiDevice = AcpiDevice;
 
+/// HPET 设备（高精度事件定时器表）。
+struct HpetDevice;
+impl Device for HpetDevice {
+    fn name(&self) -> &'static str {
+        "hpet"
+    }
+    fn id(&self) -> DeviceId {
+        DeviceId::acpi(*b"HPET")
+    }
+}
+static HPET_DEVICE: HpetDevice = HpetDevice;
+
 /// 是否已成功初始化。
 static INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -37,6 +49,11 @@ static DSDT_ADDR: AtomicU64 = AtomicU64::new(0);
 static PM1A_CNT: AtomicU16 = AtomicU16::new(0);
 /// PM1b 控制块端口。
 static PM1B_CNT: AtomicU16 = AtomicU16::new(0);
+
+/// HPET 寄存器基址（0 = 无 HPET）。
+static HPET_BASE: AtomicU64 = AtomicU64::new(0);
+/// HPET 计数器时钟周期（飞秒，0 = 无 HPET）。
+static HPET_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
 
 /// 初始化 ACPI：解析表 + 登记设备。
 pub fn init() {
@@ -53,11 +70,29 @@ pub fn init() {
             drv::probe_all();
 
             info!("[acpi] initialized (rev={})", info.rsdp_revision);
+
+            // HPET 表（可选）：保存基址/周期供 hpet 驱动使用，并登记设备。
+            if let Some(h) = info.hpet {
+                HPET_BASE.store(h.base_addr, Ordering::Release);
+                HPET_PERIOD_FS.store(h.counter_clock_period_fs as u64, Ordering::Release);
+                drv::register_device(&HPET_DEVICE);
+                drv::probe_all();
+            } else {
+                klib::info!("[acpi] no HPET table");
+            }
         }
         None => {
             klib::warn!("[acpi] init failed (no RSDP/tables)");
         }
     }
+}
+
+/// HPET 探测结果：(寄存器基址, 计数器时钟周期飞秒)，无 HPET 为 `(0, 0)`。
+pub fn hpet_info() -> (u64, u64) {
+    (
+        HPET_BASE.load(Ordering::Acquire),
+        HPET_PERIOD_FS.load(Ordering::Acquire),
+    )
 }
 
 /// 是否已成功解析 ACPI 表。
