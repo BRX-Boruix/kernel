@@ -1458,3 +1458,131 @@ pub fn test_nested_irq_priority() {
 
     info!("[irq] nested IRQ & priority tests PASS");
 }
+
+// ---- M4.3 静态 ELF 加载验收 ----
+
+/// M4.3：构造一个最小的合法 ELF64 可执行文件（text + data 两段）。
+///
+/// 布局：
+/// - ELF header（64B）+ 2 个 program header（各 56B）；
+/// - text 段（RX，vaddr=0x400000）：机器码 `write(1, msg, len); exit(0)`；
+/// - data 段（RW，vaddr=0x401000）：消息字符串 `"Hello from ELF!\n"`。
+///
+/// 这样测试能覆盖多段加载、file 内容拷贝、段权限映射（W^X）。
+#[cfg(feature = "kernel-test-m43")]
+fn build_test_elf() -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+
+    // ---- 机器码：write(1, 0x401000, 16); exit(0) ----
+    let msg: &[u8] = b"Hello from ELF!\n";
+    let mut code: Vec<u8> = Vec::new();
+    // mov rax, 0x2002 (SYS_WRITE)
+    code.extend_from_slice(&[0x48, 0xB8]);
+    code.extend_from_slice(&0x2002u64.to_le_bytes());
+    // mov rdi, 1 (fd=stdout)
+    code.extend_from_slice(&[0x48, 0xBF]);
+    code.extend_from_slice(&1u64.to_le_bytes());
+    // mov rsi, 0x401000 (msg addr)
+    code.extend_from_slice(&[0x48, 0xBE]);
+    code.extend_from_slice(&0x401000u64.to_le_bytes());
+    // mov rdx, msg.len()
+    code.extend_from_slice(&[0x48, 0xBA]);
+    code.extend_from_slice(&(msg.len() as u64).to_le_bytes());
+    // int 0x80
+    code.extend_from_slice(&[0xCD, 0x80]);
+    // mov rax, 0x0003 (SYS_EXIT)
+    code.extend_from_slice(&[0x48, 0xB8]);
+    code.extend_from_slice(&0x0003u64.to_le_bytes());
+    // mov rdi, 0 (code=0)
+    code.extend_from_slice(&[0x48, 0xBF]);
+    code.extend_from_slice(&0u64.to_le_bytes());
+    // int 0x80
+    code.extend_from_slice(&[0xCD, 0x80]);
+
+    let code_len = code.len() as u64;
+    // program header 0 起点 = header(64) + 2 * phdr(56) = 176
+    let code_off: u64 = 64 + 2 * 56;
+    let msg_off: u64 = code_off + code_len;
+
+    // ---- 组装 ELF ----
+    let mut elf: Vec<u8> = Vec::new();
+    let w16 = |v: &mut Vec<u8>, x: u16| v.extend_from_slice(&x.to_le_bytes());
+    let w32 = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_le_bytes());
+    let w64 = |v: &mut Vec<u8>, x: u64| v.extend_from_slice(&x.to_le_bytes());
+
+    // ELF header（64 字节）
+    elf.extend_from_slice(&[0x7f, b'E', b'L', b'F']); // magic
+    elf.push(2); // EI_CLASS = 64-bit
+    elf.push(1); // EI_DATA = LSB
+    elf.push(1); // EI_VERSION
+    elf.extend_from_slice(&[0u8; 9]); // e_ident 剩余
+    w16(&mut elf, 2); // e_type = ET_EXEC
+    w16(&mut elf, 0x3E); // e_machine = x86-64
+    w32(&mut elf, 1); // e_version
+    w64(&mut elf, 0x400000); // e_entry
+    w64(&mut elf, 64); // e_phoff
+    w64(&mut elf, 0); // e_shoff
+    w32(&mut elf, 0); // e_flags
+    w16(&mut elf, 64); // e_ehsize
+    w16(&mut elf, 56); // e_phentsize
+    w16(&mut elf, 2); // e_phnum
+    w16(&mut elf, 0); // e_shentsize
+    w16(&mut elf, 0); // e_shnum
+    w16(&mut elf, 0); // e_shstrndx
+
+    // program header 0：text（RX）
+    w32(&mut elf, 1); // p_type = PT_LOAD
+    w32(&mut elf, 5); // p_flags = PF_R | PF_X
+    w64(&mut elf, code_off); // p_offset
+    w64(&mut elf, 0x400000); // p_vaddr
+    w64(&mut elf, 0); // p_paddr
+    w64(&mut elf, code_len); // p_filesz
+    w64(&mut elf, code_len); // p_memsz
+    w64(&mut elf, 0x1000); // p_align
+
+    // program header 1：data（RW）
+    w32(&mut elf, 1); // p_type = PT_LOAD
+    w32(&mut elf, 6); // p_flags = PF_R | PF_W
+    w64(&mut elf, msg_off); // p_offset
+    w64(&mut elf, 0x401000); // p_vaddr
+    w64(&mut elf, 0); // p_paddr
+    w64(&mut elf, msg.len() as u64); // p_filesz
+    w64(&mut elf, msg.len() as u64); // p_memsz
+    w64(&mut elf, 0x1000); // p_align
+
+    // 段内容：text + data
+    elf.extend_from_slice(&code);
+    elf.extend_from_slice(msg);
+
+    elf
+}
+
+/// M4.3：验证静态 ELF 加载器。
+///
+/// 构造一个最小 ELF64（text + data 两段），用 `elf::load` 加载到用户地址空间，
+/// 再经调度器 spawn 运行。用户程序 `write` 输出 "Hello from ELF!" 后 `exit` 停机。
+/// 验收依据（串口日志）：`[elf] loaded ...`、`Hello from ELF!`、`exit` 停机日志。
+#[cfg(feature = "kernel-test-m43")]
+pub fn test_elf_loader() {
+    use crate::{elf, scheduler};
+    use arch_x86_64::paging::X86PageTable;
+    use mm::user_space::UserAddressSpace;
+
+    info!("[elf-test] === M4.3: static ELF loader ===");
+
+    let elf_bytes = build_test_elf();
+    info!("[elf-test] built test ELF ({} bytes)", elf_bytes.len());
+
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+    let loaded = elf::load(&elf_bytes, &mut us).expect("load elf");
+    info!(
+        "[elf-test] loaded entry={:#x} stack_top={:#x}",
+        loaded.entry, loaded.user_stack_top
+    );
+
+    let pid = scheduler::spawn(loaded.entry, loaded.user_stack_top, us).expect("spawn");
+    info!("[elf-test] spawned pid={} from ELF", pid);
+
+    // 启动调度器（永不返回：用户程序 write 后 exit 停机）。
+    scheduler::start();
+}

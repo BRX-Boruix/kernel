@@ -20,6 +20,10 @@ mod syscall;
 // 调度器（M4.2）依赖进程模型 + syscall，同样 gate 在 kernel-tests 下。
 #[cfg(feature = "kernel-tests")]
 mod scheduler;
+// 静态 ELF 加载器（M4.3）：把 ELF 镜像加载到用户地址空间。目前仅测试使用，
+// 与进程/调度同步 gate；生产化（init 拉用户程序）时解除 gate。
+#[cfg(feature = "kernel-tests")]
+mod elf;
 // 自检测试仅在 `kernel-tests` feature 下编译（SDK `build/br --test`）。
 #[cfg(feature = "kernel-tests")]
 mod tests;
@@ -247,6 +251,11 @@ unsafe fn kmain_body() -> ! {
     // M4.2 调度验收：多进程 RR 轮转（停机验收，不返回主流程），单独 gate。
     #[cfg(feature = "kernel-test-m42")]
     tests::test_scheduler();
+
+    // M4.3 静态 ELF 加载验收：解析并加载 ELF 镜像到用户空间，spawn 运行
+    // （停机验收，不返回主流程），单独 gate。
+    #[cfg(feature = "kernel-test-m43")]
+    tests::test_elf_loader();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。
