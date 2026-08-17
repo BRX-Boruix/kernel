@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+pub mod acpi;
 pub mod cpu;
 pub mod gdt;
 pub mod interrupts;

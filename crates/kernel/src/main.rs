@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod acpi;
 mod drivers;
 mod panic;
 mod pci;
@@ -105,6 +106,11 @@ unsafe fn kmain_body() -> ! {
     mm::init();
     // 物理帧分配器就绪后，给堆注入增长源（按需映射动态堆），此后堆可无限增长
     klib::allocator::set_grow_allocator(heap_grow_source);
+
+    // T6：解析 ACPI 表（RSDP → RSDT/XSDT → FADT），为 shutdown/reboot/
+    // 电源管理铺路；登记 ACPI 设备到驱动框架。
+    // 依赖 HHDM 物理映射（PHYS_OFFSET），须在 mm::init() 之后。
+    acpi::init();
 
     // 验证物理页帧分配/释放
     tests::test_frame_alloc();
