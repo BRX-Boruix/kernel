@@ -49,16 +49,29 @@ impl LazyBuddyAllocator {
 
     pub(crate) fn init_reserve(&self, pages: usize) {
         let mut added = 0usize;
+        let mut first_pfn = 0usize;
+        let mut last_pfn = 0usize;
         while added < pages {
-            if let Some(frame) = self.alloc_global(ORDER_4K, 0) {
-                self.reserve_push(frame);
+            if let Some(pfn) = self.alloc_global(ORDER_4K, 0) {
+                if added == 0 {
+                    first_pfn = pfn;
+                }
+                last_pfn = pfn;
+                self.reserve_push(pfn);
                 added += 1;
             } else {
                 break;
             }
         }
         if added > 0 {
-            info!("PMM: Reserved {} emergency pages", added);
+            info!(
+                "PMM: Reserved {} emergency pages (pfn {}..{} = phys 0x{:x}-0x{:x})",
+                added,
+                first_pfn,
+                last_pfn,
+                first_pfn * 4096,
+                last_pfn * 4096
+            );
         } else {
             warn!("PMM: Failed to reserve emergency pages");
         }

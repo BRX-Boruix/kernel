@@ -2,6 +2,17 @@
 //!
 //! 根据 Limine 内存映射计算物理内存边界、预留元数据存储位置，
 //! 建立 frame 元数据块，并登记未初始化(uninit)区域。
+//!
+//! 初始化日志（`[pmm]`）覆盖每个阶段的**统计数据与过程**：
+//! - usable 区域总数、物理内存边界、总帧数；
+//! - metadata block / 两级稀疏表 / pool 尺寸计算；
+//! - metadata 存储位置选择结果；
+//! - 逐 usable 区域的 process_range：block 覆盖、L1/L2 表按需分配、uninit 登记；
+//! - 收尾：metadata block 用量、uninit region 数、紧急预留。
+//!
+//! 耗时说明：`mm::init()` 发生在时钟源（HPET/LAPIC）注入之前，`klib::time`
+//! 尚不可用，故用 **RDTSC** 计时。通过 CPUID leaf 0x15 探测 TSC 频率，把每个
+//! 阶段的耗时换算成毫秒/秒；探测失败（TCG 下 ECX=0）则退化为只报 cycles。
 
 use core::mem::size_of;
 use core::slice;
@@ -18,6 +29,95 @@ use super::{LazyBuddyAllocator, FREE_LISTS};
 
 /// Buffer for uninit regions count to handle fragmentation
 const PADDING_REGIONS: usize = 16;
+
+/// 读 TSC（相对耗时用；时钟源注入前的早期计时）。
+///
+/// 用编译器内建 `_rdtsc()`（比手写 inline asm 更稳，避免寄存器约束问题）。
+#[inline]
+fn rdtsc() -> u64 {
+    // SAFETY: rdtsc 是单条无副作用的指令，可安全内联。
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// 探测 TSC 频率，返回 `(频率, 来源)`。
+///
+/// 优先 CPUID leaf 0x15（`ECX`=参考频率 Hz，`EBX:EAX`=TSC 倍频比，
+/// `tsc_hz = ECX*EBX/EAX`）；失败则尝试 leaf 0x16（EAX=处理器基频 MHz，近似）。
+/// 用 `core::arch::__cpuid` intrinsic（内联汇编不能用 rbx，LLVM 保留）。
+/// QEMU TCG 下 0x15/0x16 通常都不提供，此时返回 None（退化为纯 cycles）。
+fn tsc_hz() -> Option<(u64, &'static str)> {
+    // 0x15：精确 TSC 频率。
+    let r = core::arch::x86_64::__cpuid(0x15);
+    let (den, num, ref_hz) = (r.eax as u64, r.ebx as u64, r.ecx as u64);
+    if ref_hz != 0 && den != 0 {
+        let hz = ref_hz.saturating_mul(num) / den;
+        if hz != 0 {
+            return Some((hz, "cpuid 0x15"));
+        }
+    }
+    // 0x16：处理器基频（MHz），作为近似兜底。
+    let r = core::arch::x86_64::__cpuid(0x16);
+    let base_mhz = r.eax as u64;
+    if base_mhz != 0 {
+        return Some((base_mhz * 1_000_000, "cpuid 0x16 (approx)"));
+    }
+    None
+}
+
+/// 阶段耗时记录：在初始化各关键点调用 `mark` 打印该阶段耗时。
+///
+/// 用 RDTSC 测相对 cycles；若能探测到 TSC 频率，额外换算成 ns/ms/s。
+struct InitTimer {
+    start: u64,
+    last: u64,
+    hz: Option<u64>,
+}
+
+impl InitTimer {
+    fn new() -> Self {
+        let t = rdtsc();
+        let hz = match tsc_hz() {
+            Some((h, s)) => {
+                info!("[pmm] TSC freq detected: {} Hz ({})", h, s);
+                Some(h)
+            }
+            None => {
+                info!("[pmm] TSC freq unknown (CPUID 0x15/0x16 unsupported); timing in cycles only");
+                None
+            }
+        };
+        Self { start: t, last: t, hz }
+    }
+
+    /// 把 cycles 换算成 `(seconds, millis, nanos)`；无法换算（无频率）则返回 None。
+    fn elapsed(&self, cyc: u64) -> Option<(u64, u64, u64)> {
+        self.hz.map(|hz| {
+            let ns = cyc.saturating_mul(1_000_000_000) / hz;
+            (ns / 1_000_000_000, ns / 1_000_000, ns)
+        })
+    }
+
+    /// 记录自 `last` 以来的耗时，并更新 `last`；返回该阶段 cycles。
+    fn mark(&mut self, label: &str) -> u64 {
+        let now = rdtsc();
+        let cyc = now.wrapping_sub(self.last);
+        self.last = now;
+        match self.elapsed(cyc) {
+            Some((s, ms, ns)) => info!(
+                "[pmm]   -- {}: {} s / {} ms / {} ns ({} cycles)",
+                label, s, ms, ns, cyc
+            ),
+            None => info!("[pmm]   -- {}: {} cycles", label, cyc),
+        }
+        cyc
+    }
+
+    /// 初始化总耗时（cycles）。
+    fn total(&self) -> u64 {
+        rdtsc().wrapping_sub(self.start)
+    }
+}
+
 
 impl LazyBuddyAllocator {
     // Helper to find contiguous memory for metadata structures (O(N))
@@ -134,12 +234,19 @@ impl LazyBuddyAllocator {
     /// This function must be called only once and with valid memory map.
     pub(crate) unsafe fn init(&self, mmap: &[NonNullPtr<MemmapEntry>]) { unsafe {
         FREE_LISTS.call_once(FreeListTable::new);
+        let mut timer = InitTimer::new();
 
         let entries_iter = mmap.iter().map(|e| &*e.as_ptr());
 
         // 1. Calculate physical memory bounds and count usable regions
         let mut max_phys_addr: u64 = 0;
         let mut usable_regions_count: usize = 0;
+
+        // 内存映射入口清单
+        info!(
+            "[pmm] === LazyBuddy init: {} memory-map entries ===",
+            mmap.len()
+        );
 
         for entry in entries_iter.clone() {
             if entry.typ == MemoryMapEntryType::Usable {
@@ -151,14 +258,30 @@ impl LazyBuddyAllocator {
             }
         }
 
+        info!(
+            "[pmm] usable regions: {} (Usable), max phys addr: 0x{:x} ({} MB)",
+            usable_regions_count,
+            max_phys_addr as usize,
+            max_phys_addr / 1024 / 1024
+        );
+
         // Align to 4KB
         // total_frames 覆盖整个地址跨度（含空洞），因为 buddy 索引以 pfn 计，
         // 任意可分配帧的元数据都必须可寻址。但 metadata 池只需覆盖实际 usable 内存。
         let total_frames = (max_phys_addr as usize + 4095) / 4096;
+        info!("[pmm] total_frames (max span incl. holes): {}", total_frames);
 
         // Calculate block parameters
         let frame_size = size_of::<BuddyFrame>();
         let frames_per_block = 4096 / frame_size;
+        let block_size = frames_per_block * 4096; // 每个 metadata block 覆盖的字节数
+        info!(
+            "[pmm] BuddyFrame size: {} B, frames_per_block: {}, block covers {} B ({} KB)",
+            frame_size,
+            frames_per_block,
+            block_size,
+            block_size / 1024
+        );
 
         let metadata_map_len = (total_frames + frames_per_block - 1) / frames_per_block;
 
@@ -166,7 +289,6 @@ impl LazyBuddyAllocator {
         // 统计其覆盖的 block 范围。这样在稀疏内存布局下，metadata 池只按
         // 真实内存量增长，而不是按最大物理地址跨度，避免大内存/空洞机器
         // 上元数据过大导致放不进单个 usable 区域而 panic。
-        let block_size = frames_per_block * 4096; // 每个 metadata block 覆盖的字节数
         let mut needed_blocks = 0usize;
         for entry in entries_iter.clone() {
             if entry.typ != MemoryMapEntryType::Usable {
@@ -183,6 +305,10 @@ impl LazyBuddyAllocator {
             needed_blocks = needed_blocks
                 .saturating_add((last - first + 1).min(metadata_map_len.saturating_sub(first)));
         }
+        info!(
+            "[pmm] metadata_map_len (logical blocks): {}, needed metadata blocks across usable: {}",
+            metadata_map_len, needed_blocks
+        );
 
         // Calculate sizes for arrays.
         // 用 saturating 运算防御极端内存映射下的 usize 溢出。
@@ -208,11 +334,27 @@ impl LazyBuddyAllocator {
         let metadata_pool_size = metadata_pool_blocks.saturating_mul(4096); // one 4K block per metadata block
 
         info!(
-            "PMM: Total RAM: {} MB, Frames: {}, Metadata Pool: {} KB",
-            max_phys_addr / 1024 / 1024,
-            total_frames,
-            metadata_pool_size / 1024
+            "[pmm] L1 table: entries={} size={} B ({}) | L2: entries={}, blocks_per_l1={}",
+            l1_len,
+            metadata_map_size,
+            l1_len,
+            L2_ENTRIES,
+            l2_blocks_per_l1
         );
+        info!(
+            "[pmm] uninit: max_regions={}, array_size={} B",
+            max_uninit_regions, uninit_regions_size
+        );
+        info!(
+            "[pmm] metadata pool: blocks={}, size={} KB (needed={} + pad={} + l2 for {} L1)",
+            metadata_pool_blocks,
+            metadata_pool_size / 1024,
+            needed_blocks,
+            PADDING_REGIONS,
+            l1_len_for_pool
+        );
+
+        timer.mark("memory map & sizing");
 
         // 2. Allocate metadata map array, uninit regions array, and metadata pool
         let (map_paddr, uninit_paddr, pool_paddr) = Self::find_metadata_storage(
@@ -224,6 +366,16 @@ impl LazyBuddyAllocator {
         if map_paddr == 0 {
             panic!("PMM: metadata map placed at paddr 0");
         }
+
+        info!(
+            "[pmm] metadata storage: map=0x{:x} ({} B) uninit=0x{:x} ({} B) pool=0x{:x} ({} KB)",
+            map_paddr,
+            metadata_map_size,
+            uninit_paddr,
+            uninit_regions_size,
+            pool_paddr,
+            metadata_pool_size / 1024
+        );
 
         // Calculate reserved ranges for metadata structures
         let map_end = map_paddr + metadata_map_size;
@@ -257,6 +409,15 @@ impl LazyBuddyAllocator {
             frames_per_block,
         });
 
+        info!(
+            "[pmm] HHDM offset: 0x{:x}, metadata L1 @virt 0x{:x}, uninit array @virt 0x{:x}, pool @virt 0x{:x}",
+            phys_offset,
+            metadata_l1 as usize,
+            uninit_regions_ptr as usize,
+            (phys_offset + pool_paddr as u64) as usize
+        );
+        timer.mark("metadata arrays zeroed");
+
         // 3. Allocate metadata blocks and record uninit regions
         let mut blocks_allocated = 0;
         let mut region_idx = 0;
@@ -274,11 +435,22 @@ impl LazyBuddyAllocator {
             (pool_paddr, pool_end),
         ];
         reserved.sort_unstable_by_key(|r| r.0);
+        info!(
+            "[pmm] reserved metadata ranges: map(0x{:x}-0x{:x}) uninit(0x{:x}-0x{:x}) pool(0x{:x}-0x{:x})",
+            reserved[0].0, reserved[0].1, reserved[1].0, reserved[1].1, reserved[2].0, reserved[2].1
+        );
 
         for entry in entries_iter.clone() {
             if entry.typ == MemoryMapEntryType::Usable {
                 let mut current = entry.base as usize;
                 let region_end = (entry.base + entry.len) as usize;
+                info!(
+                    "[pmm] == process usable region: phys 0x{:x}-0x{:x} ({} MB, {} frames) ==",
+                    current,
+                    region_end,
+                    (region_end - current) / 1024 / 1024,
+                    (region_end - current) / 4096
+                );
 
                 // Process gaps around reserved regions
                 for (r_start, r_end) in reserved.iter() {
@@ -316,12 +488,28 @@ impl LazyBuddyAllocator {
             }
         }
 
+        {
+            let now = rdtsc();
+            let cyc = now.wrapping_sub(timer.last);
+            timer.last = now;
+            match timer.elapsed(cyc) {
+                Some((s, ms, ns)) => info!(
+                    "[pmm]   -- process usable regions ({} s / {} ms / {} ns / {} cycles): blocks_allocated={} / {} uninit_regions={}",
+                    s, ms, ns, cyc, blocks_allocated, metadata_map_len, region_idx
+                ),
+                None => info!(
+                    "[pmm]   -- process usable regions ({} cycles): blocks_allocated={} / {} uninit_regions={}",
+                    cyc, blocks_allocated, metadata_map_len, region_idx
+                ),
+            }
+        }
+
         info!(
-            "PMM: Metadata blocks allocated: {} / {}",
+            "[pmm] Metadata blocks allocated: {} / {}",
             blocks_allocated,
             metadata_map_len
         );
-        info!("PMM: Initialized with {} regions (Capacity: {})", region_idx, uninit_len);
+        info!("[pmm] Initialized with {} regions (Capacity: {})", region_idx, uninit_len);
 
         {
             let mut uninit = self.uninit.lock();
@@ -330,6 +518,20 @@ impl LazyBuddyAllocator {
         }
 
         self.init_reserve(32);
+
+        {
+            let total = timer.total();
+            match timer.elapsed(total) {
+                Some((s, ms, ns)) => info!(
+                    "[pmm] === LazyBuddy init done (total {} s / {} ms / {} ns / {} cycles) ===",
+                    s, ms, ns, total
+                ),
+                None => info!(
+                    "[pmm] === LazyBuddy init done (total {} cycles) ===",
+                    total
+                ),
+            }
+        }
     }}
 
     // Helper to process a range of usable memory
@@ -356,9 +558,19 @@ impl LazyBuddyAllocator {
         let first_block = current / block_size;
         let last_block = (end - 1) / block_size;
 
+        info!(
+            "[pmm]   process_range 0x{:x}-0x{:x} -> blocks [{}, {}] ({} blocks)",
+            current,
+            end,
+            first_block,
+            last_block,
+            last_block.saturating_sub(first_block) + 1
+        );
+
         // Ensure metadata exists for all blocks covered by this range.
         // 通过两级稀疏页表定位：L1[block_idx >> L1_SHIFT] 指向一个二级表，
         // 二级表按需分配（仅在触及该 L1 区间时），从而让索引随真实内存按需生长。
+        let mut l2_tables_allocated = 0usize;
         for block_idx in first_block..=last_block {
             if block_idx >= cfg.metadata_map_len {
                 break;
@@ -375,6 +587,13 @@ impl LazyBuddyAllocator {
                 let l2_base = metadata_pool.alloc_blocks(l2_blocks);
                 core::ptr::write_bytes(l2_base, 0, l2_blocks * metadata_pool.block_size);
                 *l1.add(l1_idx) = l2_base as *mut *mut BuddyFrame;
+                l2_tables_allocated += 1;
+                info!(
+                    "[pmm]     allocated L2 table for L1[{}] @virt 0x{:x} ({} blocks)",
+                    l1_idx,
+                    l2_base as usize,
+                    l2_blocks
+                );
             }
             let l2 = *l1.add(l1_idx);
 
@@ -392,6 +611,13 @@ impl LazyBuddyAllocator {
             }
         }
 
+        if l2_tables_allocated > 0 {
+            info!(
+                "[pmm]     built {} L2 tables, cumulative metadata blocks: {}",
+                l2_tables_allocated, *blocks_allocated
+            );
+        }
+
         // The remaining memory can be used as uninit regions
         if current < end {
             let start_pfn = current / 4096;
@@ -400,6 +626,16 @@ impl LazyBuddyAllocator {
             if start_pfn < end_pfn {
                 if *region_idx < uninit_regions.len() {
                     uninit_regions[*region_idx] = Some(UninitRegion { start_pfn, end_pfn });
+                    info!(
+                        "[pmm]     uninit region #{}: pfn {}..{} -> phys 0x{:x}-0x{:x} ({} frames, {} MB)",
+                        *region_idx,
+                        start_pfn,
+                        end_pfn,
+                        start_pfn * 4096,
+                        end_pfn * 4096,
+                        end_pfn - start_pfn,
+                        (end_pfn - start_pfn) * 4096 / 1024 / 1024
+                    );
                     *region_idx += 1;
                 } else {
                     warn!("PMM: Dropping usable memory region (uninit regions full)");
