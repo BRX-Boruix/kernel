@@ -138,7 +138,34 @@ pub extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
 ///
 /// 真实硬件的 LAPIC 总线频率随 CPU 不同（通常 100MHz~400MHz，QEMU 约
 /// 1GHz），必须实测而不能硬编码。返回 0 表示校准失败。
+///
+/// 校准顺序：**优先用 HPET 高精度时钟**（精确且不受 QEMU TCG 慢速下
+/// PIT 计时失准影响），HPET 不可用时回退 PIT。
 fn calibrate_bus_freq() -> u64 {
+    // 1. HPET 校准：LAPIC 定时器以分频 1、最大初值跑一次性周期，用 HPET
+    //    now_nanos 精确计时 20ms，读 LAPIC 递减 tick 数推算总线频率。
+    if crate::hpet::is_ready() {
+        lapic_write(LAPIC_TIMER, TIMER_VECTOR);
+        lapic_write(LAPIC_TIMER_DIV, 0x0B);
+        lapic_write(LAPIC_TIMER_INIT, 0xFFFF_FFFF);
+
+        let t0 = crate::hpet::now_nanos();
+        let target = t0 + 20_000_000; // 20ms
+        while crate::hpet::now_nanos() < target {
+            core::hint::spin_loop();
+        }
+
+        let remaining = lapic_read(LAPIC_TIMER_CURR);
+        let elapsed = 0xFFFF_FFFFu64 - remaining as u64;
+        let freq = elapsed * 1_000_000_000 / 20_000_000;
+        if freq != 0 {
+            klib::info!("[lapic] bus freq calibrated via HPET = {} Hz", freq);
+            return freq;
+        }
+        klib::warn!("[lapic] HPET calibration gave 0, falling back to PIT");
+    }
+
+    // 2. PIT 校准（HPET 不可用或校准失败时回退）。
     const PIT_CH0_DATA: u16 = 0x40; // PIT 通道 0 数据端口
     const PIT_CMD: u16 = 0x43;      // PIT 命令/控制字端口
     const PIT_PORT_B: u16 = 0x61;   // 0x61：bit4 反映通道 0 输出（反相）
@@ -224,9 +251,17 @@ pub fn init() {
     // 6. 注册 IRQ 处理（vector 0x20 → irq 0）
     interrupts::register_irq(0, lapic_timer_handler);
 
-    // 6. 把 LAPIC tick 源注入 klib 单调时钟（100Hz），此后
-    //    `klib::time::now_nanos`/`sleep_us`/`set_timeout` 可用。
-    klib::time::set_clock_source(ticks, target_hz);
+    // 7. 注入 klib 单调时钟源。**HPET 优先**：纳秒计数（1GHz 时钟源），
+    //    now_nanos 微秒级精度且不受 TCG 下 LAPIC tick 失准影响；LAPIC
+    //    tick 中断仍保留，负责唤醒与 poll_timeouts（软件定时器队列）。
+    //    HPET 不可用时回退 LAPIC tick（100Hz）。
+    if crate::hpet::is_ready() {
+        klib::time::set_clock_source(crate::hpet::now_nanos, 1_000_000_000);
+        klib::info!("[lapic] clock source: HPET (1 GHz ns clock)");
+    } else {
+        klib::time::set_clock_source(ticks, target_hz);
+        klib::info!("[lapic] clock source: LAPIC tick ({} Hz)", target_hz);
+    }
 
     // 标记 LAPIC 已可用（串口锁依赖 LAPIC id 做多核 owner 判断）
     serial::set_lapic_ready();
