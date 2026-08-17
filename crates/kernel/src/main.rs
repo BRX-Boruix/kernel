@@ -7,9 +7,12 @@ mod acpi;
 mod drivers;
 mod panic;
 mod pci;
-mod process;
 mod symbols;
 mod terminal;
+// 进程模型（M3）目前仅在自检中使用：与 `mod tests` 一样，
+// 只在 `kernel-tests` feature 下编译，避免非测试构建的 dead_code 警告。
+#[cfg(feature = "kernel-tests")]
+mod process;
 // 自检测试仅在 `kernel-tests` feature 下编译（SDK `build/br --test`）。
 #[cfg(feature = "kernel-tests")]
 mod tests;

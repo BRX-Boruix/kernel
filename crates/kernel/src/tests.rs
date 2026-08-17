@@ -591,6 +591,7 @@ pub fn test_process_table() {
     info!("[test-process] === M3.1: process table + pid mgmt ===");
 
     let mut table = ProcessTable::<X86PageTable>::new();
+    assert!(table.is_empty(), "fresh table is empty");
 
     // 1. spawn 两个进程，pid 递增（1, 2）
     let us1 = UserAddressSpace::<X86PageTable>::new().expect("us1");
@@ -604,6 +605,7 @@ pub fn test_process_table() {
     assert_eq!(pid1, 1, "first pid should be 1");
     assert_eq!(pid2, 2, "second pid should be 2");
     assert_eq!(table.len(), 2, "two live processes");
+    assert!(!table.is_empty(), "table not empty after spawn");
     assert_eq!(table.count_state(TaskState::Ready), 2, "both ready");
 
     // 2. get / get_mut 访问进程字段
@@ -632,6 +634,20 @@ pub fn test_process_table() {
         pm.set_state(TaskState::Blocked);
     }
     assert_eq!(table.count_state(TaskState::Blocked), 1);
+    assert_eq!(
+        table.count_state(TaskState::Exit),
+        0,
+        "no exited process yet"
+    );
+
+    // 2b. 其余 PCB API（M4 调度 / M3.3 用户映射预留）：pid、上下文、地址空间可变访问
+    {
+        let pm = table.get_mut(pid2).expect("get_mut pid2");
+        assert_eq!(pm.pid(), pid2, "pid() matches slot");
+        assert_eq!(pm.state(), TaskState::Ready);
+        pm.context_mut(); // 上下文访问器（M4 调度用）
+        pm.addr_space_mut(); // 地址空间可变访问器（用户映射用）
+    }
 
     // 3. terminate 回收 pid，再 spawn 复用
     assert!(table.terminate(pid1), "terminate pid1");
