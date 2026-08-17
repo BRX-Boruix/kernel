@@ -70,6 +70,20 @@ pub struct CowPage {
     pub flags: PageFlags,
 }
 
+/// 共享内存（shm）映射记账：本地址空间把某 shm 对象的物理帧映射到的区间。
+///
+/// 与 `areas` 分离：shm 帧归 shm 对象所有（多个进程共享），解映射/进程销毁时
+/// **不能**释放这些帧（否则破坏其它进程的共享视图），故单独记账、单独清理。
+#[derive(Clone, Copy)]
+pub struct ShmMap {
+    /// shm 对象 id。
+    pub id: u64,
+    /// 起始虚拟地址（页对齐）。
+    pub vaddr: u64,
+    /// 结束虚拟地址（不含，页对齐）。
+    pub end: u64,
+}
+
 /// 用户地址空间：持有独立页表 `PT`，管理用户区。
 pub struct UserAddressSpace<PT: PageTable> {
     /// 独立页表（继承内核映射 + 独立用户区）。
@@ -82,6 +96,8 @@ pub struct UserAddressSpace<PT: PageTable> {
     heap_break: u64,
     /// 写时复制共享页记账（M5 COW）。
     cow_pages: spin::Mutex<Vec<CowPage>>,
+    /// 共享内存映射记账（M5 IPC）。
+    shm_maps: spin::Mutex<Vec<ShmMap>>,
 }
 
 impl<PT> UserAddressSpace<PT>
@@ -99,6 +115,7 @@ where
             next_mmap: USER_HEAP_BASE + 16 * 1024 * 1024,
             heap_break: USER_HEAP_BASE,
             cow_pages: spin::Mutex::new(Vec::new()),
+            shm_maps: spin::Mutex::new(Vec::new()),
         })
     }
 
@@ -357,6 +374,22 @@ where
             child_cow.push(cow);
         }
         *child.cow_pages.lock() = child_cow;
+        // 共享内存映射区：子地址空间独立页表，需重新映射同一批物理帧（不复制
+        // 记账引用——帧归 shm 对象，子进程映射不额外持有引用，保持简单）。
+        *child.shm_maps.lock() = self.shm_maps.lock().clone();
+        for m in self.shm_maps.lock().iter() {
+            let npages = ((m.end - m.vaddr) / 0x1000) as usize;
+            for i in 0..npages {
+                if let Some(phys) = self.pt.translate(VirtAddr::new(m.vaddr + (i as u64) * 0x1000)) {
+                    child.pt.map(
+                        VirtAddr::new(m.vaddr + (i as u64) * 0x1000),
+                        phys,
+                        PageSize::Size4K,
+                        PageFlags::empty().writable().user(),
+                    )?;
+                }
+            }
+        }
         Ok(child)
     }
 
@@ -434,57 +467,126 @@ where
         if size == 0 {
             return Err(Error::InvalidParam.into());
         }
-        // 收集所有已声明区域的 [start, end) 并排序（含栈区/堆区/mmap 区）。
+        let gap_start = self.find_free_region(size).ok_or(Error::NoSpace)?;
+        let end = gap_start + size;
+        self.reserve_user(
+            VirtAddr::new(gap_start),
+            VirtAddr::new(end),
+            PageSize::Size4K,
+            flags,
+        )?;
+        self.next_mmap = end;
+        Ok(gap_start)
+    }
+
+    /// 在用户半区找一个能容纳 `size`（页对齐）的空闲虚拟区间，不记账。
+    ///
+    /// 采用**确定性线性扫描**（非翻倍步进）：收集所有已声明区域，排序后从
+    /// `next_mmap` 起逐个空隙寻找能容纳 `size` 的区间。这样保证**穷尽**——
+    /// 只要存在足够大的空隙就一定能找到，不会像翻倍步进那样跳过大段空闲区间
+    /// 而误报"no free mmap region"。扫描区间数即已声明区域数，规模很小。
+    ///
+    /// 返回区间起始地址（页对齐），仅供调用方决定（`mmap_user` 记账为按需分页
+    /// 预留区；`map_shm` 记账为共享内存映射）。
+    fn find_free_region(&self, size: u64) -> Option<u64> {
+        if size == 0 {
+            return None;
+        }
         let mut regions: Vec<(u64, u64)> = self
             .areas
             .lock()
             .iter()
             .map(|a| (a.start.as_u64(), a.end.as_u64()))
             .collect();
+        // 共享内存映射区也要参与空隙计算，避免与 shm 区重叠。
+        for s in self.shm_maps.lock().iter() {
+            regions.push((s.vaddr, s.end));
+        }
         regions.sort_unstable();
 
-        // 从 hint 起，在排序后的空隙中找第一个能容纳 size 的区间。
-        // 候选扫描范围上限：栈区下方（栈区是固定区域，mmap 不进入栈区）。
         let top_limit = USER_STACK_TOP - 8 * 1024 * 1024;
         let candidate = align_up(self.next_mmap, 4096);
-        // 遍历空隙：当前候选之前的已用区边界（初始为 hint 起点）。
         let mut prev_end = candidate;
         for (rs, re) in regions.iter() {
             let rs = align_up(*rs, 4096);
-            // 本空隙 = [max(candidate, prev_end), rs)。
             let gap_start = candidate.max(prev_end);
             if gap_start < rs {
-                // 空隙足够容纳 size 且不越过栈区上限 → 命中
                 let end = gap_start.checked_add(size).unwrap_or(u64::MAX);
                 if end <= rs && end <= top_limit {
-                    self.reserve_user(
-                        VirtAddr::new(gap_start),
-                        VirtAddr::new(end),
-                        PageSize::Size4K,
-                        flags,
-                    )?;
-                    self.next_mmap = end;
-                    return Ok(gap_start);
+                    return Some(gap_start);
                 }
             }
             prev_end = prev_end.max(*re);
         }
-        // 最后一个已用区之后（到 top_limit 之前）的空隙
         let gap_start = candidate.max(prev_end);
         if gap_start < top_limit {
             let end = gap_start.checked_add(size).unwrap_or(u64::MAX);
             if end <= top_limit {
-                self.reserve_user(
-                    VirtAddr::new(gap_start),
-                    VirtAddr::new(end),
-                    PageSize::Size4K,
-                    flags,
-                )?;
-                self.next_mmap = end;
-                return Ok(gap_start);
+                return Some(gap_start);
             }
         }
-        Err(Error::NoSpace.into())
+        None
+    }
+
+    /// 把共享内存对象 `id` 的物理帧映射到本地址空间（M5 IPC）。
+    ///
+    /// 分配一段空闲虚拟区间，把 `frames` 逐页映射（带 user/可写）。**不**把该
+    /// 区间记入 `areas`（帧归 shm 对象所有，多进程共享，解映射时不能释放），
+    /// 而记入独立的 `shm_maps`。返回映射起始虚拟地址。
+    pub fn map_shm(
+        &mut self,
+        id: u64,
+        frames: &[u64],
+        size: u64,
+    ) -> Result<u64, PT::Error> {
+        let size = align_up(size, 4096);
+        let npages = (size / 0x1000) as usize;
+        if npages == 0 || frames.len() < npages {
+            return Err(Error::InvalidParam.into());
+        }
+        let gap_start = self.find_free_region(size).ok_or(Error::NoSpace)?;
+        let flags = PageFlags::empty().writable().user();
+        for i in 0..npages {
+            self.pt.map(
+                VirtAddr::new(gap_start + (i as u64) * 0x1000),
+                PhysAddr::new(frames[i]),
+                PageSize::Size4K,
+                flags,
+            )?;
+        }
+        self.next_mmap = gap_start + size;
+        self.shm_maps.lock().push(ShmMap {
+            id,
+            vaddr: gap_start,
+            end: gap_start + size,
+        });
+        Ok(gap_start)
+    }
+
+    /// 解除本地址空间对共享内存对象 `id` 的映射（**不释放帧**，帧归 shm 对象）。
+    ///
+    /// 找到该 id 的映射区间，逐页 `unmap`（返回物理帧但交给 shm 对象管理），
+    /// 并从 `shm_maps` 记账移除。返回被解映射的区间起始地址。
+    pub fn unmap_shm(&mut self, id: u64) -> Result<u64, PT::Error> {
+        let mut maps = self.shm_maps.lock();
+        let Some(idx) = maps.iter().position(|m| m.id == id) else {
+            return Err(Error::NotFound.into());
+        };
+        let m = maps[idx];
+        let mut v = m.vaddr;
+        while v < m.end {
+            // 忽略解映射结果（帧不在此释放，交由 shm 对象 / 最后一次 unmap 时释放）。
+            let _ = self.pt.unmap(VirtAddr::new(v));
+            v += 0x1000;
+        }
+        maps.remove(idx);
+        Ok(m.vaddr)
+    }
+
+    /// 共享内存映射数（诊断）。
+    #[allow(dead_code)]
+    pub fn shm_map_count(&self) -> usize {
+        self.shm_maps.lock().len()
     }
 
     /// 在固定栈顶下方预留用户栈区（向下增长，按需分页）。

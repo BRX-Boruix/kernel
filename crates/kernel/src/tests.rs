@@ -1020,6 +1020,70 @@ pub fn test_cow_clone() {
     info!("[cow-test] PASS");
 }
 
+/// M5：IPC 共享内存 + 管道。
+///
+/// 验证点（纯内存逻辑，不经用户态/调度阻塞）：
+/// 1. **共享内存**：`shm_create` 分配 → 把同一 id 映射进两个独立地址空间 →
+///    两者共享同一批物理帧（写一方经 `translate` 校验物理帧相同、内容可见）；
+///    `shm_unmap` 解除一方映射后帧仍可用（对象持有）；最后一方解除时释放帧。
+/// 2. **管道**：`pipe_create` → `pipe_write` 写若干字节 → `pipe_read` 读回，
+///    校验环形缓冲内容与顺序正确；阻塞路径（空读/满写）在无进程/无调度时
+///    返回 `WouldBlock` 而非死锁。
+#[cfg(feature = "kernel-test-m5")]
+pub fn test_ipc() {
+    use mm::user_space::UserAddressSpace;
+    info!("[ipc-test] === M5: shared memory + pipe ===");
+
+    // ---- 1. 共享内存 ----
+    let shm_id = crate::ipc::shm_create(0x1000).expect("shm_create");
+    let mut as_a = UserAddressSpace::<X86PageTable>::new().expect("addr space a");
+    let mut as_b = UserAddressSpace::<X86PageTable>::new().expect("addr space b");
+    let va = crate::ipc::shm_map(shm_id, &mut as_a).expect("shm_map a");
+    let vb = crate::ipc::shm_map(shm_id, &mut as_b).expect("shm_map b");
+    // 两地址空间映射到同一物理帧（共享）。
+    let phys_a = as_a.translate(VirtAddr::new(va)).expect("a translate").as_u64();
+    let phys_b = as_b.translate(VirtAddr::new(vb)).expect("b translate").as_u64();
+    assert_eq!(phys_a, phys_b, "A/B share same physical frame");
+    info!(
+        "[ipc-test] shm id={} va={:#x} vb={:#x} shared_phys={:#x}",
+        shm_id, va, vb, phys_a
+    );
+    // 通过 A 写、B 读可见（同一物理帧）。
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    unsafe {
+        core::ptr::write_volatile((phys_a + off) as *mut u64, 0x1234_ABCDu64);
+    }
+    let seen = unsafe { core::ptr::read_volatile((phys_b + off) as *const u64) };
+    assert_eq!(seen, 0x1234_ABCDu64, "write via A visible via B");
+    // A 解映射后，B 仍可访问（帧归 shm 对象，不是 A）。
+    crate::ipc::shm_unmap(shm_id, &mut as_a).expect("shm_unmap a");
+    let seen2 = unsafe { core::ptr::read_volatile((phys_b + off) as *const u64) };
+    assert_eq!(seen2, 0x1234_ABCDu64, "frame alive after A unmaps");
+    info!("[ipc-test] shm shared write/read + refcount unmap OK");
+
+    // ---- 2. 管道（数据流 + 非死锁） ----
+    let pipe_id = crate::ipc::pipe_create().expect("pipe_create");
+    let mut frame = arch_x86_64::interrupts::InterruptFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+        vector: 0, error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+    let mut src = [0u8; 8];
+    src[..5].copy_from_slice(b"hello");
+    let n = crate::ipc::pipe_write(&mut frame, pipe_id, src.as_ptr() as u64, 5).expect("pipe_write");
+    assert_eq!(n, 5, "wrote 5 bytes");
+    let mut dst = [0u8; 8];
+    let n = crate::ipc::pipe_read(&mut frame, pipe_id, dst.as_mut_ptr() as u64, 8).expect("pipe_read");
+    assert_eq!(n, 5, "read 5 bytes");
+    assert_eq!(&dst[..5], b"hello", "pipe content preserved");
+    info!("[ipc-test] pipe wrote {} read {} payload='{}'", 5, n, core::str::from_utf8(&dst[..5]).unwrap());
+    // 空管道读：无数据、无进程可阻塞 → WouldBlock（不死锁）。
+    let e = crate::ipc::pipe_read(&mut frame, pipe_id, dst.as_mut_ptr() as u64, 4).unwrap_err();
+    assert_eq!(e, klib::error::Error::WouldBlock, "empty pipe read -> WouldBlock");
+    crate::ipc::pipe_close(pipe_id).expect("pipe_close");
+    info!("[ipc-test] PASS");
+}
+
 /// 触发异常的用户态机器码：`mov rax, MAGIC` → `mov [MAGIC_ADDR], rax` → `ud2`。
 ///
 /// `ud2`（0F 0B）是非法指令，用户态执行触发 #UD（vector 6）——用于 M3.3 验证

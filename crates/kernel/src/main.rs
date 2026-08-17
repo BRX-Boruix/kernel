@@ -28,6 +28,9 @@ mod elf;
 // 归类打印（SIGSEGV/SIGILL 等）。完整信号框架（派发/handler 回调）留待 M5。
 #[cfg(feature = "kernel-tests")]
 mod signals;
+// IPC（M5）：共享内存 + 管道。依赖进程/调度（阻塞唤醒）与 syscall 分发。
+#[cfg(feature = "kernel-tests")]
+mod ipc;
 // 自检测试仅在 `kernel-tests` feature 下编译（SDK `build/br --test`）。
 #[cfg(feature = "kernel-tests")]
 mod tests;
@@ -270,6 +273,8 @@ unsafe fn kmain_body() -> ! {
     // 逻辑验收，不进入用户态、不依赖 tick，返回主流程继续启动）。单独 gate。
     #[cfg(feature = "kernel-test-m5")]
     tests::test_cow_clone();
+    #[cfg(feature = "kernel-test-m5")]
+    tests::test_ipc();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。

@@ -34,6 +34,10 @@ mod domain {
     /// 预留域（syscall 表契约，后续实现 device 域 handler）。
     #[allow(dead_code)]
     pub const DEVICE: u32 = 0x50;
+    /// IPC 域（M5）：共享内存。
+    pub const IPC_SHM: u32 = 0x60;
+    /// IPC 域（M5）：管道。
+    pub const IPC_PIPE: u32 = 0x61;
     pub const SYSTEM: u32 = 0xF0;
 }
 
@@ -72,6 +76,24 @@ pub const SYS_SLEEP: u32 = nr(domain::TIME, op::WRITE); // 0x3002 sleep(ns)
 #[allow(dead_code)]
 pub const SYS_RANDOM: u32 = nr(domain::RANDOM, op::READ); // 0x4001 fill(buf, len)
 pub const SYS_INFO: u32 = nr(domain::SYSTEM, op::QUERY); // 0xF005 info(what) -> u64
+
+// ---- M5 IPC 共享内存 ----
+/// `shm_create(size) -> id`：分配一组物理帧登记为共享对象。
+pub const SYS_SHM_CREATE: u32 = nr(domain::IPC_SHM, op::CREATE); // 0x6000
+/// `shm_unmap(id)`：解除当前进程映射，最后一次时释放帧并移除对象。
+pub const SYS_SHM_UNMAP: u32 = nr(domain::IPC_SHM, op::CLOSE); // 0x6003
+/// `shm_map(id) -> addr`：把对象帧映射进当前进程地址空间。
+pub const SYS_SHM_MAP: u32 = nr(domain::IPC_SHM, op::QUERY); // 0x6005
+
+// ---- M5 IPC 管道 ----
+/// `pipe_create() -> id`：新建空管道。
+pub const SYS_PIPE_CREATE: u32 = nr(domain::IPC_PIPE, op::CREATE); // 0x6100
+/// `pipe_read(id, buf, len) -> n`：阻塞读。
+pub const SYS_PIPE_READ: u32 = nr(domain::IPC_PIPE, op::READ); // 0x6101
+/// `pipe_write(id, buf, len) -> n`：阻塞写。
+pub const SYS_PIPE_WRITE: u32 = nr(domain::IPC_PIPE, op::WRITE); // 0x6102
+/// `pipe_close(id)`：销毁管道。
+pub const SYS_PIPE_CLOSE: u32 = nr(domain::IPC_PIPE, op::CLOSE); // 0x6103
 
 /// `sys::info` 查询项。
 pub const INFO_VERSION: u64 = 0; // 内核版本号
@@ -184,6 +206,80 @@ fn sys_info(frame: &mut InterruptFrame) -> u64 {
     }
 }
 
+// ---------- M5 IPC handlers ----------
+
+/// 取当前进程的可变用户地址空间（失败返回 NotFound）。
+fn cur_addr_space() -> Result<
+    &'static mut mm::user_space::UserAddressSpace<arch_x86_64::paging::X86PageTable>,
+    Error,
+> {
+    current_proc_mut()
+        .map(|p| p.addr_space_mut())
+        .ok_or(Error::NotFound)
+}
+
+/// `shm_create(size) -> id`。
+fn sys_shm_create(frame: &mut InterruptFrame) -> u64 {
+    match crate::ipc::shm_create(frame.rdi) {
+        Ok(id) => pack_ok(id),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `shm_map(id) -> addr`。
+fn sys_shm_map(frame: &mut InterruptFrame) -> u64 {
+    let Ok(addr_space) = cur_addr_space() else {
+        return pack_err(Error::NotFound);
+    };
+    match crate::ipc::shm_map(frame.rdi, addr_space) {
+        Ok(a) => pack_ok(a),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `shm_unmap(id)`。
+fn sys_shm_unmap(frame: &mut InterruptFrame) -> u64 {
+    let Ok(addr_space) = cur_addr_space() else {
+        return pack_err(Error::NotFound);
+    };
+    match crate::ipc::shm_unmap(frame.rdi, addr_space) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `pipe_create() -> id`。
+fn sys_pipe_create(_frame: &mut InterruptFrame) -> u64 {
+    match crate::ipc::pipe_create() {
+        Ok(id) => pack_ok(id),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `pipe_read(id, buf, len) -> n`：阻塞读。
+fn sys_pipe_read(frame: &mut InterruptFrame) -> u64 {
+    match crate::ipc::pipe_read(frame, frame.rdi, frame.rsi, frame.rdx) {
+        Ok(n) => pack_ok(n),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `pipe_write(id, buf, len) -> n`：阻塞写。
+fn sys_pipe_write(frame: &mut InterruptFrame) -> u64 {
+    match crate::ipc::pipe_write(frame, frame.rdi, frame.rsi, frame.rdx) {
+        Ok(n) => pack_ok(n),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `pipe_close(id)`。
+fn sys_pipe_close(frame: &mut InterruptFrame) -> u64 {
+    match crate::ipc::pipe_close(frame.rdi) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
 /// `exit(code)`：终止当前进程（单进程无调度：清理后停机）。永不返回。
 fn sys_exit(frame: &mut InterruptFrame) -> ! {
     let code = frame.rdi;
@@ -208,6 +304,13 @@ fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
         SYS_SLEEP => sys_sleep(frame),
         SYS_YIELD => sys_yield(frame),
         SYS_INFO => sys_info(frame),
+        SYS_SHM_CREATE => sys_shm_create(frame),
+        SYS_SHM_MAP => sys_shm_map(frame),
+        SYS_SHM_UNMAP => sys_shm_unmap(frame),
+        SYS_PIPE_CREATE => sys_pipe_create(frame),
+        SYS_PIPE_READ => sys_pipe_read(frame),
+        SYS_PIPE_WRITE => sys_pipe_write(frame),
+        SYS_PIPE_CLOSE => sys_pipe_close(frame),
         SYS_EXIT => sys_exit(frame),
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);

@@ -272,6 +272,64 @@ pub fn yield_now(frame: &mut InterruptFrame) -> bool {
     true
 }
 
+/// 阻塞当前进程（IPC 等待用）：保存帧并置 `Blocked`，切换到下一个就绪进程。
+///
+/// 与 [`yield_now`] 不同，当前进程**不**放回就绪队列，而是置 `Blocked`（等待某
+/// 事件，如管道数据/空间）。需 [`wake`] 显式唤醒才回到就绪队列。
+///
+/// 返回 `false` 表示无可调度进程可切（就绪队列空，只有当前进程）：此时**不应**
+/// 阻塞（否则系统无进程能唤醒它，死锁），调用方应返回 `WouldBlock` 等错误而非
+/// 强行让出。返回 `true` 表示已切走（frame 已改写为下一进程帧）。
+///
+/// 注意：调用方**必须先释放**持有的 IPC 表锁再调用本函数（阻塞切走时若仍持锁，
+/// 下一进程会在同一把 IrqSpinLock 上自旋死锁）。
+pub fn block_current(frame: &mut InterruptFrame) -> bool {
+    let mut s = SCHED.lock();
+    let Some(cur_pid) = s.current else {
+        return false; // 内核 idle/主线程不参与阻塞
+    };
+    if let Some(slot) = s.procs[cur_pid].as_mut() {
+        slot.saved = *frame;
+        slot.proc.set_state(TaskState::Blocked);
+    }
+    // 取下一个就绪进程。
+    let Some(next_pid) = s.ready.pop_front() else {
+        return false; // 无可调度进程：调用方不应阻塞
+    };
+    if cur_pid == next_pid {
+        // 仅当前进程自身：不阻塞（保持 Running 继续）。
+        if let Some(slot) = s.procs[next_pid].as_mut() {
+            slot.proc.set_state(TaskState::Running);
+        }
+        return false;
+    }
+    let slot = s.procs[next_pid].as_mut().expect("ready proc exists");
+    slot.proc.set_state(TaskState::Running);
+    *frame = slot.saved;
+    let cr3 = slot.proc.addr_space_mut().page_table_paddr();
+    let ktop = slot.kstack_top;
+    let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
+    s.current = Some(next_pid);
+    klib::info!("[sched] block {} -> {}", cur_pid, next_pid);
+    arch_x86_64::mmio::write_cr3(cr3);
+    gdt::set_rsp0(ktop);
+    set_current_proc(proc_ptr);
+    true
+}
+
+/// 唤醒一个阻塞的进程（IPC 写/读端完成时调用）：置 `Ready` 并入就绪队列。
+///
+/// 仅当目标进程处于 `Blocked` 时才生效（已就绪/运行中进程忽略，避免重复入队）。
+pub fn wake(pid: usize) {
+    let mut s = SCHED.lock();
+    if let Some(slot) = s.procs.get_mut(pid).and_then(|p| p.as_mut()) {
+        if slot.proc.state() == TaskState::Blocked {
+            slot.proc.set_state(TaskState::Ready);
+            s.ready.push_back(pid);
+        }
+    }
+}
+
 /// 启动调度器（内核 idle 主循环）：取第一个就绪进程，经 `enter_usermode` 进入
 /// 其用户态。进程在用户态被 tick 打断后由 [`tick`] 轮转。永不返回。
 pub fn start() -> ! {
