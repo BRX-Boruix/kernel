@@ -193,37 +193,41 @@ pub fn test_demand_paging() {
     // 预留区域尚未映射
     assert!(us.translate(start).is_none(), "reserved page should be unmapped");
 
-    // 设置当前地址空间 + 注册 #PF 回调
+    // 注册 #PF 回调（指向本地址空间的缺页处理器）
     let us_ptr = &mut us as *mut mm::user_space::UserAddressSpace<X86PageTable> as usize;
     TEST_FAULT_US.store(us_ptr, Ordering::SeqCst);
     mm::user_space::set_page_fault_handler(test_fault_handler);
 
-    // 激活用户页表，真实访问预留地址 → 触发 #PF → 按需补页
-    us.activate();
-    info!("[test-demand] accessing reserved addr (will #PF -> demand map)...");
-    // 读预留页：present=0 → #PF → handler 补页 → 重试成功，读到 0
-    let val = unsafe { core::ptr::read_volatile(start.as_u64() as *const u32) };
-    info!("[test-demand] read reserved addr -> {:#x} (mapped on demand)", val);
-    assert_eq!(val, 0);
+    // 严格隔离（SMEP/SMAP）下内核态禁止访问用户虚拟地址，不能靠真实访问触发 #PF
+    // （会被 SMAP 拦截，且内核态 #PF 不再交给 demand-paging 处理器）。改为直接驱动
+    // 缺页处理器，验证"预留地址 + 写访问 → 补页"逻辑：error_code bit1(W) 置位。
+    info!("[test-demand] driving fault handler for reserved addr (demand map)...");
+    let ok = mm::user_space::page_fault_entry(start.as_u64(), 0b10);
+    info!("[test-demand] demand-map via handler -> {}", ok);
+    assert!(ok, "demand paging should map reserved page");
 
     // 翻译应命中
     let phys = us.translate(start).expect("translated after demand map");
     info!("[test-demand] translate -> {:#x}", phys.as_u64());
 
-    // 可写
-    unsafe { core::ptr::write_volatile(start.as_u64() as *mut u32, 0xCAFE) };
-    let v2 = unsafe { core::ptr::read_volatile(start.as_u64() as *const u32) };
-    assert_eq!(v2, 0xCAFE);
-    info!("[test-demand] write/read -> {:#x}", v2);
+    // 经物理 HHDM（supervisor 映射）验证补页内容为零、且可写入/读回——绕过 SMAP
+    // （不访问 USER 权限的用户虚拟地址，避免内核态 SMAP 拦截）。
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let pv = (phys.as_u64() + off) as *mut u32;
+    let v0 = unsafe { core::ptr::read_volatile(pv) };
+    assert_eq!(v0, 0, "demand-mapped page should be zeroed");
+    unsafe { core::ptr::write_volatile(pv, 0xCAFE) };
+    let v1 = unsafe { core::ptr::read_volatile(pv) };
+    assert_eq!(v1, 0xCAFE);
+    info!("[test-demand] write/read via phys map -> {:#x}", v1);
 
     // 非法访问（未预留地址）：handler 应返回 false
     let bad = 0x0000_0000_7000_0000u64;
-    let ok = mm::user_space::page_fault_entry(bad, 0);
-    info!("[test-demand] illegal access handled? {}", ok);
-    assert!(!ok, "unreserved access must be rejected");
+    let ok2 = mm::user_space::page_fault_entry(bad, 0);
+    info!("[test-demand] illegal access handled? {}", ok2);
+    assert!(!ok2, "unreserved access must be rejected");
 
-    // 切回内核页表
-    X86PageTable::current().activate();
+    // 清理
     mm::user_space::set_page_fault_handler(noop_fault_handler);
     TEST_FAULT_US.store(0, Ordering::SeqCst);
 
@@ -283,33 +287,54 @@ pub fn test_address_space_alloc() {
     assert_eq!(b1, USER_HEAP_BASE + 32 * 1024);
     assert_eq!(us.heap_break(), b1);
 
-    // 4. 访问栈区触发 #PF 按需补页（复用全局 handler 机制）
+    // 4. 访问栈/mmap/heap 区触发按需补页：严格隔离下内核态禁止访问用户虚拟地址，
+    //    故直接驱动缺页处理器（error_code bit1=W），再经物理 HHDM（supervisor 映射）
+    //    验证读写——绕过 SMAP（不访问 USER 权限的用户虚拟地址）。
     let us_ptr = &mut us as *mut mm::user_space::UserAddressSpace<X86PageTable> as usize;
     TEST_FAULT_US.store(us_ptr, Ordering::SeqCst);
     mm::user_space::set_page_fault_handler(test_fault_handler);
-    us.activate();
+
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let phys_of = |vaddr: u64| -> u64 {
+        us.translate(VirtAddr::new(vaddr))
+            .expect("demand-mapped")
+            .as_u64()
+            + off
+    };
 
     // 栈底附近写（栈顶向下 4KiB 内）
     let sp = USER_STACK_TOP - 8;
-    unsafe { core::ptr::write_volatile((sp - 4) as *mut u32, 0xBEEF) };
-    let sv = unsafe { core::ptr::read_volatile((sp - 4) as *const u32) };
+    assert!(
+        mm::user_space::page_fault_entry(sp - 4, 0b10),
+        "stack demand map"
+    );
+    unsafe { core::ptr::write_volatile(phys_of(sp - 4) as *mut u32, 0xBEEF) };
+    let sv = unsafe { core::ptr::read_volatile(phys_of(sp - 4) as *const u32) };
     info!("[test-alloc] stack write/read -> {:#x}", sv);
     assert_eq!(sv, 0xBEEF);
 
     // mmap 区访问补页
-    unsafe { core::ptr::write_volatile(m1 as *mut u32, 0x1234) };
-    let mv = unsafe { core::ptr::read_volatile(m1 as *const u32) };
+    assert!(
+        mm::user_space::page_fault_entry(m1, 0b10),
+        "mmap demand map"
+    );
+    unsafe { core::ptr::write_volatile(phys_of(m1) as *mut u32, 0x1234) };
+    let mv = unsafe { core::ptr::read_volatile(phys_of(m1) as *const u32) };
     info!("[test-alloc] mmap write/read -> {:#x}", mv);
     assert_eq!(mv, 0x1234);
 
     // 堆区访问补页
-    unsafe { core::ptr::write_volatile((USER_HEAP_BASE + 0x1000) as *mut u32, 0x5678) };
-    let hv = unsafe { core::ptr::read_volatile((USER_HEAP_BASE + 0x1000) as *const u32) };
+    let hv_addr = USER_HEAP_BASE + 0x1000;
+    assert!(
+        mm::user_space::page_fault_entry(hv_addr, 0b10),
+        "heap demand map"
+    );
+    unsafe { core::ptr::write_volatile(phys_of(hv_addr) as *mut u32, 0x5678) };
+    let hv = unsafe { core::ptr::read_volatile(phys_of(hv_addr) as *const u32) };
     info!("[test-alloc] heap write/read -> {:#x}", hv);
     assert_eq!(hv, 0x5678);
 
-    // 切回内核页表，清理
-    X86PageTable::current().activate();
+    // 清理
     mm::user_space::set_page_fault_handler(noop_fault_handler);
     TEST_FAULT_US.store(0, Ordering::SeqCst);
     info!("[test-alloc] PASS");

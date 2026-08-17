@@ -160,10 +160,13 @@ pub fn pipe_write(frame: &mut InterruptFrame, id: u64, src: u64, len: u64) -> Re
             let Some(pipe) = table.get_mut(&id) else {
                 return Err(Error::NotFound);
             };
+            // 内核读用户缓冲区：SMAP 下需 STAC 临时放行（在持锁块内，block 前必 CLAC）。
+            unsafe { arch_x86_64::mmio::stac() };
             while written < len && pipe.buf.len() < PIPE_CAPACITY {
                 pipe.buf.push_back(unsafe { *((src + written as u64) as *const u8) });
                 written += 1;
             }
+            unsafe { arch_x86_64::mmio::clac() };
             if written > 0 {
                 for w in pipe.read_waiters.drain(..) {
                     crate::scheduler::wake(w);
@@ -200,11 +203,14 @@ pub fn pipe_read(frame: &mut InterruptFrame, id: u64, dst: u64, len: u64) -> Res
             let Some(pipe) = table.get_mut(&id) else {
                 return Err(Error::NotFound);
             };
+            // 内核写用户缓冲区：SMAP 下需 STAC 临时放行（在持锁块内，block 前必 CLAC）。
+            unsafe { arch_x86_64::mmio::stac() };
             while got < len && !pipe.buf.is_empty() {
                 let b = pipe.buf.pop_front().expect("nonempty");
                 unsafe { *((dst + got as u64) as *mut u8) = b };
                 got += 1;
             }
+            unsafe { arch_x86_64::mmio::clac() };
             if got > 0 {
                 for w in pipe.write_waiters.drain(..) {
                     crate::scheduler::wake(w);

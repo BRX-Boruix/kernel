@@ -140,8 +140,9 @@ fn sys_write(frame: &mut InterruptFrame) -> u64 {
     let mut off = 0usize;
     while off < len as usize {
         let n = core::cmp::min(len as usize - off, CHUNK);
+        // 用户缓冲区位于用户半区（USER 权限页）；SMAP 下内核读取需 STAC 临时放行。
         unsafe {
-            core::ptr::copy_nonoverlapping((buf + off as u64) as *const u8, chunk.as_mut_ptr(), n);
+            arch_x86_64::mmio::copy_from_user(chunk.as_mut_ptr(), buf + off as u64, n);
         }
         let s = core::str::from_utf8(&chunk[..n]).unwrap_or("\u{FFFD}");
         klib::console::write_str(s);

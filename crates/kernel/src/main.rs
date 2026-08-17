@@ -115,6 +115,10 @@ unsafe fn kmain_body() -> ! {
 
     // T4：探测 CPU 特性（CPUID/vendor/brand；BSP 单线程阶段，结果缓存到静态）。
     arch_x86_64::cpu::init();
+    // 开启 SMEP/SMAP（内核/用户地址空间严格隔离）。须在分页已启用、长模式下、
+    // 任何内核访问用户内存之前调用；内核访问用户缓冲区（syscall 参数拷贝等）
+    // 已由 STAC/CLAC 包裹，SMAP 下安全放行。
+    arch_x86_64::cpu::enable_smep_smap();
     // 注入硬件熵源（RDRAND/RDSEED，无硬件时混合时钟垫底）并初始化熵池/全局 RNG。
     klib::random::set_entropy_source(arch_x86_64::cpu::entropy_u64);
     klib::random::reseed();

@@ -157,6 +157,9 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
 
     gdt::setup_cpu(gdt_ptr, tss_ptr, kstack_top, df_stack_top);
 
+    // AP 上也开启 SMEP/SMAP（CR4 是 per-CPU），与 BSP 保持一致的隔离策略。
+    crate::cpu::enable_smep_smap();
+
     // 开启中断
     crate::interrupts::enable();
 

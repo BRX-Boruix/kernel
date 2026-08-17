@@ -11,6 +11,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use arch::cpu::CpuFeature;
+use crate::mmio;
 
 /// CPUID 输出（四个寄存器）。
 #[derive(Debug, Clone, Copy, Default)]
@@ -287,6 +288,47 @@ pub fn entropy_u64() -> u64 {
         return v;
     }
     klib::time::now_nanos().rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15
+}
+
+// ---------- SMEP / SMAP 硬件防护 ----------
+
+/// 开启 SMEP/SMAP（内核/用户地址空间严格隔离）。
+///
+/// - **SMEP**（`CR4.SMEP`, bit 20）：禁止内核态（CPL=0）执行用户页（U=1）代码，
+///   杜绝"内核跳板到用户页"类提权；内核本就不执行用户代码（仅 `iretq` 切回
+///   Ring 3 合法进入），故天然安全，开启即生效。
+/// - **SMAP**（`CR4.SMAP`, bit 21）：禁止内核态读写用户页，仅经 [`mmio::stac`]
+///   临时放行（内核访问用户缓冲区如 syscall 参数拷贝时必须包裹）。
+///
+/// 经 CPUID.7.0 `EBX` 检测支持性：SMEP=bit20、SMAP=bit7；不支持则跳过对应位，
+/// 避免在未实现该特性的 CPU 上写 CR4 触发 #GP。SMAP 真正开启后调用
+/// [`mmio::set_smap_active`] 标记，使 `stac`/`clac` 在非 SMAP 平台退化为 no-op
+/// （防止在不支持 SMAP 的 CPU 上执行 `stac`/`clac` 触发 #UD）。
+///
+/// 须在分页已启用、长模式运行后调用（BSP 早期；AP 在各自启动路径也应调用）。
+pub fn enable_smep_smap() {
+    const SMEP: u64 = 1 << 20;
+    const SMAP: u64 = 1 << 21;
+    let r7 = cpuid(7, 0);
+    let smep_ok = r7.ebx & (1 << 20) != 0;
+    let smap_ok = r7.ebx & (1 << 7) != 0;
+
+    let mut cr4 = mmio::read_cr4();
+    if smep_ok {
+        cr4 |= SMEP;
+    }
+    if smap_ok {
+        cr4 |= SMAP;
+        mmio::set_smap_active(true);
+    }
+    mmio::write_cr4(cr4);
+
+    klib::info!(
+        "[cpu] SMEP={} SMAP={} enabled (CR4={:#x})",
+        smep_ok,
+        smap_ok,
+        cr4
+    );
 }
 
 // ---------- arch::cpu::Cpu 实现 ----------

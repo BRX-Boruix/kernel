@@ -537,15 +537,20 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         klib::info!("  vector: {:#x}", vector);
         klib::info!("  rip:    {:#x}", frame.rip);
         if vector == 14 {
-            // 页错误：优先交给已注册的 #PF 回调（如按需分页）。
+            // 页错误：仅**用户态**缺页交给已注册的 #PF 回调（按需分页 / COW）。
+            // 内核态 #PF（含 SMAP/SMEP 违规、访问未映射内核地址）一律视为致命
+            // 错误，不交给用户态补页处理器——否则可能被 `cow_pages` 记账误命中
+            // 或掩盖真实的防护触发（严格隔离下内核不应访问用户页 / 执行用户代码）。
             // 回调约定：`fn(cr2, error_code) -> bool`（虚拟地址在前，错误码在后）。
             let cr2 = crate::mmio::cr2();
-            if let Some(h) = PAGE_FAULT_HANDLER.get() {
-                if h(cr2, frame.error_code) {
-                    return; // 已处理（如补页成功），返回用户态/内核态继续
+            if frame.cs & 3 == 3 {
+                if let Some(h) = PAGE_FAULT_HANDLER.get() {
+                    if h(cr2, frame.error_code) {
+                        return; // 已处理（如补页成功），返回用户态继续
+                    }
                 }
             }
-            // 未注册或未处理：打印 CR2 并停机
+            // 未注册/未处理/内核态：打印 CR2 并停机
             klib::info!("  cr2:    {:#x}", cr2);
             klib::info!("  error:  P={:#x}", frame.error_code);
         }

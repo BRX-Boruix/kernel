@@ -13,6 +13,7 @@
 //!   适合 PCI BAR 等任意对齐、小块设备寄存器。
 
 use arch::phys_to_virt;
+use core::sync::atomic::{AtomicBool, Ordering};
 use crate::paging::{
     flush_tlb, index_at, page_levels, ADDR_MASK, FLAG_LARGE, FLAG_PRESENT, FLAG_WRITABLE,
 };
@@ -187,4 +188,81 @@ pub fn test_map_phys_4k() {
             klib::warn!("[mmio] 4K map readback mismatch: {:#x}", v);
         }
     }
+}
+
+// ---- CR4 / SMEP / SMAP 支持 ----
+
+/// 读取 CR4。
+#[inline]
+pub fn read_cr4() -> u64 {
+    let val: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) val, options(nomem, nostack));
+    }
+    val
+}
+
+/// 写入 CR4（仅在分页已启用、长模式下调用）。
+#[inline]
+pub fn write_cr4(val: u64) {
+    unsafe {
+        core::arch::asm!("mov cr4, {}", in(reg) val, options(nostack));
+    }
+}
+
+/// 是否已在当前 CPU 上开启 SMAP（CR4.SMAP=1）。
+///
+/// 门控 [`stac`]/[`clac`]：SMAP 未开启（或 CPU 不支持）时这两个指令本质是
+/// no-op——既避免在不支持 SMAP 的 CPU 上执行 `stac`/`clac` 触发 #UD，又保证
+/// 语义自洽（无 SMAP 时内核本就可直接访问用户页，无需放行）。
+static SMAP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// 标记 SMAP 是否已启用（由 `cpu::enable_smep_smap` 在成功写 CR4 后调用）。
+pub fn set_smap_active(on: bool) {
+    SMAP_ACTIVE.store(on, Ordering::Relaxed);
+}
+
+/// 置 EFLAGS.AC 位：允许内核态（CPL=0）临时访问用户页（SMAP 的"白名单"放行）。
+///
+/// 开启 SMAP 后内核态默认禁止读写带 USER 权限的页；对来自用户的缓冲区做合法
+/// 拷贝时，在访问前后用 `stac`/`clac` 临时放行。SMAP 未开启时本函数为 no-op。
+#[inline]
+pub unsafe fn stac() {
+    if SMAP_ACTIVE.load(Ordering::Relaxed) {
+        core::arch::asm!("stac", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// 清 EFLAGS.AC 位：恢复 SMAP 默认禁止内核访问用户页。SMAP 未开启时 no-op。
+#[inline]
+pub unsafe fn clac() {
+    if SMAP_ACTIVE.load(Ordering::Relaxed) {
+        core::arch::asm!("clac", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// 从用户虚拟地址 `src` 拷贝 `len` 字节到内核 `dst`（SMAP 安全）。
+///
+/// 内部 STAC 放行，并以编译器屏障防止访问被移出 STAC/CLAC 区间，CLAC 恢复。
+pub unsafe fn copy_from_user(dst: *mut u8, src: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    stac();
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    core::ptr::copy_nonoverlapping(src as *const u8, dst, len);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    clac();
+}
+
+/// 从内核 `src` 拷贝 `len` 字节到用户虚拟地址 `dst`（SMAP 安全）。
+pub unsafe fn copy_to_user(dst: u64, src: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    stac();
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    core::ptr::copy_nonoverlapping(src, dst as *mut u8, len);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    clac();
 }
