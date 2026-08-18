@@ -144,6 +144,91 @@ const KEYMAP_SHIFT: [u8; 0x80] = {
 const SC_LSHIFT: u8 = 0x2A;
 const SC_RSHIFT: u8 = 0x36;
 
+/// `0xE0` 扩展前缀标志：现代 101 键键盘的方向键/编辑键/小键盘（NumLock 关）/
+/// 右 Ctrl/Alt 等以 `0xE0 0xXX` 双字节序列发送。IRQ 每中断只读 1 字节，须跨中断
+/// 缓存前缀，待下一字节到达再合成完整键码。
+static mut E0_PREFIX: bool = false;
+
+/// 译码结果：无输出 / 单个 ASCII 字节 / 一段（转义序列，静态生命周期）。
+enum KeyOut {
+    None,
+    Ascii(u8),
+    Seq(&'static [u8]),
+}
+
+/// 把（扩展标志, 键码, 释放?）译码为可入缓冲的字节序列。
+///
+/// - 主键盘可打印键 → ASCII（受 Shift 影响，查 `KEYMAP`/`KEYMAP_SHIFT`）。
+/// - 非 `E0` 的 `0x47..=0x53` 等区域：来自 **NumLock 开启**时的数字小键盘 → 数字。
+/// - `E0` 前缀的光标/编辑键 → ANSI 转义序列（与终端约定一致，shell 可据此行编辑）。
+/// - F1–F12（主集 `0x3B..=0x44`/`0x57`/`0x58`）→ ANSI 转义序列。
+fn decode_key(e0: bool, code: u8, key_up: bool) -> KeyOut {
+    if key_up {
+        return KeyOut::None;
+    }
+    if !e0 {
+        // 主键盘可打印字符（受 Shift 影响）。
+        let shift = SHIFT.load(Ordering::Relaxed) != 0;
+        let ch = if shift {
+            KEYMAP_SHIFT[code as usize]
+        } else {
+            KEYMAP[code as usize]
+        };
+        if ch != 0 {
+            return KeyOut::Ascii(ch);
+        }
+        // NumLock 语义的数字小键盘 / 主键盘符号，以及 F-keys。
+        return match code {
+            // 小键盘数字（NumLock 开）
+            0x47 => KeyOut::Ascii(b'7'),
+            0x48 => KeyOut::Ascii(b'8'),
+            0x49 => KeyOut::Ascii(b'9'),
+            0x4B => KeyOut::Ascii(b'4'),
+            0x4C => KeyOut::Ascii(b'5'),
+            0x4D => KeyOut::Ascii(b'6'),
+            0x4F => KeyOut::Ascii(b'1'),
+            0x50 => KeyOut::Ascii(b'2'),
+            0x51 => KeyOut::Ascii(b'3'),
+            0x52 => KeyOut::Ascii(b'0'),
+            0x53 => KeyOut::Ascii(b'.'),
+            // 小键盘/主键盘符号
+            0x37 => KeyOut::Ascii(b'*'), // 主键盘 '*'（8 上方）
+            0x4A => KeyOut::Ascii(b'-'), // 小键盘 '-'
+            0x4E => KeyOut::Ascii(b'+'), // 小键盘 '+'
+            // F1–F12
+            0x3B => KeyOut::Seq(b"\x1bOP"),
+            0x3C => KeyOut::Seq(b"\x1bOQ"),
+            0x3D => KeyOut::Seq(b"\x1bOR"),
+            0x3E => KeyOut::Seq(b"\x1bOS"),
+            0x3F => KeyOut::Seq(b"\x1b[15~"),
+            0x40 => KeyOut::Seq(b"\x1b[17~"),
+            0x41 => KeyOut::Seq(b"\x1b[18~"),
+            0x42 => KeyOut::Seq(b"\x1b[19~"),
+            0x43 => KeyOut::Seq(b"\x1b[20~"),
+            0x44 => KeyOut::Seq(b"\x1b[21~"),
+            0x57 => KeyOut::Seq(b"\x1b[23~"),
+            0x58 => KeyOut::Seq(b"\x1b[24~"),
+            _ => KeyOut::None,
+        };
+    }
+    // 扩展键（E0 前缀）：方向键 / 编辑键 / 小键盘 Enter、'/' → 转义序列。
+    match code {
+        0x48 => KeyOut::Seq(b"\x1b[A"), // ↑
+        0x50 => KeyOut::Seq(b"\x1b[B"), // ↓
+        0x4B => KeyOut::Seq(b"\x1b[D"), // ←
+        0x4D => KeyOut::Seq(b"\x1b[C"), // →
+        0x47 => KeyOut::Seq(b"\x1b[H"), // Home
+        0x4F => KeyOut::Seq(b"\x1b[F"), // End
+        0x52 => KeyOut::Seq(b"\x1b[2~"), // Insert
+        0x53 => KeyOut::Seq(b"\x1b[3~"), // Delete
+        0x49 => KeyOut::Seq(b"\x1b[5~"), // PgUp
+        0x51 => KeyOut::Seq(b"\x1b[6~"), // PgDn
+        0x35 => KeyOut::Seq(b"/"),       // 小键盘 '/'
+        0x1C => KeyOut::Seq(b"\n"),      // 小键盘 Enter
+        _ => KeyOut::None,
+    }
+}
+
 // ---------- 输入缓冲 ----------
 
 /// 键盘有输入时通知等待方（如阻塞的 read）的回调。由内核在启动时通过
@@ -204,22 +289,40 @@ pub fn has_input() -> bool {
 
 // ---------- IRQ1 中断 handler ----------
 
-/// IRQ1 键盘中断：读扫描码、处理 Shift、译码 ASCII、压入缓冲。
+/// IRQ1 键盘中断：读扫描码、处理 `0xE0` 扩展前缀、译码并压入缓冲。
 pub extern "C" fn irq1_handler(_irq: u8) -> bool {
     // 读数据端口（清中断挂起）。
     let scancode = inb(DATA_PORT);
+
+    // `0xE0` 扩展前缀：缓存标志，等待下一 IRQ 的真正键码（单独一字节无意义）。
+    if scancode == 0xE0 {
+        unsafe { E0_PREFIX = true };
+        crate::lapic::end_of_interrupt();
+        return true;
+    }
+    // `0xE1`（Pause/Break 序列）：忽略后续字节。
+    if scancode == 0xE1 {
+        unsafe { E0_PREFIX = false };
+        crate::lapic::end_of_interrupt();
+        return true;
+    }
+
+    let e0 = unsafe { E0_PREFIX };
+    unsafe { E0_PREFIX = false };
     let key_up = scancode & 0x80 != 0; // bit7=1 表示释放
     let code = scancode & 0x7F;
 
     if code == SC_LSHIFT || code == SC_RSHIFT {
         SHIFT.store(if key_up { 0 } else { 1 }, Ordering::Relaxed);
-    } else if !key_up && code < 0x80 {
-        // 按下且非特殊：译码 ASCII 压入缓冲
-        let shift = SHIFT.load(Ordering::Relaxed) != 0;
-        let idx = code as usize;
-        let ch = if shift { KEYMAP_SHIFT[idx] } else { KEYMAP[idx] };
-        if ch != 0 {
-            push(ch);
+    } else {
+        match decode_key(e0, code, key_up) {
+            KeyOut::None => {}
+            KeyOut::Ascii(c) => push(c),
+            KeyOut::Seq(s) => {
+                for &b in s {
+                    push(b);
+                }
+            }
         }
     }
 
