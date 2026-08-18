@@ -86,6 +86,19 @@ fn write_cfg(cfg: u8) {
     outb(DATA_PORT, cfg);
 }
 
+/// 向键盘数据端口发命令并等待 ACK（0xFA）。返回 ACK 或 0（超时/异常）。
+fn send_kbd_cmd(cmd: u8) -> u8 {
+    if !wait_input_empty() {
+        return 0;
+    }
+    outb(DATA_PORT, cmd);
+    if wait_output_full() {
+        inb(DATA_PORT)
+    } else {
+        0
+    }
+}
+
 // ---------- 扫描码译码 ----------
 
 /// 扫描码 → ASCII（无 Shift 时）。索引 = 扫描码（Set 1，~0x01..=0x58）。
@@ -233,12 +246,18 @@ pub fn init() -> bool {
         return false;
     }
 
-    // 2. 使能键盘 IRQ + 扫描码翻译（Set 1 翻译）。
+    // 2. 使能键盘 IRQ（**关闭**扫描码翻译）。本驱动键位表 `KEYMAP` 是 Set 1；
+    //    开启 8042 的 Set2→Set1 翻译会让 backspace(Set2 0x66) 等码在翻译环节被
+    //    丢弃（翻译表无对应项），导致删除键收不到扫描码。故关闭翻译，并随后把
+    //    键盘切到 Set 1，使所有键（含 backspace 0x0e）直通。
     let mut cfg = read_cfg();
-    cfg |= CFG_IRQ_ENABLE | CFG_TRANSLATE;
+    cfg |= CFG_IRQ_ENABLE;
+    cfg &= !CFG_TRANSLATE;
     write_cfg(cfg);
 
-    // 3. 发送"开扫描"命令，等待 ACK。
+    // 3. 切换键盘到扫描码集 1（Set 1），再开扫描。顺序：F0 01 切 Set1，F4 开扫描。
+    let _ = send_kbd_cmd(0xF0);
+    let _ = send_kbd_cmd(0x01);
     if wait_input_empty() {
         outb(DATA_PORT, KB_ENABLE_SCAN);
         // 等 ACK（0xFA）；可能需先清多余输出。

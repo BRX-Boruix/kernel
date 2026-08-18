@@ -4,7 +4,7 @@
 //! 上下文被全局持有（`'static`），供 `panic` 等场景在任意时刻向屏幕输出。
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use flanterm_rust::FlantermContext;
 use klib::{error, info};
@@ -14,6 +14,9 @@ use klib::{error, info};
 /// 用 `AtomicUsize` 存裸地址，避免要求 `FlantermContext: Sync`；
 /// 访问均在串口已停机/单核的 panic 场景进行，无并发竞争。
 static TERMINAL_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// 初始化时保存的 framebuffer 物理/虚拟地址，用于自愈被堆踩踏清零的指针。
+static EXPECTED_FB: AtomicUsize = AtomicUsize::new(0);
 
 /// 用 flanterm 初始化终端并在屏幕上打印文本。
 ///
@@ -66,6 +69,7 @@ pub fn init(fb: &limine::Framebuffer) {
         // leak 为 'static，供 panic 等全局场景使用
         let ctx: &'static mut FlantermContext = Box::leak(ctx);
         TERMINAL_PTR.store(ctx as *mut FlantermContext as usize, Ordering::Release);
+        EXPECTED_FB.store(fb_ptr as usize, Ordering::Release);
         // 写入文本
         write_str("Hello, BORUIX!\r\n");
         write_str("Kernel M0 is running.\r\n");
@@ -82,6 +86,24 @@ pub fn write_str(s: &str) {
         return;
     }
     let ctx = unsafe { &mut *(p as *mut FlantermContext) };
+    // 自愈：若 framebuffer 指针被堆踩踏清零，用初始化时保存的地址恢复，避免绘制
+    // page fault 崩溃（根因——谁踩踏了 leaked 的 FlantermContext——仍待定位）。
+    let expected = EXPECTED_FB.load(Ordering::Relaxed) as *mut u32;
+    if expected.is_null() {
+        return;
+    }
+    let restored = flanterm_rust::flanterm_fb_check_and_restore(ctx, expected);
+    if restored {
+        // 一次性报告：确认 leaked 的 FlantermContext 的 framebuffer 字段被堆踩踏清零
+        // （根因：内核某处野写；曾由被破坏的调度器 CR3 切换/失效 proc_ptr 写入引发）。
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            klib::warn!(
+                "[terminal] framebuffer ptr was corrupted to NULL; restored from saved {:#x}",
+                expected as usize
+            );
+        }
+    }
     let bytes = s.as_bytes();
     let mut start = 0usize;
     for i in 0..=bytes.len() {
@@ -93,6 +115,16 @@ pub fn write_str(s: &str) {
                 flanterm_rust::flanterm_write(ctx, b"\r\n");
             }
             start = i + 1;
+        }
+    }
+    // 诊断：本次写入期间若 flanterm 检测到 framebuffer 指针为 0（堆踩踏），
+    // 一次性报告，便于确认根因（早期被破坏的调度器 CR3 切换曾踩踏 leaked ctx）。
+    if flanterm_rust::FB_NULL_SEEN.load(Ordering::Relaxed) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            klib::warn!(
+                "[terminal] framebuffer ptr was NULL during draw (leaked ctx heap-corrupted?)"
+            );
         }
     }
 }

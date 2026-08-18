@@ -214,8 +214,6 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
     let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
     s.current = Some(next_pid);
 
-    // 低频日志（切换时）：TCG 慢速下避免每 tick 打日志饿死主线程。
-    klib::info!("[sched] switch {} -> {}", cur_pid, next_pid);
     arch_x86_64::mmio::write_cr3(cr3);
     gdt::set_rsp0(ktop);
     set_current_proc(proc_ptr);
@@ -265,7 +263,6 @@ pub fn yield_now(frame: &mut InterruptFrame) -> bool {
     let ktop = slot.kstack_top;
     let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
     s.current = Some(next_pid);
-    klib::info!("[sched] yield {} -> {}", cur_pid, next_pid);
     arch_x86_64::mmio::write_cr3(cr3);
     gdt::set_rsp0(ktop);
     set_current_proc(proc_ptr);
@@ -327,7 +324,6 @@ pub fn block_current(frame: &mut InterruptFrame) -> bool {
     let ktop = slot.kstack_top;
     let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
     s.current = Some(next_pid);
-    klib::info!("[sched] block {} -> {}", cur_pid, next_pid);
     arch_x86_64::mmio::write_cr3(cr3);
     gdt::set_rsp0(ktop);
     set_current_proc(proc_ptr);
@@ -370,7 +366,6 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> bool {
             let ktop = slot.kstack_top;
             let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
             s.current = Some(next);
-            klib::info!("[sched] block-kbd {} -> {}", cur_pid, next);
             drop(s);
             arch_x86_64::mmio::write_cr3(cr3);
             gdt::set_rsp0(ktop);
@@ -400,7 +395,6 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> bool {
             let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
             s.current = Some(next);
             KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
-            klib::info!("[sched] block-kbd idle wake -> {}", next);
             drop(s);
             arch_x86_64::mmio::write_cr3(cr3);
             gdt::set_rsp0(ktop);
@@ -451,7 +445,6 @@ pub fn exit_current(frame: &mut InterruptFrame) {
         // 无 Ready 进程：可能有 Blocked 进程（如 shell 等键盘输入）。进入 idle
         // 等待，被外部中断（键盘 → `wake_kbd` 把其入就绪队列）唤醒后切回，
         // 而非永久停机——否则 shell 收不到输入、系统假死。
-        klib::info!("[sched] no ready; idle-wait for wakeup");
         arch_x86_64::interrupts::enable();
         loop {
             // 极短持锁检查是否有被唤醒的进程；空则释放锁后 halt（中断可达）。
@@ -470,7 +463,6 @@ pub fn exit_current(frame: &mut InterruptFrame) {
         let ktop = slot.kstack_top;
         let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
         s.current = Some(next);
-        klib::info!("[sched] exit-idle -> {}", next);
         drop(s);
         arch_x86_64::mmio::write_cr3(cr3);
         gdt::set_rsp0(ktop);
@@ -484,7 +476,6 @@ pub fn exit_current(frame: &mut InterruptFrame) {
     let ktop = slot.kstack_top;
     let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
     s.current = Some(next_pid);
-    klib::info!("[sched] exit {} -> {}", cur_pid, next_pid);
     drop(s);
     arch_x86_64::mmio::write_cr3(cr3);
     gdt::set_rsp0(ktop);

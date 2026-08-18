@@ -3,6 +3,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::ptr::{copy_nonoverlapping, write_unaligned};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::flanterm::{flanterm_context_new, flanterm_context_reinit, BackendOps, FlantermCore};
 use crate::generated::BUILTIN_FONT;
@@ -13,6 +14,27 @@ pub const FLANTERM_FB_ROTATE_180: i32 = 2;
 pub const FLANTERM_FB_ROTATE_270: i32 = 3;
 
 const FLANTERM_FB_FONT_GLYPHS: usize = 256;
+
+/// 一次性诊断标志：若在绘制时发现 `framebuffer` 指针为 0，置位。
+///
+/// `framebuffer` 仅在 `flanterm_fb_init` 构造时写入一次，之后无任何代码清零；
+/// 变 0 说明 leaked 的 `FlantermContext` 被内核堆踩踏（早期被破坏的调度器在
+/// CR3 切换后 panic / 用失效 `proc_ptr` 写入曾导致）。由 terminal 层读取并报告。
+pub static FB_NULL_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// 自愈：若 `framebuffer` 指针被踩踏清零，用初始化时保存的地址恢复，避免绘制崩溃。
+///
+/// `framebuffer` 仅在 `flanterm_fb_init` 写入一次；此处仅在其被外部野写清零时
+/// 兜底恢复，不掩盖根因（真正的堆踩踏仍需定位），仅防止内核因此 page fault 停机。
+/// 返回 `true` 表示确实发生了清零并已被恢复（供上层一次性报告根因）。
+pub fn flanterm_fb_check_and_restore(ctx: &mut FlantermContext, expected: *mut u32) -> bool {
+    if ctx.backend.framebuffer.is_null() && !expected.is_null() {
+        ctx.backend.framebuffer = expected;
+        true
+    } else {
+        false
+    }
+}
 
 #[derive(Copy, Clone)]
 struct FlantermFbChar {
@@ -160,9 +182,10 @@ unsafe fn plot_char(
     x: usize,
     y: usize,
 ) {
-    // 临时保护：framebuffer 指针若为 null（疑似内核堆被踩），跳过绘制避免
-    // page fault 崩溃。正常情形下它由 limine 提供且非 null。
+    // 防御性保护：framebuffer 指针若为 null（疑似内核堆被踩），记录一次性标志
+    // 并跳过绘制，避免 page fault 崩溃。正常情形下由 limine 提供且非 null。
     if fb.framebuffer.is_null() {
+        FB_NULL_SEEN.store(true, Ordering::Relaxed);
         return;
     }
     match fb.plot_mode {
