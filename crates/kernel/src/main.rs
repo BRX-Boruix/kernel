@@ -210,6 +210,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_time_abstraction();
 
+    // 验证 sleep_nanos 真实阻塞（后台作业 sleep 正确性前提）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_sleep_accuracy();
+
     // T3：验证 HPET 高精度事件定时器（备选时钟源）：计数器推进/周期换算/
     // 单调性/与 LAPIC tick 对齐。HPET 已在 paging::init 后初始化。
     #[cfg(feature = "kernel-tests")]

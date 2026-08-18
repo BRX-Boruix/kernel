@@ -541,6 +541,29 @@ pub fn test_time_abstraction() {
     info!("[time] time abstraction tests passed");
 }
 
+/// 验证 `klib::time::sleep_nanos` 真实阻塞：睡 1 秒，测量前后 HPET 单调时钟
+/// 差值（应 ≈ 1e9 ns）。若差值远小于目标，说明睡眠未真正阻塞（即时钟未推进
+/// 或 deadline 计算错误），后台作业 `sleep` 会瞬间返回。
+pub fn test_sleep_accuracy() {
+    info!("[sleep] entering test_sleep_accuracy");
+    let target: u64 = 1_000_000_000; // 1 秒
+    let before = klib::time::now_nanos();
+    klib::time::sleep_nanos(target);
+    let after = klib::time::now_nanos();
+    let delta = after.saturating_sub(before);
+    info!(
+        "[sleep] sleep_nanos({}ns) -> now delta = {} ns ({} ms)",
+        target, delta, delta / 1_000_000
+    );
+    // 允许较大容差（QEMU TCG 下时钟抖动），但必须真正阻塞（>= 0.5s）。
+    assert!(
+        delta >= 500_000_000,
+        "sleep_nanos returned too early: delta={}ns (expected ~{}ns)",
+        delta, target
+    );
+    info!("[sleep] sleep accuracy test passed");
+}
+
 /// 验证物理页帧分配器的分配/释放基本逻辑。
 pub fn test_frame_alloc() {
     // 统计初始状态

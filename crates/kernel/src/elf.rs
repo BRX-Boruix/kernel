@@ -300,11 +300,11 @@ fn setup_user_stack(
 
         if !cmd.is_empty() {
             // 栈内偏移（字节，从 stack_top 向下）。
+            // 命令字符串放在 0x200 处；argc/argv 按 Linux `_start` 约定直接放在
+            // 0x220 起的连续槽位（无独立指针数组间接层）。
             const STR_OFF: usize = 0x200;
-            const ARGV_OFF: usize = 0x210;
             const RSP_OFF: usize = 0x220;
             let str_user = stack_top - STR_OFF as u64;
-            let argv_user = stack_top - ARGV_OFF as u64;
             let rsp_user = stack_top - RSP_OFF as u64;
 
             // 命令字符串（含 NUL），最长 STR_OFF-1 字节，超出截断。
@@ -315,15 +315,17 @@ fn setup_user_stack(
             }
             *sp.add(n) = 0;
 
-            // argv 数组：argv[0]=str_user、argv[1]=NULL。
-            let ap = top.sub(ARGV_OFF) as *mut u64;
-            *ap = str_user;
-            *ap.add(1) = 0;
-
-            // argc / argv。
+            // 按 Linux `_start` 约定直接布置 argv 数组（连续槽位）：
+            //   [rsp]      = argc = 1
+            //   [rsp + 8]  = argv[0] = str_user（字符串指针本身）
+            //   [rsp + 16] = 0          （argv[1] = NULL 结束符）
+            // 注意：`_start` 取 `rsi = [rsp+8]` 当作 `argv[0]`，故此处必须直接
+            // 放字符串指针，而非"指向 argv 数组的指针"——后者会让 `user_main`
+            // 把指针值当字符串读，首字节即 0 导致命令被丢弃（后台作业瞬间退出）。
             let rp = top.sub(RSP_OFF) as *mut u64;
-            *rp = 1;
-            *rp.add(1) = argv_user;
+            *rp = 1; // argc
+            *rp.add(1) = str_user; // argv[0]
+            *rp.add(2) = 0; // argv[1] = NULL
 
             return Ok(rsp_user);
         }
