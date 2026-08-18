@@ -606,10 +606,11 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             disable();
         }
         CURRENT_IRQ_PRIO.store(prev, Ordering::Relaxed);
-        if !handled {
-            // 无 handler 或全部未处理：直接 EOI
-            crate::pic::end_of_interrupt(irq);
-        }
+        // 外部中断统一向 8259 发送 EOI，清除其 ISR 服务位——否则 8259 会持续
+        // 屏蔽同 IRQ 的后续中断（键盘等只收到第一个字符）。LAPIC EOI 由各
+        // handler 自行发送（见 `irq1_handler` 等）。无条件发送对走 LAPIC 自身
+        // 定时器（irq0）等路径亦无害。
+        crate::pic::end_of_interrupt(irq);
         // M4.2：IRQ0（LAPIC 定时器）之后调用调度器 tick，允许在中断帧上做
         // 进程切换（改写 frame → 返回时 iretq 到目标进程）。仅 BSP 调度。
         if irq == 0 {

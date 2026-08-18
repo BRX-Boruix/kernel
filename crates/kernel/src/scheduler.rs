@@ -283,6 +283,23 @@ pub fn yield_now(frame: &mut InterruptFrame) -> bool {
 ///
 /// 注意：调用方**必须先释放**持有的 IPC 表锁再调用本函数（阻塞切走时若仍持锁，
 /// 下一进程会在同一把 IrqSpinLock 上自旋死锁）。
+/// 从就绪队列取出下一个**有效**进程，跳过已回收/已退出的残留引用。
+///
+/// `yield`/`exec` 等可能把进程多次入队，进程退出（`procs[pid]=None`）后其
+/// 就绪队列引用不会自动清除；直接 `pop_front().expect(...)` 会取到死 pid 并
+/// panic。本函数循环弹出并丢弃无效项（`procs[pid]` 为 `None` 或状态 `Exit`），
+/// 返回第一个有效 pid，队列空/仅含死进程时返回 `None`。
+fn pop_ready(s: &mut Scheduler) -> Option<usize> {
+    while let Some(pid) = s.ready.pop_front() {
+        if let Some(slot) = s.procs[pid].as_ref() {
+            if slot.proc.state() != TaskState::Exit {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
 pub fn block_current(frame: &mut InterruptFrame) -> bool {
     let mut s = SCHED.lock();
     let Some(cur_pid) = s.current else {
@@ -292,8 +309,8 @@ pub fn block_current(frame: &mut InterruptFrame) -> bool {
         slot.saved = *frame;
         slot.proc.set_state(TaskState::Blocked);
     }
-    // 取下一个就绪进程。
-    let Some(next_pid) = s.ready.pop_front() else {
+    // 取下一个有效就绪进程（跳过已退出残留引用）。
+    let Some(next_pid) = pop_ready(&mut s) else {
         return false; // 无可调度进程：调用方不应阻塞
     };
     if cur_pid == next_pid {
@@ -317,6 +334,99 @@ pub fn block_current(frame: &mut InterruptFrame) -> bool {
     true
 }
 
+/// 阻塞等待键盘输入的进程 pid（`u32::MAX` 表示无）。`sys_read` 缓冲空时登记，
+/// 键盘中断经回调 [`wake_kbd`] 唤醒。单 waiter（stdin 仅一个读者，即 shell）。
+static KBD_WAITER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// 阻塞当前进程等待键盘输入（`read` syscall 缓冲空时调用）。
+///
+/// 登记 [`KBD_WAITER`] 后把当前进程置 `Blocked`（不回就绪队列），切到下一个就绪
+/// 进程；若**无其他就绪进程**（单 shell 场景），进入 idle halt 等待键盘中断唤醒——
+/// 键盘 handler 经 [`wake_kbd`] 把本进程放回就绪队列，idle 循环检测到后切回。
+/// 被唤醒后用户态 `read` 重试即可取到字符（消除空转 + 刷屏）。
+///
+/// 切换成功后改写 `*frame` 并 `return false`：控制流回到 `syscall_entry`，由其
+/// `iretq` 进入目标进程用户态（与 `block_current` 相同机制）。函数虽声明返回
+/// 值，但切换发生后 CPU 不再回到此处，故返回值不会被真正消费。
+pub fn block_for_kbd(frame: &mut InterruptFrame) -> bool {
+    let mut s = SCHED.lock();
+    let cur_pid = s.current.expect("block_for_kbd outside process");
+    if let Some(slot) = s.procs[cur_pid].as_mut() {
+        slot.saved = *frame;
+        slot.proc.set_state(TaskState::Blocked);
+    }
+    s.current = None;
+    clear_current_proc();
+    KBD_WAITER.store(cur_pid as u32, core::sync::atomic::Ordering::Release);
+
+    // 取下一个有效就绪进程切换（跳过已退出残留引用）。
+    match pop_ready(&mut s) {
+        Some(next) => {
+            let slot = s.procs[next].as_mut().expect("ready proc exists");
+            slot.proc.set_state(TaskState::Running);
+            *frame = slot.saved;
+            let cr3 = slot.proc.addr_space_mut().page_table_paddr();
+            let ktop = slot.kstack_top;
+            let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
+            s.current = Some(next);
+            klib::info!("[sched] block-kbd {} -> {}", cur_pid, next);
+            drop(s);
+            arch_x86_64::mmio::write_cr3(cr3);
+            gdt::set_rsp0(ktop);
+            set_current_proc(proc_ptr);
+            return false; // frame 已改，由 syscall_entry iret 切换
+        }
+        None => {
+            drop(s);
+            // 无就绪进程：idle halt 等键盘中断唤醒（先释放锁再 halt，使中断可达）。
+            arch_x86_64::interrupts::enable();
+            loop {
+                // 极短持锁检查是否有进程被唤醒；空则释放锁后 halt（中断可用）。
+                let ready = !SCHED.lock().ready.is_empty();
+                if ready {
+                    break;
+                }
+                arch_x86_64::interrupts::halt();
+            }
+            arch_x86_64::interrupts::disable();
+            let mut s = SCHED.lock();
+            let next = pop_ready(&mut s).expect("woken keyboard waiter");
+            let slot = s.procs[next].as_mut().expect("woken proc exists");
+            slot.proc.set_state(TaskState::Running);
+            *frame = slot.saved;
+            let cr3 = slot.proc.addr_space_mut().page_table_paddr();
+            let ktop = slot.kstack_top;
+            let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
+            s.current = Some(next);
+            KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+            klib::info!("[sched] block-kbd idle wake -> {}", next);
+            drop(s);
+            arch_x86_64::mmio::write_cr3(cr3);
+            gdt::set_rsp0(ktop);
+            set_current_proc(proc_ptr);
+            return false; // frame 已改，由 syscall_entry iret 切换
+        }
+    }
+}
+
+/// 键盘有输入时唤醒阻塞的进程（由 arch 键盘 handler 经回调调用）。
+///
+/// 取出 [`KBD_WAITER`] 登记的 pid，将其置 `Ready` 并入就绪队列。调度器下次调度
+/// （tick ≤10ms 或 idle 循环立即）切回该进程，使其 `read` 重试取到字符。
+/// 在中断上下文调用，持锁时间极短（仅入队）。
+pub fn wake_kbd() {
+    let p = KBD_WAITER.swap(u32::MAX, core::sync::atomic::Ordering::AcqRel);
+    if p == u32::MAX {
+        return;
+    }
+    let mut s = SCHED.lock();
+    if let Some(slot) = s.procs[p as usize].as_mut() {
+        slot.proc.set_state(TaskState::Ready);
+        s.ready.push_back(p as usize);
+    }
+}
+
 /// 终止当前进程（`exit` syscall）：回收其槽位并切换到下一个就绪进程。
 ///
 /// 当前进程置 `Exit` 并从就绪队列/进程池移除（其 `UserAddressSpace` 随
@@ -335,15 +445,37 @@ pub fn exit_current(frame: &mut InterruptFrame) {
     s.current = None;
     clear_current_proc();
 
-    // 取下一个就绪进程。
-    let Some(next_pid) = s.ready.pop_front() else {
+    // 取下一个有效就绪进程（跳过已退出残留引用）。
+    let Some(next_pid) = pop_ready(&mut s) else {
         drop(s);
-        // 无进程可调度：停机（系统空转）。
-        klib::info!("[sched] all processes exited, halting");
-        arch_x86_64::interrupts::disable();
+        // 无 Ready 进程：可能有 Blocked 进程（如 shell 等键盘输入）。进入 idle
+        // 等待，被外部中断（键盘 → `wake_kbd` 把其入就绪队列）唤醒后切回，
+        // 而非永久停机——否则 shell 收不到输入、系统假死。
+        klib::info!("[sched] no ready; idle-wait for wakeup");
+        arch_x86_64::interrupts::enable();
         loop {
+            // 极短持锁检查是否有被唤醒的进程；空则释放锁后 halt（中断可达）。
+            if !SCHED.lock().ready.is_empty() {
+                break;
+            }
             arch_x86_64::interrupts::halt();
         }
+        arch_x86_64::interrupts::disable();
+        let mut s = SCHED.lock();
+        let next = pop_ready(&mut s).expect("woken process after idle");
+        let slot = s.procs[next].as_mut().expect("woken proc exists");
+        slot.proc.set_state(TaskState::Running);
+        *frame = slot.saved;
+        let cr3 = slot.proc.addr_space_mut().page_table_paddr();
+        let ktop = slot.kstack_top;
+        let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
+        s.current = Some(next);
+        klib::info!("[sched] exit-idle -> {}", next);
+        drop(s);
+        arch_x86_64::mmio::write_cr3(cr3);
+        gdt::set_rsp0(ktop);
+        set_current_proc(proc_ptr);
+        return; // frame 已改，由 syscall_entry iret 切换
     };
     let slot = s.procs[next_pid].as_mut().expect("ready proc exists");
     slot.proc.set_state(TaskState::Running);
@@ -376,9 +508,9 @@ pub fn wake(pid: usize) {
 /// 其用户态。进程在用户态被 tick 打断后由 [`tick`] 轮转。永不返回。
 pub fn start() -> ! {
     loop {
-        // 取一个就绪进程启动。
+        // 取一个有效就绪进程启动（跳过已退出残留引用）。
         let mut s = SCHED.lock();
-        let Some(pid) = s.ready.pop_front() else {
+        let Some(pid) = pop_ready(&mut s) else {
             drop(s);
             arch_x86_64::interrupts::halt(); // 无进程：停机等待中断
             continue;

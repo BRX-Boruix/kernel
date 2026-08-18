@@ -305,7 +305,13 @@ unsafe fn kmain_body() -> ! {
     // 放在所有测试之后（避免干扰 LAPIC tick 时序测试）、进入 init 之前，
     // 使 shell REPL 能接收键盘输入。
     arch_x86_64::ioapic::init();
+    // IMCR 切到 PIC 模式会让 QEMU 重置 8259 掩码，须在切换后重新解屏蔽键盘
+    // IRQ1（其余保持屏蔽：IRQ0 timer 由 LAPIC 接管）。否则键盘中断被 8259 屏蔽。
+    arch_x86_64::pic::set_mask(0xFFFD);
     arch_x86_64::keyboard::init();
+    // 注册键盘输入回调：有按键时唤醒阻塞在 `read` 的进程（如 shell）。arch 层
+    // 不反向依赖 kernel，经函数指针解耦（指向 `scheduler::wake_kbd`）。
+    arch_x86_64::keyboard::set_input_callback(crate::scheduler::wake_kbd);
 
     // 生产化：进入用户态 init（PID 1），而非内核 idle 停机。加载 init.elf →
     // spawn → `scheduler::start` 永不返回；init 经 syscall 与内核交互、退出。

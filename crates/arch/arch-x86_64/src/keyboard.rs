@@ -133,6 +133,29 @@ const SC_RSHIFT: u8 = 0x36;
 
 // ---------- 输入缓冲 ----------
 
+/// 键盘有输入时通知等待方（如阻塞的 read）的回调。由内核在启动时通过
+/// `set_input_callback` 注册（指向 `scheduler::wake_kbd`）。arch 层不反向依赖
+/// kernel，故用函数指针解耦。
+static mut INPUT_CB: Option<fn()> = None;
+
+/// 注册键盘输入回调（内核启动时调用一次）。
+pub fn set_input_callback(cb: fn()) {
+    // SAFETY: 早期单线程注册，之后仅只读访问。
+    unsafe {
+        INPUT_CB = Some(cb);
+    }
+}
+
+/// 通知等待方：有字符入缓冲（中断上下文调用）。
+fn notify_input() {
+    // SAFETY: 回调只读，且已注册。
+    unsafe {
+        if let Some(cb) = INPUT_CB {
+            cb();
+        }
+    }
+}
+
 /// 压入一个字符到缓冲（IRQ1 中断上下文调用）。
 fn push(ch: u8) {
     let w = WRITE_INDEX.load(Ordering::Relaxed);
@@ -143,6 +166,7 @@ fn push(ch: u8) {
     BUF_DATA[w % BUF_CAP].store(ch as u32, Ordering::Relaxed);
     WRITE_INDEX.store(w + 1, Ordering::Release);
     BUF_INIT.store(1, Ordering::Release);
+    notify_input(); // 唤醒阻塞在 read 的进程
 }
 
 /// 弹出一个字符（read syscall 调用）。无数据返回 None。

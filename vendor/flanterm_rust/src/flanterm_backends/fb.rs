@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use core::ptr::{copy_nonoverlapping, write_volatile};
+use core::ptr::{copy_nonoverlapping, write_unaligned};
 
 use crate::flanterm::{flanterm_context_new, flanterm_context_reinit, BackendOps, FlantermCore};
 use crate::generated::BUILTIN_FONT;
@@ -160,6 +160,11 @@ unsafe fn plot_char(
     x: usize,
     y: usize,
 ) {
+    // 临时保护：framebuffer 指针若为 null（疑似内核堆被踩），跳过绘制避免
+    // page fault 崩溃。正常情形下它由 limine 提供且非 null。
+    if fb.framebuffer.is_null() {
+        return;
+    }
     match fb.plot_mode {
         PlotMode::ScaledCanvas => plot_char_scaled_canvas(fb, cols, rows, c, x, y),
         PlotMode::ScaledNoCanvas => plot_char_scaled_uncanvas(fb, cols, rows, c, x, y),
@@ -248,7 +253,7 @@ unsafe fn plot_char_scaled_canvas(
                 };
                 let pixel = if *glyph_pointer != 0 { fg } else { bg };
                 unsafe {
-                    write_volatile(fb_line, pixel);
+                    write_unaligned(fb_line, pixel);
                 }
                 fb_line = unsafe { fb_line.offset(inner_stride) };
             }
@@ -332,7 +337,7 @@ unsafe fn plot_char_scaled_uncanvas(
             for _ in 0..fb.font_scale_x {
                 let pixel = if *glyph_pointer != 0 { fg } else { bg };
                 unsafe {
-                    write_volatile(fb_line, pixel);
+                    write_unaligned(fb_line, pixel);
                 }
                 fb_line = unsafe { fb_line.offset(inner_stride) };
             }
@@ -419,7 +424,7 @@ unsafe fn plot_char_unscaled_canvas(
             };
             let pixel = if *glyph_pointer != 0 { fg } else { bg };
             unsafe {
-                write_volatile(fb_line, pixel);
+                write_unaligned(fb_line, pixel);
             }
             fb_line = unsafe { fb_line.offset(inner_stride) };
             glyph_pointer = unsafe { glyph_pointer.add(1) };
@@ -500,7 +505,7 @@ unsafe fn plot_char_unscaled_uncanvas(
         for _fx in 0..fb.font_width {
             let pixel = if *glyph_pointer != 0 { fg } else { bg };
             unsafe {
-                write_volatile(fb_line, pixel);
+                write_unaligned(fb_line, pixel);
             }
             fb_line = unsafe { fb_line.offset(inner_stride) };
             glyph_pointer = unsafe { glyph_pointer.add(1) };
@@ -868,11 +873,11 @@ fn flanterm_fb_full_refresh(ctx: &mut FlantermContext) {
                 if let Some(canvas) = fb.canvas.as_ref() {
                     let val = canvas[y * width + x];
                     unsafe {
-                        write_volatile(fb.framebuffer.add(offset), val);
+                        write_unaligned(fb.framebuffer.add(offset), val);
                     }
                 } else {
                     unsafe {
-                        write_volatile(fb.framebuffer.add(offset), default_bg);
+                        write_unaligned(fb.framebuffer.add(offset), default_bg);
                     }
                 }
             }

@@ -52,6 +52,8 @@ const LAPIC_TIMER_DIV: usize = 0x3E0; // 分频
 const LAPIC_TIMER_INIT: usize = 0x380; // Initial Count
 const LAPIC_TIMER_CURR: usize = 0x390; // Current Count (只读)
 const LAPIC_EOI: usize = 0xB0;      // End of Interrupt
+const LAPIC_LINT0: usize = 0x350;   // LVT LINT0 寄存器
+const LINT0_EXTINT: u32 = 0x0000_0700; // delivery=ExtINT(111), unmasked
 
 // LVT Timer 位
 const TIMER_PERIODIC: u32 = 0x0002_0000; // 周期性模式
@@ -113,6 +115,16 @@ fn lapic_rmw(reg: usize, clear_bits: u32, set_bits: u32) {
 /// 发送 EOI 给 LAPIC。
 pub fn end_of_interrupt() {
     lapic_write(LAPIC_EOI, 0);
+}
+
+/// 配置 LAPIC LINT0 为 ExtINT 模式接收 8259 中断。
+///
+/// QEMU `pc` 机器在 LAPIC 启用时，把 8259 输出路由到 LAPIC 的 LINT0；配置为
+/// ExtINT 后，ISA 设备（键盘 IRQ1）经 8259 → LINT0 → CPU（向量由 8259 提供，
+/// 经 `pic::remap` 重映射为 33）。须在 SVR 使能且 `pic::init` 完成之后调用。
+pub fn configure_lint0_extint() {
+    lapic_write(LAPIC_LINT0, LINT0_EXTINT);
+    klib::info!("[lapic] LINT0 configured as ExtINT (8259 source)");
 }
 
 /// IRQ 处理函数（定时器）：递增 tick、驱动软件定时器队列并 EOI。
@@ -265,6 +277,9 @@ pub fn init() {
 
     // 标记 LAPIC 已可用（串口锁依赖 LAPIC id 做多核 owner 判断）
     serial::set_lapic_ready();
+
+    // 配置 LINT0 为 ExtINT 接收 8259 外部中断（键盘等 ISA 设备）。
+    configure_lint0_extint();
 
     klib::info!("[lapic] LAPIC timer initialized");
 }

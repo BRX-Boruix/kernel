@@ -87,18 +87,18 @@ pub fn end_of_interrupt(irq: u8) {
     outb(PIC1_COMMAND, 0x20);
 }
 
-/// 初始化 8259 PIC，默认全部屏蔽 IRQ。
+/// 初始化 8259 PIC。
 ///
-/// - 若 LAPIC 已启用（现代平台），8259 不再承担外部中断分发，跳过重映射，
-///   仅屏蔽所有 IRQ，避免干扰 IOAPIC 路径。
-/// - 否则（传统 BIOS/非 APIC 环境）重映射到向量 32~47 并屏蔽。
+/// 无条件重映射 8259 到向量 32~47（避免与 CPU 异常向量 0~31 冲突），并**仅解除
+/// 键盘 IRQ1 屏蔽**（bit1=0），其余（含 IRQ0 timer、IRQ2 级联）保持屏蔽。
+///
+/// 本项目键盘走 **8259 → LAPIC LINT0 (ExtINT)** 路径（QEMU `pc` 机器最可靠的
+/// 外部中断源）：`ioapic::init` 把 IMCR 切到 PIC 模式使 8259 输出连 LINT0，
+/// `lapic::init` 把 LINT0 配为 ExtINT 接收；此处解屏蔽 IRQ1 才能让其到达 CPU。
+/// IRQ0（timer）由 LAPIC 自身定时器接管，故保持屏蔽。
 pub fn init() {
-    if apic_enabled() {
-        set_mask(0xFFFF); // 屏蔽所有 IRQ
-        klib::info!("[pic] APIC enabled, skipping 8259 remap (IRQs masked)");
-    } else {
-        remap();
-        set_mask(0xFFFF);
-        klib::info!("[pic] 8259 remapped to vectors 32-47");
-    }
+    remap();
+    // 仅 IRQ1（键盘）使能（bit1=0），其余（含 IRQ0 timer、IRQ2 级联）屏蔽。
+    set_mask(0xFFFD);
+    klib::info!("[pic] 8259 remapped, IRQ1 (kbd) unmasked");
 }

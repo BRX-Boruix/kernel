@@ -185,7 +185,13 @@ fn sys_read(frame: &mut InterruptFrame) -> u64 {
         }
     }
     if got == 0 {
-        return pack_err(Error::WouldBlock); // 缓冲空
+        // 缓冲空：阻塞等待键盘输入（登记 waiter，切走或 idle halt）。
+        // `block_for_kbd` 改写 `*frame` 后返回，由 `syscall_entry` 的 `iretq`
+        // 切到目标进程；本 `read` 实例不再回到此处，被唤醒后由用户态 `read`
+        // 重试重新进入 syscall 取到字符。
+        crate::scheduler::block_for_kbd(frame);
+        // 不会执行到此处（已切换进程）。返回以满足类型检查。
+        return pack_ok(0);
     }
     // SMAP 安全地写到用户缓冲。
     unsafe {
@@ -409,6 +415,8 @@ fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
 /// `exit` 不返回（停机），故不会执行到返回语句。
 pub extern "C" fn syscall_entry(frame: &mut InterruptFrame) -> bool {
     let nr = frame.rax;
+    // 进入/返回 trace 仅在自检构建开启（避免每条 syscall 生产刷屏）。
+    #[cfg(feature = "kernel-tests")]
     klib::info!(
         "[syscall] nr={:#x} a1={:#x} a2={:#x} a3={:#x}",
         nr,
@@ -417,6 +425,7 @@ pub extern "C" fn syscall_entry(frame: &mut InterruptFrame) -> bool {
         frame.rdx
     );
     let ret = dispatch(nr, frame);
+    #[cfg(feature = "kernel-tests")]
     klib::info!("[syscall] nr={:#x} -> {:#x}", nr, ret);
     frame.rax = ret;
     true
