@@ -18,7 +18,7 @@ use arch_x86_64::interrupts::InterruptFrame;
 use klib::error::Error;
 use mm::user_space::{USER_BASE, USER_TOP};
 
-use crate::process::{clear_current_proc, current_proc_mut};
+use crate::process::current_proc_mut;
 
 // ---------- syscall 号（域 + 操作二维编码） ----------
 
@@ -94,13 +94,59 @@ pub const SYS_PIPE_WRITE: u32 = nr(domain::IPC_PIPE, op::WRITE); // 0x6102
 /// `pipe_close(id)`：销毁管道。
 pub const SYS_PIPE_CLOSE: u32 = nr(domain::IPC_PIPE, op::CLOSE); // 0x6103
 
+// ---- 进程查询 / 信号 ----
+/// `ps(buf, cap) -> count`：枚举存活进程快照写入用户缓冲（每条 8 字节）。
+pub const SYS_PS: u32 = nr(domain::SYSTEM, 0x10); // 0xF010
+/// `kill(pid, sig) -> 0`：向进程发送信号（9=SIGKILL / 15=SIGTERM 终止；0=校验存在）。
+pub const SYS_KILL: u32 = nr(domain::SYSTEM, 0x20); // 0xF020
+
 /// `sys::info` 查询项。
 pub const INFO_VERSION: u64 = 0; // 内核版本号
 pub const INFO_BOOT_MS: u64 = 1; // 启动以来毫秒数
 pub const INFO_CPU_COUNT: u64 = 2; // CPU 数
 
 /// 内核版本号（major<<16 | minor<<8 | patch）。
-pub const KERNEL_VERSION: u64 = 0x0000_0401; // v0.4.1
+///
+/// 与启动横幅保持一致：来源为 `CARGO_PKG_VERSION`（见 `kernel/Cargo.toml` 的
+/// `version`，即 workspace 的 `0.1.0`），而非手填常量。编译期从 `env!` 取版本串
+/// 并打包，保证 `version`/`uname` 命令与 `BORUIX KERNEL v.x.y.z` 横幅同源。
+pub const KERNEL_VERSION: u64 = pack_pkg_version();
+
+/// 把 `CARGO_PKG_VERSION`（如 `"0.1.0"`）解析并打包为
+/// `major<<16 | minor<<8 | patch` 的 u64（编译期常量）。
+const fn pack_pkg_version() -> u64 {
+    let s = env!("CARGO_PKG_VERSION");
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    let mut cur: u64 = 0;
+    let mut major: u64 = 0;
+    let mut minor: u64 = 0;
+    let mut patch: u64 = 0;
+    let mut which = 0u32; // 0=major 1=minor 2=patch
+    while i < b.len() {
+        if b[i] == b'.' {
+            if which == 0 {
+                major = cur;
+            } else if which == 1 {
+                minor = cur;
+            }
+            cur = 0;
+            which += 1;
+        } else if b[i].is_ascii_digit() {
+            cur = cur * 10 + (b[i] - b'0') as u64;
+        }
+        i += 1;
+    }
+    // 收尾最后一段（无结尾 '.' 的情况）。
+    if which == 0 {
+        major = cur;
+    } else if which == 1 {
+        minor = cur;
+    } else {
+        patch = cur;
+    }
+    (major << 16) | (minor << 8) | patch
+}
 
 // ---------- ABI 打包（成功 / 错误） ----------
 
@@ -377,6 +423,24 @@ fn sys_exit(frame: &mut InterruptFrame) -> u64 {
     0
 }
 
+/// `ps(buf, cap) -> count`：枚举存活进程快照写入用户缓冲（每条约 8 字节）。
+fn sys_ps(frame: &mut InterruptFrame) -> u64 {
+    let buf = frame.rdi as *mut u8;
+    let cap = frame.rsi as usize;
+    let n = crate::scheduler::ps_snapshot(buf, cap);
+    pack_ok(n as u64)
+}
+
+/// `kill(pid, sig) -> 0`：向进程发送信号（终止 / 校验存在）。
+fn sys_kill(frame: &mut InterruptFrame) -> u64 {
+    let target = frame.rdi as usize;
+    let sig = frame.rsi as u32;
+    match crate::scheduler::kill_pid(target, sig, frame) {
+        Ok(_) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
 // ---------- 分发 ----------
 
 /// 按系统调用号分发到具体实现。返回打包后的结果（写回 `frame.rax`）。
@@ -398,6 +462,8 @@ fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
         SYS_PIPE_READ => sys_pipe_read(frame),
         SYS_PIPE_WRITE => sys_pipe_write(frame),
         SYS_PIPE_CLOSE => sys_pipe_close(frame),
+        SYS_PS => sys_ps(frame),
+        SYS_KILL => sys_kill(frame),
         SYS_EXIT => sys_exit(frame),
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);

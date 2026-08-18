@@ -482,6 +482,85 @@ pub fn exit_current(frame: &mut InterruptFrame) {
     set_current_proc(proc_ptr);
 }
 
+/// 枚举全部存活进程，向用户态缓冲写入快照条目。
+///
+/// 每条 8 字节：`pid: u32`（小端）+ `state: u8`（1=Ready 2=Running 3=Blocked）+ 3 字节填充。
+/// 返回写入的条目数（受 `cap` 字节限制）。经 `copy_to_user` 安全写入用户缓冲（SMAP）。
+pub fn ps_snapshot(buf: *mut u8, cap: usize) -> usize {
+    let s = SCHED.lock();
+    let mut off = 0usize;
+    let mut n = 0usize;
+    for entry in s.procs.iter() {
+        if let Some(e) = entry.as_ref() {
+            if e.proc.state() == TaskState::Exit {
+                continue;
+            }
+            if off + 8 > cap {
+                break;
+            }
+            let pid = e.proc.pid() as u32;
+            let state: u8 = match e.proc.state() {
+                TaskState::Ready => 1,
+                TaskState::Running => 2,
+                TaskState::Blocked => 3,
+                TaskState::Exit => 0,
+            };
+            let ent = [
+                pid as u8,
+                (pid >> 8) as u8,
+                (pid >> 16) as u8,
+                (pid >> 24) as u8,
+                state,
+                0,
+                0,
+                0,
+            ];
+            unsafe {
+                arch_x86_64::mmio::copy_to_user(buf.add(off) as u64, ent.as_ptr(), 8);
+            }
+            off += 8;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// 向进程 `target` 发送信号 `sig`（当前仅 `SIGKILL=9`/`SIGTERM=15` 终止目标；
+/// `sig=0` 仅校验进程存在，不实际发送）。
+///
+/// - 目标为当前进程：走标准 `exit_current` 退出路径（永不返回）。
+/// - 目标为其它进程（单核、非当前，可安全释放其页表/帧）：从就绪队列移除并回收槽位
+///   （`ProcEntry` Drop 自动回收 `UserAddressSpace` 物理资源）；若其为键盘 waiter，
+///   一并清除 `KBD_WAITER` 避免悬挂唤醒。
+pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u64, Error> {
+    if sig != 0 && sig != 9 && sig != 15 {
+        return Err(Error::NotSupported);
+    }
+    let current = {
+        let s = SCHED.lock();
+        s.current
+    };
+    if current == Some(target) {
+        // 自杀：走标准退出路径（释放自身并切换）。exit_current 内部自行加锁，
+        // 故此处不持锁调用。
+        exit_current(frame);
+        // 不返回
+    }
+    // 校验目标存在且非退出。
+    let mut s = SCHED.lock();
+    let exists = matches!(s.procs.get(target), Some(Some(e)) if e.proc.state() != TaskState::Exit);
+    if !exists {
+        return Err(Error::InvalidParam);
+    }
+    // 若是键盘 waiter，清空避免悬挂唤醒。
+    if KBD_WAITER.load(core::sync::atomic::Ordering::Acquire) == target as u32 {
+        KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+    }
+    s.ready.retain(|&p| p != target);
+    s.procs[target] = None; // Drop：回收 UserAddressSpace 等物理资源
+    Ok(0)
+}
+
 /// 唤醒一个阻塞的进程（IPC 写/读端完成时调用）：置 `Ready` 并入就绪队列。
 ///
 /// 仅当目标进程处于 `Blocked` 时才生效（已就绪/运行中进程忽略，避免重复入队）。
