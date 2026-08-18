@@ -392,7 +392,7 @@ fn start_init() -> ! {
             CurrentArch::halt();
         }
     };
-    let loaded = match elf::load(elf_bytes, &mut us) {
+    let loaded = match elf::load(elf_bytes, &mut us, &[]) {
         Ok(l) => l,
         Err(e) => {
             error!("[kmain] init: load init.elf failed: {:?}", e);

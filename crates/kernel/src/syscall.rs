@@ -253,16 +253,33 @@ fn sys_read(frame: &mut InterruptFrame) -> u64 {
 /// 由调度器 RR 轮转调度（与 init 并存）。
 fn sys_exec(frame: &mut InterruptFrame) -> u64 {
     let idx = frame.rdi as usize;
+    let arg_ptr = frame.rsi;
+    let arg_len = frame.rdx;
     let Some(elf_bytes) = crate::program_elf(idx) else {
         return pack_err(Error::InvalidParam);
     };
+    // 拷命令行到内核缓冲（带 SMAP 安全的 copy_from_user）。空命令行 → 正常启动。
+    let mut cmd = [0u8; 512];
+    let cmd_len = if arg_len == 0 {
+        0
+    } else {
+        if arg_ptr < USER_BASE || arg_ptr + arg_len > USER_TOP {
+            return pack_err(Error::OutOfRange);
+        }
+        let l = core::cmp::min(arg_len as usize, cmd.len());
+        unsafe {
+            arch_x86_64::mmio::copy_from_user(cmd.as_mut_ptr(), arg_ptr, l);
+        }
+        l
+    };
+    let cmd = &cmd[..cmd_len];
     let Ok(mut us) = mm::user_space::UserAddressSpace::<
         arch_x86_64::paging::X86PageTable,
     >::new()
     else {
         return pack_err(Error::OutOfMemory);
     };
-    let loaded = match crate::elf::load(elf_bytes, &mut us) {
+    let loaded = match crate::elf::load(elf_bytes, &mut us, cmd) {
         Ok(l) => l,
         Err(e) => return pack_err(e),
     };

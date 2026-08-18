@@ -1824,7 +1824,7 @@ pub fn test_elf_loader() {
     info!("[elf-test] built test ELF ({} bytes)", elf_bytes.len());
 
     let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
-    let loaded = elf::load(&elf_bytes, &mut us).expect("load elf");
+    let loaded = elf::load(&elf_bytes, &mut us, &[]).expect("load elf");
     info!(
         "[elf-test] loaded entry={:#x} stack_top={:#x}",
         loaded.entry, loaded.user_stack_top
@@ -1858,7 +1858,7 @@ pub fn test_userspace_elf() {
     info!("[userspace] embedded init.elf ({} bytes)", elf_bytes.len());
 
     let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
-    let loaded = elf::load(elf_bytes, &mut us).expect("load init.elf");
+    let loaded = elf::load(elf_bytes, &mut us, &[]).expect("load init.elf");
     info!(
         "[userspace] loaded entry={:#x} stack_top={:#x}",
         loaded.entry, loaded.user_stack_top

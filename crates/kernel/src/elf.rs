@@ -83,14 +83,19 @@ pub struct LoadedElf {
 
 /// 把 ELF 镜像加载到 `addr_space`，返回入口与用户栈顶。
 ///
+/// `cmd` 为可选命令行（`exec` 系统调用传入的参数字节串，如 `echo hi`）；
+/// 非空时在新进程用户栈上布置 `argc=1 / argv[0]=cmd`，使新进程以"一次性
+/// 命令模式"启动（见 `setup_user_stack`）；为空则按 `argc=0` 正常启动。
+///
 /// 流程：
 /// 1. 校验 ELF header（magic / 64 位 / 小端 / ET_EXEC / x86-64）；
 /// 2. 遍历 program headers，逐段加载所有 `PT_LOAD`（分配物理帧 + 拷贝
 ///    file 内容 + 清零 bss + 按段权限映射，W^X）；
-/// 3. 设置用户栈（立即映射 8 页），栈顶放 argc/argv 雏形。
+/// 3. 设置用户栈（立即映射 8 页），栈顶放 argc/argv 雏形或命令行。
 pub fn load(
     elf: &[u8],
     addr_space: &mut UserAddressSpace<X86PageTable>,
+    cmd: &[u8],
 ) -> Result<LoadedElf, Error> {
     // 1. 解析并校验 header。
     let (entry, phoff, phentsize, phnum) = parse_header(elf)?;
@@ -109,8 +114,8 @@ pub fn load(
         return Err(Error::InvalidParam);
     }
 
-    // 3. 设置用户栈 + argc/argv 雏形。
-    let stack_top = setup_user_stack(addr_space)?;
+    // 3. 设置用户栈 + argc/argv 雏形（或命令行）。
+    let stack_top = setup_user_stack(addr_space, cmd)?;
 
     klib::info!(
         "[elf] loaded {} segments, entry={:#x}, stack_top={:#x}",
@@ -248,16 +253,27 @@ fn load_segment(
     Ok(())
 }
 
-/// 设置用户栈：立即映射 8 页，栈顶放 argc/argv 雏形。
+/// 设置用户栈：立即映射 8 页，栈顶放 argc/argv 雏形或命令行。
 ///
-/// 栈顶布局（Linux `_start` 约定）：
+/// 无命令行（正常启动，如 init 拉起 shell）时栈顶布局（Linux `_start` 约定）：
 /// ```text
 ///   [stack_top - 16] = argc = 0
 ///   [stack_top - 8]  = argv[0] = NULL（argv 结束）
 /// 初始 rsp = stack_top - 16，故 [rsp]=argc、[rsp+8]=argv[0]
 /// ```
+///
+/// 有命令行（`cmd` 非空，如 `exec(shell, b"echo hi")` 的后台作业模式）时，
+/// 在栈顶页内布置字符串与 argv 数组，使新进程以 `argc=1 / argv[0]=cmd` 启动：
+/// ```text
+///   str_user  = stack_top - 0x200 : "cmd\0"
+///   argv_user = stack_top - 0x210 : [str_user (u64), 0 (u64)]
+///   rsp_user  = stack_top - 0x220 : [argc=1 (u64), argv_user (u64)]
+/// ```
+/// 写入位置用 HHDM 内核虚拟地址（`top - off`），但写入的**值**用新进程用户
+/// 虚拟地址（`USER_STACK_TOP - off`），二者独立、互不混淆。
 fn setup_user_stack(
     addr_space: &mut UserAddressSpace<X86PageTable>,
+    cmd: &[u8],
 ) -> Result<u64, Error> {
     let stack_size = (USER_STACK_PAGES * 0x1000) as u64;
     let stack_top = USER_STACK_TOP;
@@ -280,11 +296,42 @@ fn setup_user_stack(
     // 写 argc/argv 雏形到栈顶页（经 HHDM；栈顶页 = 最后一个帧）。
     let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
     unsafe {
-        let top = (frames[USER_STACK_PAGES - 1] + off + 0x1000) as *mut u64;
-        // [stack_top - 16] = argc = 0
-        *top.sub(2) = 0;
-        // [stack_top - 8] = argv[0] = NULL
-        *top.sub(1) = 0;
+        let top = (frames[USER_STACK_PAGES - 1] + off + 0x1000) as *mut u8;
+
+        if !cmd.is_empty() {
+            // 栈内偏移（字节，从 stack_top 向下）。
+            const STR_OFF: usize = 0x200;
+            const ARGV_OFF: usize = 0x210;
+            const RSP_OFF: usize = 0x220;
+            let str_user = stack_top - STR_OFF as u64;
+            let argv_user = stack_top - ARGV_OFF as u64;
+            let rsp_user = stack_top - RSP_OFF as u64;
+
+            // 命令字符串（含 NUL），最长 STR_OFF-1 字节，超出截断。
+            let sp = top.sub(STR_OFF);
+            let n = cmd.len().min(STR_OFF - 1);
+            for i in 0..n {
+                *sp.add(i) = cmd[i];
+            }
+            *sp.add(n) = 0;
+
+            // argv 数组：argv[0]=str_user、argv[1]=NULL。
+            let ap = top.sub(ARGV_OFF) as *mut u64;
+            *ap = str_user;
+            *ap.add(1) = 0;
+
+            // argc / argv。
+            let rp = top.sub(RSP_OFF) as *mut u64;
+            *rp = 1;
+            *rp.add(1) = argv_user;
+
+            return Ok(rsp_user);
+        }
+
+        // 无命令行：argc=0, argv=NULL（原行为）。
+        let top64 = top as *mut u64;
+        *top64.sub(2) = 0; // argc
+        *top64.sub(1) = 0; // argv[0]=NULL
     }
 
     Ok(stack_top - 16)
