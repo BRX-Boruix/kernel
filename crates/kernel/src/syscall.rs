@@ -180,7 +180,7 @@ fn sys_write(frame: &mut InterruptFrame) -> u64 {
     if buf < USER_BASE || end > USER_TOP {
         return pack_err(Error::OutOfRange);
     }
-    const CHUNK: usize = 256;
+    const CHUNK: usize = 4096;
     let mut chunk = [0u8; CHUNK];
     let mut off = 0usize;
     while off < len as usize {
