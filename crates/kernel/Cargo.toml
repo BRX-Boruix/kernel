@@ -35,3 +35,5 @@ drv = { path = "../drv" }
 arch = { path = "../arch/arch" }
 arch-x86_64 = { path = "../arch/arch-x86_64" }
 mm = { path = "../mm" }
+vfs = { path = "../vfs" }
+spin = "0.9"

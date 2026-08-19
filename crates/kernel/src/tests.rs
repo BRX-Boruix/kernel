@@ -1893,3 +1893,89 @@ pub fn test_userspace_elf() {
     // 启动调度器（永不返回：init 打印信息后 exit 停机）。
     scheduler::start();
 }
+
+/// M6.1：验证 VFS 核心抽象与 RamFS 内存文件系统。
+///
+/// 覆盖：
+/// 1. 根文件系统目录骨架完整性（/binaries, /config, /system, /users, /temporary, /volumes）。
+/// 2. 文件创建、句柄流式读写、Seek 与无状态 pread/pwrite。
+/// 3. 子目录创建、嵌套路径解析与目录项枚举（list_dir）。
+/// 4. 软链接创建与目标解析（symlink）。
+/// 5. 延迟删除与非空目录保护（unlink）。
+/// 6. 独立子文件系统挂载（mount to /volumes/data）。
+pub fn test_vfs_m61() {
+    use crate::vfs_init;
+    use vfs::file_handle::{FileHandle, OpenFlags, SeekWhence};
+    use vfs::inode::{INodeType, Permissions};
+    use vfs::ramfs::RamFS;
+    use alloc::sync::Arc;
+
+    info!("[test-vfs-m61] === M6.1: VFS abstraction and RamFS selftest ===");
+
+    let root = vfs_init::root();
+
+    // 1. 验证 RESTful 顶层目录骨架
+    for dir in &["/binaries", "/config", "/system", "/users", "/temporary", "/volumes"] {
+        let node = root.resolve(dir, true).expect("resolve skeleton dir");
+        assert_eq!(
+            node.metadata().expect("meta").node_type,
+            INodeType::Directory,
+            "skeleton entry must be directory"
+        );
+    }
+    info!("[test-vfs-m61] skeleton dirs verified");
+
+    // 2. 创建文件与句柄流式读写
+    let file_node = root
+        .create_file("/config/kernel.json", Permissions::read_write())
+        .expect("create file");
+    let handle = FileHandle::new(file_node.clone(), OpenFlags::READ_WRITE);
+    let payload = b"{\"arch\":\"x86_64\",\"version\":\"0.1.0\",\"status\":\"ok\"}";
+    let written = handle.write(payload).expect("write payload");
+    assert_eq!(written, payload.len());
+    assert_eq!(file_node.metadata().expect("meta").size, payload.len() as u64);
+
+    // Seek 读回
+    handle.seek(0, SeekWhence::Set).expect("seek 0");
+    let mut read_buf = [0u8; 64];
+    let n = handle.read(&mut read_buf).expect("read");
+    assert_eq!(n, payload.len());
+    assert_eq!(&read_buf[..n], payload);
+
+    // pread 随机读取
+    let mut chunk = [0u8; 6];
+    assert_eq!(handle.pread(9, &mut chunk).expect("pread"), 6);
+    assert_eq!(&chunk, b"x86_64");
+    info!("[test-vfs-m61] file create and stream/positioned io verified");
+
+    // 3. 目录项枚举
+    let config_dir = root.resolve("/config", true).expect("resolve config");
+    let entries = config_dir.list_dir().expect("list config dir");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name.as_str(), "kernel.json");
+    assert_eq!(entries[0].size, payload.len() as u64);
+
+    // 4. 软链接创建与多层解析
+    root.symlink("/config/kernel.json", "/config/current_config")
+        .expect("symlink");
+    let linked = root.resolve("/config/current_config", true).expect("resolve symlink");
+    assert_eq!(linked.metadata().expect("meta").node_type, INodeType::RegularFile);
+
+    // 5. 挂载独立文件系统到 /volumes/workspace
+    let data_fs = Arc::new(RamFS::new());
+    root.mkdir("/volumes/workspace", Permissions::all()).expect("mkdir mount point");
+    root.mount("/volumes/workspace", data_fs).expect("mount workspace");
+    root.create_file("/volumes/workspace/main.rs", Permissions::all()).expect("create in volume");
+    let vol_file = root.resolve("/volumes/workspace/main.rs", true).expect("resolve vol file");
+    assert_eq!(vol_file.metadata().expect("meta").node_type, INodeType::RegularFile);
+
+    // 6. 延迟删除与目录保护
+    root.mkdir("/temporary/trash", Permissions::all()).expect("mkdir trash");
+    root.create_file("/temporary/trash/item1", Permissions::all()).expect("create trash item");
+    assert!(root.unlink("/temporary/trash").is_err(), "non-empty dir cannot be unlinked");
+    root.unlink("/temporary/trash/item1").expect("unlink item");
+    root.unlink("/temporary/trash").expect("unlink empty dir");
+
+    info!("[test-vfs-m61] PASS");
+}
+

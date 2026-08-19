@@ -1,0 +1,8 @@
+[package]
+name = "vfs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+klib = { path = "../klib" }
+spin = "0.9"

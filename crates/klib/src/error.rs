@@ -32,6 +32,18 @@ pub enum Error {
     NoSpace,
     /// 设备 I/O 错误。
     Io,
+    /// 并非目录（试图对文件执行 lookup/readdir 等）。
+    NotDirectory,
+    /// 是目录（试图对目录执行非目录文件操作）。
+    IsDirectory,
+    /// 权限拒绝。
+    PermissionDenied,
+    /// 目录非空（删除非空目录）。
+    NotEmpty,
+    /// 文件名或路径超长。
+    NameTooLong,
+    /// 软链接层级过深（死循环）。
+    TooManySymlinks,
     /// 过渡用：携带原始错误描述字符串（迁移完成后移除）。
     Msg(&'static str),
 }
@@ -40,16 +52,22 @@ impl Error {
     /// 转为 POSIX errno 风格数值（ADR-003 syscall 边界铺路，可后续直接映射）。
     pub fn to_errno(self) -> i32 {
         match self {
-            Error::OutOfMemory => 12,   // ENOMEM
-            Error::InvalidParam => 22,  // EINVAL
-            Error::OutOfRange => 34,    // ERANGE
-            Error::NotFound => 2,       // ENOENT
-            Error::AlreadyExists => 17, // EEXIST
-            Error::NotSupported => 95,  // ENOTSUP
-            Error::WouldBlock => 11,    // EAGAIN
-            Error::NoSpace => 28,       // ENOSPC
-            Error::Io => 5,             // EIO
-            Error::Msg(_) => 22,        // EINVAL
+            Error::OutOfMemory => 12,        // ENOMEM
+            Error::InvalidParam => 22,       // EINVAL
+            Error::OutOfRange => 34,         // ERANGE
+            Error::NotFound => 2,            // ENOENT
+            Error::AlreadyExists => 17,      // EEXIST
+            Error::NotSupported => 95,       // ENOTSUP
+            Error::WouldBlock => 11,         // EAGAIN
+            Error::NoSpace => 28,            // ENOSPC
+            Error::Io => 5,                  // EIO
+            Error::NotDirectory => 20,       // ENOTDIR
+            Error::IsDirectory => 21,        // EISDIR
+            Error::PermissionDenied => 13,   // EACCES
+            Error::NotEmpty => 39,           // ENOTEMPTY
+            Error::NameTooLong => 36,        // ENAMETOOLONG
+            Error::TooManySymlinks => 40,    // ELOOP
+            Error::Msg(_) => 22,             // EINVAL
         }
     }
 }
@@ -73,6 +91,12 @@ impl core::fmt::Display for Error {
             Error::WouldBlock => f.write_str("would block"),
             Error::NoSpace => f.write_str("no space"),
             Error::Io => f.write_str("i/o error"),
+            Error::NotDirectory => f.write_str("not a directory"),
+            Error::IsDirectory => f.write_str("is a directory"),
+            Error::PermissionDenied => f.write_str("permission denied"),
+            Error::NotEmpty => f.write_str("directory not empty"),
+            Error::NameTooLong => f.write_str("name too long"),
+            Error::TooManySymlinks => f.write_str("too many levels of symbolic links"),
             Error::Msg(s) => f.write_str(s),
         }
     }

@@ -22,6 +22,8 @@ mod elf;
 mod signals;
 // IPC（M5）：共享内存 + 管道。依赖进程/调度（阻塞唤醒）与 syscall 分发。
 mod ipc;
+// VFS 虚拟文件系统初始化（M6.1）。
+mod vfs_init;
 // 自检测试仅在 `kernel-tests` feature 下编译（SDK `build/br --test`）。
 #[cfg(feature = "kernel-tests")]
 mod tests;
@@ -274,6 +276,13 @@ unsafe fn kmain_body() -> ! {
     tests::test_ipc();
     #[cfg(feature = "kernel-test-m5")]
     tests::test_process_reclaim();
+
+    // M6.1：初始化 VFS 根挂载表与 RESTful 目录骨架。
+    vfs_init::init();
+
+    // 运行 M6.1 VFS 自检测试（在 kernel-tests feature 启用时）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_vfs_m61();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。
