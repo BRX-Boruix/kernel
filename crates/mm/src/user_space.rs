@@ -254,31 +254,65 @@ where
             return false;
         }
 
-        // 分配物理页
-        let frame = match allocate_frame() {
-            Some(f) => f,
-            None => return false, // 物理内存耗尽
-        };
-        let phys = frame.start_paddr();
-
-        // 清零该物理页（经 HHDM 虚拟地址），保证新页内容确定
-        let page_virt = phys_to_virt(phys) as *mut u8;
-        unsafe { core::ptr::write_bytes(page_virt, 0, area.size.bytes() as usize) };
-
-        // 建立映射（带 user 标志 + 区域权限）
-        let aligned = area.start.as_u64() + ((vaddr - area.start.as_u64()) / area.size.bytes()) * area.size.bytes();
-        if let Err(_) = self.pt.map(
-            VirtAddr::new(aligned),
-            PhysAddr::new(phys),
-            area.size,
-            area.flags.user(),
-        ) {
-            // 映射失败：释放刚分配的页
-            deallocate_frame(frame);
-            return false;
+        // 1. 2MB 大页直通优化：如果区域本身是 Size2M 且对齐，直接分配 ORDER_2M 物理大页
+        if area.size == PageSize::Size2M {
+            let aligned = area.start.as_u64() + ((vaddr - area.start.as_u64()) / area.size.bytes()) * area.size.bytes();
+            if let Some(frame) = crate::frame_allocator::allocate_frames(crate::frame_allocator::ORDER_2M) {
+                let phys = frame.start_paddr();
+                let page_virt = phys_to_virt(phys) as *mut u8;
+                unsafe { core::ptr::write_bytes(page_virt, 0, area.size.bytes() as usize) };
+                if self.pt.map(
+                    VirtAddr::new(aligned),
+                    PhysAddr::new(phys),
+                    PageSize::Size2M,
+                    area.flags.user(),
+                ).is_ok() {
+                    drop(areas);
+                    return true;
+                }
+                deallocate_frame(frame);
+            }
         }
+
+        // 2. 4KB 页按需分配 + 批量预取（Fault-Ahead Prefetch）：
+        // 当访问连续堆/栈区时，一次性从 LazyBuddy PerCpuCache 预充连续的最多 4 个物理页，
+        // 极大降低连续线性写（如 Vec::push / 扩容）时的连续 #PF 异常触发开销。
+        let aligned = area.start.as_u64() + ((vaddr - area.start.as_u64()) / 4096) * 4096;
+        let mut mapped_any = false;
+        let prefetch_count = 4usize;
+
+        for step in 0..prefetch_count {
+            let cur_v = aligned + (step as u64) * 4096;
+            if cur_v >= area.end.as_u64() {
+                break;
+            }
+            // 若该虚拟页已映射（可能被之前的操作建立过），跳过
+            if self.pt.translate(VirtAddr::new(cur_v)).is_some() {
+                continue;
+            }
+
+            let Some(frame) = allocate_frame() else {
+                break;
+            };
+            let phys = frame.start_paddr();
+            let page_virt = phys_to_virt(phys) as *mut u8;
+            unsafe { core::ptr::write_bytes(page_virt, 0, 4096) };
+
+            if self.pt.map(
+                VirtAddr::new(cur_v),
+                PhysAddr::new(phys),
+                PageSize::Size4K,
+                area.flags.user(),
+            ).is_ok() {
+                mapped_any = true;
+            } else {
+                deallocate_frame(frame);
+                break;
+            }
+        }
+
         drop(areas);
-        true
+        mapped_any
     }
 
     /// 写时复制（COW）页：把当前共享页复制为私有可写页（供 #PF 写故障调用）。
