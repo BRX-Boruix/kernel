@@ -162,6 +162,7 @@ impl DevFS {
                         } else {
                             let _ = obj.field_null("driver");
                         }
+                        let _ = obj.field_str("uri", &alloc::format!("/devices/{}", d.name));
                         Ok(())
                     });
                 }
