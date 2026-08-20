@@ -2317,6 +2317,17 @@ pub fn test_driver_hub_m72() {
     assert!(found_ata, "ata0 must be registered in DriverHub");
     assert!(found_ramdisk, "ramdisk0 must be registered in DriverHub");
 
+    // 6. 验证 DevFS /devices/list 动态投影与 JSON HATEOAS
+    let root = crate::vfs_init::root();
+    let dev_list_node = root.resolve("/devices/list", true).expect("resolve /devices/list");
+    let mut dev_json_buf = [0u8; 4096];
+    let dev_json_n = dev_list_node.read_at(0, &mut dev_json_buf).expect("read /devices/list");
+    assert!(dev_json_n > 0, "devfs list cannot be empty");
+    let dev_json_str = core::str::from_utf8(&dev_json_buf[..dev_json_n]).unwrap_or("");
+    assert!(dev_json_str.contains("serial-com1"), "must contain serial-com1");
+    assert!(dev_json_str.contains("uri"), "must contain HATEOAS uri links");
+    info!("[test-driver-hub-m72] DevFS /devices/list JSON dynamic projection OK ({} bytes)", dev_json_n);
+
     info!("[test-driver-hub-m72] PASS");
 }
 

@@ -118,6 +118,16 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         if buf.is_empty() {
             return Ok(0);
         }
+        let count = drv::DriverHub::device_count();
+        for i in 0..count {
+            if let Some(info) = drv::DriverHub::device_info_at(i) {
+                if info.name == "serial-com1" {
+                    if let Some(ops) = drv::DriverHub::device_at(i) {
+                        return Ok(ops.read(buf));
+                    }
+                }
+            }
+        }
         if let Some(b) = arch_x86_64::serial::read_byte() {
             buf[0] = b;
             Ok(1)
@@ -127,6 +137,16 @@ impl DeviceInfoProvider for KernelDeviceProvider {
     }
 
     fn serial_write(&self, buf: &[u8]) -> Result<usize, klib::error::Error> {
+        let count = drv::DriverHub::device_count();
+        for i in 0..count {
+            if let Some(info) = drv::DriverHub::device_info_at(i) {
+                if info.name == "serial-com1" {
+                    if let Some(ops) = drv::DriverHub::device_at(i) {
+                        return Ok(ops.write(buf));
+                    }
+                }
+            }
+        }
         for &b in buf {
             arch_x86_64::serial::write_byte(b);
         }
