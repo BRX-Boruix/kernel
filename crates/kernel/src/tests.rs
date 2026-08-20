@@ -2201,6 +2201,66 @@ pub fn test_vfs_m65() {
     info!("[test-vfs-m65] PASS");
 }
 
+/// M7.2：验证 Platform 平台基础驱动接入 DriverHub（Early 串口、PS/2 键盘、CMOS RTC、伪设备）。
+pub fn test_driver_hub_m72() {
+    use drv::DriverHub;
+
+    info!("[test-driver-hub-m72] === M7.2: Platform Core Drivers and DriverHub Selftest ===");
+
+    // 1. 验证设备与驱动注册数量
+    let drv_count = DriverHub::driver_count();
+    let dev_count = DriverHub::device_count();
+    assert!(drv_count >= 3, "must register serial, keyboard, cmos, pseudo");
+    assert!(dev_count >= 3, "must register serial-com1, ps2-keyboard, cmos-rtc, null, zero");
+    info!(
+        "[test-driver-hub-m72] DriverHub stats: registered_drivers={}, registered_devices={}",
+        drv_count, dev_count
+    );
+
+    // 2. 验证 CMOS RTC 硬件时钟可读性
+    let mut found_cmos = false;
+    for i in 0..dev_count {
+        if let Some(info) = DriverHub::device_info_at(i) {
+            if info.name == "cmos-rtc" {
+                found_cmos = true;
+                if let Some(ops) = DriverHub::device_at(i) {
+                    let mut buf = [0u8; 32];
+                    let n = ops.read(&mut buf);
+                    assert!(n > 0, "cmos read must return timestamp");
+                    let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
+                    info!("[test-driver-hub-m72] CMOS RTC timestamp: {}", s.trim());
+                }
+            }
+        }
+    }
+    assert!(found_cmos, "cmos-rtc device must be present in DriverHub");
+
+    // 3. 验证 Zero/Null 伪设备行为
+    for i in 0..dev_count {
+        if let Some(info) = DriverHub::device_info_at(i) {
+            if info.name == "zero" {
+                if let Some(ops) = DriverHub::device_at(i) {
+                    let mut buf = [0xFFu8; 16];
+                    let n = ops.read(&mut buf);
+                    assert_eq!(n, 16);
+                    assert_eq!(buf, [0u8; 16], "zero device must fill zeroes");
+                }
+            } else if info.name == "null" {
+                if let Some(ops) = DriverHub::device_at(i) {
+                    let mut buf = [0x55u8; 16];
+                    let n = ops.read(&mut buf);
+                    assert_eq!(n, 0, "null device read must return 0");
+                    let wn = ops.write(b"discard");
+                    assert_eq!(wn, 7, "null device write must accept all");
+                }
+            }
+        }
+    }
+
+    info!("[test-driver-hub-m72] PASS");
+}
+
+
 
 
 

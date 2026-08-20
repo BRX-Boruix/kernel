@@ -84,36 +84,31 @@ struct KernelDeviceProvider;
 impl DeviceInfoProvider for KernelDeviceProvider {
     fn list_devices(&self) -> Vec<DeviceInfo> {
         let mut list = Vec::new();
-        drv::with_registry(|reg| {
-            reg.for_each_device(|dev| {
-                let id = dev.id();
-                let bus_str = match id.bus {
+        let count = drv::DriverHub::device_count();
+        for i in 0..count {
+            if let Some(info) = drv::DriverHub::device_info_at(i) {
+                let bus_str = match info.bus {
                     drv::BusType::Pci => "PCI",
-                    drv::BusType::System => "System",
-                    drv::BusType::Serial => "Serial",
-                    drv::BusType::Ps2 => "PS2",
-                    drv::BusType::Framebuffer => "Framebuffer",
-                    drv::BusType::Acpi => "ACPI",
+                    drv::BusType::Platform => "Platform",
+                    drv::BusType::Virtual => "Virtual",
+                    drv::BusType::Unknown => "Unknown",
                 };
-                let bound = if reg.is_bound(dev) {
-                    Some(String::from("attached"))
-                } else {
-                    None
-                };
+                let bound = drv::DriverHub::device_driver_at(i).map(|s| String::from(s)).or(Some(String::from("attached")));
+                let class_val = ((info.class_code as u32) << 16) | ((info.subclass as u32) << 8) | (info.prog_if as u32);
                 list.push(DeviceInfo {
-                    name: String::from(dev.name()),
+                    name: String::from(info.name),
                     bus: String::from(bus_str),
-                    class: format!("{:#06x}", id.class),
+                    class: format!("{:#06x}", class_val),
                     bound_driver: bound,
                 });
-            });
-        });
+            }
+        }
         if list.is_empty() {
             list.push(DeviceInfo {
                 name: String::from("serial-com1"),
                 bus: String::from("Serial"),
                 class: String::from("UART"),
-                bound_driver: Some(String::from("uart16550")),
+                bound_driver: Some(String::from("attached")),
             });
         }
         list

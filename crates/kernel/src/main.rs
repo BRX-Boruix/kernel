@@ -294,6 +294,8 @@ unsafe fn kmain_body() -> ! {
     tests::test_vfs_m64();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m65();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_driver_hub_m72();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。

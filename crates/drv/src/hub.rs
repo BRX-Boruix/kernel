@@ -145,8 +145,19 @@ impl DriverHub {
             .and_then(|entry| entry.driver_name)
     }
 
+    fn ensure_registered() {
+        if REGISTERED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        crate::platform::serial::register_serial_driver();
+        crate::platform::keyboard::register_keyboard_driver();
+        crate::platform::cmos::register_cmos_driver();
+        crate::platform::pseudo::register_pseudo_driver();
+    }
+
     /// 触发指定生命周期阶段的所有驱动初始化。
     pub fn init_stage(stage: DriverStage) {
+        Self::ensure_registered();
         let count = DRIVER_COUNT.load(Ordering::Relaxed);
         let list = DRIVERS.lock();
         let hub = DriverHub;
