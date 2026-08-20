@@ -431,7 +431,8 @@ pub fn wake_kbd() {
 pub fn exit_current(frame: &mut InterruptFrame) {
     let mut s = SCHED.lock();
     let cur_pid = s.current.expect("exit called outside process");
-    // 回收当前进程槽位。
+    // 回收当前进程槽位与 UIO 驱动沙箱隔离清理（M11.2 零 Panic 故障恢复）。
+    drv::uio_on_process_exit(cur_pid);
     if let Some(slot) = s.procs[cur_pid].as_mut() {
         slot.proc.set_state(TaskState::Exit);
     }

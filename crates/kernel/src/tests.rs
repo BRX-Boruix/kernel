@@ -2422,6 +2422,19 @@ pub fn test_driver_hub_m72() {
     assert!(net_str.contains("rx_bytes"), "net stats must contain rx_bytes");
     info!("[test-driver-hub-m72] /devices/net/primary/stats OK: {}", net_str.trim());
 
+    // 10. 验证 M11 用户态驱动沙箱与零 Panic 隔离（UIO & Fault Isolation）
+    let fake_driver_pid = 999;
+    let uio_reg = drv::uio_register_driver(fake_driver_pid, "pci-ethernet", 0xE0000000, 4096);
+    assert!(uio_reg.is_ok(), "UIO driver registration must succeed");
+    assert!(drv::uio_is_device_claimed("pci-ethernet"), "device must be marked as claimed");
+    info!("[test-driver-hub-m72] UIO userspace driver registration & device claim OK");
+
+    // 模拟用户态驱动异常退出 / 强行 kill (Fault Recovery)
+    let isolated = drv::uio_on_process_exit(fake_driver_pid);
+    assert!(isolated, "UIO fault isolation handler must catch process exit");
+    assert!(!drv::uio_is_device_claimed("pci-ethernet"), "claimed device must be safely released");
+    info!("[test-driver-hub-m72] UIO zero-panic crash isolation OK");
+
     info!("[test-driver-hub-m72] PASS");
 }
 

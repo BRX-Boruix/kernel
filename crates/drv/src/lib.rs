@@ -14,6 +14,7 @@ pub mod hub;
 pub mod pci;
 pub mod pci_drivers;
 pub mod platform;
+pub mod uio;
 
 pub use device::{
     BlockDevice, BusType, CharDevice, Device, DeviceInfo, DeviceKind, DeviceOps, InputDevice,
@@ -22,6 +23,7 @@ pub use device::{
 pub use driver::{Driver, DriverEntry, DriverStage};
 pub use event::{publish_event, pop_event, pending_event_count, subscribe_events, DeviceEvent, EventSubscriber};
 pub use hub::DriverHub;
+pub use uio::{uio_register_driver, uio_on_process_exit, uio_is_device_claimed, UioDriverEntry};
 
 #[cfg(test)]
 mod tests {

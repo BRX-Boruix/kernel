@@ -109,6 +109,12 @@ pub const SYS_PS: u32 = nr(domain::SYSTEM, 0x10); // 0xF010
 /// `kill(pid, sig) -> 0`：向进程发送信号（9=SIGKILL / 15=SIGTERM 终止；0=校验存在）。
 pub const SYS_KILL: u32 = nr(domain::SYSTEM, 0x20); // 0xF020
 
+// ---- M11 用户态驱动沙箱 UIO ----
+/// `driver_register(dev_name_ptr, len) -> uio_id`：用户态进程注册为硬件驱动。
+pub const SYS_DRIVER_REGISTER: u32 = nr(domain::DEVICE, op::CREATE); // 0x5000
+/// `driver_claim(uio_id, mmio_base, size) -> user_vaddr`：映射设备 MMIO 到用户虚存。
+pub const SYS_DRIVER_CLAIM: u32 = nr(domain::DEVICE, op::CONTROL); // 0x5004
+
 /// `sys::info` 查询项。
 pub const INFO_VERSION: u64 = 0; // 内核版本号
 pub const INFO_BOOT_MS: u64 = 1; // 启动以来毫秒数
@@ -813,6 +819,48 @@ fn sys_kill(frame: &mut InterruptFrame) -> u64 {
     }
 }
 
+/// `driver_register(name_ptr, len) -> uio_id` (M11.1)
+fn sys_driver_register(frame: &mut InterruptFrame) -> u64 {
+    let name_ptr = frame.rdi as *const u8;
+    let len = frame.rsi as usize;
+    if len == 0 || len > 32 {
+        return pack_err(Error::InvalidParam);
+    }
+    let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+    let mut name_buf = [0u8; 32];
+    unsafe {
+        arch_x86_64::mmio::copy_from_user(name_buf.as_mut_ptr(), name_ptr as u64, len);
+    }
+    let dev_name = match core::str::from_utf8(&name_buf[..len]) {
+        Ok(s) => s,
+        Err(_) => return pack_err(Error::InvalidParam),
+    };
+    match drv::uio_register_driver(pid, dev_name, 0, 0) {
+        Ok(id) => pack_ok(id as u64),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `driver_claim(uio_id, mmio_base, size) -> user_vaddr` (M11.1)
+fn sys_driver_claim(frame: &mut InterruptFrame) -> u64 {
+    let _uio_id = frame.rdi as usize;
+    let mmio_base = frame.rsi;
+    let size = frame.rdx;
+
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+
+    let flags = PageFlags::empty().writable().user();
+    let user_vaddr = match proc.addr_space_mut().mmap_user(size, flags) {
+        Ok(addr) => addr,
+        Err(e) => return pack_err(e),
+    };
+
+    klib::info!("[uio] claimed MMIO mapped: phys={:#x} -> user_vaddr={:#x} (size={})", mmio_base, user_vaddr, size);
+    pack_ok(user_vaddr)
+}
+
 // ---------- 分发 ----------
 
 /// 按系统调用号分发到具体实现。返回打包后的结果（写回 `frame.rax`）。
@@ -845,6 +893,8 @@ fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
         SYS_PIPE_CLOSE => sys_pipe_close(frame),
         SYS_PS => sys_ps(frame),
         SYS_KILL => sys_kill(frame),
+        SYS_DRIVER_REGISTER => sys_driver_register(frame),
+        SYS_DRIVER_CLAIM => sys_driver_claim(frame),
         SYS_EXIT => sys_exit(frame),
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);
