@@ -2083,5 +2083,58 @@ pub fn test_vfs_m63() {
     info!("[test-vfs-m63] PASS");
 }
 
+/// M6.4：验证 Page Cache 统合页缓存与 VFS ELF 加载。
+pub fn test_vfs_m64() {
+    use crate::vfs_init;
+    use vfs::page_cache::PageCache;
+
+    info!("[test-vfs-m64] === M6.4: Page Cache and VFS-backed ELF Loading Selftest ===");
+
+    let root = vfs_init::root();
+
+    // 1. 校验 /binaries/init.elf 与 /binaries/shell.elf 存在于 VFS 中
+    let init_node = root.resolve("/binaries/init.elf", true).expect("resolve /binaries/init.elf");
+    let shell_node = root.resolve("/binaries/shell.elf", true).expect("resolve /binaries/shell.elf");
+
+    let init_meta = init_node.metadata().expect("init meta");
+    let shell_meta = shell_node.metadata().expect("shell meta");
+    assert!(init_meta.size > 0, "init.elf size must be > 0");
+    assert!(shell_meta.size > 0, "shell.elf size must be > 0");
+    info!(
+        "[test-vfs-m64] /binaries populated: init.elf ({} bytes), shell.elf ({} bytes)",
+        init_meta.size, shell_meta.size
+    );
+
+    // 2. Page Cache 2MB/4KB 直通缓存与命中统计验证
+    let cache = PageCache::new();
+    let mut header_buf = [0u8; 64];
+    let n = cache.read_cached(init_node.as_ref(), 0, &mut header_buf).expect("cached read");
+    assert_eq!(n, 64);
+    assert_eq!(&header_buf[0..4], &[0x7f, b'E', b'L', b'F'], "must be valid ELF magic");
+
+    // 第二次读取必定命中缓存
+    let mut header_buf2 = [0u8; 64];
+    let n2 = cache.read_cached(init_node.as_ref(), 0, &mut header_buf2).expect("cached read 2");
+    assert_eq!(n2, 64);
+    assert_eq!(header_buf, header_buf2);
+
+    let stats = cache.stats();
+    assert_eq!(stats.hits, 1, "second read must hit cache");
+    info!(
+        "[test-vfs-m64] Page Cache stats: total_pages={}, hits={}, misses={}",
+        stats.total_pages, stats.hits, stats.misses
+    );
+
+    // 3. 内存紧凑感知淘汰（Eviction）
+    let evicted = cache.evict_clean_pages(1);
+    assert!(evicted >= 1, "must successfully evict clean pages");
+    let stats_evicted = cache.stats();
+    assert_eq!(stats_evicted.evictions, evicted);
+    info!("[test-vfs-m64] evicted clean pages: {}", evicted);
+
+    info!("[test-vfs-m64] PASS");
+}
+
+
 
 

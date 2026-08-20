@@ -172,6 +172,14 @@ pub fn init() {
     let devfs = Arc::new(DevFS::new(Arc::new(KernelDeviceProvider)));
     mount_table.mount("/devices", devfs).expect("mount devfs");
 
+    // M6.4：将内核可执行程序装入 /binaries 虚拟目录（VFS 直接加载支持）
+    if let Ok(init_node) = mount_table.create_file("/binaries/init.elf", Permissions::read_exec()) {
+        let _ = init_node.write_at(0, include_bytes!("../init.elf"));
+    }
+    if let Ok(shell_node) = mount_table.create_file("/binaries/shell.elf", Permissions::read_exec()) {
+        let _ = shell_node.write_at(0, include_bytes!("../shell.elf"));
+    }
+
     VFS_ROOT.call_once(|| mount_table);
-    klib::info!("[vfs] root RamFS, ProcFS, SysFS, DevFS mounted successfully");
+    klib::info!("[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /binaries populated");
 }

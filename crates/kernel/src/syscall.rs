@@ -544,18 +544,75 @@ fn sys_read(frame: &mut InterruptFrame) -> u64 {
     }
 }
 
-/// `exec(prog)`：加载内核嵌入的用户程序（`prog` 为嵌入池索引）为新进程并运行。
+/// `exec(prog, cmd)`：加载程序（可为 VFS 路径字符串指针，或内建索引）为新进程并运行。
 ///
-/// 复用 `elf::load` + `scheduler::spawn`（与启动 init 相同路径），返回新进程
-/// pid。`prog` 越界或加载失败返回对应错误。新进程独立地址空间、独立内核栈，
-/// 由调度器 RR 轮转调度（与 init 并存）。
+/// 优先从 VFS（如 `/binaries/shell.elf`）读取 ELF 数据，全面升级为基于 VFS 的动态装载；
+/// 如果参数为小数值索引（如 0, 1），则自动解析为对应内建路径 `/binaries/init.elf` / `/binaries/shell.elf`。
 fn sys_exec(frame: &mut InterruptFrame) -> u64 {
-    let idx = frame.rdi as usize;
+    let arg1 = frame.rdi;
     let arg_ptr = frame.rsi;
     let arg_len = frame.rdx;
-    let Some(elf_bytes) = crate::program_elf(idx) else {
-        return pack_err(Error::InvalidParam);
+
+    let root = crate::vfs_init::root();
+
+    // 1. 获取 ELF 字节数据
+    let elf_data: alloc::vec::Vec<u8> = if arg1 < 16 {
+        // 小索引模式兼容
+        let path = match arg1 {
+            0 => "/binaries/init.elf",
+            1 => "/binaries/shell.elf",
+            _ => {
+                if let Some(bytes) = crate::program_elf(arg1 as usize) {
+                    return spawn_elf_image(bytes, arg_ptr, arg_len, arg1 as usize);
+                }
+                return pack_err(Error::InvalidParam);
+            }
+        };
+        match root.resolve(path, true) {
+            Ok(inode) => {
+                let meta = match inode.metadata() {
+                    Ok(m) => m,
+                    Err(e) => return pack_err(e),
+                };
+                let mut buf = alloc::vec![0u8; meta.size as usize];
+                if let Err(e) = inode.read_at(0, &mut buf) {
+                    return pack_err(e);
+                }
+                buf
+            }
+            Err(_) => {
+                if let Some(bytes) = crate::program_elf(arg1 as usize) {
+                    return spawn_elf_image(bytes, arg_ptr, arg_len, arg1 as usize);
+                }
+                return pack_err(Error::NotFound);
+            }
+        }
+    } else {
+        // 路径字符串模式
+        let path = match copy_path_from_user(arg1, 4096) {
+            Ok(p) => p,
+            Err(e) => return pack_err(e),
+        };
+        match root.resolve(&path, true) {
+            Ok(inode) => {
+                let meta = match inode.metadata() {
+                    Ok(m) => m,
+                    Err(e) => return pack_err(e),
+                };
+                let mut buf = alloc::vec![0u8; meta.size as usize];
+                if let Err(e) = inode.read_at(0, &mut buf) {
+                    return pack_err(e);
+                }
+                buf
+            }
+            Err(e) => return pack_err(e),
+        }
     };
+
+    spawn_elf_image(&elf_data, arg_ptr, arg_len, arg1 as usize)
+}
+
+fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: usize) -> u64 {
     // 拷命令行到内核缓冲（带 SMAP 安全的 copy_from_user）。空命令行 → 正常启动。
     let mut cmd = [0u8; 512];
     let cmd_len = if arg_len == 0 {
@@ -585,7 +642,7 @@ fn sys_exec(frame: &mut InterruptFrame) -> u64 {
         Ok(pid) => {
             klib::info!(
                 "[syscall] exec prog={} -> pid={} entry={:#x}",
-                idx,
+                idx_or_tag,
                 pid,
                 loaded.entry
             );

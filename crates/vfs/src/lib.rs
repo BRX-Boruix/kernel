@@ -14,6 +14,7 @@ pub mod dynamic;
 pub mod file_handle;
 pub mod inode;
 pub mod mount;
+pub mod page_cache;
 pub mod path;
 pub mod procfs;
 pub mod ramfs;
@@ -24,6 +25,7 @@ pub use dynamic::{DynamicDirNode, DynamicFileNode};
 pub use file_handle::{FileHandle, OpenFlags};
 pub use inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
 pub use mount::MountTable;
+pub use page_cache::{PageCache, PageCacheStats, HUGE_PAGE_SIZE, PAGE_SIZE};
 pub use path::Path;
 pub use procfs::{ProcessInfoProvider, ProcessSnapshot, ProcFS};
 pub use sysfs::{SysFS, SystemInfoProvider};
@@ -288,5 +290,65 @@ mod tests {
         let n9 = mode_file.read_at(0, &mut buf).unwrap();
         let s9 = core::str::from_utf8(&buf[..n9]).unwrap();
         assert!(s9.contains(r#""width":1024"#));
+    }
+
+    #[test]
+    fn test_page_cache_2m_and_4k_eviction() {
+        let ramfs = Arc::new(RamFS::new());
+        let mount_table = Arc::new(MountTable::new(ramfs));
+        mount_table.mkdir("/binaries", Permissions::all()).unwrap();
+
+        let file = mount_table
+            .create_file("/binaries/app.elf", Permissions::read_write())
+            .unwrap();
+
+        // 写入一段 2MB+ 的数据
+        let pattern_len = 2 * 1024 * 1024 + 8192;
+        let mut sample_data = alloc::vec![0u8; pattern_len];
+        for (i, b) in sample_data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        file.write_at(0, &sample_data).unwrap();
+
+        let cache = PageCache::new();
+
+        // 1. 4KB 页缓存读取（跨越 4096 边界，涉及 page 0 与 page 1）
+        let mut read_buf_4k = [0u8; 100];
+        let n1 = cache.read_cached(file.as_ref(), 4090, &mut read_buf_4k).unwrap();
+        assert_eq!(n1, 100);
+        assert_eq!(&read_buf_4k, &sample_data[4090..4190]);
+        let stats1 = cache.stats();
+        assert_eq!(stats1.misses, 2); // 跨 2 个 4KB 页未命中
+        assert_eq!(stats1.hits, 0);
+
+        // 再次读取命中 4KB 缓存（2 个页皆已缓存）
+        let mut read_buf_4k_hit = [0u8; 100];
+        let n2 = cache.read_cached(file.as_ref(), 4090, &mut read_buf_4k_hit).unwrap();
+        assert_eq!(n2, 100);
+        assert_eq!(&read_buf_4k_hit, &sample_data[4090..4190]);
+        let stats2 = cache.stats();
+        assert_eq!(stats2.hits, 2);
+
+        // 2. 2MB 大页直通缓存读取
+        let mut big_buf = alloc::vec![0u8; 256 * 1024];
+        let n_big = cache.read_cached(file.as_ref(), 0, &mut big_buf).unwrap();
+        assert_eq!(n_big, 256 * 1024);
+        assert_eq!(&big_buf[..], &sample_data[..256 * 1024]);
+        let stats3 = cache.stats();
+        assert_eq!(stats3.huge_pages, 1);
+
+        // 再次命中 2MB 大页缓存
+        let mut big_buf2 = alloc::vec![0u8; 1024];
+        let n_big2 = cache.read_cached(file.as_ref(), 65536, &mut big_buf2).unwrap();
+        assert_eq!(n_big2, 1024);
+        assert_eq!(&big_buf2[..], &sample_data[65536..65536 + 1024]);
+        let stats4 = cache.stats();
+        assert_eq!(stats4.hits, 2);
+
+        // 3. 淘汰机制测试（Eviction）
+        let evicted = cache.evict_clean_pages(1);
+        assert!(evicted >= 1);
+        let stats5 = cache.stats();
+        assert!(stats5.evictions >= 1);
     }
 }
