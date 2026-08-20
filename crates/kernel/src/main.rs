@@ -5,26 +5,13 @@ extern crate alloc;
 
 mod acpi;
 mod drivers;
+mod ipc_init;
 mod panic;
 mod pci;
 mod symbols;
-mod terminal;
-// 进程模型（M3）：生产化后（boot→init）无条件编译。所有进程模块已从
-// `kernel-tests` gate 解除——生产构建（无该 feature）也会加载并运行 init。
-mod process;
-// syscall 机制（M4.1）：依赖进程模型（经 `current_proc_mut` 访问进程内存/退出）。
 mod syscall;
-// 调度器（M4.2）：依赖进程模型 + syscall，多进程 RR 轮转。
-mod scheduler;
-// 静态 ELF 加载器（M4.3）：把 ELF 镜像（init.elf）加载到用户地址空间。
-mod elf;
-// 简单信号机制雏形（M3.3）：信号号 + CPU 异常→信号映射。
-mod signals;
-// IPC（M5）：共享内存 + 管道。依赖进程/调度（阻塞唤醒）与 syscall 分发。
-mod ipc;
-// VFS 虚拟文件系统初始化（M6.1）。
 mod vfs_init;
-// 自检测试仅在 `kernel-tests` feature 下编译（SDK `build/br --test`）。
+
 #[cfg(feature = "kernel-tests")]
 mod tests;
 
@@ -91,7 +78,7 @@ unsafe fn kmain_body() -> ! {
     panic::set_panic_output(
         arch_x86_64::serial::write_str as fn(&str),
         panic_cpu_id,
-        terminal::write_str as fn(&str),
+        term::write_str as fn(&str),
     );
     // 显示前置要素（堆分配器 + Limine framebuffer + 驱动框架）均已就绪：
     // 立即启动 framebuffer 终端，比任何 test 都靠前，方便屏幕实时看日志。
@@ -241,17 +228,20 @@ unsafe fn kmain_body() -> ! {
     // 与 `mod syscall` 同步 gate：生产构建（无 kernel-tests）不编译 syscall 机制。
     arch_x86_64::interrupts::register_soft_interrupt_handler(syscall::syscall_entry);
 
-    // 注册运行时用户进程的缺页处理函数（处理用户态按需分页与 COW）。
-    mm::user_space::set_page_fault_handler(process::process_page_fault_handler);
-
     // M4.1 syscall 验收：用户代码经 `int 0x80` 调用 write/exit 等（停机验收，
     // 不返回主流程），故单独用 kernel-test-m41 feature 门控。
     #[cfg(feature = "kernel-test-m41")]
     tests::test_syscall();
 
+    // 注册运行时用户进程的缺页处理函数（处理用户态按需分页与 COW）。
+    mm::user_space::set_page_fault_handler(task::process_page_fault_handler);
+
+    // 初始化 IPC 与 Task 调度粘合
+    ipc_init::init_ipc();
+
     // M4.2：注册调度器 tick（LAPIC IRQ0 每 10ms 触发 → RR 轮转）。
     // 生产化后无条件注册（用户进程依赖 tick 轮转）；仅在 BSP 上生效（arch 层过滤）。
-    arch_x86_64::interrupts::register_scheduler_tick(scheduler::tick);
+    arch_x86_64::interrupts::register_scheduler_tick(task::tick);
 
     // M4.2 调度验收：多进程 RR 轮转（停机验收，不返回主流程），单独 gate。
     #[cfg(feature = "kernel-test-m42")]
@@ -332,8 +322,8 @@ unsafe fn kmain_body() -> ! {
     arch_x86_64::pic::set_mask(0xFFFD);
     arch_x86_64::keyboard::init();
     // 注册键盘输入回调：有按键时唤醒阻塞在 `read` 的进程（如 shell）。arch 层
-    // 不反向依赖 kernel，经函数指针解耦（指向 `scheduler::wake_kbd`）。
-    arch_x86_64::keyboard::set_input_callback(crate::scheduler::wake_kbd);
+    // 不反向依赖 kernel，经函数指针解耦（指向 `task::wake_kbd`）。
+    arch_x86_64::keyboard::set_input_callback(task::wake_kbd);
 
     // 生产化：进入用户态 init（PID 1），而非内核 idle 停机。加载 init.elf →
     // spawn → `scheduler::start` 永不返回；init 经 syscall 与内核交互、退出。
@@ -414,7 +404,7 @@ fn start_init() -> ! {
             CurrentArch::halt();
         }
     };
-    let loaded = match elf::load(elf_bytes, &mut us, &[]) {
+    let loaded = match loader::load(elf_bytes, &mut us, &[]) {
         Ok(l) => l,
         Err(e) => {
             error!("[kmain] init: load init.elf failed: {:?}", e);
@@ -426,7 +416,7 @@ fn start_init() -> ! {
         "[kmain] init: entry={:#x} stack_top={:#x}",
         loaded.entry, loaded.user_stack_top
     );
-    let pid = match scheduler::spawn(loaded.entry, loaded.user_stack_top, us) {
+    let pid = match task::spawn(loaded.entry, loaded.user_stack_top, us) {
         Ok(p) => p,
         Err(e) => {
             error!("[kmain] init: spawn failed: {:?}", e);
@@ -436,5 +426,5 @@ fn start_init() -> ! {
     };
     info!("[kmain] init: spawned pid={} from init.elf", pid);
     // 启动调度器（永不返回）：进入 init 用户态，tick 轮转，init 经 syscall 退出。
-    scheduler::start();
+    task::start();
 }

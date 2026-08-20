@@ -36,4 +36,8 @@ arch = { path = "../arch/arch" }
 arch-x86_64 = { path = "../arch/arch-x86_64" }
 mm = { path = "../mm" }
 vfs = { path = "../vfs" }
+task = { path = "../task" }
+ipc = { path = "../ipc" }
+loader = { path = "../loader" }
+term = { path = "../term" }
 spin = "0.9"

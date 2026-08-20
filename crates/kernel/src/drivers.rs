@@ -31,8 +31,8 @@ fn init_framebuffer(_hub: &DriverHub) {
         return;
     }
     let fb: &limine::Framebuffer = unsafe { &*(p as *const limine::Framebuffer) };
-    crate::terminal::init(fb);
-    let _ = klib::console::register_console(&crate::terminal::TERMINAL_CONSOLE);
+    term::init(fb);
+    let _ = klib::console::register_console(&term::TERMINAL_CONSOLE);
     DriverHub::register_device_info(
         DeviceInfo {
             name: "framebuffer",

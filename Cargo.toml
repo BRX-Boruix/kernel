@@ -8,6 +8,10 @@ members = [
     "crates/arch/arch-x86_64",
     "crates/drv",
     "crates/vfs",
+    "crates/task",
+    "crates/ipc",
+    "crates/loader",
+    "crates/term",
 ]
 
 [workspace.package]

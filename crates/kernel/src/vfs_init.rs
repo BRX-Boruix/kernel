@@ -33,11 +33,11 @@ struct KernelProcessProvider;
 
 impl ProcessInfoProvider for KernelProcessProvider {
     fn list_processes(&self) -> Vec<ProcessSnapshot> {
-        crate::scheduler::process_snapshots()
+        task::process_snapshots()
     }
 
     fn get_process(&self, pid: usize) -> Option<ProcessSnapshot> {
-        crate::scheduler::get_process_snapshot(pid)
+        task::get_process_snapshot(pid)
     }
 }
 

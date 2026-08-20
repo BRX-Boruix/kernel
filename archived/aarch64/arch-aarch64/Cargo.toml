@@ -1,7 +1,0 @@
-[package]
-name = "arch-aarch64"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-arch = { path = "../arch" }

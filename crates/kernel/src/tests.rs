@@ -895,7 +895,7 @@ pub fn test_scheduler() {
 /// 2. `get` / `get_mut` 访问进程字段与状态切换。
 /// 3. `terminate` 回收 pid，再 `spawn` 复用该 pid。
 pub fn test_process_table() {
-    use crate::process::{ProcessTable, TaskState};
+    use task::{ProcessTable, TaskState};
     use mm::user_space::UserAddressSpace;
 
     info!("[test-process] === M3.1: process table + pid mgmt ===");
@@ -1990,7 +1990,7 @@ pub fn test_vfs_m62() {
     use vfs::inode::Permissions;
     use mm::user_space::UserAddressSpace;
     use arch_x86_64::paging::X86PageTable;
-    use crate::process::Process;
+    use task::Process;
 
     info!("[test-vfs-m62] === M6.2: Process FD Table and VFS Syscall Integration ===");
 

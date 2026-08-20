@@ -43,6 +43,17 @@ name = "flanterm_rust"
 version = "0.1.0"
 
 [[package]]
+name = "ipc"
+version = "0.1.0"
+dependencies = [
+ "arch",
+ "arch-x86_64",
+ "klib",
+ "mm",
+ "spin",
+]
+
+[[package]]
 name = "kernel"
 version = "0.1.0"
 dependencies = [
@@ -50,10 +61,14 @@ dependencies = [
  "arch-x86_64",
  "drv",
  "flanterm_rust",
+ "ipc",
  "klib",
  "limine",
+ "loader",
  "mm",
  "spin",
+ "task",
+ "term",
  "vfs",
 ]
 
@@ -81,6 +96,16 @@ checksum = "1044abd8ac7bd1002d5c1e045314dd7d1c31896442f4b9270fd56aa234b0de81"
 dependencies = [
  "quote",
  "syn",
+]
+
+[[package]]
+name = "loader"
+version = "0.1.0"
+dependencies = [
+ "arch",
+ "arch-x86_64",
+ "klib",
+ "mm",
 ]
 
 [[package]]
@@ -144,6 +169,29 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "task"
+version = "0.1.0"
+dependencies = [
+ "arch",
+ "arch-x86_64",
+ "drv",
+ "klib",
+ "mm",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "term"
+version = "0.1.0"
+dependencies = [
+ "flanterm_rust",
+ "klib",
+ "limine",
+ "spin",
 ]
 
 [[package]]

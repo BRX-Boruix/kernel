@@ -18,7 +18,7 @@ use arch_x86_64::interrupts::InterruptFrame;
 use klib::error::Error;
 use mm::user_space::{USER_BASE, USER_TOP};
 
-use crate::process::current_proc_mut;
+use task::current_proc_mut;
 
 // ---------- syscall 号（域 + 操作二维编码） ----------
 
@@ -521,7 +521,7 @@ fn sys_read(frame: &mut InterruptFrame) -> u64 {
             }
         }
         if got == 0 {
-            crate::scheduler::block_for_kbd(frame);
+            task::block_for_kbd(frame);
             return pack_ok(0);
         }
         unsafe {
@@ -640,11 +640,11 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: usi
     else {
         return pack_err(Error::OutOfMemory);
     };
-    let loaded = match crate::elf::load(elf_bytes, &mut us, cmd) {
+    let loaded = match loader::load(elf_bytes, &mut us, cmd) {
         Ok(l) => l,
         Err(e) => return pack_err(e),
     };
-    match crate::scheduler::spawn(loaded.entry, loaded.user_stack_top, us) {
+    match task::spawn(loaded.entry, loaded.user_stack_top, us) {
         Ok(pid) => {
             klib::info!(
                 "[syscall] exec prog={} -> pid={} entry={:#x}",
@@ -700,7 +700,7 @@ fn sys_sleep(frame: &mut InterruptFrame) -> u64 {
 /// 返回后 `syscall_entry` 把返回值 0 写回（对已让出的进程在下一次恢复时生效，
 /// 对当前切换目标进程的 rax 置 0 无副作用）。`iretq` 即进入目标进程用户态。
 fn sys_yield(frame: &mut InterruptFrame) -> u64 {
-    crate::scheduler::yield_now(frame);
+    task::yield_now(frame);
     pack_ok(0)
 }
 
@@ -728,7 +728,7 @@ fn cur_addr_space() -> Result<
 
 /// `shm_create(size) -> id`。
 fn sys_shm_create(frame: &mut InterruptFrame) -> u64 {
-    match crate::ipc::shm_create(frame.rdi) {
+    match ipc::shm_create(frame.rdi) {
         Ok(id) => pack_ok(id),
         Err(e) => pack_err(e),
     }
@@ -739,7 +739,7 @@ fn sys_shm_map(frame: &mut InterruptFrame) -> u64 {
     let Ok(addr_space) = cur_addr_space() else {
         return pack_err(Error::NotFound);
     };
-    match crate::ipc::shm_map(frame.rdi, addr_space) {
+    match ipc::shm_map(frame.rdi, addr_space) {
         Ok(a) => pack_ok(a),
         Err(e) => pack_err(e),
     }
@@ -750,7 +750,7 @@ fn sys_shm_unmap(frame: &mut InterruptFrame) -> u64 {
     let Ok(addr_space) = cur_addr_space() else {
         return pack_err(Error::NotFound);
     };
-    match crate::ipc::shm_unmap(frame.rdi, addr_space) {
+    match ipc::shm_unmap(frame.rdi, addr_space) {
         Ok(()) => pack_ok(0),
         Err(e) => pack_err(e),
     }
@@ -758,7 +758,7 @@ fn sys_shm_unmap(frame: &mut InterruptFrame) -> u64 {
 
 /// `pipe_create() -> id`。
 fn sys_pipe_create(_frame: &mut InterruptFrame) -> u64 {
-    match crate::ipc::pipe_create() {
+    match ipc::pipe_create() {
         Ok(id) => pack_ok(id),
         Err(e) => pack_err(e),
     }
@@ -766,7 +766,7 @@ fn sys_pipe_create(_frame: &mut InterruptFrame) -> u64 {
 
 /// `pipe_read(id, buf, len) -> n`：阻塞读。
 fn sys_pipe_read(frame: &mut InterruptFrame) -> u64 {
-    match crate::ipc::pipe_read(frame, frame.rdi, frame.rsi, frame.rdx) {
+    match ipc::pipe_read(frame, frame.rdi, frame.rsi, frame.rdx) {
         Ok(n) => pack_ok(n),
         Err(e) => pack_err(e),
     }
@@ -774,7 +774,7 @@ fn sys_pipe_read(frame: &mut InterruptFrame) -> u64 {
 
 /// `pipe_write(id, buf, len) -> n`：阻塞写。
 fn sys_pipe_write(frame: &mut InterruptFrame) -> u64 {
-    match crate::ipc::pipe_write(frame, frame.rdi, frame.rsi, frame.rdx) {
+    match ipc::pipe_write(frame, frame.rdi, frame.rsi, frame.rdx) {
         Ok(n) => pack_ok(n),
         Err(e) => pack_err(e),
     }
@@ -782,7 +782,7 @@ fn sys_pipe_write(frame: &mut InterruptFrame) -> u64 {
 
 /// `pipe_close(id)`。
 fn sys_pipe_close(frame: &mut InterruptFrame) -> u64 {
-    match crate::ipc::pipe_close(frame.rdi) {
+    match ipc::pipe_close(frame.rdi) {
         Ok(()) => pack_ok(0),
         Err(e) => pack_err(e),
     }
@@ -797,7 +797,7 @@ fn sys_exit(frame: &mut InterruptFrame) -> u64 {
     let code = frame.rdi;
     let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
     klib::info!("[syscall] process {} exit(code={})", pid, code);
-    crate::scheduler::exit_current(frame);
+    task::exit_current(frame);
     0
 }
 
@@ -805,7 +805,7 @@ fn sys_exit(frame: &mut InterruptFrame) -> u64 {
 fn sys_ps(frame: &mut InterruptFrame) -> u64 {
     let buf = frame.rdi as *mut u8;
     let cap = frame.rsi as usize;
-    let n = crate::scheduler::ps_snapshot(buf, cap);
+    let n = task::ps_snapshot(buf, cap);
     pack_ok(n as u64)
 }
 
@@ -813,7 +813,7 @@ fn sys_ps(frame: &mut InterruptFrame) -> u64 {
 fn sys_kill(frame: &mut InterruptFrame) -> u64 {
     let target = frame.rdi as usize;
     let sig = frame.rsi as u32;
-    match crate::scheduler::kill_pid(target, sig, frame) {
+    match task::kill_pid(target, sig, frame) {
         Ok(_) => pack_ok(0),
         Err(e) => pack_err(e),
     }

@@ -1,0 +1,10 @@
+[package]
+name = "term"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+limine = { version = "0.1", features = ["requests-section"] }
+flanterm_rust = { path = "../../vendor/flanterm_rust" }
+klib = { path = "../klib" }
+spin = "0.9"
