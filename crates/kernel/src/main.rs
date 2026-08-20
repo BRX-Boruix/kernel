@@ -100,11 +100,7 @@ unsafe fn kmain_body() -> ! {
     // 串口驱动 `init` 在此完成统一 console 串口 sink 的注册（不再手动接线），
     // 此后所有内核日志先汇聚到 console 再转发。
     drivers::init();
-    info!("[kmain] serial initialized (arch={})", CurrentArch::name());
-
-    // T6.1：枚举 PCI 总线（bus 0），把发现的设备登记到驱动框架。
-    // 早于具体设备驱动使用；框架就绪后即可。
-    pci::enumerate();
+    info!("[kmain] serial & driver hub initialized (arch={})", CurrentArch::name());
 
     // T4：探测 CPU 特性（CPUID/vendor/brand；BSP 单线程阶段，结果缓存到静态）。
     arch_x86_64::cpu::init();

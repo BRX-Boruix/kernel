@@ -10,6 +10,8 @@ extern crate std;
 pub mod device;
 pub mod driver;
 pub mod hub;
+pub mod pci;
+pub mod pci_drivers;
 pub mod platform;
 
 pub use device::{

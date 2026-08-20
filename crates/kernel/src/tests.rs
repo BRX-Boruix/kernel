@@ -2257,6 +2257,29 @@ pub fn test_driver_hub_m72() {
         }
     }
 
+    // 4. 验证 PCI 总线设备与自动 Attach
+    let mut pci_dev_count = 0;
+    let mut bound_pci_count = 0;
+    for i in 0..dev_count {
+        if let Some(info) = DriverHub::device_info_at(i) {
+            if info.bus == drv::BusType::Pci {
+                pci_dev_count += 1;
+                if let Some(driver) = DriverHub::device_driver_at(i) {
+                    bound_pci_count += 1;
+                    info!(
+                        "[test-driver-hub-m72] PCI device bound: name={} driver={} vendor={:04x}:{:04x}",
+                        info.name, driver, info.vendor_id, info.device_id
+                    );
+                }
+            }
+        }
+    }
+    assert!(pci_dev_count > 0, "must discover at least 1 PCI device on bus");
+    info!(
+        "[test-driver-hub-m72] PCI discovery: total_pci={}, bound_pci={}",
+        pci_dev_count, bound_pci_count
+    );
+
     info!("[test-driver-hub-m72] PASS");
 }
 

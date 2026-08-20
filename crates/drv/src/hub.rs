@@ -153,6 +153,8 @@ impl DriverHub {
         crate::platform::keyboard::register_keyboard_driver();
         crate::platform::cmos::register_cmos_driver();
         crate::platform::pseudo::register_pseudo_driver();
+        crate::pci::register_pci_bus_driver();
+        crate::pci_drivers::register_pci_class_drivers();
     }
 
     /// 触发指定生命周期阶段的所有驱动初始化。
