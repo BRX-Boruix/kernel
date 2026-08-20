@@ -585,52 +585,84 @@ fn push_to_queue(
 fn flanterm_fb_revscroll(ctx: &mut FlantermContext) {
     let rows = ctx.rows;
     let cols = ctx.cols;
-    let start = ctx.scroll_top_margin * cols;
-    let end = (ctx.scroll_bottom_margin - 1) * cols;
+    let top = ctx.scroll_top_margin;
+    let bot = ctx.scroll_bottom_margin;
+    if top >= bot || bot > rows {
+        return;
+    }
+
     let fb = &mut ctx.backend;
-    let mut i = end;
-    while i > start {
-        i -= 1;
+
+    // 先提取受影响区域当前可见字符的完整快照，杜绝循环迭代中 push_to_queue 修改 map 导致的读写踩踏
+    let mut snapshot = alloc::vec::Vec::with_capacity((bot - top) * cols);
+    for i in (top * cols)..(bot * cols) {
         let c_val = if let Some(idx) = fb.map[i] {
             fb.queue[idx].c
         } else {
             fb.grid[i]
         };
-        push_to_queue(fb, rows, cols, &c_val, (i + cols) % cols, (i + cols) / cols);
+        snapshot.push(c_val);
     }
 
+    // 向下移动 (bot - 1 down to top + 1)
+    for y in (top + 1..bot).rev() {
+        let src_rel_y = y - 1 - top;
+        for x in 0..cols {
+            let c_val = snapshot[src_rel_y * cols + x];
+            push_to_queue(fb, rows, cols, &c_val, x, y);
+        }
+    }
+
+    // 顶行填充空格
     let empty = FlantermFbChar {
         c: b' ' as u32,
         fg: fb.text_fg,
         bg: fb.text_bg,
     };
-    for i in 0..cols {
-        push_to_queue(fb, rows, cols, &empty, i, ctx.scroll_top_margin);
+    for x in 0..cols {
+        push_to_queue(fb, rows, cols, &empty, x, top);
     }
 }
 
 fn flanterm_fb_scroll(ctx: &mut FlantermContext) {
     let rows = ctx.rows;
     let cols = ctx.cols;
-    let start = (ctx.scroll_top_margin + 1) * cols;
-    let end = ctx.scroll_bottom_margin * cols;
+    let top = ctx.scroll_top_margin;
+    let bot = ctx.scroll_bottom_margin;
+    if top >= bot || bot > rows {
+        return;
+    }
+
     let fb = &mut ctx.backend;
-    for i in start..end {
+
+    // 先提取受影响区域当前可见字符的完整快照，杜绝循环迭代中 push_to_queue 修改 map 导致的读写踩踏
+    let mut snapshot = alloc::vec::Vec::with_capacity((bot - top) * cols);
+    for i in (top * cols)..(bot * cols) {
         let c_val = if let Some(idx) = fb.map[i] {
             fb.queue[idx].c
         } else {
             fb.grid[i]
         };
-        push_to_queue(fb, rows, cols, &c_val, (i - cols) % cols, (i - cols) / cols);
+        snapshot.push(c_val);
     }
 
+    // 向上移动 (top up to bot - 1)
+    for y in top..(bot - 1) {
+        let src_rel_y = y + 1 - top;
+        for x in 0..cols {
+            let c_val = snapshot[src_rel_y * cols + x];
+            push_to_queue(fb, rows, cols, &c_val, x, y);
+        }
+    }
+
+    // 底行填充空格
     let empty = FlantermFbChar {
         c: b' ' as u32,
         fg: fb.text_fg,
         bg: fb.text_bg,
     };
-    for i in 0..cols {
-        push_to_queue(fb, rows, cols, &empty, i, ctx.scroll_bottom_margin - 1);
+    for x in 0..cols {
+        push_to_queue(fb, rows, cols, &empty, x, bot - 1);
     }
 }
 

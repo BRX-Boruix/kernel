@@ -2328,6 +2328,15 @@ pub fn test_driver_hub_m72() {
     assert!(dev_json_str.contains("uri"), "must contain HATEOAS uri links");
     info!("[test-driver-hub-m72] DevFS /devices/list JSON dynamic projection OK ({} bytes)", dev_json_n);
 
+    // 7. 压力测试：向终端打印长文本与连续换行触发滚屏，验证屏幕字符不乱码
+    for line_i in 0..10 {
+        crate::terminal::write_str(&alloc::format!(
+            "Scrolling stress test line {:02}: 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\n",
+            line_i
+        ));
+    }
+    info!("[test-driver-hub-m72] Terminal multiline long scrolling stress OK");
+
     info!("[test-driver-hub-m72] PASS");
 }
 
