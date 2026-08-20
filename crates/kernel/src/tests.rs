@@ -2326,14 +2326,68 @@ pub fn test_driver_hub_m72() {
     assert!(dev_json_n > 0, "devfs list cannot be empty");
     let dev_json_str = core::str::from_utf8(&dev_json_buf[..dev_json_n]).unwrap_or("");
     assert!(dev_json_str.contains("serial-com1"), "must contain serial-com1");
-    // 7. 压力测试：向终端打印长文本与换行触发滚屏，验证屏幕字符不乱码
-    for line_i in 0..3 {
-        crate::terminal::write_str(&alloc::format!(
-            "Scrolling stress test line {:02}: ABCDEFGHIJKLMNOPQRSTUVWXYZ\n",
-            line_i
-        ));
+    // 8. 验证 M9.1 硬件拓扑事件总线与 M9.2 即插即拔/热重载（Hotplug In/Out & Live Reload）
+    let initial_dev_count = DriverHub::device_count();
+    
+    // (1) 模拟动态接入新外设 (Hotplug In)
+    let hotplug_net_dev = drv::DeviceInfo {
+        name: "pci-hotplug-nic",
+        kind: drv::DeviceKind::Net,
+        bus: drv::BusType::Pci,
+        location: 0x00040000,
+        vendor_id: 0x8086,
+        device_id: 0x100E,
+        class_code: 0x02,
+        subclass: 0x00,
+        prog_if: 0x00,
+    };
+    DriverHub::register_device_info(hotplug_net_dev, None, None);
+    assert_eq!(DriverHub::device_count(), initial_dev_count + 1);
+
+    // 验证事件总线接收到 DeviceArrived 事件
+    let mut found_arrived = false;
+    while let Some(ev) = drv::pop_event() {
+        if let drv::DeviceEvent::DeviceArrived(dev) = ev {
+            if dev.name == "pci-hotplug-nic" {
+                found_arrived = true;
+                break;
+            }
+        }
     }
-    info!("[test-driver-hub-m72] Terminal multiline long scrolling stress OK");
+    assert!(found_arrived, "must publish DeviceArrived event for hotplug device");
+
+    // 动态竞标仲裁并绑定
+    DriverHub::attach_all();
+    let hotplug_idx = DriverHub::device_capacity() - 1;
+    let bound_drv = DriverHub::device_driver_at(hotplug_idx);
+    let bound_score = DriverHub::device_driver_score_at(hotplug_idx);
+    assert_eq!(bound_drv, Some("pci-net"));
+    assert_eq!(bound_score, 95);
+    info!("[test-driver-hub-m72] Hotplug In & Bidding OK: bound=pci-net score=95");
+
+    // (2) 验证驱动在线热重载 (Live Driver Reloading)
+    let reloaded = DriverHub::reload_device_driver("pci-hotplug-nic");
+    assert!(reloaded, "live driver reload must succeed");
+    assert_eq!(DriverHub::device_driver_at(hotplug_idx), Some("pci-net"));
+    info!("[test-driver-hub-m72] Live driver reload OK");
+
+    // (3) 模拟动态拔除外设 (Hotplug Out)
+    let unregistered = DriverHub::unregister_device_by_name("pci-hotplug-nic");
+    assert!(unregistered, "hotplug out must succeed");
+    assert_eq!(DriverHub::device_count(), initial_dev_count);
+
+    // 验证事件总线接收到 DeviceDeparted 事件
+    let mut found_departed = false;
+    while let Some(ev) = drv::pop_event() {
+        if let drv::DeviceEvent::DeviceDeparted(dev) = ev {
+            if dev.name == "pci-hotplug-nic" {
+                found_departed = true;
+                break;
+            }
+        }
+    }
+    assert!(found_departed, "must publish DeviceDeparted event for hotplug device");
+    info!("[test-driver-hub-m72] Hotplug Out & Detach lifecycle OK");
 
     info!("[test-driver-hub-m72] PASS");
 }

@@ -9,6 +9,7 @@ extern crate std;
 
 pub mod device;
 pub mod driver;
+pub mod event;
 pub mod hub;
 pub mod pci;
 pub mod pci_drivers;
@@ -19,6 +20,7 @@ pub use device::{
     IoDevice, NetDevice,
 };
 pub use driver::{Driver, DriverEntry, DriverStage};
+pub use event::{publish_event, pop_event, pending_event_count, subscribe_events, DeviceEvent, EventSubscriber};
 pub use hub::DriverHub;
 
 #[cfg(test)]

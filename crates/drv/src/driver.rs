@@ -1,4 +1,4 @@
-//! 统一驱动生命周期抽象与四阶段调度定义（Driver / DriverStage / Bidding）。
+//! 统一驱动生命周期抽象与四阶段调度定义（Driver / DriverStage / Bidding / Hotplug Detach）。
 
 use crate::device::DeviceInfo;
 use crate::hub::DriverHub;
@@ -16,7 +16,7 @@ pub enum DriverStage {
     Late = 3,
 }
 
-/// 统一驱动抽象：声明阶段、初始化钩子与多驱动竞标/仲裁/绑定机制。
+/// 统一驱动抽象：声明阶段、初始化钩子与多驱动竞标/仲裁/绑定与热解绑机制（M9.2）。
 pub trait Driver: Send + Sync {
     /// 驱动名（调试与 DevFS 挂载用）。
     fn name(&self) -> &'static str;
@@ -49,6 +49,11 @@ pub trait Driver: Send + Sync {
     fn attach(&self, _hub: &DriverHub, _dev: &DeviceInfo) -> Result<(), ()> {
         Ok(())
     }
+
+    /// 硬件拔除或热重载时安全解绑释放驱动资源（M9.2）。
+    fn detach(&self, _hub: &DriverHub, _dev: &DeviceInfo) -> Result<(), ()> {
+        Ok(())
+    }
 }
 
 /// 注册表内部紧凑驱动条目。
@@ -60,6 +65,7 @@ pub struct DriverEntry {
     pub probe: Option<fn(&DriverHub, &DeviceInfo) -> bool>,
     pub score_probe: Option<fn(&DriverHub, &DeviceInfo) -> u8>,
     pub attach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
+    pub detach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
 }
 
 fn noop(_hub: &DriverHub) {}
@@ -72,6 +78,7 @@ impl DriverEntry {
         probe: None,
         score_probe: None,
         attach: None,
+        detach: None,
     };
 }
 
@@ -111,6 +118,14 @@ impl Driver for DriverEntry {
     fn attach(&self, hub: &DriverHub, dev: &DeviceInfo) -> Result<(), ()> {
         if let Some(attach_fn) = self.attach {
             attach_fn(hub, dev)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn detach(&self, hub: &DriverHub, dev: &DeviceInfo) -> Result<(), ()> {
+        if let Some(detach_fn) = self.detach {
+            detach_fn(hub, dev)
         } else {
             Ok(())
         }

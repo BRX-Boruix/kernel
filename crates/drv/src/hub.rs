@@ -1,6 +1,6 @@
 //! 统一驱动中枢引擎（DriverHub Central Registry & Lifecycle Engine）。
 //!
-//! 提供线程安全的驱动与设备集中注册表、4 阶段严格生命周期触发以及自动多驱动竞标与降级机制（M8.1 & M8.2）。
+//! 提供线程安全的驱动与设备集中注册表、4 阶段严格生命周期触发、多驱动竞标与热插拔/热重载支持（M8 ~ M9）。
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
@@ -8,6 +8,7 @@ use klib::{info, warn};
 
 use crate::device::{BusType, DeviceInfo, DeviceOps};
 use crate::driver::{Driver, DriverEntry, DriverStage};
+use crate::event::{publish_event, DeviceEvent};
 
 pub const MAX_DRIVERS: usize = 32;
 pub const MAX_DEVICES: usize = 64;
@@ -46,6 +47,7 @@ impl DriverHub {
             probe: None,
             score_probe: None,
             attach: None,
+            detach: None,
         };
     }
 
@@ -69,6 +71,7 @@ impl DriverHub {
             probe,
             score_probe: None,
             attach,
+            detach: None,
         };
     }
 
@@ -79,6 +82,18 @@ impl DriverHub {
         init: fn(&DriverHub),
         score_probe: Option<fn(&DriverHub, &DeviceInfo) -> u8>,
         attach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
+    ) {
+        Self::register_driver_full(name, stage, init, score_probe, attach, None);
+    }
+
+    /// 注册一个全功能生命周期驱动（含竞标打分、Attach 与 Detach 热插拔支持，M9.2）。
+    pub fn register_driver_full(
+        name: &'static str,
+        stage: DriverStage,
+        init: fn(&DriverHub),
+        score_probe: Option<fn(&DriverHub, &DeviceInfo) -> u8>,
+        attach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
+        detach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
     ) {
         let idx = DRIVER_COUNT.fetch_add(1, Ordering::Relaxed);
         if idx >= MAX_DRIVERS {
@@ -92,10 +107,11 @@ impl DriverHub {
             probe: None,
             score_probe,
             attach,
+            detach,
         };
     }
 
-    /// 向中枢注册一个已发现的硬件设备实例。
+    /// 向中枢注册一个已发现的硬件设备实例，并向拓扑事件总线发布 `DeviceArrived` 事件（M9.1）。
     pub fn register_device_info(
         info: DeviceInfo,
         dev: Option<&'static dyn DeviceOps>,
@@ -105,13 +121,119 @@ impl DriverHub {
         if idx >= MAX_DEVICES {
             return;
         }
-        let mut list = DEVICES.lock();
-        list[idx] = Some(DeviceEntry {
-            info,
-            dev,
-            driver_name,
-            driver_score: if driver_name.is_some() { 50 } else { 0 },
-        });
+        {
+            let mut list = DEVICES.lock();
+            list[idx] = Some(DeviceEntry {
+                info,
+                dev,
+                driver_name,
+                driver_score: if driver_name.is_some() { 50 } else { 0 },
+            });
+        }
+        // 发布拓扑接入事件
+        publish_event(DeviceEvent::DeviceArrived(info));
+    }
+
+    /// 动态拔除/下线一个硬件设备（Hotplug Out），安全解绑驱动并发布 `DeviceDeparted` 事件（M9.1 & M9.2）。
+    pub fn unregister_device_by_name(name: &str) -> bool {
+        let dev_count = DEVICE_COUNT.load(Ordering::Relaxed);
+        let hub = DriverHub;
+
+        for idx in 0..dev_count {
+            let mut matched_info: Option<DeviceInfo> = None;
+            let mut matched_drv_name: Option<&'static str> = None;
+
+            {
+                let devices = DEVICES.lock();
+                if let Some(entry) = devices.get(idx).and_then(|e| e.as_ref()) {
+                    if entry.info.name == name {
+                        matched_info = Some(entry.info);
+                        matched_drv_name = entry.driver_name;
+                    }
+                }
+            }
+
+            if let Some(info) = matched_info {
+                // 1. 如果已绑定驱动，先调用驱动的 detach 进行安全解绑
+                if let Some(drv_name) = matched_drv_name {
+                    let drv_count = DRIVER_COUNT.load(Ordering::Relaxed);
+                    let drivers = DRIVERS.lock();
+                    for drv in drivers.iter().take(drv_count) {
+                        if drv.name == drv_name {
+                            if let Err(()) = drv.detach(&hub, &info) {
+                                warn!("[driver_hub] detach driver={} failed on device={}", drv_name, info.name);
+                            }
+                            info!("[driver_hub] detached driver={} from device={}", drv_name, info.name);
+                            break;
+                        }
+                    }
+                }
+
+                // 2. 清除设备条目
+                {
+                    let mut devices = DEVICES.lock();
+                    devices[idx] = None;
+                }
+
+                // 3. 向事件总线广播拔除事件
+                publish_event(DeviceEvent::DeviceDeparted(info));
+                info!("[driver_hub] hotplug: device={} departed safely", name);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// 驱动在线热重载（Live Reloading）：安全解绑当前驱动 -> 重新执行竞标仲裁并绑定（M9.2）。
+    pub fn reload_device_driver(name: &str) -> bool {
+        let dev_count = DEVICE_COUNT.load(Ordering::Relaxed);
+        let hub = DriverHub;
+
+        for idx in 0..dev_count {
+            let mut target_info: Option<DeviceInfo> = None;
+            let mut current_drv: Option<&'static str> = None;
+
+            {
+                let devices = DEVICES.lock();
+                if let Some(entry) = devices.get(idx).and_then(|e| e.as_ref()) {
+                    if entry.info.name == name {
+                        target_info = Some(entry.info);
+                        current_drv = entry.driver_name;
+                    }
+                }
+            }
+
+            if let Some(info) = target_info {
+                // 1. Detach 解绑
+                if let Some(drv_name) = current_drv {
+                    let drv_count = DRIVER_COUNT.load(Ordering::Relaxed);
+                    let drivers = DRIVERS.lock();
+                    for drv in drivers.iter().take(drv_count) {
+                        if drv.name == drv_name {
+                            let _ = drv.detach(&hub, &info);
+                            break;
+                        }
+                    }
+                }
+
+                // 2. 重置绑定状态
+                {
+                    let mut devices = DEVICES.lock();
+                    if let Some(entry) = devices.get_mut(idx).and_then(|e| e.as_mut()) {
+                        entry.driver_name = None;
+                        entry.driver_score = 0;
+                    }
+                }
+
+                // 3. 重新竞标仲裁与绑定
+                let attached = Self::arbitrate_and_attach_device(idx);
+                info!("[driver_hub] hot-reload device={} result={}", name, attached);
+                return attached;
+            }
+        }
+
+        false
     }
 
     /// 注册一个现成的 DeviceOps 实例。
@@ -152,8 +274,15 @@ impl DriverHub {
         );
     }
 
-    /// 返回当前已注册的设备总数。
+    /// 返回当前已注册的有效设备总数。
     pub fn device_count() -> usize {
+        let max_idx = DEVICE_COUNT.load(Ordering::Relaxed);
+        let list = DEVICES.lock();
+        list.iter().take(max_idx).filter(|e| e.is_some()).count()
+    }
+
+    /// 返回最大分配的设备槽位上限。
+    pub fn device_capacity() -> usize {
         DEVICE_COUNT.load(Ordering::Relaxed)
     }
 

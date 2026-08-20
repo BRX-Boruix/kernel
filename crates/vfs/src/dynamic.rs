@@ -133,6 +133,18 @@ impl DynamicDirNode {
         entries.retain(|(n, _)| n != name);
         entries.push((alloc::string::String::from(name), node));
     }
+
+    pub fn remove_child(&self, name: &str) -> bool {
+        let mut entries = self.entries.write();
+        let before_len = entries.len();
+        entries.retain(|(n, _)| n != name);
+        entries.len() < before_len
+    }
+
+    pub fn clear_children(&self) {
+        let mut entries = self.entries.write();
+        entries.clear();
+    }
 }
 
 impl INode for DynamicDirNode {

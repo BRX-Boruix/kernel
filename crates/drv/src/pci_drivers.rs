@@ -1,4 +1,4 @@
-//! PCI 硬件驱动匹配与智能竞标绑定（PciDriver / Bidding / Fallback）。
+//! PCI 硬件驱动匹配与智能竞标绑定与热插拔解绑（PciDriver / Bidding / Fallback / Detach）。
 
 use crate::device::{BusType, DeviceInfo};
 use crate::driver::DriverStage;
@@ -28,6 +28,14 @@ pub fn attach_pci_block(_hub: &DriverHub, dev: &DeviceInfo) -> Result<(), ()> {
     Ok(())
 }
 
+pub fn detach_pci_block(_hub: &DriverHub, dev: &DeviceInfo) -> Result<(), ()> {
+    info!(
+        "[pci_driver] detached block driver from {:04x}:{:04x} location={:#x}",
+        dev.vendor_id, dev.device_id, dev.location
+    );
+    Ok(())
+}
+
 // 2. PCI 网络设备（以太网控制器，Class 0x02）
 pub fn score_pci_net(_hub: &DriverHub, dev: &DeviceInfo) -> u8 {
     if dev.bus == BusType::Pci && dev.class_code == 0x02 {
@@ -46,6 +54,14 @@ pub fn score_pci_net(_hub: &DriverHub, dev: &DeviceInfo) -> u8 {
 pub fn attach_pci_net(_hub: &DriverHub, dev: &DeviceInfo) -> Result<(), ()> {
     info!(
         "[pci_driver] attached net driver to {:04x}:{:04x} location={:#x}",
+        dev.vendor_id, dev.device_id, dev.location
+    );
+    Ok(())
+}
+
+pub fn detach_pci_net(_hub: &DriverHub, dev: &DeviceInfo) -> Result<(), ()> {
+    info!(
+        "[pci_driver] detached net driver from {:04x}:{:04x} location={:#x}",
         dev.vendor_id, dev.device_id, dev.location
     );
     Ok(())
@@ -74,29 +90,40 @@ pub fn attach_pci_display(_hub: &DriverHub, dev: &DeviceInfo) -> Result<(), ()> 
     Ok(())
 }
 
-/// 注册所有标准 PCI 智能竞标驱动。
+pub fn detach_pci_display(_hub: &DriverHub, dev: &DeviceInfo) -> Result<(), ()> {
+    info!(
+        "[pci_driver] detached display driver from {:04x}:{:04x} location={:#x}",
+        dev.vendor_id, dev.device_id, dev.location
+    );
+    Ok(())
+}
+
+/// 注册所有标准 PCI 智能竞标驱动（支持 Detach 与热重载，M9.2）。
 pub fn register_pci_class_drivers() {
-    DriverHub::register_driver_bidding(
+    DriverHub::register_driver_full(
         "pci-block",
         DriverStage::Devices,
         |_| {},
         Some(score_pci_block),
         Some(attach_pci_block),
+        Some(detach_pci_block),
     );
 
-    DriverHub::register_driver_bidding(
+    DriverHub::register_driver_full(
         "pci-net",
         DriverStage::Devices,
         |_| {},
         Some(score_pci_net),
         Some(attach_pci_net),
+        Some(detach_pci_net),
     );
 
-    DriverHub::register_driver_bidding(
+    DriverHub::register_driver_full(
         "pci-display",
         DriverStage::Devices,
         |_| {},
         Some(score_pci_display),
         Some(attach_pci_display),
+        Some(detach_pci_display),
     );
 }
