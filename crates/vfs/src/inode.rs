@@ -61,6 +61,24 @@ impl Permissions {
             system_only: false,
         }
     }
+
+    pub const fn to_bits(self) -> u32 {
+        let mut bits = 0;
+        if self.readable { bits |= 1 << 0; }
+        if self.writable { bits |= 1 << 1; }
+        if self.executable { bits |= 1 << 2; }
+        if self.system_only { bits |= 1 << 3; }
+        bits
+    }
+
+    pub const fn from_bits(bits: u32) -> Self {
+        Self {
+            readable: (bits & (1 << 0)) != 0,
+            writable: (bits & (1 << 1)) != 0,
+            executable: (bits & (1 << 2)) != 0,
+            system_only: (bits & (1 << 3)) != 0,
+        }
+    }
 }
 
 /// 精简三时间戳元数据（ADR-011，无 atime）。

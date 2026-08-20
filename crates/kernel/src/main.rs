@@ -245,6 +245,9 @@ unsafe fn kmain_body() -> ! {
     // 与 `mod syscall` 同步 gate：生产构建（无 kernel-tests）不编译 syscall 机制。
     arch_x86_64::interrupts::register_soft_interrupt_handler(syscall::syscall_entry);
 
+    // 注册运行时用户进程的缺页处理函数（处理用户态按需分页与 COW）。
+    mm::user_space::set_page_fault_handler(process::process_page_fault_handler);
+
     // M4.1 syscall 验收：用户代码经 `int 0x80` 调用 write/exit 等（停机验收，
     // 不返回主流程），故单独用 kernel-test-m41 feature 门控。
     #[cfg(feature = "kernel-test-m41")]
@@ -280,9 +283,11 @@ unsafe fn kmain_body() -> ! {
     // M6.1：初始化 VFS 根挂载表与 RESTful 目录骨架。
     vfs_init::init();
 
-    // 运行 M6.1 VFS 自检测试（在 kernel-tests feature 启用时）。
+    // 运行 M6.1 / M6.2 VFS 自检测试（在 kernel-tests feature 启用时）。
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m61();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_vfs_m62();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。

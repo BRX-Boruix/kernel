@@ -1979,3 +1979,53 @@ pub fn test_vfs_m61() {
     info!("[test-vfs-m61] PASS");
 }
 
+/// M6.2：验证进程文件描述符表（FD Table）与 IO 域系统调用。
+///
+/// 覆盖：
+/// 1. 进程 alloc_fd, get_fd, close_fd。
+/// 2. 进程间 FD 隔离与资源复用。
+pub fn test_vfs_m62() {
+    use crate::vfs_init;
+    use vfs::file_handle::{FileHandle, OpenFlags};
+    use vfs::inode::Permissions;
+    use mm::user_space::UserAddressSpace;
+    use arch_x86_64::paging::X86PageTable;
+    use crate::process::Process;
+
+    info!("[test-vfs-m62] === M6.2: Process FD Table and VFS Syscall Integration ===");
+
+    let root = vfs_init::root();
+    let file = root.create_file("/config/fd_test.txt", Permissions::read_write()).expect("create file");
+
+    let us = UserAddressSpace::<X86PageTable>::new().expect("user space");
+    let mut proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, us);
+
+    let handle1 = FileHandle::new(file.clone(), OpenFlags::READ_WRITE);
+    let fd1 = proc.alloc_fd(handle1);
+    assert_eq!(fd1, 3, "first user fd must be 3");
+
+    let handle2 = FileHandle::new(file.clone(), OpenFlags::READ_ONLY);
+    let fd2 = proc.alloc_fd(handle2);
+    assert_eq!(fd2, 4, "second user fd must be 4");
+
+    // 句柄隔离验证
+    let h1 = proc.get_fd(fd1).expect("get fd 3");
+    assert_eq!(h1.write(b"FD table OK").unwrap(), 11);
+
+    let h2 = proc.get_fd(fd2).expect("get fd 4");
+    let mut buf = [0u8; 11];
+    assert_eq!(h2.read(&mut buf).unwrap(), 11);
+    assert_eq!(&buf, b"FD table OK");
+
+    // 关闭与槽位复用验证
+    assert!(proc.close_fd(fd1).is_some());
+    assert!(proc.get_fd(fd1).is_none());
+
+    let handle3 = FileHandle::new(file.clone(), OpenFlags::READ_WRITE);
+    let fd3 = proc.alloc_fd(handle3);
+    assert_eq!(fd3, 3, "slot 3 must be reused after close");
+
+    info!("[test-vfs-m62] PASS");
+}
+
+

@@ -58,8 +58,17 @@ const fn nr(d: u32, o: u32) -> u32 {
     (d << 8) | o
 }
 
-pub const SYS_WRITE: u32 = nr(domain::IO, op::WRITE); // 0x2002 write(fd, buf, len) -> n
+pub const SYS_OPEN: u32 = nr(domain::IO, op::CREATE); // 0x2000 open(path, flags, perm) -> fd
 pub const SYS_READ: u32 = nr(domain::IO, op::READ); // 0x2001 read(fd, buf, len) -> n
+pub const SYS_WRITE: u32 = nr(domain::IO, op::WRITE); // 0x2002 write(fd, buf, len) -> n
+pub const SYS_CLOSE: u32 = nr(domain::IO, op::CLOSE); // 0x2003 close(fd) -> 0
+pub const SYS_SEEK: u32 = nr(domain::IO, 0x04); // 0x2004 seek(fd, offset, whence) -> new_offset
+pub const SYS_READDIR: u32 = nr(domain::IO, 0x05); // 0x2005 readdir(path, buf, cap) -> count
+pub const SYS_MKDIR: u32 = nr(domain::IO, 0x06); // 0x2006 mkdir(path, perm) -> 0
+pub const SYS_UNLINK: u32 = nr(domain::IO, 0x07); // 0x2007 unlink(path) -> 0
+pub const SYS_PREAD: u32 = nr(domain::IO, 0x08); // 0x2008 pread(fd, buf, len, offset) -> n
+pub const SYS_PWRITE: u32 = nr(domain::IO, 0x09); // 0x2009 pwrite(fd, buf, len, offset) -> n
+pub const SYS_FLOCK: u32 = nr(domain::IO, 0x0A); // 0x200A flock(fd, op) -> 0
 pub const SYS_EXEC: u32 = nr(domain::PROCESS, op::CREATE); // 0x0000 exec(prog) -> pid
 pub const SYS_MMAP: u32 = nr(domain::MEMORY, op::CREATE); // 0x1000 mmap(size) -> addr
 /// 预留 ABI 槽（后续实现 munmap）。
@@ -164,15 +173,275 @@ fn pack_err(e: Error) -> u64 {
 
 // ---------- 具体 syscall 实现 ----------
 
-/// `write(fd, buf, len)`：把用户缓冲输出到统一 console（fd 1=stdout）。
-/// 分块拷贝（栈缓冲，no_std 无堆），校验缓冲位于用户半区。
+/// 从用户空间拷贝以 null 结尾的路径字符串。
+fn copy_path_from_user(path_ptr: u64, max_len: usize) -> Result<alloc::string::String, Error> {
+    if path_ptr < USER_BASE || path_ptr >= USER_TOP {
+        return Err(Error::OutOfRange);
+    }
+    let mut bytes = alloc::vec::Vec::new();
+    let mut cur = path_ptr;
+    while bytes.len() < max_len {
+        if cur >= USER_TOP {
+            return Err(Error::OutOfRange);
+        }
+        let mut byte = [0u8; 1];
+        unsafe {
+            arch_x86_64::mmio::copy_from_user(byte.as_mut_ptr(), cur, 1);
+        }
+        if byte[0] == 0 {
+            break;
+        }
+        bytes.push(byte[0]);
+        cur += 1;
+    }
+    alloc::string::String::from_utf8(bytes).map_err(|_| Error::InvalidParam)
+}
+
+/// `open(path_ptr, flags_bits, perm_bits)`：打开或创建文件，返回 fd。
+fn sys_open(frame: &mut InterruptFrame) -> u64 {
+    let path_ptr = frame.rdi;
+    let flags_bits = frame.rsi as u32;
+    let perm_bits = frame.rdx as u32;
+
+    let path = match copy_path_from_user(path_ptr, 4096) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+
+    let flags = vfs::file_handle::OpenFlags::from_bits(flags_bits);
+    let perm = vfs::inode::Permissions::from_bits(perm_bits);
+    let root = crate::vfs_init::root();
+
+    let inode = match root.resolve(&path, true) {
+        Ok(n) => {
+            if flags.truncate && flags.write {
+                let _ = n.truncate(0);
+            }
+            n
+        }
+        Err(Error::NotFound) if flags.create => {
+            match root.create_file(&path, perm) {
+                Ok(n) => n,
+                Err(e) => return pack_err(e),
+            }
+        }
+        Err(e) => return pack_err(e),
+    };
+
+    let handle = vfs::file_handle::FileHandle::new(inode, flags);
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let fd = proc.alloc_fd(handle);
+    pack_ok(fd as u64)
+}
+
+/// `close(fd)`：关闭文件描述符。
+fn sys_close(frame: &mut InterruptFrame) -> u64 {
+    let fd = frame.rdi as usize;
+    if fd < 3 {
+        // 标准流不支持 close
+        return pack_ok(0);
+    }
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    if proc.close_fd(fd).is_some() {
+        pack_ok(0)
+    } else {
+        pack_err(Error::NotFound)
+    }
+}
+
+/// `seek(fd, offset, whence)`：调整文件句柄游标。
+fn sys_seek(frame: &mut InterruptFrame) -> u64 {
+    let fd = frame.rdi as usize;
+    let offset = frame.rsi as i64;
+    let whence_raw = frame.rdx as u32;
+    let whence = match whence_raw {
+        0 => vfs::file_handle::SeekWhence::Set,
+        1 => vfs::file_handle::SeekWhence::Current,
+        2 => vfs::file_handle::SeekWhence::End,
+        _ => return pack_err(Error::InvalidParam),
+    };
+
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let Some(handle) = proc.get_fd(fd) else {
+        return pack_err(Error::NotFound);
+    };
+    match handle.seek(offset, whence) {
+        Ok(new_off) => pack_ok(new_off),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `mkdir(path_ptr, perm_bits)`：创建目录。
+fn sys_mkdir(frame: &mut InterruptFrame) -> u64 {
+    let path_ptr = frame.rdi;
+    let perm_bits = frame.rsi as u32;
+    let path = match copy_path_from_user(path_ptr, 4096) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    let perm = vfs::inode::Permissions::from_bits(perm_bits);
+    let root = crate::vfs_init::root();
+    match root.mkdir(&path, perm) {
+        Ok(_) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `unlink(path_ptr)`：删除文件或空目录。
+fn sys_unlink(frame: &mut InterruptFrame) -> u64 {
+    let path_ptr = frame.rdi;
+    let path = match copy_path_from_user(path_ptr, 4096) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    let root = crate::vfs_init::root();
+    match root.unlink(&path) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `pread(fd, buf, len, offset)`：显式无状态定位读。
+fn sys_pread(frame: &mut InterruptFrame) -> u64 {
+    let fd = frame.rdi as usize;
+    let buf = frame.rsi;
+    let len = frame.rdx as usize;
+    let offset = frame.r10;
+
+    let Some(end) = buf.checked_add(len as u64) else {
+        return pack_err(Error::OutOfRange);
+    };
+    if buf < USER_BASE || end > USER_TOP {
+        return pack_err(Error::OutOfRange);
+    };
+
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let Some(handle) = proc.get_fd(fd) else {
+        return pack_err(Error::NotFound);
+    };
+
+    let mut kbuf = alloc::vec![0u8; len];
+    match handle.pread(offset, &mut kbuf) {
+        Ok(n) => {
+            unsafe {
+                arch_x86_64::mmio::copy_to_user(buf, kbuf.as_ptr(), n);
+            }
+            pack_ok(n as u64)
+        }
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `pwrite(fd, buf, len, offset)`：显式无状态定位写。
+fn sys_pwrite(frame: &mut InterruptFrame) -> u64 {
+    let fd = frame.rdi as usize;
+    let buf = frame.rsi;
+    let len = frame.rdx as usize;
+    let offset = frame.r10;
+
+    let Some(end) = buf.checked_add(len as u64) else {
+        return pack_err(Error::OutOfRange);
+    };
+    if buf < USER_BASE || end > USER_TOP {
+        return pack_err(Error::OutOfRange);
+    };
+
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let Some(handle) = proc.get_fd(fd) else {
+        return pack_err(Error::NotFound);
+    };
+
+    let mut kbuf = alloc::vec![0u8; len];
+    unsafe {
+        arch_x86_64::mmio::copy_from_user(kbuf.as_mut_ptr(), buf, len);
+    }
+    match handle.pwrite(offset, &kbuf) {
+        Ok(n) => pack_ok(n as u64),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `readdir(path_ptr, buf_ptr, max_bytes)`：获取目录项列表（以 JSON 结构或固定格式写入用户缓冲）。
+fn sys_readdir(frame: &mut InterruptFrame) -> u64 {
+    let path_ptr = frame.rdi;
+    let buf_ptr = frame.rsi;
+    let max_bytes = frame.rdx as usize;
+
+    let path = match copy_path_from_user(path_ptr, 4096) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+
+    let root = crate::vfs_init::root();
+    let dir_node = match root.resolve(&path, true) {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+
+    let entries = match dir_node.list_dir() {
+        Ok(list) => list,
+        Err(e) => return pack_err(e),
+    };
+
+    // 格式化为换行分隔的名字与大小列表（或直接写入紧凑字节流）
+    // 格式：`name:type:size\n`
+    let mut out = alloc::string::String::new();
+    for e in &entries {
+        use core::fmt::Write;
+        let t = match e.node_type {
+            vfs::inode::INodeType::Directory => "dir",
+            vfs::inode::INodeType::RegularFile => "file",
+            vfs::inode::INodeType::Symlink => "link",
+            vfs::inode::INodeType::CharacterDevice => "chardev",
+            vfs::inode::INodeType::BlockDevice => "blkdev",
+            vfs::inode::INodeType::Fifo => "fifo",
+        };
+        let _ = write!(out, "{}:{}:{}\n", e.name, t, e.size);
+    }
+
+    let bytes = out.as_bytes();
+    let n = bytes.len().min(max_bytes);
+    if n > 0 {
+        if buf_ptr < USER_BASE || buf_ptr + (n as u64) > USER_TOP {
+            return pack_err(Error::OutOfRange);
+        }
+        unsafe {
+            arch_x86_64::mmio::copy_to_user(buf_ptr, bytes.as_ptr(), n);
+        }
+    }
+    pack_ok(n as u64)
+}
+
+/// `flock(fd, op)`：顾问文件锁。
+fn sys_flock(frame: &mut InterruptFrame) -> u64 {
+    let fd = frame.rdi as usize;
+    let _op = frame.rsi as u32;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    if proc.get_fd(fd).is_some() {
+        pack_ok(0)
+    } else {
+        pack_err(Error::NotFound)
+    }
+}
+
+/// `write(fd, buf, len)`：写入 stdout/stderr 或用户 FD 句柄。
 fn sys_write(frame: &mut InterruptFrame) -> u64 {
     let fd = frame.rdi;
     let buf = frame.rsi;
     let len = frame.rdx;
-    if fd != 1 && fd != 2 {
-        return pack_err(Error::InvalidParam);
-    }
+
     // 校验 [buf, buf+len) 完全落在用户半区，避免越界读内核地址。
     let Some(end) = buf.checked_add(len) else {
         return pack_err(Error::OutOfRange);
@@ -180,32 +449,45 @@ fn sys_write(frame: &mut InterruptFrame) -> u64 {
     if buf < USER_BASE || end > USER_TOP {
         return pack_err(Error::OutOfRange);
     }
-    const CHUNK: usize = 4096;
-    let mut chunk = [0u8; CHUNK];
-    let mut off = 0usize;
-    while off < len as usize {
-        let n = core::cmp::min(len as usize - off, CHUNK);
-        // 用户缓冲区位于用户半区（USER 权限页）；SMAP 下内核读取需 STAC 临时放行。
-        unsafe {
-            arch_x86_64::mmio::copy_from_user(chunk.as_mut_ptr(), buf + off as u64, n);
+
+    // 标准输出 / 标准错误
+    if fd == 1 || fd == 2 {
+        const CHUNK: usize = 4096;
+        let mut chunk = [0u8; CHUNK];
+        let mut off = 0usize;
+        while off < len as usize {
+            let n = core::cmp::min(len as usize - off, CHUNK);
+            unsafe {
+                arch_x86_64::mmio::copy_from_user(chunk.as_mut_ptr(), buf + off as u64, n);
+            }
+            let s = core::str::from_utf8(&chunk[..n]).unwrap_or("\u{FFFD}");
+            klib::console::write_str(s);
+            off += n;
         }
-        let s = core::str::from_utf8(&chunk[..n]).unwrap_or("\u{FFFD}");
-        klib::console::write_str(s);
-        off += n;
+        return pack_ok(len);
     }
-    pack_ok(len)
+
+    // 普通文件描述符
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let Some(handle) = proc.get_fd(fd as usize) else {
+        return pack_err(Error::InvalidParam);
+    };
+
+    let mut kbuf = alloc::vec![0u8; len as usize];
+    unsafe {
+        arch_x86_64::mmio::copy_from_user(kbuf.as_mut_ptr(), buf, len as usize);
+    }
+    match handle.write(&kbuf) {
+        Ok(n) => pack_ok(n as u64),
+        Err(e) => pack_err(e),
+    }
 }
 
-/// `read(fd, buf, len)`：从 fd 读字节到用户缓冲（0=stdin 键盘）。
-///
-/// 从 PS/2 键盘输入缓冲取最多 `len` 个字符（`keyboard::pop`），经 SMAP 安全的
-/// `copy_to_user` 写到用户缓冲。缓冲空时返回 `WouldBlock`（非阻塞读，用户态
-/// REPL 据此决定等待/重试）。
+/// `read(fd, buf, len)`：从 stdin 键盘或用户 FD 句柄读取。
 fn sys_read(frame: &mut InterruptFrame) -> u64 {
     let fd = frame.rdi;
-    if fd != 0 {
-        return pack_err(Error::InvalidParam);
-    }
     let buf = frame.rsi;
     let len = frame.rdx;
     if len == 0 {
@@ -218,32 +500,48 @@ fn sys_read(frame: &mut InterruptFrame) -> u64 {
     if buf < USER_BASE || end > USER_TOP {
         return pack_err(Error::OutOfRange);
     }
-    // 从键盘输入缓冲取字节。
-    let mut got = 0usize;
-    let mut tmp = [0u8; 64];
-    while got < len as usize && got < tmp.len() {
-        match arch_x86_64::keyboard::pop() {
-            Some(ch) => {
-                tmp[got] = ch;
-                got += 1;
+
+    // 标准输入 stdin (0)
+    if fd == 0 {
+        let mut got = 0usize;
+        let mut tmp = [0u8; 64];
+        while got < len as usize && got < tmp.len() {
+            match arch_x86_64::keyboard::pop() {
+                Some(ch) => {
+                    tmp[got] = ch;
+                    got += 1;
+                }
+                None => break,
             }
-            None => break,
         }
+        if got == 0 {
+            crate::scheduler::block_for_kbd(frame);
+            return pack_ok(0);
+        }
+        unsafe {
+            arch_x86_64::mmio::copy_to_user(buf, tmp.as_ptr(), got);
+        }
+        return pack_ok(got as u64);
     }
-    if got == 0 {
-        // 缓冲空：阻塞等待键盘输入（登记 waiter，切走或 idle halt）。
-        // `block_for_kbd` 改写 `*frame` 后返回，由 `syscall_entry` 的 `iretq`
-        // 切到目标进程；本 `read` 实例不再回到此处，被唤醒后由用户态 `read`
-        // 重试重新进入 syscall 取到字符。
-        crate::scheduler::block_for_kbd(frame);
-        // 不会执行到此处（已切换进程）。返回以满足类型检查。
-        return pack_ok(0);
+
+    // 普通文件描述符
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let Some(handle) = proc.get_fd(fd as usize) else {
+        return pack_err(Error::InvalidParam);
+    };
+
+    let mut kbuf = alloc::vec![0u8; len as usize];
+    match handle.read(&mut kbuf) {
+        Ok(n) => {
+            unsafe {
+                arch_x86_64::mmio::copy_to_user(buf, kbuf.as_ptr(), n);
+            }
+            pack_ok(n as u64)
+        }
+        Err(e) => pack_err(e),
     }
-    // SMAP 安全地写到用户缓冲。
-    unsafe {
-        arch_x86_64::mmio::copy_to_user(buf, tmp.as_ptr(), got);
-    }
-    pack_ok(got as u64)
 }
 
 /// `exec(prog)`：加载内核嵌入的用户程序（`prog` 为嵌入池索引）为新进程并运行。
@@ -463,8 +761,17 @@ fn sys_kill(frame: &mut InterruptFrame) -> u64 {
 /// 按系统调用号分发到具体实现。返回打包后的结果（写回 `frame.rax`）。
 fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
     match nr as u32 {
+        SYS_OPEN => sys_open(frame),
         SYS_READ => sys_read(frame),
         SYS_WRITE => sys_write(frame),
+        SYS_CLOSE => sys_close(frame),
+        SYS_SEEK => sys_seek(frame),
+        SYS_READDIR => sys_readdir(frame),
+        SYS_MKDIR => sys_mkdir(frame),
+        SYS_UNLINK => sys_unlink(frame),
+        SYS_PREAD => sys_pread(frame),
+        SYS_PWRITE => sys_pwrite(frame),
+        SYS_FLOCK => sys_flock(frame),
         SYS_EXEC => sys_exec(frame),
         SYS_MMAP => sys_mmap(frame),
         SYS_BRK => sys_brk(frame),

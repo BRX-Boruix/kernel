@@ -33,6 +33,16 @@ use mm::user_space::UserAddressSpace;
 // - 进程生命周期 = 内核生命周期（单进程停机模型下泄漏无害，M4.2 调度器再改为正式持有/回收）。
 static CURRENT_PROC: AtomicUsize = AtomicUsize::new(0);
 
+/// 进程缺页处理入口：转发给当前运行进程的 UserAddressSpace::handle_page_fault。
+pub extern "C" fn process_page_fault_handler(vaddr: u64, error_code: u64) -> bool {
+    let p = CURRENT_PROC.load(Ordering::Acquire);
+    if p == 0 {
+        return false;
+    }
+    let proc = unsafe { &mut *(p as *mut Process<X86PageTable>) };
+    proc.addr_space_mut().handle_page_fault(vaddr, error_code)
+}
+
 /// 记录当前运行进程（`run` 进入用户态前设置）。
 pub fn set_current_proc(p: *mut Process<X86PageTable>) {
     CURRENT_PROC.store(p as usize, Ordering::Release);
@@ -84,6 +94,8 @@ pub struct Process<PT: PageTable> {
     entry_rip: u64,
     /// 用户栈顶 RSP。
     user_stack_top: u64,
+    /// 文件描述符表（FD Table，M6.2）。
+    fd_table: Vec<Option<vfs::file_handle::FileHandle>>,
 }
 
 impl<PT: PageTable> Process<PT> {
@@ -106,6 +118,38 @@ impl<PT: PageTable> Process<PT> {
             kernel_stack_top,
             entry_rip,
             user_stack_top,
+            fd_table: Vec::new(),
+        }
+    }
+
+    /// 分配新的文件描述符（返回分配的 fd 编号）。
+    pub fn alloc_fd(&mut self, handle: vfs::file_handle::FileHandle) -> usize {
+        for (fd, slot) in self.fd_table.iter_mut().enumerate() {
+            // 跳过 0, 1, 2（保留给标准 IO）
+            if fd >= 3 && slot.is_none() {
+                *slot = Some(handle);
+                return fd;
+            }
+        }
+        while self.fd_table.len() < 3 {
+            self.fd_table.push(None);
+        }
+        let fd = self.fd_table.len();
+        self.fd_table.push(Some(handle));
+        fd
+    }
+
+    /// 获取指定 fd 句柄的只读引用。
+    pub fn get_fd(&self, fd: usize) -> Option<&vfs::file_handle::FileHandle> {
+        self.fd_table.get(fd)?.as_ref()
+    }
+
+    /// 关闭并移除指定 fd 句柄。
+    pub fn close_fd(&mut self, fd: usize) -> Option<vfs::file_handle::FileHandle> {
+        if fd < self.fd_table.len() {
+            self.fd_table[fd].take()
+        } else {
+            None
         }
     }
 
@@ -230,15 +274,13 @@ impl<PT: PageTable> ProcessTable<PT> {
         addr_space: UserAddressSpace<PT>,
     ) -> Result<usize, klib::error::Error> {
         let pid = self.alloc_pid();
-        let proc = Process {
+        let proc = Process::new(
             pid,
-            state: TaskState::Ready,
-            context: TaskContext::empty(),
-            addr_space,
-            kernel_stack_top,
             entry_rip,
             user_stack_top,
-        };
+            kernel_stack_top,
+            addr_space,
+        );
         // 若 pid 复用空闲槽，直接覆盖；否则追加（可能中间有 None 空洞）。
         if pid < self.processes.len() {
             self.processes[pid] = Some(proc);

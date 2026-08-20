@@ -53,6 +53,28 @@ impl OpenFlags {
         append: false,
         directory: false,
     };
+
+    pub const fn to_bits(self) -> u32 {
+        let mut bits = 0;
+        if self.read { bits |= 1 << 0; }
+        if self.write { bits |= 1 << 1; }
+        if self.create { bits |= 1 << 2; }
+        if self.truncate { bits |= 1 << 3; }
+        if self.append { bits |= 1 << 4; }
+        if self.directory { bits |= 1 << 5; }
+        bits
+    }
+
+    pub const fn from_bits(bits: u32) -> Self {
+        Self {
+            read: (bits & (1 << 0)) != 0,
+            write: (bits & (1 << 1)) != 0,
+            create: (bits & (1 << 2)) != 0,
+            truncate: (bits & (1 << 3)) != 0,
+            append: (bits & (1 << 4)) != 0,
+            directory: (bits & (1 << 5)) != 0,
+        }
+    }
 }
 
 /// 进程打开文件句柄（持有底层 INode + 独立读写偏移量 offset + 打开标志）。
