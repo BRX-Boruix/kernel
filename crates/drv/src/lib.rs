@@ -56,16 +56,17 @@ mod tests {
         dev.bus == BusType::Pci && dev.class_code == 0x01
     }
 
-    fn attach_block(_hub: &DriverHub, _dev: &DeviceInfo) {
+    fn attach_block(_hub: &DriverHub, _dev: &DeviceInfo) -> Result<(), ()> {
         DRV_ATTACHED.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     #[test]
-    fn test_driver_hub_lifecycle_and_probe() {
+    fn test_driver_hub_lifecycle_and_bidding() {
         // 1. 注册 Early 阶段驱动
         DriverHub::register_driver("early-serial", DriverStage::Early, early_init);
 
-        // 2. 注册 Devices 阶段带 probe 的块设备驱动
+        // 2. 注册 Devices 阶段带竞标的块设备驱动
         DriverHub::register_driver_ops(
             "pci-block-driver",
             DriverStage::Devices,

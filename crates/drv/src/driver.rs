@@ -1,4 +1,4 @@
-//! 统一驱动生命周期抽象与四阶段调度定义（Driver / DriverStage）。
+//! 统一驱动生命周期抽象与四阶段调度定义（Driver / DriverStage / Bidding）。
 
 use crate::device::DeviceInfo;
 use crate::hub::DriverHub;
@@ -16,7 +16,7 @@ pub enum DriverStage {
     Late = 3,
 }
 
-/// 统一驱动抽象：声明阶段、初始化钩子与 probe/attach 匹配机制。
+/// 统一驱动抽象：声明阶段、初始化钩子与多驱动竞标/仲裁/绑定机制。
 pub trait Driver: Send + Sync {
     /// 驱动名（调试与 DevFS 挂载用）。
     fn name(&self) -> &'static str;
@@ -32,8 +32,23 @@ pub trait Driver: Send + Sync {
         false
     }
 
-    /// 探测成功后实例化驱动并绑定设备。
-    fn attach(&self, _hub: &DriverHub, _dev: &DeviceInfo) {}
+    /// 驱动竞标打分（0~100 分制，M8.1 核心）：
+    /// - 0: 不匹配/不支持
+    /// - 20~40: 通用回退驱动（Fallback / Generic）
+    /// - 50~70: 标准 Class 驱动（如 PCI-IDE, Standard 16550 UART）
+    /// - 80~100: 专用厂商加速优化驱动（如 Intel AHCI / VirtIO 加速驱动）
+    fn score_probe(&self, hub: &DriverHub, dev: &DeviceInfo) -> u8 {
+        if self.probe(hub, dev) {
+            50
+        } else {
+            0
+        }
+    }
+
+    /// 探测成功后实例化驱动并绑定设备（返回 Ok(()) 表示绑定成功，Err(()) 触发自动降级）。
+    fn attach(&self, _hub: &DriverHub, _dev: &DeviceInfo) -> Result<(), ()> {
+        Ok(())
+    }
 }
 
 /// 注册表内部紧凑驱动条目。
@@ -43,7 +58,8 @@ pub struct DriverEntry {
     pub stage: DriverStage,
     pub init: fn(&DriverHub),
     pub probe: Option<fn(&DriverHub, &DeviceInfo) -> bool>,
-    pub attach: Option<fn(&DriverHub, &DeviceInfo)>,
+    pub score_probe: Option<fn(&DriverHub, &DeviceInfo) -> u8>,
+    pub attach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
 }
 
 fn noop(_hub: &DriverHub) {}
@@ -54,6 +70,7 @@ impl DriverEntry {
         stage: DriverStage::Late,
         init: noop,
         probe: None,
+        score_probe: None,
         attach: None,
     };
 }
@@ -72,15 +89,30 @@ impl Driver for DriverEntry {
     }
 
     fn probe(&self, hub: &DriverHub, dev: &DeviceInfo) -> bool {
-        match self.probe {
-            Some(f) => f(hub, dev),
-            None => false,
+        if let Some(score_fn) = self.score_probe {
+            score_fn(hub, dev) > 0
+        } else if let Some(probe_fn) = self.probe {
+            probe_fn(hub, dev)
+        } else {
+            false
         }
     }
 
-    fn attach(&self, hub: &DriverHub, dev: &DeviceInfo) {
-        if let Some(f) = self.attach {
-            f(hub, dev);
+    fn score_probe(&self, hub: &DriverHub, dev: &DeviceInfo) -> u8 {
+        if let Some(score_fn) = self.score_probe {
+            score_fn(hub, dev)
+        } else if let Some(probe_fn) = self.probe {
+            if probe_fn(hub, dev) { 50 } else { 0 }
+        } else {
+            0
+        }
+    }
+
+    fn attach(&self, hub: &DriverHub, dev: &DeviceInfo) -> Result<(), ()> {
+        if let Some(attach_fn) = self.attach {
+            attach_fn(hub, dev)
+        } else {
+            Ok(())
         }
     }
 }

@@ -1,10 +1,10 @@
 //! 统一驱动中枢引擎（DriverHub Central Registry & Lifecycle Engine）。
 //!
-//! 提供线程安全的驱动与设备集中注册表、4 阶段严格生命周期触发以及自动 `attach_all` 探测机制。
+//! 提供线程安全的驱动与设备集中注册表、4 阶段严格生命周期触发以及自动多驱动竞标与降级机制（M8.1 & M8.2）。
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
-use klib::info;
+use klib::{info, warn};
 
 use crate::device::{BusType, DeviceInfo, DeviceOps};
 use crate::driver::{Driver, DriverEntry, DriverStage};
@@ -17,6 +17,7 @@ pub struct DeviceEntry {
     pub info: DeviceInfo,
     pub dev: Option<&'static dyn DeviceOps>,
     pub driver_name: Option<&'static str>,
+    pub driver_score: u8,
 }
 
 static DRIVER_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -43,6 +44,7 @@ impl DriverHub {
             stage,
             init,
             probe: None,
+            score_probe: None,
             attach: None,
         };
     }
@@ -53,7 +55,7 @@ impl DriverHub {
         stage: DriverStage,
         init: fn(&DriverHub),
         probe: Option<fn(&DriverHub, &DeviceInfo) -> bool>,
-        attach: Option<fn(&DriverHub, &DeviceInfo)>,
+        attach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
     ) {
         let idx = DRIVER_COUNT.fetch_add(1, Ordering::Relaxed);
         if idx >= MAX_DRIVERS {
@@ -65,6 +67,30 @@ impl DriverHub {
             stage,
             init,
             probe,
+            score_probe: None,
+            attach,
+        };
+    }
+
+    /// 注册一个带显式竞标打分（score_probe）的智能驱动（M8.1）。
+    pub fn register_driver_bidding(
+        name: &'static str,
+        stage: DriverStage,
+        init: fn(&DriverHub),
+        score_probe: Option<fn(&DriverHub, &DeviceInfo) -> u8>,
+        attach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
+    ) {
+        let idx = DRIVER_COUNT.fetch_add(1, Ordering::Relaxed);
+        if idx >= MAX_DRIVERS {
+            return;
+        }
+        let mut list = DRIVERS.lock();
+        list[idx] = DriverEntry {
+            name,
+            stage,
+            init,
+            probe: None,
+            score_probe,
             attach,
         };
     }
@@ -84,6 +110,7 @@ impl DriverHub {
             info,
             dev,
             driver_name,
+            driver_score: if driver_name.is_some() { 50 } else { 0 },
         });
     }
 
@@ -94,6 +121,25 @@ impl DriverHub {
                 name: dev.name(),
                 kind: dev.kind(),
                 bus: BusType::Unknown,
+                location: 0,
+                vendor_id: 0,
+                device_id: 0,
+                class_code: 0,
+                subclass: 0,
+                prog_if: 0,
+            },
+            Some(dev),
+            None,
+        );
+    }
+
+    /// 注册指定总线类型的 DeviceOps 实例。
+    pub fn register_device_bus(dev: &'static dyn DeviceOps, bus: BusType) {
+        Self::register_device_info(
+            DeviceInfo {
+                name: dev.name(),
+                kind: dev.kind(),
+                bus,
                 location: 0,
                 vendor_id: 0,
                 device_id: 0,
@@ -145,6 +191,18 @@ impl DriverHub {
             .and_then(|entry| entry.driver_name)
     }
 
+    /// 获取指定索引设备当前绑定驱动的竞标得分。
+    pub fn device_driver_score_at(index: usize) -> u8 {
+        if index >= DEVICE_COUNT.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let list = DEVICES.lock();
+        list.get(index)
+            .and_then(|e| e.as_ref())
+            .map(|entry| entry.driver_score)
+            .unwrap_or(0)
+    }
+
     fn ensure_registered() {
         if REGISTERED.swap(true, Ordering::Relaxed) {
             return;
@@ -173,42 +231,90 @@ impl DriverHub {
         }
     }
 
-    /// 遍历所有未绑定的设备，自动运行所有注册驱动的 `probe` 并执行 `attach` 绑定。
-    pub fn attach_all() {
-        let dev_count = DEVICE_COUNT.load(Ordering::Relaxed);
+    /// 执行多驱动竞标打分与最高分择优绑定，支持故障自动降级回退（M8.1 & M8.2 核心仲裁引擎）。
+    pub fn arbitrate_and_attach_device(dev_idx: usize) -> bool {
+        let info = {
+            let devices = DEVICES.lock();
+            match devices.get(dev_idx).and_then(|e| e.as_ref()) {
+                Some(entry) => entry.info,
+                None => return false,
+            }
+        };
+
         let drv_count = DRIVER_COUNT.load(Ordering::Relaxed);
         let hub = DriverHub;
-        for idx in 0..dev_count {
-            let info = {
-                let devices = DEVICES.lock();
-                match devices.get(idx).and_then(|e| e.as_ref()) {
-                    Some(entry) => entry.info,
-                    None => continue,
-                }
-            };
 
-            let mut attached: Option<&'static str> = None;
+        // 1. 收集所有驱动对该设备的竞标打分 (score, driver_entry)
+        let mut bids: [Option<(u8, DriverEntry)>; MAX_DRIVERS] = [None; MAX_DRIVERS];
+        let mut bid_len = 0usize;
+
+        {
             let drivers = DRIVERS.lock();
             for drv in drivers.iter().take(drv_count) {
-                if drv.probe(&hub, &info) {
-                    if drv.attach.is_some() {
-                        drv.attach(&hub, &info);
-                        attached = Some(drv.name);
-                        info!(
-                            "[driver_hub] attached driver={} to device={}",
-                            drv.name, info.name
-                        );
-                    }
-                    break;
+                let score = drv.score_probe(&hub, &info);
+                if score > 0 {
+                    bids[bid_len] = Some((score, *drv));
+                    bid_len += 1;
                 }
             }
-            drop(drivers);
+        }
 
-            if let Some(name) = attached {
-                let mut devices = DEVICES.lock();
-                if let Some(entry) = devices.get_mut(idx).and_then(|e| e.as_mut()) {
-                    entry.driver_name = Some(name);
+        if bid_len == 0 {
+            return false;
+        }
+
+        // 2. 按竞标分数从高到低排序 (降序)
+        for i in 0..bid_len {
+            for j in (i + 1)..bid_len {
+                let score_i = bids[i].map(|b| b.0).unwrap_or(0);
+                let score_j = bids[j].map(|b| b.0).unwrap_or(0);
+                if score_j > score_i {
+                    bids.swap(i, j);
                 }
+            }
+        }
+
+        // 3. 从最高分驱动开始尝试 attach，若失败则原地降级回退到次高分驱动（M8.2 故障隔离与 Fallback）
+        for (score, drv) in bids.iter().take(bid_len).flatten() {
+            info!(
+                "[driver_hub] bidding: device={} evaluating candidate driver={} (score={})",
+                info.name, drv.name, score
+            );
+            match drv.attach(&hub, &info) {
+                Ok(()) => {
+                    info!(
+                        "[driver_hub] arbitrated winner: attached driver={} (score={}) to device={}",
+                        drv.name, score, info.name
+                    );
+                    let mut devices = DEVICES.lock();
+                    if let Some(entry) = devices.get_mut(dev_idx).and_then(|e| e.as_mut()) {
+                        entry.driver_name = Some(drv.name);
+                        entry.driver_score = *score;
+                    }
+                    return true;
+                }
+                Err(()) => {
+                    warn!(
+                        "[driver_hub] fallback triggered: driver={} failed attach to device={}, falling back to next bidder",
+                        drv.name, info.name
+                    );
+                }
+            }
+        }
+
+        false
+    }
+
+    /// 遍历所有未绑定的设备，自动运行智能竞标仲裁与绑定。
+    pub fn attach_all() {
+        let dev_count = DEVICE_COUNT.load(Ordering::Relaxed);
+        for idx in 0..dev_count {
+            let is_unbound = {
+                let devices = DEVICES.lock();
+                devices.get(idx).and_then(|e| e.as_ref()).map(|e| e.driver_name.is_none()).unwrap_or(false)
+            };
+            if is_unbound {
+                Self::arbitrate_and_attach_device(idx);
             }
         }
     }
@@ -218,27 +324,20 @@ impl DriverHub {
         Self::init_stage(DriverStage::Early);
     }
 
-    /// 核心阶段初始化（Keyboard & Platform Controllers）。
+    /// 核心阶段初始化（Keyboard, CMOS RTC, Pseudo）。
     pub fn init_core() {
         Self::init_stage(DriverStage::Core);
     }
 
-    /// 外设探测阶段初始化（PCI Bus Scan & attach_all）。
+    /// 外设探测与自动绑定阶段（PCI Scan, ATA, PCI Drivers）。
     pub fn init_devices() {
         Self::init_stage(DriverStage::Devices);
         Self::attach_all();
     }
 
-    /// 后置阶段初始化（Ramdisk & Virtual Devices）。
+    /// 后置阶段初始化（Ramdisk, Services）。
     pub fn init_late() {
         Self::init_stage(DriverStage::Late);
-    }
-
-    /// 全阶段按序执行（测试与宿主运行用）。
-    pub fn init_all() {
-        Self::init_early();
-        Self::init_core();
-        Self::init_devices();
-        Self::init_late();
+        Self::attach_all();
     }
 }
