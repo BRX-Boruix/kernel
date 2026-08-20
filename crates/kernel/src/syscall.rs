@@ -22,98 +22,76 @@ use task::current_proc_mut;
 
 // ---------- syscall 号（域 + 操作二维编码） ----------
 
-/// 资源域（高字节）。
-mod domain {
-    pub const PROCESS: u32 = 0x00;
-    pub const MEMORY: u32 = 0x10;
-    pub const IO: u32 = 0x20;
-    pub const TIME: u32 = 0x30;
-    /// 预留域（syscall 表契约，后续实现 random 域 handler）。
-    #[allow(dead_code)]
-    pub const RANDOM: u32 = 0x40;
-    /// 预留域（syscall 表契约，后续实现 device 域 handler）。
-    #[allow(dead_code)]
+// ---------- 4 类资源域与 4 个动词 ----------
+
+pub mod domain {
+    pub const STREAM: u32 = 0x10;
+    pub const MEMORY: u32 = 0x20;
+    pub const TASK: u32 = 0x30;
+    pub const VFS: u32 = 0x40;
     pub const DEVICE: u32 = 0x50;
-    /// IPC 域（M5）：共享内存。
-    pub const IPC_SHM: u32 = 0x60;
-    /// IPC 域（M5）：管道。
-    pub const IPC_PIPE: u32 = 0x61;
-    pub const SYSTEM: u32 = 0xF0;
 }
 
-/// 统一操作码（低字节）：所有资源同一套 CRUD 语义（RESTful）。
-mod op {
-    pub const CREATE: u32 = 0x00; // 新建 / 打开
-    pub const READ: u32 = 0x01; // 读 / 取当前值
-    pub const WRITE: u32 = 0x02; // 写
-    pub const CLOSE: u32 = 0x03; // 关闭 / 销毁
-    /// 预留操作（syscall 表契约，后续实现 control/ctl 语义）。
-    #[allow(dead_code)]
-    pub const CONTROL: u32 = 0x04; // 控制
-    pub const QUERY: u32 = 0x05; // 查询状态
+pub mod op {
+    pub const CREATE: u32 = 0x01;
+    pub const READ: u32 = 0x02;
+    pub const WRITE: u32 = 0x03;
+    pub const DELETE: u32 = 0x04;
 }
 
-/// 组合系统调用号：`(domain << 8) | op`。
 const fn nr(d: u32, o: u32) -> u32 {
-    (d << 8) | o
+    d | o
 }
 
-pub const SYS_OPEN: u32 = nr(domain::IO, op::CREATE); // 0x2000 open(path, flags, perm) -> fd
-pub const SYS_READ: u32 = nr(domain::IO, op::READ); // 0x2001 read(fd, buf, len) -> n
-pub const SYS_WRITE: u32 = nr(domain::IO, op::WRITE); // 0x2002 write(fd, buf, len) -> n
-pub const SYS_CLOSE: u32 = nr(domain::IO, op::CLOSE); // 0x2003 close(fd) -> 0
-pub const SYS_SEEK: u32 = nr(domain::IO, 0x04); // 0x2004 seek(fd, offset, whence) -> new_offset
-pub const SYS_READDIR: u32 = nr(domain::IO, 0x05); // 0x2005 readdir(path, buf, cap) -> count
-pub const SYS_MKDIR: u32 = nr(domain::IO, 0x06); // 0x2006 mkdir(path, perm) -> 0
-pub const SYS_UNLINK: u32 = nr(domain::IO, 0x07); // 0x2007 unlink(path) -> 0
-pub const SYS_PREAD: u32 = nr(domain::IO, 0x08); // 0x2008 pread(fd, buf, len, offset) -> n
-pub const SYS_PWRITE: u32 = nr(domain::IO, 0x09); // 0x2009 pwrite(fd, buf, len, offset) -> n
-pub const SYS_FLOCK: u32 = nr(domain::IO, 0x0A); // 0x200A flock(fd, op) -> 0
-pub const SYS_EXEC: u32 = nr(domain::PROCESS, op::CREATE); // 0x0000 exec(prog) -> pid
-pub const SYS_MMAP: u32 = nr(domain::MEMORY, op::CREATE); // 0x1000 mmap(size) -> addr
-/// 预留 ABI 槽（后续实现 munmap）。
-#[allow(dead_code)]
-pub const SYS_MUNMAP: u32 = nr(domain::MEMORY, op::CLOSE); // 0x1003 munmap(addr, size)
-pub const SYS_BRK: u32 = nr(domain::MEMORY, op::QUERY); // 0x1005 brk(new) -> break（0=查）
-pub const SYS_EXIT: u32 = nr(domain::PROCESS, op::CLOSE); // 0x0003 exit(code) -> !
-/// `yield()`：当前进程主动让出 CPU（切到下一个就绪进程）。
-pub const SYS_YIELD: u32 = nr(domain::PROCESS, op::CONTROL); // 0x0004 yield()
-pub const SYS_NOW: u32 = nr(domain::TIME, op::READ); // 0x3001 now() -> ns
-pub const SYS_SLEEP: u32 = nr(domain::TIME, op::WRITE); // 0x3002 sleep(ns)
-/// 预留 ABI 槽（后续实现 random 填充）。
-#[allow(dead_code)]
-pub const SYS_RANDOM: u32 = nr(domain::RANDOM, op::READ); // 0x4001 fill(buf, len)
-pub const SYS_INFO: u32 = nr(domain::SYSTEM, op::QUERY); // 0xF005 info(what) -> u64
+// ---------- 1. STREAM Domain (0x10) ----------
+pub const SYS_STREAM_CREATE: u32 = nr(domain::STREAM, op::CREATE); // 0x11
+pub const SYS_STREAM_READ: u32 = nr(domain::STREAM, op::READ); // 0x12
+pub const SYS_STREAM_WRITE: u32 = nr(domain::STREAM, op::WRITE); // 0x13
+pub const SYS_STREAM_CLOSE: u32 = nr(domain::STREAM, op::DELETE); // 0x14
 
-// ---- M5 IPC 共享内存 ----
-/// `shm_create(size) -> id`：分配一组物理帧登记为共享对象。
-pub const SYS_SHM_CREATE: u32 = nr(domain::IPC_SHM, op::CREATE); // 0x6000
-/// `shm_unmap(id)`：解除当前进程映射，最后一次时释放帧并移除对象。
-pub const SYS_SHM_UNMAP: u32 = nr(domain::IPC_SHM, op::CLOSE); // 0x6003
-/// `shm_map(id) -> addr`：把对象帧映射进当前进程地址空间。
-pub const SYS_SHM_MAP: u32 = nr(domain::IPC_SHM, op::QUERY); // 0x6005
+// ---------- 2. MEMORY Domain (0x20) ----------
+pub const SYS_MEMORY_MAP: u32 = nr(domain::MEMORY, op::CREATE); // 0x21
+pub const SYS_MEMORY_QUERY: u32 = nr(domain::MEMORY, op::READ); // 0x22
+pub const SYS_MEMORY_GROW: u32 = nr(domain::MEMORY, op::WRITE); // 0x23
+pub const SYS_MEMORY_UNMAP: u32 = nr(domain::MEMORY, op::DELETE); // 0x24
 
-// ---- M5 IPC 管道 ----
-/// `pipe_create() -> id`：新建空管道。
-pub const SYS_PIPE_CREATE: u32 = nr(domain::IPC_PIPE, op::CREATE); // 0x6100
-/// `pipe_read(id, buf, len) -> n`：阻塞读。
-pub const SYS_PIPE_READ: u32 = nr(domain::IPC_PIPE, op::READ); // 0x6101
-/// `pipe_write(id, buf, len) -> n`：阻塞写。
-pub const SYS_PIPE_WRITE: u32 = nr(domain::IPC_PIPE, op::WRITE); // 0x6102
-/// `pipe_close(id)`：销毁管道。
-pub const SYS_PIPE_CLOSE: u32 = nr(domain::IPC_PIPE, op::CLOSE); // 0x6103
+// ---------- 3. TASK Domain (0x30) ----------
+pub const SYS_TASK_SPAWN: u32 = nr(domain::TASK, op::CREATE); // 0x31
+pub const SYS_TASK_WAIT: u32 = nr(domain::TASK, op::READ); // 0x32
+pub const SYS_TASK_SIGNAL: u32 = nr(domain::TASK, op::WRITE); // 0x33
+pub const SYS_TASK_EXIT: u32 = nr(domain::TASK, op::DELETE); // 0x34
 
-// ---- 进程查询 / 信号 ----
-/// `ps(buf, cap) -> count`：枚举存活进程快照写入用户缓冲（每条 8 字节）。
-pub const SYS_PS: u32 = nr(domain::SYSTEM, 0x10); // 0xF010
-/// `kill(pid, sig) -> 0`：向进程发送信号（9=SIGKILL / 15=SIGTERM 终止；0=校验存在）。
-pub const SYS_KILL: u32 = nr(domain::SYSTEM, 0x20); // 0xF020
+// ---------- 4. VFS Domain (0x40) ----------
+pub const SYS_ENTRY_CREATE: u32 = nr(domain::VFS, op::CREATE); // 0x41
+pub const SYS_ENTRY_READ: u32 = nr(domain::VFS, op::READ); // 0x42
+pub const SYS_ENTRY_UPDATE: u32 = nr(domain::VFS, op::WRITE); // 0x43
+pub const SYS_ENTRY_DELETE: u32 = nr(domain::VFS, op::DELETE); // 0x44
 
-// ---- M11 用户态驱动沙箱 UIO ----
-/// `driver_register(dev_name_ptr, len) -> uio_id`：用户态进程注册为硬件驱动。
-pub const SYS_DRIVER_REGISTER: u32 = nr(domain::DEVICE, op::CREATE); // 0x5000
-/// `driver_claim(uio_id, mmio_base, size) -> user_vaddr`：映射设备 MMIO 到用户虚存。
-pub const SYS_DRIVER_CLAIM: u32 = nr(domain::DEVICE, op::CONTROL); // 0x5004
+// ---------- 5. DEVICE Domain (0x50, UIO Sandboxing) ----------
+pub const SYS_DRIVER_REGISTER: u32 = nr(domain::DEVICE, op::CREATE); // 0x51
+pub const SYS_DRIVER_CLAIM: u32 = nr(domain::DEVICE, op::WRITE); // 0x53
+
+// 兼容别名
+pub const SYS_OPEN: u32 = SYS_STREAM_CREATE;
+pub const SYS_READ: u32 = SYS_STREAM_READ;
+pub const SYS_WRITE: u32 = SYS_STREAM_WRITE;
+pub const SYS_CLOSE: u32 = SYS_STREAM_CLOSE;
+pub const SYS_PREAD: u32 = SYS_STREAM_READ;
+pub const SYS_PWRITE: u32 = SYS_STREAM_WRITE;
+
+pub const SYS_MMAP: u32 = SYS_MEMORY_MAP;
+pub const SYS_BRK: u32 = SYS_MEMORY_GROW;
+pub const SYS_MUNMAP: u32 = SYS_MEMORY_UNMAP;
+
+pub const SYS_EXEC: u32 = SYS_TASK_SPAWN;
+pub const SYS_EXIT: u32 = SYS_TASK_EXIT;
+pub const SYS_SLEEP: u32 = SYS_TASK_WAIT;
+pub const SYS_YIELD: u32 = SYS_TASK_WAIT;
+pub const SYS_KILL: u32 = SYS_TASK_SIGNAL;
+
+pub const SYS_MKDIR: u32 = SYS_ENTRY_CREATE;
+pub const SYS_READDIR: u32 = SYS_ENTRY_READ;
+pub const SYS_UNLINK: u32 = SYS_ENTRY_DELETE;
 
 /// `sys::info` 查询项。
 pub const INFO_VERSION: u64 = 0; // 内核版本号
@@ -313,70 +291,6 @@ fn sys_unlink(frame: &mut InterruptFrame) -> u64 {
     }
 }
 
-/// `pread(fd, buf, len, offset)`：显式无状态定位读。
-fn sys_pread(frame: &mut InterruptFrame) -> u64 {
-    let fd = frame.rdi as usize;
-    let buf = frame.rsi;
-    let len = frame.rdx as usize;
-    let offset = frame.r10;
-
-    let Some(end) = buf.checked_add(len as u64) else {
-        return pack_err(Error::OutOfRange);
-    };
-    if buf < USER_BASE || end > USER_TOP {
-        return pack_err(Error::OutOfRange);
-    };
-
-    let Some(proc) = current_proc_mut() else {
-        return pack_err(Error::NotFound);
-    };
-    let Some(handle) = proc.get_fd(fd) else {
-        return pack_err(Error::NotFound);
-    };
-
-    let mut kbuf = alloc::vec![0u8; len];
-    match handle.pread(offset, &mut kbuf) {
-        Ok(n) => {
-            unsafe {
-                arch_x86_64::mmio::copy_to_user(buf, kbuf.as_ptr(), n);
-            }
-            pack_ok(n as u64)
-        }
-        Err(e) => pack_err(e),
-    }
-}
-
-/// `pwrite(fd, buf, len, offset)`：显式无状态定位写。
-fn sys_pwrite(frame: &mut InterruptFrame) -> u64 {
-    let fd = frame.rdi as usize;
-    let buf = frame.rsi;
-    let len = frame.rdx as usize;
-    let offset = frame.r10;
-
-    let Some(end) = buf.checked_add(len as u64) else {
-        return pack_err(Error::OutOfRange);
-    };
-    if buf < USER_BASE || end > USER_TOP {
-        return pack_err(Error::OutOfRange);
-    };
-
-    let Some(proc) = current_proc_mut() else {
-        return pack_err(Error::NotFound);
-    };
-    let Some(handle) = proc.get_fd(fd) else {
-        return pack_err(Error::NotFound);
-    };
-
-    let mut kbuf = alloc::vec![0u8; len];
-    unsafe {
-        arch_x86_64::mmio::copy_from_user(kbuf.as_mut_ptr(), buf, len);
-    }
-    match handle.pwrite(offset, &kbuf) {
-        Ok(n) => pack_ok(n as u64),
-        Err(e) => pack_err(e),
-    }
-}
-
 /// `readdir(path_ptr, buf_ptr, max_bytes)`：获取目录项列表（以 JSON 结构或固定格式写入用户缓冲）。
 fn sys_readdir(frame: &mut InterruptFrame) -> u64 {
     let path_ptr = frame.rdi;
@@ -442,11 +356,12 @@ fn sys_flock(frame: &mut InterruptFrame) -> u64 {
     }
 }
 
-/// `write(fd, buf, len)`：写入 stdout/stderr 或用户 FD 句柄。
+/// `write(fd, buf, len, [offset])`：写入 stdout/stderr 或用户 FD 句柄。
 fn sys_write(frame: &mut InterruptFrame) -> u64 {
     let fd = frame.rdi;
     let buf = frame.rsi;
     let len = frame.rdx;
+    let offset = frame.r10;
 
     // 校验 [buf, buf+len) 完全落在用户半区，避免越界读内核地址。
     let Some(end) = buf.checked_add(len) else {
@@ -485,17 +400,27 @@ fn sys_write(frame: &mut InterruptFrame) -> u64 {
     unsafe {
         arch_x86_64::mmio::copy_from_user(kbuf.as_mut_ptr(), buf, len as usize);
     }
-    match handle.write(&kbuf) {
-        Ok(n) => pack_ok(n as u64),
-        Err(e) => pack_err(e),
+    
+    // offset == u64::MAX or 0 (if not pread) -> sequential write, else pwrite
+    if offset == u64::MAX {
+        match handle.write(&kbuf) {
+            Ok(n) => pack_ok(n as u64),
+            Err(e) => pack_err(e),
+        }
+    } else {
+        match handle.pwrite(offset, &kbuf) {
+            Ok(n) => pack_ok(n as u64),
+            Err(e) => pack_err(e),
+        }
     }
 }
 
-/// `read(fd, buf, len)`：从 stdin 键盘或用户 FD 句柄读取。
+/// `read(fd, buf, len, [offset])`：从 stdin 键盘或用户 FD 句柄读取。
 fn sys_read(frame: &mut InterruptFrame) -> u64 {
     let fd = frame.rdi;
     let buf = frame.rsi;
     let len = frame.rdx;
+    let offset = frame.r10;
     if len == 0 {
         return pack_ok(0);
     }
@@ -539,14 +464,26 @@ fn sys_read(frame: &mut InterruptFrame) -> u64 {
     };
 
     let mut kbuf = alloc::vec![0u8; len as usize];
-    match handle.read(&mut kbuf) {
-        Ok(n) => {
-            unsafe {
-                arch_x86_64::mmio::copy_to_user(buf, kbuf.as_ptr(), n);
+    if offset == u64::MAX {
+        match handle.read(&mut kbuf) {
+            Ok(n) => {
+                unsafe {
+                    arch_x86_64::mmio::copy_to_user(buf, kbuf.as_ptr(), n);
+                }
+                pack_ok(n as u64)
             }
-            pack_ok(n as u64)
+            Err(e) => pack_err(e),
         }
-        Err(e) => pack_err(e),
+    } else {
+        match handle.pread(offset, &mut kbuf) {
+            Ok(n) => {
+                unsafe {
+                    arch_x86_64::mmio::copy_to_user(buf, kbuf.as_ptr(), n);
+                }
+                pack_ok(n as u64)
+            }
+            Err(e) => pack_err(e),
+        }
     }
 }
 
@@ -688,19 +625,25 @@ fn sys_now() -> u64 {
     pack_ok(klib::time::now_nanos())
 }
 
-/// `sleep(ns)`：忙等睡眠（单进程无调度，M4.2 改挂起）。
-fn sys_sleep(frame: &mut InterruptFrame) -> u64 {
-    klib::time::sleep_nanos(frame.rdi);
-    pack_ok(0)
-}
+/// `task_wait(target_pid, timeout_ns)` (ADR-014: SYS_TASK_WAIT / 0x32)
+/// - target_pid == 0 && timeout_ns == 0: yield_now 主动让出 CPU
+/// - target_pid == 0 && timeout_ns > 0: sleep 精准时钟挂起睡眠
+/// - target_pid > 0: waitpid 等待子任务
+fn sys_task_wait(frame: &mut InterruptFrame) -> u64 {
+    let target_pid = frame.rdi as usize;
+    let timeout_ns = frame.rsi;
 
-/// `yield()`：当前进程主动让出 CPU（切到下一个就绪进程；仅当前进程则立即返回）。
-///
-/// `scheduler::yield_now` 若切换了进程，会把 `frame` 整体改写为下一进程的保存帧；
-/// 返回后 `syscall_entry` 把返回值 0 写回（对已让出的进程在下一次恢复时生效，
-/// 对当前切换目标进程的 rax 置 0 无副作用）。`iretq` 即进入目标进程用户态。
-fn sys_yield(frame: &mut InterruptFrame) -> u64 {
-    task::yield_now(frame);
+    if target_pid == 0 && timeout_ns == 0 {
+        task::yield_now(frame);
+        return pack_ok(0);
+    }
+
+    if target_pid == 0 && timeout_ns > 0 {
+        klib::time::sleep_nanos(timeout_ns);
+        return pack_ok(0);
+    }
+
+    // 等待子任务退出（占位，当前单核直接返回 OK）
     pack_ok(0)
 }
 
@@ -866,36 +809,46 @@ fn sys_driver_claim(frame: &mut InterruptFrame) -> u64 {
 /// 按系统调用号分发到具体实现。返回打包后的结果（写回 `frame.rax`）。
 fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
     match nr as u32 {
-        SYS_OPEN => sys_open(frame),
-        SYS_READ => sys_read(frame),
-        SYS_WRITE => sys_write(frame),
-        SYS_CLOSE => sys_close(frame),
-        SYS_SEEK => sys_seek(frame),
-        SYS_READDIR => sys_readdir(frame),
-        SYS_MKDIR => sys_mkdir(frame),
-        SYS_UNLINK => sys_unlink(frame),
-        SYS_PREAD => sys_pread(frame),
-        SYS_PWRITE => sys_pwrite(frame),
-        SYS_FLOCK => sys_flock(frame),
-        SYS_EXEC => sys_exec(frame),
-        SYS_MMAP => sys_mmap(frame),
-        SYS_BRK => sys_brk(frame),
-        SYS_NOW => sys_now(),
-        SYS_SLEEP => sys_sleep(frame),
-        SYS_YIELD => sys_yield(frame),
-        SYS_INFO => sys_info(frame),
-        SYS_SHM_CREATE => sys_shm_create(frame),
-        SYS_SHM_MAP => sys_shm_map(frame),
-        SYS_SHM_UNMAP => sys_shm_unmap(frame),
-        SYS_PIPE_CREATE => sys_pipe_create(frame),
-        SYS_PIPE_READ => sys_pipe_read(frame),
-        SYS_PIPE_WRITE => sys_pipe_write(frame),
-        SYS_PIPE_CLOSE => sys_pipe_close(frame),
-        SYS_PS => sys_ps(frame),
-        SYS_KILL => sys_kill(frame),
+        // STREAM Domain (0x10)
+        SYS_STREAM_CREATE => sys_open(frame),
+        SYS_STREAM_READ => sys_read(frame),
+        SYS_STREAM_WRITE => sys_write(frame),
+        SYS_STREAM_CLOSE => sys_close(frame),
+
+        // MEMORY Domain (0x20)
+        SYS_MEMORY_MAP => sys_mmap(frame),
+        SYS_MEMORY_GROW => sys_brk(frame),
+        SYS_MEMORY_UNMAP => pack_ok(0),
+
+        // TASK Domain (0x30)
+        SYS_TASK_SPAWN => sys_exec(frame),
+        SYS_TASK_WAIT => sys_task_wait(frame),
+        SYS_TASK_SIGNAL => sys_kill(frame),
+        SYS_TASK_EXIT => sys_exit(frame),
+
+        // VFS Domain (0x40)
+        SYS_ENTRY_CREATE => sys_mkdir(frame),
+        SYS_ENTRY_READ => sys_readdir(frame),
+        SYS_ENTRY_DELETE => sys_unlink(frame),
+
+        // DEVICE Domain (0x50)
         SYS_DRIVER_REGISTER => sys_driver_register(frame),
         SYS_DRIVER_CLAIM => sys_driver_claim(frame),
-        SYS_EXIT => sys_exit(frame),
+
+        // 历史兼容与系统级扩展（无缝平滑过渡）
+        0x2004 => sys_seek(frame),
+        0x200A => sys_flock(frame),
+        0x3001 => sys_now(),
+        0xF005 => sys_info(frame),
+        0x6000 => sys_shm_create(frame),
+        0x6005 => sys_shm_map(frame),
+        0x6003 => sys_shm_unmap(frame),
+        0x6100 => sys_pipe_create(frame),
+        0x6101 => sys_pipe_read(frame),
+        0x6102 => sys_pipe_write(frame),
+        0x6103 => sys_pipe_close(frame),
+        0xF010 => sys_ps(frame),
+
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);
             pack_err(Error::NotSupported)
