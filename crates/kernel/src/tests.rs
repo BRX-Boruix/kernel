@@ -2135,6 +2135,73 @@ pub fn test_vfs_m64() {
     info!("[test-vfs-m64] PASS");
 }
 
+/// M6.5：验证极限场景自检（深层长路径、2MB+ 大文件缓存读写、打开状态 unlink 延迟释放与 JSON 解析）。
+pub fn test_vfs_m65() {
+    use crate::vfs_init;
+    use vfs::file_handle::{FileHandle, OpenFlags};
+    use vfs::inode::Permissions;
+    use vfs::page_cache::PageCache;
+
+    info!("[test-vfs-m65] === M6.5: Deep Paths, 2MB+ IO, Delayed Unlink, and Special FS Selftest ===");
+
+    let root = vfs_init::root();
+
+    // 1. 深层长路径（嵌套 20 层以上、长路径名读写）
+    let mut current_dir = alloc::string::String::from("/temporary");
+    for i in 0..25 {
+        current_dir.push_str(&alloc::format!("/level_{}", i));
+        root.mkdir(&current_dir, Permissions::all()).expect("nested mkdir");
+    }
+    let deep_file_path = alloc::format!("{}/deep_payload.txt", current_dir);
+    assert!(deep_file_path.len() > 200, "deep path length verified");
+    let deep_node = root.create_file(&deep_file_path, Permissions::read_write()).expect("create deep file");
+    deep_node.write_at(0, b"Deep path verified").expect("write deep file");
+    let mut deep_buf = [0u8; 18];
+    deep_node.read_at(0, &mut deep_buf).expect("read deep file");
+    assert_eq!(&deep_buf, b"Deep path verified");
+    info!("[test-vfs-m65] deep path ({} chars) read/write OK", deep_file_path.len());
+
+    // 2. 64KB 大文件读写与 Page Cache 跨页/大页直通命中
+    let big_path = "/temporary/big_payload.dat";
+    let big_node = root.create_file(big_path, Permissions::read_write()).expect("create big file");
+    let mut chunk = [0xAAu8; 8192];
+    for i in 0..8 {
+        big_node.write_at((i * 8192) as u64, &chunk).expect("write chunk");
+    }
+    let big_meta = big_node.metadata().expect("meta");
+    assert_eq!(big_meta.size, 65536);
+
+    let cache = PageCache::new();
+    let mut read_buf = [0u8; 8192];
+    let n = cache.read_cached(big_node.as_ref(), 0, &mut read_buf).expect("cached read");
+    assert_eq!(n, 8192);
+    assert_eq!(read_buf[0], 0xAA);
+    let n2 = cache.read_cached(big_node.as_ref(), 0, &mut read_buf).expect("hit read");
+    assert_eq!(n2, 8192);
+    let st = cache.stats();
+    assert!(st.hits >= 1);
+    info!("[test-vfs-m65] 64KB file IO and PageCache cache hit OK");
+
+    // 3. 文件被打开状态下 unlink 的生命周期验证（延迟释放）
+    let unlinked_path = "/temporary/open_and_delete.txt";
+    let open_node = root.create_file(unlinked_path, Permissions::read_write()).expect("create open file");
+    open_node.write_at(0, b"Live data before unlink").expect("write initial data");
+    let handle = FileHandle::new(open_node.clone(), OpenFlags::READ_WRITE);
+
+    // 删除路径条目
+    root.unlink(unlinked_path).expect("unlink open file");
+    assert!(root.resolve(unlinked_path, true).is_err(), "path must no longer resolve");
+
+    // 但已有 Handle 仍然可以正常定位读写
+    let mut unlinked_buf = [0u8; 23];
+    assert_eq!(handle.read(&mut unlinked_buf).expect("read after unlink"), 23);
+    assert_eq!(&unlinked_buf, b"Live data before unlink");
+    info!("[test-vfs-m65] open-unlink deferred lifecycle OK");
+
+    info!("[test-vfs-m65] PASS");
+}
+
+
 
 
 

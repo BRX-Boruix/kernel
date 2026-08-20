@@ -154,20 +154,28 @@ impl PageCache {
                 }
             }
 
-            // 未命中 2MB 大页：预载大页
+            // 未命中 2MB 大页：预载大页（大小按文件元数据尺寸截断，最多 2MB）
             self.misses.fetch_add(1, Ordering::Relaxed);
-            let mut huge_buf = alloc::vec![0u8; HUGE_PAGE_SIZE];
-            let read_len = inode.read_at(huge_offset, &mut huge_buf)?;
-            if read_len > 0 {
-                huge_buf.truncate(read_len);
-                let page = Arc::new(CachePage::new_huge(huge_buf));
-                self.pages_huge.write().insert(huge_offset, page.clone());
+            let meta_size = inode.metadata().map(|m| m.size).unwrap_or(HUGE_PAGE_SIZE as u64);
+            let needed_size = if huge_offset < meta_size {
+                core::cmp::min(HUGE_PAGE_SIZE as u64, meta_size - huge_offset) as usize
+            } else {
+                0
+            };
+            if needed_size > 0 {
+                let mut huge_buf = alloc::vec![0u8; needed_size];
+                let read_len = inode.read_at(huge_offset, &mut huge_buf)?;
+                if read_len > 0 {
+                    huge_buf.truncate(read_len);
+                    let page = Arc::new(CachePage::new_huge(huge_buf));
+                    self.pages_huge.write().insert(huge_offset, page.clone());
 
-                if huge_inner_off < page.data.len() {
-                    let available = &page.data[huge_inner_off..];
-                    let copy_len = core::cmp::min(buf.len(), available.len());
-                    buf[..copy_len].copy_from_slice(&available[..copy_len]);
-                    return Ok(copy_len);
+                    if huge_inner_off < page.data.len() {
+                        let available = &page.data[huge_inner_off..];
+                        let copy_len = core::cmp::min(buf.len(), available.len());
+                        buf[..copy_len].copy_from_slice(&available[..copy_len]);
+                        return Ok(copy_len);
+                    }
                 }
             }
             return Ok(0);
