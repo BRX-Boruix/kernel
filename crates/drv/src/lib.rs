@@ -9,12 +9,14 @@ extern crate std;
 
 pub mod device;
 pub mod driver;
+pub mod drivers;
 pub mod event;
 pub mod hub;
-pub mod pci;
-pub mod pci_drivers;
-pub mod platform;
 pub mod uio;
+
+// 向上提供对 PCI 深度自省等功能的导出
+pub use drivers::pci_bus as pci;
+pub use drivers::pci_classes as pci_drivers;
 
 pub use device::{
     BlockDevice, BusType, CharDevice, Device, DeviceInfo, DeviceKind, DeviceOps, InputDevice,

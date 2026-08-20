@@ -336,14 +336,14 @@ impl DriverHub {
         if REGISTERED.swap(true, Ordering::Relaxed) {
             return;
         }
-        crate::platform::serial::register_serial_driver();
-        crate::platform::keyboard::register_keyboard_driver();
-        crate::platform::cmos::register_cmos_driver();
-        crate::platform::pseudo::register_pseudo_driver();
-        crate::platform::ata_pio::register_ata_driver();
-        crate::platform::ramdisk::register_ramdisk_driver();
-        crate::pci::register_pci_bus_driver();
-        crate::pci_drivers::register_pci_class_drivers();
+        crate::drivers::serial::register_serial_driver();
+        crate::drivers::keyboard::register_keyboard_driver();
+        crate::drivers::cmos::register_cmos_driver();
+        crate::drivers::pseudo::register_pseudo_driver();
+        crate::drivers::ata_pio::register_ata_driver();
+        crate::drivers::ramdisk::register_ramdisk_driver();
+        crate::drivers::pci_bus::register_pci_bus_driver();
+        crate::drivers::pci_classes::register_pci_class_drivers();
     }
 
     /// 触发指定生命周期阶段的所有驱动初始化。
