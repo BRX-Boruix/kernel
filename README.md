@@ -53,6 +53,8 @@ python get.py
 # 到env配置你的 qemu 地址
 # 然后cd到sdk
 cd sdk
+# 下载并部署 Limine bootloader
+python main.py limine
 # 编译内核与相关组件至ISO
 python main.py build --release
 # 直接构建并运行
