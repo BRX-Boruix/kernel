@@ -670,29 +670,20 @@ fn syscall_user_code() -> [u8; 200] {
             i += 8;
         }};
     }
-    // SYS_NOW (0x3001)：now()，存结果
-    reg64!(0xB8, 0x3001u32);
-    int80!();
-    store_rax!(SAVE_ADDR + 0);
-    // SYS_WRITE (0x2002)：write(1, MSG, len)，存返回字节数
-    reg64!(0xB8, 0x2002u32);
+    // SYS_STREAM_WRITE (0x13)：write(1, MSG, len, offset=MAX)，存返回字节数
+    reg64!(0xB8, 0x13u32);
     reg64!(0xBF, 1);
     reg64!(0xBE, MSG_ADDR);
     reg64!(0xBA, MSG.len());
     int80!();
     store_rax!(SAVE_ADDR + 8);
-    // SYS_INFO (0xF005)：info(0)，存版本号
-    reg64!(0xB8, 0xF005u32);
-    reg64!(0xBF, 0);
-    int80!();
-    store_rax!(SAVE_ADDR + 16);
-    // SYS_BRK (0x1005)：brk(0) 查询当前断点，存结果
-    reg64!(0xB8, 0x1005u32);
+    // SYS_MEMORY_GROW (0x23)：grow(0) 查询当前断点，存结果
+    reg64!(0xB8, 0x23u32);
     reg64!(0xBF, 0);
     int80!();
     store_rax!(SAVE_ADDR + 24);
-    // SYS_EXIT (0x0003)：exit(42)，停机（不返回）
-    reg64!(0xB8, 0x0003u32);
+    // SYS_TASK_EXIT (0x34)：exit(42)，停机（不返回）
+    reg64!(0xB8, 0x34u32);
     reg64!(0xBF, 42);
     int80!();
     emit!(0x0F, 0x0B); // ud2（不应到达）
@@ -803,18 +794,22 @@ fn sched_user_code() -> [u8; 96] {
     macro_rules! emit {
         ($($b:expr),*) => { $( c[i] = $b; i += 1; )* };
     }
-    // mov rax, SYS_WRITE(0x2002)
-    emit!(0x48, 0xB8); c[i..i + 8].copy_from_slice(&0x2002u64.to_le_bytes()); i += 8;
+    // mov rax, SYS_STREAM_WRITE(0x13)
+    emit!(0x48, 0xB8); c[i..i + 8].copy_from_slice(&0x13u64.to_le_bytes()); i += 8;
     // mov rdi, 1 (fd=stdout)
     emit!(0x48, 0xBF); c[i..i + 8].copy_from_slice(&1u64.to_le_bytes()); i += 8;
     // mov rsi, MSG_ADDR
     emit!(0x48, 0xBE); c[i..i + 8].copy_from_slice(&MSG_ADDR.to_le_bytes()); i += 8;
     // mov rdx, 1 (len)
     emit!(0x48, 0xBA); c[i..i + 8].copy_from_slice(&1u64.to_le_bytes()); i += 8;
+    // mov r10, u64::MAX (offset = stream write)
+    emit!(0x49, 0xC7, 0xC2); c[i..i + 4].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); i += 4;
     // int 0x80 (write)
     emit!(0xCD, 0x80);
-    // mov rax, SYS_YIELD(0x0004)：主动让出
-    emit!(0x48, 0xB8); c[i..i + 8].copy_from_slice(&0x0004u64.to_le_bytes()); i += 8;
+    // mov rax, SYS_TASK_WAIT(0x32)：主动让出 (target_pid=0, timeout=0)
+    emit!(0x48, 0xB8); c[i..i + 8].copy_from_slice(&0x32u64.to_le_bytes()); i += 8;
+    emit!(0x48, 0xBF); c[i..i + 8].copy_from_slice(&0u64.to_le_bytes()); i += 8;
+    emit!(0x48, 0xBE); c[i..i + 8].copy_from_slice(&0u64.to_le_bytes()); i += 8;
     // int 0x80 (yield)
     emit!(0xCD, 0x80);
     // jmp $（死循环）

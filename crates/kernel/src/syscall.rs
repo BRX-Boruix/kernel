@@ -71,76 +71,6 @@ pub const SYS_ENTRY_DELETE: u32 = nr(domain::VFS, op::DELETE); // 0x44
 pub const SYS_DRIVER_REGISTER: u32 = nr(domain::DEVICE, op::CREATE); // 0x51
 pub const SYS_DRIVER_CLAIM: u32 = nr(domain::DEVICE, op::WRITE); // 0x53
 
-// 兼容别名
-pub const SYS_OPEN: u32 = SYS_STREAM_CREATE;
-pub const SYS_READ: u32 = SYS_STREAM_READ;
-pub const SYS_WRITE: u32 = SYS_STREAM_WRITE;
-pub const SYS_CLOSE: u32 = SYS_STREAM_CLOSE;
-pub const SYS_PREAD: u32 = SYS_STREAM_READ;
-pub const SYS_PWRITE: u32 = SYS_STREAM_WRITE;
-
-pub const SYS_MMAP: u32 = SYS_MEMORY_MAP;
-pub const SYS_BRK: u32 = SYS_MEMORY_GROW;
-pub const SYS_MUNMAP: u32 = SYS_MEMORY_UNMAP;
-
-pub const SYS_EXEC: u32 = SYS_TASK_SPAWN;
-pub const SYS_EXIT: u32 = SYS_TASK_EXIT;
-pub const SYS_SLEEP: u32 = SYS_TASK_WAIT;
-pub const SYS_YIELD: u32 = SYS_TASK_WAIT;
-pub const SYS_KILL: u32 = SYS_TASK_SIGNAL;
-
-pub const SYS_MKDIR: u32 = SYS_ENTRY_CREATE;
-pub const SYS_READDIR: u32 = SYS_ENTRY_READ;
-pub const SYS_UNLINK: u32 = SYS_ENTRY_DELETE;
-
-/// `sys::info` 查询项。
-pub const INFO_VERSION: u64 = 0; // 内核版本号
-pub const INFO_BOOT_MS: u64 = 1; // 启动以来毫秒数
-pub const INFO_CPU_COUNT: u64 = 2; // CPU 数
-
-/// 内核版本号（major<<16 | minor<<8 | patch）。
-///
-/// 与启动横幅保持一致：来源为 `CARGO_PKG_VERSION`（见 `kernel/Cargo.toml` 的
-/// `version`，即 workspace 的 `0.1.0`），而非手填常量。编译期从 `env!` 取版本串
-/// 并打包，保证 `version`/`uname` 命令与 `BORUIX KERNEL v.x.y.z` 横幅同源。
-pub const KERNEL_VERSION: u64 = pack_pkg_version();
-
-/// 把 `CARGO_PKG_VERSION`（如 `"0.1.0"`）解析并打包为
-/// `major<<16 | minor<<8 | patch` 的 u64（编译期常量）。
-const fn pack_pkg_version() -> u64 {
-    let s = env!("CARGO_PKG_VERSION");
-    let b = s.as_bytes();
-    let mut i = 0usize;
-    let mut cur: u64 = 0;
-    let mut major: u64 = 0;
-    let mut minor: u64 = 0;
-    let mut patch: u64 = 0;
-    let mut which = 0u32; // 0=major 1=minor 2=patch
-    while i < b.len() {
-        if b[i] == b'.' {
-            if which == 0 {
-                major = cur;
-            } else if which == 1 {
-                minor = cur;
-            }
-            cur = 0;
-            which += 1;
-        } else if b[i].is_ascii_digit() {
-            cur = cur * 10 + (b[i] - b'0') as u64;
-        }
-        i += 1;
-    }
-    // 收尾最后一段（无结尾 '.' 的情况）。
-    if which == 0 {
-        major = cur;
-    } else if which == 1 {
-        minor = cur;
-    } else {
-        patch = cur;
-    }
-    (major << 16) | (minor << 8) | patch
-}
-
 // ---------- ABI 打包（成功 / 错误） ----------
 
 /// 打包成功值：原样返回全 64 位（可容纳地址/指针/长度）。
@@ -237,30 +167,6 @@ fn sys_close(frame: &mut InterruptFrame) -> u64 {
     }
 }
 
-/// `seek(fd, offset, whence)`：调整文件句柄游标。
-fn sys_seek(frame: &mut InterruptFrame) -> u64 {
-    let fd = frame.rdi as usize;
-    let offset = frame.rsi as i64;
-    let whence_raw = frame.rdx as u32;
-    let whence = match whence_raw {
-        0 => vfs::file_handle::SeekWhence::Set,
-        1 => vfs::file_handle::SeekWhence::Current,
-        2 => vfs::file_handle::SeekWhence::End,
-        _ => return pack_err(Error::InvalidParam),
-    };
-
-    let Some(proc) = current_proc_mut() else {
-        return pack_err(Error::NotFound);
-    };
-    let Some(handle) = proc.get_fd(fd) else {
-        return pack_err(Error::NotFound);
-    };
-    match handle.seek(offset, whence) {
-        Ok(new_off) => pack_ok(new_off),
-        Err(e) => pack_err(e),
-    }
-}
-
 /// `mkdir(path_ptr, perm_bits)`：创建目录。
 fn sys_mkdir(frame: &mut InterruptFrame) -> u64 {
     let path_ptr = frame.rdi;
@@ -340,20 +246,6 @@ fn sys_readdir(frame: &mut InterruptFrame) -> u64 {
         }
     }
     pack_ok(n as u64)
-}
-
-/// `flock(fd, op)`：顾问文件锁。
-fn sys_flock(frame: &mut InterruptFrame) -> u64 {
-    let fd = frame.rdi as usize;
-    let _op = frame.rsi as u32;
-    let Some(proc) = current_proc_mut() else {
-        return pack_err(Error::NotFound);
-    };
-    if proc.get_fd(fd).is_some() {
-        pack_ok(0)
-    } else {
-        pack_err(Error::NotFound)
-    }
 }
 
 /// `write(fd, buf, len, [offset])`：写入 stdout/stderr 或用户 FD 句柄。
@@ -620,11 +512,6 @@ fn sys_brk(frame: &mut InterruptFrame) -> u64 {
     }
 }
 
-/// `now()`：单调时钟，纳秒。
-fn sys_now() -> u64 {
-    pack_ok(klib::time::now_nanos())
-}
-
 /// `task_wait(target_pid, timeout_ns)` (ADR-014: SYS_TASK_WAIT / 0x32)
 /// - target_pid == 0 && timeout_ns == 0: yield_now 主动让出 CPU
 /// - target_pid == 0 && timeout_ns > 0: sleep 精准时钟挂起睡眠
@@ -647,90 +534,6 @@ fn sys_task_wait(frame: &mut InterruptFrame) -> u64 {
     pack_ok(0)
 }
 
-/// `info(what)`：查询内核信息。
-fn sys_info(frame: &mut InterruptFrame) -> u64 {
-    match frame.rdi {
-        INFO_VERSION => pack_ok(KERNEL_VERSION),
-        INFO_BOOT_MS => pack_ok(klib::time::now_millis()),
-        INFO_CPU_COUNT => pack_ok(mm::cpu_count() as u64),
-        _ => pack_err(Error::InvalidParam),
-    }
-}
-
-// ---------- M5 IPC handlers ----------
-
-/// 取当前进程的可变用户地址空间（失败返回 NotFound）。
-fn cur_addr_space() -> Result<
-    &'static mut mm::user_space::UserAddressSpace<arch_x86_64::paging::X86PageTable>,
-    Error,
-> {
-    current_proc_mut()
-        .map(|p| p.addr_space_mut())
-        .ok_or(Error::NotFound)
-}
-
-/// `shm_create(size) -> id`。
-fn sys_shm_create(frame: &mut InterruptFrame) -> u64 {
-    match ipc::shm_create(frame.rdi) {
-        Ok(id) => pack_ok(id),
-        Err(e) => pack_err(e),
-    }
-}
-
-/// `shm_map(id) -> addr`。
-fn sys_shm_map(frame: &mut InterruptFrame) -> u64 {
-    let Ok(addr_space) = cur_addr_space() else {
-        return pack_err(Error::NotFound);
-    };
-    match ipc::shm_map(frame.rdi, addr_space) {
-        Ok(a) => pack_ok(a),
-        Err(e) => pack_err(e),
-    }
-}
-
-/// `shm_unmap(id)`。
-fn sys_shm_unmap(frame: &mut InterruptFrame) -> u64 {
-    let Ok(addr_space) = cur_addr_space() else {
-        return pack_err(Error::NotFound);
-    };
-    match ipc::shm_unmap(frame.rdi, addr_space) {
-        Ok(()) => pack_ok(0),
-        Err(e) => pack_err(e),
-    }
-}
-
-/// `pipe_create() -> id`。
-fn sys_pipe_create(_frame: &mut InterruptFrame) -> u64 {
-    match ipc::pipe_create() {
-        Ok(id) => pack_ok(id),
-        Err(e) => pack_err(e),
-    }
-}
-
-/// `pipe_read(id, buf, len) -> n`：阻塞读。
-fn sys_pipe_read(frame: &mut InterruptFrame) -> u64 {
-    match ipc::pipe_read(frame, frame.rdi, frame.rsi, frame.rdx) {
-        Ok(n) => pack_ok(n),
-        Err(e) => pack_err(e),
-    }
-}
-
-/// `pipe_write(id, buf, len) -> n`：阻塞写。
-fn sys_pipe_write(frame: &mut InterruptFrame) -> u64 {
-    match ipc::pipe_write(frame, frame.rdi, frame.rsi, frame.rdx) {
-        Ok(n) => pack_ok(n),
-        Err(e) => pack_err(e),
-    }
-}
-
-/// `pipe_close(id)`。
-fn sys_pipe_close(frame: &mut InterruptFrame) -> u64 {
-    match ipc::pipe_close(frame.rdi) {
-        Ok(()) => pack_ok(0),
-        Err(e) => pack_err(e),
-    }
-}
-
 /// `exit(code)`：终止当前进程并调度到下一个就绪进程（多进程场景）。
 ///
 /// 经 `scheduler::exit_current` 回收当前进程槽位并改写 `frame` 为下一个就绪
@@ -742,14 +545,6 @@ fn sys_exit(frame: &mut InterruptFrame) -> u64 {
     klib::info!("[syscall] process {} exit(code={})", pid, code);
     task::exit_current(frame);
     0
-}
-
-/// `ps(buf, cap) -> count`：枚举存活进程快照写入用户缓冲（每条约 8 字节）。
-fn sys_ps(frame: &mut InterruptFrame) -> u64 {
-    let buf = frame.rdi as *mut u8;
-    let cap = frame.rsi as usize;
-    let n = task::ps_snapshot(buf, cap);
-    pack_ok(n as u64)
 }
 
 /// `kill(pid, sig) -> 0`：向进程发送信号（终止 / 校验存在）。
@@ -834,20 +629,6 @@ fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
         // DEVICE Domain (0x50)
         SYS_DRIVER_REGISTER => sys_driver_register(frame),
         SYS_DRIVER_CLAIM => sys_driver_claim(frame),
-
-        // 历史兼容与系统级扩展（无缝平滑过渡）
-        0x2004 => sys_seek(frame),
-        0x200A => sys_flock(frame),
-        0x3001 => sys_now(),
-        0xF005 => sys_info(frame),
-        0x6000 => sys_shm_create(frame),
-        0x6005 => sys_shm_map(frame),
-        0x6003 => sys_shm_unmap(frame),
-        0x6100 => sys_pipe_create(frame),
-        0x6101 => sys_pipe_read(frame),
-        0x6102 => sys_pipe_write(frame),
-        0x6103 => sys_pipe_close(frame),
-        0xF010 => sys_ps(frame),
 
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);
