@@ -20,6 +20,7 @@ pub mod collections;
 pub mod console;
 pub mod error;
 pub mod format;
+pub mod json;
 pub mod log;
 pub mod random;
 pub mod serial;
