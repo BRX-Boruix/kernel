@@ -194,6 +194,12 @@ pub fn device_count() -> usize {
     REGISTRY.lock().device_count()
 }
 
+/// 访问全局注册表并执行闭包。
+pub fn with_registry<R, F: FnOnce(&Registry) -> R>(f: F) -> R {
+    let reg = REGISTRY.lock();
+    f(&reg)
+}
+
 /// 已绑定关系数。
 pub fn binding_count() -> usize {
     REGISTRY.lock().binding_count()

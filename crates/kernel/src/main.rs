@@ -283,11 +283,13 @@ unsafe fn kmain_body() -> ! {
     // M6.1：初始化 VFS 根挂载表与 RESTful 目录骨架。
     vfs_init::init();
 
-    // 运行 M6.1 / M6.2 VFS 自检测试（在 kernel-tests feature 启用时）。
+    // 运行 M6.1 / M6.2 / M6.3 VFS 自检测试（在 kernel-tests feature 启用时）。
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m61();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m62();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_vfs_m63();
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。

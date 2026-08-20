@@ -24,6 +24,11 @@ pub use refcount::{count as frame_refcount, decref as frame_decref, incref as fr
 pub use stats::reset_stats as reset_frame_stats;
 pub use stats::{frag_stats, reset_stats, stats, FrameAllocatorStats, PmmFragStats};
 
+/// 获取物理页帧总数。
+pub fn total_frames() -> usize {
+    ALLOCATOR.config().total_frames
+}
+
 
 // Global allocator instance
 static ALLOCATOR: LazyBuddyAllocator = LazyBuddyAllocator::new();

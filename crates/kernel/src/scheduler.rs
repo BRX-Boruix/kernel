@@ -525,6 +525,70 @@ pub fn ps_snapshot(buf: *mut u8, cap: usize) -> usize {
     n
 }
 
+/// 收集所有存活进程的快照列表（供 ProcFS 使用）。
+pub fn process_snapshots() -> Vec<vfs::ProcessSnapshot> {
+    let s = SCHED.lock();
+    let mut list = Vec::new();
+    for entry in s.procs.iter() {
+        if let Some(e) = entry.as_ref() {
+            if e.proc.state() == TaskState::Exit {
+                continue;
+            }
+            let pid = e.proc.pid();
+            let state_str = match e.proc.state() {
+                TaskState::Ready => "Ready",
+                TaskState::Running => "Running",
+                TaskState::Blocked => "Blocked",
+                TaskState::Exit => "Exit",
+            };
+            let name = if pid == 1 {
+                alloc::string::String::from("init")
+            } else if pid == 2 {
+                alloc::string::String::from("shell")
+            } else {
+                alloc::format!("proc-{}", pid)
+            };
+            list.push(vfs::ProcessSnapshot {
+                pid,
+                name,
+                state: alloc::string::String::from(state_str),
+                memory_bytes: 65536, // 预设/统计页表映射
+                threads: 1,
+            });
+        }
+    }
+    list
+}
+
+/// 获取单个进程的快照信息（供 ProcFS 使用）。
+pub fn get_process_snapshot(pid: usize) -> Option<vfs::ProcessSnapshot> {
+    let s = SCHED.lock();
+    let entry = s.procs.get(pid)?.as_ref()?;
+    if entry.proc.state() == TaskState::Exit {
+        return None;
+    }
+    let state_str = match entry.proc.state() {
+        TaskState::Ready => "Ready",
+        TaskState::Running => "Running",
+        TaskState::Blocked => "Blocked",
+        TaskState::Exit => "Exit",
+    };
+    let name = if pid == 1 {
+        alloc::string::String::from("init")
+    } else if pid == 2 {
+        alloc::string::String::from("shell")
+    } else {
+        alloc::format!("proc-{}", pid)
+    };
+    Some(vfs::ProcessSnapshot {
+        pid,
+        name,
+        state: alloc::string::String::from(state_str),
+        memory_bytes: 65536,
+        threads: 1,
+    })
+}
+
 /// 向进程 `target` 发送信号 `sig`（当前仅 `SIGKILL=9`/`SIGTERM=15` 终止目标；
 /// `sig=0` 仅校验进程存在，不实际发送）。
 ///

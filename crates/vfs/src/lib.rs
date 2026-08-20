@@ -9,20 +9,30 @@ extern crate std;
 
 extern crate alloc;
 
+pub mod devfs;
+pub mod dynamic;
 pub mod file_handle;
 pub mod inode;
 pub mod mount;
 pub mod path;
+pub mod procfs;
 pub mod ramfs;
+pub mod sysfs;
 
+pub use devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
+pub use dynamic::{DynamicDirNode, DynamicFileNode};
 pub use file_handle::{FileHandle, OpenFlags};
 pub use inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
 pub use mount::MountTable;
 pub use path::Path;
+pub use procfs::{ProcessInfoProvider, ProcessSnapshot, ProcFS};
+pub use sysfs::{SysFS, SystemInfoProvider};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::String;
     use alloc::sync::Arc;
+    use alloc::vec::Vec;
     use crate::file_handle::{FileHandle, OpenFlags, SeekWhence};
     use crate::inode::{INodeType, Permissions};
     use crate::mount::MountTable;
@@ -122,5 +132,161 @@ mod tests {
             Err(Error::NotFound) => {}
             _ => panic!("expected NotFound after unlink"),
         }
+    }
+
+    struct MockProcessProvider;
+    impl ProcessInfoProvider for MockProcessProvider {
+        fn list_processes(&self) -> Vec<ProcessSnapshot> {
+            alloc::vec![
+                ProcessSnapshot {
+                    pid: 1,
+                    name: alloc::string::String::from("init"),
+                    state: alloc::string::String::from("Running"),
+                    memory_bytes: 65536,
+                    threads: 1,
+                },
+                ProcessSnapshot {
+                    pid: 2,
+                    name: alloc::string::String::from("shell"),
+                    state: alloc::string::String::from("Ready"),
+                    memory_bytes: 131072,
+                    threads: 1,
+                },
+            ]
+        }
+
+        fn get_process(&self, pid: usize) -> Option<ProcessSnapshot> {
+            if pid == 1 {
+                Some(ProcessSnapshot {
+                    pid: 1,
+                    name: alloc::string::String::from("init"),
+                    state: alloc::string::String::from("Running"),
+                    memory_bytes: 65536,
+                    threads: 1,
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    struct MockSystemProvider;
+    impl SystemInfoProvider for MockSystemProvider {
+        fn cpu_json(&self) -> alloc::string::String {
+            alloc::string::String::from(r#"{"arch":"x86_64","cores":1,"vendor":"GenuineIntel"}"#)
+        }
+        fn memory_json(&self) -> alloc::string::String {
+            alloc::string::String::from(r#"{"capacity_bytes":134217728,"allocated_bytes":4194304,"free_bytes":130023424}"#)
+        }
+        fn kernel_json(&self) -> alloc::string::String {
+            alloc::string::String::from(r#"{"version":"0.1.0","git_commit":"abcdef"}"#)
+        }
+    }
+
+    struct MockDeviceProvider {
+        baud: core::sync::atomic::AtomicU32,
+    }
+    impl DeviceInfoProvider for MockDeviceProvider {
+        fn list_devices(&self) -> Vec<DeviceInfo> {
+            alloc::vec![
+                DeviceInfo {
+                    name: alloc::string::String::from("serial-com1"),
+                    bus: alloc::string::String::from("ISA"),
+                    class: alloc::string::String::from("UART"),
+                    bound_driver: Some(alloc::string::String::from("uart16550")),
+                }
+            ]
+        }
+        fn serial_read(&self, buf: &mut [u8]) -> Result<usize, Error> {
+            let data = b"OK";
+            let l = core::cmp::min(buf.len(), data.len());
+            buf[..l].copy_from_slice(&data[..l]);
+            Ok(l)
+        }
+        fn serial_write(&self, buf: &[u8]) -> Result<usize, Error> {
+            Ok(buf.len())
+        }
+        fn get_serial_baudrate(&self) -> u32 {
+            self.baud.load(core::sync::atomic::Ordering::Relaxed)
+        }
+        fn set_serial_baudrate(&self, baud: u32) -> Result<(), Error> {
+            self.baud.store(baud, core::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_m63_special_filesystems() {
+        let ramfs_root = Arc::new(RamFS::new());
+        let mount_table = MountTable::new(ramfs_root);
+
+        mount_table.mkdir("/processes", Permissions::all()).unwrap();
+        mount_table.mkdir("/system", Permissions::all()).unwrap();
+        mount_table.mkdir("/devices", Permissions::all()).unwrap();
+
+        // 1. ProcFS 挂载与 JSON 读取
+        let procfs = Arc::new(ProcFS::new(Arc::new(MockProcessProvider)));
+        mount_table.mount("/processes", procfs).unwrap();
+
+        let list_file = mount_table.resolve("/processes/list", true).unwrap();
+        let mut buf = [0u8; 512];
+        let n = list_file.read_at(0, &mut buf).unwrap();
+        let s = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(s.contains(r#""name":"init""#));
+        assert!(s.contains(r#""name":"shell""#));
+
+        let status_file = mount_table.resolve("/processes/1/status", true).unwrap();
+        let n2 = status_file.read_at(0, &mut buf).unwrap();
+        let s2 = core::str::from_utf8(&buf[..n2]).unwrap();
+        assert!(s2.contains(r#""pid":1"#));
+        assert!(s2.contains(r#""state":"Running""#));
+
+        // 2. SysFS 挂载与 JSON 读取
+        let sysfs = Arc::new(SysFS::new(Arc::new(MockSystemProvider)));
+        mount_table.mount("/system", sysfs).unwrap();
+
+        let cpu_file = mount_table.resolve("/system/cpu", true).unwrap();
+        let n3 = cpu_file.read_at(0, &mut buf).unwrap();
+        let s3 = core::str::from_utf8(&buf[..n3]).unwrap();
+        assert!(s3.contains(r#""arch":"x86_64""#));
+
+        let mem_file = mount_table.resolve("/system/memory", true).unwrap();
+        let n4 = mem_file.read_at(0, &mut buf).unwrap();
+        let s4 = core::str::from_utf8(&buf[..n4]).unwrap();
+        assert!(s4.contains(r#""capacity_bytes":134217728"#));
+
+        // 3. DevFS 挂载与属性子文件
+        let devfs = Arc::new(DevFS::new(Arc::new(MockDeviceProvider {
+            baud: core::sync::atomic::AtomicU32::new(115200),
+        })));
+        mount_table.mount("/devices", devfs).unwrap();
+
+        // 读取设备列表 JSON
+        let dev_list = mount_table.resolve("/devices/list", true).unwrap();
+        let n5 = dev_list.read_at(0, &mut buf).unwrap();
+        let s5 = core::str::from_utf8(&buf[..n5]).unwrap();
+        assert!(s5.contains(r#""driver":"uart16550""#));
+
+        // 串口属性子文件测试
+        let baud_file = mount_table.resolve("/devices/serial-com1/baudrate", true).unwrap();
+        let n6 = baud_file.read_at(0, &mut buf).unwrap();
+        assert_eq!(core::str::from_utf8(&buf[..n6]).unwrap().trim(), "115200");
+
+        // 写入调速
+        baud_file.write_at(0, b"9600").unwrap();
+        let n7 = baud_file.read_at(0, &mut buf).unwrap();
+        assert_eq!(core::str::from_utf8(&buf[..n7]).unwrap().trim(), "9600");
+
+        // 串口 config JSON
+        let cfg_file = mount_table.resolve("/devices/serial-com1/config", true).unwrap();
+        let n8 = cfg_file.read_at(0, &mut buf).unwrap();
+        let s8 = core::str::from_utf8(&buf[..n8]).unwrap();
+        assert!(s8.contains(r#""baudrate":9600"#));
+
+        // 显示器分辨率 mode JSON
+        let mode_file = mount_table.resolve("/devices/displays/primary/mode", true).unwrap();
+        let n9 = mode_file.read_at(0, &mut buf).unwrap();
+        let s9 = core::str::from_utf8(&buf[..n9]).unwrap();
+        assert!(s9.contains(r#""width":1024"#));
     }
 }

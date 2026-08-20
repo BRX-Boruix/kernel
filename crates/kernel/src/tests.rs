@@ -2028,4 +2028,60 @@ pub fn test_vfs_m62() {
     info!("[test-vfs-m62] PASS");
 }
 
+/// M6.3：验证特殊文件系统（ProcFS / SysFS / DevFS）与 JSON 第一公民。
+pub fn test_vfs_m63() {
+    use crate::vfs_init;
+
+    info!("[test-vfs-m63] === M6.3: ProcFS, SysFS, DevFS JSON First-Citizen Selftest ===");
+
+    let root = vfs_init::root();
+
+    // 1. ProcFS 验证 (/processes/list)
+    let proc_list = root.resolve("/processes/list", true).expect("resolve /processes/list");
+    let mut buf = [0u8; 1024];
+    let n1 = proc_list.read_at(0, &mut buf).expect("read /processes/list");
+    let s1 = core::str::from_utf8(&buf[..n1]).expect("utf8 /processes/list");
+    assert!(s1.starts_with('['), "process list must be a JSON array");
+    info!("[test-vfs-m63] /processes/list JSON output: {}", s1.trim());
+
+    // 2. SysFS 验证 (/system/cpu, /system/memory, /system/kernel)
+    let cpu_node = root.resolve("/system/cpu", true).expect("resolve /system/cpu");
+    let n2 = cpu_node.read_at(0, &mut buf).expect("read /system/cpu");
+    let s2 = core::str::from_utf8(&buf[..n2]).expect("utf8 /system/cpu");
+    assert!(s2.contains(r#""arch":""#), "cpu json must contain arch field");
+    info!("[test-vfs-m63] /system/cpu: {}", s2.trim());
+
+    let mem_node = root.resolve("/system/memory", true).expect("resolve /system/memory");
+    let n3 = mem_node.read_at(0, &mut buf).expect("read /system/memory");
+    let s3 = core::str::from_utf8(&buf[..n3]).expect("utf8 /system/memory");
+    assert!(s3.contains(r#""capacity_bytes":"#), "mem json must contain capacity_bytes");
+    info!("[test-vfs-m63] /system/memory: {}", s3.trim());
+
+    let kernel_node = root.resolve("/system/kernel", true).expect("resolve /system/kernel");
+    let n4 = kernel_node.read_at(0, &mut buf).expect("read /system/kernel");
+    let s4 = core::str::from_utf8(&buf[..n4]).expect("utf8 /system/kernel");
+    assert!(s4.contains(r#""name":"BORUIX""#), "kernel json must contain name BORUIX");
+    info!("[test-vfs-m63] /system/kernel: {}", s4.trim());
+
+    // 3. DevFS 验证 (/devices/list, /devices/serial-com1/baudrate, /devices/displays/primary/mode)
+    let dev_list = root.resolve("/devices/list", true).expect("resolve /devices/list");
+    let n5 = dev_list.read_at(0, &mut buf).expect("read /devices/list");
+    let s5 = core::str::from_utf8(&buf[..n5]).expect("utf8 /devices/list");
+    assert!(s5.starts_with('['), "device list must be a JSON array");
+    info!("[test-vfs-m63] /devices/list: {}", s5.trim());
+
+    let baud_node = root.resolve("/devices/serial-com1/baudrate", true).expect("resolve baudrate");
+    let n6 = baud_node.read_at(0, &mut buf).expect("read baudrate");
+    assert_eq!(core::str::from_utf8(&buf[..n6]).unwrap().trim(), "115200");
+
+    let disp_mode = root.resolve("/devices/displays/primary/mode", true).expect("resolve mode");
+    let n7 = disp_mode.read_at(0, &mut buf).expect("read mode");
+    let s7 = core::str::from_utf8(&buf[..n7]).expect("utf8 mode");
+    assert!(s7.contains(r#""width":1024"#));
+    info!("[test-vfs-m63] /devices/displays/primary/mode: {}", s7.trim());
+
+    info!("[test-vfs-m63] PASS");
+}
+
+
 

@@ -32,4 +32,5 @@ pub use module::{ModuleLoader, load_module, set_module_loader};
 pub use probe::{idle_all, probe_all, shutdown_all};
 pub use registry::{
     Binding, Registry, binding_count, device_count, driver_count, register_device, register_driver,
+    with_registry,
 };
