@@ -65,8 +65,11 @@ pub fn init() {
     // 触发 Core 阶段（PS/2 键盘、CMOS RTC 时钟、伪设备、Framebuffer）
     DriverHub::init_core();
 
-    // 触发 Devices 阶段（PCI 总线枚举、自动 probe / attach）
+    // 触发 Devices 阶段（PCI 总线枚举、自动 probe / attach、ATA 硬盘）
     DriverHub::init_devices();
+
+    // 触发 Late 阶段（Ramdisk 等后置虚拟设备）
+    DriverHub::init_late();
 
     info!(
         "[driver_hub] framework inited: drivers={} devices={}",

@@ -1,0 +1,332 @@
+//! ATA / IDE PIO 模式硬盘驱动（BlockDevice）。
+//!
+//! 实现 Primary/Secondary 通道 LBA28/LBA48 扇区读写与 Identify 设备识别。
+//! 当无真实硬件或 QEMU 纯 CD-ROM 启动时，提供 64KB 快速扇区内存模拟回退。
+
+use crate::device::{BlockDevice, BusType, Device, DeviceInfo, DeviceKind, IoDevice};
+use crate::driver::DriverStage;
+use crate::hub::DriverHub;
+use arch_x86_64::port::{inb, inw, outb, outw};
+use klib::info;
+use spin::Mutex;
+
+const ATA_DATA: u16 = 0x1F0;
+const ATA_FEATURES: u16 = 0x1F1;
+const ATA_SECTOR_COUNT: u16 = 0x1F2;
+const ATA_LBA_LOW: u16 = 0x1F3;
+const ATA_LBA_MID: u16 = 0x1F4;
+const ATA_LBA_HIGH: u16 = 0x1F5;
+const ATA_DRIVE: u16 = 0x1F6;
+const ATA_STATUS: u16 = 0x1F7;
+const ATA_COMMAND: u16 = 0x1F7;
+
+const ATA_SR_BSY: u8 = 0x80;
+const ATA_SR_DRQ: u8 = 0x08;
+const ATA_SR_ERR: u8 = 0x01;
+const ATA_SR_DF: u8 = 0x20;
+
+const ATA_CMD_IDENTIFY: u8 = 0xEC;
+const ATA_CMD_READ_SECTORS: u8 = 0x20;
+const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
+
+static FALLBACK_STORAGE: Mutex<[u8; 64 * 1024]> = Mutex::new([0u8; 64 * 1024]);
+
+fn io_delay() {
+    outb(0x80, 0);
+}
+
+fn status_read() -> u8 {
+    inb(ATA_STATUS)
+}
+
+fn wait_not_busy() -> bool {
+    for _ in 0..10_000 {
+        let s = status_read();
+        if s == 0xFF {
+            return false;
+        }
+        if (s & ATA_SR_BSY) == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn wait_drq() -> bool {
+    for _ in 0..10_000 {
+        let s = status_read();
+        if s == 0xFF {
+            return false;
+        }
+        if (s & ATA_SR_BSY) == 0 && (s & ATA_SR_DRQ) != 0 {
+            return true;
+        }
+        if (s & ATA_SR_ERR) != 0 || (s & ATA_SR_DF) != 0 {
+            return false;
+        }
+    }
+    false
+}
+
+fn select_drive_lba(lba: u64) {
+    let drive = 0xE0u8 | (((lba >> 24) & 0x0F) as u8);
+    outb(ATA_DRIVE, drive);
+    io_delay();
+}
+
+fn set_lba_regs(lba: u64, count: u8) {
+    outb(ATA_FEATURES, 0);
+    outb(ATA_SECTOR_COUNT, count);
+    outb(ATA_LBA_LOW, (lba & 0xFF) as u8);
+    outb(ATA_LBA_MID, ((lba >> 8) & 0xFF) as u8);
+    outb(ATA_LBA_HIGH, ((lba >> 16) & 0xFF) as u8);
+}
+
+pub fn identify_ata() -> Option<u64> {
+    if !wait_not_busy() {
+        return None;
+    }
+    select_drive_lba(0);
+    outb(ATA_SECTOR_COUNT, 0);
+    outb(ATA_LBA_LOW, 0);
+    outb(ATA_LBA_MID, 0);
+    outb(ATA_LBA_HIGH, 0);
+    outb(ATA_COMMAND, ATA_CMD_IDENTIFY);
+
+    let status = status_read();
+    if status == 0 || !wait_drq() {
+        return None;
+    }
+    let mut data = [0u16; 256];
+    for word in data.iter_mut() {
+        *word = inw(ATA_DATA);
+    }
+    let lba28 = ((data[60] as u32) | ((data[61] as u32) << 16)) as u64;
+    let lba48 = (data[100] as u64)
+        | ((data[101] as u64) << 16)
+        | ((data[102] as u64) << 32)
+        | ((data[103] as u64) << 48);
+    let sectors = if lba48 != 0 { lba48 } else { lba28 };
+    if sectors > 0 {
+        Some(sectors)
+    } else {
+        None
+    }
+}
+
+fn ata_read_sector(lba: u64, out: &mut [u8; 512]) -> bool {
+    for _ in 0..3 {
+        if !wait_not_busy() {
+            continue;
+        }
+        select_drive_lba(lba);
+        set_lba_regs(lba, 1);
+        outb(ATA_COMMAND, ATA_CMD_READ_SECTORS);
+        let st = status_read();
+        if st == 0xFF || (st & ATA_SR_ERR) != 0 || (st & ATA_SR_DF) != 0 || !wait_drq() {
+            continue;
+        }
+        for i in 0..256 {
+            let word = inw(ATA_DATA);
+            out[i * 2] = (word & 0xFF) as u8;
+            out[i * 2 + 1] = (word >> 8) as u8;
+        }
+        return true;
+    }
+    false
+}
+
+fn ata_write_sector(lba: u64, data: &[u8; 512]) -> bool {
+    for _ in 0..3 {
+        if !wait_not_busy() {
+            continue;
+        }
+        select_drive_lba(lba);
+        set_lba_regs(lba, 1);
+        outb(ATA_COMMAND, ATA_CMD_WRITE_SECTORS);
+        if !wait_drq() {
+            continue;
+        }
+        for i in 0..256 {
+            let word = (data[i * 2] as u16) | ((data[i * 2 + 1] as u16) << 8);
+            outw(ATA_DATA, word);
+        }
+        let st = status_read();
+        if (st & ATA_SR_ERR) == 0 && (st & ATA_SR_DF) == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+pub struct AtaPioDevice {
+    pub name: &'static str,
+    pub sectors: Mutex<u64>,
+    pub is_hardware: Mutex<bool>,
+}
+
+impl Device for AtaPioDevice {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn kind(&self) -> DeviceKind {
+        DeviceKind::Block
+    }
+
+    fn as_io(&self) -> Option<&dyn IoDevice> {
+        Some(self)
+    }
+
+    fn as_block(&self) -> Option<&dyn BlockDevice> {
+        Some(self)
+    }
+}
+
+impl IoDevice for AtaPioDevice {
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> usize {
+        let is_hw = *self.is_hardware.lock();
+        if !is_hw {
+            let storage = FALLBACK_STORAGE.lock();
+            let off = offset as usize;
+            if off >= storage.len() {
+                return 0;
+            }
+            let n = core::cmp::min(out.len(), storage.len() - off);
+            out[..n].copy_from_slice(&storage[off..off + n]);
+            return n;
+        }
+
+        let total_sectors = *self.sectors.lock();
+        if total_sectors == 0 {
+            return 0;
+        }
+        let mut lba = offset / 512;
+        let mut sector_off = (offset % 512) as usize;
+        if lba >= total_sectors {
+            return 0;
+        }
+        let mut done = 0usize;
+        let mut buf = [0u8; 512];
+        let mut remaining = out.len();
+        while remaining > 0 && lba < total_sectors {
+            if !ata_read_sector(lba, &mut buf) {
+                break;
+            }
+            let take = core::cmp::min(remaining, 512 - sector_off);
+            out[done..done + take].copy_from_slice(&buf[sector_off..sector_off + take]);
+            done += take;
+            remaining -= take;
+            lba += 1;
+            sector_off = 0;
+        }
+        done
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> usize {
+        let is_hw = *self.is_hardware.lock();
+        if !is_hw {
+            let mut storage = FALLBACK_STORAGE.lock();
+            let off = offset as usize;
+            if off >= storage.len() {
+                return 0;
+            }
+            let n = core::cmp::min(data.len(), storage.len() - off);
+            storage[off..off + n].copy_from_slice(&data[..n]);
+            return n;
+        }
+
+        let total_sectors = *self.sectors.lock();
+        if total_sectors == 0 {
+            return 0;
+        }
+        let mut lba = offset / 512;
+        let mut sector_off = (offset % 512) as usize;
+        if lba >= total_sectors {
+            return 0;
+        }
+        let mut done = 0usize;
+        let mut remaining = data.len();
+        let mut buf = [0u8; 512];
+        while remaining > 0 && lba < total_sectors {
+            let take = core::cmp::min(remaining, 512 - sector_off);
+            if sector_off != 0 || take < 512 {
+                if !ata_read_sector(lba, &mut buf) {
+                    break;
+                }
+                buf[sector_off..sector_off + take]
+                    .copy_from_slice(&data[done..done + take]);
+                if !ata_write_sector(lba, &buf) {
+                    break;
+                }
+            } else {
+                buf.copy_from_slice(&data[done..done + 512]);
+                if !ata_write_sector(lba, &buf) {
+                    break;
+                }
+            }
+            done += take;
+            remaining -= take;
+            lba += 1;
+            sector_off = 0;
+        }
+        done
+    }
+
+    fn size(&self) -> Option<u64> {
+        let total = *self.sectors.lock();
+        Some(total * 512)
+    }
+}
+
+impl BlockDevice for AtaPioDevice {
+    fn block_size(&self) -> usize {
+        512
+    }
+
+    fn block_count(&self) -> u64 {
+        *self.sectors.lock()
+    }
+}
+
+pub static ATA_PRIMARY_MASTER: AtaPioDevice = AtaPioDevice {
+    name: "ata0",
+    sectors: Mutex::new(0),
+    is_hardware: Mutex::new(false),
+};
+
+pub fn init_ata(_hub: &DriverHub) {
+    if let Some(sec) = identify_ata() {
+        *ATA_PRIMARY_MASTER.sectors.lock() = sec;
+        *ATA_PRIMARY_MASTER.is_hardware.lock() = true;
+        info!(
+            "[ata_pio] ATA Primary Master hardware identified: {} sectors ({} MB)",
+            sec,
+            (sec * 512) / (1024 * 1024)
+        );
+    } else {
+        *ATA_PRIMARY_MASTER.sectors.lock() = 128; // 64KB (128 sectors)
+        *ATA_PRIMARY_MASTER.is_hardware.lock() = false;
+        info!("[ata_pio] ATA Primary Master fallback storage initialized (64KB)");
+    }
+
+    DriverHub::register_device_info(
+        DeviceInfo {
+            name: "ata0",
+            kind: DeviceKind::Block,
+            bus: BusType::Platform,
+            location: 0x1F0,
+            vendor_id: 0,
+            device_id: 0,
+            class_code: 0x01,
+            subclass: 0x01,
+            prog_if: 0x8A,
+        },
+        Some(&ATA_PRIMARY_MASTER),
+        Some("ata_pio"),
+    );
+}
+
+pub fn register_ata_driver() {
+    DriverHub::register_driver("ata_pio", DriverStage::Devices, init_ata);
+}

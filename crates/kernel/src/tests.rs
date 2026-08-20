@@ -2280,6 +2280,43 @@ pub fn test_driver_hub_m72() {
         pci_dev_count, bound_pci_count
     );
 
+    // 5. 验证 M7.4 块存储设备（ATA/IDE 硬盘与 Ramdisk）
+    let mut found_ata = false;
+    let mut found_ramdisk = false;
+    for i in 0..dev_count {
+        if let Some(info) = DriverHub::device_info_at(i) {
+            if info.name == "ata0" {
+                found_ata = true;
+                if let Some(dev) = DriverHub::device_at(i) {
+                    assert_eq!(dev.kind(), drv::DeviceKind::Block);
+                    let mut test_buf = [0u8; 512];
+                    test_buf[0..4].copy_from_slice(b"BRX!");
+                    let written = dev.write_at(0, &test_buf);
+                    assert_eq!(written, 512, "ata write_at sector 0");
+                    let mut read_buf = [0u8; 512];
+                    let read_n = dev.read_at(0, &mut read_buf);
+                    assert_eq!(read_n, 512, "ata read_at sector 0");
+                    assert_eq!(&read_buf[0..4], b"BRX!", "ata sector 0 content match");
+                    info!("[test-driver-hub-m72] ATA/IDE block device read/write 512B OK");
+                }
+            } else if info.name == "ramdisk0" {
+                found_ramdisk = true;
+                if let Some(dev) = DriverHub::device_at(i) {
+                    assert_eq!(dev.kind(), drv::DeviceKind::Block);
+                    let written = dev.write_at(1024, b"RAMDISK_BORUIX_VOLUME");
+                    assert_eq!(written, 21);
+                    let mut r_buf = [0u8; 21];
+                    let read_n = dev.read_at(1024, &mut r_buf);
+                    assert_eq!(read_n, 21);
+                    assert_eq!(&r_buf, b"RAMDISK_BORUIX_VOLUME");
+                    info!("[test-driver-hub-m72] Ramdisk block device read/write OK");
+                }
+            }
+        }
+    }
+    assert!(found_ata, "ata0 must be registered in DriverHub");
+    assert!(found_ramdisk, "ramdisk0 must be registered in DriverHub");
+
     info!("[test-driver-hub-m72] PASS");
 }
 
