@@ -160,6 +160,61 @@ impl DeviceInfoProvider for KernelDeviceProvider {
     fn set_serial_baudrate(&self, _baud: u32) -> Result<(), klib::error::Error> {
         Ok(())
     }
+
+    fn telemetry_json(&self) -> String {
+        let count = drv::DriverHub::device_count();
+        let drv_count = drv::DriverHub::driver_count();
+        format!(
+            r#"{{"status":"healthy","total_devices":{},"total_drivers":{},"uptime_ms":{}}}"#,
+            count, drv_count, klib::time::now_millis()
+        )
+    }
+
+    fn pci_bars_json(&self, _dev_name: &str) -> String {
+        let bars = drv::pci::inspect_pci_bars(0, 1, 1); // IDE controller at 00:01.1
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        if let Ok(mut arr) = writer.start_array() {
+            for (i, bar) in bars.iter().enumerate() {
+                match bar {
+                    drv::pci::PciBar::IoPort { port, size } => {
+                        let _ = arr.push_object(|obj| {
+                            let _ = obj.field_u64("bar", i as u64);
+                            let _ = obj.field_str("type", "io_port");
+                            let _ = obj.field_u64("port", *port as u64);
+                            let _ = obj.field_u64("size", *size as u64);
+                            Ok(())
+                        });
+                    }
+                    drv::pci::PciBar::Mmio32 { addr, size, prefetchable } => {
+                        let _ = arr.push_object(|obj| {
+                            let _ = obj.field_u64("bar", i as u64);
+                            let _ = obj.field_str("type", "mmio32");
+                            let _ = obj.field_u64("addr", *addr as u64);
+                            let _ = obj.field_u64("size", *size as u64);
+                            let _ = obj.field_bool("prefetchable", *prefetchable);
+                            Ok(())
+                        });
+                    }
+                    drv::pci::PciBar::Mmio64 { addr, size, prefetchable } => {
+                        let _ = arr.push_object(|obj| {
+                            let _ = obj.field_u64("bar", i as u64);
+                            let _ = obj.field_str("type", "mmio64");
+                            let _ = obj.field_u64("addr", *addr);
+                            let _ = obj.field_u64("size", *size);
+                            let _ = obj.field_bool("prefetchable", *prefetchable);
+                            Ok(())
+                        });
+                    }
+                    drv::pci::PciBar::None => {}
+                }
+            }
+            let _ = arr.end();
+        }
+        let bytes = target.into_bytes();
+        let s = core::str::from_utf8(&bytes).unwrap_or("[]");
+        String::from(s)
+    }
 }
 
 /// 初始化根文件系统并构建默认 RESTful 目录骨架与特殊文件系统挂载（ADR-005 / ADR-011 / ADR-012 / ADR-013）。

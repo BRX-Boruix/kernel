@@ -1,6 +1,6 @@
-//! PCI 总线枚举与设备控制模块（BusType::Pci）。
+//! PCI 总线枚举与设备控制模块（BusType::Pci，BAR 自省与遥测支持，M10.1）。
 //!
-//! 支持通过 I/O 端口 0xCF8 / 0xCFC 进行 Legacy PCI 配置空间扫描与读写。
+//! 支持通过 I/O 端口 0xCF8 / 0xCFC 进行 Legacy PCI 配置空间扫描、BARs 解析与读写。
 
 use crate::device::{BusType, DeviceInfo, DeviceKind};
 use crate::driver::DriverStage;
@@ -58,6 +58,94 @@ pub fn enable_bus_master(bus: u8, device: u8, function: u8) {
     if new_cmd != cmd {
         write_config_u16(bus, device, function, 0x04, new_cmd);
     }
+}
+
+/// PCI Base Address Register (BAR) 深度自省模型（M10.1）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PciBar {
+    IoPort {
+        port: u16,
+        size: u32,
+    },
+    Mmio32 {
+        addr: u32,
+        size: u32,
+        prefetchable: bool,
+    },
+    Mmio64 {
+        addr: u64,
+        size: u64,
+        prefetchable: bool,
+    },
+    None,
+}
+
+/// 解析指定 PCI 设备的 6 个 BAR 配置空间。
+pub fn inspect_pci_bars(bus: u8, device: u8, function: u8) -> [PciBar; 6] {
+    let mut bars = [PciBar::None; 6];
+    let mut i = 0;
+
+    while i < 6 {
+        let offset = 0x10 + (i as u8) * 4;
+        let orig_val = read_config_u32(bus, device, function, offset);
+
+        if orig_val == 0 || orig_val == 0xFFFF_FFFF {
+            bars[i] = PciBar::None;
+            i += 1;
+            continue;
+        }
+
+        // 写入全 1 获取 BAR 请求大小
+        write_config_u32(bus, device, function, offset, 0xFFFF_FFFF);
+        let size_mask = read_config_u32(bus, device, function, offset);
+        // 恢复原始配置
+        write_config_u32(bus, device, function, offset, orig_val);
+
+        if orig_val & 1 == 1 {
+            // I/O Port BAR
+            let port = (orig_val & 0xFFFC) as u16;
+            let size = !(size_mask & 0xFFFC) + 1;
+            bars[i] = PciBar::IoPort { port, size };
+            i += 1;
+        } else {
+            // MMIO BAR
+            let bar_type = (orig_val >> 1) & 0x03;
+            let prefetchable = (orig_val & (1 << 3)) != 0;
+
+            if bar_type == 2 && i + 1 < 6 {
+                // 64-bit MMIO
+                let next_offset = 0x10 + ((i + 1) as u8) * 4;
+                let orig_high = read_config_u32(bus, device, function, next_offset);
+                write_config_u32(bus, device, function, next_offset, 0xFFFF_FFFF);
+                let high_mask = read_config_u32(bus, device, function, next_offset);
+                write_config_u32(bus, device, function, next_offset, orig_high);
+
+                let full_addr = ((orig_high as u64) << 32) | ((orig_val & 0xFFFF_FFF0) as u64);
+                let full_mask = ((high_mask as u64) << 32) | ((size_mask & 0xFFFF_FFF0) as u64);
+                let size = !full_mask + 1;
+
+                bars[i] = PciBar::Mmio64 {
+                    addr: full_addr,
+                    size,
+                    prefetchable,
+                };
+                bars[i + 1] = PciBar::None;
+                i += 2;
+            } else {
+                // 32-bit MMIO
+                let addr = orig_val & 0xFFFF_FFF0;
+                let size = !(size_mask & 0xFFFF_FFF0) + 1;
+                bars[i] = PciBar::Mmio32 {
+                    addr,
+                    size,
+                    prefetchable,
+                };
+                i += 1;
+            }
+        }
+    }
+
+    bars
 }
 
 fn kind_for_class(class_code: u8) -> DeviceKind {

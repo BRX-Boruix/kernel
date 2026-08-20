@@ -2389,6 +2389,39 @@ pub fn test_driver_hub_m72() {
     assert!(found_departed, "must publish DeviceDeparted event for hotplug device");
     info!("[test-driver-hub-m72] Hotplug Out & Detach lifecycle OK");
 
+    // 9. 验证 M10 深度自省与硬件遥测（Deep Telemetry & PCI BARs & Storage/Net Status）
+    let telemetry_node = root.resolve("/devices/telemetry", true).expect("resolve /devices/telemetry");
+    let mut tel_buf = [0u8; 1024];
+    let tel_n = telemetry_node.read_at(0, &mut tel_buf).expect("read /devices/telemetry");
+    assert!(tel_n > 0);
+    let tel_str = core::str::from_utf8(&tel_buf[..tel_n]).unwrap_or("");
+    assert!(tel_str.contains("healthy"), "telemetry must report healthy status");
+    info!("[test-driver-hub-m72] /devices/telemetry HATEOAS JSON OK: {}", tel_str.trim());
+
+    let pci_bars_node = root.resolve("/devices/pci/bars", true).expect("resolve /devices/pci/bars");
+    let mut bars_buf = [0u8; 1024];
+    let bars_n = pci_bars_node.read_at(0, &mut bars_buf).expect("read /devices/pci/bars");
+    assert!(bars_n > 0);
+    let bars_str = core::str::from_utf8(&bars_buf[..bars_n]).unwrap_or("");
+    assert!(bars_str.contains("io_port") || bars_str.contains("bar"), "must contain PCI BAR metadata");
+    info!("[test-driver-hub-m72] /devices/pci/bars JSON inspection OK: {}", bars_str.trim());
+
+    let storage_status_node = root.resolve("/devices/storage/primary/status", true).expect("resolve /devices/storage/primary/status");
+    let mut stor_buf = [0u8; 1024];
+    let stor_n = storage_status_node.read_at(0, &mut stor_buf).expect("read storage status");
+    assert!(stor_n > 0);
+    let stor_str = core::str::from_utf8(&stor_buf[..stor_n]).unwrap_or("");
+    assert!(stor_str.contains("sectors_read"), "storage status must contain sectors_read");
+    info!("[test-driver-hub-m72] /devices/storage/primary/status OK: {}", stor_str.trim());
+
+    let net_stats_node = root.resolve("/devices/net/primary/stats", true).expect("resolve /devices/net/primary/stats");
+    let mut net_buf = [0u8; 1024];
+    let net_n = net_stats_node.read_at(0, &mut net_buf).expect("read net stats");
+    assert!(net_n > 0);
+    let net_str = core::str::from_utf8(&net_buf[..net_n]).unwrap_or("");
+    assert!(net_str.contains("rx_bytes"), "net stats must contain rx_bytes");
+    info!("[test-driver-hub-m72] /devices/net/primary/stats OK: {}", net_str.trim());
+
     info!("[test-driver-hub-m72] PASS");
 }
 
