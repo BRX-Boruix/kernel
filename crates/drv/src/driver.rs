@@ -1,93 +1,86 @@
-//! 驱动生命周期抽象（`Driver` trait）。
+//! 统一驱动生命周期抽象与四阶段调度定义（Driver / DriverStage）。
 
-use crate::device::Device;
-use crate::id::DeviceId;
+use crate::device::DeviceInfo;
+use crate::hub::DriverHub;
 
-/// 驱动操作结果的错误类型（统一错误码，ADR-010）。
-pub type DrvResult = Result<(), klib::error::Error>;
-
-/// 设备驱动：声明支持哪些设备，并实现其生命周期。
-///
-/// 生命周期阶段（由框架/总线探测驱动）：
-/// 1. [`Driver::matches`]：id 匹配（注册表遍历用，快路径）；
-/// 2. [`Driver::probe`]：探测——确认设备确实存在/可访问（可跳过/留空）；
-/// 3. [`Driver::init`]：初始化——分配资源、注册中断等；成功即绑定；
-/// 4. [`Driver::idle`]：周期轮询（可选，如轮询式设备、后台维护）；
-/// 5. [`Driver::shutdown`]：关闭/卸载（预留动态卸载）。
-///
-/// 静态驱动通常是零大小结构体 + 内部原子状态，因此方法均取 `&self`
-/// （与 `klib::console::Console` 风格一致），保证注册表可安全共享。
-pub trait Driver: Send + Sync {
-    /// 驱动名（调试/日志用）。
-    fn name(&self) -> &'static str;
-
-    /// 该驱动是否支持指定设备（id 匹配）。
-    fn matches(&self, id: &DeviceId) -> bool;
-
-    /// 探测设备是否真实存在/可用。默认认为匹配即存在（静态注册的设备
-    /// 通常已经确认存在）；需要读硬件确认的驱动可覆盖此方法。
-    fn probe(&self, _dev: &dyn Device) -> DrvResult {
-        Ok(())
-    }
-
-    /// 初始化并绑定设备。返回错误表示绑定失败（驱动继续尝试下一个匹配）。
-    fn init(&self, dev: &dyn Device) -> DrvResult;
-
-    /// 周期轮询（默认空操作；由 [`crate::probe::idle_all`] 周期调用）。
-    fn idle(&self, _dev: &dyn Device) {}
-
-    /// 关闭/卸载设备（预留动态卸载；默认空操作）。
-    fn shutdown(&self, _dev: &dyn Device) {}
+/// 驱动四阶段确定性启动时序（ADR-008 核心哲学）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DriverStage {
+    /// 极早阶段（无堆内存、无中断）：Early 串口与基础计时器
+    Early = 0,
+    /// 核心阶段（堆已就绪、中断已启用）：PS/2 键盘控制器、CMOS RTC 时钟、伪设备
+    Core = 1,
+    /// 外设探测阶段：PCI 总线扫描、自动 probe/attach 绑定块设备与网卡
+    Devices = 2,
+    /// 后置阶段：系统服务就绪、终端虚拟设备、Ramdisk 与交互通道
+    Late = 3,
 }
 
-// ---------- 单元测试 ----------
+/// 统一驱动抽象：声明阶段、初始化钩子与 probe/attach 匹配机制。
+pub trait Driver: Send + Sync {
+    /// 驱动名（调试与 DevFS 挂载用）。
+    fn name(&self) -> &'static str;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::device::Device;
-    use crate::id::{BusType, DeviceClass, DeviceId};
+    /// 所属的启动生命周期阶段。
+    fn stage(&self) -> DriverStage;
 
-    struct DummyDevice;
+    /// 阶段驱动初始化钩子。
+    fn init(&self, hub: &DriverHub);
 
-    impl Device for DummyDevice {
-        fn name(&self) -> &'static str {
-            "dummy"
-        }
-        fn id(&self) -> DeviceId {
-            DeviceId::system(DeviceClass::Generic, 0)
+    /// 设备匹配探测（返回 true 表示该驱动支持并能够接管该硬件）。
+    fn probe(&self, _hub: &DriverHub, _dev: &DeviceInfo) -> bool {
+        false
+    }
+
+    /// 探测成功后实例化驱动并绑定设备。
+    fn attach(&self, _hub: &DriverHub, _dev: &DeviceInfo) {}
+}
+
+/// 注册表内部紧凑驱动条目。
+#[derive(Clone, Copy)]
+pub struct DriverEntry {
+    pub name: &'static str,
+    pub stage: DriverStage,
+    pub init: fn(&DriverHub),
+    pub probe: Option<fn(&DriverHub, &DeviceInfo) -> bool>,
+    pub attach: Option<fn(&DriverHub, &DeviceInfo)>,
+}
+
+fn noop(_hub: &DriverHub) {}
+
+impl DriverEntry {
+    pub const EMPTY: DriverEntry = DriverEntry {
+        name: "",
+        stage: DriverStage::Late,
+        init: noop,
+        probe: None,
+        attach: None,
+    };
+}
+
+impl Driver for DriverEntry {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn stage(&self) -> DriverStage {
+        self.stage
+    }
+
+    fn init(&self, hub: &DriverHub) {
+        (self.init)(hub);
+    }
+
+    fn probe(&self, hub: &DriverHub, dev: &DeviceInfo) -> bool {
+        match self.probe {
+            Some(f) => f(hub, dev),
+            None => false,
         }
     }
 
-    struct DummyDriver;
-
-    impl Driver for DummyDriver {
-        fn name(&self) -> &'static str {
-            "dummy"
+    fn attach(&self, hub: &DriverHub, dev: &DeviceInfo) {
+        if let Some(f) = self.attach {
+            f(hub, dev);
         }
-        fn matches(&self, id: &DeviceId) -> bool {
-            id.bus == BusType::System
-        }
-        fn init(&self, _dev: &dyn Device) -> DrvResult {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn driver_defaults() {
-        let d = DummyDriver;
-        let dev = DummyDevice;
-        // probe/idle/shutdown 有默认实现，不 panic 即可。
-        assert_eq!(d.probe(&dev), Ok(()));
-        d.idle(&dev);
-        d.shutdown(&dev);
-    }
-
-    #[test]
-    fn driver_matches() {
-        let d = DummyDriver;
-        let dev = DummyDevice;
-        assert!(d.matches(&dev.id()));
-        assert!(!d.matches(&DeviceId::pci(0x8086, 0x1234, 0)));
     }
 }

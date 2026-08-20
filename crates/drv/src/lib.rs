@@ -1,17 +1,6 @@
-//! 设备/驱动框架（ADR-008 核心）。
+//! 设备与驱动框架统一中枢（ADR-008 核心）。
 //!
-//! 提供统一 `Driver` trait / 设备注册表 / probe 机制：
-//! - [`DeviceId`]：跨总线设备 id 约定（总线 + vendor/device/class）；
-//! - [`Device`]：通用设备抽象；
-//! - [`Driver`]：驱动生命周期（`probe`/`init`/`idle`/`shutdown`）；
-//! - [`Registry`]：驱动 + 设备注册表（静态链接，`IrqSpinLock` 保护）；
-//! - [`probe_all`]：总线探测（对每个设备找匹配驱动 → probe → init → 绑定）；
-//! - [`ModuleLoader`]：预留"加载 ELF 模块"接口（动态化时只加加载机制）。
-//!
-//! 设计要点（ADR-008）：
-//! - 驱动静态起步，但接口按"可加载模块"设计；未来动态化只需实现
-//!   [`ModuleLoader`] 并让模块镜像注册驱动，注册表接口不变。
-//! - 框架本身零硬件依赖（不依赖 arch），具体驱动实现方负责访问硬件。
+//! 提供基于 ADR-008 驱动中枢哲学的四阶段生命周期、自动总线探测与统一设备分类标准。
 
 #![no_std]
 
@@ -20,17 +9,96 @@ extern crate std;
 
 pub mod device;
 pub mod driver;
-pub mod id;
-pub mod module;
-pub mod probe;
-pub mod registry;
+pub mod hub;
 
-pub use device::Device;
-pub use driver::{Driver, DrvResult};
-pub use id::{BusType, DeviceId};
-pub use module::{ModuleLoader, load_module, set_module_loader};
-pub use probe::{idle_all, probe_all, shutdown_all};
-pub use registry::{
-    Binding, Registry, binding_count, device_count, driver_count, register_device, register_driver,
-    with_registry,
+pub use device::{
+    BlockDevice, BusType, CharDevice, Device, DeviceInfo, DeviceKind, DeviceOps, InputDevice,
+    IoDevice, NetDevice,
 };
+pub use driver::{Driver, DriverEntry, DriverStage};
+pub use hub::DriverHub;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    struct MockSerialDev;
+    impl Device for MockSerialDev {
+        fn name(&self) -> &'static str {
+            "serial-com1"
+        }
+        fn kind(&self) -> DeviceKind {
+            DeviceKind::Char
+        }
+        fn as_io(&self) -> Option<&dyn IoDevice> {
+            Some(self)
+        }
+    }
+    impl IoDevice for MockSerialDev {
+        fn write(&self, data: &[u8]) -> usize {
+            data.len()
+        }
+    }
+
+    static DRV_EARLY_INITED: AtomicBool = AtomicBool::new(false);
+    static DRV_PROBED: AtomicBool = AtomicBool::new(false);
+    static DRV_ATTACHED: AtomicBool = AtomicBool::new(false);
+
+    fn early_init(_hub: &DriverHub) {
+        DRV_EARLY_INITED.store(true, Ordering::Relaxed);
+    }
+
+    fn probe_block(_hub: &DriverHub, dev: &DeviceInfo) -> bool {
+        dev.bus == BusType::Pci && dev.class_code == 0x01
+    }
+
+    fn attach_block(_hub: &DriverHub, _dev: &DeviceInfo) {
+        DRV_ATTACHED.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_driver_hub_lifecycle_and_probe() {
+        // 1. 注册 Early 阶段驱动
+        DriverHub::register_driver("early-serial", DriverStage::Early, early_init);
+
+        // 2. 注册 Devices 阶段带 probe 的块设备驱动
+        DriverHub::register_driver_ops(
+            "pci-block-driver",
+            DriverStage::Devices,
+            |_| {},
+            Some(probe_block),
+            Some(attach_block),
+        );
+
+        // 3. 注册一个 Platform 字符设备和一个 PCI 块设备
+        DriverHub::register_device(&MockSerialDev);
+        DriverHub::register_device_info(
+            DeviceInfo {
+                name: "pci-ata-disk",
+                kind: DeviceKind::Block,
+                bus: BusType::Pci,
+                location: 0x00010000,
+                vendor_id: 0x8086,
+                device_id: 0x7010,
+                class_code: 0x01,
+                subclass: 0x01,
+                prog_if: 0x80,
+            },
+            None,
+            None,
+        );
+
+        assert!(DriverHub::device_count() >= 2);
+        assert!(DriverHub::driver_count() >= 2);
+
+        // 4. 触发 Early 阶段
+        DriverHub::init_early();
+        assert!(DRV_EARLY_INITED.load(Ordering::Relaxed));
+        assert!(!DRV_ATTACHED.load(Ordering::Relaxed));
+
+        // 5. 触发 Devices 阶段（自动 probe / attach）
+        DriverHub::init_devices();
+        assert!(DRV_ATTACHED.load(Ordering::Relaxed));
+    }
+}

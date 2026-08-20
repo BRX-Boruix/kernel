@@ -34,6 +34,7 @@ name = "drv"
 version = "0.1.0"
 dependencies = [
  "klib",
+ "spin",
 ]
 
 [[package]]
