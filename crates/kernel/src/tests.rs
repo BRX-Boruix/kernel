@@ -2198,6 +2198,148 @@ pub fn test_vfs_m62() {
 ///
 /// 此测试直接走 syscall 分发，避免依赖当前用户进程；`sys_close` 对 fd 0/1/2
 /// 必须在查询进程 FD 表之前拒绝请求。
+/// DMYGH #6：`munmap(addr, size)` 必须删除 mmap 区域记账、清除真实 PTE，
+/// 回收已补页的帧；不得把未发生的解除映射报告为成功。
+///
+/// 该测试直接通过 `int 0x80` 分发调用，使用当前进程的真实地址空间，覆盖：
+/// - 正常两页匿名映射与已补页 PTE 的解除；
+/// - 部分范围解除后相邻页仍保持可用；
+/// - 已解除范围的重复解除（ENOENT）；
+/// - 零长度、非页对齐地址、跨用户上界与整数溢出参数（EINVAL）。
+pub fn test_syscall_munmap() {
+    use alloc::boxed::Box;
+    use arch_x86_64::interrupts::InterruptFrame;
+    use klib::error::Error;
+    use task::Process;
+
+    info!("[test-syscall-munmap] === DMYGH #6: real munmap ===");
+
+    fn frame(nr: u32, addr: u64, size: u64) -> InterruptFrame {
+        InterruptFrame {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rbp: 0,
+            rdi: addr,
+            rsi: size,
+            rdx: 0,
+            rcx: 0,
+            rbx: 0,
+            rax: nr as u64,
+            vector: 0,
+            error_code: 0,
+            rip: 0,
+            cs: 0,
+            rflags: 0,
+            rsp: 0,
+            ss: 0,
+        }
+    }
+
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    let mapped = map.rax;
+    assert!(
+        mapped >= mm::user_space::USER_BASE && mapped < mm::user_space::USER_TOP,
+        "mmap must return a user address"
+    );
+
+    // 按需补页会建立真实 PTE；解除映射后 translate 必须不再命中。
+    let proc = task::current_proc_mut().expect("test process installed");
+    assert!(proc.addr_space_mut().handle_page_fault(mapped, 0));
+    assert!(
+        proc.addr_space_mut()
+            .translate(VirtAddr::new(mapped))
+            .is_some(),
+        "faulted mmap page must have a real PTE before munmap"
+    );
+    assert!(
+        proc.addr_space_mut()
+            .translate(VirtAddr::new(mapped + 0x1000))
+            .is_some(),
+        "fault-ahead second page must have a real PTE before partial munmap"
+    );
+
+    let mut unmap_first = frame(crate::syscall::SYS_MEMORY_UNMAP, mapped, 0x1000);
+    assert!(crate::syscall::syscall_entry(&mut unmap_first));
+    assert_eq!(unmap_first.rax, 0, "first partial munmap must succeed");
+    let proc = task::current_proc_mut().expect("test process retained");
+    assert!(
+        proc.addr_space_mut()
+            .translate(VirtAddr::new(mapped))
+            .is_none(),
+        "munmap must clear the first page PTE"
+    );
+    assert!(
+        !proc.addr_space_mut().handle_page_fault(mapped, 0),
+        "a fault on a munmap address must be rejected, not demand-mapped again"
+    );
+    assert!(
+        proc.addr_space_mut()
+            .translate(VirtAddr::new(mapped + 0x1000))
+            .is_some(),
+        "partial munmap must preserve its adjacent mapping"
+    );
+
+    let expected_not_found = (-(Error::NotFound.to_errno() as i64)) as u64;
+    let mut repeat = frame(crate::syscall::SYS_MEMORY_UNMAP, mapped, 0x1000);
+    assert!(crate::syscall::syscall_entry(&mut repeat));
+    assert_eq!(repeat.rax, expected_not_found, "repeat munmap must fail");
+
+    let mut unmap_second = frame(crate::syscall::SYS_MEMORY_UNMAP, mapped + 0x1000, 0x1000);
+    assert!(crate::syscall::syscall_entry(&mut unmap_second));
+    assert_eq!(unmap_second.rax, 0, "second partial munmap must succeed");
+
+    // `brk` 区域也是按需分页，但生命周期归堆管理：munmap 绝不能越权删除它。
+    let heap_end = mm::user_space::USER_HEAP_BASE + 0x1000;
+    let mut grow_heap = frame(crate::syscall::SYS_MEMORY_GROW, heap_end, 0);
+    assert!(crate::syscall::syscall_entry(&mut grow_heap));
+    assert_eq!(grow_heap.rax, heap_end, "brk must establish heap reservation");
+    let mut unmap_heap = frame(
+        crate::syscall::SYS_MEMORY_UNMAP,
+        mm::user_space::USER_HEAP_BASE,
+        0x1000,
+    );
+    assert!(crate::syscall::syscall_entry(&mut unmap_heap));
+    assert_eq!(
+        unmap_heap.rax, expected_not_found,
+        "munmap must reject non-anonymous heap regions"
+    );
+
+    let expected_invalid = (-(Error::InvalidParam.to_errno() as i64)) as u64;
+    for (addr, size, label) in [
+        (mapped, 0, "zero length"),
+        (mapped + 1, 0x1000, "unaligned address"),
+        (
+            mm::user_space::USER_TOP - 0x1000,
+            0x2000,
+            "crosses user top",
+        ),
+        (u64::MAX - 0xFFF, 0x2000, "integer overflow"),
+    ] {
+        let mut invalid = frame(crate::syscall::SYS_MEMORY_UNMAP, addr, size);
+        assert!(crate::syscall::syscall_entry(&mut invalid));
+        assert_eq!(invalid.rax, expected_invalid, "munmap {label} must reject");
+    }
+
+    task::clear_current_proc();
+    // `set_current_proc` receives a raw pointer to avoid retaining a scheduler lock during
+    // syscall dispatch; this test owns it and must restore Box ownership for Drop cleanup.
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    info!("[test-syscall-munmap] PASS");
+}
+
 pub fn test_syscall_std_stream_close() {
     use arch_x86_64::interrupts::InterruptFrame;
     use klib::error::Error;

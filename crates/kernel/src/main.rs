@@ -279,6 +279,8 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_std_stream_close();
     #[cfg(feature = "kernel-tests")]
+    tests::test_syscall_munmap();
+    #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m63();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m64();

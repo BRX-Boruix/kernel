@@ -509,6 +509,22 @@ fn sys_mmap(frame: &mut InterruptFrame) -> u64 {
     }
 }
 
+/// `munmap(addr, size)`：释放当前进程的一段匿名 mmap 地址区间。
+///
+/// ABI 使用 `rdi=addr`、`rsi=size`。地址与长度必须均为 4KiB 粒度，且整个范围
+/// 必须属于单个匿名 mmap 区域；否则返回明确错误，绝不把无操作伪装成成功。
+fn sys_munmap(frame: &mut InterruptFrame) -> u64 {
+    let addr = frame.rdi;
+    let size = frame.rsi;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    match proc.addr_space_mut().munmap_anonymous(addr, size) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
 /// `brk(new)`：调整当前进程堆断点（0 = 仅查询）。
 fn sys_brk(frame: &mut InterruptFrame) -> u64 {
     let new = frame.rdi;
@@ -627,7 +643,7 @@ fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
         // MEMORY Domain (0x20)
         SYS_MEMORY_MAP => sys_mmap(frame),
         SYS_MEMORY_GROW => sys_brk(frame),
-        SYS_MEMORY_UNMAP => pack_ok(0),
+        SYS_MEMORY_UNMAP => sys_munmap(frame),
 
         // TASK Domain (0x30)
         SYS_TASK_SPAWN => sys_exec(frame),

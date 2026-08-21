@@ -40,6 +40,18 @@ pub struct MmapRegion {
     pub end: u64,
 }
 
+/// 用户区来源。`munmap` 只允许释放由匿名 `mmap` 创建的区域，防止用户进程
+/// 解除 ELF、堆或用户栈等由其专属生命周期管理的映射。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UserAreaKind {
+    /// 加载器或内核在指定虚拟地址建立的映射。
+    Fixed,
+    /// 堆、栈等按需分页保留区；由对应的专用 API 收缩/销毁。
+    Reserved,
+    /// `mmap` 创建的匿名按需分页区域；可经 `munmap` 释放。
+    AnonymousMmap,
+}
+
 /// 用户区映射记录（按需分页 / 统计用）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UserArea {
@@ -53,6 +65,8 @@ pub struct UserArea {
     pub flags: PageFlags,
     /// 是否按需分页（`true` = 预留区域，尚未映射，访问时补页）。
     pub demand_paging: bool,
+    /// 区域的所有权与释放策略。
+    pub kind: UserAreaKind,
 }
 
 /// 写时复制（COW）共享页记账：一个已映射但被多个地址空间共享、只读的叶页。
@@ -158,6 +172,7 @@ where
             size,
             flags: uflags,
             demand_paging: false,
+            kind: UserAreaKind::Fixed,
         });
         Ok(())
     }
@@ -173,6 +188,18 @@ where
         size: PageSize,
         flags: PageFlags,
     ) -> Result<(), PT::Error> {
+        self.reserve_user_with_kind(start, end, size, flags, UserAreaKind::Reserved)
+    }
+
+    /// 声明按需分页区，并在区域记录中写入唯一的所有权策略。
+    fn reserve_user_with_kind(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        size: PageSize,
+        flags: PageFlags,
+        kind: UserAreaKind,
+    ) -> Result<(), PT::Error> {
         let s = start.as_u64();
         let e = end.as_u64();
         if s < USER_BASE || e > USER_TOP || e <= s {
@@ -185,6 +212,7 @@ where
             size,
             flags: uflags,
             demand_paging: true,
+            kind,
         });
         Ok(())
     }
@@ -593,14 +621,84 @@ where
         }
         let gap_start = self.find_free_region(size).ok_or(Error::NoSpace)?;
         let end = gap_start + size;
-        self.reserve_user(
+        self.reserve_user_with_kind(
             VirtAddr::new(gap_start),
             VirtAddr::new(end),
             PageSize::Size4K,
             flags,
+            UserAreaKind::AnonymousMmap,
         )?;
         self.next_mmap = end;
         Ok(gap_start)
+    }
+
+    /// 解除匿名 `mmap` 区间 `[start, start + len)`。
+    ///
+    /// `start` 必须 4KiB 对齐，`len` 必须非零且为 4KiB 的整数倍。整个请求必须
+    /// 落在**同一个**由 [`mmap_user`] 创建的匿名区域内；这禁止借由 `munmap`
+    /// 删除 ELF、堆、栈或共享内存等具有不同生命周期/所有权的映射。
+    ///
+    /// 已按需补页的叶 PTE 会真实解除并将帧交还给 frame allocator；尚未补页的
+    /// 页面没有帧，只从区域记账中删除。完成后地址不再属于 demand-paging 区域，
+    /// 因此随后的访问会被 #PF 路径拒绝而非重新分配。
+    pub fn munmap_anonymous(&mut self, start: u64, len: u64) -> Result<(), PT::Error> {
+        const PAGE_SIZE: u64 = 4096;
+        if len == 0 || start % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
+            return Err(Error::InvalidParam.into());
+        }
+        let end = start.checked_add(len).ok_or(Error::InvalidParam)?;
+        if start < USER_BASE || end > USER_TOP || end <= start {
+            return Err(Error::InvalidParam.into());
+        }
+
+        // 先完整验证所有权和边界，任何非法请求均在修改页表/记账前失败。
+        let (area_idx, area) = {
+            let areas = self.areas.lock();
+            let Some((idx, area)) = areas.iter().copied().enumerate().find(|(_, area)| {
+                area.kind == UserAreaKind::AnonymousMmap
+                    && start >= area.start.as_u64()
+                    && end <= area.end.as_u64()
+            }) else {
+                return Err(Error::NotFound.into());
+            };
+            (idx, area)
+        };
+        debug_assert_eq!(area.size, PageSize::Size4K);
+
+        // PTE 与数据帧始终成对释放。translate 为 None 的页是尚未 demand-fault 的
+        // 预留页；它没有任何资源可回收，但仍必须从区域范围中移除。
+        let mut vaddr = start;
+        while vaddr < end {
+            if let Some(phys) = self.pt.translate(VirtAddr::new(vaddr)) {
+                self.pt.unmap(VirtAddr::new(vaddr))?;
+                deallocate_frame(PhysFrame::from_paddr_raw(phys.as_u64()));
+            }
+            vaddr += PAGE_SIZE;
+        }
+
+        // COW 记录与 PTE 同步删除，防止后续 #PF 将已经 munmap 的页错误视为 COW 页。
+        self.cow_pages
+            .lock()
+            .retain(|cow| cow.vaddr < start || cow.vaddr >= end);
+
+        // 区间可以从匿名区域中部切除；保留左右两侧的原属性和匿名所有权。先 remove
+        // 再插入，保证同一匿名区域不出现重叠的重复记录。
+        let mut areas = self.areas.lock();
+        let removed = areas.remove(area_idx);
+        debug_assert_eq!(removed.start.as_u64(), area.start.as_u64());
+        if area.start.as_u64() < start {
+            areas.push(UserArea {
+                end: VirtAddr::new(start),
+                ..area
+            });
+        }
+        if end < area.end.as_u64() {
+            areas.push(UserArea {
+                start: VirtAddr::new(end),
+                ..area
+            });
+        }
+        Ok(())
     }
 
     /// 在用户半区找一个能容纳 `size`（页对齐）的空闲虚拟区间，不记账。
