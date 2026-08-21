@@ -46,12 +46,41 @@ struct KernelSystemProvider;
 
 impl SystemInfoProvider for KernelSystemProvider {
     fn cpu_json(&self) -> String {
-        let arch_name = crate::CurrentArch::name();
-        let cores = mm::cpu_count();
-        format!(
-            r#"{{"arch":"{}","cores":{},"vendor":"GenuineIntel","features":["smap","smep","syscall","xsave"]}}"#,
-            arch_name, cores
-        )
+        use arch::cpu::Cpu as _;
+        use arch_x86_64::cpu::X8664Cpu;
+
+        // CPU 信息在 BSP 单线程阶段由 `arch_x86_64::cpu::init()` 经 CPUID 探测并
+        // 缓存；SysFS 只投影该缓存，绝不编造厂商或功能位。
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        let mut object = writer
+            .start_object()
+            .expect("Vec-backed CPU JSON serialization cannot fail");
+        object
+            .field_str("arch", crate::CurrentArch::name())
+            .expect("Vec-backed CPU JSON serialization cannot fail");
+        object
+            .field_u64("cores", mm::cpu_count() as u64)
+            .expect("Vec-backed CPU JSON serialization cannot fail");
+        object
+            .field_str("vendor", X8664Cpu::vendor_id())
+            .expect("Vec-backed CPU JSON serialization cannot fail");
+        object
+            .sub_array("features", |features| {
+                for feature in arch::cpu::CpuFeature::ALL {
+                    if X8664Cpu::has_feature(feature) {
+                        features.push_str(feature.name())?;
+                    }
+                }
+                Ok(())
+            })
+            .expect("Vec-backed CPU JSON serialization cannot fail");
+        object
+            .end()
+            .expect("Vec-backed CPU JSON serialization cannot fail");
+        target
+            .into_string()
+            .expect("CPU vendor and feature names are valid UTF-8")
     }
 
     fn memory_json(&self) -> String {

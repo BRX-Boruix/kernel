@@ -42,6 +42,10 @@ pub enum CpuFeature {
     Nx = 21,
     Abm = 22,
     Sse4a = 23,
+    /// Supervisor Mode Execution Prevention (x86 CPUID.7.0:EBX[20]).
+    Smep = 24,
+    /// Supervisor Mode Access Prevention (x86 CPUID.7.0:EBX[7]).
+    Smap = 25,
 }
 
 impl CpuFeature {
@@ -72,11 +76,13 @@ impl CpuFeature {
             Self::Nx => "nx",
             Self::Abm => "abm",
             Self::Sse4a => "sse4a",
+            Self::Smep => "smep",
+            Self::Smap => "smap",
         }
     }
 
     /// 本枚举覆盖的全部特性（按索引顺序，可遍历打印/探测）。
-    pub const ALL: [CpuFeature; 24] = [
+    pub const ALL: [CpuFeature; 26] = [
         Self::Mmx,
         Self::Sse,
         Self::Sse2,
@@ -101,6 +107,8 @@ impl CpuFeature {
         Self::Nx,
         Self::Abm,
         Self::Sse4a,
+        Self::Smep,
+        Self::Smap,
     ];
 }
 

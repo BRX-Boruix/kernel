@@ -128,6 +128,8 @@ pub fn init() {
         set_feat(&mut feat, CpuFeature::Rdseed, r7.ebx & (1 << 18) != 0);
         set_feat(&mut feat, CpuFeature::Adx, r7.ebx & (1 << 19) != 0);
         set_feat(&mut feat, CpuFeature::Sha, r7.ebx & (1 << 29) != 0);
+        set_feat(&mut feat, CpuFeature::Smep, r7.ebx & (1 << 20) != 0);
+        set_feat(&mut feat, CpuFeature::Smap, r7.ebx & (1 << 7) != 0);
     }
     if max_ext >= 0x8000_0001 {
         let rx = cpuid(0x8000_0001, 0);
@@ -301,9 +303,8 @@ pub fn entropy_u64() -> u64 {
 pub fn enable_smep_smap() {
     const SMEP: u64 = 1 << 20;
     const SMAP: u64 = 1 << 21;
-    let r7 = cpuid(7, 0);
-    let smep_ok = r7.ebx & (1 << 20) != 0;
-    let smap_ok = r7.ebx & (1 << 7) != 0;
+    let smep_ok = has_feature(CpuFeature::Smep);
+    let smap_ok = has_feature(CpuFeature::Smap);
 
     let mut cr4 = mmio::read_cr4();
     if smep_ok {

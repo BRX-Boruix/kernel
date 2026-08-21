@@ -2265,6 +2265,30 @@ pub fn test_vfs_m63() {
         s2.contains(r#""arch":""#),
         "cpu json must contain arch field"
     );
+
+    // DMYGH #3：SysFS 绝不能伪造 CPU 厂商或特性。逐项将 JSON 投影与 BSP
+    // 阶段缓存的 CPUID 探测结果比对；该断言可在不同 QEMU CPU 模型下成立。
+    use arch::cpu::Cpu as _;
+    use arch_x86_64::cpu::X8664Cpu;
+    let expected_vendor = X8664Cpu::vendor_id();
+    assert!(
+        !expected_vendor.is_empty(),
+        "CPUID vendor must be available before SysFS is mounted"
+    );
+    assert!(
+        s2.contains(&alloc::format!(r#""vendor":"{}""#, expected_vendor)),
+        "SysFS vendor must equal CPUID vendor: {}",
+        expected_vendor
+    );
+    for feature in arch::cpu::CpuFeature::ALL {
+        let serialized = alloc::format!(r#""{}""#, feature.name());
+        assert_eq!(
+            s2.contains(&serialized),
+            X8664Cpu::has_feature(feature),
+            "SysFS feature {} must equal CPUID cache",
+            feature.name()
+        );
+    }
     info!("[test-vfs-m63] /system/cpu: {}", s2.trim());
 
     let mem_node = root
