@@ -52,22 +52,22 @@ impl Error {
     /// 转为 POSIX errno 风格数值（ADR-003 syscall 边界铺路，可后续直接映射）。
     pub fn to_errno(self) -> i32 {
         match self {
-            Error::OutOfMemory => 12,        // ENOMEM
-            Error::InvalidParam => 22,       // EINVAL
-            Error::OutOfRange => 34,         // ERANGE
-            Error::NotFound => 2,            // ENOENT
-            Error::AlreadyExists => 17,      // EEXIST
-            Error::NotSupported => 95,       // ENOTSUP
-            Error::WouldBlock => 11,         // EAGAIN
-            Error::NoSpace => 28,            // ENOSPC
-            Error::Io => 5,                  // EIO
-            Error::NotDirectory => 20,       // ENOTDIR
-            Error::IsDirectory => 21,        // EISDIR
-            Error::PermissionDenied => 13,   // EACCES
-            Error::NotEmpty => 39,           // ENOTEMPTY
-            Error::NameTooLong => 36,        // ENAMETOOLONG
-            Error::TooManySymlinks => 40,    // ELOOP
-            Error::Msg(_) => 22,             // EINVAL
+            Error::OutOfMemory => 12,      // ENOMEM
+            Error::InvalidParam => 22,     // EINVAL
+            Error::OutOfRange => 34,       // ERANGE
+            Error::NotFound => 2,          // ENOENT
+            Error::AlreadyExists => 17,    // EEXIST
+            Error::NotSupported => 95,     // ENOTSUP
+            Error::WouldBlock => 11,       // EAGAIN
+            Error::NoSpace => 28,          // ENOSPC
+            Error::Io => 5,                // EIO
+            Error::NotDirectory => 20,     // ENOTDIR
+            Error::IsDirectory => 21,      // EISDIR
+            Error::PermissionDenied => 13, // EACCES
+            Error::NotEmpty => 39,         // ENOTEMPTY
+            Error::NameTooLong => 36,      // ENAMETOOLONG
+            Error::TooManySymlinks => 40,  // ELOOP
+            Error::Msg(_) => 22,           // EINVAL
         }
     }
 }
@@ -121,7 +121,10 @@ mod tests {
     fn display_text() {
         assert_eq!(format!("{}", Error::OutOfMemory), "out of memory");
         assert_eq!(format!("{}", Error::NoSpace), "no space");
-        assert_eq!(format!("{}", Error::Msg("no free mmap region")), "no free mmap region");
+        assert_eq!(
+            format!("{}", Error::Msg("no free mmap region")),
+            "no free mmap region"
+        );
     }
 
     #[test]

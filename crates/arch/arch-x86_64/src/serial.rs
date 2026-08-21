@@ -6,7 +6,7 @@
 //! - 中断门会自动 `cli`，因此中断上下文与本 CPU 主线程的竞争靠重入计数化解；
 //!   不同 CPU 之间靠自旋互斥。
 
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 use crate::port::{inb, outb};
 
@@ -84,7 +84,6 @@ impl SerialLock {
             core::hint::spin_loop();
         }
     }
-
 
     /// 释放串口锁（递减重入计数，归零才真正释放）。
     fn release(&self) {

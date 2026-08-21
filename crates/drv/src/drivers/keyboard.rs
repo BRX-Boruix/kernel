@@ -1,6 +1,8 @@
 //! Core 阶段：PS/2 键盘控制器驱动（Platform InputDevice）。
 
-use crate::device::{BusType, CharDevice, Device, DeviceInfo, DeviceKind, DeviceOps, InputDevice, IoDevice};
+use crate::device::{
+    BusType, CharDevice, Device, DeviceInfo, DeviceKind, DeviceOps, InputDevice, IoDevice,
+};
 use crate::driver::DriverStage;
 use crate::hub::DriverHub;
 

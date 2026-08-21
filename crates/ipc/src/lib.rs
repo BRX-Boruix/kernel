@@ -82,7 +82,10 @@ pub fn shm_create(size: u64) -> Result<u64, Error> {
 }
 
 /// `shm_map(id) -> addr`：把 shm 对象帧映射进调用进程地址空间。
-pub fn shm_map(id: u64, addr_space: &mut mm::user_space::UserAddressSpace<arch_x86_64::paging::X86PageTable>) -> Result<u64, Error> {
+pub fn shm_map(
+    id: u64,
+    addr_space: &mut mm::user_space::UserAddressSpace<arch_x86_64::paging::X86PageTable>,
+) -> Result<u64, Error> {
     let mut table = SHM_TABLE.lock();
     let obj = table.get_mut(&id).ok_or(Error::NotFound)?;
     let vaddr = addr_space.map_shm(id, &obj.frames, obj.size)?;
@@ -92,7 +95,10 @@ pub fn shm_map(id: u64, addr_space: &mut mm::user_space::UserAddressSpace<arch_x
 }
 
 /// `shm_unmap(id)`：解除调用进程对该 shm 对象的映射。
-pub fn shm_unmap(id: u64, addr_space: &mut mm::user_space::UserAddressSpace<arch_x86_64::paging::X86PageTable>) -> Result<(), Error> {
+pub fn shm_unmap(
+    id: u64,
+    addr_space: &mut mm::user_space::UserAddressSpace<arch_x86_64::paging::X86PageTable>,
+) -> Result<(), Error> {
     addr_space.unmap_shm(id)?;
     let mut table = SHM_TABLE.lock();
     let obj = table.get_mut(&id).ok_or(Error::NotFound)?;
@@ -102,7 +108,11 @@ pub fn shm_unmap(id: u64, addr_space: &mut mm::user_space::UserAddressSpace<arch
         for &phys in obj.frames.iter() {
             mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(phys));
         }
-        klib::info!("[ipc] shm_unmap id={} freed {} frames", id, obj.frames.len());
+        klib::info!(
+            "[ipc] shm_unmap id={} freed {} frames",
+            id,
+            obj.frames.len()
+        );
     } else {
         klib::info!("[ipc] shm_unmap id={} refs now {}", id, obj.refs);
     }
@@ -161,7 +171,8 @@ pub fn pipe_write(frame: &mut InterruptFrame, id: u64, src: u64, len: u64) -> Re
             };
             unsafe { arch_x86_64::mmio::stac() };
             while written < len && pipe.buf.len() < PIPE_CAPACITY {
-                pipe.buf.push_back(unsafe { *((src + written as u64) as *const u8) });
+                pipe.buf
+                    .push_back(unsafe { *((src + written as u64) as *const u8) });
                 written += 1;
             }
             unsafe { arch_x86_64::mmio::clac() };

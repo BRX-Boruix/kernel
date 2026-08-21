@@ -7,8 +7,10 @@ use crate::driver::DriverStage;
 use crate::hub::DriverHub;
 use spin::Mutex;
 
-const RAMDISK_CAPACITY: usize = 16 * 1024 * 1024; // 16 MB 内存盘
-static RAMDISK_STORAGE: Mutex<[u8; 1024 * 64]> = Mutex::new([0u8; 1024 * 64]); // 64KB 内核紧凑缓冲区
+/// Ramdisk 的实际可写容量。静态后端占用 BSS；该常量同时决定存储数组、
+/// `size()` 与 `block_count()`，防止容量上报与真实存储再次分叉（DMYGH #14）。
+const RAMDISK_CAPACITY: usize = 64 * 1024;
+static RAMDISK_STORAGE: Mutex<[u8; RAMDISK_CAPACITY]> = Mutex::new([0u8; RAMDISK_CAPACITY]);
 
 pub struct RamdiskDevice {
     pub name: &'static str,
@@ -35,7 +37,9 @@ impl Device for RamdiskDevice {
 impl IoDevice for RamdiskDevice {
     fn read_at(&self, offset: u64, out: &mut [u8]) -> usize {
         let storage = RAMDISK_STORAGE.lock();
-        let off = offset as usize;
+        let Ok(off) = usize::try_from(offset) else {
+            return 0;
+        };
         if off >= storage.len() {
             return 0;
         }
@@ -45,14 +49,21 @@ impl IoDevice for RamdiskDevice {
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> usize {
+        // 兼容旧的短写风格接口；新调用方应使用 write_at_checked 获得精确错误码。
+        self.write_at_checked(offset, data).unwrap_or(0)
+    }
+
+    fn write_at_checked(&self, offset: u64, data: &[u8]) -> Result<usize, klib::error::Error> {
         let mut storage = RAMDISK_STORAGE.lock();
-        let off = offset as usize;
-        if off >= storage.len() {
-            return 0;
+        let off = usize::try_from(offset).map_err(|_| klib::error::Error::OutOfRange)?;
+        let end = off
+            .checked_add(data.len())
+            .ok_or(klib::error::Error::OutOfRange)?;
+        if end > storage.len() {
+            return Err(klib::error::Error::OutOfRange);
         }
-        let n = core::cmp::min(data.len(), storage.len() - off);
-        storage[off..off + n].copy_from_slice(&data[..n]);
-        n
+        storage[off..end].copy_from_slice(data);
+        Ok(data.len())
     }
 
     fn size(&self) -> Option<u64> {

@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+# 真机调度档：透传至 task，每个 100Hz LAPIC tick 触发一次 RR 调度；默认 TCG 档为 10 tick。
+real-hw = ["task/real-hw"]
 # 编译带自检测试（kernel::tests）的内核。默认关闭；SDK 的
 # `build --test` / `br --test` 会显式启用该 feature。
 kernel-tests = []

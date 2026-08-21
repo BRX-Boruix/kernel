@@ -13,15 +13,9 @@ pub enum DeviceEvent {
     /// 硬件设备拔除/下线（Hotplug Out）
     DeviceDeparted(DeviceInfo),
     /// 硬件运行态错误/异常告警
-    DeviceError {
-        dev: DeviceInfo,
-        code: u32,
-    },
+    DeviceError { dev: DeviceInfo, code: u32 },
     /// 硬件电源状态变更（D0 运行, D1/D2 待机, D3 关闭）
-    PowerStateChanged {
-        dev: DeviceInfo,
-        new_state: u8,
-    },
+    PowerStateChanged { dev: DeviceInfo, new_state: u8 },
 }
 
 pub const EVENT_QUEUE_CAPACITY: usize = 64;
@@ -74,7 +68,8 @@ static EVENT_QUEUE: Mutex<EventRingBuffer> = Mutex::new(EventRingBuffer::new());
 
 pub type EventSubscriber = fn(&DeviceEvent);
 pub const MAX_SUBSCRIBERS: usize = 8;
-static SUBSCRIBERS: Mutex<[Option<EventSubscriber>; MAX_SUBSCRIBERS]> = Mutex::new([None; MAX_SUBSCRIBERS]);
+static SUBSCRIBERS: Mutex<[Option<EventSubscriber>; MAX_SUBSCRIBERS]> =
+    Mutex::new([None; MAX_SUBSCRIBERS]);
 
 /// 发布一个硬件拓扑事件。
 pub fn publish_event(event: DeviceEvent) {

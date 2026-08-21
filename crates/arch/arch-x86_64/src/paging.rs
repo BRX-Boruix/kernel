@@ -9,7 +9,7 @@
 //! 由于 `arch-x86_64` 不依赖 `mm`（避免循环），页表页的分配通过
 //! 启动时注入的函数指针完成。
 
-use arch::{phys_to_virt, PageFlags, PageSize, PhysAddr, VirtAddr};
+use arch::{PageFlags, PageSize, PhysAddr, VirtAddr, phys_to_virt};
 use spin::Once;
 
 use crate::mmio;
@@ -36,11 +36,7 @@ pub fn init(alloc: extern "C" fn() -> u64, dealloc: extern "C" fn(u64), phys_off
 /// `pub(crate)` 供 `mmio::map_lapic` 在中间页表页缺失时主动分配。
 pub(crate) fn alloc_frame() -> Option<u64> {
     let p = FRAME_ALLOC.get().map(|f| f())?;
-    if p == 0 {
-        None
-    } else {
-        Some(p)
-    }
+    if p == 0 { None } else { Some(p) }
 }
 
 /// 释放一个物理页帧（页表页回收用）。
@@ -104,11 +100,7 @@ fn la57_enabled() -> bool {
 /// 无需在 `X86PageTable` 里存字段。
 #[inline]
 pub(crate) fn page_levels() -> usize {
-    if la57_enabled() {
-        5
-    } else {
-        4
-    }
+    if la57_enabled() { 5 } else { 4 }
 }
 
 /// 计算虚地址在 `levels` 级页表中第 `level` 层的索引。
@@ -220,7 +212,6 @@ impl X86PageTable {
         }
         Some((entries, levels - 1, levels))
     }
-
 }
 
 impl arch::ActivePageTable for X86PageTable {
@@ -262,7 +253,13 @@ impl arch::PageTable for X86PageTable {
         Ok(Self { pml4: top })
     }
 
-    fn map(&mut self, vaddr: VirtAddr, paddr: PhysAddr, size: PageSize, flags: PageFlags) -> Result<(), Self::Error> {
+    fn map(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        size: PageSize,
+        flags: PageFlags,
+    ) -> Result<(), Self::Error> {
         let levels = page_levels();
         let v = vaddr.as_u64();
         let p = paddr.as_u64();
@@ -316,7 +313,8 @@ impl arch::PageTable for X86PageTable {
 
     fn unmap(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, Self::Error> {
         let v = vaddr.as_u64();
-        let (entries, leaf, levels) = unsafe { self.walk(v) }.ok_or(klib::error::Error::NotFound)?;
+        let (entries, leaf, levels) =
+            unsafe { self.walk(v) }.ok_or(klib::error::Error::NotFound)?;
         // 清掉叶层条目：父表 = 上一层的下一级表（顶层时为自身）
         let parent_phys = if leaf == 0 {
             self.pml4

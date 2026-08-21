@@ -6,8 +6,8 @@ use core::sync::atomic::Ordering;
 
 use klib::{info, warn};
 
-use super::allocator_core::{FrameState, ORDER_4K};
 use super::LazyBuddyAllocator;
+use super::allocator_core::{FrameState, ORDER_4K};
 
 impl LazyBuddyAllocator {
     pub(crate) fn reserve_pop(&self) -> Option<usize> {

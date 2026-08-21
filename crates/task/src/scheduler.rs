@@ -31,7 +31,7 @@ use klib::error::Error;
 use klib::sync::irq::IrqSpinLock;
 use mm::user_space::UserAddressSpace;
 
-use crate::process::{clear_current_proc, set_current_proc, Process, TaskState};
+use crate::process::{Process, TaskState, clear_current_proc, set_current_proc};
 
 /// 每进程独立内核栈大小（16 帧 = 64K）。
 ///
@@ -47,6 +47,19 @@ const UCODE_RPL3: u16 = arch_x86_64::gdt::UCODE | 3;
 const UDATA_RPL3: u16 = arch_x86_64::gdt::UDATA | 3;
 /// 用户态 RFLAGS：IF=1（开中断）、IOPL=0、保留位 1。
 const USER_RFLAGS: u64 = 0x0000_0000_0000_0202;
+
+/// Round-Robin 时间片长度，单位为 LAPIC tick（当前时钟源为 100Hz）。
+///
+/// 默认 TCG 档为 10 tick（约 100ms 虚拟时间）：QEMU TCG 可能使虚拟时钟相对
+/// 指令执行快进，过短的每 tick 切换会让用户任务在到达有效工作前频繁被抢占。
+/// 启用 task crate 的 `real-hw` feature 时使用 1 tick（10ms 真实时间），便于
+/// 真机部署者显式选择低延迟档。此处是唯一的时间片参数来源。
+#[cfg(not(feature = "real-hw"))]
+pub const TIMESLICE_TICKS: usize = 10;
+
+/// 真机时间片档：每个 LAPIC tick 触发一次调度。
+#[cfg(feature = "real-hw")]
+pub const TIMESLICE_TICKS: usize = 1;
 
 /// 单进程槽：进程对象 + 被中断时的完整帧 + 独立内核栈顶。
 struct ProcEntry {
@@ -167,11 +180,8 @@ pub fn ready_count() -> usize {
 static TICK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 pub extern "C" fn tick(frame: &mut InterruptFrame) {
-    // 时间片：每 10 次 tick（~100ms 虚拟）做一次 RR 切换。TCG 慢速下虚拟时钟
-    // 快进，若每 tick（10ms 虚拟）都切换，进程时间片过短、执行不到 write；
-    // 拉长时间片让进程有足够指令时间。真机上可调回 1（每 tick 切换）。
     let n = TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if n % 10 != 0 {
+    if n % TIMESLICE_TICKS != 0 {
         return;
     }
 
@@ -332,8 +342,7 @@ pub fn block_current(frame: &mut InterruptFrame) -> bool {
 
 /// 阻塞等待键盘输入的进程 pid（`u32::MAX` 表示无）。`sys_read` 缓冲空时登记，
 /// 键盘中断经回调 [`wake_kbd`] 唤醒。单 waiter（stdin 仅一个读者，即 shell）。
-static KBD_WAITER: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static KBD_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// 阻塞当前进程等待键盘输入（`read` syscall 缓冲空时调用）。
 ///

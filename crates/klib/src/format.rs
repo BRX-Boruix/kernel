@@ -49,21 +49,81 @@ impl FmtArg {
     }
 }
 
-impl From<i8> for FmtArg { fn from(v: i8) -> Self { FmtArg::Int(v as i128) } }
-impl From<i16> for FmtArg { fn from(v: i16) -> Self { FmtArg::Int(v as i128) } }
-impl From<i32> for FmtArg { fn from(v: i32) -> Self { FmtArg::Int(v as i128) } }
-impl From<i64> for FmtArg { fn from(v: i64) -> Self { FmtArg::Int(v as i128) } }
-impl From<i128> for FmtArg { fn from(v: i128) -> Self { FmtArg::Int(v) } }
-impl From<isize> for FmtArg { fn from(v: isize) -> Self { FmtArg::Int(v as i128) } }
-impl From<u8> for FmtArg { fn from(v: u8) -> Self { FmtArg::UInt(v as u128) } }
-impl From<u16> for FmtArg { fn from(v: u16) -> Self { FmtArg::UInt(v as u128) } }
-impl From<u32> for FmtArg { fn from(v: u32) -> Self { FmtArg::UInt(v as u128) } }
-impl From<u64> for FmtArg { fn from(v: u64) -> Self { FmtArg::UInt(v as u128) } }
-impl From<u128> for FmtArg { fn from(v: u128) -> Self { FmtArg::UInt(v) } }
-impl From<usize> for FmtArg { fn from(v: usize) -> Self { FmtArg::UInt(v as u128) } }
-impl From<char> for FmtArg { fn from(v: char) -> Self { FmtArg::Char(v) } }
-impl From<bool> for FmtArg { fn from(v: bool) -> Self { FmtArg::Bool(v) } }
-impl From<&'static str> for FmtArg { fn from(v: &'static str) -> Self { FmtArg::Str(v) } }
+impl From<i8> for FmtArg {
+    fn from(v: i8) -> Self {
+        FmtArg::Int(v as i128)
+    }
+}
+impl From<i16> for FmtArg {
+    fn from(v: i16) -> Self {
+        FmtArg::Int(v as i128)
+    }
+}
+impl From<i32> for FmtArg {
+    fn from(v: i32) -> Self {
+        FmtArg::Int(v as i128)
+    }
+}
+impl From<i64> for FmtArg {
+    fn from(v: i64) -> Self {
+        FmtArg::Int(v as i128)
+    }
+}
+impl From<i128> for FmtArg {
+    fn from(v: i128) -> Self {
+        FmtArg::Int(v)
+    }
+}
+impl From<isize> for FmtArg {
+    fn from(v: isize) -> Self {
+        FmtArg::Int(v as i128)
+    }
+}
+impl From<u8> for FmtArg {
+    fn from(v: u8) -> Self {
+        FmtArg::UInt(v as u128)
+    }
+}
+impl From<u16> for FmtArg {
+    fn from(v: u16) -> Self {
+        FmtArg::UInt(v as u128)
+    }
+}
+impl From<u32> for FmtArg {
+    fn from(v: u32) -> Self {
+        FmtArg::UInt(v as u128)
+    }
+}
+impl From<u64> for FmtArg {
+    fn from(v: u64) -> Self {
+        FmtArg::UInt(v as u128)
+    }
+}
+impl From<u128> for FmtArg {
+    fn from(v: u128) -> Self {
+        FmtArg::UInt(v)
+    }
+}
+impl From<usize> for FmtArg {
+    fn from(v: usize) -> Self {
+        FmtArg::UInt(v as u128)
+    }
+}
+impl From<char> for FmtArg {
+    fn from(v: char) -> Self {
+        FmtArg::Char(v)
+    }
+}
+impl From<bool> for FmtArg {
+    fn from(v: bool) -> Self {
+        FmtArg::Bool(v)
+    }
+}
+impl From<&'static str> for FmtArg {
+    fn from(v: &'static str) -> Self {
+        FmtArg::Str(v)
+    }
+}
 
 // ---------- 数字转换表 ----------
 
@@ -97,11 +157,26 @@ pub fn format_to(out: &mut dyn fmt::Write, fmt: &str, args: &[FmtArg]) -> fmt::R
         let mut alt = false;
         loop {
             match bytes.get(i).copied() {
-                Some(b'-') => { left = true; i += 1; }
-                Some(b'0') => { zero = true; i += 1; }
-                Some(b'+') => { plus = true; i += 1; }
-                Some(b' ') => { space = true; i += 1; }
-                Some(b'#') => { alt = true; i += 1; }
+                Some(b'-') => {
+                    left = true;
+                    i += 1;
+                }
+                Some(b'0') => {
+                    zero = true;
+                    i += 1;
+                }
+                Some(b'+') => {
+                    plus = true;
+                    i += 1;
+                }
+                Some(b' ') => {
+                    space = true;
+                    i += 1;
+                }
+                Some(b'#') => {
+                    alt = true;
+                    i += 1;
+                }
                 _ => break,
             }
         }
@@ -147,18 +222,90 @@ pub fn format_to(out: &mut dyn fmt::Write, fmt: &str, args: &[FmtArg]) -> fmt::R
         if let Some(arg) = arg {
             arg_i += 1;
             match spec {
-                b'd' | b'i' => emit_number(out, arg.as_u128(), 10, false, true,
-                    plus, space, alt, width, zero, left, precision)?,
-                b'u' => emit_number(out, arg.as_u128(), 10, false, false,
-                    false, false, alt, width, zero, left, precision)?,
-                b'x' => emit_number(out, arg.as_u128(), 16, false, false,
-                    false, false, alt, width, zero, left, precision)?,
-                b'X' => emit_number(out, arg.as_u128(), 16, true, false,
-                    false, false, alt, width, zero, left, precision)?,
-                b'o' => emit_number(out, arg.as_u128(), 8, false, false,
-                    false, false, alt, width, zero, left, precision)?,
-                b'b' => emit_number(out, arg.as_u128(), 2, false, false,
-                    false, false, alt, width, zero, left, precision)?,
+                b'd' | b'i' => emit_number(
+                    out,
+                    arg.as_u128(),
+                    10,
+                    false,
+                    true,
+                    plus,
+                    space,
+                    alt,
+                    width,
+                    zero,
+                    left,
+                    precision,
+                )?,
+                b'u' => emit_number(
+                    out,
+                    arg.as_u128(),
+                    10,
+                    false,
+                    false,
+                    false,
+                    false,
+                    alt,
+                    width,
+                    zero,
+                    left,
+                    precision,
+                )?,
+                b'x' => emit_number(
+                    out,
+                    arg.as_u128(),
+                    16,
+                    false,
+                    false,
+                    false,
+                    false,
+                    alt,
+                    width,
+                    zero,
+                    left,
+                    precision,
+                )?,
+                b'X' => emit_number(
+                    out,
+                    arg.as_u128(),
+                    16,
+                    true,
+                    false,
+                    false,
+                    false,
+                    alt,
+                    width,
+                    zero,
+                    left,
+                    precision,
+                )?,
+                b'o' => emit_number(
+                    out,
+                    arg.as_u128(),
+                    8,
+                    false,
+                    false,
+                    false,
+                    false,
+                    alt,
+                    width,
+                    zero,
+                    left,
+                    precision,
+                )?,
+                b'b' => emit_number(
+                    out,
+                    arg.as_u128(),
+                    2,
+                    false,
+                    false,
+                    false,
+                    false,
+                    alt,
+                    width,
+                    zero,
+                    left,
+                    precision,
+                )?,
                 b'p' => emit_pointer(out, arg, width, zero, left)?,
                 b's' => emit_string(out, arg, width, left, precision)?,
                 b'c' => emit_char(out, arg, width, left)?,
@@ -187,7 +334,13 @@ fn emit_string(
 ) -> fmt::Result {
     let s = match arg {
         FmtArg::Str(s) => s,
-        FmtArg::Bool(b) => if b { "true" } else { "false" },
+        FmtArg::Bool(b) => {
+            if b {
+                "true"
+            } else {
+                "false"
+            }
+        }
         FmtArg::Char(_c) => return emit_char(out, arg, width, left),
         other => {
             // 非字符串参数：退化为单字符
@@ -198,11 +351,15 @@ fn emit_string(
     let visible = precision.map_or(s.len(), |p| p.min(s.len()));
     let pad = width.saturating_sub(visible);
     if !left {
-        for _ in 0..pad { out.write_char(' ')?; }
+        for _ in 0..pad {
+            out.write_char(' ')?;
+        }
     }
     out.write_str(&s[..visible])?;
     if left {
-        for _ in 0..pad { out.write_char(' ')?; }
+        for _ in 0..pad {
+            out.write_char(' ')?;
+        }
     }
     Ok(())
 }
@@ -215,11 +372,15 @@ fn emit_char(out: &mut dyn fmt::Write, arg: FmtArg, width: usize, left: bool) ->
     };
     let pad = width.saturating_sub(1);
     if !left {
-        for _ in 0..pad { out.write_char(' ')?; }
+        for _ in 0..pad {
+            out.write_char(' ')?;
+        }
     }
     out.write_char(c)?;
     if left {
-        for _ in 0..pad { out.write_char(' ')?; }
+        for _ in 0..pad {
+            out.write_char(' ')?;
+        }
     }
     Ok(())
 }
@@ -237,15 +398,21 @@ fn emit_pointer(
     let total = 2 + digits; // "0x" + hex
     let pad = width.saturating_sub(total);
     if !left && !zero {
-        for _ in 0..pad { out.write_char(' ')?; }
+        for _ in 0..pad {
+            out.write_char(' ')?;
+        }
     }
     out.write_str("0x")?;
     if zero && !left {
-        for _ in 0..pad { out.write_char('0')?; }
+        for _ in 0..pad {
+            out.write_char('0')?;
+        }
     }
     write_uint_raw(out, v, 16, false)?;
     if left {
-        for _ in 0..pad { out.write_char(' ')?; }
+        for _ in 0..pad {
+            out.write_char(' ')?;
+        }
     }
     Ok(())
 }
@@ -271,7 +438,15 @@ fn emit_number(
     // 符号
     let sign: Option<char> = if signed {
         let v = value as i128;
-        if v < 0 { Some('-') } else if plus { Some('+') } else if space { Some(' ') } else { None }
+        if v < 0 {
+            Some('-')
+        } else if plus {
+            Some('+')
+        } else if space {
+            Some(' ')
+        } else {
+            None
+        }
     } else if plus {
         Some('+')
     } else if space {
@@ -283,7 +458,13 @@ fn emit_number(
     // 前缀（`#` 标志）
     let prefix: &str = if alt {
         match base {
-            16 => if upper { "0X" } else { "0x" },
+            16 => {
+                if upper {
+                    "0X"
+                } else {
+                    "0x"
+                }
+            }
             8 => "0",
             _ => "",
         }
@@ -313,26 +494,44 @@ fn emit_number(
     if !left {
         if zero {
             // 零填充：sign + prefix + 0* + prec* + digits
-            if let Some(s) = sign { out.write_char(s)?; }
+            if let Some(s) = sign {
+                out.write_char(s)?;
+            }
             out.write_str(prefix)?;
-            for _ in 0..zero_pad { out.write_char('0')?; }
-            for _ in 0..prec_pad { out.write_char('0')?; }
+            for _ in 0..zero_pad {
+                out.write_char('0')?;
+            }
+            for _ in 0..prec_pad {
+                out.write_char('0')?;
+            }
             write_uint_raw(out, mag, base, upper)?;
         } else {
             // 空格填充：pad + sign + prefix + prec + digits
-            for _ in 0..space_pad { out.write_char(' ')?; }
-            if let Some(s) = sign { out.write_char(s)?; }
+            for _ in 0..space_pad {
+                out.write_char(' ')?;
+            }
+            if let Some(s) = sign {
+                out.write_char(s)?;
+            }
             out.write_str(prefix)?;
-            for _ in 0..prec_pad { out.write_char('0')?; }
+            for _ in 0..prec_pad {
+                out.write_char('0')?;
+            }
             write_uint_raw(out, mag, base, upper)?;
         }
     } else {
         // 左对齐：sign + prefix + prec + digits + pad
-        if let Some(s) = sign { out.write_char(s)?; }
+        if let Some(s) = sign {
+            out.write_char(s)?;
+        }
         out.write_str(prefix)?;
-        for _ in 0..prec_pad { out.write_char('0')?; }
+        for _ in 0..prec_pad {
+            out.write_char('0')?;
+        }
         write_uint_raw(out, mag, base, upper)?;
-        for _ in 0..space_pad { out.write_char(' ')?; }
+        for _ in 0..space_pad {
+            out.write_char(' ')?;
+        }
     }
     Ok(())
 }
@@ -352,7 +551,12 @@ fn count_digits(mut value: u128, base: u32) -> usize {
 }
 
 /// 直接输出 `value` 的 `base` 进制表示（低位先算，倒序写出）。
-fn write_uint_raw(out: &mut dyn fmt::Write, mut value: u128, base: u32, upper: bool) -> fmt::Result {
+fn write_uint_raw(
+    out: &mut dyn fmt::Write,
+    mut value: u128,
+    base: u32,
+    upper: bool,
+) -> fmt::Result {
     let mut buf = [0u8; 128];
     let mut n = 0usize;
     let base = base as u128;
@@ -512,13 +716,19 @@ mod tests {
     #[test]
     fn test_unsigned_hex() {
         let mut b = [0u8; 256];
-        assert_eq!(fmt("hex=%x UPPER=%X", kfmt_args!(255u32, 255u32), &mut b), "hex=ff UPPER=FF");
+        assert_eq!(
+            fmt("hex=%x UPPER=%X", kfmt_args!(255u32, 255u32), &mut b),
+            "hex=ff UPPER=FF"
+        );
     }
 
     #[test]
     fn test_zero_pad_width() {
         let mut b = [0u8; 256];
-        assert_eq!(fmt("0x%08x", kfmt_args!(0xdeadbeefu64), &mut b), "0xdeadbeef");
+        assert_eq!(
+            fmt("0x%08x", kfmt_args!(0xdeadbeefu64), &mut b),
+            "0xdeadbeef"
+        );
         let mut c = [0u8; 256];
         assert_eq!(fmt("%08x", kfmt_args!(0xabu32), &mut c), "000000ab");
     }
@@ -555,7 +765,10 @@ mod tests {
     fn test_signed_neg_hex() {
         // %x 对负数取补码无符号视图
         let mut b = [0u8; 256];
-        assert_eq!(fmt("%x", kfmt_args!(-1i32), &mut b), "ffffffffffffffffffffffffffffffff");
+        assert_eq!(
+            fmt("%x", kfmt_args!(-1i32), &mut b),
+            "ffffffffffffffffffffffffffffffff"
+        );
     }
 
     #[test]
@@ -567,6 +780,9 @@ mod tests {
     #[test]
     fn test_alt_prefix() {
         let mut b = [0u8; 256];
-        assert_eq!(fmt("%#x %#X", kfmt_args!(255u32, 255u32), &mut b), "0xff 0XFF");
+        assert_eq!(
+            fmt("%#x %#X", kfmt_args!(255u32, 255u32), &mut b),
+            "0xff 0XFF"
+        );
     }
 }

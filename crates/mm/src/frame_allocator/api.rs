@@ -7,7 +7,7 @@ use klib::warn;
 use arch::PhysFrame;
 
 use super::allocator_core::{MAX_ORDER, ORDER_4K};
-use super::{current_cpu_id, LazyBuddyAllocator};
+use super::{LazyBuddyAllocator, current_cpu_id};
 
 impl LazyBuddyAllocator {
     /// Allocate a frame of order N
@@ -73,7 +73,10 @@ impl LazyBuddyAllocator {
         // 无元数据（孔洞）检查：必须在读取帧元数据前完成，避免空指针解引用。
         let block_idx = pfn / cfg.frames_per_block;
         if unsafe { self.block_ptr(block_idx) }.is_null() {
-            warn!("PMM: Deallocate frame with no metadata (hole?): pfn {}", pfn);
+            warn!(
+                "PMM: Deallocate frame with no metadata (hole?): pfn {}",
+                pfn
+            );
             return;
         }
 
@@ -82,10 +85,7 @@ impl LazyBuddyAllocator {
         let order = match self.deallocate_checked(pfn) {
             Some(order) => order,
             None => {
-                warn!(
-                    "PMM: Double free or invalid free at pfn {}",
-                    pfn
-                );
+                warn!("PMM: Double free or invalid free at pfn {}", pfn);
                 return;
             }
         };

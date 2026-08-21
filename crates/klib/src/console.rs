@@ -113,8 +113,7 @@ pub fn register(f: SinkFn) -> bool {
         // 池槽在注册后不再被写入，可安全提升为 'static。
         &*(&FN_POOL.slots[idx] as *const core::cell::UnsafeCell<FnConsole>).cast::<FnConsole>()
     };
-    let (data, vtable) =
-        unsafe { core::mem::transmute::<&'static dyn Console, (usize, usize)>(c) };
+    let (data, vtable) = unsafe { core::mem::transmute::<&'static dyn Console, (usize, usize)>(c) };
     SINKS[idx].data.store(data, Ordering::SeqCst);
     SINKS[idx].vtable.store(vtable, Ordering::SeqCst);
     true
@@ -136,8 +135,9 @@ pub fn write_str(s: &str) {
         if data != 0 {
             let vtable = SINKS[i].vtable.load(Ordering::Acquire);
             // 仅初始化期写入了真实指针，此处读取安全。
-            let c: &'static dyn Console =
-                unsafe { core::mem::transmute::<(usize, usize), &'static dyn Console>((data, vtable)) };
+            let c: &'static dyn Console = unsafe {
+                core::mem::transmute::<(usize, usize), &'static dyn Console>((data, vtable))
+            };
             c.write_str(s);
         }
     }
@@ -150,7 +150,10 @@ pub fn write_str(s: &str) {
 /// 调用方都经此转发。
 pub fn write_fmt(args: fmt::Arguments) {
     let mut buf = [0u8; 1024];
-    let mut w = StackWriter { buf: &mut buf, len: 0 };
+    let mut w = StackWriter {
+        buf: &mut buf,
+        len: 0,
+    };
     let _ = fmt::Write::write_fmt(&mut w, args);
     let len = w.len;
     write_str(core::str::from_utf8(&buf[..len]).unwrap_or(""));

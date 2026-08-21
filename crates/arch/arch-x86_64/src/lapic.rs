@@ -46,13 +46,13 @@ fn read_apic_base() -> u64 {
 static LAPIC_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // LAPIC 寄存器偏移
-const LAPIC_SVR: usize = 0xF0;      // Spurious Interrupt Vector
-const LAPIC_TIMER: usize = 0x320;   // LVT Timer
+const LAPIC_SVR: usize = 0xF0; // Spurious Interrupt Vector
+const LAPIC_TIMER: usize = 0x320; // LVT Timer
 const LAPIC_TIMER_DIV: usize = 0x3E0; // 分频
 const LAPIC_TIMER_INIT: usize = 0x380; // Initial Count
 const LAPIC_TIMER_CURR: usize = 0x390; // Current Count (只读)
-const LAPIC_EOI: usize = 0xB0;      // End of Interrupt
-const LAPIC_LINT0: usize = 0x350;   // LVT LINT0 寄存器
+const LAPIC_EOI: usize = 0xB0; // End of Interrupt
+const LAPIC_LINT0: usize = 0x350; // LVT LINT0 寄存器
 const LINT0_EXTINT: u32 = 0x0000_0700; // delivery=ExtINT(111), unmasked
 
 // LVT Timer 位
@@ -179,10 +179,10 @@ fn calibrate_bus_freq() -> u64 {
 
     // 2. PIT 校准（HPET 不可用或校准失败时回退）。
     const PIT_CH0_DATA: u16 = 0x40; // PIT 通道 0 数据端口
-    const PIT_CMD: u16 = 0x43;      // PIT 命令/控制字端口
-    const PIT_PORT_B: u16 = 0x61;   // 0x61：bit4 反映通道 0 输出（反相）
+    const PIT_CMD: u16 = 0x43; // PIT 命令/控制字端口
+    const PIT_PORT_B: u16 = 0x61; // 0x61：bit4 反映通道 0 输出（反相）
     const PIT_FREQ: u64 = 1_193_182; // PIT 计数频率（Hz）
-    const PIT_TICKS: u16 = 0xFFFF;   // 最大计数值，约 54.9ms
+    const PIT_TICKS: u16 = 0xFFFF; // 最大计数值，约 54.9ms
 
     // PIT 通道 0：一次性模式 (mode 0)，先低后高字节，二进制计数。
     outb(PIT_CMD, 0x30);

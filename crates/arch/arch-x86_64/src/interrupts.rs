@@ -17,13 +17,13 @@ use crate::gdt::{IST_DF, KCODE};
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct IdtEntry {
-    offset_low: u16,   // 处理函数偏移 0..15
-    selector: u16,     // 代码段选择子
-    ist: u8,           // IST（未用，填 0）
-    flags: u8,         // 类型与属性（present, DPL, interrupt gate）
-    offset_mid: u16,   // 偏移 16..31
-    offset_high: u32,  // 偏移 32..63
-    reserved: u32,     // 保留（必须为 0），使条目总大小为 16 字节
+    offset_low: u16,  // 处理函数偏移 0..15
+    selector: u16,    // 代码段选择子
+    ist: u8,          // IST（未用，填 0）
+    flags: u8,        // 类型与属性（present, DPL, interrupt gate）
+    offset_mid: u16,  // 偏移 16..31
+    offset_high: u32, // 偏移 32..63
+    reserved: u32,    // 保留（必须为 0），使条目总大小为 16 字节
 }
 
 impl IdtEntry {
@@ -773,11 +773,11 @@ fn get_isr_addr(vector: u16) -> u64 {
     }
 
     const HANDLERS: [unsafe extern "C" fn(); 48] = [
-        isr_0, isr_1, isr_2, isr_3, isr_4, isr_5, isr_6, isr_7, isr_8, isr_9,
-        isr_10, isr_11, isr_12, isr_13, isr_14, isr_15, isr_16, isr_17, isr_18, isr_19,
-        isr_20, isr_21, isr_22, isr_23, isr_24, isr_25, isr_26, isr_27, isr_28, isr_29,
-        isr_30, isr_31, isr_32, isr_33, isr_34, isr_35, isr_36, isr_37, isr_38, isr_39,
-        isr_40, isr_41, isr_42, isr_43, isr_44, isr_45, isr_46, isr_47,
+        isr_0, isr_1, isr_2, isr_3, isr_4, isr_5, isr_6, isr_7, isr_8, isr_9, isr_10, isr_11,
+        isr_12, isr_13, isr_14, isr_15, isr_16, isr_17, isr_18, isr_19, isr_20, isr_21, isr_22,
+        isr_23, isr_24, isr_25, isr_26, isr_27, isr_28, isr_29, isr_30, isr_31, isr_32, isr_33,
+        isr_34, isr_35, isr_36, isr_37, isr_38, isr_39, isr_40, isr_41, isr_42, isr_43, isr_44,
+        isr_45, isr_46, isr_47,
     ];
 
     // 软中断向量 0x80 使用独立的 isr_128 入口。

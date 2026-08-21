@@ -107,11 +107,7 @@ pub fn identify_ata() -> Option<u64> {
         | ((data[102] as u64) << 32)
         | ((data[103] as u64) << 48);
     let sectors = if lba48 != 0 { lba48 } else { lba28 };
-    if sectors > 0 {
-        Some(sectors)
-    } else {
-        None
-    }
+    if sectors > 0 { Some(sectors) } else { None }
 }
 
 fn ata_read_sector(lba: u64, out: &mut [u8; 512]) -> bool {
@@ -254,8 +250,7 @@ impl IoDevice for AtaPioDevice {
                 if !ata_read_sector(lba, &mut buf) {
                     break;
                 }
-                buf[sector_off..sector_off + take]
-                    .copy_from_slice(&data[done..done + take]);
+                buf[sector_off..sector_off + take].copy_from_slice(&data[done..done + take]);
                 if !ata_write_sector(lba, &buf) {
                     break;
                 }

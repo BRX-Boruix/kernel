@@ -3,12 +3,12 @@
 //! 提供线程安全的驱动与设备集中注册表、4 阶段严格生命周期触发、多驱动竞标与热插拔/热重载支持（M8 ~ M9）。
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use spin::Mutex;
 use klib::{info, warn};
+use spin::Mutex;
 
 use crate::device::{BusType, DeviceInfo, DeviceOps};
 use crate::driver::{Driver, DriverEntry, DriverStage};
-use crate::event::{publish_event, DeviceEvent};
+use crate::event::{DeviceEvent, publish_event};
 
 pub const MAX_DRIVERS: usize = 32;
 pub const MAX_DEVICES: usize = 64;
@@ -161,9 +161,15 @@ impl DriverHub {
                     for drv in drivers.iter().take(drv_count) {
                         if drv.name == drv_name {
                             if let Err(()) = drv.detach(&hub, &info) {
-                                warn!("[driver_hub] detach driver={} failed on device={}", drv_name, info.name);
+                                warn!(
+                                    "[driver_hub] detach driver={} failed on device={}",
+                                    drv_name, info.name
+                                );
                             }
-                            info!("[driver_hub] detached driver={} from device={}", drv_name, info.name);
+                            info!(
+                                "[driver_hub] detached driver={} from device={}",
+                                drv_name, info.name
+                            );
                             break;
                         }
                     }
@@ -228,7 +234,10 @@ impl DriverHub {
 
                 // 3. 重新竞标仲裁与绑定
                 let attached = Self::arbitrate_and_attach_device(idx);
-                info!("[driver_hub] hot-reload device={} result={}", name, attached);
+                info!(
+                    "[driver_hub] hot-reload device={} result={}",
+                    name, attached
+                );
                 return attached;
             }
         }
@@ -355,7 +364,11 @@ impl DriverHub {
         for entry in list.iter().take(count) {
             if entry.stage == stage {
                 entry.init(&hub);
-                info!("[driver_hub] init stage={:?} driver={}", stage, entry.name());
+                info!(
+                    "[driver_hub] init stage={:?} driver={}",
+                    stage,
+                    entry.name()
+                );
             }
         }
     }
@@ -440,7 +453,11 @@ impl DriverHub {
         for idx in 0..dev_count {
             let is_unbound = {
                 let devices = DEVICES.lock();
-                devices.get(idx).and_then(|e| e.as_ref()).map(|e| e.driver_name.is_none()).unwrap_or(false)
+                devices
+                    .get(idx)
+                    .and_then(|e| e.as_ref())
+                    .map(|e| e.driver_name.is_none())
+                    .unwrap_or(false)
             };
             if is_unbound {
                 Self::arbitrate_and_attach_device(idx);

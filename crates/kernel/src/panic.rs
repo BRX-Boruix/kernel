@@ -64,7 +64,9 @@ fn arch_name() -> &'static str {
     if ptr == 0 {
         "unknown"
     } else {
-        unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr as *const u8, len)) }
+        unsafe {
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr as *const u8, len))
+        }
     }
 }
 
@@ -106,7 +108,13 @@ fn build_msg<'a>(buf: &'a mut [u8], info: &core::panic::PanicInfo) -> &'a str {
     let _ = write!(w, "cpu:  {}\n", cpu_id());
     let _ = write!(w, "message: {}", info.message());
     if let Some(loc) = info.location() {
-        let _ = write!(w, "\nlocation: {}:{}:{}", loc.file(), loc.line(), loc.column());
+        let _ = write!(
+            w,
+            "\nlocation: {}:{}:{}",
+            loc.file(),
+            loc.line(),
+            loc.column()
+        );
     }
     let len = w.len;
     drop(w); // 结束对 buf 的可变借用
@@ -123,7 +131,9 @@ fn write_backtrace(out: &mut [u8]) -> &str {
     use core::fmt::Write as _;
     let mut w = symbols::BufWriter { buf: out, len: 0 };
     let mut rbp: usize;
-    unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack));
+    }
     let mut valid = 0usize;
     for i in 0..32 {
         let next: usize;

@@ -6,7 +6,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use arch::{PageFlags, PageSize, PhysAddr, PageTable, VirtAddr};
+use arch::{PageFlags, PageSize, PageTable, PhysAddr, VirtAddr};
 
 /// 一次映射的段记录。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,7 +24,12 @@ pub struct Area {
 impl Area {
     /// 新建一段区域。
     pub const fn new(start: VirtAddr, end: VirtAddr, size: PageSize, flags: PageFlags) -> Self {
-        Self { start, end, size, flags }
+        Self {
+            start,
+            end,
+            size,
+            flags,
+        }
     }
 }
 

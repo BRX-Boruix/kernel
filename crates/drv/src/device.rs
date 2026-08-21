@@ -2,6 +2,8 @@
 //!
 //! 统一抽象字符设备、块设备、输入设备与网络设备，支持零 ioctl 纯属性读写。
 
+use klib::error::Error;
+
 /// 基础 IO 设备 Trait（只包含标准 read/write/poll/size 等操作，彻底抛弃 ioctl）。
 pub trait IoDevice: Send + Sync {
     fn read(&self, _out: &mut [u8]) -> usize {
@@ -15,6 +17,19 @@ pub trait IoDevice: Send + Sync {
     }
     fn write_at(&self, _offset: u64, data: &[u8]) -> usize {
         self.write(data)
+    }
+    /// 带错误码的定位写接口。
+    ///
+    /// `write_at` 是遗留的短写风格接口，无法区分 0 字节写、设备繁忙与参数越界；
+    /// 新调用方应使用本接口获得可程序化的失败原因。默认实现保留旧设备兼容性，
+    /// 将短写归类为设备 I/O 错误。
+    fn write_at_checked(&self, offset: u64, data: &[u8]) -> Result<usize, Error> {
+        let written = self.write_at(offset, data);
+        if written == data.len() {
+            Ok(written)
+        } else {
+            Err(Error::Io)
+        }
     }
     fn poll(&self) -> bool {
         false

@@ -74,7 +74,11 @@ pub fn init(base_phys: u64, acpi_period_fs: u64) -> bool {
         period_fs = acpi_period_fs;
     }
     if period_fs == 0 {
-        klib::warn!("[hpet] clock period unavailable (hw={} acpi={})", read_period_fs(virt), acpi_period_fs);
+        klib::warn!(
+            "[hpet] clock period unavailable (hw={} acpi={})",
+            read_period_fs(virt),
+            acpi_period_fs
+        );
         return false;
     }
 

@@ -20,9 +20,7 @@ impl<'a> Path<'a> {
 
     /// 流式组件迭代器（自动消除连续 `/` 和 `.`）。
     pub fn components(&self) -> impl Iterator<Item = &'a str> {
-        self.raw
-            .split('/')
-            .filter(|&c| !c.is_empty() && c != ".")
+        self.raw.split('/').filter(|&c| !c.is_empty() && c != ".")
     }
 
     /// 路径规范化（解析 `..`，严格消除多余层次）。
@@ -42,7 +40,11 @@ impl<'a> Path<'a> {
         }
 
         if stack.is_empty() {
-            return if is_abs { String::from("/") } else { String::from(".") };
+            return if is_abs {
+                String::from("/")
+            } else {
+                String::from(".")
+            };
         }
 
         let mut res = String::new();

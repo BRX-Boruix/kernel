@@ -49,6 +49,12 @@ pub const SYS_STREAM_READ: u32 = nr(domain::STREAM, op::READ); // 0x12
 pub const SYS_STREAM_WRITE: u32 = nr(domain::STREAM, op::WRITE); // 0x13
 pub const SYS_STREAM_CLOSE: u32 = nr(domain::STREAM, op::DELETE); // 0x14
 
+/// STREAM read/write 的顺序 I/O 哨兵值。
+///
+/// 仅此值表示使用并推进 FD 的当前位置；`0` 与其他所有偏移都表示定位
+/// `pread`/`pwrite`，其中 `0` 即文件起始位置。
+const STREAM_OFFSET_CURRENT: u64 = u64::MAX;
+
 // ---------- 2. MEMORY Domain (0x20) ----------
 pub const SYS_MEMORY_MAP: u32 = nr(domain::MEMORY, op::CREATE); // 0x21
 pub const SYS_MEMORY_QUERY: u32 = nr(domain::MEMORY, op::READ); // 0x22
@@ -133,12 +139,10 @@ fn sys_open(frame: &mut InterruptFrame) -> u64 {
             }
             n
         }
-        Err(Error::NotFound) if flags.create => {
-            match root.create_file(&path, perm) {
-                Ok(n) => n,
-                Err(e) => return pack_err(e),
-            }
-        }
+        Err(Error::NotFound) if flags.create => match root.create_file(&path, perm) {
+            Ok(n) => n,
+            Err(e) => return pack_err(e),
+        },
         Err(e) => return pack_err(e),
     };
 
@@ -150,12 +154,14 @@ fn sys_open(frame: &mut InterruptFrame) -> u64 {
     pack_ok(fd as u64)
 }
 
-/// `close(fd)`：关闭文件描述符。
+/// `close(fd)`：关闭用户分配的文件描述符。
+///
+/// fd 0/1/2 是进程的保留标准流，不是可关闭的用户句柄；拒绝该操作并返回
+/// `Error::NotSupported`（ENOTSUP），绝不以成功码掩盖未发生的状态变化。
 fn sys_close(frame: &mut InterruptFrame) -> u64 {
     let fd = frame.rdi as usize;
     if fd < 3 {
-        // 标准流不支持 close
-        return pack_ok(0);
+        return pack_err(Error::NotSupported);
     }
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
@@ -248,7 +254,10 @@ fn sys_readdir(frame: &mut InterruptFrame) -> u64 {
     pack_ok(n as u64)
 }
 
-/// `write(fd, buf, len, [offset])`：写入 stdout/stderr 或用户 FD 句柄。
+/// `write(fd, buf, len, offset)`：写入 stdout/stderr 或用户 FD 句柄。
+///
+/// ABI 约定：仅 [`STREAM_OFFSET_CURRENT`] 表示顺序写；`offset=0` 以及任意其他
+/// 偏移均为定位写（`pwrite`），不会推进句柄当前位置。
 fn sys_write(frame: &mut InterruptFrame) -> u64 {
     let fd = frame.rdi;
     let buf = frame.rsi;
@@ -292,9 +301,8 @@ fn sys_write(frame: &mut InterruptFrame) -> u64 {
     unsafe {
         arch_x86_64::mmio::copy_from_user(kbuf.as_mut_ptr(), buf, len as usize);
     }
-    
-    // offset == u64::MAX or 0 (if not pread) -> sequential write, else pwrite
-    if offset == u64::MAX {
+
+    if offset == STREAM_OFFSET_CURRENT {
         match handle.write(&kbuf) {
             Ok(n) => pack_ok(n as u64),
             Err(e) => pack_err(e),
@@ -307,7 +315,10 @@ fn sys_write(frame: &mut InterruptFrame) -> u64 {
     }
 }
 
-/// `read(fd, buf, len, [offset])`：从 stdin 键盘或用户 FD 句柄读取。
+/// `read(fd, buf, len, offset)`：从 stdin 键盘或用户 FD 句柄读取。
+///
+/// ABI 约定：仅 [`STREAM_OFFSET_CURRENT`] 表示顺序读；`offset=0` 以及任意其他
+/// 偏移均为定位读（`pread`），不会推进句柄当前位置。
 fn sys_read(frame: &mut InterruptFrame) -> u64 {
     let fd = frame.rdi;
     let buf = frame.rsi;
@@ -356,7 +367,7 @@ fn sys_read(frame: &mut InterruptFrame) -> u64 {
     };
 
     let mut kbuf = alloc::vec![0u8; len as usize];
-    if offset == u64::MAX {
+    if offset == STREAM_OFFSET_CURRENT {
         match handle.read(&mut kbuf) {
             Ok(n) => {
                 unsafe {
@@ -463,9 +474,7 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: usi
         l
     };
     let cmd = &cmd[..cmd_len];
-    let Ok(mut us) = mm::user_space::UserAddressSpace::<
-        arch_x86_64::paging::X86PageTable,
-    >::new()
+    let Ok(mut us) = mm::user_space::UserAddressSpace::<arch_x86_64::paging::X86PageTable>::new()
     else {
         return pack_err(Error::OutOfMemory);
     };
@@ -595,7 +604,12 @@ fn sys_driver_claim(frame: &mut InterruptFrame) -> u64 {
         Err(e) => return pack_err(e),
     };
 
-    klib::info!("[uio] claimed MMIO mapped: phys={:#x} -> user_vaddr={:#x} (size={})", mmio_base, user_vaddr, size);
+    klib::info!(
+        "[uio] claimed MMIO mapped: phys={:#x} -> user_vaddr={:#x} (size={})",
+        mmio_base,
+        user_vaddr,
+        size
+    );
     pack_ok(user_vaddr)
 }
 

@@ -22,8 +22,8 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use arch::task::TaskContext;
 use arch::PageTable;
+use arch::task::TaskContext;
 use arch_x86_64::paging::X86PageTable;
 use mm::user_space::UserAddressSpace;
 
@@ -274,13 +274,7 @@ impl<PT: PageTable> ProcessTable<PT> {
         addr_space: UserAddressSpace<PT>,
     ) -> Result<usize, klib::error::Error> {
         let pid = self.alloc_pid();
-        let proc = Process::new(
-            pid,
-            entry_rip,
-            user_stack_top,
-            kernel_stack_top,
-            addr_space,
-        );
+        let proc = Process::new(pid, entry_rip, user_stack_top, kernel_stack_top, addr_space);
         // 若 pid 复用空闲槽，直接覆盖；否则追加（可能中间有 None 空洞）。
         if pid < self.processes.len() {
             self.processes[pid] = Some(proc);

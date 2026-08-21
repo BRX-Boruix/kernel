@@ -74,8 +74,7 @@ impl<T, const N: usize> RingBuffer<T, N> {
         if head.wrapping_sub(tail) == N {
             return Err(value); // 满
         }
-        let slot: *mut MaybeUninit<T> =
-            unsafe { self.buf.get_unchecked(head & (N - 1)).get() };
+        let slot: *mut MaybeUninit<T> = unsafe { self.buf.get_unchecked(head & (N - 1)).get() };
         unsafe {
             (*slot).write(value);
         }
@@ -90,8 +89,7 @@ impl<T, const N: usize> RingBuffer<T, N> {
         if tail == head {
             return None; // 空
         }
-        let slot: *const MaybeUninit<T> =
-            unsafe { self.buf.get_unchecked(tail & (N - 1)).get() };
+        let slot: *const MaybeUninit<T> = unsafe { self.buf.get_unchecked(tail & (N - 1)).get() };
         let v = unsafe { (*slot).assume_init_read() };
         self.tail.store(tail + 1, Ordering::Release);
         Some(v)

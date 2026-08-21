@@ -156,7 +156,10 @@ impl PageCache {
 
             // 未命中 2MB 大页：预载大页（大小按文件元数据尺寸截断，最多 2MB）
             self.misses.fetch_add(1, Ordering::Relaxed);
-            let meta_size = inode.metadata().map(|m| m.size).unwrap_or(HUGE_PAGE_SIZE as u64);
+            let meta_size = inode
+                .metadata()
+                .map(|m| m.size)
+                .unwrap_or(HUGE_PAGE_SIZE as u64);
             let needed_size = if huge_offset < meta_size {
                 core::cmp::min(HUGE_PAGE_SIZE as u64, meta_size - huge_offset) as usize
             } else {

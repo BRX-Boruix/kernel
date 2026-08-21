@@ -45,12 +45,7 @@ impl Xoshiro256 {
     pub fn new(seed: u64) -> Self {
         let mut sm = SplitMix64(seed);
         Self {
-            s: [
-                sm.next_u64(),
-                sm.next_u64(),
-                sm.next_u64(),
-                sm.next_u64(),
-            ],
+            s: [sm.next_u64(), sm.next_u64(), sm.next_u64(), sm.next_u64()],
         }
     }
 
@@ -148,8 +143,7 @@ pub fn entropy_source_ready() -> bool {
 pub fn add_entropy(value: u64) {
     let mut p = POOL.lock();
     let idx = p.index;
-    let mixed =
-        p.state[idx] ^ value.wrapping_add(p.added.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mixed = p.state[idx] ^ value.wrapping_add(p.added.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let mut sm = SplitMix64(mixed);
     p.state[idx] = sm.next_u64();
     p.index = (p.index + 1) & 3;
@@ -264,8 +258,7 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// 假熵源：确定性递增，便于验证 collect/seed 通路。
-    static FAKE_ENTROPY: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static FAKE_ENTROPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn fake_source() -> u64 {
         FAKE_ENTROPY.fetch_add(0x9E37_79B9_7F4A_7C15, std::sync::atomic::Ordering::Relaxed)

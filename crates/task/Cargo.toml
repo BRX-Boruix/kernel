@@ -3,6 +3,10 @@ name = "task"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# QEMU TCG 默认需要较长的虚拟时间片；启用此项时改为真机档位（每个 LAPIC tick 调度）。
+real-hw = []
+
 [dependencies]
 klib = { path = "../klib" }
 arch = { path = "../arch/arch" }

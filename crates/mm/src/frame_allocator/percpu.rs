@@ -22,11 +22,7 @@ impl LazyBuddyAllocator {
 
     fn per_cpu_batch(order: usize) -> u16 {
         let limit = Self::per_cpu_limit(order);
-        if limit > 8 {
-            8
-        } else {
-            limit
-        }
+        if limit > 8 { 8 } else { limit }
     }
 
     pub(crate) fn percpu_pop_raw(&self, cpu: usize, order: usize) -> Option<usize> {

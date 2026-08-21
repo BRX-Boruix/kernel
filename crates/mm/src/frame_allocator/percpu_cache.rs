@@ -26,7 +26,9 @@ unsafe impl Sync for PerCpuCacheSet {}
 
 impl PerCpuCacheSet {
     pub(crate) const fn new() -> Self {
-        Self { caches: Once::new() }
+        Self {
+            caches: Once::new(),
+        }
     }
 
     /// 依据实际 CPU 数初始化缓存数组（由内核注入 CPU 数后调用一次）。

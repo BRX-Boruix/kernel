@@ -17,15 +17,15 @@
 use core::mem::size_of;
 use core::slice;
 
-use limine::{MemmapEntry, MemoryMapEntryType, NonNullPtr};
 use klib::{info, warn};
+use limine::{MemmapEntry, MemoryMapEntryType, NonNullPtr};
 
 use super::allocator_core::{
-    align_4k, AllocatorConfig, BuddyFrame, MetadataPool, UninitRegion, L1_ENTRIES, L1_SHIFT,
-    L2_ENTRIES, L2_MASK,
+    AllocatorConfig, BuddyFrame, L1_ENTRIES, L1_SHIFT, L2_ENTRIES, L2_MASK, MetadataPool,
+    UninitRegion, align_4k,
 };
 use super::percpu_cache::FreeListTable;
-use super::{LazyBuddyAllocator, FREE_LISTS};
+use super::{FREE_LISTS, LazyBuddyAllocator};
 
 /// Buffer for uninit regions count to handle fragmentation
 const PADDING_REGIONS: usize = 16;
@@ -82,11 +82,17 @@ impl InitTimer {
                 Some(h)
             }
             None => {
-                info!("[pmm] TSC freq unknown (CPUID 0x15/0x16 unsupported); timing in cycles only");
+                info!(
+                    "[pmm] TSC freq unknown (CPUID 0x15/0x16 unsupported); timing in cycles only"
+                );
                 None
             }
         };
-        Self { start: t, last: t, hz }
+        Self {
+            start: t,
+            last: t,
+            hz,
+        }
     }
 
     /// 把 cycles 换算成 `(seconds, millis, nanos)`；无法换算（无频率）则返回 None。
@@ -117,7 +123,6 @@ impl InitTimer {
         rdtsc().wrapping_sub(self.start)
     }
 }
-
 
 impl LazyBuddyAllocator {
     // Helper to find contiguous memory for metadata structures (O(N))
@@ -232,307 +237,314 @@ impl LazyBuddyAllocator {
     ///
     /// # Safety
     /// This function must be called only once and with valid memory map.
-    pub(crate) unsafe fn init(&self, mmap: &[NonNullPtr<MemmapEntry>]) { unsafe {
-        FREE_LISTS.call_once(FreeListTable::new);
-        let mut timer = InitTimer::new();
+    pub(crate) unsafe fn init(&self, mmap: &[NonNullPtr<MemmapEntry>]) {
+        unsafe {
+            FREE_LISTS.call_once(FreeListTable::new);
+            let mut timer = InitTimer::new();
 
-        let entries_iter = mmap.iter().map(|e| &*e.as_ptr());
+            let entries_iter = mmap.iter().map(|e| &*e.as_ptr());
 
-        // 1. Calculate physical memory bounds and count usable regions
-        let mut max_phys_addr: u64 = 0;
-        let mut usable_regions_count: usize = 0;
+            // 1. Calculate physical memory bounds and count usable regions
+            let mut max_phys_addr: u64 = 0;
+            let mut usable_regions_count: usize = 0;
 
-        // 内存映射入口清单
-        info!(
-            "[pmm] === LazyBuddy init: {} memory-map entries ===",
-            mmap.len()
-        );
+            // 内存映射入口清单
+            info!(
+                "[pmm] === LazyBuddy init: {} memory-map entries ===",
+                mmap.len()
+            );
 
-        for entry in entries_iter.clone() {
-            if entry.typ == MemoryMapEntryType::Usable {
-                let end = entry.base + entry.len;
-                if end > max_phys_addr {
-                    max_phys_addr = end;
-                }
-                usable_regions_count += 1;
-            }
-        }
-
-        info!(
-            "[pmm] usable regions: {} (Usable), max phys addr: 0x{:x} ({} MB)",
-            usable_regions_count,
-            max_phys_addr as usize,
-            max_phys_addr / 1024 / 1024
-        );
-
-        // Align to 4KB
-        // total_frames 覆盖整个地址跨度（含空洞），因为 buddy 索引以 pfn 计，
-        // 任意可分配帧的元数据都必须可寻址。但 metadata 池只需覆盖实际 usable 内存。
-        let total_frames = (max_phys_addr as usize + 4095) / 4096;
-        info!("[pmm] total_frames (max span incl. holes): {}", total_frames);
-
-        // Calculate block parameters
-        let frame_size = size_of::<BuddyFrame>();
-        let frames_per_block = 4096 / frame_size;
-        let block_size = frames_per_block * 4096; // 每个 metadata block 覆盖的字节数
-        info!(
-            "[pmm] BuddyFrame size: {} B, frames_per_block: {}, block covers {} B ({} KB)",
-            frame_size,
-            frames_per_block,
-            block_size,
-            block_size / 1024
-        );
-
-        let metadata_map_len = (total_frames + frames_per_block - 1) / frames_per_block;
-
-        // 计算实际需要分配的 metadata block 数：遍历每个 usable 区域，
-        // 统计其覆盖的 block 范围。这样在稀疏内存布局下，metadata 池只按
-        // 真实内存量增长，而不是按最大物理地址跨度，避免大内存/空洞机器
-        // 上元数据过大导致放不进单个 usable 区域而 panic。
-        let mut needed_blocks = 0usize;
-        for entry in entries_iter.clone() {
-            if entry.typ != MemoryMapEntryType::Usable {
-                continue;
-            }
-            let start = entry.base as usize;
-            let end = (entry.base + entry.len) as usize;
-            if end <= start {
-                continue;
-            }
-            let first = start / block_size;
-            let last = (end - 1) / block_size;
-            // 累加该区域覆盖的 block 数（cap 到 metadata_map_len 上界）
-            needed_blocks = needed_blocks
-                .saturating_add((last - first + 1).min(metadata_map_len.saturating_sub(first)));
-        }
-        info!(
-            "[pmm] metadata_map_len (logical blocks): {}, needed metadata blocks across usable: {}",
-            metadata_map_len, needed_blocks
-        );
-
-        // Calculate sizes for arrays.
-        // 用 saturating 运算防御极端内存映射下的 usize 溢出。
-        // 注意：不再分配 `counts` 数组（见 find_metadata_storage 注释）。
-        //
-        // metadata_map 改为两级稀疏页表：只分配固定大小的一级表（L1），
-        // 每个条目覆盖 L1_ENTRIES 个 block。二级表（每块覆盖 L1_ENTRIES 个 block
-        // 的 `*mut BuddyFrame` 数组）仅在 process_range 触及相应 L1 项时按需分配。
-        // 这样 L1 体积恒定（8KB），不再随最高物理地址跨度膨胀。
-        let l1_len = (metadata_map_len.saturating_add(L1_ENTRIES - 1)) / L1_ENTRIES;
-        let metadata_map_size = l1_len.saturating_mul(size_of::<usize>()); // L1 表（指针数组）
-        let max_uninit_regions = usable_regions_count.saturating_mul(2) + PADDING_REGIONS;
-        let uninit_regions_size = max_uninit_regions.saturating_mul(size_of::<Option<UninitRegion>>());
-        // metadata 池只按实际 usable 内存覆盖的 block 数分配（含少量上浮余量）。
-        // 此外需预留两级页表的二级表空间：每个被触及的 L1 区间需要
-        // L2_BLOCKS 个 block（L2_ENTRIES 个指针 / 每 block 指针数）。
-        let l2_blocks_per_l1 = (L2_ENTRIES * size_of::<*mut BuddyFrame>()).div_ceil(4096);
-        // 最多触及的 L1 区间数不超过 metadata_map 的 L1 项数（l1_len）
-        let l1_len_for_pool = (metadata_map_len.saturating_add(L1_ENTRIES - 1)) / L1_ENTRIES;
-        let metadata_pool_blocks = needed_blocks
-            .saturating_add(PADDING_REGIONS)
-            .saturating_add(l1_len_for_pool.saturating_mul(l2_blocks_per_l1));
-        let metadata_pool_size = metadata_pool_blocks.saturating_mul(4096); // one 4K block per metadata block
-
-        info!(
-            "[pmm] L1 table: entries={} size={} B ({}) | L2: entries={}, blocks_per_l1={}",
-            l1_len,
-            metadata_map_size,
-            l1_len,
-            L2_ENTRIES,
-            l2_blocks_per_l1
-        );
-        info!(
-            "[pmm] uninit: max_regions={}, array_size={} B",
-            max_uninit_regions, uninit_regions_size
-        );
-        info!(
-            "[pmm] metadata pool: blocks={}, size={} KB (needed={} + pad={} + l2 for {} L1)",
-            metadata_pool_blocks,
-            metadata_pool_size / 1024,
-            needed_blocks,
-            PADDING_REGIONS,
-            l1_len_for_pool
-        );
-
-        timer.mark("memory map & sizing");
-
-        // 2. Allocate metadata map array, uninit regions array, and metadata pool
-        let (map_paddr, uninit_paddr, pool_paddr) = Self::find_metadata_storage(
-            mmap,
-            metadata_map_size,
-            uninit_regions_size,
-            metadata_pool_size,
-        );
-        if map_paddr == 0 {
-            panic!("PMM: metadata map placed at paddr 0");
-        }
-
-        info!(
-            "[pmm] metadata storage: map=0x{:x} ({} B) uninit=0x{:x} ({} B) pool=0x{:x} ({} KB)",
-            map_paddr,
-            metadata_map_size,
-            uninit_paddr,
-            uninit_regions_size,
-            pool_paddr,
-            metadata_pool_size / 1024
-        );
-
-        // Calculate reserved ranges for metadata structures
-        let map_end = map_paddr + metadata_map_size;
-        let uninit_end = uninit_paddr + uninit_regions_size;
-        let pool_end = pool_paddr + metadata_pool_size;
-
-        // Initialize pointers
-        let phys_offset = match arch::PHYS_OFFSET.get() {
-            Some(v) => *v,
-            None => return,
-        };
-        // 一级表（L1）：`*mut *mut BuddyFrame` 数组，初始全 null。
-        // 二级表在 process_range 触及对应 L1 项时按需分配。
-        let metadata_l1 = (phys_offset + map_paddr as u64) as *mut *mut *mut BuddyFrame;
-        // write_bytes 的第三个参数是字节数：l1_len 个 8 字节指针。
-        core::ptr::write_bytes(metadata_l1, 0, l1_len * size_of::<*mut *mut BuddyFrame>());
-
-        let uninit_regions_ptr = (phys_offset + uninit_paddr as u64) as *mut Option<UninitRegion>;
-        let uninit_regions = slice::from_raw_parts_mut(uninit_regions_ptr, max_uninit_regions);
-        let uninit_len = uninit_regions.len();
-
-        // Initialize arrays
-        for r in uninit_regions.iter_mut() {
-            *r = None;
-        }
-
-        self.config.call_once(|| AllocatorConfig {
-            total_frames,
-            metadata_l1,
-            metadata_map_len,
-            frames_per_block,
-        });
-
-        info!(
-            "[pmm] HHDM offset: 0x{:x}, metadata L1 @virt 0x{:x}, uninit array @virt 0x{:x}, pool @virt 0x{:x}",
-            phys_offset,
-            metadata_l1 as usize,
-            uninit_regions_ptr as usize,
-            (phys_offset + pool_paddr as u64) as usize
-        );
-        timer.mark("metadata arrays zeroed");
-
-        // 3. Allocate metadata blocks and record uninit regions
-        let mut blocks_allocated = 0;
-        let mut region_idx = 0;
-        let mut metadata_pool = MetadataPool {
-            base: (phys_offset + pool_paddr as u64) as *mut u8,
-            blocks: metadata_pool_blocks,
-            next: 0,
-            block_size: 4096,
-        };
-
-        // Simple array of reserved ranges, sorted
-        let mut reserved = [
-            (map_paddr, map_end),
-            (uninit_paddr, uninit_end),
-            (pool_paddr, pool_end),
-        ];
-        reserved.sort_unstable_by_key(|r| r.0);
-        info!(
-            "[pmm] reserved metadata ranges: map(0x{:x}-0x{:x}) uninit(0x{:x}-0x{:x}) pool(0x{:x}-0x{:x})",
-            reserved[0].0, reserved[0].1, reserved[1].0, reserved[1].1, reserved[2].0, reserved[2].1
-        );
-
-        for entry in entries_iter.clone() {
-            if entry.typ == MemoryMapEntryType::Usable {
-                let mut current = entry.base as usize;
-                let region_end = (entry.base + entry.len) as usize;
-                info!(
-                    "[pmm] == process usable region: phys 0x{:x}-0x{:x} ({} MB, {} frames) ==",
-                    current,
-                    region_end,
-                    (region_end - current) / 1024 / 1024,
-                    (region_end - current) / 4096
-                );
-
-                // Process gaps around reserved regions
-                for (r_start, r_end) in reserved.iter() {
-                    // If current region overlaps with reserved block
-                    if current < *r_end && region_end > *r_start {
-                        // Process gap before reserved block
-                        if *r_start > current {
-                            self.process_range(
-                                current,
-                                *r_start,
-                                &mut blocks_allocated,
-                                &mut region_idx,
-                                uninit_regions,
-                                &mut metadata_pool,
-                            );
-                        }
-                        // Advance past reserved block
-                        current = core::cmp::max(current, *r_end);
-                        // Align
-                        current = align_4k(current);
+            for entry in entries_iter.clone() {
+                if entry.typ == MemoryMapEntryType::Usable {
+                    let end = entry.base + entry.len;
+                    if end > max_phys_addr {
+                        max_phys_addr = end;
                     }
+                    usable_regions_count += 1;
                 }
+            }
 
-                // Process remaining part of the region
-                if current < region_end {
-                    self.process_range(
+            info!(
+                "[pmm] usable regions: {} (Usable), max phys addr: 0x{:x} ({} MB)",
+                usable_regions_count,
+                max_phys_addr as usize,
+                max_phys_addr / 1024 / 1024
+            );
+
+            // Align to 4KB
+            // total_frames 覆盖整个地址跨度（含空洞），因为 buddy 索引以 pfn 计，
+            // 任意可分配帧的元数据都必须可寻址。但 metadata 池只需覆盖实际 usable 内存。
+            let total_frames = (max_phys_addr as usize + 4095) / 4096;
+            info!(
+                "[pmm] total_frames (max span incl. holes): {}",
+                total_frames
+            );
+
+            // Calculate block parameters
+            let frame_size = size_of::<BuddyFrame>();
+            let frames_per_block = 4096 / frame_size;
+            let block_size = frames_per_block * 4096; // 每个 metadata block 覆盖的字节数
+            info!(
+                "[pmm] BuddyFrame size: {} B, frames_per_block: {}, block covers {} B ({} KB)",
+                frame_size,
+                frames_per_block,
+                block_size,
+                block_size / 1024
+            );
+
+            let metadata_map_len = (total_frames + frames_per_block - 1) / frames_per_block;
+
+            // 计算实际需要分配的 metadata block 数：遍历每个 usable 区域，
+            // 统计其覆盖的 block 范围。这样在稀疏内存布局下，metadata 池只按
+            // 真实内存量增长，而不是按最大物理地址跨度，避免大内存/空洞机器
+            // 上元数据过大导致放不进单个 usable 区域而 panic。
+            let mut needed_blocks = 0usize;
+            for entry in entries_iter.clone() {
+                if entry.typ != MemoryMapEntryType::Usable {
+                    continue;
+                }
+                let start = entry.base as usize;
+                let end = (entry.base + entry.len) as usize;
+                if end <= start {
+                    continue;
+                }
+                let first = start / block_size;
+                let last = (end - 1) / block_size;
+                // 累加该区域覆盖的 block 数（cap 到 metadata_map_len 上界）
+                needed_blocks = needed_blocks
+                    .saturating_add((last - first + 1).min(metadata_map_len.saturating_sub(first)));
+            }
+            info!(
+                "[pmm] metadata_map_len (logical blocks): {}, needed metadata blocks across usable: {}",
+                metadata_map_len, needed_blocks
+            );
+
+            // Calculate sizes for arrays.
+            // 用 saturating 运算防御极端内存映射下的 usize 溢出。
+            // 注意：不再分配 `counts` 数组（见 find_metadata_storage 注释）。
+            //
+            // metadata_map 改为两级稀疏页表：只分配固定大小的一级表（L1），
+            // 每个条目覆盖 L1_ENTRIES 个 block。二级表（每块覆盖 L1_ENTRIES 个 block
+            // 的 `*mut BuddyFrame` 数组）仅在 process_range 触及相应 L1 项时按需分配。
+            // 这样 L1 体积恒定（8KB），不再随最高物理地址跨度膨胀。
+            let l1_len = (metadata_map_len.saturating_add(L1_ENTRIES - 1)) / L1_ENTRIES;
+            let metadata_map_size = l1_len.saturating_mul(size_of::<usize>()); // L1 表（指针数组）
+            let max_uninit_regions = usable_regions_count.saturating_mul(2) + PADDING_REGIONS;
+            let uninit_regions_size =
+                max_uninit_regions.saturating_mul(size_of::<Option<UninitRegion>>());
+            // metadata 池只按实际 usable 内存覆盖的 block 数分配（含少量上浮余量）。
+            // 此外需预留两级页表的二级表空间：每个被触及的 L1 区间需要
+            // L2_BLOCKS 个 block（L2_ENTRIES 个指针 / 每 block 指针数）。
+            let l2_blocks_per_l1 = (L2_ENTRIES * size_of::<*mut BuddyFrame>()).div_ceil(4096);
+            // 最多触及的 L1 区间数不超过 metadata_map 的 L1 项数（l1_len）
+            let l1_len_for_pool = (metadata_map_len.saturating_add(L1_ENTRIES - 1)) / L1_ENTRIES;
+            let metadata_pool_blocks = needed_blocks
+                .saturating_add(PADDING_REGIONS)
+                .saturating_add(l1_len_for_pool.saturating_mul(l2_blocks_per_l1));
+            let metadata_pool_size = metadata_pool_blocks.saturating_mul(4096); // one 4K block per metadata block
+
+            info!(
+                "[pmm] L1 table: entries={} size={} B ({}) | L2: entries={}, blocks_per_l1={}",
+                l1_len, metadata_map_size, l1_len, L2_ENTRIES, l2_blocks_per_l1
+            );
+            info!(
+                "[pmm] uninit: max_regions={}, array_size={} B",
+                max_uninit_regions, uninit_regions_size
+            );
+            info!(
+                "[pmm] metadata pool: blocks={}, size={} KB (needed={} + pad={} + l2 for {} L1)",
+                metadata_pool_blocks,
+                metadata_pool_size / 1024,
+                needed_blocks,
+                PADDING_REGIONS,
+                l1_len_for_pool
+            );
+
+            timer.mark("memory map & sizing");
+
+            // 2. Allocate metadata map array, uninit regions array, and metadata pool
+            let (map_paddr, uninit_paddr, pool_paddr) = Self::find_metadata_storage(
+                mmap,
+                metadata_map_size,
+                uninit_regions_size,
+                metadata_pool_size,
+            );
+            if map_paddr == 0 {
+                panic!("PMM: metadata map placed at paddr 0");
+            }
+
+            info!(
+                "[pmm] metadata storage: map=0x{:x} ({} B) uninit=0x{:x} ({} B) pool=0x{:x} ({} KB)",
+                map_paddr,
+                metadata_map_size,
+                uninit_paddr,
+                uninit_regions_size,
+                pool_paddr,
+                metadata_pool_size / 1024
+            );
+
+            // Calculate reserved ranges for metadata structures
+            let map_end = map_paddr + metadata_map_size;
+            let uninit_end = uninit_paddr + uninit_regions_size;
+            let pool_end = pool_paddr + metadata_pool_size;
+
+            // Initialize pointers
+            let phys_offset = match arch::PHYS_OFFSET.get() {
+                Some(v) => *v,
+                None => return,
+            };
+            // 一级表（L1）：`*mut *mut BuddyFrame` 数组，初始全 null。
+            // 二级表在 process_range 触及对应 L1 项时按需分配。
+            let metadata_l1 = (phys_offset + map_paddr as u64) as *mut *mut *mut BuddyFrame;
+            // write_bytes 的第三个参数是字节数：l1_len 个 8 字节指针。
+            core::ptr::write_bytes(metadata_l1, 0, l1_len * size_of::<*mut *mut BuddyFrame>());
+
+            let uninit_regions_ptr =
+                (phys_offset + uninit_paddr as u64) as *mut Option<UninitRegion>;
+            let uninit_regions = slice::from_raw_parts_mut(uninit_regions_ptr, max_uninit_regions);
+            let uninit_len = uninit_regions.len();
+
+            // Initialize arrays
+            for r in uninit_regions.iter_mut() {
+                *r = None;
+            }
+
+            self.config.call_once(|| AllocatorConfig {
+                total_frames,
+                metadata_l1,
+                metadata_map_len,
+                frames_per_block,
+            });
+
+            info!(
+                "[pmm] HHDM offset: 0x{:x}, metadata L1 @virt 0x{:x}, uninit array @virt 0x{:x}, pool @virt 0x{:x}",
+                phys_offset,
+                metadata_l1 as usize,
+                uninit_regions_ptr as usize,
+                (phys_offset + pool_paddr as u64) as usize
+            );
+            timer.mark("metadata arrays zeroed");
+
+            // 3. Allocate metadata blocks and record uninit regions
+            let mut blocks_allocated = 0;
+            let mut region_idx = 0;
+            let mut metadata_pool = MetadataPool {
+                base: (phys_offset + pool_paddr as u64) as *mut u8,
+                blocks: metadata_pool_blocks,
+                next: 0,
+                block_size: 4096,
+            };
+
+            // Simple array of reserved ranges, sorted
+            let mut reserved = [
+                (map_paddr, map_end),
+                (uninit_paddr, uninit_end),
+                (pool_paddr, pool_end),
+            ];
+            reserved.sort_unstable_by_key(|r| r.0);
+            info!(
+                "[pmm] reserved metadata ranges: map(0x{:x}-0x{:x}) uninit(0x{:x}-0x{:x}) pool(0x{:x}-0x{:x})",
+                reserved[0].0,
+                reserved[0].1,
+                reserved[1].0,
+                reserved[1].1,
+                reserved[2].0,
+                reserved[2].1
+            );
+
+            for entry in entries_iter.clone() {
+                if entry.typ == MemoryMapEntryType::Usable {
+                    let mut current = entry.base as usize;
+                    let region_end = (entry.base + entry.len) as usize;
+                    info!(
+                        "[pmm] == process usable region: phys 0x{:x}-0x{:x} ({} MB, {} frames) ==",
                         current,
                         region_end,
-                        &mut blocks_allocated,
-                        &mut region_idx,
-                        uninit_regions,
-                        &mut metadata_pool,
+                        (region_end - current) / 1024 / 1024,
+                        (region_end - current) / 4096
                     );
+
+                    // Process gaps around reserved regions
+                    for (r_start, r_end) in reserved.iter() {
+                        // If current region overlaps with reserved block
+                        if current < *r_end && region_end > *r_start {
+                            // Process gap before reserved block
+                            if *r_start > current {
+                                self.process_range(
+                                    current,
+                                    *r_start,
+                                    &mut blocks_allocated,
+                                    &mut region_idx,
+                                    uninit_regions,
+                                    &mut metadata_pool,
+                                );
+                            }
+                            // Advance past reserved block
+                            current = core::cmp::max(current, *r_end);
+                            // Align
+                            current = align_4k(current);
+                        }
+                    }
+
+                    // Process remaining part of the region
+                    if current < region_end {
+                        self.process_range(
+                            current,
+                            region_end,
+                            &mut blocks_allocated,
+                            &mut region_idx,
+                            uninit_regions,
+                            &mut metadata_pool,
+                        );
+                    }
+                }
+            }
+
+            {
+                let now = rdtsc();
+                let cyc = now.wrapping_sub(timer.last);
+                timer.last = now;
+                match timer.elapsed(cyc) {
+                    Some((s, ms, ns)) => info!(
+                        "[pmm]   -- process usable regions ({} s / {} ms / {} ns / {} cycles): blocks_allocated={} / {} uninit_regions={}",
+                        s, ms, ns, cyc, blocks_allocated, metadata_map_len, region_idx
+                    ),
+                    None => info!(
+                        "[pmm]   -- process usable regions ({} cycles): blocks_allocated={} / {} uninit_regions={}",
+                        cyc, blocks_allocated, metadata_map_len, region_idx
+                    ),
+                }
+            }
+
+            info!(
+                "[pmm] Metadata blocks allocated: {} / {}",
+                blocks_allocated, metadata_map_len
+            );
+            info!(
+                "[pmm] Initialized with {} regions (Capacity: {})",
+                region_idx, uninit_len
+            );
+
+            {
+                let mut uninit = self.uninit.lock();
+                uninit.regions = uninit_regions;
+                uninit.last_uninit_idx = 0;
+            }
+
+            self.init_reserve(32);
+
+            {
+                let total = timer.total();
+                match timer.elapsed(total) {
+                    Some((s, ms, ns)) => info!(
+                        "[pmm] === LazyBuddy init done (total {} s / {} ms / {} ns / {} cycles) ===",
+                        s, ms, ns, total
+                    ),
+                    None => info!("[pmm] === LazyBuddy init done (total {} cycles) ===", total),
                 }
             }
         }
-
-        {
-            let now = rdtsc();
-            let cyc = now.wrapping_sub(timer.last);
-            timer.last = now;
-            match timer.elapsed(cyc) {
-                Some((s, ms, ns)) => info!(
-                    "[pmm]   -- process usable regions ({} s / {} ms / {} ns / {} cycles): blocks_allocated={} / {} uninit_regions={}",
-                    s, ms, ns, cyc, blocks_allocated, metadata_map_len, region_idx
-                ),
-                None => info!(
-                    "[pmm]   -- process usable regions ({} cycles): blocks_allocated={} / {} uninit_regions={}",
-                    cyc, blocks_allocated, metadata_map_len, region_idx
-                ),
-            }
-        }
-
-        info!(
-            "[pmm] Metadata blocks allocated: {} / {}",
-            blocks_allocated,
-            metadata_map_len
-        );
-        info!("[pmm] Initialized with {} regions (Capacity: {})", region_idx, uninit_len);
-
-        {
-            let mut uninit = self.uninit.lock();
-            uninit.regions = uninit_regions;
-            uninit.last_uninit_idx = 0;
-        }
-
-        self.init_reserve(32);
-
-        {
-            let total = timer.total();
-            match timer.elapsed(total) {
-                Some((s, ms, ns)) => info!(
-                    "[pmm] === LazyBuddy init done (total {} s / {} ms / {} ns / {} cycles) ===",
-                    s, ms, ns, total
-                ),
-                None => info!(
-                    "[pmm] === LazyBuddy init done (total {} cycles) ===",
-                    total
-                ),
-            }
-        }
-    }}
+    }
 
     // Helper to process a range of usable memory
     unsafe fn process_range(
@@ -543,104 +555,104 @@ impl LazyBuddyAllocator {
         region_idx: &mut usize,
         uninit_regions: &mut [Option<UninitRegion>],
         metadata_pool: &mut MetadataPool,
-    ) { unsafe {
-        let mut current = start;
-        // Align start to 4KB
-        current = align_4k(current);
+    ) {
+        unsafe {
+            let mut current = start;
+            // Align start to 4KB
+            current = align_4k(current);
 
-        let cfg = self.config();
-        let block_size = cfg.frames_per_block * 4096;
+            let cfg = self.config();
+            let block_size = cfg.frames_per_block * 4096;
 
-        if current >= end {
-            return;
-        }
-
-        let first_block = current / block_size;
-        let last_block = (end - 1) / block_size;
-
-        info!(
-            "[pmm]   process_range 0x{:x}-0x{:x} -> blocks [{}, {}] ({} blocks)",
-            current,
-            end,
-            first_block,
-            last_block,
-            last_block.saturating_sub(first_block) + 1
-        );
-
-        // Ensure metadata exists for all blocks covered by this range.
-        // 通过两级稀疏页表定位：L1[block_idx >> L1_SHIFT] 指向一个二级表，
-        // 二级表按需分配（仅在触及该 L1 区间时），从而让索引随真实内存按需生长。
-        let mut l2_tables_allocated = 0usize;
-        for block_idx in first_block..=last_block {
-            if block_idx >= cfg.metadata_map_len {
-                break;
+            if current >= end {
+                return;
             }
 
-            let l1_idx = block_idx >> L1_SHIFT;
-            let l2_idx = block_idx & L2_MASK;
+            let first_block = current / block_size;
+            let last_block = (end - 1) / block_size;
 
-            // 若该 L1 区间尚无二级表，则分配并清零（L2_ENTRIES 个指针 = L2_BLOCKS 个 block）
-            let l1 = cfg.metadata_l1;
-            if (*l1.add(l1_idx)).is_null() {
-                let l2_bytes = L2_ENTRIES * size_of::<*mut BuddyFrame>();
-                let l2_blocks = l2_bytes.div_ceil(metadata_pool.block_size);
-                let l2_base = metadata_pool.alloc_blocks(l2_blocks);
-                core::ptr::write_bytes(l2_base, 0, l2_blocks * metadata_pool.block_size);
-                *l1.add(l1_idx) = l2_base as *mut *mut BuddyFrame;
-                l2_tables_allocated += 1;
+            info!(
+                "[pmm]   process_range 0x{:x}-0x{:x} -> blocks [{}, {}] ({} blocks)",
+                current,
+                end,
+                first_block,
+                last_block,
+                last_block.saturating_sub(first_block) + 1
+            );
+
+            // Ensure metadata exists for all blocks covered by this range.
+            // 通过两级稀疏页表定位：L1[block_idx >> L1_SHIFT] 指向一个二级表，
+            // 二级表按需分配（仅在触及该 L1 区间时），从而让索引随真实内存按需生长。
+            let mut l2_tables_allocated = 0usize;
+            for block_idx in first_block..=last_block {
+                if block_idx >= cfg.metadata_map_len {
+                    break;
+                }
+
+                let l1_idx = block_idx >> L1_SHIFT;
+                let l2_idx = block_idx & L2_MASK;
+
+                // 若该 L1 区间尚无二级表，则分配并清零（L2_ENTRIES 个指针 = L2_BLOCKS 个 block）
+                let l1 = cfg.metadata_l1;
+                if (*l1.add(l1_idx)).is_null() {
+                    let l2_bytes = L2_ENTRIES * size_of::<*mut BuddyFrame>();
+                    let l2_blocks = l2_bytes.div_ceil(metadata_pool.block_size);
+                    let l2_base = metadata_pool.alloc_blocks(l2_blocks);
+                    core::ptr::write_bytes(l2_base, 0, l2_blocks * metadata_pool.block_size);
+                    *l1.add(l1_idx) = l2_base as *mut *mut BuddyFrame;
+                    l2_tables_allocated += 1;
+                    info!(
+                        "[pmm]     allocated L2 table for L1[{}] @virt 0x{:x} ({} blocks)",
+                        l1_idx, l2_base as usize, l2_blocks
+                    );
+                }
+                let l2 = *l1.add(l1_idx);
+
+                let entry_ptr = l2.add(l2_idx);
+                if (*entry_ptr).is_null() {
+                    let block_ptr = metadata_pool.alloc_block();
+                    *entry_ptr = block_ptr;
+
+                    // Initialize block memory
+                    for i in 0..cfg.frames_per_block {
+                        block_ptr.add(i).write(BuddyFrame::new());
+                    }
+
+                    *blocks_allocated += 1;
+                }
+            }
+
+            if l2_tables_allocated > 0 {
                 info!(
-                    "[pmm]     allocated L2 table for L1[{}] @virt 0x{:x} ({} blocks)",
-                    l1_idx,
-                    l2_base as usize,
-                    l2_blocks
+                    "[pmm]     built {} L2 tables, cumulative metadata blocks: {}",
+                    l2_tables_allocated, *blocks_allocated
                 );
             }
-            let l2 = *l1.add(l1_idx);
 
-            let entry_ptr = l2.add(l2_idx);
-            if (*entry_ptr).is_null() {
-                let block_ptr = metadata_pool.alloc_block();
-                *entry_ptr = block_ptr;
+            // The remaining memory can be used as uninit regions
+            if current < end {
+                let start_pfn = current / 4096;
+                let end_pfn = end / 4096;
 
-                // Initialize block memory
-                for i in 0..cfg.frames_per_block {
-                    block_ptr.add(i).write(BuddyFrame::new());
-                }
-
-                *blocks_allocated += 1;
-            }
-        }
-
-        if l2_tables_allocated > 0 {
-            info!(
-                "[pmm]     built {} L2 tables, cumulative metadata blocks: {}",
-                l2_tables_allocated, *blocks_allocated
-            );
-        }
-
-        // The remaining memory can be used as uninit regions
-        if current < end {
-            let start_pfn = current / 4096;
-            let end_pfn = end / 4096;
-
-            if start_pfn < end_pfn {
-                if *region_idx < uninit_regions.len() {
-                    uninit_regions[*region_idx] = Some(UninitRegion { start_pfn, end_pfn });
-                    info!(
-                        "[pmm]     uninit region #{}: pfn {}..{} -> phys 0x{:x}-0x{:x} ({} frames, {} MB)",
-                        *region_idx,
-                        start_pfn,
-                        end_pfn,
-                        start_pfn * 4096,
-                        end_pfn * 4096,
-                        end_pfn - start_pfn,
-                        (end_pfn - start_pfn) * 4096 / 1024 / 1024
-                    );
-                    *region_idx += 1;
-                } else {
-                    warn!("PMM: Dropping usable memory region (uninit regions full)");
+                if start_pfn < end_pfn {
+                    if *region_idx < uninit_regions.len() {
+                        uninit_regions[*region_idx] = Some(UninitRegion { start_pfn, end_pfn });
+                        info!(
+                            "[pmm]     uninit region #{}: pfn {}..{} -> phys 0x{:x}-0x{:x} ({} frames, {} MB)",
+                            *region_idx,
+                            start_pfn,
+                            end_pfn,
+                            start_pfn * 4096,
+                            end_pfn * 4096,
+                            end_pfn - start_pfn,
+                            (end_pfn - start_pfn) * 4096 / 1024 / 1024
+                        );
+                        *region_idx += 1;
+                    } else {
+                        warn!("PMM: Dropping usable memory region (uninit regions full)");
+                    }
                 }
             }
         }
-    }}
+    }
 }

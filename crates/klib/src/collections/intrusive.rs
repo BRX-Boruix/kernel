@@ -19,13 +19,11 @@ use core::ptr;
 /// `$node`：`*mut IntrusiveNode`；`$ty`：容器类型；`$field`：节点字段名。
 #[macro_export]
 macro_rules! container_of {
-    ($node:expr, $ty:ty, $field:ident) => {
-        {
-            let node_ptr = $node as usize;
-            let offset = core::mem::offset_of!($ty, $field);
-            (node_ptr - offset) as *mut $ty
-        }
-    };
+    ($node:expr, $ty:ty, $field:ident) => {{
+        let node_ptr = $node as usize;
+        let offset = core::mem::offset_of!($ty, $field);
+        (node_ptr - offset) as *mut $ty
+    }};
 }
 
 /// 侵入式链表节点，内嵌于容器对象中。
@@ -216,7 +214,11 @@ impl<T: Intrusible> IntrusiveList<T> {
     /// 不可变迭代。
     pub fn iter(&self) -> Iter<'_, T> {
         let s = ptr::addr_of!(self.head);
-        let next = if self.head.next.is_null() { s } else { self.head.next };
+        let next = if self.head.next.is_null() {
+            s
+        } else {
+            self.head.next
+        };
         Iter {
             head: s,
             cur: next,
@@ -227,7 +229,11 @@ impl<T: Intrusible> IntrusiveList<T> {
     /// 可变迭代。
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         let s = ptr::addr_of_mut!(self.head);
-        let next = if self.head.next.is_null() { s } else { self.head.next };
+        let next = if self.head.next.is_null() {
+            s
+        } else {
+            self.head.next
+        };
         IterMut {
             head: s,
             cur: next,

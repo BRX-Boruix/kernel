@@ -17,11 +17,26 @@ pub fn test_paging() {
     let mut pt = X86PageTable::new_empty().expect("no page table frame");
     let phys4k = mm::allocate_frame().expect("no 4k frame").start_paddr();
     let vaddr4k = VirtAddr::new(0x0000_0000_4000_0000);
-    pt.map(vaddr4k, PhysAddr::new(phys4k), PageSize::Size4K, PageFlags::empty().writable())
-        .expect("4k map");
-    info!("[test-paging] 4K: mapped {} -> {}", vaddr4k.as_u64(), phys4k);
-    info!("[test-paging] 4K: translate -> {:#x}", pt.translate(vaddr4k).unwrap().as_u64());
-    info!("[test-paging] 4K: unmap -> {:#x}", pt.unmap(vaddr4k).unwrap().as_u64());
+    pt.map(
+        vaddr4k,
+        PhysAddr::new(phys4k),
+        PageSize::Size4K,
+        PageFlags::empty().writable(),
+    )
+    .expect("4k map");
+    info!(
+        "[test-paging] 4K: mapped {} -> {}",
+        vaddr4k.as_u64(),
+        phys4k
+    );
+    info!(
+        "[test-paging] 4K: translate -> {:#x}",
+        pt.translate(vaddr4k).unwrap().as_u64()
+    );
+    info!(
+        "[test-paging] 4K: unmap -> {:#x}",
+        pt.unmap(vaddr4k).unwrap().as_u64()
+    );
     mm::deallocate_frame(PhysFrame::from_paddr_raw(phys4k));
 
     // ---- 2. 2MB 大页映射（逻辑验证）----
@@ -30,15 +45,26 @@ pub fn test_paging() {
         .expect("no 2M frame")
         .start_paddr();
     let vaddr2m = VirtAddr::new(0x0000_0000_5000_0000); // 2MB 对齐
-    pt2.map(vaddr2m, PhysAddr::new(phys2m), PageSize::Size2M, PageFlags::empty().writable())
-        .expect("2M map");
+    pt2.map(
+        vaddr2m,
+        PhysAddr::new(phys2m),
+        PageSize::Size2M,
+        PageFlags::empty().writable(),
+    )
+    .expect("2M map");
     info!(
         "[test-paging] 2M: mapped {} -> {}",
         vaddr2m.as_u64(),
         phys2m
     );
-    info!("[test-paging] 2M: translate -> {:#x}", pt2.translate(vaddr2m).unwrap().as_u64());
-    info!("[test-paging] 2M: unmap -> {:#x}", pt2.unmap(vaddr2m).unwrap().as_u64());
+    info!(
+        "[test-paging] 2M: translate -> {:#x}",
+        pt2.translate(vaddr2m).unwrap().as_u64()
+    );
+    info!(
+        "[test-paging] 2M: unmap -> {:#x}",
+        pt2.unmap(vaddr2m).unwrap().as_u64()
+    );
     mm::deallocate_frame(PhysFrame::from_paddr_raw(phys2m));
 
     // ---- 3. MemorySet 地址空间抽象（经 arch 抽象层）----
@@ -64,7 +90,9 @@ pub fn test_paging() {
     info!("[test-paging] MemorySet areas={}", ms.areas());
     info!(
         "[test-paging] MemorySet translate[1] -> {:#x}",
-        pt3.translate(VirtAddr::new(0x0000_0000_6000_1000)).unwrap().as_u64()
+        pt3.translate(VirtAddr::new(0x0000_0000_6000_1000))
+            .unwrap()
+            .as_u64()
     );
     for f in frames {
         mm::deallocate_frame(PhysFrame::from_paddr_raw(f));
@@ -149,8 +177,7 @@ pub fn test_user_address_space() {
 // ---- M1.3 按需分页测试 ----
 
 /// 当前测试用户地址空间指针（M1 简化：单地址空间，M3 后改为进程结构）。
-static TEST_FAULT_US: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static TEST_FAULT_US: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// #PF 回调：转发给当前测试用户地址空间的 `handle_page_fault`。
 extern "C" fn test_fault_handler(vaddr: u64, error_code: u64) -> bool {
@@ -191,7 +218,10 @@ pub fn test_demand_paging() {
     );
 
     // 预留区域尚未映射
-    assert!(us.translate(start).is_none(), "reserved page should be unmapped");
+    assert!(
+        us.translate(start).is_none(),
+        "reserved page should be unmapped"
+    );
 
     // 注册 #PF 回调（指向本地址空间的缺页处理器）
     let us_ptr = &mut us as *mut mm::user_space::UserAddressSpace<X86PageTable> as usize;
@@ -244,9 +274,7 @@ pub fn test_demand_paging() {
 /// 3. `brk`：查询/扩展堆断点，堆区访问按需补页。
 pub fn test_address_space_alloc() {
     use core::sync::atomic::Ordering;
-    use mm::user_space::{
-        USER_HEAP_BASE, USER_STACK_TOP, DEFAULT_STACK_SIZE,
-    };
+    use mm::user_space::{DEFAULT_STACK_SIZE, USER_HEAP_BASE, USER_STACK_TOP};
 
     let mut us = mm::user_space::UserAddressSpace::<X86PageTable>::new().expect("new us");
     info!("[test-alloc] created user address space");
@@ -262,8 +290,12 @@ pub fn test_address_space_alloc() {
     assert_eq!(us.area_count(), 1);
 
     // 2. mmap 两段，验证不重叠且不与栈重叠
-    let m1 = us.mmap_user(64 * 1024, arch::PageFlags::empty().writable()).expect("mmap1");
-    let m2 = us.mmap_user(128 * 1024, arch::PageFlags::empty().writable()).expect("mmap2");
+    let m1 = us
+        .mmap_user(64 * 1024, arch::PageFlags::empty().writable())
+        .expect("mmap1");
+    let m2 = us
+        .mmap_user(128 * 1024, arch::PageFlags::empty().writable())
+        .expect("mmap2");
     info!(
         "[test-alloc] mmap1={:#x}..{:#x}, mmap2={:#x}..{:#x}",
         m1,
@@ -279,11 +311,7 @@ pub fn test_address_space_alloc() {
     let b0 = us.brk(0).expect("brk query");
     assert_eq!(b0, USER_HEAP_BASE);
     let b1 = us.brk(USER_HEAP_BASE + 32 * 1024).expect("brk extend");
-    info!(
-        "[test-alloc] brk {:#x} -> {:#x}",
-        b0,
-        b1
-    );
+    info!("[test-alloc] brk {:#x} -> {:#x}", b0, b1);
     assert_eq!(b1, USER_HEAP_BASE + 32 * 1024);
     assert_eq!(us.heap_break(), b1);
 
@@ -460,7 +488,11 @@ pub fn test_timer() {
         arch_x86_64::interrupts::halt();
         rounds += 1;
         if rounds % 50 == 0 {
-            info!("[timer] ... rounds={} ticks={}", rounds, arch_x86_64::lapic::ticks());
+            info!(
+                "[timer] ... rounds={} ticks={}",
+                rounds,
+                arch_x86_64::lapic::ticks()
+            );
         }
         if rounds > 500 {
             info!(
@@ -504,7 +536,9 @@ pub fn test_time_abstraction() {
     let m1 = X8664Timer::now_millis();
     info!(
         "[time] monotonic: {}ms -> {}ms (+{}ms, 5 ticks @100Hz = ~50ms)",
-        m0, m1, m1.saturating_sub(m0)
+        m0,
+        m1,
+        m1.saturating_sub(m0)
     );
     // 5 tick @100Hz ≈ 50ms，下限 20ms 保证时钟确实推进；上限放宽到 5s，
     // 因为 QEMU TCG（无 KVM 加速）下 LAPIC PIT 校准不稳定会导致 tick
@@ -535,8 +569,15 @@ pub fn test_time_abstraction() {
     let t2 = arch_x86_64::lapic::ticks();
     X8664Timer::sleep_us(20_000); // 20ms
     let elapsed_ticks = arch_x86_64::lapic::ticks().wrapping_sub(t2);
-    info!("[time] sleep_us(20ms) cost {} ticks (~{}ms)", elapsed_ticks, elapsed_ticks * 10);
-    assert!(elapsed_ticks >= 1 && elapsed_ticks <= 20, "sleep_us drifted");
+    info!(
+        "[time] sleep_us(20ms) cost {} ticks (~{}ms)",
+        elapsed_ticks,
+        elapsed_ticks * 10
+    );
+    assert!(
+        elapsed_ticks >= 1 && elapsed_ticks <= 20,
+        "sleep_us drifted"
+    );
 
     info!("[time] time abstraction tests passed");
 }
@@ -553,13 +594,16 @@ pub fn test_sleep_accuracy() {
     let delta = after.saturating_sub(before);
     info!(
         "[sleep] sleep_nanos({}ns) -> now delta = {} ns ({} ms)",
-        target, delta, delta / 1_000_000
+        target,
+        delta,
+        delta / 1_000_000
     );
     // 允许较大容差（QEMU TCG 下时钟抖动），但必须真正阻塞（>= 0.5s）。
     assert!(
         delta >= 500_000_000,
         "sleep_nanos returned too early: delta={}ns (expected ~{}ns)",
-        delta, target
+        delta,
+        target
     );
     info!("[sleep] sleep accuracy test passed");
 }
@@ -661,7 +705,9 @@ fn syscall_user_code() -> [u8; 200] {
         }};
     }
     macro_rules! int80 {
-        () => { emit!(0xCD, 0x80); };
+        () => {
+            emit!(0xCD, 0x80);
+        };
     }
     macro_rules! store_rax {
         ($a:expr) => {{
@@ -795,21 +841,37 @@ fn sched_user_code() -> [u8; 96] {
         ($($b:expr),*) => { $( c[i] = $b; i += 1; )* };
     }
     // mov rax, SYS_STREAM_WRITE(0x13)
-    emit!(0x48, 0xB8); c[i..i + 8].copy_from_slice(&0x13u64.to_le_bytes()); i += 8;
+    emit!(0x48, 0xB8);
+    c[i..i + 8].copy_from_slice(&0x13u64.to_le_bytes());
+    i += 8;
     // mov rdi, 1 (fd=stdout)
-    emit!(0x48, 0xBF); c[i..i + 8].copy_from_slice(&1u64.to_le_bytes()); i += 8;
+    emit!(0x48, 0xBF);
+    c[i..i + 8].copy_from_slice(&1u64.to_le_bytes());
+    i += 8;
     // mov rsi, MSG_ADDR
-    emit!(0x48, 0xBE); c[i..i + 8].copy_from_slice(&MSG_ADDR.to_le_bytes()); i += 8;
+    emit!(0x48, 0xBE);
+    c[i..i + 8].copy_from_slice(&MSG_ADDR.to_le_bytes());
+    i += 8;
     // mov rdx, 1 (len)
-    emit!(0x48, 0xBA); c[i..i + 8].copy_from_slice(&1u64.to_le_bytes()); i += 8;
+    emit!(0x48, 0xBA);
+    c[i..i + 8].copy_from_slice(&1u64.to_le_bytes());
+    i += 8;
     // mov r10, u64::MAX (offset = stream write)
-    emit!(0x49, 0xC7, 0xC2); c[i..i + 4].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); i += 4;
+    emit!(0x49, 0xC7, 0xC2);
+    c[i..i + 4].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+    i += 4;
     // int 0x80 (write)
     emit!(0xCD, 0x80);
     // mov rax, SYS_TASK_WAIT(0x32)：主动让出 (target_pid=0, timeout=0)
-    emit!(0x48, 0xB8); c[i..i + 8].copy_from_slice(&0x32u64.to_le_bytes()); i += 8;
-    emit!(0x48, 0xBF); c[i..i + 8].copy_from_slice(&0u64.to_le_bytes()); i += 8;
-    emit!(0x48, 0xBE); c[i..i + 8].copy_from_slice(&0u64.to_le_bytes()); i += 8;
+    emit!(0x48, 0xB8);
+    c[i..i + 8].copy_from_slice(&0x32u64.to_le_bytes());
+    i += 8;
+    emit!(0x48, 0xBF);
+    c[i..i + 8].copy_from_slice(&0u64.to_le_bytes());
+    i += 8;
+    emit!(0x48, 0xBE);
+    c[i..i + 8].copy_from_slice(&0u64.to_le_bytes());
+    i += 8;
     // int 0x80 (yield)
     emit!(0xCD, 0x80);
     // jmp $（死循环）
@@ -890,8 +952,8 @@ pub fn test_scheduler() {
 /// 2. `get` / `get_mut` 访问进程字段与状态切换。
 /// 3. `terminate` 回收 pid，再 `spawn` 复用该 pid。
 pub fn test_process_table() {
-    use task::{ProcessTable, TaskState};
     use mm::user_space::UserAddressSpace;
+    use task::{ProcessTable, TaskState};
 
     info!("[test-process] === M3.1: process table + pid mgmt ===");
 
@@ -997,7 +1059,9 @@ pub fn test_cow_clone() {
 
     // 1. 父映射一可写数据页并预填内容。
     let data_frame = mm::allocate_frame().expect("data frame").start_paddr();
-    unsafe { core::ptr::write_volatile(arch::phys_to_virt(data_frame) as *mut u64, 0xDEAD_BEEFu64) };
+    unsafe {
+        core::ptr::write_volatile(arch::phys_to_virt(data_frame) as *mut u64, 0xDEAD_BEEFu64)
+    };
     parent
         .map_user(
             VirtAddr::new(DATA),
@@ -1015,8 +1079,14 @@ pub fn test_cow_clone() {
 
     // 2. clone_cow：子共享同一物理帧，双方页只读，引用计数 1→2。
     let mut child = parent.clone_cow().expect("clone cow");
-    let child_phys = child.translate(VirtAddr::new(DATA)).expect("child translate").as_u64();
-    assert_eq!(child_phys, data_frame, "child initially shares parent frame");
+    let child_phys = child
+        .translate(VirtAddr::new(DATA))
+        .expect("child translate")
+        .as_u64();
+    assert_eq!(
+        child_phys, data_frame,
+        "child initially shares parent frame"
+    );
     assert_eq!(mm::frame_refcount(data_frame), 2, "shared frame refcount=2");
     info!(
         "[cow-test] after clone: parent={:#x} child={:#x} refcount={}",
@@ -1028,7 +1098,10 @@ pub fn test_cow_clone() {
     // 3. 子写触发 COW：模拟 #PF 写故障（error_code bit1=W）→ handle_page_fault 复制。
     let handled = child.handle_page_fault(DATA, 0b10);
     assert!(handled, "child write fault handled by COW");
-    let child_new = child.translate(VirtAddr::new(DATA)).expect("child after cow translate").as_u64();
+    let child_new = child
+        .translate(VirtAddr::new(DATA))
+        .expect("child after cow translate")
+        .as_u64();
     assert_ne!(child_new, data_frame, "child page copied to new frame");
     assert_eq!(
         unsafe { core::ptr::read_volatile(arch::phys_to_virt(child_new) as *const u64) },
@@ -1042,7 +1115,11 @@ pub fn test_cow_clone() {
         0xDEAD_BEEFu64,
         "parent unchanged after child write"
     );
-    assert_eq!(mm::frame_refcount(data_frame), 1, "parent frame refcount back to 1");
+    assert_eq!(
+        mm::frame_refcount(data_frame),
+        1,
+        "parent frame refcount back to 1"
+    );
     info!(
         "[cow-test] child copied to phys={:#x} value={:#x}; parent still={:#x}",
         child_new,
@@ -1053,8 +1130,14 @@ pub fn test_cow_clone() {
     // 4. 父写触发父侧 COW（父页也变只读）：父子物理帧完全分离。
     let handled_p = parent.handle_page_fault(DATA, 0b10);
     assert!(handled_p, "parent write fault handled by COW");
-    let parent_new = parent.translate(VirtAddr::new(DATA)).expect("parent after cow translate").as_u64();
-    assert_ne!(parent_new, child_new, "parent and child pages fully separated");
+    let parent_new = parent
+        .translate(VirtAddr::new(DATA))
+        .expect("parent after cow translate")
+        .as_u64();
+    assert_ne!(
+        parent_new, child_new,
+        "parent and child pages fully separated"
+    );
 
     info!(
         "[cow-test] final: parent={:#x} child={:#x} (fully separated)",
@@ -1084,8 +1167,14 @@ pub fn test_ipc() {
     let va = crate::ipc::shm_map(shm_id, &mut as_a).expect("shm_map a");
     let vb = crate::ipc::shm_map(shm_id, &mut as_b).expect("shm_map b");
     // 两地址空间映射到同一物理帧（共享）。
-    let phys_a = as_a.translate(VirtAddr::new(va)).expect("a translate").as_u64();
-    let phys_b = as_b.translate(VirtAddr::new(vb)).expect("b translate").as_u64();
+    let phys_a = as_a
+        .translate(VirtAddr::new(va))
+        .expect("a translate")
+        .as_u64();
+    let phys_b = as_b
+        .translate(VirtAddr::new(vb))
+        .expect("b translate")
+        .as_u64();
     assert_eq!(phys_a, phys_b, "A/B share same physical frame");
     info!(
         "[ipc-test] shm id={} va={:#x} vb={:#x} shared_phys={:#x}",
@@ -1107,22 +1196,52 @@ pub fn test_ipc() {
     // ---- 2. 管道（数据流 + 非死锁） ----
     let pipe_id = crate::ipc::pipe_create().expect("pipe_create");
     let mut frame = arch_x86_64::interrupts::InterruptFrame {
-        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
-        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
-        vector: 0, error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        vector: 0,
+        error_code: 0,
+        rip: 0,
+        cs: 0,
+        rflags: 0,
+        rsp: 0,
+        ss: 0,
     };
     let mut src = [0u8; 8];
     src[..5].copy_from_slice(b"hello");
-    let n = crate::ipc::pipe_write(&mut frame, pipe_id, src.as_ptr() as u64, 5).expect("pipe_write");
+    let n =
+        crate::ipc::pipe_write(&mut frame, pipe_id, src.as_ptr() as u64, 5).expect("pipe_write");
     assert_eq!(n, 5, "wrote 5 bytes");
     let mut dst = [0u8; 8];
-    let n = crate::ipc::pipe_read(&mut frame, pipe_id, dst.as_mut_ptr() as u64, 8).expect("pipe_read");
+    let n =
+        crate::ipc::pipe_read(&mut frame, pipe_id, dst.as_mut_ptr() as u64, 8).expect("pipe_read");
     assert_eq!(n, 5, "read 5 bytes");
     assert_eq!(&dst[..5], b"hello", "pipe content preserved");
-    info!("[ipc-test] pipe wrote {} read {} payload='{}'", 5, n, core::str::from_utf8(&dst[..5]).unwrap());
+    info!(
+        "[ipc-test] pipe wrote {} read {} payload='{}'",
+        5,
+        n,
+        core::str::from_utf8(&dst[..5]).unwrap()
+    );
     // 空管道读：无数据、无进程可阻塞 → WouldBlock（不死锁）。
     let e = crate::ipc::pipe_read(&mut frame, pipe_id, dst.as_mut_ptr() as u64, 4).unwrap_err();
-    assert_eq!(e, klib::error::Error::WouldBlock, "empty pipe read -> WouldBlock");
+    assert_eq!(
+        e,
+        klib::error::Error::WouldBlock,
+        "empty pipe read -> WouldBlock"
+    );
     crate::ipc::pipe_close(pipe_id).expect("pipe_close");
     info!("[ipc-test] PASS");
 }
@@ -1203,11 +1322,14 @@ pub fn test_process_reclaim() {
 fn usermode_fault_code() -> [u8; 26] {
     use usermode::{MAGIC, MAGIC_ADDR};
     let mut c = [0u8; 26];
-    c[0] = 0x48; c[1] = 0xB8; // mov rax, imm64
+    c[0] = 0x48;
+    c[1] = 0xB8; // mov rax, imm64
     c[2..10].copy_from_slice(&MAGIC.to_le_bytes());
-    c[10] = 0x48; c[11] = 0xA3; // mov [moffs64], rax
+    c[10] = 0x48;
+    c[11] = 0xA3; // mov [moffs64], rax
     c[12..20].copy_from_slice(&MAGIC_ADDR.to_le_bytes());
-    c[20] = 0x0F; c[21] = 0x0B; // ud2（非法指令 → #UD）
+    c[20] = 0x0F;
+    c[21] = 0x0B; // ud2（非法指令 → #UD）
     c[22..].fill(0x90); // nop 填充
     c
 }
@@ -1253,11 +1375,7 @@ pub fn test_spawn_user_fault() {
     let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
     let code = usermode_fault_code();
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            code.as_ptr(),
-            (code_frame + off) as *mut u8,
-            code.len(),
-        );
+        core::ptr::copy_nonoverlapping(code.as_ptr(), (code_frame + off) as *mut u8, code.len());
     }
     us.map_user(
         VirtAddr::new(CODE_ADDR),
@@ -1289,7 +1407,10 @@ pub fn test_spawn_user_fault() {
     let pid = table
         .spawn(CODE_ADDR, stack_top, 0xffff_ffff_801b_6910, us)
         .expect("spawn process");
-    info!("[test-fault] spawned pid={} (code: write magic then ud2)", pid);
+    info!(
+        "[test-fault] spawned pid={} (code: write magic then ud2)",
+        pid
+    );
 
     // 注册用户态异常处理器：终止崩溃进程。
     arch_x86_64::interrupts::register_user_exception_handler(user_fault_handler);
@@ -1377,8 +1498,7 @@ pub fn test_cpu_entropy() {
 ///
 /// 正常路径不打断 LAPIC 定时器（返回 false 表示未处理，继续调用下一个），
 /// 用于验证共享表多 handler 分发不冲突。
-static SHARED_IRQ_CALLS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static SHARED_IRQ_CALLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 extern "C" fn shared_irq_observer(_irq: u8) -> bool {
     // 观察者只计数，不认领（返回 false），验证共享分发会继续到主 handler。
@@ -1405,7 +1525,11 @@ pub fn test_shared_irq() {
 
     info!("[irq] === T7: shared IRQ ===");
     info!("[irq] IRQ0 handlers before: {}", irq_handler_count(0));
-    assert_eq!(irq_handler_count(0), 1, "LAPIC timer handler expected on IRQ0");
+    assert_eq!(
+        irq_handler_count(0),
+        1,
+        "LAPIC timer handler expected on IRQ0"
+    );
 
     // 1. 注销 LAPIC handler，把共享观察者注册到 slot 0。
     assert!(
@@ -1420,7 +1544,11 @@ pub fn test_shared_irq() {
         register_irq(0, arch_x86_64::lapic::lapic_timer_handler),
         "re-register lapic handler"
     );
-    assert_eq!(irq_handler_count(0), 2, "two shared handlers on IRQ0 expected");
+    assert_eq!(
+        irq_handler_count(0),
+        2,
+        "two shared handlers on IRQ0 expected"
+    );
 
     // 2. 重复注册同一 handler 应去重。
     assert!(
@@ -1451,7 +1579,10 @@ pub fn test_shared_irq() {
     );
 
     // 4. 注销观察者并重排：恢复为仅 LAPIC handler（slot 0）。
-    assert!(unregister_irq(0, shared_irq_observer), "unregister observer");
+    assert!(
+        unregister_irq(0, shared_irq_observer),
+        "unregister observer"
+    );
     // 观察者在 slot 0 被移除后，LAPIC 在 slot 1；重新注册 LAPIC 去重（仍 1 个）。
     // 为保持槽位干净，把 LAPIC 注销后重新注册到 slot 0。
     assert!(
@@ -1573,40 +1704,42 @@ pub fn test_hpet() {
 // ---- T7：嵌套控制与优先级 ----
 
 /// IRQ1（prio=12）探针：记录进入时的 IF 与当前优先级，再触发 IRQ2（prio=1，更低）。
-static NEST_IRQ1_IF: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static NEST_IRQ1_IF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static NEST_IRQ1_PRIO: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 extern "C" fn nested_probe_irq1(_irq: u8) -> bool {
     use arch_x86_64::interrupts::{current_irq_priority, interrupts_enabled};
-    NEST_IRQ1_IF.store(
-        interrupts_enabled(),
+    NEST_IRQ1_IF.store(interrupts_enabled(), core::sync::atomic::Ordering::Relaxed);
+    NEST_IRQ1_PRIO.store(
+        current_irq_priority(),
         core::sync::atomic::Ordering::Relaxed,
     );
-    NEST_IRQ1_PRIO.store(current_irq_priority(), core::sync::atomic::Ordering::Relaxed);
     // 处理中再触发 IRQ2（prio=1 < IRQ1 的 12）：应不能打断（IF 保持关）。
-    unsafe { core::arch::asm!("int $0x22"); }
+    unsafe {
+        core::arch::asm!("int $0x22");
+    }
     true // 认领，避免对 LAPIC in-service 误 EOI
 }
 
 /// IRQ2（prio=1）探针：记录进入时的 IF 与当前优先级。
-static NEST_IRQ2_IF: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static NEST_IRQ2_IF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static NEST_IRQ2_PRIO: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 extern "C" fn nested_probe_irq2(_irq: u8) -> bool {
     use arch_x86_64::interrupts::{current_irq_priority, interrupts_enabled};
-    NEST_IRQ2_IF.store(
-        interrupts_enabled(),
+    NEST_IRQ2_IF.store(interrupts_enabled(), core::sync::atomic::Ordering::Relaxed);
+    NEST_IRQ2_PRIO.store(
+        current_irq_priority(),
         core::sync::atomic::Ordering::Relaxed,
     );
-    NEST_IRQ2_PRIO.store(current_irq_priority(), core::sync::atomic::Ordering::Relaxed);
     true
 }
 
 /// IRQ0 观察者：LAPIC tick 分发时触发 IRQ1（int 0x21），驱动嵌套链。
 extern "C" fn nested_trigger(_irq: u8) -> bool {
-    unsafe { core::arch::asm!("int $0x21"); }
+    unsafe {
+        core::arch::asm!("int $0x21");
+    }
     false // 不认领，LAPIC handler 继续
 }
 
@@ -1620,11 +1753,11 @@ extern "C" fn nested_trigger(_irq: u8) -> bool {
 /// - 嵌套开启：IRQ1（更高优先级）打断 IRQ0 → IF=1；IRQ2（更低优先级）
 ///   在 IRQ1 处理中不能打断 → IF=0。
 pub fn test_nested_irq_priority() {
-    use core::sync::atomic::Ordering;
     use arch_x86_64::interrupts::{
-        irq_handler_count, irq_priority, nested_irq_enabled, register_irq, set_irq_priority,
-        set_nested_irq, unregister_irq, IRQ_PRIO_MAX, IRQ_PRIO_NONE,
+        IRQ_PRIO_MAX, IRQ_PRIO_NONE, irq_handler_count, irq_priority, nested_irq_enabled,
+        register_irq, set_irq_priority, set_nested_irq, unregister_irq,
     };
+    use core::sync::atomic::Ordering;
 
     info!("[irq] === T7: nested IRQ & priority ===");
 
@@ -1680,8 +1813,16 @@ pub fn test_nested_irq_priority() {
         !NEST_IRQ1_IF.load(Ordering::Relaxed),
         "nested off: IRQ1 should NOT preempt (IF=0)"
     );
-    assert_eq!(NEST_IRQ1_PRIO.load(Ordering::Relaxed), 12, "IRQ1 prio recorded");
-    assert_eq!(NEST_IRQ2_PRIO.load(Ordering::Relaxed), 1, "IRQ2 prio recorded");
+    assert_eq!(
+        NEST_IRQ1_PRIO.load(Ordering::Relaxed),
+        12,
+        "IRQ1 prio recorded"
+    );
+    assert_eq!(
+        NEST_IRQ2_PRIO.load(Ordering::Relaxed),
+        1,
+        "IRQ2 prio recorded"
+    );
 
     // 4. 嵌套开启：高优先级（IRQ1=12）打断 IRQ0 处理（IF=1）；更低优先级
     //    （IRQ2=1）在 IRQ1 处理中不能打断（IF=0）。
@@ -1900,17 +2041,24 @@ pub fn test_userspace_elf() {
 /// 6. 独立子文件系统挂载（mount to /volumes/data）。
 pub fn test_vfs_m61() {
     use crate::vfs_init;
+    use alloc::sync::Arc;
     use vfs::file_handle::{FileHandle, OpenFlags, SeekWhence};
     use vfs::inode::{INodeType, Permissions};
     use vfs::ramfs::RamFS;
-    use alloc::sync::Arc;
 
     info!("[test-vfs-m61] === M6.1: VFS abstraction and RamFS selftest ===");
 
     let root = vfs_init::root();
 
     // 1. 验证 RESTful 顶层目录骨架
-    for dir in &["/binaries", "/config", "/system", "/users", "/temporary", "/volumes"] {
+    for dir in &[
+        "/binaries",
+        "/config",
+        "/system",
+        "/users",
+        "/temporary",
+        "/volumes",
+    ] {
         let node = root.resolve(dir, true).expect("resolve skeleton dir");
         assert_eq!(
             node.metadata().expect("meta").node_type,
@@ -1928,7 +2076,10 @@ pub fn test_vfs_m61() {
     let payload = b"{\"arch\":\"x86_64\",\"version\":\"0.1.0\",\"status\":\"ok\"}";
     let written = handle.write(payload).expect("write payload");
     assert_eq!(written, payload.len());
-    assert_eq!(file_node.metadata().expect("meta").size, payload.len() as u64);
+    assert_eq!(
+        file_node.metadata().expect("meta").size,
+        payload.len() as u64
+    );
 
     // Seek 读回
     handle.seek(0, SeekWhence::Set).expect("seek 0");
@@ -1953,21 +2104,39 @@ pub fn test_vfs_m61() {
     // 4. 软链接创建与多层解析
     root.symlink("/config/kernel.json", "/config/current_config")
         .expect("symlink");
-    let linked = root.resolve("/config/current_config", true).expect("resolve symlink");
-    assert_eq!(linked.metadata().expect("meta").node_type, INodeType::RegularFile);
+    let linked = root
+        .resolve("/config/current_config", true)
+        .expect("resolve symlink");
+    assert_eq!(
+        linked.metadata().expect("meta").node_type,
+        INodeType::RegularFile
+    );
 
     // 5. 挂载独立文件系统到 /volumes/workspace
     let data_fs = Arc::new(RamFS::new());
-    root.mkdir("/volumes/workspace", Permissions::all()).expect("mkdir mount point");
-    root.mount("/volumes/workspace", data_fs).expect("mount workspace");
-    root.create_file("/volumes/workspace/main.rs", Permissions::all()).expect("create in volume");
-    let vol_file = root.resolve("/volumes/workspace/main.rs", true).expect("resolve vol file");
-    assert_eq!(vol_file.metadata().expect("meta").node_type, INodeType::RegularFile);
+    root.mkdir("/volumes/workspace", Permissions::all())
+        .expect("mkdir mount point");
+    root.mount("/volumes/workspace", data_fs)
+        .expect("mount workspace");
+    root.create_file("/volumes/workspace/main.rs", Permissions::all())
+        .expect("create in volume");
+    let vol_file = root
+        .resolve("/volumes/workspace/main.rs", true)
+        .expect("resolve vol file");
+    assert_eq!(
+        vol_file.metadata().expect("meta").node_type,
+        INodeType::RegularFile
+    );
 
     // 6. 延迟删除与目录保护
-    root.mkdir("/temporary/trash", Permissions::all()).expect("mkdir trash");
-    root.create_file("/temporary/trash/item1", Permissions::all()).expect("create trash item");
-    assert!(root.unlink("/temporary/trash").is_err(), "non-empty dir cannot be unlinked");
+    root.mkdir("/temporary/trash", Permissions::all())
+        .expect("mkdir trash");
+    root.create_file("/temporary/trash/item1", Permissions::all())
+        .expect("create trash item");
+    assert!(
+        root.unlink("/temporary/trash").is_err(),
+        "non-empty dir cannot be unlinked"
+    );
     root.unlink("/temporary/trash/item1").expect("unlink item");
     root.unlink("/temporary/trash").expect("unlink empty dir");
 
@@ -1981,16 +2150,18 @@ pub fn test_vfs_m61() {
 /// 2. 进程间 FD 隔离与资源复用。
 pub fn test_vfs_m62() {
     use crate::vfs_init;
+    use arch_x86_64::paging::X86PageTable;
+    use mm::user_space::UserAddressSpace;
+    use task::Process;
     use vfs::file_handle::{FileHandle, OpenFlags};
     use vfs::inode::Permissions;
-    use mm::user_space::UserAddressSpace;
-    use arch_x86_64::paging::X86PageTable;
-    use task::Process;
 
     info!("[test-vfs-m62] === M6.2: Process FD Table and VFS Syscall Integration ===");
 
     let root = vfs_init::root();
-    let file = root.create_file("/config/fd_test.txt", Permissions::read_write()).expect("create file");
+    let file = root
+        .create_file("/config/fd_test.txt", Permissions::read_write())
+        .expect("create file");
 
     let us = UserAddressSpace::<X86PageTable>::new().expect("user space");
     let mut proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, us);
@@ -2023,6 +2194,47 @@ pub fn test_vfs_m62() {
     info!("[test-vfs-m62] PASS");
 }
 
+/// DMYGH #10：标准流不是可关闭的用户文件描述符，必须返回明确的 ENOTSUP。
+///
+/// 此测试直接走 syscall 分发，避免依赖当前用户进程；`sys_close` 对 fd 0/1/2
+/// 必须在查询进程 FD 表之前拒绝请求。
+pub fn test_syscall_std_stream_close() {
+    use arch_x86_64::interrupts::InterruptFrame;
+    use klib::error::Error;
+
+    info!("[test-syscall-close] === DMYGH #10: reject closing stdio ===");
+    let expected = (-(Error::NotSupported.to_errno() as i64)) as u64;
+    for fd in [0u64, 1, 2] {
+        let mut frame = InterruptFrame {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rbp: 0,
+            rdi: fd,
+            rsi: 0,
+            rdx: 0,
+            rcx: 0,
+            rbx: 0,
+            rax: crate::syscall::SYS_STREAM_CLOSE as u64,
+            vector: 0,
+            error_code: 0,
+            rip: 0,
+            cs: 0,
+            rflags: 0,
+            rsp: 0,
+            ss: 0,
+        };
+        assert!(crate::syscall::syscall_entry(&mut frame));
+        assert_eq!(frame.rax, expected, "close({fd}) must return ENOTSUP");
+    }
+    info!("[test-syscall-close] PASS");
+}
+
 /// M6.3：验证特殊文件系统（ProcFS / SysFS / DevFS）与 JSON 第一公民。
 pub fn test_vfs_m63() {
     use crate::vfs_init;
@@ -2032,48 +2244,78 @@ pub fn test_vfs_m63() {
     let root = vfs_init::root();
 
     // 1. ProcFS 验证 (/processes/list)
-    let proc_list = root.resolve("/processes/list", true).expect("resolve /processes/list");
+    let proc_list = root
+        .resolve("/processes/list", true)
+        .expect("resolve /processes/list");
     let mut buf = [0u8; 1024];
-    let n1 = proc_list.read_at(0, &mut buf).expect("read /processes/list");
+    let n1 = proc_list
+        .read_at(0, &mut buf)
+        .expect("read /processes/list");
     let s1 = core::str::from_utf8(&buf[..n1]).expect("utf8 /processes/list");
     assert!(s1.starts_with('['), "process list must be a JSON array");
     info!("[test-vfs-m63] /processes/list JSON output: {}", s1.trim());
 
     // 2. SysFS 验证 (/system/cpu, /system/memory, /system/kernel)
-    let cpu_node = root.resolve("/system/cpu", true).expect("resolve /system/cpu");
+    let cpu_node = root
+        .resolve("/system/cpu", true)
+        .expect("resolve /system/cpu");
     let n2 = cpu_node.read_at(0, &mut buf).expect("read /system/cpu");
     let s2 = core::str::from_utf8(&buf[..n2]).expect("utf8 /system/cpu");
-    assert!(s2.contains(r#""arch":""#), "cpu json must contain arch field");
+    assert!(
+        s2.contains(r#""arch":""#),
+        "cpu json must contain arch field"
+    );
     info!("[test-vfs-m63] /system/cpu: {}", s2.trim());
 
-    let mem_node = root.resolve("/system/memory", true).expect("resolve /system/memory");
+    let mem_node = root
+        .resolve("/system/memory", true)
+        .expect("resolve /system/memory");
     let n3 = mem_node.read_at(0, &mut buf).expect("read /system/memory");
     let s3 = core::str::from_utf8(&buf[..n3]).expect("utf8 /system/memory");
-    assert!(s3.contains(r#""capacity_bytes":"#), "mem json must contain capacity_bytes");
+    assert!(
+        s3.contains(r#""capacity_bytes":"#),
+        "mem json must contain capacity_bytes"
+    );
     info!("[test-vfs-m63] /system/memory: {}", s3.trim());
 
-    let kernel_node = root.resolve("/system/kernel", true).expect("resolve /system/kernel");
-    let n4 = kernel_node.read_at(0, &mut buf).expect("read /system/kernel");
+    let kernel_node = root
+        .resolve("/system/kernel", true)
+        .expect("resolve /system/kernel");
+    let n4 = kernel_node
+        .read_at(0, &mut buf)
+        .expect("read /system/kernel");
     let s4 = core::str::from_utf8(&buf[..n4]).expect("utf8 /system/kernel");
-    assert!(s4.contains(r#""name":"BORUIX""#), "kernel json must contain name BORUIX");
+    assert!(
+        s4.contains(r#""name":"BORUIX""#),
+        "kernel json must contain name BORUIX"
+    );
     info!("[test-vfs-m63] /system/kernel: {}", s4.trim());
 
     // 3. DevFS 验证 (/devices/list, /devices/serial-com1/baudrate, /devices/displays/primary/mode)
-    let dev_list = root.resolve("/devices/list", true).expect("resolve /devices/list");
+    let dev_list = root
+        .resolve("/devices/list", true)
+        .expect("resolve /devices/list");
     let n5 = dev_list.read_at(0, &mut buf).expect("read /devices/list");
     let s5 = core::str::from_utf8(&buf[..n5]).expect("utf8 /devices/list");
     assert!(s5.starts_with('['), "device list must be a JSON array");
     info!("[test-vfs-m63] /devices/list: {}", s5.trim());
 
-    let baud_node = root.resolve("/devices/serial-com1/baudrate", true).expect("resolve baudrate");
+    let baud_node = root
+        .resolve("/devices/serial-com1/baudrate", true)
+        .expect("resolve baudrate");
     let n6 = baud_node.read_at(0, &mut buf).expect("read baudrate");
     assert_eq!(core::str::from_utf8(&buf[..n6]).unwrap().trim(), "115200");
 
-    let disp_mode = root.resolve("/devices/displays/primary/mode", true).expect("resolve mode");
+    let disp_mode = root
+        .resolve("/devices/displays/primary/mode", true)
+        .expect("resolve mode");
     let n7 = disp_mode.read_at(0, &mut buf).expect("read mode");
     let s7 = core::str::from_utf8(&buf[..n7]).expect("utf8 mode");
     assert!(s7.contains(r#""width":1024"#));
-    info!("[test-vfs-m63] /devices/displays/primary/mode: {}", s7.trim());
+    info!(
+        "[test-vfs-m63] /devices/displays/primary/mode: {}",
+        s7.trim()
+    );
 
     info!("[test-vfs-m63] PASS");
 }
@@ -2088,8 +2330,12 @@ pub fn test_vfs_m64() {
     let root = vfs_init::root();
 
     // 1. 校验 /binaries/init.elf 与 /binaries/shell.elf 存在于 VFS 中
-    let init_node = root.resolve("/binaries/init.elf", true).expect("resolve /binaries/init.elf");
-    let shell_node = root.resolve("/binaries/shell.elf", true).expect("resolve /binaries/shell.elf");
+    let init_node = root
+        .resolve("/binaries/init.elf", true)
+        .expect("resolve /binaries/init.elf");
+    let shell_node = root
+        .resolve("/binaries/shell.elf", true)
+        .expect("resolve /binaries/shell.elf");
 
     let init_meta = init_node.metadata().expect("init meta");
     let shell_meta = shell_node.metadata().expect("shell meta");
@@ -2103,13 +2349,21 @@ pub fn test_vfs_m64() {
     // 2. Page Cache 2MB/4KB 直通缓存与命中统计验证
     let cache = PageCache::new();
     let mut header_buf = [0u8; 64];
-    let n = cache.read_cached(init_node.as_ref(), 0, &mut header_buf).expect("cached read");
+    let n = cache
+        .read_cached(init_node.as_ref(), 0, &mut header_buf)
+        .expect("cached read");
     assert_eq!(n, 64);
-    assert_eq!(&header_buf[0..4], &[0x7f, b'E', b'L', b'F'], "must be valid ELF magic");
+    assert_eq!(
+        &header_buf[0..4],
+        &[0x7f, b'E', b'L', b'F'],
+        "must be valid ELF magic"
+    );
 
     // 第二次读取必定命中缓存
     let mut header_buf2 = [0u8; 64];
-    let n2 = cache.read_cached(init_node.as_ref(), 0, &mut header_buf2).expect("cached read 2");
+    let n2 = cache
+        .read_cached(init_node.as_ref(), 0, &mut header_buf2)
+        .expect("cached read 2");
     assert_eq!(n2, 64);
     assert_eq!(header_buf, header_buf2);
 
@@ -2137,7 +2391,9 @@ pub fn test_vfs_m65() {
     use vfs::inode::Permissions;
     use vfs::page_cache::PageCache;
 
-    info!("[test-vfs-m65] === M6.5: Deep Paths, 2MB+ IO, Delayed Unlink, and Special FS Selftest ===");
+    info!(
+        "[test-vfs-m65] === M6.5: Deep Paths, 2MB+ IO, Delayed Unlink, and Special FS Selftest ==="
+    );
 
     let root = vfs_init::root();
 
@@ -2145,11 +2401,16 @@ pub fn test_vfs_m65() {
     let mut current_dir = alloc::string::String::from("/temporary");
     for i in 0..5 {
         current_dir.push_str(&alloc::format!("/level_{}", i));
-        root.mkdir(&current_dir, Permissions::all()).expect("nested mkdir");
+        root.mkdir(&current_dir, Permissions::all())
+            .expect("nested mkdir");
     }
     let deep_file_path = alloc::format!("{}/deep_payload.txt", current_dir);
-    let deep_node = root.create_file(&deep_file_path, Permissions::read_write()).expect("create deep file");
-    deep_node.write_at(0, b"Deep path verified").expect("write deep file");
+    let deep_node = root
+        .create_file(&deep_file_path, Permissions::read_write())
+        .expect("create deep file");
+    deep_node
+        .write_at(0, b"Deep path verified")
+        .expect("write deep file");
     let mut deep_buf = [0u8; 18];
     deep_node.read_at(0, &mut deep_buf).expect("read deep file");
     assert_eq!(&deep_buf, b"Deep path verified");
@@ -2157,20 +2418,28 @@ pub fn test_vfs_m65() {
 
     // 2. 16KB 文件读写与 Page Cache 跨页/大页直通命中
     let big_path = "/temporary/big_payload.dat";
-    let big_node = root.create_file(big_path, Permissions::read_write()).expect("create big file");
+    let big_node = root
+        .create_file(big_path, Permissions::read_write())
+        .expect("create big file");
     let mut chunk = [0xAAu8; 4096];
     for i in 0..4 {
-        big_node.write_at((i * 4096) as u64, &chunk).expect("write chunk");
+        big_node
+            .write_at((i * 4096) as u64, &chunk)
+            .expect("write chunk");
     }
     let big_meta = big_node.metadata().expect("meta");
     assert_eq!(big_meta.size, 16384);
 
     let cache = PageCache::new();
     let mut read_buf = [0u8; 4096];
-    let n = cache.read_cached(big_node.as_ref(), 0, &mut read_buf).expect("cached read");
+    let n = cache
+        .read_cached(big_node.as_ref(), 0, &mut read_buf)
+        .expect("cached read");
     assert_eq!(n, 4096);
     assert_eq!(read_buf[0], 0xAA);
-    let n2 = cache.read_cached(big_node.as_ref(), 0, &mut read_buf).expect("hit read");
+    let n2 = cache
+        .read_cached(big_node.as_ref(), 0, &mut read_buf)
+        .expect("hit read");
     assert_eq!(n2, 4096);
     let st = cache.stats();
     assert!(st.hits >= 1);
@@ -2178,17 +2447,27 @@ pub fn test_vfs_m65() {
 
     // 3. 文件被打开状态下 unlink 的生命周期验证（延迟释放）
     let unlinked_path = "/temporary/open_and_delete.txt";
-    let open_node = root.create_file(unlinked_path, Permissions::read_write()).expect("create open file");
-    open_node.write_at(0, b"Live data before unlink").expect("write initial data");
+    let open_node = root
+        .create_file(unlinked_path, Permissions::read_write())
+        .expect("create open file");
+    open_node
+        .write_at(0, b"Live data before unlink")
+        .expect("write initial data");
     let handle = FileHandle::new(open_node.clone(), OpenFlags::READ_WRITE);
 
     // 删除路径条目
     root.unlink(unlinked_path).expect("unlink open file");
-    assert!(root.resolve(unlinked_path, true).is_err(), "path must no longer resolve");
+    assert!(
+        root.resolve(unlinked_path, true).is_err(),
+        "path must no longer resolve"
+    );
 
     // 但已有 Handle 仍然可以正常定位读写
     let mut unlinked_buf = [0u8; 23];
-    assert_eq!(handle.read(&mut unlinked_buf).expect("read after unlink"), 23);
+    assert_eq!(
+        handle.read(&mut unlinked_buf).expect("read after unlink"),
+        23
+    );
     assert_eq!(&unlinked_buf, b"Live data before unlink");
     info!("[test-vfs-m65] open-unlink deferred lifecycle OK");
 
@@ -2199,7 +2478,9 @@ pub fn test_vfs_m65() {
 pub fn test_driver_hub_m72() {
     use drv::DriverHub;
 
-    info!("[test-driver-hub-m72] === M7.2 & M8: Platform Core Drivers and DriverHub Bidding Selftest ===");
+    info!(
+        "[test-driver-hub-m72] === M7.2 & M8: Platform Core Drivers and DriverHub Bidding Selftest ==="
+    );
 
     // 1. 验证设备与驱动注册数量
     let drv_count = DriverHub::driver_count();
@@ -2208,8 +2489,14 @@ pub fn test_driver_hub_m72() {
         "[test-driver-hub-m72] DriverHub stats: registered_drivers={}, registered_devices={}",
         drv_count, dev_count
     );
-    assert!(drv_count >= 3, "must register serial, keyboard, cmos, pseudo");
-    assert!(dev_count >= 3, "must register serial-com1, ps2-keyboard, cmos-rtc, null, zero");
+    assert!(
+        drv_count >= 3,
+        "must register serial, keyboard, cmos, pseudo"
+    );
+    assert!(
+        dev_count >= 3,
+        "must register serial-com1, ps2-keyboard, cmos-rtc, null, zero"
+    );
 
     // 2. 验证 CMOS RTC 硬件时钟可读性
     let mut found_cmos = false;
@@ -2270,7 +2557,10 @@ pub fn test_driver_hub_m72() {
             }
         }
     }
-    assert!(pci_dev_count > 0, "must discover at least 1 PCI device on bus");
+    assert!(
+        pci_dev_count > 0,
+        "must discover at least 1 PCI device on bus"
+    );
     info!(
         "[test-driver-hub-m72] PCI discovery: total_pci={}, bound_pci={}",
         pci_dev_count, bound_pci_count
@@ -2305,7 +2595,31 @@ pub fn test_driver_hub_m72() {
                     let read_n = dev.read_at(1024, &mut r_buf);
                     assert_eq!(read_n, 21);
                     assert_eq!(&r_buf, b"RAMDISK_BORUIX_VOLUME");
-                    info!("[test-driver-hub-m72] Ramdisk block device read/write OK");
+
+                    // DMYGH #14：容量必须与实际静态后端一致，跨末尾写必须原子拒绝，
+                    // 禁止把 3 字节静默截断成尾部 2 字节写入。
+                    const RAMDISK_STATIC_CAPACITY: u64 = 64 * 1024;
+                    assert_eq!(
+                        dev.size(),
+                        Some(RAMDISK_STATIC_CAPACITY),
+                        "ramdisk must report its actual writable storage capacity"
+                    );
+                    let tail_offset = RAMDISK_STATIC_CAPACITY - 2;
+                    assert_eq!(dev.write_at(tail_offset, b"OK"), 2);
+                    assert_eq!(
+                        dev.write_at_checked(tail_offset, b"BAD"),
+                        Err(klib::error::Error::OutOfRange),
+                        "ramdisk must return an explicit range error instead of truncating"
+                    );
+                    assert_eq!(
+                        dev.write_at(tail_offset, b"BAD"),
+                        0,
+                        "legacy write_at compatibility path must not partially write"
+                    );
+                    let mut tail = [0u8; 2];
+                    assert_eq!(dev.read_at(tail_offset, &mut tail), 2);
+                    assert_eq!(&tail, b"OK", "rejected write must not alter tail bytes");
+                    info!("[test-driver-hub-m72] Ramdisk capacity and boundary-write honesty OK");
                 }
             }
         }
@@ -2315,15 +2629,31 @@ pub fn test_driver_hub_m72() {
 
     // 6. 验证 DevFS /devices/list 动态投影与 JSON HATEOAS
     let root = crate::vfs_init::root();
-    let dev_list_node = root.resolve("/devices/list", true).expect("resolve /devices/list");
+    let dev_list_node = root
+        .resolve("/devices/list", true)
+        .expect("resolve /devices/list");
     let mut dev_json_buf = [0u8; 4096];
-    let dev_json_n = dev_list_node.read_at(0, &mut dev_json_buf).expect("read /devices/list");
-    assert!(dev_json_n > 0, "devfs list cannot be empty");
+    let dev_json_n = dev_list_node
+        .read_at(0, &mut dev_json_buf)
+        .expect("read /devices/list");
+    assert!(
+        dev_json_n > 0,
+        "DevFS must serialize even an empty device registry"
+    );
     let dev_json_str = core::str::from_utf8(&dev_json_buf[..dev_json_n]).unwrap_or("");
-    assert!(dev_json_str.contains("serial-com1"), "must contain serial-com1");
+    assert!(
+        dev_json_str.contains("serial-com1"),
+        "must contain registered serial-com1"
+    );
+    // DMYGH #4：DevFS 列表只能投影真实 Registry；禁止在空 Registry 时伪造条目。
+    let projected_device_count = dev_json_str.matches(r#""name":"#).count();
+    assert_eq!(
+        projected_device_count, dev_count,
+        "DevFS device list must faithfully project DriverHub without phantom entries"
+    );
     // 8. 验证 M9.1 硬件拓扑事件总线与 M9.2 即插即拔/热重载（Hotplug In/Out & Live Reload）
     let initial_dev_count = DriverHub::device_count();
-    
+
     // (1) 模拟动态接入新外设 (Hotplug In)
     let hotplug_net_dev = drv::DeviceInfo {
         name: "pci-hotplug-nic",
@@ -2349,7 +2679,10 @@ pub fn test_driver_hub_m72() {
             }
         }
     }
-    assert!(found_arrived, "must publish DeviceArrived event for hotplug device");
+    assert!(
+        found_arrived,
+        "must publish DeviceArrived event for hotplug device"
+    );
 
     // 动态竞标仲裁并绑定
     DriverHub::attach_all();
@@ -2381,60 +2714,106 @@ pub fn test_driver_hub_m72() {
             }
         }
     }
-    assert!(found_departed, "must publish DeviceDeparted event for hotplug device");
+    assert!(
+        found_departed,
+        "must publish DeviceDeparted event for hotplug device"
+    );
     info!("[test-driver-hub-m72] Hotplug Out & Detach lifecycle OK");
 
     // 9. 验证 M10 深度自省与硬件遥测（Deep Telemetry & PCI BARs & Storage/Net Status）
-    let telemetry_node = root.resolve("/devices/telemetry", true).expect("resolve /devices/telemetry");
+    let telemetry_node = root
+        .resolve("/devices/telemetry", true)
+        .expect("resolve /devices/telemetry");
     let mut tel_buf = [0u8; 1024];
-    let tel_n = telemetry_node.read_at(0, &mut tel_buf).expect("read /devices/telemetry");
+    let tel_n = telemetry_node
+        .read_at(0, &mut tel_buf)
+        .expect("read /devices/telemetry");
     assert!(tel_n > 0);
     let tel_str = core::str::from_utf8(&tel_buf[..tel_n]).unwrap_or("");
-    assert!(tel_str.contains("healthy"), "telemetry must report healthy status");
-    info!("[test-driver-hub-m72] /devices/telemetry HATEOAS JSON OK: {}", tel_str.trim());
+    assert!(
+        tel_str.contains("healthy"),
+        "telemetry must report healthy status"
+    );
+    info!(
+        "[test-driver-hub-m72] /devices/telemetry HATEOAS JSON OK: {}",
+        tel_str.trim()
+    );
 
-    let pci_bars_node = root.resolve("/devices/pci/bars", true).expect("resolve /devices/pci/bars");
+    let pci_bars_node = root
+        .resolve("/devices/pci/bars", true)
+        .expect("resolve /devices/pci/bars");
     let mut bars_buf = [0u8; 1024];
-    let bars_n = pci_bars_node.read_at(0, &mut bars_buf).expect("read /devices/pci/bars");
+    let bars_n = pci_bars_node
+        .read_at(0, &mut bars_buf)
+        .expect("read /devices/pci/bars");
     assert!(bars_n > 0);
     let bars_str = core::str::from_utf8(&bars_buf[..bars_n]).unwrap_or("");
-    assert!(bars_str.contains("io_port") || bars_str.contains("bar"), "must contain PCI BAR metadata");
-    info!("[test-driver-hub-m72] /devices/pci/bars JSON inspection OK: {}", bars_str.trim());
+    assert!(
+        bars_str.contains("io_port") || bars_str.contains("bar"),
+        "must contain PCI BAR metadata"
+    );
+    info!(
+        "[test-driver-hub-m72] /devices/pci/bars JSON inspection OK: {}",
+        bars_str.trim()
+    );
 
-    let storage_status_node = root.resolve("/devices/storage/primary/status", true).expect("resolve /devices/storage/primary/status");
+    let storage_status_node = root
+        .resolve("/devices/storage/primary/status", true)
+        .expect("resolve /devices/storage/primary/status");
     let mut stor_buf = [0u8; 1024];
-    let stor_n = storage_status_node.read_at(0, &mut stor_buf).expect("read storage status");
+    let stor_n = storage_status_node
+        .read_at(0, &mut stor_buf)
+        .expect("read storage status");
     assert!(stor_n > 0);
     let stor_str = core::str::from_utf8(&stor_buf[..stor_n]).unwrap_or("");
-    assert!(stor_str.contains("sectors_read"), "storage status must contain sectors_read");
-    info!("[test-driver-hub-m72] /devices/storage/primary/status OK: {}", stor_str.trim());
+    assert!(
+        stor_str.contains("sectors_read"),
+        "storage status must contain sectors_read"
+    );
+    info!(
+        "[test-driver-hub-m72] /devices/storage/primary/status OK: {}",
+        stor_str.trim()
+    );
 
-    let net_stats_node = root.resolve("/devices/net/primary/stats", true).expect("resolve /devices/net/primary/stats");
+    let net_stats_node = root
+        .resolve("/devices/net/primary/stats", true)
+        .expect("resolve /devices/net/primary/stats");
     let mut net_buf = [0u8; 1024];
-    let net_n = net_stats_node.read_at(0, &mut net_buf).expect("read net stats");
+    let net_n = net_stats_node
+        .read_at(0, &mut net_buf)
+        .expect("read net stats");
     assert!(net_n > 0);
     let net_str = core::str::from_utf8(&net_buf[..net_n]).unwrap_or("");
-    assert!(net_str.contains("rx_bytes"), "net stats must contain rx_bytes");
-    info!("[test-driver-hub-m72] /devices/net/primary/stats OK: {}", net_str.trim());
+    assert!(
+        net_str.contains("rx_bytes"),
+        "net stats must contain rx_bytes"
+    );
+    info!(
+        "[test-driver-hub-m72] /devices/net/primary/stats OK: {}",
+        net_str.trim()
+    );
 
     // 10. 验证 M11 用户态驱动沙箱与零 Panic 隔离（UIO & Fault Isolation）
     let fake_driver_pid = 999;
     let uio_reg = drv::uio_register_driver(fake_driver_pid, "pci-ethernet", 0xE0000000, 4096);
     assert!(uio_reg.is_ok(), "UIO driver registration must succeed");
-    assert!(drv::uio_is_device_claimed("pci-ethernet"), "device must be marked as claimed");
+    assert!(
+        drv::uio_is_device_claimed("pci-ethernet"),
+        "device must be marked as claimed"
+    );
     info!("[test-driver-hub-m72] UIO userspace driver registration & device claim OK");
 
     // 模拟用户态驱动异常退出 / 强行 kill (Fault Recovery)
     let isolated = drv::uio_on_process_exit(fake_driver_pid);
-    assert!(isolated, "UIO fault isolation handler must catch process exit");
-    assert!(!drv::uio_is_device_claimed("pci-ethernet"), "claimed device must be safely released");
+    assert!(
+        isolated,
+        "UIO fault isolation handler must catch process exit"
+    );
+    assert!(
+        !drv::uio_is_device_claimed("pci-ethernet"),
+        "claimed device must be safely released"
+    );
     info!("[test-driver-hub-m72] UIO zero-panic crash isolation OK");
 
     info!("[test-driver-hub-m72] PASS");
 }
-
-
-
-
-
-

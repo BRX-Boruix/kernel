@@ -6,7 +6,7 @@ use core::sync::atomic::Ordering;
 
 use klib::warn;
 
-use super::allocator_core::{for_each_global_list, MAX_ORDER};
+use super::allocator_core::{MAX_ORDER, for_each_global_list};
 use super::{ALLOCATOR, LazyBuddyAllocator, PER_CPU};
 
 impl LazyBuddyAllocator {

@@ -13,9 +13,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
-use arch::phys_to_virt;
 use crate::gdt;
 use crate::lapic;
+use arch::phys_to_virt;
 use limine::SmpRequest;
 
 /// 请求 Limine 启动 AP。
@@ -223,8 +223,14 @@ pub fn init() {
     // 初始化每个 AP 的 GDT/TSS 物理帧（写入初始值，供 AP 使用）。
     for i in 0..real_ap {
         unsafe {
-            core::ptr::write(phys_to_virt(gdt_paddrs[i]) as *mut gdt::Gdt, gdt::Gdt::new());
-            core::ptr::write(phys_to_virt(tss_paddrs[i]) as *mut gdt::Tss, gdt::Tss::new());
+            core::ptr::write(
+                phys_to_virt(gdt_paddrs[i]) as *mut gdt::Gdt,
+                gdt::Gdt::new(),
+            );
+            core::ptr::write(
+                phys_to_virt(tss_paddrs[i]) as *mut gdt::Tss,
+                gdt::Tss::new(),
+            );
         }
     }
 
@@ -241,7 +247,12 @@ pub fn init() {
     let effective_total = real_ap + 1;
     TOTAL_CPUS.store(effective_total, Ordering::Relaxed);
     // 一次 write_str 完整打印 BSP 信息，避免交错
-    klog_combined("[smp] BSP lapic_id=", bsp_lapic, ", total cpus=", total as u64);
+    klog_combined(
+        "[smp] BSP lapic_id=",
+        bsp_lapic,
+        ", total cpus=",
+        total as u64,
+    );
 
     // BSP 槽位 0（默认即 0，显式置位以便清晰）
     LAPIC_TO_SLOT[(bsp_lapic & 0xFF) as usize].store(0, Ordering::Release);

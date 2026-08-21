@@ -56,12 +56,24 @@ impl OpenFlags {
 
     pub const fn to_bits(self) -> u32 {
         let mut bits = 0;
-        if self.read { bits |= 1 << 0; }
-        if self.write { bits |= 1 << 1; }
-        if self.create { bits |= 1 << 2; }
-        if self.truncate { bits |= 1 << 3; }
-        if self.append { bits |= 1 << 4; }
-        if self.directory { bits |= 1 << 5; }
+        if self.read {
+            bits |= 1 << 0;
+        }
+        if self.write {
+            bits |= 1 << 1;
+        }
+        if self.create {
+            bits |= 1 << 2;
+        }
+        if self.truncate {
+            bits |= 1 << 3;
+        }
+        if self.append {
+            bits |= 1 << 4;
+        }
+        if self.directory {
+            bits |= 1 << 5;
+        }
         bits
     }
 
@@ -166,7 +178,9 @@ impl FileHandle {
                     let neg = (-offset) as u64;
                     meta.size.checked_sub(neg).ok_or(Error::OutOfRange)?
                 } else {
-                    meta.size.checked_add(offset as u64).ok_or(Error::OutOfRange)?
+                    meta.size
+                        .checked_add(offset as u64)
+                        .ok_or(Error::OutOfRange)?
                 }
             }
         };

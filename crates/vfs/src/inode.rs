@@ -64,10 +64,18 @@ impl Permissions {
 
     pub const fn to_bits(self) -> u32 {
         let mut bits = 0;
-        if self.readable { bits |= 1 << 0; }
-        if self.writable { bits |= 1 << 1; }
-        if self.executable { bits |= 1 << 2; }
-        if self.system_only { bits |= 1 << 3; }
+        if self.readable {
+            bits |= 1 << 0;
+        }
+        if self.writable {
+            bits |= 1 << 1;
+        }
+        if self.executable {
+            bits |= 1 << 2;
+        }
+        if self.system_only {
+            bits |= 1 << 3;
+        }
         bits
     }
 

@@ -57,7 +57,12 @@ impl MountTable {
         self.resolve_internal(path_str, follow_symlink, 0)
     }
 
-    fn resolve_internal(&self, path_str: &str, follow_symlink: bool, depth: usize) -> Result<Arc<dyn INode>, Error> {
+    fn resolve_internal(
+        &self,
+        path_str: &str,
+        follow_symlink: bool,
+        depth: usize,
+    ) -> Result<Arc<dyn INode>, Error> {
         if depth > MAX_SYMLINK_DEPTH {
             return Err(Error::TooManySymlinks);
         }

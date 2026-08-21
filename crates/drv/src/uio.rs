@@ -3,9 +3,9 @@
 //! 提供用户态驱动注册、设备硬件认领（Claim）、MMIO 物理地址安全映射及异常隔离守护。
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use spin::Mutex;
 use klib::error::Error;
 use klib::info;
+use spin::Mutex;
 
 pub const MAX_UIO_DRIVERS: usize = 16;
 
@@ -31,10 +31,16 @@ impl UioDriverEntry {
 }
 
 static UIO_COUNT: AtomicUsize = AtomicUsize::new(0);
-static UIO_DRIVERS: Mutex<[UioDriverEntry; MAX_UIO_DRIVERS]> = Mutex::new([UioDriverEntry::EMPTY; MAX_UIO_DRIVERS]);
+static UIO_DRIVERS: Mutex<[UioDriverEntry; MAX_UIO_DRIVERS]> =
+    Mutex::new([UioDriverEntry::EMPTY; MAX_UIO_DRIVERS]);
 
 /// 用户态进程注册为驱动实例（UIO Register，M11.1）。
-pub fn uio_register_driver(pid: usize, dev_name: &str, mmio_base: u64, mmio_size: u64) -> Result<usize, Error> {
+pub fn uio_register_driver(
+    pid: usize,
+    dev_name: &str,
+    mmio_base: u64,
+    mmio_size: u64,
+) -> Result<usize, Error> {
     let mut list = UIO_DRIVERS.lock();
     for (i, entry) in list.iter_mut().enumerate() {
         if !entry.is_alive {
@@ -51,7 +57,10 @@ pub fn uio_register_driver(pid: usize, dev_name: &str, mmio_base: u64, mmio_size
                 is_alive: true,
             };
             UIO_COUNT.fetch_add(1, Ordering::Relaxed);
-            info!("[uio] driver registered: pid={} claiming dev={} mmio={:#x} (size={})", pid, dev_name, mmio_base, mmio_size);
+            info!(
+                "[uio] driver registered: pid={} claiming dev={} mmio={:#x} (size={})",
+                pid, dev_name, mmio_base, mmio_size
+            );
             return Ok(i);
         }
     }
@@ -66,8 +75,12 @@ pub fn uio_on_process_exit(pid: usize) -> bool {
         if entry.is_alive && entry.pid == pid {
             entry.is_alive = false;
             found = true;
-            let dev_str = core::str::from_utf8(&entry.claimed_device[..entry.claimed_len]).unwrap_or("unknown");
-            info!("[uio] isolated crashed driver: pid={} claimed_dev={} (kernel protected, 0 Panic)", pid, dev_str);
+            let dev_str = core::str::from_utf8(&entry.claimed_device[..entry.claimed_len])
+                .unwrap_or("unknown");
+            info!(
+                "[uio] isolated crashed driver: pid={} claimed_dev={} (kernel protected, 0 Panic)",
+                pid, dev_str
+            );
         }
     }
     found

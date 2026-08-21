@@ -11,8 +11,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::{Mutex, Once};
 
-use super::percpu_cache::{FreeList, ReserveList};
 use super::FREE_LISTS;
+use super::percpu_cache::{FreeList, ReserveList};
 
 /// Buddy 系统的 order 数（order 0..MAX_ORDER-1 有效）。
 ///
@@ -226,14 +226,16 @@ impl LazyBuddyAllocator {
     // 通过两级稀疏页表定位 block 指针（*mut BuddyFrame）。
     // 未建 block 的 L2 项为 null；调用方须保证 block 已由 process_range 建立。
     #[inline]
-    pub(crate) unsafe fn block_ptr(&self, block_idx: usize) -> *mut BuddyFrame { unsafe {
-        let cfg = self.config();
-        let l1 = cfg.metadata_l1;
-        let l1_idx = block_idx >> L1_SHIFT;
-        let l2 = *l1.add(l1_idx);
-        let l2_idx = block_idx & L2_MASK;
-        *l2.add(l2_idx)
-    }}
+    pub(crate) unsafe fn block_ptr(&self, block_idx: usize) -> *mut BuddyFrame {
+        unsafe {
+            let cfg = self.config();
+            let l1 = cfg.metadata_l1;
+            let l1_idx = block_idx >> L1_SHIFT;
+            let l2 = *l1.add(l1_idx);
+            let l2_idx = block_idx & L2_MASK;
+            *l2.add(l2_idx)
+        }
+    }
 
     // 返回帧元数据裸指针（**非** `&'static mut`）。
     //
@@ -242,13 +244,15 @@ impl LazyBuddyAllocator {
     // 即构成别名/noalias 未定义行为（LLVM 可借 noalias 做激进优化而对同一
     // 元数据字节产生交错写）；裸指针不携带独占所有权假设，可安全用于此场景。
     #[inline]
-    pub(crate) unsafe fn frame_ptr(&self, pfn: usize) -> *mut BuddyFrame { unsafe {
-        let cfg = self.config();
-        let block_idx = pfn / cfg.frames_per_block;
-        let offset = pfn % cfg.frames_per_block;
-        let block_ptr = self.block_ptr(block_idx);
-        block_ptr.add(offset)
-    }}
+    pub(crate) unsafe fn frame_ptr(&self, pfn: usize) -> *mut BuddyFrame {
+        unsafe {
+            let cfg = self.config();
+            let block_idx = pfn / cfg.frames_per_block;
+            let offset = pfn % cfg.frames_per_block;
+            let block_ptr = self.block_ptr(block_idx);
+            block_ptr.add(offset)
+        }
+    }
 
     // 带缓存的等价版本（同一 block 内连续访问时复用 block 指针）。
     #[inline]
@@ -256,18 +260,20 @@ impl LazyBuddyAllocator {
         &self,
         pfn: usize,
         cache: &mut MetadataCache,
-    ) -> *mut BuddyFrame { unsafe {
-        let cfg = self.config();
-        let block_idx = pfn / cfg.frames_per_block;
-        let offset = pfn % cfg.frames_per_block;
+    ) -> *mut BuddyFrame {
+        unsafe {
+            let cfg = self.config();
+            let block_idx = pfn / cfg.frames_per_block;
+            let offset = pfn % cfg.frames_per_block;
 
-        if block_idx != cache.block_idx {
-            cache.block_ptr = self.block_ptr(block_idx);
-            cache.block_idx = block_idx;
+            if block_idx != cache.block_idx {
+                cache.block_ptr = self.block_ptr(block_idx);
+                cache.block_idx = block_idx;
+            }
+
+            cache.block_ptr.add(offset)
         }
-
-        cache.block_ptr.add(offset)
-    }}
+    }
 
     /// 把一个帧标记为已分配，并脱离所有链表（复位 next/prev/order/migratable）。
     #[inline]
@@ -294,7 +300,13 @@ impl LazyBuddyAllocator {
     /// 供 `push_to_global`、`percpu_push_raw`、`reserve_push` 复用，
     /// 统一"写 order/state/migratable/next/prev"五连操作。
     #[inline]
-    pub(crate) unsafe fn link_frame_as(&self, pfn: usize, order: u8, state: FrameState, next: Option<usize>) {
+    pub(crate) unsafe fn link_frame_as(
+        &self,
+        pfn: usize,
+        order: u8,
+        state: FrameState,
+        next: Option<usize>,
+    ) {
         let frame = unsafe { self.frame_ptr(pfn) };
         unsafe {
             (*frame).order = order;
@@ -306,7 +318,11 @@ impl LazyBuddyAllocator {
     }
 
     /// 取得某 order 下指定 shard 的全局链表锁，并计入一次全局链表操作。
-    pub(crate) fn lock_global_list(&self, order: usize, shard: usize) -> spin::MutexGuard<'_, FreeList> {
+    pub(crate) fn lock_global_list(
+        &self,
+        order: usize,
+        shard: usize,
+    ) -> spin::MutexGuard<'_, FreeList> {
         let lists = FREE_LISTS.get().expect("PMM free lists not initialized");
         self.global_list_ops.fetch_add(1, Ordering::Relaxed);
         lists.orders[order].shards[shard].lock()

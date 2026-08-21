@@ -14,11 +14,11 @@ pub mod scheduler;
 pub mod signals;
 
 pub use process::{
-    clear_current_proc, current_proc_mut, process_page_fault_handler, set_current_proc, Process,
-    ProcessTable, TaskState,
+    Process, ProcessTable, TaskState, clear_current_proc, current_proc_mut,
+    process_page_fault_handler, set_current_proc,
 };
 pub use scheduler::{
     block_current, block_for_kbd, exit_current, get_process_snapshot, kill_pid, process_snapshots,
     ps_snapshot, spawn, start, tick, wake, wake_kbd, yield_now,
 };
-pub use signals::{signal_for_exception, signal_name, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTERM};
+pub use signals::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTERM, signal_for_exception, signal_name};

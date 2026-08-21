@@ -38,11 +38,7 @@ pub trait Driver: Send + Sync {
     /// - 50~70: 标准 Class 驱动（如 PCI-IDE, Standard 16550 UART）
     /// - 80~100: 专用厂商加速优化驱动（如 Intel AHCI / VirtIO 加速驱动）
     fn score_probe(&self, hub: &DriverHub, dev: &DeviceInfo) -> u8 {
-        if self.probe(hub, dev) {
-            50
-        } else {
-            0
-        }
+        if self.probe(hub, dev) { 50 } else { 0 }
     }
 
     /// 探测成功后实例化驱动并绑定设备（返回 Ok(()) 表示绑定成功，Err(()) 触发自动降级）。

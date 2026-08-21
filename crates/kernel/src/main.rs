@@ -41,7 +41,6 @@ fn heap_grow_source(order: u32) -> u64 {
 /// 避免 Limine 提供的初始引导栈过小导致深调用（如 flanterm）溢出。
 const KMAIN_STACK_SIZE: usize = 1024 * 1024;
 
-
 /// 内核主栈（静态分配，位于 .bss）。
 static mut KMAIN_STACK: [u8; KMAIN_STACK_SIZE] = [0; KMAIN_STACK_SIZE];
 
@@ -87,7 +86,10 @@ unsafe fn kmain_body() -> ! {
     // 串口驱动 `init` 在此完成统一 console 串口 sink 的注册（不再手动接线），
     // 此后所有内核日志先汇聚到 console 再转发。
     drivers::init();
-    info!("[kmain] serial & driver hub initialized (arch={})", CurrentArch::name());
+    info!(
+        "[kmain] serial & driver hub initialized (arch={})",
+        CurrentArch::name()
+    );
 
     // T4：探测 CPU 特性（CPUID/vendor/brand；BSP 单线程阶段，结果缓存到静态）。
     arch_x86_64::cpu::init();
@@ -275,6 +277,8 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m62();
     #[cfg(feature = "kernel-tests")]
+    tests::test_syscall_std_stream_close();
+    #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m63();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m64();
@@ -303,7 +307,10 @@ unsafe fn kmain_body() -> ! {
     let total = arch_x86_64::smp::total_cpus();
     // 等待所有 AP 上线，超时 2 秒（基于 LAPIC 定时器真实时间）
     let online = arch_x86_64::smp::wait_all_online(total, 2_000);
-    info!("[kmain] SMP done, {} cpus online (target {})", online, total);
+    info!(
+        "[kmain] SMP done, {} cpus online (target {})",
+        online, total
+    );
 
     // 内核全部组件加载完成（测试若开启也已全部通过）：打印版本横幅。
     info!("============================================================");
@@ -365,7 +372,10 @@ fn init_display() {
 /// 经 `include_bytes!` 在编译期嵌入）。`exec` 系统调用按索引加载运行。
 ///
 /// 索引与 libsys `nr::PROG_*` 对齐：0 = init（PID 1），1 = shell（PID 2）。
-static PROGRAMS: &[&[u8]] = &[include_bytes!("../init.elf"), include_bytes!("../shell.elf")];
+static PROGRAMS: &[&[u8]] = &[
+    include_bytes!("../init.elf"),
+    include_bytes!("../shell.elf"),
+];
 
 /// 取嵌入程序池中第 `idx` 个 ELF（越界返回 `None`）。
 pub fn program_elf(idx: usize) -> Option<&'static [u8]> {

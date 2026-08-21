@@ -235,7 +235,12 @@ mod tests {
         assert_eq!(lines.len(), RING_LINES);
         // 最旧的一条被淘汰，最后一条保留
         assert!(lines[0].contains(&format!("line {}", 10)));
-        assert!(lines.last().unwrap().contains(&format!("line {}", RING_LINES + 9)));
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .contains(&format!("line {}", RING_LINES + 9))
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use arch::{PageFlags, PageSize, VirtAddr};
 use arch_x86_64::paging::X86PageTable;
 use klib::error::Error;
-use mm::user_space::{UserAddressSpace, USER_STACK_TOP};
+use mm::user_space::{USER_STACK_TOP, UserAddressSpace};
 
 // ---------- ELF 常量 ----------
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];

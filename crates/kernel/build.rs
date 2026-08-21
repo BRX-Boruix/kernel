@@ -56,7 +56,10 @@ fn emit_build_timestamp() {
 
 /// 获取 git 当前 HEAD 提交 hash（失败返回 None）。
 fn git_commit_hash() -> Option<String> {
-    let out = Command::new("git").args(["rev-parse", "HEAD"]).output().ok()?;
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

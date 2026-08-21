@@ -136,7 +136,7 @@ fn tss_low(base: u64) -> u64 {
         | ((base & 0xFFFF) << 16)                // base[15:0]
         | (((base >> 16) & 0xFF) << 32)          // base[23:16]
         | (0x89u64 << 40)                        // access: type=0x9, P=1, DPL=0, S=0
-        | (((base >> 24) & 0xFF) << 56)          // base[31:24]
+        | (((base >> 24) & 0xFF) << 56) // base[31:24]
 }
 
 /// TSS 段描述符高 64 位（存放 base 的 32~63 位，即 base 高 32 位）。
@@ -218,7 +218,10 @@ pub fn setup_cpu(gdt: *mut Gdt, tss: *mut Tss, kstack_top: u64, df_stack_top: u6
 /// 必须在允许使用全局静态变量的早期（堆初始化前即可）调用。
 pub fn init() {
     let kstack_top = stack_top(core::ptr::addr_of!(BSP_KSTACK) as *const u8, KSTACK_SIZE);
-    let df_stack_top = stack_top(core::ptr::addr_of!(BSP_DF_STACK) as *const u8, DF_STACK_SIZE);
+    let df_stack_top = stack_top(
+        core::ptr::addr_of!(BSP_DF_STACK) as *const u8,
+        DF_STACK_SIZE,
+    );
     let gdt_ptr = core::ptr::addr_of_mut!(BSP_GDT);
     let tss_ptr = core::ptr::addr_of_mut!(BSP_TSS);
     setup_cpu(gdt_ptr, tss_ptr, kstack_top, df_stack_top);
@@ -248,5 +251,3 @@ pub fn load_and_reload(gdt: &Gdt) {
         x86_64_load_tss();
     }
 }
-
-

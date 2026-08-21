@@ -48,11 +48,7 @@ impl<const WORDS: usize> Bitmap<WORDS> {
 
     /// 按值置位 / 清零第 `i` 位。
     pub fn set_to(&mut self, i: usize, v: bool) {
-        if v {
-            self.set(i)
-        } else {
-            self.clear(i)
-        }
+        if v { self.set(i) } else { self.clear(i) }
     }
 
     /// 从 `from` 起查找第一个空闲（0）位；没有返回 `None`。

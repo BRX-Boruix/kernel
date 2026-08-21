@@ -210,8 +210,8 @@ pub fn poll_timeouts() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::vec;
     use std::vec::Vec;
 
@@ -239,7 +239,10 @@ mod tests {
     }
 
     fn cb_push(arg: usize) {
-        ORDER.lock().unwrap_or_else(|e| e.into_inner()).push(arg as u32);
+        ORDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(arg as u32);
     }
 
     /// 复位全局测试状态。
@@ -356,7 +359,7 @@ mod tests {
         assert_eq!(now_nanos(), 0);
         assert!(set_timeout(10, cb_count, 0).is_none());
         poll_timeouts(); // 不 panic
-        sleep_ms(1);     // 立即返回，不 panic
+        sleep_ms(1); // 立即返回，不 panic
         sleep_us(1);
         sleep_nanos(1);
     }

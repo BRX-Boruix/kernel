@@ -9,8 +9,8 @@
 use core::mem::size_of;
 
 use arch::acpi::{
-    checksum_valid, entry_count, parse_hpet, parse_rsdp, parse_sdt_header, Hpet, SDT_HEADER_LEN,
-    SdtHeader,
+    Hpet, SDT_HEADER_LEN, SdtHeader, checksum_valid, entry_count, parse_hpet, parse_rsdp,
+    parse_sdt_header,
 };
 use arch::phys_to_virt;
 
@@ -81,7 +81,9 @@ pub fn init() -> Option<AcpiInfo> {
         // SAFETY: 表条目数组在 XSDT 表内（表长已验证）。
         let entry: u64 = unsafe {
             core::ptr::read_unaligned(
-                (xsdt_vaddr as *const u8).add(SDT_HEADER_LEN + i * entry_size).cast::<u64>(),
+                (xsdt_vaddr as *const u8)
+                    .add(SDT_HEADER_LEN + i * entry_size)
+                    .cast::<u64>(),
             )
         };
         // RSDT 是 32 位条目。
@@ -100,7 +102,8 @@ pub fn init() -> Option<AcpiInfo> {
             } else if hdr.is(b"HPET") {
                 // 读取 HPET 表关键字段（基址/周期/比较器数）。
                 // SAFETY: `va` 指向已验证的 HPET 表（表长已由 sdt_at 校验）。
-                let buf = unsafe { core::slice::from_raw_parts(va as *const u8, hdr.length as usize) };
+                let buf =
+                    unsafe { core::slice::from_raw_parts(va as *const u8, hdr.length as usize) };
                 hpet = parse_hpet(buf);
                 if hpet.is_none() {
                     // 诊断：打印表长与关键偏移字节（Event Timer Block ID、
@@ -111,8 +114,26 @@ pub fn init() -> Option<AcpiInfo> {
                         buf.len(),
                         u32::from_le_bytes([at(36), at(37), at(38), at(39)]),
                         u32::from_le_bytes([at(44), at(45), at(46), at(47)]),
-                        u64::from_le_bytes([at(48), at(49), at(50), at(51), at(52), at(53), at(54), at(55)]),
-                        u64::from_le_bytes([at(56), at(57), at(58), at(59), at(60), at(61), at(62), at(63)]),
+                        u64::from_le_bytes([
+                            at(48),
+                            at(49),
+                            at(50),
+                            at(51),
+                            at(52),
+                            at(53),
+                            at(54),
+                            at(55)
+                        ]),
+                        u64::from_le_bytes([
+                            at(56),
+                            at(57),
+                            at(58),
+                            at(59),
+                            at(60),
+                            at(61),
+                            at(62),
+                            at(63)
+                        ]),
                     );
                 }
             }
@@ -202,11 +223,7 @@ fn parse_fadt(va: u64) -> Fadt {
     let dsdt64 = u64::from_le_bytes([
         b[140], b[141], b[142], b[143], b[144], b[145], b[146], b[147],
     ]);
-    let dsdt_addr = if dsdt32 != 0 {
-        dsdt32 as u64
-    } else {
-        dsdt64
-    };
+    let dsdt_addr = if dsdt32 != 0 { dsdt32 as u64 } else { dsdt64 };
 
     // PM1 控制块端口（4 字节字段，端口在低 16 位）：
     // offset 64 = PM1a_CNT_BLK，offset 68 = PM1b_CNT_BLK。

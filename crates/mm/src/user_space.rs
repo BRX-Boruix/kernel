@@ -12,7 +12,7 @@
 use alloc::vec::Vec;
 
 use arch::{
-    phys_to_virt, ActivePageTable, PageFlags, PageSize, PhysAddr, PhysFrame, PageTable, VirtAddr,
+    ActivePageTable, PageFlags, PageSize, PageTable, PhysAddr, PhysFrame, VirtAddr, phys_to_virt,
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -148,7 +148,8 @@ where
         }
         let mut vaddr = s;
         for &phys in phys_frames.iter().take(count as usize) {
-            self.pt.map(VirtAddr::new(vaddr), PhysAddr::new(phys), size, uflags)?;
+            self.pt
+                .map(VirtAddr::new(vaddr), PhysAddr::new(phys), size, uflags)?;
             vaddr += page;
         }
         self.areas.lock().push(UserArea {
@@ -230,19 +231,20 @@ where
     pub fn handle_page_fault(&mut self, vaddr: u64, error_code: u64) -> bool {
         // COW 写故障（优先于按需分页）：命中共享页记账且本次为写访问 → 写时复制。
         if error_code & 0b10 != 0 {
-            let hit = self.cow_pages.lock().iter().position(|c| {
-                vaddr >= c.vaddr && vaddr < c.vaddr + 0x1000
-            });
+            let hit = self
+                .cow_pages
+                .lock()
+                .iter()
+                .position(|c| vaddr >= c.vaddr && vaddr < c.vaddr + 0x1000);
             if let Some(idx) = hit {
                 return self.cow_fault(idx);
             }
         }
         let areas = self.areas.lock();
-        let Some(idx) = areas.iter().position(|a| {
-            a.demand_paging
-                && vaddr >= a.start.as_u64()
-                && vaddr < a.end.as_u64()
-        }) else {
+        let Some(idx) = areas
+            .iter()
+            .position(|a| a.demand_paging && vaddr >= a.start.as_u64() && vaddr < a.end.as_u64())
+        else {
             return false; // 未预留区域 → 非法访问
         };
         let area = areas[idx];
@@ -256,17 +258,24 @@ where
 
         // 1. 2MB 大页直通优化：如果区域本身是 Size2M 且对齐，直接分配 ORDER_2M 物理大页
         if area.size == PageSize::Size2M {
-            let aligned = area.start.as_u64() + ((vaddr - area.start.as_u64()) / area.size.bytes()) * area.size.bytes();
-            if let Some(frame) = crate::frame_allocator::allocate_frames(crate::frame_allocator::ORDER_2M) {
+            let aligned = area.start.as_u64()
+                + ((vaddr - area.start.as_u64()) / area.size.bytes()) * area.size.bytes();
+            if let Some(frame) =
+                crate::frame_allocator::allocate_frames(crate::frame_allocator::ORDER_2M)
+            {
                 let phys = frame.start_paddr();
                 let page_virt = phys_to_virt(phys) as *mut u8;
                 unsafe { core::ptr::write_bytes(page_virt, 0, area.size.bytes() as usize) };
-                if self.pt.map(
-                    VirtAddr::new(aligned),
-                    PhysAddr::new(phys),
-                    PageSize::Size2M,
-                    area.flags.user(),
-                ).is_ok() {
+                if self
+                    .pt
+                    .map(
+                        VirtAddr::new(aligned),
+                        PhysAddr::new(phys),
+                        PageSize::Size2M,
+                        area.flags.user(),
+                    )
+                    .is_ok()
+                {
                     drop(areas);
                     return true;
                 }
@@ -298,12 +307,16 @@ where
             let page_virt = phys_to_virt(phys) as *mut u8;
             unsafe { core::ptr::write_bytes(page_virt, 0, 4096) };
 
-            if self.pt.map(
-                VirtAddr::new(cur_v),
-                PhysAddr::new(phys),
-                PageSize::Size4K,
-                area.flags.user(),
-            ).is_ok() {
+            if self
+                .pt
+                .map(
+                    VirtAddr::new(cur_v),
+                    PhysAddr::new(phys),
+                    PageSize::Size4K,
+                    area.flags.user(),
+                )
+                .is_ok()
+            {
                 mapped_any = true;
             } else {
                 deallocate_frame(frame);
@@ -332,7 +345,9 @@ where
         // 分配新帧并拷贝旧帧内容。
         let Some(frame) = allocate_frame() else {
             // 物理内存耗尽：恢复原只读共享映射。
-            let _ = self.pt.map(vaddr, PhysAddr::new(old_phys), PageSize::Size4K, cow.flags);
+            let _ = self
+                .pt
+                .map(vaddr, PhysAddr::new(old_phys), PageSize::Size4K, cow.flags);
             return false;
         };
         let new_phys = frame.start_paddr();
@@ -344,13 +359,16 @@ where
             );
         }
         // 按完整权限（含可写）重映射为独立页。
-        if self.pt
+        if self
+            .pt
             .map(vaddr, PhysAddr::new(new_phys), PageSize::Size4K, cow.flags)
             .is_err()
         {
             // 罕见：映射失败，归还新帧，恢复原共享映射。
             deallocate_frame(frame);
-            let _ = self.pt.map(vaddr, PhysAddr::new(old_phys), PageSize::Size4K, cow.flags);
+            let _ = self
+                .pt
+                .map(vaddr, PhysAddr::new(old_phys), PageSize::Size4K, cow.flags);
             return false;
         }
         // 释放对旧共享帧的引用（可能仍有其它地址空间引用，由 refcount 决定是否归还）。
@@ -401,12 +419,19 @@ where
             if self.pt.unmap(VirtAddr::new(v)).is_err() {
                 continue;
             }
-            self.pt.map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)?;
+            self.pt
+                .map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)?;
             // 子映射共享帧只读。
-            child.pt.map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)?;
+            child
+                .pt
+                .map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)?;
             // 共享帧引用计数 +1（父 + 子各持一份引用）。
             crate::frame_allocator::frame_incref(phys);
-            let cow = CowPage { vaddr: v, phys, flags };
+            let cow = CowPage {
+                vaddr: v,
+                phys,
+                flags,
+            };
             self.cow_pages.lock().push(cow);
             child_cow.push(cow);
         }
@@ -417,7 +442,10 @@ where
         for m in self.shm_maps.lock().iter() {
             let npages = ((m.end - m.vaddr) / 0x1000) as usize;
             for i in 0..npages {
-                if let Some(phys) = self.pt.translate(VirtAddr::new(m.vaddr + (i as u64) * 0x1000)) {
+                if let Some(phys) = self
+                    .pt
+                    .translate(VirtAddr::new(m.vaddr + (i as u64) * 0x1000))
+                {
                     child.pt.map(
                         VirtAddr::new(m.vaddr + (i as u64) * 0x1000),
                         phys,
@@ -434,7 +462,9 @@ where
     /// 仅回收当前已映射的页，未映射部分不动。
     pub fn unmap_area_pages(&mut self, area_idx: usize) {
         let areas = self.areas.lock();
-        let Some(&area) = areas.get(area_idx) else { return };
+        let Some(&area) = areas.get(area_idx) else {
+            return;
+        };
         drop(areas);
         let page = area.size.bytes();
         let mut v = area.start.as_u64();
@@ -627,12 +657,7 @@ where
     /// 分配一段空闲虚拟区间，把 `frames` 逐页映射（带 user/可写）。**不**把该
     /// 区间记入 `areas`（帧归 shm 对象所有，多进程共享，解映射时不能释放），
     /// 而记入独立的 `shm_maps`。返回映射起始虚拟地址。
-    pub fn map_shm(
-        &mut self,
-        id: u64,
-        frames: &[u64],
-        size: u64,
-    ) -> Result<u64, PT::Error> {
+    pub fn map_shm(&mut self, id: u64, frames: &[u64], size: u64) -> Result<u64, PT::Error> {
         let size = align_up(size, 4096);
         let npages = (size / 0x1000) as usize;
         if npages == 0 || frames.len() < npages {

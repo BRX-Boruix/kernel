@@ -101,7 +101,9 @@ impl INode for RamINode {
         match &self.data {
             RamNodeData::File { content } => {
                 let mut c = content.write();
-                let end = (offset as usize).checked_add(buf.len()).ok_or(Error::OutOfRange)?;
+                let end = (offset as usize)
+                    .checked_add(buf.len())
+                    .ok_or(Error::OutOfRange)?;
                 if end > c.len() {
                     c.resize(end, 0);
                 }

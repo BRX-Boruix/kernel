@@ -118,22 +118,22 @@ pub extern "C" fn x86_64_enter_usermode(frame: &arch::task::TrapFrame) {
         // rdi = frame；把 iretq 帧的五个字段 push（先压 SS 最后压 RIP）
         // frame 偏移（repr(C)）：rip=0, cs=8, rflags=16, rsp=24, ss=32, cr3=40
         // 先装载 CR3（若 cr3 != 0 则写 CR3 切到进程页表）
-        "mov rax, [rdi + 40]",          // cr3
+        "mov rax, [rdi + 40]", // cr3
         "test rax, rax",
-        "jz 0f",                        // cr3 == 0 → 不切换页表
-        "mov cr3, rax",                 // 写 CR3（切到进程用户页表）
+        "jz 0f",        // cr3 == 0 → 不切换页表
+        "mov cr3, rax", // 写 CR3（切到进程用户页表）
         "0:",
-        "mov rax, [rdi + 32]",          // ss
+        "mov rax, [rdi + 32]", // ss
         "push rax",
-        "mov rax, [rdi + 24]",          // rsp
+        "mov rax, [rdi + 24]", // rsp
         "push rax",
-        "mov rax, [rdi + 16]",          // rflags
+        "mov rax, [rdi + 16]", // rflags
         "push rax",
-        "mov rax, [rdi + 8]",           // cs
+        "mov rax, [rdi + 8]", // cs
         "push rax",
-        "mov rax, [rdi + 0]",           // rip
+        "mov rax, [rdi + 0]", // rip
         "push rax",
-        "iretq",                        // 弹出 RIP/CS/RFLAGS/RSP/SS → 切到 Ring 3
+        "iretq", // 弹出 RIP/CS/RFLAGS/RSP/SS → 切到 Ring 3
     );
 }
 

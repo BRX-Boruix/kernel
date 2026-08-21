@@ -83,7 +83,10 @@ impl INode for ProcRootNode {
                             let _ = obj.field_str("state", &proc.state);
                             let _ = obj.field_u64("memory_bytes", proc.memory_bytes);
                             let _ = obj.field_u64("threads", proc.threads as u64);
-                            let _ = obj.field_str("uri", &alloc::format!("/processes/{}/status", proc.pid));
+                            let _ = obj.field_str(
+                                "uri",
+                                &alloc::format!("/processes/{}/status", proc.pid),
+                            );
                             Ok(())
                         });
                     }
@@ -111,7 +114,10 @@ impl INode for ProcRootNode {
                             let _ = obj.field_str("state", &proc.state);
                             let _ = obj.field_u64("memory_bytes", proc.memory_bytes);
                             let _ = obj.field_u64("threads", proc.threads as u64);
-                            let _ = obj.field_str("uri", &alloc::format!("/processes/{}/status", proc.pid));
+                            let _ = obj.field_str(
+                                "uri",
+                                &alloc::format!("/processes/{}/status", proc.pid),
+                            );
                             let _ = obj.end();
                         }
                     }

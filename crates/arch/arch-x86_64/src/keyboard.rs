@@ -105,19 +105,56 @@ fn send_kbd_cmd(cmd: u8) -> u8 {
 const KEYMAP: [u8; 0x80] = {
     let mut m = [0u8; 0x80];
     m[0x01] = 27; // Esc
-    m[0x02] = b'1'; m[0x03] = b'2'; m[0x04] = b'3'; m[0x05] = b'4'; m[0x06] = b'5';
-    m[0x07] = b'6'; m[0x08] = b'7'; m[0x09] = b'8'; m[0x0A] = b'9'; m[0x0B] = b'0';
-    m[0x0C] = b'-'; m[0x0D] = b'='; m[0x0E] = 0x7F; // backspace
+    m[0x02] = b'1';
+    m[0x03] = b'2';
+    m[0x04] = b'3';
+    m[0x05] = b'4';
+    m[0x06] = b'5';
+    m[0x07] = b'6';
+    m[0x08] = b'7';
+    m[0x09] = b'8';
+    m[0x0A] = b'9';
+    m[0x0B] = b'0';
+    m[0x0C] = b'-';
+    m[0x0D] = b'=';
+    m[0x0E] = 0x7F; // backspace
     m[0x0F] = b'\t';
-    m[0x10] = b'q'; m[0x11] = b'w'; m[0x12] = b'e'; m[0x13] = b'r'; m[0x14] = b't';
-    m[0x15] = b'y'; m[0x16] = b'u'; m[0x17] = b'i'; m[0x18] = b'o'; m[0x19] = b'p';
-    m[0x1A] = b'['; m[0x1B] = b']'; m[0x1C] = b'\n';
-    m[0x1E] = b'a'; m[0x1F] = b's'; m[0x20] = b'd'; m[0x21] = b'f'; m[0x22] = b'g';
-    m[0x23] = b'h'; m[0x24] = b'j'; m[0x25] = b'k'; m[0x26] = b'l'; m[0x27] = b';';
-    m[0x28] = b'\''; m[0x29] = b'`';
+    m[0x10] = b'q';
+    m[0x11] = b'w';
+    m[0x12] = b'e';
+    m[0x13] = b'r';
+    m[0x14] = b't';
+    m[0x15] = b'y';
+    m[0x16] = b'u';
+    m[0x17] = b'i';
+    m[0x18] = b'o';
+    m[0x19] = b'p';
+    m[0x1A] = b'[';
+    m[0x1B] = b']';
+    m[0x1C] = b'\n';
+    m[0x1E] = b'a';
+    m[0x1F] = b's';
+    m[0x20] = b'd';
+    m[0x21] = b'f';
+    m[0x22] = b'g';
+    m[0x23] = b'h';
+    m[0x24] = b'j';
+    m[0x25] = b'k';
+    m[0x26] = b'l';
+    m[0x27] = b';';
+    m[0x28] = b'\'';
+    m[0x29] = b'`';
     m[0x2B] = b'\\';
-    m[0x2C] = b'z'; m[0x2D] = b'x'; m[0x2E] = b'c'; m[0x2F] = b'v'; m[0x30] = b'b';
-    m[0x31] = b'n'; m[0x32] = b'm'; m[0x33] = b','; m[0x34] = b'.'; m[0x35] = b'/';
+    m[0x2C] = b'z';
+    m[0x2D] = b'x';
+    m[0x2E] = b'c';
+    m[0x2F] = b'v';
+    m[0x30] = b'b';
+    m[0x31] = b'n';
+    m[0x32] = b'm';
+    m[0x33] = b',';
+    m[0x34] = b'.';
+    m[0x35] = b'/';
     m[0x39] = b' ';
     m
 };
@@ -125,18 +162,53 @@ const KEYMAP: [u8; 0x80] = {
 /// 扫描码 → ASCII（Shift 按住时）。
 const KEYMAP_SHIFT: [u8; 0x80] = {
     let mut m = [0u8; 0x80];
-    m[0x02] = b'!'; m[0x03] = b'@'; m[0x04] = b'#'; m[0x05] = b'$'; m[0x06] = b'%';
-    m[0x07] = b'^'; m[0x08] = b'&'; m[0x09] = b'*'; m[0x0A] = b'('; m[0x0B] = b')';
-    m[0x0C] = b'_'; m[0x0D] = b'+';
-    m[0x10] = b'Q'; m[0x11] = b'W'; m[0x12] = b'E'; m[0x13] = b'R'; m[0x14] = b'T';
-    m[0x15] = b'Y'; m[0x16] = b'U'; m[0x17] = b'I'; m[0x18] = b'O'; m[0x19] = b'P';
-    m[0x1A] = b'{'; m[0x1B] = b'}';
-    m[0x1E] = b'A'; m[0x1F] = b'S'; m[0x20] = b'D'; m[0x21] = b'F'; m[0x22] = b'G';
-    m[0x23] = b'H'; m[0x24] = b'J'; m[0x25] = b'K'; m[0x26] = b'L'; m[0x27] = b':';
-    m[0x28] = b'"'; m[0x29] = b'~';
+    m[0x02] = b'!';
+    m[0x03] = b'@';
+    m[0x04] = b'#';
+    m[0x05] = b'$';
+    m[0x06] = b'%';
+    m[0x07] = b'^';
+    m[0x08] = b'&';
+    m[0x09] = b'*';
+    m[0x0A] = b'(';
+    m[0x0B] = b')';
+    m[0x0C] = b'_';
+    m[0x0D] = b'+';
+    m[0x10] = b'Q';
+    m[0x11] = b'W';
+    m[0x12] = b'E';
+    m[0x13] = b'R';
+    m[0x14] = b'T';
+    m[0x15] = b'Y';
+    m[0x16] = b'U';
+    m[0x17] = b'I';
+    m[0x18] = b'O';
+    m[0x19] = b'P';
+    m[0x1A] = b'{';
+    m[0x1B] = b'}';
+    m[0x1E] = b'A';
+    m[0x1F] = b'S';
+    m[0x20] = b'D';
+    m[0x21] = b'F';
+    m[0x22] = b'G';
+    m[0x23] = b'H';
+    m[0x24] = b'J';
+    m[0x25] = b'K';
+    m[0x26] = b'L';
+    m[0x27] = b':';
+    m[0x28] = b'"';
+    m[0x29] = b'~';
     m[0x2B] = b'|';
-    m[0x2C] = b'Z'; m[0x2D] = b'X'; m[0x2E] = b'C'; m[0x2F] = b'V'; m[0x30] = b'B';
-    m[0x31] = b'N'; m[0x32] = b'M'; m[0x33] = b'<'; m[0x34] = b'>'; m[0x35] = b'?';
+    m[0x2C] = b'Z';
+    m[0x2D] = b'X';
+    m[0x2E] = b'C';
+    m[0x2F] = b'V';
+    m[0x30] = b'B';
+    m[0x31] = b'N';
+    m[0x32] = b'M';
+    m[0x33] = b'<';
+    m[0x34] = b'>';
+    m[0x35] = b'?';
     m
 };
 
@@ -213,12 +285,12 @@ fn decode_key(e0: bool, code: u8, key_up: bool) -> KeyOut {
     }
     // 扩展键（E0 前缀）：方向键 / 编辑键 / 小键盘 Enter、'/' → 转义序列。
     match code {
-        0x48 => KeyOut::Seq(b"\x1b[A"), // ↑
-        0x50 => KeyOut::Seq(b"\x1b[B"), // ↓
-        0x4B => KeyOut::Seq(b"\x1b[D"), // ←
-        0x4D => KeyOut::Seq(b"\x1b[C"), // →
-        0x47 => KeyOut::Seq(b"\x1b[H"), // Home
-        0x4F => KeyOut::Seq(b"\x1b[F"), // End
+        0x48 => KeyOut::Seq(b"\x1b[A"),  // ↑
+        0x50 => KeyOut::Seq(b"\x1b[B"),  // ↓
+        0x4B => KeyOut::Seq(b"\x1b[D"),  // ←
+        0x4D => KeyOut::Seq(b"\x1b[C"),  // →
+        0x47 => KeyOut::Seq(b"\x1b[H"),  // Home
+        0x4F => KeyOut::Seq(b"\x1b[F"),  // End
         0x52 => KeyOut::Seq(b"\x1b[2~"), // Insert
         0x53 => KeyOut::Seq(b"\x1b[3~"), // Delete
         0x49 => KeyOut::Seq(b"\x1b[5~"), // PgUp
@@ -364,7 +436,11 @@ pub fn init() -> bool {
     if wait_input_empty() {
         outb(DATA_PORT, KB_ENABLE_SCAN);
         // 等 ACK（0xFA）；可能需先清多余输出。
-        let ack = if wait_output_full() { inb(DATA_PORT) } else { 0 };
+        let ack = if wait_output_full() {
+            inb(DATA_PORT)
+        } else {
+            0
+        };
         if ack != KB_CMD_ACK {
             klib::info!("[kbd] enable-scan ack mismatch (0x{:02x})", ack);
         }

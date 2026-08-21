@@ -5,9 +5,9 @@
 
 use core::sync::atomic::Ordering;
 
-use super::allocator_core::{FrameState, MetadataCache, MAX_ORDER, SHARD_COUNT};
-use super::percpu_cache::FreeList;
 use super::LazyBuddyAllocator;
+use super::allocator_core::{FrameState, MAX_ORDER, MetadataCache, SHARD_COUNT};
+use super::percpu_cache::FreeList;
 
 impl LazyBuddyAllocator {
     /// 帧 → shard 的"分组粒度"：同一 (pfn>>SHARD_PFN_SHIFT) 区间内的帧共享同一 shard。
@@ -63,30 +63,32 @@ impl LazyBuddyAllocator {
         list.head = Some(pfn);
     }
 
-    unsafe fn remove_from_list_with_list(&self, pfn: usize, order: usize, list: &mut FreeList) { unsafe {
-        let (prev_idx, next_idx) = {
-            let frame = self.frame_ptr(pfn);
-            let prev = (*frame).prev;
-            let next = (*frame).next;
-            (*frame).next = None;
-            (*frame).prev = None;
-            (prev, next)
-        };
+    unsafe fn remove_from_list_with_list(&self, pfn: usize, order: usize, list: &mut FreeList) {
+        unsafe {
+            let (prev_idx, next_idx) = {
+                let frame = self.frame_ptr(pfn);
+                let prev = (*frame).prev;
+                let next = (*frame).next;
+                (*frame).next = None;
+                (*frame).prev = None;
+                (prev, next)
+            };
 
-        if let Some(prev) = prev_idx {
-            let prev_frame = self.frame_ptr(prev);
-            (*prev_frame).next = next_idx;
-        } else {
-            list.head = next_idx;
+            if let Some(prev) = prev_idx {
+                let prev_frame = self.frame_ptr(prev);
+                (*prev_frame).next = next_idx;
+            } else {
+                list.head = next_idx;
+            }
+
+            if let Some(next) = next_idx {
+                let next_frame = self.frame_ptr(next);
+                (*next_frame).prev = prev_idx;
+            }
+
+            let _ = order; // keep signature parity
         }
-
-        if let Some(next) = next_idx {
-            let next_frame = self.frame_ptr(next);
-            (*next_frame).prev = prev_idx;
-        }
-
-        let _ = order; // keep signature parity
-    }}
+    }
 
     pub(crate) fn alloc_from_list(&self, order: usize, cpu: usize) -> Option<usize> {
         if let Some(idx) = self.pop_from_global(order, cpu) {

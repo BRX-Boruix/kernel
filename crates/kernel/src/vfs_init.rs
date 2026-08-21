@@ -17,7 +17,7 @@ use spin::Once;
 use vfs::devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
 use vfs::inode::Permissions;
 use vfs::mount::MountTable;
-use vfs::procfs::{ProcessInfoProvider, ProcessSnapshot, ProcFS};
+use vfs::procfs::{ProcFS, ProcessInfoProvider, ProcessSnapshot};
 use vfs::ramfs::RamFS;
 use vfs::sysfs::{SysFS, SystemInfoProvider};
 
@@ -93,8 +93,12 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                     drv::BusType::Virtual => "Virtual",
                     drv::BusType::Unknown => "Unknown",
                 };
-                let bound = drv::DriverHub::device_driver_at(i).map(|s| String::from(s)).or(Some(String::from("attached")));
-                let class_val = ((info.class_code as u32) << 16) | ((info.subclass as u32) << 8) | (info.prog_if as u32);
+                let bound = drv::DriverHub::device_driver_at(i)
+                    .map(|s| String::from(s))
+                    .or(Some(String::from("attached")));
+                let class_val = ((info.class_code as u32) << 16)
+                    | ((info.subclass as u32) << 8)
+                    | (info.prog_if as u32);
                 list.push(DeviceInfo {
                     name: String::from(info.name),
                     bus: String::from(bus_str),
@@ -103,14 +107,7 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                 });
             }
         }
-        if list.is_empty() {
-            list.push(DeviceInfo {
-                name: String::from("serial-com1"),
-                bus: String::from("Serial"),
-                class: String::from("UART"),
-                bound_driver: Some(String::from("attached")),
-            });
-        }
+        // 设备注册表为空是合法状态；DevFS 必须如实返回空列表，不能伪造设备。
         list
     }
 
@@ -166,7 +163,9 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         let drv_count = drv::DriverHub::driver_count();
         format!(
             r#"{{"status":"healthy","total_devices":{},"total_drivers":{},"uptime_ms":{}}}"#,
-            count, drv_count, klib::time::now_millis()
+            count,
+            drv_count,
+            klib::time::now_millis()
         )
     }
 
@@ -186,7 +185,11 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                             Ok(())
                         });
                     }
-                    drv::pci::PciBar::Mmio32 { addr, size, prefetchable } => {
+                    drv::pci::PciBar::Mmio32 {
+                        addr,
+                        size,
+                        prefetchable,
+                    } => {
                         let _ = arr.push_object(|obj| {
                             let _ = obj.field_u64("bar", i as u64);
                             let _ = obj.field_str("type", "mmio32");
@@ -196,7 +199,11 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                             Ok(())
                         });
                     }
-                    drv::pci::PciBar::Mmio64 { addr, size, prefetchable } => {
+                    drv::pci::PciBar::Mmio64 {
+                        addr,
+                        size,
+                        prefetchable,
+                    } => {
                         let _ = arr.push_object(|obj| {
                             let _ = obj.field_u64("bar", i as u64);
                             let _ = obj.field_str("type", "mmio64");
@@ -223,18 +230,36 @@ pub fn init() {
     let mount_table = Arc::new(MountTable::new(ramfs));
 
     // 构建默认顶层骨架（全称 RESTful 集合）
-    mount_table.mkdir("/binaries", Permissions::all()).expect("mkdir /binaries");
-    mount_table.mkdir("/config", Permissions::all()).expect("mkdir /config");
-    mount_table.mkdir("/system", Permissions::all()).expect("mkdir /system");
-    mount_table.mkdir("/processes", Permissions::all()).expect("mkdir /processes");
-    mount_table.mkdir("/devices", Permissions::all()).expect("mkdir /devices");
-    mount_table.mkdir("/users", Permissions::all()).expect("mkdir /users");
-    mount_table.mkdir("/temporary", Permissions::all()).expect("mkdir /temporary");
-    mount_table.mkdir("/volumes", Permissions::all()).expect("mkdir /volumes");
+    mount_table
+        .mkdir("/binaries", Permissions::all())
+        .expect("mkdir /binaries");
+    mount_table
+        .mkdir("/config", Permissions::all())
+        .expect("mkdir /config");
+    mount_table
+        .mkdir("/system", Permissions::all())
+        .expect("mkdir /system");
+    mount_table
+        .mkdir("/processes", Permissions::all())
+        .expect("mkdir /processes");
+    mount_table
+        .mkdir("/devices", Permissions::all())
+        .expect("mkdir /devices");
+    mount_table
+        .mkdir("/users", Permissions::all())
+        .expect("mkdir /users");
+    mount_table
+        .mkdir("/temporary", Permissions::all())
+        .expect("mkdir /temporary");
+    mount_table
+        .mkdir("/volumes", Permissions::all())
+        .expect("mkdir /volumes");
 
     // 挂载特殊文件系统
     let procfs = Arc::new(ProcFS::new(Arc::new(KernelProcessProvider)));
-    mount_table.mount("/processes", procfs).expect("mount procfs");
+    mount_table
+        .mount("/processes", procfs)
+        .expect("mount procfs");
 
     let sysfs = Arc::new(SysFS::new(Arc::new(KernelSystemProvider)));
     mount_table.mount("/system", sysfs).expect("mount sysfs");
@@ -246,7 +271,8 @@ pub fn init() {
     if let Ok(init_node) = mount_table.create_file("/binaries/init.elf", Permissions::read_exec()) {
         let _ = init_node.write_at(0, include_bytes!("../init.elf"));
     }
-    if let Ok(shell_node) = mount_table.create_file("/binaries/shell.elf", Permissions::read_exec()) {
+    if let Ok(shell_node) = mount_table.create_file("/binaries/shell.elf", Permissions::read_exec())
+    {
         let _ = shell_node.write_at(0, include_bytes!("../shell.elf"));
     }
 

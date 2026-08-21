@@ -12,12 +12,12 @@
 //! - **4KB 页**（[`map_phys`] 传 `PageSize::Size4K`，或 [`map_phys_4k`] 便捷入口）：
 //!   适合 PCI BAR 等任意对齐、小块设备寄存器。
 
-use arch::phys_to_virt;
-use core::sync::atomic::{AtomicBool, Ordering};
 use crate::paging::{
-    flush_tlb, index_at, page_levels, ADDR_MASK, FLAG_LARGE, FLAG_PRESENT, FLAG_WRITABLE,
+    ADDR_MASK, FLAG_LARGE, FLAG_PRESENT, FLAG_WRITABLE, flush_tlb, index_at, page_levels,
 };
 use arch::PageSize;
+use arch::phys_to_virt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// 2MB 页大小。
 const PAGE_2M: u64 = 0x20_0000;
@@ -183,7 +183,11 @@ pub fn test_map_phys_4k() {
         write_u32(MARK_ADDR, 0x5A);
         let v = read_u32(MARK_ADDR);
         if v == 0x5A {
-            klib::info!("[mmio] 4K map verified: phys {:#x} -> virt {:#x}", RAM_PHYS, RAM_VIRT);
+            klib::info!(
+                "[mmio] 4K map verified: phys {:#x} -> virt {:#x}",
+                RAM_PHYS,
+                RAM_VIRT
+            );
         } else {
             klib::warn!("[mmio] 4K map readback mismatch: {:#x}", v);
         }

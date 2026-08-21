@@ -83,7 +83,13 @@ pub trait PageTable {
         Self: Sized;
 
     /// 把物理页 `paddr` 以 `size` 大小映射到虚拟地址 `vaddr`。
-    fn map(&mut self, vaddr: VirtAddr, paddr: PhysAddr, size: PageSize, flags: PageFlags) -> Result<(), Self::Error>;
+    fn map(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        size: PageSize,
+        flags: PageFlags,
+    ) -> Result<(), Self::Error>;
 
     /// 解除 `vaddr` 处的映射，返回被解映射的物理地址。
     fn unmap(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, Self::Error>;

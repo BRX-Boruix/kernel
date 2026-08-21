@@ -25,21 +25,21 @@ pub use dynamic::{DynamicDirNode, DynamicFileNode};
 pub use file_handle::{FileHandle, OpenFlags};
 pub use inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
 pub use mount::MountTable;
-pub use page_cache::{PageCache, PageCacheStats, HUGE_PAGE_SIZE, PAGE_SIZE};
+pub use page_cache::{HUGE_PAGE_SIZE, PAGE_SIZE, PageCache, PageCacheStats};
 pub use path::Path;
-pub use procfs::{ProcessInfoProvider, ProcessSnapshot, ProcFS};
+pub use procfs::{ProcFS, ProcessInfoProvider, ProcessSnapshot};
 pub use sysfs::{SysFS, SystemInfoProvider};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::string::String;
-    use alloc::sync::Arc;
-    use alloc::vec::Vec;
     use crate::file_handle::{FileHandle, OpenFlags, SeekWhence};
     use crate::inode::{INodeType, Permissions};
     use crate::mount::MountTable;
     use crate::path::Path;
     use crate::ramfs::RamFS;
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
     use klib::error::Error;
 
     #[test]
@@ -57,11 +57,17 @@ mod tests {
         let mount_table = MountTable::new(ramfs);
 
         // 创建目录
-        mount_table.mkdir("/config", Permissions::all()).expect("mkdir");
-        mount_table.mkdir("/binaries", Permissions::all()).expect("mkdir");
+        mount_table
+            .mkdir("/config", Permissions::all())
+            .expect("mkdir");
+        mount_table
+            .mkdir("/binaries", Permissions::all())
+            .expect("mkdir");
 
         // 创建文件
-        let file = mount_table.create_file("/config/system.toml", Permissions::read_write()).expect("create");
+        let file = mount_table
+            .create_file("/config/system.toml", Permissions::read_write())
+            .expect("create");
         assert_eq!(file.metadata().unwrap().node_type, INodeType::RegularFile);
 
         // 句柄写入与读取
@@ -81,8 +87,17 @@ mod tests {
         assert_eq!(handle.pread(6, &mut pbuf).unwrap(), 6);
         assert_eq!(&pbuf, b"boruix");
 
+        // DMYGH #12：offset=0 是定位 I/O 的文件起始位置，必须覆盖而非追加。
+        assert_eq!(handle.pwrite(0, b"HELLO").unwrap(), 5);
+        handle.seek(0, SeekWhence::Set).unwrap();
+        let mut overwritten = [0u8; 16];
+        assert_eq!(handle.read(&mut overwritten).unwrap(), 16);
+        assert_eq!(&overwritten, b"HELLO boruix vfs");
+
         // 列出目录
-        let config_dir = mount_table.resolve("/config", true).expect("resolve config");
+        let config_dir = mount_table
+            .resolve("/config", true)
+            .expect("resolve config");
         let entries = config_dir.list_dir().expect("list dir");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "system.toml");
@@ -95,15 +110,24 @@ mod tests {
         let mount_table = MountTable::new(ramfs_root);
 
         mount_table.mkdir("/users", Permissions::all()).unwrap();
-        mount_table.mkdir("/users/aixiaoji", Permissions::all()).unwrap();
-        mount_table.create_file("/users/aixiaoji/notes.txt", Permissions::all()).unwrap();
+        mount_table
+            .mkdir("/users/aixiaoji", Permissions::all())
+            .unwrap();
+        mount_table
+            .create_file("/users/aixiaoji/notes.txt", Permissions::all())
+            .unwrap();
 
         // 创建软链接
-        mount_table.symlink("/users/aixiaoji/notes.txt", "/latest_notes").unwrap();
+        mount_table
+            .symlink("/users/aixiaoji/notes.txt", "/latest_notes")
+            .unwrap();
 
         // 经由软链接读取目标节点
         let resolved = mount_table.resolve("/latest_notes", true).unwrap();
-        assert_eq!(resolved.metadata().unwrap().node_type, INodeType::RegularFile);
+        assert_eq!(
+            resolved.metadata().unwrap().node_type,
+            INodeType::RegularFile
+        );
 
         // 挂载独立子文件系统到 /volumes/data
         mount_table.mkdir("/volumes", Permissions::all()).unwrap();
@@ -111,9 +135,16 @@ mod tests {
         mount_table.mount("/volumes/data", data_ramfs).unwrap();
 
         // 在挂载的文件系统上创建文件
-        mount_table.create_file("/volumes/data/project.rs", Permissions::all()).unwrap();
-        let proj_file = mount_table.resolve("/volumes/data/project.rs", true).unwrap();
-        assert_eq!(proj_file.metadata().unwrap().node_type, INodeType::RegularFile);
+        mount_table
+            .create_file("/volumes/data/project.rs", Permissions::all())
+            .unwrap();
+        let proj_file = mount_table
+            .resolve("/volumes/data/project.rs", true)
+            .unwrap();
+        assert_eq!(
+            proj_file.metadata().unwrap().node_type,
+            INodeType::RegularFile
+        );
     }
 
     #[test]
@@ -122,7 +153,9 @@ mod tests {
         let mount_table = MountTable::new(ramfs);
 
         mount_table.mkdir("/testdir", Permissions::all()).unwrap();
-        mount_table.create_file("/testdir/file1", Permissions::all()).unwrap();
+        mount_table
+            .create_file("/testdir/file1", Permissions::all())
+            .unwrap();
 
         // 试图删除非空目录应失败
         assert_eq!(mount_table.unlink("/testdir").unwrap_err(), Error::NotEmpty);
@@ -178,7 +211,9 @@ mod tests {
             alloc::string::String::from(r#"{"arch":"x86_64","cores":1,"vendor":"GenuineIntel"}"#)
         }
         fn memory_json(&self) -> alloc::string::String {
-            alloc::string::String::from(r#"{"capacity_bytes":134217728,"allocated_bytes":4194304,"free_bytes":130023424}"#)
+            alloc::string::String::from(
+                r#"{"capacity_bytes":134217728,"allocated_bytes":4194304,"free_bytes":130023424}"#,
+            )
         }
         fn kernel_json(&self) -> alloc::string::String {
             alloc::string::String::from(r#"{"version":"0.1.0","git_commit":"abcdef"}"#)
@@ -190,14 +225,12 @@ mod tests {
     }
     impl DeviceInfoProvider for MockDeviceProvider {
         fn list_devices(&self) -> Vec<DeviceInfo> {
-            alloc::vec![
-                DeviceInfo {
-                    name: alloc::string::String::from("serial-com1"),
-                    bus: alloc::string::String::from("ISA"),
-                    class: alloc::string::String::from("UART"),
-                    bound_driver: Some(alloc::string::String::from("uart16550")),
-                }
-            ]
+            alloc::vec![DeviceInfo {
+                name: alloc::string::String::from("serial-com1"),
+                bus: alloc::string::String::from("ISA"),
+                class: alloc::string::String::from("UART"),
+                bound_driver: Some(alloc::string::String::from("uart16550")),
+            }]
         }
         fn serial_read(&self, buf: &mut [u8]) -> Result<usize, Error> {
             let data = b"OK";
@@ -270,7 +303,9 @@ mod tests {
         assert!(s5.contains(r#""driver":"uart16550""#));
 
         // 串口属性子文件测试
-        let baud_file = mount_table.resolve("/devices/serial-com1/baudrate", true).unwrap();
+        let baud_file = mount_table
+            .resolve("/devices/serial-com1/baudrate", true)
+            .unwrap();
         let n6 = baud_file.read_at(0, &mut buf).unwrap();
         assert_eq!(core::str::from_utf8(&buf[..n6]).unwrap().trim(), "115200");
 
@@ -280,16 +315,53 @@ mod tests {
         assert_eq!(core::str::from_utf8(&buf[..n7]).unwrap().trim(), "9600");
 
         // 串口 config JSON
-        let cfg_file = mount_table.resolve("/devices/serial-com1/config", true).unwrap();
+        let cfg_file = mount_table
+            .resolve("/devices/serial-com1/config", true)
+            .unwrap();
         let n8 = cfg_file.read_at(0, &mut buf).unwrap();
         let s8 = core::str::from_utf8(&buf[..n8]).unwrap();
         assert!(s8.contains(r#""baudrate":9600"#));
 
         // 显示器分辨率 mode JSON
-        let mode_file = mount_table.resolve("/devices/displays/primary/mode", true).unwrap();
+        let mode_file = mount_table
+            .resolve("/devices/displays/primary/mode", true)
+            .unwrap();
         let n9 = mode_file.read_at(0, &mut buf).unwrap();
         let s9 = core::str::from_utf8(&buf[..n9]).unwrap();
         assert!(s9.contains(r#""width":1024"#));
+    }
+
+    struct EmptyDeviceProvider;
+    impl DeviceInfoProvider for EmptyDeviceProvider {
+        fn list_devices(&self) -> Vec<DeviceInfo> {
+            Vec::new()
+        }
+
+        fn serial_read(&self, _buf: &mut [u8]) -> Result<usize, Error> {
+            Err(Error::NotFound)
+        }
+
+        fn serial_write(&self, _buf: &[u8]) -> Result<usize, Error> {
+            Err(Error::NotFound)
+        }
+
+        fn get_serial_baudrate(&self) -> u32 {
+            0
+        }
+
+        fn set_serial_baudrate(&self, _baud: u32) -> Result<(), Error> {
+            Err(Error::NotFound)
+        }
+    }
+
+    /// DMYGH #4：设备注册表为空是合法状态，DevFS 必须如实输出空数组。
+    #[test]
+    fn test_devfs_empty_device_registry_is_honest() {
+        let devfs = DevFS::new(Arc::new(EmptyDeviceProvider));
+        let list = devfs.root().lookup("list").expect("resolve device list");
+        let mut buf = [0u8; 8];
+        let n = list.read_at(0, &mut buf).expect("read empty device list");
+        assert_eq!(&buf[..n], b"[]\n");
     }
 
     #[test]
@@ -314,7 +386,9 @@ mod tests {
 
         // 1. 4KB 页缓存读取（跨越 4096 边界，涉及 page 0 与 page 1）
         let mut read_buf_4k = [0u8; 100];
-        let n1 = cache.read_cached(file.as_ref(), 4090, &mut read_buf_4k).unwrap();
+        let n1 = cache
+            .read_cached(file.as_ref(), 4090, &mut read_buf_4k)
+            .unwrap();
         assert_eq!(n1, 100);
         assert_eq!(&read_buf_4k, &sample_data[4090..4190]);
         let stats1 = cache.stats();
@@ -323,7 +397,9 @@ mod tests {
 
         // 再次读取命中 4KB 缓存（2 个页皆已缓存）
         let mut read_buf_4k_hit = [0u8; 100];
-        let n2 = cache.read_cached(file.as_ref(), 4090, &mut read_buf_4k_hit).unwrap();
+        let n2 = cache
+            .read_cached(file.as_ref(), 4090, &mut read_buf_4k_hit)
+            .unwrap();
         assert_eq!(n2, 100);
         assert_eq!(&read_buf_4k_hit, &sample_data[4090..4190]);
         let stats2 = cache.stats();
@@ -339,7 +415,9 @@ mod tests {
 
         // 再次命中 2MB 大页缓存
         let mut big_buf2 = alloc::vec![0u8; 1024];
-        let n_big2 = cache.read_cached(file.as_ref(), 65536, &mut big_buf2).unwrap();
+        let n_big2 = cache
+            .read_cached(file.as_ref(), 65536, &mut big_buf2)
+            .unwrap();
         assert_eq!(n_big2, 1024);
         assert_eq!(&big_buf2[..], &sample_data[65536..65536 + 1024]);
         let stats4 = cache.stats();

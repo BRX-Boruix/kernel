@@ -11,7 +11,7 @@ mod stats;
 
 use core::mem::size_of;
 
-use arch::{phys_to_virt, PhysFrame};
+use arch::{PhysFrame, phys_to_virt};
 use limine::{MemmapEntry, NonNullPtr};
 use spin::Once;
 
@@ -22,13 +22,12 @@ pub use allocator_core::{ORDER_1G, ORDER_2M};
 pub use compact::compact_now;
 pub use refcount::{count as frame_refcount, decref as frame_decref, incref as frame_incref};
 pub use stats::reset_stats as reset_frame_stats;
-pub use stats::{frag_stats, reset_stats, stats, FrameAllocatorStats, PmmFragStats};
+pub use stats::{FrameAllocatorStats, PmmFragStats, frag_stats, reset_stats, stats};
 
 /// 获取物理页帧总数。
 pub fn total_frames() -> usize {
     ALLOCATOR.config().total_frames
 }
-
 
 // Global allocator instance
 static ALLOCATOR: LazyBuddyAllocator = LazyBuddyAllocator::new();
@@ -96,9 +95,11 @@ unsafe impl Send for LazyBuddyAllocator {}
 unsafe impl Sync for LazyBuddyAllocator {}
 
 /// Initialize the global allocator
-pub unsafe fn init(mmap: &[NonNullPtr<MemmapEntry>]) { unsafe {
-    ALLOCATOR.init(mmap);
-}}
+pub unsafe fn init(mmap: &[NonNullPtr<MemmapEntry>]) {
+    unsafe {
+        ALLOCATOR.init(mmap);
+    }
+}
 
 /// Allocate a physical frame
 pub fn allocate_frame() -> Option<PhysFrame> {

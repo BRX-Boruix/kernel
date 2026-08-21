@@ -20,13 +20,13 @@ pub const SIGTERM: u32 = 15;
 /// CPU 异常 vector → 信号号（雏形映射，仅用户态异常使用）。
 pub const fn signal_for_exception(vector: u64) -> u32 {
     match vector {
-        0 => SIGFPE,            // #DE 除零
-        4 | 5 | 6 => SIGILL,    // #OF / #BR / #UD
-        8 => SIGFPE,            // #DF（兜底按算术）
+        0 => SIGFPE,             // #DE 除零
+        4 | 5 | 6 => SIGILL,     // #OF / #BR / #UD
+        8 => SIGFPE,             // #DF（兜底按算术）
         11 | 12 | 13 => SIGSEGV, // #NP / #SS / #GP
-        14 => SIGSEGV,          // #PF 页错误
-        17 => SIGSEGV,          // #AC 对齐检查
-        _ => SIGTERM,           // 其余未知异常 → 兜底终止
+        14 => SIGSEGV,           // #PF 页错误
+        17 => SIGSEGV,           // #AC 对齐检查
+        _ => SIGTERM,            // 其余未知异常 → 兜底终止
     }
 }
 

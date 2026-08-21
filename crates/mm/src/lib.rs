@@ -17,9 +17,9 @@ pub mod memory_set;
 pub mod user_space;
 
 pub use frame_allocator::{
-    allocate_frame, allocate_frames, compact_now, deallocate_frame, frag_stats, frame_decref,
-    frame_incref, frame_refcount, init as init_frame, stats as frame_stats, reset_frame_stats,
-    total_frames, FrameAllocatorStats, PmmFragStats,
+    FrameAllocatorStats, PmmFragStats, allocate_frame, allocate_frames, compact_now,
+    deallocate_frame, frag_stats, frame_decref, frame_incref, frame_refcount, init as init_frame,
+    reset_frame_stats, stats as frame_stats, total_frames,
 };
 
 use core::sync::atomic::{AtomicUsize, Ordering};

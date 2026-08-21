@@ -23,9 +23,11 @@ pub use device::{
     IoDevice, NetDevice,
 };
 pub use driver::{Driver, DriverEntry, DriverStage};
-pub use event::{publish_event, pop_event, pending_event_count, subscribe_events, DeviceEvent, EventSubscriber};
+pub use event::{
+    DeviceEvent, EventSubscriber, pending_event_count, pop_event, publish_event, subscribe_events,
+};
 pub use hub::DriverHub;
-pub use uio::{uio_register_driver, uio_on_process_exit, uio_is_device_claimed, UioDriverEntry};
+pub use uio::{UioDriverEntry, uio_is_device_claimed, uio_on_process_exit, uio_register_driver};
 
 #[cfg(test)]
 mod tests {

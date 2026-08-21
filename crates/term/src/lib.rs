@@ -43,8 +43,16 @@ pub fn init(fb: &limine::Framebuffer) {
     );
     let ctx = unsafe {
         flanterm_rust::flanterm_fb_init(
-            fb_ptr, width, height, pitch,
-            rms, rsh, gms, gsh, bms, bsh,
+            fb_ptr,
+            width,
+            height,
+            pitch,
+            rms,
+            rsh,
+            gms,
+            gsh,
+            bms,
+            bsh,
             core::ptr::null_mut(),
             core::ptr::null_mut(),
             core::ptr::null_mut(),
@@ -53,13 +61,19 @@ pub fn init(fb: &limine::Framebuffer) {
             core::ptr::null_mut(),
             core::ptr::null_mut(),
             core::ptr::null_mut(),
-            0, 0, 0,
-            1, 1,
+            0,
+            0,
+            0,
+            1,
+            1,
             0,
             flanterm_rust::FLANTERM_FB_ROTATE_0,
         )
     };
-    info!("[terminal] flanterm_fb_init done, ctx.is_some={}", ctx.is_some());
+    info!(
+        "[terminal] flanterm_fb_init done, ctx.is_some={}",
+        ctx.is_some()
+    );
 
     if let Some(ctx) = ctx {
         let ctx: &'static mut FlantermContext = Box::leak(ctx);

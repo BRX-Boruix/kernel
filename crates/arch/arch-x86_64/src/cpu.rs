@@ -10,8 +10,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use arch::cpu::CpuFeature;
 use crate::mmio;
+use arch::cpu::CpuFeature;
 
 /// CPUID 输出（四个寄存器）。
 #[derive(Debug, Clone, Copy, Default)]
@@ -219,11 +219,7 @@ fn rdrand_attempt() -> Option<u64> {
             options(nomem, nostack),
         );
     }
-    if ok != 0 {
-        Some(out)
-    } else {
-        None
-    }
+    if ok != 0 { Some(out) } else { None }
 }
 
 /// 单次 RDSEED 尝试。
@@ -240,11 +236,7 @@ fn rdseed_attempt() -> Option<u64> {
             options(nomem, nostack),
         );
     }
-    if ok != 0 {
-        Some(out)
-    } else {
-        None
-    }
+    if ok != 0 { Some(out) } else { None }
 }
 
 /// 读 64 位硬件真随机数（RDRAND）。指令不可用或连续 10 次失败返回 `None`。

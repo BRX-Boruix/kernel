@@ -22,10 +22,10 @@ pub mod timer;
 pub use acpi::{Rsdp, SdtHeader};
 pub use addr::{PhysAddr, PhysFrame, VirtAddr};
 pub use cpu::{Cpu, CpuFeature};
-pub use hhdm::{phys_to_virt, virt_to_phys, PHYS_OFFSET};
+pub use hhdm::{PHYS_OFFSET, phys_to_virt, virt_to_phys};
 pub use paging::{ActivePageTable, PageFlags, PageSize, PageTable};
 pub use pci::{Pci, PciDeviceInfo};
-pub use task::{switch_to, TaskContext};
+pub use task::{TaskContext, switch_to};
 pub use timer::{Timer, TimerCallback};
 
 /// 架构平台抽象。

@@ -489,7 +489,8 @@ mod tests {
         {
             let mut writer = JsonWriter::new(&mut target);
             let mut obj = writer.start_object().unwrap();
-            obj.field_str("msg", "hello \"world\"\nnewline\ttab").unwrap();
+            obj.field_str("msg", "hello \"world\"\nnewline\ttab")
+                .unwrap();
             obj.end().unwrap();
         }
         assert_eq!(

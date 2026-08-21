@@ -223,7 +223,10 @@ pub fn scan_pci_bus() -> usize {
             }
         }
     }
-    info!("[pci] scan complete: found and registered {} devices", count);
+    info!(
+        "[pci] scan complete: found and registered {} devices",
+        count
+    );
     count
 }
 

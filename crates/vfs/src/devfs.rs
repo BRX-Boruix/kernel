@@ -38,17 +38,27 @@ pub trait DeviceInfoProvider: Send + Sync {
     fn get_serial_baudrate(&self) -> u32;
     fn set_serial_baudrate(&self, baud: u32) -> Result<(), Error>;
     fn telemetry_json(&self) -> String {
-        alloc::format!(r#"{{"status":"healthy","devices_count":{},"uptime_ms":{}}}"#, self.list_devices().len(), klib::time::now_millis())
+        alloc::format!(
+            r#"{{"status":"healthy","devices_count":{},"uptime_ms":{}}}"#,
+            self.list_devices().len(),
+            klib::time::now_millis()
+        )
     }
     fn pci_bars_json(&self, dev_name: &str) -> String {
         let _ = dev_name;
         alloc::string::String::from(r#"[{"bar":0,"type":"io","port":49200,"size":16}]"#)
     }
     fn storage_status_json(&self, dev_name: &str) -> String {
-        alloc::format!(r#"{{"device":"{}","status":"healthy","sectors_read":1024,"sectors_written":512,"io_latency_us":45}}"#, dev_name)
+        alloc::format!(
+            r#"{{"device":"{}","status":"healthy","sectors_read":1024,"sectors_written":512,"io_latency_us":45}}"#,
+            dev_name
+        )
     }
     fn net_stats_json(&self, dev_name: &str) -> String {
-        alloc::format!(r#"{{"device":"{}","status":"up","rx_bytes":65536,"tx_bytes":32768,"drops":0,"link_speed_mbps":1000}}"#, dev_name)
+        alloc::format!(
+            r#"{{"device":"{}","status":"up","rx_bytes":65536,"tx_bytes":32768,"drops":0,"link_speed_mbps":1000}}"#,
+            dev_name
+        )
     }
 }
 
