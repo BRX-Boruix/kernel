@@ -99,6 +99,8 @@ pub const MAX_TIMERS: usize = 32;
 /// 单个定时器槽：`deadline` 为到期时刻（纳秒时间线）。
 /// 三个字段均为原子，避免持有锁读；写入仅在锁内进行。
 struct TimerSlot {
+    /// 注册时分配的非零 identity；0 表示槽位空闲。
+    id: AtomicU64,
     deadline: AtomicU64,
     callback: AtomicUsize, // TimerCallback as usize，0 = 空闲
     arg: AtomicUsize,
@@ -107,6 +109,7 @@ struct TimerSlot {
 impl TimerSlot {
     const fn empty() -> Self {
         Self {
+            id: AtomicU64::new(0),
             deadline: AtomicU64::new(0),
             callback: AtomicUsize::new(0),
             arg: AtomicUsize::new(0),
@@ -135,24 +138,50 @@ pub fn set_timeout(delay_ns: u64, callback: TimerCallback, arg: usize) -> Option
     }
     let deadline = now_nanos().saturating_add(delay_ns);
     let mut table = TIMER_TABLE.lock();
-    for slot in &table.slots {
-        if slot.callback.load(Ordering::Relaxed) == 0 {
-            slot.deadline.store(deadline, Ordering::Release);
-            slot.callback.store(callback as usize, Ordering::Release);
-            slot.arg.store(arg, Ordering::Relaxed);
-            let id = table.next_id;
-            table.next_id = table.next_id.wrapping_add(1);
-            return Some(id);
-        }
+    let slot_index = table
+        .slots
+        .iter()
+        .position(|slot| slot.callback.load(Ordering::Relaxed) == 0)?;
+
+    // 0 始终表示“无 ID”；绕回时跳过它，确保 live ID 永不与空槽混淆。
+    let id = table.next_id;
+    table.next_id = table.next_id.wrapping_add(1);
+    if table.next_id == 0 {
+        table.next_id = 1;
     }
-    None
+
+    let slot = &table.slots[slot_index];
+    // 发布顺序：先完整初始化 payload，最后写 callback 作为槽位 live 标志。
+    // 所有查看 live 槽位的路径均在 TIMER_TABLE 锁内，仍保留 Release 以
+    // 明确 callback 的发布语义。
+    slot.id.store(id, Ordering::Relaxed);
+    slot.deadline.store(deadline, Ordering::Relaxed);
+    slot.arg.store(arg, Ordering::Relaxed);
+    slot.callback.store(callback as usize, Ordering::Release);
+    Some(id)
 }
 
 /// 取消一个未到期的定时器。已触发/不存在的 id 返回 `false`。
+///
+/// 调用与 `poll_timeouts` 均持有同一把 IRQ-safe 锁，因此二者线性化：若取消先
+/// 取得锁，回调绝不会进入锁外执行队列；若 poll 先取得锁并摘除槽位，则取消如实
+/// 返回 false，回调会按既有语义执行。
 pub fn cancel_timeout(id: u64) -> bool {
-    // 槽位不存 id，无法按 id 精确匹配；此版本在 `set_timeout` 写入前
-    // 无并发取消场景，直接实现为"全部取消"保留接口兼容。
-    let _ = id;
+    if id == 0 {
+        return false;
+    }
+    let table = TIMER_TABLE.lock();
+    for slot in &table.slots {
+        if slot.id.load(Ordering::Relaxed) == id && slot.callback.load(Ordering::Acquire) != 0 {
+            // callback 是槽位的 live 标志；先清它使 poll 无法再认领，再清理余下
+            // 元数据，确保该 id 永远不会在重用槽里再次匹配。
+            slot.callback.store(0, Ordering::Release);
+            slot.id.store(0, Ordering::Relaxed);
+            slot.deadline.store(0, Ordering::Relaxed);
+            slot.arg.store(0, Ordering::Relaxed);
+            return true;
+        }
+    }
     false
 }
 
@@ -181,6 +210,11 @@ pub fn poll_timeouts() {
                 due[n] = slot.callback.swap(0, Ordering::AcqRel);
                 dl[n] = deadline;
                 args[n] = slot.arg.load(Ordering::Relaxed);
+                // poll 已认领回调；该 ID 从此不再可取消，也不会与后续重用槽位
+                // 的新定时器相混淆。
+                slot.id.store(0, Ordering::Relaxed);
+                slot.deadline.store(0, Ordering::Relaxed);
+                slot.arg.store(0, Ordering::Relaxed);
                 n += 1;
             }
         }
@@ -259,8 +293,10 @@ mod tests {
     fn clear_table() {
         let table = TIMER_TABLE.lock();
         for slot in &table.slots {
+            slot.id.store(0, Ordering::Relaxed);
             slot.callback.store(0, Ordering::Relaxed);
             slot.deadline.store(0, Ordering::Relaxed);
+            slot.arg.store(0, Ordering::Relaxed);
         }
     }
 
@@ -333,6 +369,81 @@ mod tests {
         poll_timeouts();
         let v = ORDER.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(*v, vec![4, 3, 2, 1, 0]); // 到期时间先后
+    }
+
+    #[test]
+    fn cancel_timeout_removes_only_its_exact_timer() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+
+        let first = set_timeout(10_000, cb_push, 1).expect("first timer id");
+        let middle = set_timeout(20_000, cb_push, 2).expect("middle timer id");
+        let last = set_timeout(30_000, cb_push, 3).expect("last timer id");
+        assert_ne!(first, 0, "timer id zero is reserved as no-id");
+        assert_ne!(first, middle, "live timers need distinct ids");
+        assert_ne!(middle, last, "live timers need distinct ids");
+
+        assert!(cancel_timeout(middle), "cancel must find the requested id");
+        assert!(
+            !cancel_timeout(middle),
+            "repeated cancellation must truthfully report no live timer"
+        );
+        assert!(
+            !cancel_timeout(u64::MAX),
+            "unknown ids must not claim cancellation success"
+        );
+
+        // All original deadlines have elapsed. Only the non-cancelled callbacks may run.
+        FAKE_TICK.store(100, Ordering::Relaxed);
+        poll_timeouts();
+        assert_eq!(
+            *ORDER.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![1, 3],
+            "cancelling one timer must not suppress or reorder other due timers"
+        );
+        assert!(
+            !cancel_timeout(first),
+            "a timer already claimed by poll_timeouts is no longer cancellable"
+        );
+        assert!(
+            !cancel_timeout(last),
+            "an executed timer id must not remain live"
+        );
+    }
+
+    #[test]
+    fn cancellation_releases_capacity_immediately() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+
+        let mut ids = [0u64; MAX_TIMERS];
+        for id in &mut ids {
+            *id = set_timeout(1_000_000, cb_count, 0).expect("timer table slot");
+        }
+        assert!(
+            set_timeout(1_000_000, cb_count, 0).is_none(),
+            "table must be full"
+        );
+
+        let released = ids[MAX_TIMERS / 2];
+        assert!(
+            cancel_timeout(released),
+            "cancelling a live timer frees its slot"
+        );
+        let replacement = set_timeout(1_000_000, cb_count, 0)
+            .expect("cancelled slot must be reusable without waiting for deadline");
+        assert_ne!(
+            replacement, released,
+            "reused slot must receive a new identity"
+        );
+
+        // Clean up every still-live timer so this global-state test cannot leak into another.
+        for id in ids {
+            if id != released {
+                assert!(cancel_timeout(id));
+            }
+        }
+        assert!(cancel_timeout(replacement));
     }
 
     #[test]

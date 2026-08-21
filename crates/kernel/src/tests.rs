@@ -516,6 +516,10 @@ fn timeout_cb(_arg: usize) {
     TIMEOUT_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
+fn timeout_mark_cb(arg: usize) {
+    TIMEOUT_FIRED.fetch_or(arg, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// 验证 `arch::Timer`（X8664Timer）抽象：单调时钟换算、sleep、软件定时器。
 pub fn test_time_abstraction() {
     use core::sync::atomic::Ordering;
@@ -565,7 +569,42 @@ pub fn test_time_abstraction() {
         "software timer callback should have fired once"
     );
 
-    // 3. sleep_us：忙等 20ms，验证期间时间确实流逝。
+    // 3. #9：真实取消——取消一个尚未到期的 timer 后等待超过 deadline，回调
+    // 绝不能运行；未取消的相邻 timer 仍必须运行，证明不是“全部取消”。
+    TIMEOUT_FIRED.store(0, Ordering::Relaxed);
+    let cancelled = X8664Timer::set_timeout(500_000_000, timeout_mark_cb, 0b01)
+        .expect("register cancellable timeout");
+    let survivor = X8664Timer::set_timeout(500_000_000, timeout_mark_cb, 0b10)
+        .expect("register survivor timeout");
+    assert_ne!(cancelled, survivor, "live timeout ids must be distinct");
+    assert!(
+        klib::time::cancel_timeout(cancelled),
+        "cancel_timeout must locate its live id"
+    );
+    assert!(
+        !klib::time::cancel_timeout(cancelled),
+        "cancelling the same id twice must fail"
+    );
+    assert!(
+        !klib::time::cancel_timeout(u64::MAX),
+        "unknown timeout id must fail"
+    );
+    let t_cancel = arch_x86_64::lapic::ticks();
+    while arch_x86_64::lapic::ticks().wrapping_sub(t_cancel) < 70 {
+        arch_x86_64::interrupts::enable();
+        arch_x86_64::interrupts::halt();
+    }
+    assert_eq!(
+        TIMEOUT_FIRED.load(Ordering::Relaxed),
+        0b10,
+        "only the non-cancelled timeout callback may run"
+    );
+    assert!(
+        !klib::time::cancel_timeout(survivor),
+        "an executed timeout must no longer be cancellable"
+    );
+
+    // 4. sleep_us：忙等 20ms，验证期间时间确实流逝。
     let t2 = arch_x86_64::lapic::ticks();
     X8664Timer::sleep_us(20_000); // 20ms
     let elapsed_ticks = arch_x86_64::lapic::ticks().wrapping_sub(t2);
@@ -2305,7 +2344,10 @@ pub fn test_syscall_munmap() {
     let heap_end = mm::user_space::USER_HEAP_BASE + 0x1000;
     let mut grow_heap = frame(crate::syscall::SYS_MEMORY_GROW, heap_end, 0);
     assert!(crate::syscall::syscall_entry(&mut grow_heap));
-    assert_eq!(grow_heap.rax, heap_end, "brk must establish heap reservation");
+    assert_eq!(
+        grow_heap.rax, heap_end,
+        "brk must establish heap reservation"
+    );
     let mut unmap_heap = frame(
         crate::syscall::SYS_MEMORY_UNMAP,
         mm::user_space::USER_HEAP_BASE,
