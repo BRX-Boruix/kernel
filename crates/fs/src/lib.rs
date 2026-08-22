@@ -11,6 +11,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod ext2;
 pub mod mbr;
 
 /// 块设备字节读后端最小抽象。
