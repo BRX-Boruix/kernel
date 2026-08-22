@@ -96,6 +96,7 @@ mod tests {
                 class_code: 0x01,
                 subclass: 0x01,
                 prog_if: 0x80,
+                volatile: false,
             },
             None,
             None,
@@ -128,6 +129,7 @@ mod tests {
                 class_code: 0x02,
                 subclass: 0x00,
                 prog_if: 0x00,
+                volatile: true,
             },
             None,
             None,
@@ -166,6 +168,7 @@ mod tests {
                 class_code: 0x06,
                 subclass: 0x04,
                 prog_if: 0x00,
+                volatile: true,
             },
             None,
             None,
@@ -179,6 +182,71 @@ mod tests {
             DriverHub::pci_location_of("pci-ethernet"),
             Some((0, 3, 0)),
             "first device must still be locatable after second registration"
+        );
+    }
+
+    /// C15.1：DeviceInfo.volatile 必须经注册表原样往返，且泛型注册入口
+    /// （register_device / register_device_bus）在无持久化证据时保守披露 true。
+    #[test]
+    fn test_volatile_disclosure() {
+        // 持久硬件声明：false 必须原样保留
+        DriverHub::register_device_info(
+            DeviceInfo {
+                name: "volatile-hw-disk",
+                kind: DeviceKind::Block,
+                bus: BusType::Pci,
+                location: 0x00050000,
+                vendor_id: 0x8086,
+                device_id: 0x7010,
+                class_code: 0x01,
+                subclass: 0x01,
+                prog_if: 0x80,
+                volatile: false,
+            },
+            None,
+            None,
+        );
+
+        // 易失设备声明：true 必须原样保留
+        DriverHub::register_device_info(
+            DeviceInfo {
+                name: "volatile-ram-disk",
+                kind: DeviceKind::Block,
+                bus: BusType::Virtual,
+                location: 0,
+                vendor_id: 0,
+                device_id: 0,
+                class_code: 0x01,
+                subclass: 0x80,
+                prog_if: 0,
+                volatile: true,
+            },
+            None,
+            None,
+        );
+
+        let find_info = |name: &str| {
+            (0..DriverHub::device_count()).find_map(|i| {
+                DriverHub::device_info_at(i).filter(|info| info.name == name)
+            })
+        };
+
+        let hw = find_info("volatile-hw-disk").expect("hw disk registered");
+        assert!(
+            !hw.volatile,
+            "persistent hardware declaration must round-trip as volatile=false"
+        );
+        let ram = find_info("volatile-ram-disk").expect("ram disk registered");
+        assert!(
+            ram.volatile,
+            "volatile declaration must round-trip as volatile=true"
+        );
+
+        // 泛型入口（仅知 name/kind）：无持久化证据必须保守上报 true
+        let generic = find_info("serial-com1").expect("generic-registered device present");
+        assert!(
+            generic.volatile,
+            "generic registration without persistence evidence must disclose volatile=true"
         );
     }
 }

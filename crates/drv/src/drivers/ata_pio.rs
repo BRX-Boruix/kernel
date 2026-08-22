@@ -284,30 +284,55 @@ impl BlockDevice for AtaPioDevice {
     }
 }
 
+/// identify 成功时的真实硬件盘身份：背后是可持久化介质（-hda 镜像/真机硬盘）。
 pub static ATA_PRIMARY_MASTER: AtaPioDevice = AtaPioDevice {
     name: "ata0",
     sectors: Mutex::new(0),
     is_hardware: Mutex::new(false),
 };
 
+/// identify 失败时的内存回退盘身份（DMYGH #15）：
+/// 独立注册名 + 易失披露，杜绝以 "ata0" 名义伪装持久硬盘。
+static ATA_RAM_FALLBACK: AtaPioDevice = AtaPioDevice {
+    name: "ata0-ramfallback",
+    sectors: Mutex::new(0),
+    is_hardware: Mutex::new(false),
+};
+
+/// 回退盘容量：128 扇区 × 512B = 64KiB。
+const FALLBACK_SECTOR_COUNT: u64 = 128;
+
 pub fn init_ata(_hub: &DriverHub) {
-    if let Some(sec) = identify_ata() {
-        *ATA_PRIMARY_MASTER.sectors.lock() = sec;
-        *ATA_PRIMARY_MASTER.is_hardware.lock() = true;
-        info!(
-            "[ata_pio] ATA Primary Master hardware identified: {} sectors ({} MB)",
-            sec,
-            (sec * 512) / (1024 * 1024)
-        );
-    } else {
-        *ATA_PRIMARY_MASTER.sectors.lock() = 128; // 64KB (128 sectors)
-        *ATA_PRIMARY_MASTER.is_hardware.lock() = false;
-        info!("[ata_pio] ATA Primary Master fallback storage initialized (64KB)");
-    }
+    // 身份在 init 时一次性判定并写入注册表，运行期不再变更（无影子状态）。
+    let (dev, dev_name, volatile): (&'static AtaPioDevice, &'static str, bool) = match identify_ata()
+    {
+        Some(sec) => {
+            *ATA_PRIMARY_MASTER.sectors.lock() = sec;
+            *ATA_PRIMARY_MASTER.is_hardware.lock() = true;
+            info!(
+                "[ata_pio] ATA Primary Master hardware identified: {} sectors ({} MB)",
+                sec,
+                (sec * 512) / (1024 * 1024)
+            );
+            (&ATA_PRIMARY_MASTER, "ata0", false)
+        }
+        None => {
+            // DMYGH #15：identify 失败时如实登记为非持久内存回退盘，
+            // 日志保留 fallback 说明，设备列表同步携带 volatile=true。
+            *ATA_RAM_FALLBACK.sectors.lock() = FALLBACK_SECTOR_COUNT;
+            *ATA_RAM_FALLBACK.is_hardware.lock() = false;
+            info!(
+                "[ata_pio] ATA identify failed; fallback to NON-PERSISTENT RAM storage '{}' ({} KiB) - all data is lost on reboot",
+                ATA_RAM_FALLBACK.name,
+                (FALLBACK_SECTOR_COUNT * 512) / 1024
+            );
+            (&ATA_RAM_FALLBACK, "ata0-ramfallback", true)
+        }
+    };
 
     DriverHub::register_device_info(
         DeviceInfo {
-            name: "ata0",
+            name: dev_name,
             kind: DeviceKind::Block,
             bus: BusType::Platform,
             location: 0x1F0,
@@ -316,8 +341,9 @@ pub fn init_ata(_hub: &DriverHub) {
             class_code: 0x01,
             subclass: 0x01,
             prog_if: 0x8A,
+            volatile,
         },
-        Some(&ATA_PRIMARY_MASTER),
+        Some(dev),
         Some("ata_pio"),
     );
 }

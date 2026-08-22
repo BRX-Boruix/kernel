@@ -74,6 +74,8 @@ pub fn init_pseudo(_hub: &DriverHub) {
             class_code: 0,
             subclass: 0,
             prog_if: 0,
+            // C15.1：纯虚拟黑洞设备，写入即弃。
+            volatile: true,
         },
         Some(&NULL_DEV),
         Some("pseudo"),
@@ -90,6 +92,8 @@ pub fn init_pseudo(_hub: &DriverHub) {
             class_code: 0,
             subclass: 0,
             prog_if: 0,
+            // C15.1：纯虚拟零流设备，不承载可持久数据。
+            volatile: true,
         },
         Some(&ZERO_DEV),
         Some("pseudo"),

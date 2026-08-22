@@ -2840,8 +2840,21 @@ pub fn test_driver_hub_m72() {
     let mut found_ramdisk = false;
     for i in 0..dev_count {
         if let Some(info) = DriverHub::device_info_at(i) {
-            if info.name == "ata0" {
+            // DMYGH #15：ATA 只允许两种诚实身份——硬件盘 "ata0"（volatile=false）
+            // 或内存回退盘 "ata0-ramfallback"（volatile=true），身份与披露必须一致。
+            if info.name == "ata0" || info.name == "ata0-ramfallback" {
                 found_ata = true;
+                if info.name == "ata0" {
+                    assert!(
+                        !info.volatile,
+                        "hardware ata0 must disclose volatile=false"
+                    );
+                } else {
+                    assert!(
+                        info.volatile,
+                        "RAM fallback disk must disclose volatile=true under its distinct name"
+                    );
+                }
                 if let Some(dev) = DriverHub::device_at(i) {
                     assert_eq!(dev.kind(), drv::DeviceKind::Block);
                     let mut test_buf = [0u8; 512];
@@ -2852,10 +2865,18 @@ pub fn test_driver_hub_m72() {
                     let read_n = dev.read_at(0, &mut read_buf);
                     assert_eq!(read_n, 512, "ata read_at sector 0");
                     assert_eq!(&read_buf[0..4], b"BRX!", "ata sector 0 content match");
-                    info!("[test-driver-hub-m72] ATA/IDE block device read/write 512B OK");
+                    info!(
+                        "[test-driver-hub-m72] ATA block device identity={} volatile={} read/write 512B OK",
+                        info.name, info.volatile
+                    );
                 }
             } else if info.name == "ramdisk0" {
                 found_ramdisk = true;
+                // C15.1：Ramdisk 后端是内存，必须披露易失。
+                assert!(
+                    info.volatile,
+                    "ramdisk0 must disclose volatile=true"
+                );
                 if let Some(dev) = DriverHub::device_at(i) {
                     assert_eq!(dev.kind(), drv::DeviceKind::Block);
                     let written = dev.write_at(1024, b"RAMDISK_BORUIX_VOLUME");
@@ -2893,7 +2914,7 @@ pub fn test_driver_hub_m72() {
             }
         }
     }
-    assert!(found_ata, "ata0 must be registered in DriverHub");
+    assert!(found_ata, "an honestly-identified ata0/ata0-ramfallback must be registered in DriverHub");
     assert!(found_ramdisk, "ramdisk0 must be registered in DriverHub");
 
     // 6. 验证 DevFS /devices/list 动态投影与 JSON HATEOAS
@@ -2920,6 +2941,25 @@ pub fn test_driver_hub_m72() {
         projected_device_count, dev_count,
         "DevFS device list must faithfully project DriverHub without phantom entries"
     );
+    // DMYGH C15.1：每个投影设备必须携带各自的易失性披露字段，且两种取值
+    // 在标准设备集下都必须可见（串口/Ramdisk 为 true，CMOS 时钟为 false）。
+    let volatile_flag_count = dev_json_str.matches(r#""volatile":"#).count();
+    assert_eq!(
+        volatile_flag_count, projected_device_count,
+        "every projected device must carry its own volatile disclosure field"
+    );
+    assert!(
+        dev_json_str.contains(r#""volatile":true"#),
+        "stream/memory devices must disclose volatile=true in /devices/list"
+    );
+    assert!(
+        dev_json_str.contains(r#""volatile":false"#),
+        "battery-backed CMOS RTC must disclose volatile=false in /devices/list"
+    );
+    info!(
+        "[test-driver-hub-m72] DevFS volatile disclosure projection OK: {} devices, {} flags",
+        projected_device_count, volatile_flag_count
+    );
     // 8. 验证 M9.1 硬件拓扑事件总线与 M9.2 即插即拔/热重载（Hotplug In/Out & Live Reload）
     let initial_dev_count = DriverHub::device_count();
 
@@ -2934,6 +2974,7 @@ pub fn test_driver_hub_m72() {
         class_code: 0x02,
         subclass: 0x00,
         prog_if: 0x00,
+        volatile: true, // 非海量存储类 PCI 设备，按 C15.1 规则披露为易失
     };
     DriverHub::register_device_info(hotplug_net_dev, None, None);
     assert_eq!(DriverHub::device_count(), initial_dev_count + 1);

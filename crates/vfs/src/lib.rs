@@ -222,12 +222,22 @@ mod tests {
     }
     impl DeviceInfoProvider for MockDeviceProvider {
         fn list_devices(&self) -> Vec<DeviceInfo> {
-            alloc::vec![DeviceInfo {
-                name: alloc::string::String::from("serial-com1"),
-                bus: alloc::string::String::from("ISA"),
-                class: alloc::string::String::from("UART"),
-                bound_driver: Some(alloc::string::String::from("uart16550")),
-            }]
+            alloc::vec![
+                DeviceInfo {
+                    name: alloc::string::String::from("serial-com1"),
+                    bus: alloc::string::String::from("ISA"),
+                    class: alloc::string::String::from("UART"),
+                    bound_driver: Some(alloc::string::String::from("uart16550")),
+                    volatile: true,
+                },
+                DeviceInfo {
+                    name: alloc::string::String::from("ata0"),
+                    bus: alloc::string::String::from("ISA"),
+                    class: alloc::string::String::from("IDE"),
+                    bound_driver: Some(alloc::string::String::from("ata_pio")),
+                    volatile: false,
+                },
+            ]
         }
         fn serial_read(&self, buf: &mut [u8]) -> Result<usize, Error> {
             let data = b"OK";
@@ -300,6 +310,15 @@ mod tests {
         let n5 = dev_list.read_at(0, &mut buf).unwrap();
         let s5 = core::str::from_utf8(&buf[..n5]).unwrap();
         assert!(s5.contains(r#""driver":"uart16550""#));
+        // C15.1：易失性披露字段必须逐设备出现在 /devices/list JSON 中。
+        assert!(s5.contains(r#""volatile":true"#), "serial-com1 is a stream device and must disclose volatile=true");
+        assert!(s5.contains(r#""volatile":false"#), "hardware ata0 must disclose volatile=false");
+        // 披露字段必须与设备条目一一对应（两台设备各一个 volatile 标记）。
+        assert_eq!(
+            s5.matches(r#""volatile":"#).count(),
+            2,
+            "every listed device must carry its own volatile disclosure"
+        );
 
         // 串口属性子文件测试
         let baud_file = mount_table

@@ -45,6 +45,8 @@ pub fn init() {
                     class_code: 0,
                     subclass: 0,
                     prog_if: 0,
+                    // C15.1：固件表登记属控制面，不承载数据持久语义，保守披露。
+                    volatile: true,
                 },
                 None,
                 Some("acpi"),
@@ -67,6 +69,8 @@ pub fn init() {
                         class_code: 0,
                         subclass: 0,
                         prog_if: 0,
+                        // C15.1：HPET 计数器重启归零，状态不持久。
+                        volatile: true,
                     },
                     None,
                     Some("hpet"),

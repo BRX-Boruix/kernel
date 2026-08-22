@@ -101,6 +101,11 @@ pub struct DeviceInfo {
     pub class_code: u8,
     pub subclass: u8,
     pub prog_if: u8,
+    /// 数据易失性披露（DMYGH C15.1）：`true` 表示该设备承载的数据在断电或
+    /// 重启后不持久（内存模拟盘、流式设备、纯虚拟设备等）。只有可证明
+    /// 持久化的真实硬件介质（如 ATA 硬盘、电池供电 CMOS）才允许 `false`。
+    /// 无法证明持久化的设备必须保守上报 `true`，禁止默认伪装为持久存储。
+    pub volatile: bool,
 }
 
 impl DeviceInfo {
@@ -115,6 +120,8 @@ impl DeviceInfo {
             class_code: 0,
             subclass: 0,
             prog_if: 0,
+            // 空描述符不承载任何持久性证据，按易失披露（保守方向）。
+            volatile: true,
         }
     }
 }

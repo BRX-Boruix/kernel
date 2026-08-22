@@ -52,6 +52,8 @@ pub fn init_serial(hub: &DriverHub) {
             class_code: 0x07, // Simple Communications Controller
             subclass: 0x00,   // Generic 16550 UART
             prog_if: 0x02,
+            // C15.1：串口是流式通道，不持久化任何数据。
+            volatile: true,
         },
         Some(&SERIAL_DEV),
         Some("serial"),

@@ -44,6 +44,8 @@ fn init_framebuffer(_hub: &DriverHub) {
             class_code: 0x03,
             subclass: 0x00,
             prog_if: 0x00,
+            // C15.1：帧缓冲是易失显示面，内容不持久。
+            volatile: true,
         },
         Some(&FRAMEBUFFER_DEV),
         Some("framebuffer"),

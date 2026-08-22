@@ -46,6 +46,8 @@ pub fn enumerate() -> usize {
                 class_code: info.class,
                 subclass: info.subclass,
                 prog_if: info.prog_if,
+                // C15.1：与 drv::pci_bus 同规则——仅海量存储类可承诺持久。
+                volatile: info.class != 0x01,
             },
             None,
             None,

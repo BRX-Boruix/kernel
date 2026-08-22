@@ -198,6 +198,9 @@ pub fn scan_pci_bus() -> usize {
                 let location = ((bus as u32) << 16) | ((device as u32) << 8) | (function as u32);
                 let kind = kind_for_class(class_code);
                 let name = name_for_device(class_code, subclass);
+                // C15.1：只有海量存储类（PCI class 0x01）硬件背后存在可持久化
+                // 介质；其余类别的设备一律保守披露为易失，禁止伪装持久存储。
+                let is_mass_storage = class_code == 0x01;
 
                 DriverHub::register_device_info(
                     DeviceInfo {
@@ -210,6 +213,7 @@ pub fn scan_pci_bus() -> usize {
                         class_code,
                         subclass,
                         prog_if,
+                        volatile: !is_mass_storage,
                     },
                     None,
                     None,

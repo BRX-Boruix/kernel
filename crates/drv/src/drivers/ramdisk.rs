@@ -95,6 +95,8 @@ pub fn init_ramdisk(_hub: &DriverHub) {
             class_code: 0x01,
             subclass: 0x80,
             prog_if: 0,
+            // DMYGH C15.1：Ramdisk 后端是进程地址空间外的静态内存，重启即失。
+            volatile: true,
         },
         Some(&RAMDISK_DEV),
         Some("ramdisk"),

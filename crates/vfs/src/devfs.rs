@@ -26,6 +26,9 @@ pub struct DeviceInfo {
     pub bus: String,
     pub class: String,
     pub bound_driver: Option<String>,
+    /// 数据易失性披露（DMYGH C15.1）：true 表示数据断电/重启后不持久。
+    /// `/devices/list` 必须把该字段原样暴露给用户态。
+    pub volatile: bool,
 }
 
 /// 设备系统回调 Provider Trait（由内核 drv 模块注入实现，支持 M10 深度自省与遥测）。
@@ -192,6 +195,8 @@ impl DevFS {
                             let _ = obj.field_null("driver");
                         }
                         let _ = obj.field_str("uri", &alloc::format!("/devices/{}", d.name));
+                        // C15.1：逐设备易失性披露，禁止省略字段。
+                        let _ = obj.field_bool("volatile", d.volatile);
                         Ok(())
                     });
                 }

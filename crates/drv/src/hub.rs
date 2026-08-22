@@ -246,6 +246,9 @@ impl DriverHub {
     }
 
     /// 注册一个现成的 DeviceOps 实例。
+    ///
+    /// 泛型入口无从得知设备的持久化证据，按 C15.1 保守披露 `volatile: true`；
+    /// 可证明持久化的硬件必须改用 `register_device_info` 显式声明。
     pub fn register_device(dev: &'static dyn DeviceOps) {
         Self::register_device_info(
             DeviceInfo {
@@ -258,6 +261,7 @@ impl DriverHub {
                 class_code: 0,
                 subclass: 0,
                 prog_if: 0,
+                volatile: true,
             },
             Some(dev),
             None,
@@ -265,6 +269,8 @@ impl DriverHub {
     }
 
     /// 注册指定总线类型的 DeviceOps 实例。
+    ///
+    /// 持久化证据与总线类型无关，泛型入口同样保守披露 `volatile: true`。
     pub fn register_device_bus(dev: &'static dyn DeviceOps, bus: BusType) {
         Self::register_device_info(
             DeviceInfo {
@@ -277,6 +283,7 @@ impl DriverHub {
                 class_code: 0,
                 subclass: 0,
                 prog_if: 0,
+                volatile: true,
             },
             Some(dev),
             None,

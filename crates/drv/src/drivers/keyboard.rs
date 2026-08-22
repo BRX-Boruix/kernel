@@ -57,6 +57,8 @@ pub fn init_keyboard(_hub: &DriverHub) {
             class_code: 0x09, // Input Device Controller
             subclass: 0x00,   // Keyboard Controller
             prog_if: 0x00,
+            // C15.1：按键是瞬时输入事件，不持久化任何数据。
+            volatile: true,
         },
         Some(&KEYBOARD_DEV),
         Some("keyboard"),

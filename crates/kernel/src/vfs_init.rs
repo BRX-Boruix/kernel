@@ -133,6 +133,8 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                     bus: String::from(bus_str),
                     class: format!("{:#06x}", class_val),
                     bound_driver: bound,
+                    // C15.1：易失性披露直通 DriverHub 注册值，无影子副本。
+                    volatile: info.volatile,
                 });
             }
         }

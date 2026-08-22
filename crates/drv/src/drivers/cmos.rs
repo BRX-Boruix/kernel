@@ -147,6 +147,8 @@ pub fn init_cmos(_hub: &DriverHub) {
             class_code: 0x0C,
             subclass: 0x00,
             prog_if: 0x00,
+            // C15.1：CMOS RTC 由主板电池供电，时钟状态在断电后依然持久。
+            volatile: false,
         },
         Some(&CMOS_DEV),
         Some("cmos"),
