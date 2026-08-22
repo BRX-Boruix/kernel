@@ -113,4 +113,72 @@ mod tests {
         DriverHub::init_devices();
         assert!(DRV_ATTACHED.load(Ordering::Relaxed));
     }
+
+    #[test]
+    fn test_pci_location_reverse_lookup() {
+        // C5.1：注册 → 反查回环。location 编码 = (bus<<16)|(device<<8)|function。
+        DriverHub::register_device_info(
+            DeviceInfo {
+                name: "pci-ethernet",
+                kind: DeviceKind::Net,
+                bus: BusType::Pci,
+                location: 0x00030000, // bus=0, device=3, function=0
+                vendor_id: 0x8086,
+                device_id: 0x100E,
+                class_code: 0x02,
+                subclass: 0x00,
+                prog_if: 0x00,
+            },
+            None,
+            None,
+        );
+
+        // 正向反查
+        assert_eq!(
+            DriverHub::pci_location_of("pci-ethernet"),
+            Some((0, 3, 0)),
+            "registered PCI device must be reverse-locatable"
+        );
+
+        // 对抗：未知名称
+        assert_eq!(
+            DriverHub::pci_location_of("nonexistent-device"),
+            None,
+            "unknown device name must not yield a location"
+        );
+
+        // 对抗：非 PCI 设备（MockSerialDev 是 Platform/Unknown bus）
+        assert_eq!(
+            DriverHub::pci_location_of("serial-com1"),
+            None,
+            "non-PCI device must not return a PCI location"
+        );
+
+        // 多设备区分：注册第二个不同位置的 PCI 设备
+        DriverHub::register_device_info(
+            DeviceInfo {
+                name: "pci-bridge",
+                kind: DeviceKind::Misc,
+                bus: BusType::Pci,
+                location: 0x01040001, // bus=1, device=4, function=1
+                vendor_id: 0x8086,
+                device_id: 0x244E,
+                class_code: 0x06,
+                subclass: 0x04,
+                prog_if: 0x00,
+            },
+            None,
+            None,
+        );
+        assert_eq!(
+            DriverHub::pci_location_of("pci-bridge"),
+            Some((1, 4, 1)),
+            "second PCI device at different BDF must be locatable"
+        );
+        assert_eq!(
+            DriverHub::pci_location_of("pci-ethernet"),
+            Some((0, 3, 0)),
+            "first device must still be locatable after second registration"
+        );
+    }
 }

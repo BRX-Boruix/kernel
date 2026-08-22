@@ -244,14 +244,31 @@ impl DevFS {
         root.add_child("telemetry", telemetry_node);
 
         // 5. /devices/pci (M10.1 PCI 深度自省目录)
+        // C5.1/#5：按设备名参数化 BAR 查询。为每个已注册 PCI 设备创建
+        // `{name}/bars` 子目录；查不到的设备返回错误 JSON，不回退到固定设备。
         let pci_dir = Arc::new(DynamicDirNode::new());
-        let p_pci = provider.clone();
-        let pci_bars_node = Arc::new(DynamicFileNode::read_only(move || {
-            let mut json = p_pci.pci_bars_json("primary").into_bytes();
+        for dev in provider.list_devices() {
+            if dev.bus == "PCI" {
+                let p_pci = provider.clone();
+                let dev_name = dev.name.clone();
+                let dev_dir = Arc::new(DynamicDirNode::new());
+                let bars_node = Arc::new(DynamicFileNode::read_only(move || {
+                    let mut json = p_pci.pci_bars_json(&dev_name).into_bytes();
+                    json.push(b'\n');
+                    json
+                }));
+                dev_dir.add_child("bars", bars_node);
+                pci_dir.add_child(&dev.name, dev_dir);
+            }
+        }
+        // 兼容：保留 /devices/pci/bars 作为无设备名查询入口，返回 not_found 错误。
+        let p_pci_err = provider.clone();
+        let pci_bars_fallback = Arc::new(DynamicFileNode::read_only(move || {
+            let mut json = p_pci_err.pci_bars_json("").into_bytes();
             json.push(b'\n');
             json
         }));
-        pci_dir.add_child("bars", pci_bars_node);
+        pci_dir.add_child("bars", pci_bars_fallback);
         root.add_child("pci", pci_dir);
 
         // 6. /devices/storage/primary/status (M10.2 块存储遥测)

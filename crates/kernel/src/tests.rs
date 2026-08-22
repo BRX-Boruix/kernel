@@ -3008,22 +3008,81 @@ pub fn test_driver_hub_m72() {
         tel_str.trim()
     );
 
-    let pci_bars_node = root
+    // C5.1/#5：PCI BAR 查询已参数化。/devices/pci/bars（无设备名）返回 not_found 错误；
+    // 每个已注册 PCI 设备有独立 /devices/pci/{name}/bars 子目录，返回各自 BAR 结构。
+    let pci_bars_fallback = root
         .resolve("/devices/pci/bars", true)
-        .expect("resolve /devices/pci/bars");
+        .expect("resolve /devices/pci/bars fallback");
     let mut bars_buf = [0u8; 1024];
-    let bars_n = pci_bars_node
+    let bars_n = pci_bars_fallback
         .read_at(0, &mut bars_buf)
-        .expect("read /devices/pci/bars");
-    assert!(bars_n > 0);
+        .expect("read /devices/pci/bars fallback");
     let bars_str = core::str::from_utf8(&bars_buf[..bars_n]).unwrap_or("");
     assert!(
-        bars_str.contains("io_port") || bars_str.contains("bar"),
-        "must contain PCI BAR metadata"
+        bars_str.contains(r#""error":"not_found""#),
+        "unnamed PCI BAR query must return not_found, not fake data: {}",
+        bars_str.trim()
     );
     info!(
-        "[test-driver-hub-m72] /devices/pci/bars JSON inspection OK: {}",
+        "[test-driver-hub-m72] /devices/pci/bars (no device) returns not_found: {}",
         bars_str.trim()
+    );
+
+    // 遍历已注册 PCI 设备，验证每个设备有独立 bars 子目录且返回真实 BAR 数据或空数组。
+    let dev_list_str = {
+        let node = root
+            .resolve("/devices/list", true)
+            .expect("resolve /devices/list");
+        let n = node.read_at(0, &mut bars_buf).expect("read /devices/list");
+        core::str::from_utf8(&bars_buf[..n]).unwrap_or("")
+    };
+    let dev_list_str: alloc::string::String = alloc::string::String::from(dev_list_str);
+    let mut pci_devices_checked = 0usize;
+    // 从 /devices/list JSON 中提取 PCI 设备名
+    for segment in dev_list_str.split("\"bus\":\"PCI\"") {
+        // 在每个 PCI 设备段中向前找 name 字段
+        if let Some(name_start) = segment.rfind("\"name\":\"") {
+            let after = &segment[name_start + 8..];
+            if let Some(name_end) = after.find('"') {
+                let dev_name = &after[..name_end];
+                let bars_path = alloc::format!("/devices/pci/{}/bars", dev_name);
+                match root.resolve(&bars_path, true) {
+                    Ok(node) => {
+                        let n = node
+                            .read_at(0, &mut bars_buf)
+                            .expect("read per-device bars");
+                        let s = core::str::from_utf8(&bars_buf[..n]).unwrap_or("");
+                        assert!(
+                            !s.contains(r#""error":"not_found""#),
+                            "registered PCI device {} must be locatable: {}",
+                            dev_name,
+                            s.trim()
+                        );
+                        pci_devices_checked += 1;
+                        info!(
+                            "[test-driver-hub-m72] /devices/pci/{}/bars: {}",
+                            dev_name,
+                            s.trim()
+                        );
+                    }
+                    Err(e) => {
+                        // 某些 PCI 设备名可能含特殊字符导致路径解析失败——记录但不跳过
+                        info!(
+                            "[test-driver-hub-m72] /devices/pci/{}/bars resolve failed: {:?}",
+                            dev_name, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        pci_devices_checked > 0,
+        "at least one PCI device must have a per-device bars subdirectory"
+    );
+    info!(
+        "[test-driver-hub-m72] per-device PCI BAR inspection OK ({} devices)",
+        pci_devices_checked
     );
 
     let storage_status_node = root

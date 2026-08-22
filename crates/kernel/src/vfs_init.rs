@@ -198,8 +198,19 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         )
     }
 
-    fn pci_bars_json(&self, _dev_name: &str) -> String {
-        let bars = drv::pci::inspect_pci_bars(0, 1, 1); // IDE controller at 00:01.1
+    fn pci_bars_json(&self, dev_name: &str) -> String {
+        // C5.1/#5：经 DriverHub 反查设备名 → PCI 位置 → inspect_pci_bars。
+        // 不存在或非 PCI 设备返回错误 JSON，禁止回退到固定设备。
+        let (bus, device, function) = match drv::DriverHub::pci_location_of(dev_name) {
+            Some(loc) => loc,
+            None => {
+                return format!(
+                    r#"{{"error":"not_found","device":"{}"}}"#,
+                    dev_name
+                );
+            }
+        };
+        let bars = drv::pci::inspect_pci_bars(bus, device, function);
         let mut target = klib::json::VecTarget::new();
         let mut writer = klib::json::JsonWriter::new(&mut target);
         if let Ok(mut arr) = writer.start_array() {

@@ -283,6 +283,26 @@ impl DriverHub {
         );
     }
 
+    /// 按设备名反查 PCI 位置（bus, device, function）。
+    ///
+    /// 遍历已注册设备，找到名称匹配且 `bus == BusType::Pci` 的条目，
+    /// 从 `location` 字段解码出 `(bus, device, function)`。非 PCI 设备或
+    /// 未知名称返回 `None`，绝不回退到固定设备。
+    pub fn pci_location_of(name: &str) -> Option<(u8, u8, u8)> {
+        let dev_count = DEVICE_COUNT.load(Ordering::Relaxed);
+        let devices = DEVICES.lock();
+        for entry in devices.iter().take(dev_count).flatten() {
+            if entry.info.bus == BusType::Pci && entry.info.name == name {
+                let loc = entry.info.location;
+                let bus = ((loc >> 16) & 0xFF) as u8;
+                let device = ((loc >> 8) & 0xFF) as u8;
+                let function = (loc & 0xFF) as u8;
+                return Some((bus, device, function));
+            }
+        }
+        None
+    }
+
     /// 返回当前已注册的有效设备总数。
     pub fn device_count() -> usize {
         let max_idx = DEVICE_COUNT.load(Ordering::Relaxed);
