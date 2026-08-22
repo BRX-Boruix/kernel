@@ -2,7 +2,63 @@
 //!
 //! 统一抽象字符设备、块设备、输入设备与网络设备，支持零 ioctl 纯属性读写。
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use klib::error::Error;
+
+/// 计算字节区间 `[offset, offset+len)` 触碰的 512B 扇区块数（去重）。
+///
+/// `len == 0` 恒为 0；跨界部分扇区按实际触碰的去重块数计。
+/// 该公式是内存型后端（ramdisk / ATA 回退盘）扇区计数的唯一口径。
+pub fn sectors_touched(offset: u64, len: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let span = offset % 512 + len;
+    (span + 511) / 512
+}
+
+/// 块设备真实 I/O 计数（DMYGH C16.1）。
+///
+/// 语义：计数与介质实际发生的 512B 扇区传输一一对应——
+/// - 硬件 ATA：每条**成功**的扇区读/写命令各计 1；
+/// - 内存型后端（ramdisk / ATA 回退盘）：按传输区间触碰的去重扇区块数
+///   （[`sectors_touched`]）累计，其"扇区"为逻辑单位，设备自身的
+///   `volatile=true` 披露已表明无物理介质。
+///
+/// 只有成功路径计数；失败、越界、被拒绝的操作一律不计。
+/// 字段私有 + 只读访问器：外部只能观测，无法凭空写入。
+#[derive(Debug)]
+pub struct IoStats {
+    sectors_read: AtomicU64,
+    sectors_written: AtomicU64,
+}
+
+impl IoStats {
+    pub const fn new() -> Self {
+        Self {
+            sectors_read: AtomicU64::new(0),
+            sectors_written: AtomicU64::new(0),
+        }
+    }
+
+    /// 记录一次成功传输涉及的扇区数。内部使用 wrapping 语义防溢出 panic：
+    /// u64 扇区数在可预见寿命内不可能绕回，绕回本身即统计失真前兆。
+    pub fn record_read(&self, sectors: u64) {
+        self.sectors_read.fetch_add(sectors, Ordering::Relaxed);
+    }
+
+    pub fn record_write(&self, sectors: u64) {
+        self.sectors_written.fetch_add(sectors, Ordering::Relaxed);
+    }
+
+    pub fn sectors_read(&self) -> u64 {
+        self.sectors_read.load(Ordering::Relaxed)
+    }
+
+    pub fn sectors_written(&self) -> u64 {
+        self.sectors_written.load(Ordering::Relaxed)
+    }
+}
 
 /// 基础 IO 设备 Trait（只包含标准 read/write/poll/size 等操作，彻底抛弃 ioctl）。
 pub trait IoDevice: Send + Sync {
@@ -35,6 +91,11 @@ pub trait IoDevice: Send + Sync {
         false
     }
     fn size(&self) -> Option<u64> {
+        None
+    }
+    /// 返回该设备的真实 I/O 计数；无计数能力的设备返回 `None`。
+    /// 缺失必须可见（JSON 输出 null/error），禁止用零值冒充"从未发生 I/O"。
+    fn io_stats(&self) -> Option<&IoStats> {
         None
     }
 }

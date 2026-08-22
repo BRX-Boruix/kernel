@@ -200,6 +200,56 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         )
     }
 
+    fn storage_status_json(&self) -> String {
+        // DMYGH #16：主块设备 = 注册表中第一个 Block 类设备（天然兼容 #15
+        // 双身份 ata0 / ata0-ramfallback）；计数直读驱动 IoStats，无影子副本。
+        // 无设备、无 IO 操作集或无计数来源均输出显式错误，绝不编造健康值。
+        let count = drv::DriverHub::device_count();
+        for i in 0..count {
+            let Some(info) = drv::DriverHub::device_info_at(i) else {
+                continue;
+            };
+            if info.kind != drv::DeviceKind::Block {
+                continue;
+            }
+            let name = info.name;
+            let Some(ops) = drv::DriverHub::device_at(i) else {
+                return format!(r#"{{"error":"no_io_ops","device":"{}"}}"#, name);
+            };
+            let Some(io) = ops.as_io() else {
+                return format!(r#"{{"error":"no_io_ops","device":"{}"}}"#, name);
+            };
+            return match io.io_stats() {
+                Some(st) => format!(
+                    r#"{{"device":"{}","volatile":{},"sectors_read":{},"sectors_written":{}}}"#,
+                    name,
+                    info.volatile,
+                    st.sectors_read(),
+                    st.sectors_written()
+                ),
+                None => format!(r#"{{"error":"no_counter","device":"{}"}}"#, name),
+            };
+        }
+        String::from(r#"{"error":"no_block_device"}"#)
+    }
+
+    fn net_stats_json(&self) -> String {
+        // DMYGH #16：尚无真实 NIC 数据路径。若存在 Net 类设备则如实报告其
+        // 统计不受支持；一个都没有则报告 no_net_device。禁止编造收发统计。
+        let count = drv::DriverHub::device_count();
+        for i in 0..count {
+            if let Some(info) = drv::DriverHub::device_info_at(i) {
+                if info.kind == drv::DeviceKind::Net {
+                    return format!(
+                        r#"{{"error":"nic_stats_unsupported","device":"{}"}}"#,
+                        info.name
+                    );
+                }
+            }
+        }
+        String::from(r#"{"error":"no_net_device"}"#)
+    }
+
     fn pci_bars_json(&self, dev_name: &str) -> String {
         // C5.1/#5：经 DriverHub 反查设备名 → PCI 位置 → inspect_pci_bars。
         // 不存在或非 PCI 设备返回错误 JSON，禁止回退到固定设备。

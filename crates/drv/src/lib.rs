@@ -20,7 +20,7 @@ pub use drivers::pci_classes as pci_drivers;
 
 pub use device::{
     BlockDevice, BusType, CharDevice, Device, DeviceInfo, DeviceKind, DeviceOps, InputDevice,
-    IoDevice, NetDevice,
+    IoDevice, IoStats, NetDevice, sectors_touched,
 };
 pub use driver::{Driver, DriverEntry, DriverStage};
 pub use event::{
@@ -248,5 +248,37 @@ mod tests {
             generic.volatile,
             "generic registration without persistence evidence must disclose volatile=true"
         );
+    }
+
+    /// C16.1：触碰扇区公式边界矩阵与计数器读写语义。
+    /// 公式是 ramdisk / ATA 回退盘扇区计数的唯一口径，边界必须钉死。
+    #[test]
+    fn test_io_stats_and_sector_touch_math() {
+        use crate::device::{IoStats, sectors_touched};
+
+        // 空传输恒为 0
+        assert_eq!(sectors_touched(0, 0), 0);
+        assert_eq!(sectors_touched(512, 0), 0);
+        // 单字节占一块
+        assert_eq!(sectors_touched(0, 1), 1);
+        // 恰好整块
+        assert_eq!(sectors_touched(0, 512), 1);
+        assert_eq!(sectors_touched(1024, 1024), 2);
+        // 越过整块边界 1 字节 → 新增一块
+        assert_eq!(sectors_touched(0, 513), 2);
+        // 块内偏移 + 跨界
+        assert_eq!(sectors_touched(511, 2), 2);
+        assert_eq!(sectors_touched(511, 513), 3);
+        // 大偏移不溢出（u64 全域）
+        assert_eq!(sectors_touched(u64::MAX - 600, 100), 2);
+
+        // 计数器：record 后只读访问器必须精确回读
+        let st = IoStats::new();
+        assert_eq!((st.sectors_read(), st.sectors_written()), (0, 0));
+        st.record_read(3);
+        st.record_write(5);
+        st.record_read(1);
+        assert_eq!(st.sectors_read(), 4);
+        assert_eq!(st.sectors_written(), 5);
     }
 }

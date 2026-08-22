@@ -2857,6 +2857,11 @@ pub fn test_driver_hub_m72() {
                 }
                 if let Some(dev) = DriverHub::device_at(i) {
                     assert_eq!(dev.kind(), drv::DeviceKind::Block);
+                    // DMYGH C16.1：I/O 计数与真实成功操作一一对应。
+                    let ata_io = dev.as_io().expect("block device exposes io ops");
+                    let ata_stats = ata_io.io_stats().expect("ata must expose real io stats");
+                    let aw0 = ata_stats.sectors_written();
+                    let ar0 = ata_stats.sectors_read();
                     let mut test_buf = [0u8; 512];
                     test_buf[0..4].copy_from_slice(b"BRX!");
                     let written = dev.write_at(0, &test_buf);
@@ -2865,8 +2870,18 @@ pub fn test_driver_hub_m72() {
                     let read_n = dev.read_at(0, &mut read_buf);
                     assert_eq!(read_n, 512, "ata read_at sector 0");
                     assert_eq!(&read_buf[0..4], b"BRX!", "ata sector 0 content match");
+                    assert_eq!(
+                        ata_stats.sectors_written(),
+                        aw0 + 1,
+                        "one successful full-sector write must count exactly 1"
+                    );
+                    assert_eq!(
+                        ata_stats.sectors_read(),
+                        ar0 + 1,
+                        "one successful full-sector read must count exactly 1"
+                    );
                     info!(
-                        "[test-driver-hub-m72] ATA block device identity={} volatile={} read/write 512B OK",
+                        "[test-driver-hub-m72] ATA block device identity={} volatile={} read/write 512B OK io_count(+1w,+1r)",
                         info.name, info.volatile
                     );
                 }
@@ -2910,6 +2925,47 @@ pub fn test_driver_hub_m72() {
                     assert_eq!(dev.read_at(tail_offset, &mut tail), 2);
                     assert_eq!(&tail, b"OK", "rejected write must not alter tail bytes");
                     info!("[test-driver-hub-m72] Ramdisk capacity and boundary-write honesty OK");
+
+                    // DMYGH C16.1：真实 I/O 计数——对齐整扇区、部分扇区、失败写三类。
+                    let rd_io = dev.as_io().expect("ramdisk exposes io ops");
+                    let rd_stats = rd_io.io_stats().expect("ramdisk must expose real io stats");
+                    let w_base = rd_stats.sectors_written();
+                    let r_base = rd_stats.sectors_read();
+                    let two_sectors = [0xA7u8; 1024];
+                    assert_eq!(dev.write_at(8192, &two_sectors), 1024);
+                    assert_eq!(
+                        rd_stats.sectors_written(),
+                        w_base + 2,
+                        "aligned 2-sector write must count exactly 2"
+                    );
+                    let mut back = [0u8; 1024];
+                    assert_eq!(dev.read_at(8192, &mut back), 1024);
+                    assert_eq!(&back[..4], &two_sectors[..4], "read-back content match");
+                    assert_eq!(
+                        rd_stats.sectors_read(),
+                        r_base + 2,
+                        "aligned 2-sector read must count exactly 2"
+                    );
+                    // 单扇区内部分写：触碰恰好 1 个逻辑扇区
+                    assert_eq!(dev.write_at(4096 + 100, b"PARTIAL"), 7);
+                    assert_eq!(
+                        rd_stats.sectors_written(),
+                        w_base + 3,
+                        "in-sector partial write touches exactly 1 logical sector"
+                    );
+                    // 失败/被拒绝的写绝不计数
+                    assert_eq!(
+                        dev.write_at_checked(tail_offset, b"BAD"),
+                        Err(klib::error::Error::OutOfRange)
+                    );
+                    assert_eq!(
+                        rd_stats.sectors_written(),
+                        w_base + 3,
+                        "rejected out-of-range write must not count"
+                    );
+                    info!(
+                        "[test-driver-hub-m72] Ramdisk real IO accounting OK (+2w/+2r full, +1 partial, rejected not counted)"
+                    );
                 }
             }
         }
@@ -3135,9 +3191,25 @@ pub fn test_driver_hub_m72() {
         .expect("read storage status");
     assert!(stor_n > 0);
     let stor_str = core::str::from_utf8(&stor_buf[..stor_n]).unwrap_or("");
+    // DMYGH #16：storage status 必须携带真实主块设备身份与真实计数，
+    // 禁止回退到编造的 healthy/latency 占位值。
     assert!(
-        stor_str.contains("sectors_read"),
-        "storage status must contain sectors_read"
+        stor_str.contains(r#""device":"ata0""#) || stor_str.contains(r#""device":"ata0-ramfallback""#),
+        "storage status must name the real primary block device, got: {}",
+        stor_str
+    );
+    assert!(
+        stor_str.contains(r#""sectors_read":"#) && stor_str.contains(r#""sectors_written":"#),
+        "storage status must expose real io counters, got: {}",
+        stor_str
+    );
+    assert!(
+        stor_str.contains(r#""volatile":"#),
+        "storage status must carry the C15.1 volatility disclosure"
+    );
+    assert!(
+        !stor_str.contains("io_latency_us") && !stor_str.contains("healthy"),
+        "storage status must not fabricate latency or fake health"
     );
     info!(
         "[test-driver-hub-m72] /devices/storage/primary/status OK: {}",
@@ -3153,12 +3225,18 @@ pub fn test_driver_hub_m72() {
         .expect("read net stats");
     assert!(net_n > 0);
     let net_str = core::str::from_utf8(&net_buf[..net_n]).unwrap_or("");
+    // DMYGH #16：无真实 NIC 数据路径时必须显式 unsupported，禁止编造 rx/tx。
     assert!(
-        net_str.contains("rx_bytes"),
-        "net stats must contain rx_bytes"
+        net_str.contains(r#""error":"nic_stats_unsupported""#),
+        "net stats must explicitly report unsupported until a real NIC data path exists, got: {}",
+        net_str
+    );
+    assert!(
+        !net_str.contains("rx_bytes") && !net_str.contains("link_speed_mbps"),
+        "net stats must not fabricate rx/tx counters"
     );
     info!(
-        "[test-driver-hub-m72] /devices/net/primary/stats OK: {}",
+        "[test-driver-hub-m72] /devices/net/primary/stats OK (honest unsupported): {}",
         net_str.trim()
     );
 

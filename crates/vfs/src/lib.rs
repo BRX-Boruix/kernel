@@ -255,6 +255,16 @@ mod tests {
             self.baud.store(baud, core::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
+        fn storage_status_json(&self) -> alloc::string::String {
+            alloc::string::String::from(
+                r#"{"device":"mock-vol","sectors_read":7,"sectors_written":3}"#,
+            )
+        }
+        fn net_stats_json(&self) -> alloc::string::String {
+            alloc::string::String::from(
+                r#"{"error":"nic_stats_unsupported","device":"mock-nic"}"#,
+            )
+        }
     }
 
     #[test]
@@ -354,6 +364,21 @@ mod tests {
         let n9 = mode_file.read_at(0, &mut buf).unwrap();
         let s9 = core::str::from_utf8(&buf[..n9]).unwrap();
         assert!(s9.contains(r#""width":1024"#));
+
+        // DMYGH #16：storage/net 遥测节点必须原样透传 Provider 的真实数据，
+        // DevFS 层不得注入任何设备名或计数。
+        let status = mount_table.resolve("/devices/storage/primary/status", true).unwrap();
+        let n10 = status.read_at(0, &mut buf).unwrap();
+        assert_eq!(
+            core::str::from_utf8(&buf[..n10]).unwrap(),
+            "{\"device\":\"mock-vol\",\"sectors_read\":7,\"sectors_written\":3}\n"
+        );
+        let nstats = mount_table.resolve("/devices/net/primary/stats", true).unwrap();
+        let n11 = nstats.read_at(0, &mut buf).unwrap();
+        assert_eq!(
+            core::str::from_utf8(&buf[..n11]).unwrap(),
+            "{\"error\":\"nic_stats_unsupported\",\"device\":\"mock-nic\"}\n"
+        );
     }
 
     struct EmptyDeviceProvider;
@@ -387,6 +412,43 @@ mod tests {
         let mut buf = [0u8; 8];
         let n = list.read_at(0, &mut buf).expect("read empty device list");
         assert_eq!(&buf[..n], b"[]\n");
+    }
+
+    /// DMYGH #16：Provider 未实现遥测查询时，默认实现必须输出显式错误 JSON，
+    /// 绝不允许回退到编造的健康计数（sectors_read:1024 / rx_bytes:65536 等）。
+    #[test]
+    fn test_devfs_defaults_must_not_fabricate_telemetry() {
+        let devfs = DevFS::new(Arc::new(EmptyDeviceProvider));
+        let mut buf = [0u8; 256];
+
+        // 存储状态：默认实现禁止编造 sectors/latency
+        let storage = devfs.root().lookup("storage").expect("storage dir");
+        let primary = storage.lookup("primary").expect("storage primary dir");
+        let status = primary.lookup("status").expect("storage status node");
+        let n = status.read_at(0, &mut buf).expect("read storage status");
+        let s = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(s.contains(r#""error""#), "storage default must emit explicit error JSON, got: {}", s);
+        assert!(!s.contains("healthy"), "storage default must not fabricate healthy status");
+        assert!(!s.contains("sectors_read"), "storage default must not fabricate sector counters");
+        assert!(!s.contains("io_latency_us"), "storage default must not fabricate latency");
+
+        // 网络统计：默认实现禁止编造 rx/tx
+        let net = devfs.root().lookup("net").expect("net dir");
+        let nprimary = net.lookup("primary").expect("net primary dir");
+        let stats = nprimary.lookup("stats").expect("net stats node");
+        let n2 = stats.read_at(0, &mut buf).expect("read net stats");
+        let s2 = core::str::from_utf8(&buf[..n2]).unwrap();
+        assert!(s2.contains(r#""error""#), "net default must emit explicit error JSON, got: {}", s2);
+        assert!(!s2.contains("rx_bytes"), "net default must not fabricate rx counters");
+        assert!(!s2.contains("link_speed_mbps"), "net default must not fabricate link speed");
+
+        // PCI BAR：默认实现禁止编造 BAR 结构
+        let pci = devfs.root().lookup("pci").expect("pci dir");
+        let bars = pci.lookup("bars").expect("pci fallback bars node");
+        let n3 = bars.read_at(0, &mut buf).expect("read pci bars");
+        let s3 = core::str::from_utf8(&buf[..n3]).unwrap();
+        assert!(s3.contains(r#""error""#), "pci bars default must emit explicit error JSON, got: {}", s3);
+        assert!(!s3.contains("49200"), "pci bars default must not fabricate BAR ports");
     }
 
     #[test]

@@ -2,7 +2,9 @@
 //!
 //! 在内存中开辟连续空间模拟块存储，直接作为 VFS 挂载点或数据卷。
 
-use crate::device::{BlockDevice, BusType, Device, DeviceInfo, DeviceKind, IoDevice};
+use crate::device::{
+    sectors_touched, BlockDevice, BusType, Device, DeviceInfo, DeviceKind, IoDevice, IoStats,
+};
 use crate::driver::DriverStage;
 use crate::hub::DriverHub;
 use spin::Mutex;
@@ -14,6 +16,8 @@ static RAMDISK_STORAGE: Mutex<[u8; RAMDISK_CAPACITY]> = Mutex::new([0u8; RAMDISK
 
 pub struct RamdiskDevice {
     pub name: &'static str,
+    /// 真实 I/O 计数（C16.1）：按成功传输区间触碰的去重扇区块数累计。
+    pub stats: IoStats,
 }
 
 impl Device for RamdiskDevice {
@@ -45,6 +49,7 @@ impl IoDevice for RamdiskDevice {
         }
         let n = core::cmp::min(out.len(), storage.len() - off);
         out[..n].copy_from_slice(&storage[off..off + n]);
+        self.stats.record_read(sectors_touched(offset, n as u64));
         n
     }
 
@@ -63,11 +68,18 @@ impl IoDevice for RamdiskDevice {
             return Err(klib::error::Error::OutOfRange);
         }
         storage[off..end].copy_from_slice(data);
+        // C16.1：只有完整成功的写入才计数；上面的越界/溢出错误路径不经过此处。
+        self.stats
+            .record_write(sectors_touched(offset, data.len() as u64));
         Ok(data.len())
     }
 
     fn size(&self) -> Option<u64> {
         Some(RAMDISK_CAPACITY as u64)
+    }
+
+    fn io_stats(&self) -> Option<&IoStats> {
+        Some(&self.stats)
     }
 }
 
@@ -81,7 +93,10 @@ impl BlockDevice for RamdiskDevice {
     }
 }
 
-pub static RAMDISK_DEV: RamdiskDevice = RamdiskDevice { name: "ramdisk0" };
+pub static RAMDISK_DEV: RamdiskDevice = RamdiskDevice {
+    name: "ramdisk0",
+    stats: IoStats::new(),
+};
 
 pub fn init_ramdisk(_hub: &DriverHub) {
     DriverHub::register_device_info(

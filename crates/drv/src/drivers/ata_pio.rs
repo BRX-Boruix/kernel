@@ -3,7 +3,9 @@
 //! 实现 Primary/Secondary 通道 LBA28/LBA48 扇区读写与 Identify 设备识别。
 //! 当无真实硬件或 QEMU 纯 CD-ROM 启动时，提供 64KB 快速扇区内存模拟回退。
 
-use crate::device::{BlockDevice, BusType, Device, DeviceInfo, DeviceKind, IoDevice};
+use crate::device::{
+    sectors_touched, BlockDevice, BusType, Device, DeviceInfo, DeviceKind, IoDevice, IoStats,
+};
 use crate::driver::DriverStage;
 use crate::hub::DriverHub;
 use arch_x86_64::port::{inb, inw, outb, outw};
@@ -159,6 +161,9 @@ pub struct AtaPioDevice {
     pub name: &'static str,
     pub sectors: Mutex<u64>,
     pub is_hardware: Mutex<bool>,
+    /// 真实 I/O 计数（C16.1）：硬件路径按成功 sector 命令计数，
+    /// 回退路径按触碰扇区块计数。
+    pub stats: IoStats,
 }
 
 impl Device for AtaPioDevice {
@@ -190,6 +195,8 @@ impl IoDevice for AtaPioDevice {
             }
             let n = core::cmp::min(out.len(), storage.len() - off);
             out[..n].copy_from_slice(&storage[off..off + n]);
+            // C16.1：成功读取按触碰扇区块计数。
+            self.stats.record_read(sectors_touched(offset, n as u64));
             return n;
         }
 
@@ -209,6 +216,8 @@ impl IoDevice for AtaPioDevice {
             if !ata_read_sector(lba, &mut buf) {
                 break;
             }
+            // C16.1：每条成功 sector 读命令计 1。
+            self.stats.record_read(1);
             let take = core::cmp::min(remaining, 512 - sector_off);
             out[done..done + take].copy_from_slice(&buf[sector_off..sector_off + take]);
             done += take;
@@ -229,6 +238,8 @@ impl IoDevice for AtaPioDevice {
             }
             let n = core::cmp::min(data.len(), storage.len() - off);
             storage[off..off + n].copy_from_slice(&data[..n]);
+            // C16.1：成功写入按触碰扇区块计数。
+            self.stats.record_write(sectors_touched(offset, n as u64));
             return n;
         }
 
@@ -247,18 +258,22 @@ impl IoDevice for AtaPioDevice {
         while remaining > 0 && lba < total_sectors {
             let take = core::cmp::min(remaining, 512 - sector_off);
             if sector_off != 0 || take < 512 {
+                // 部分扇区写：真实的读-改-写序列，两条命令各计其账。
                 if !ata_read_sector(lba, &mut buf) {
                     break;
                 }
+                self.stats.record_read(1);
                 buf[sector_off..sector_off + take].copy_from_slice(&data[done..done + take]);
                 if !ata_write_sector(lba, &buf) {
                     break;
                 }
+                self.stats.record_write(1);
             } else {
                 buf.copy_from_slice(&data[done..done + 512]);
                 if !ata_write_sector(lba, &buf) {
                     break;
                 }
+                self.stats.record_write(1);
             }
             done += take;
             remaining -= take;
@@ -271,6 +286,10 @@ impl IoDevice for AtaPioDevice {
     fn size(&self) -> Option<u64> {
         let total = *self.sectors.lock();
         Some(total * 512)
+    }
+
+    fn io_stats(&self) -> Option<&IoStats> {
+        Some(&self.stats)
     }
 }
 
@@ -289,6 +308,7 @@ pub static ATA_PRIMARY_MASTER: AtaPioDevice = AtaPioDevice {
     name: "ata0",
     sectors: Mutex::new(0),
     is_hardware: Mutex::new(false),
+    stats: IoStats::new(),
 };
 
 /// identify 失败时的内存回退盘身份（DMYGH #15）：
@@ -297,6 +317,7 @@ static ATA_RAM_FALLBACK: AtaPioDevice = AtaPioDevice {
     name: "ata0-ramfallback",
     sectors: Mutex::new(0),
     is_hardware: Mutex::new(false),
+    stats: IoStats::new(),
 };
 
 /// 回退盘容量：128 扇区 × 512B = 64KiB。

@@ -47,20 +47,20 @@ pub trait DeviceInfoProvider: Send + Sync {
         )
     }
     fn pci_bars_json(&self, dev_name: &str) -> String {
-        let _ = dev_name;
-        alloc::string::String::from(r#"[{"bar":0,"type":"io","port":49200,"size":16}]"#)
-    }
-    fn storage_status_json(&self, dev_name: &str) -> String {
+        // DMYGH #16：无真实 BAR 数据源时必须显式报错，禁止编造端口/大小。
         alloc::format!(
-            r#"{{"device":"{}","status":"healthy","sectors_read":1024,"sectors_written":512,"io_latency_us":45}}"#,
+            r#"{{"error":"no_pci_info","device":"{}"}}"#,
             dev_name
         )
     }
-    fn net_stats_json(&self, dev_name: &str) -> String {
-        alloc::format!(
-            r#"{{"device":"{}","status":"up","rx_bytes":65536,"tx_bytes":32768,"drops":0,"link_speed_mbps":1000}}"#,
-            dev_name
-        )
+    /// 存储状态由 Provider 自行解析真实主块设备（含 #15 双身份），
+    /// 无计数来源时输出显式错误，绝不返回健康假值或编造计数器。
+    fn storage_status_json(&self) -> String {
+        alloc::string::String::from(r#"{"error":"no_counter"}"#)
+    }
+    /// 网络统计在真实 NIC 数据路径落地前只允许显式 unsupported。
+    fn net_stats_json(&self) -> String {
+        alloc::string::String::from(r#"{"error":"no_net_stats"}"#)
     }
 }
 
@@ -281,7 +281,9 @@ impl DevFS {
         let primary_storage_dir = Arc::new(DynamicDirNode::new());
         let p_storage = provider.clone();
         let storage_status_node = Arc::new(DynamicFileNode::read_only(move || {
-            let mut json = p_storage.storage_status_json("ata0").into_bytes();
+            // DMYGH #16：设备名解析权在 Provider（经 DriverHub 反查真实主块设备），
+            // DevFS 不再硬编码 "ata0"。
+            let mut json = p_storage.storage_status_json().into_bytes();
             json.push(b'\n');
             json
         }));
@@ -294,7 +296,8 @@ impl DevFS {
         let primary_net_dir = Arc::new(DynamicDirNode::new());
         let p_net = provider.clone();
         let net_stats_node = Arc::new(DynamicFileNode::read_only(move || {
-            let mut json = p_net.net_stats_json("eth0").into_bytes();
+            // DMYGH #16：不再硬编码 "eth0"；Provider 无真实 NIC 统计时输出显式错误。
+            let mut json = p_net.net_stats_json().into_bytes();
             json.push(b'\n');
             json
         }));
