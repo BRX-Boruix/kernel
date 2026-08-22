@@ -2520,7 +2520,52 @@ pub fn test_vfs_m63() {
         .resolve("/devices/serial-com1/baudrate", true)
         .expect("resolve baudrate");
     let n6 = baud_node.read_at(0, &mut buf).expect("read baudrate");
-    assert_eq!(core::str::from_utf8(&buf[..n6]).unwrap().trim(), "115200");
+    assert_eq!(
+        core::str::from_utf8(&buf[..n6]).unwrap().trim(),
+        "38400",
+        "DevFS must report the divisor programmed by serial::init"
+    );
+
+    // C8.1/#8：通过 DevFS 对多个可精确表达的 divisor 编程，并从 UART
+    // DLL/DLM 硬件寄存器回读；每档再做真实 16550 loopback 收发。无影子状态。
+    for &(baud, probe) in &[
+        (9_600u32, 0x39u8),
+        (57_600, 0xA6),
+        (115_200, 0x5C),
+        (300, 0x7B), // divisor=0x0180，覆盖 DLM 非零路径
+        (38_400, 0xE1),
+    ] {
+        let text = alloc::format!("{}\n", baud);
+        assert_eq!(
+            baud_node.write_at(0, text.as_bytes()).expect("set baudrate"),
+            text.len()
+        );
+        let n = baud_node.read_at(0, &mut buf).expect("read back baudrate");
+        assert_eq!(
+            core::str::from_utf8(&buf[..n]).unwrap().trim(),
+            text.trim(),
+            "DevFS readback must reflect UART DLL/DLM"
+        );
+        arch_x86_64::serial::loopback_test(probe).expect("UART loopback at programmed baudrate");
+        info!(
+            "[test-vfs-m63] baud={} divisor readback + loopback byte={:#04x} PASS",
+            baud, probe
+        );
+    }
+
+    // 零值、无法由 115200Hz 基准时钟整除、以及 divisor 超过 16 位的低速率
+    // 都必须明确失败，并保持此前硬件配置不变。
+    for invalid in [0u32, 10_000, 1] {
+        let text = alloc::format!("{}", invalid);
+        assert_eq!(
+            baud_node.write_at(0, text.as_bytes()),
+            Err(klib::error::Error::InvalidParam)
+        );
+        let n = baud_node.read_at(0, &mut buf).expect("read unchanged baudrate");
+        assert_eq!(core::str::from_utf8(&buf[..n]).unwrap().trim(), "38400");
+    }
+
+    info!("[test-vfs-m63] serial baudrate runtime API PASS");
 
     let disp_mode = root
         .resolve("/devices/displays/primary/mode", true)

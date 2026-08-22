@@ -179,12 +179,12 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         Ok(buf.len())
     }
 
-    fn get_serial_baudrate(&self) -> u32 {
-        115200
+    fn get_serial_baudrate(&self) -> Result<u32, klib::error::Error> {
+        arch_x86_64::serial::get_baudrate()
     }
 
-    fn set_serial_baudrate(&self, _baud: u32) -> Result<(), klib::error::Error> {
-        Ok(())
+    fn set_serial_baudrate(&self, baud: u32) -> Result<(), klib::error::Error> {
+        arch_x86_64::serial::set_baudrate(baud)
     }
 
     fn telemetry_json(&self) -> String {

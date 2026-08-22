@@ -9,6 +9,27 @@
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 use crate::port::{inb, outb};
+use klib::error::Error;
+
+/// 16550 UART 输入时钟经 16 倍采样后的标准波特率基准（1.8432MHz / 16）。
+const UART_BAUD_BASE: u32 = 115_200;
+/// 16550 divisor latch 是 16 位且零值无效。
+const UART_DIVISOR_MAX: u32 = u16::MAX as u32;
+
+const REG_DATA_OR_DLL: u16 = 0;
+const REG_IER_OR_DLM: u16 = 1;
+const REG_FIFO_CONTROL: u16 = 2;
+const REG_LINE_CONTROL: u16 = 3;
+const REG_MODEM_CONTROL: u16 = 4;
+const REG_LINE_STATUS: u16 = 5;
+
+const LCR_DLAB: u8 = 1 << 7;
+const LCR_8N1: u8 = 0x03;
+const MCR_LOOPBACK: u8 = 1 << 4;
+const LSR_DATA_READY: u8 = 1 << 0;
+const LSR_TX_EMPTY: u8 = 1 << 5;
+/// 防止缺失/故障 UART 令验收永久自旋；这是寄存器轮询次数，不是伪造超时成功。
+const LOOPBACK_POLL_LIMIT: usize = 1_000_000;
 
 /// 保存当前中断状态并关中断（写串口期间禁用本 CPU 中断）。
 ///
@@ -104,14 +125,108 @@ pub fn init() {
     let base = probe_serial();
     COM_BASE.store(base, Ordering::Relaxed);
 
-    let com = COM_BASE.load(Ordering::Relaxed);
-    outb(com + 1, 0x00); // 禁用中断
-    outb(com + 3, 0x80); // DLAB 开，设置波特率
-    outb(com + 0, 0x03); // 除数低字节 (38400)
-    outb(com + 1, 0x00); // 除数高字节
-    outb(com + 3, 0x03); // 8 位数据，无校验，1 停止位
-    outb(com + 2, 0xC7); // 启用 FIFO，清空
-    outb(com + 4, 0x0B); // IRQ 使能，RTS/DSR
+    outb(base + REG_IER_OR_DLM, 0x00); // 禁用 UART 中断
+    program_divisor_locked(base, 3); // 115200 / 3 = 38400
+    outb(base + REG_FIFO_CONTROL, 0xC7); // 启用 FIFO，清空
+    outb(base + REG_MODEM_CONTROL, 0x0B); // OUT2、RTS、DTR
+}
+
+/// 将请求速率转换为 16550 divisor。
+///
+/// 只接受能由标准 115200Hz 基准**精确表达**的速率；禁止悄悄取整为另一
+/// 个实际速率。divisor 必须落在 1..=65535。
+fn divisor_for_baudrate(baud: u32) -> Result<u16, Error> {
+    if baud == 0 || UART_BAUD_BASE % baud != 0 {
+        return Err(Error::InvalidParam);
+    }
+    let divisor = UART_BAUD_BASE / baud;
+    if divisor == 0 || divisor > UART_DIVISOR_MAX {
+        return Err(Error::InvalidParam);
+    }
+    Ok(divisor as u16)
+}
+
+/// 持锁且本 CPU 关中断时编程 DLL/DLM，最后恢复为固定 8N1。
+fn program_divisor_locked(base: u16, divisor: u16) {
+    outb(base + REG_LINE_CONTROL, LCR_DLAB);
+    outb(base + REG_DATA_OR_DLL, divisor as u8);
+    outb(base + REG_IER_OR_DLM, (divisor >> 8) as u8);
+    outb(base + REG_LINE_CONTROL, LCR_8N1);
+}
+
+/// 从 UART divisor latch 回读当前**实际生效**的波特率。
+///
+/// 返回值来自 DLL/DLM 硬件寄存器，不维护软件影子副本。发现非法 divisor=0
+/// 时返回 I/O 错误，避免伪造速率。
+pub fn get_baudrate() -> Result<u32, Error> {
+    let saved = irq_save();
+    LOCK.acquire();
+    let base = com_base();
+    let lcr = inb(base + REG_LINE_CONTROL);
+    outb(base + REG_LINE_CONTROL, lcr | LCR_DLAB);
+    let divisor = u16::from_le_bytes([
+        inb(base + REG_DATA_OR_DLL),
+        inb(base + REG_IER_OR_DLM),
+    ]);
+    outb(base + REG_LINE_CONTROL, lcr & !LCR_DLAB);
+    LOCK.release();
+    irq_restore(saved);
+
+    if divisor == 0 {
+        Err(Error::Io)
+    } else {
+        Ok(UART_BAUD_BASE / u32::from(divisor))
+    }
+}
+
+/// 运行时设置串口波特率，真实重编程 DLL/DLM，并保持 8N1。
+///
+/// 参数校验在触碰硬件前完成，失败不会改变现有配置。寄存器更新与普通串口
+/// 写共享同一可重入锁并关本 CPU 中断，避免输出字节被误写入 divisor latch。
+pub fn set_baudrate(baud: u32) -> Result<(), Error> {
+    let divisor = divisor_for_baudrate(baud)?;
+    let saved = irq_save();
+    LOCK.acquire();
+    program_divisor_locked(com_base(), divisor);
+    LOCK.release();
+    irq_restore(saved);
+    Ok(())
+}
+
+/// 通过 16550 内部 loopback 路径做一次真实收发验收。
+///
+/// 测试会保存并恢复 MCR；成功仅在 LSR 声明数据就绪且 RBR 回读字节逐位相同
+/// 时返回。轮询耗尽返回 `Error::Io`，绝不假成功。
+pub fn loopback_test(byte: u8) -> Result<(), Error> {
+    let saved = irq_save();
+    LOCK.acquire();
+    let base = com_base();
+    let mcr = inb(base + REG_MODEM_CONTROL);
+    outb(base + REG_MODEM_CONTROL, mcr | MCR_LOOPBACK);
+    outb(base + REG_DATA_OR_DLL, byte);
+
+    let mut ready = false;
+    for _ in 0..LOOPBACK_POLL_LIMIT {
+        if inb(base + REG_LINE_STATUS) & LSR_DATA_READY != 0 {
+            ready = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let received = if ready {
+        Some(inb(base + REG_DATA_OR_DLL))
+    } else {
+        None
+    };
+    outb(base + REG_MODEM_CONTROL, mcr);
+    LOCK.release();
+    irq_restore(saved);
+
+    if received == Some(byte) {
+        Ok(())
+    } else {
+        Err(Error::Io)
+    }
 }
 
 /// 探测可用的串口，返回其基址。找不到则回退 COM1。
@@ -146,7 +261,7 @@ fn com_base() -> u16 {
 #[inline]
 fn putc_wait(byte: u8) {
     let com = com_base();
-    while inb(com + 5) & 0x20 == 0 {}
+    while inb(com + REG_LINE_STATUS) & LSR_TX_EMPTY == 0 {}
     outb(com, byte);
 }
 
@@ -160,14 +275,20 @@ pub fn write_byte(byte: u8) {
 }
 
 /// 读取单个字节（无数据返回 None）。
+///
+/// 与调速共享串口锁，避免另一 CPU 在 DLAB 打开期间把 DLL 当作接收数据读取。
 pub fn read_byte() -> Option<u8> {
+    let saved = irq_save();
+    LOCK.acquire();
     let com = com_base();
-    // LSR bit 0 表示数据就绪
-    if inb(com + 5) & 0x01 != 0 {
-        Some(inb(com))
+    let byte = if inb(com + REG_LINE_STATUS) & LSR_DATA_READY != 0 {
+        Some(inb(com + REG_DATA_OR_DLL))
     } else {
         None
-    }
+    };
+    LOCK.release();
+    irq_restore(saved);
+    byte
 }
 
 /// 直接写入一串字节到串口（\n 转 \r\n）。带锁 + 关中断。
@@ -201,4 +322,28 @@ impl klib::console::Console for SerialConsole {
         crate::serial::write_byte(b);
     }
     fn flush(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baudrate_to_divisor_accepts_exact_rates() {
+        assert_eq!(divisor_for_baudrate(115_200), Ok(1));
+        assert_eq!(divisor_for_baudrate(57_600), Ok(2));
+        assert_eq!(divisor_for_baudrate(38_400), Ok(3));
+        assert_eq!(divisor_for_baudrate(19_200), Ok(6));
+        assert_eq!(divisor_for_baudrate(9_600), Ok(12));
+        assert_eq!(divisor_for_baudrate(300), Ok(384));
+    }
+
+    #[test]
+    fn baudrate_to_divisor_rejects_zero_rounding_and_overflow() {
+        assert_eq!(divisor_for_baudrate(0), Err(Error::InvalidParam));
+        assert_eq!(divisor_for_baudrate(10_000), Err(Error::InvalidParam));
+        assert_eq!(divisor_for_baudrate(115_201), Err(Error::InvalidParam));
+        assert_eq!(divisor_for_baudrate(1), Err(Error::InvalidParam));
+        assert_eq!(divisor_for_baudrate(u32::MAX), Err(Error::InvalidParam));
+    }
 }

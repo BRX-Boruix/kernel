@@ -241,8 +241,8 @@ mod tests {
         fn serial_write(&self, buf: &[u8]) -> Result<usize, Error> {
             Ok(buf.len())
         }
-        fn get_serial_baudrate(&self) -> u32 {
-            self.baud.load(core::sync::atomic::Ordering::Relaxed)
+        fn get_serial_baudrate(&self) -> Result<u32, Error> {
+            Ok(self.baud.load(core::sync::atomic::Ordering::Relaxed))
         }
         fn set_serial_baudrate(&self, baud: u32) -> Result<(), Error> {
             self.baud.store(baud, core::sync::atomic::Ordering::Relaxed);
@@ -313,6 +313,13 @@ mod tests {
         baud_file.write_at(0, b"9600").unwrap();
         let n7 = baud_file.read_at(0, &mut buf).unwrap();
         assert_eq!(core::str::from_utf8(&buf[..n7]).unwrap().trim(), "9600");
+        assert_eq!(
+            baud_file.write_at(0, b"not-a-number"),
+            Err(Error::InvalidParam)
+        );
+        assert_eq!(baud_file.write_at(0, b"4294967296"), Err(Error::InvalidParam));
+        let n7b = baud_file.read_at(0, &mut buf).unwrap();
+        assert_eq!(core::str::from_utf8(&buf[..n7b]).unwrap().trim(), "9600");
 
         // 串口 config JSON
         let cfg_file = mount_table
@@ -345,8 +352,8 @@ mod tests {
             Err(Error::NotFound)
         }
 
-        fn get_serial_baudrate(&self) -> u32 {
-            0
+        fn get_serial_baudrate(&self) -> Result<u32, Error> {
+            Err(Error::NotFound)
         }
 
         fn set_serial_baudrate(&self, _baud: u32) -> Result<(), Error> {

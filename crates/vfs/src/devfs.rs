@@ -10,11 +10,9 @@
 //! - `/devices/net/{dev}/stats`：网络设备收发包与带宽遥测（JSON）；
 //! - `/devices/telemetry`：全系统硬件运行态健康全景遥测聚合点（JSON）。
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
 use klib::error::Error;
 use klib::json::{JsonObject, JsonWriter, VecTarget};
 
@@ -35,7 +33,8 @@ pub trait DeviceInfoProvider: Send + Sync {
     fn list_devices(&self) -> Vec<DeviceInfo>;
     fn serial_read(&self, buf: &mut [u8]) -> Result<usize, Error>;
     fn serial_write(&self, buf: &[u8]) -> Result<usize, Error>;
-    fn get_serial_baudrate(&self) -> u32;
+    /// 返回 UART divisor latch 对应的实际速率；硬件回读失败必须返回错误。
+    fn get_serial_baudrate(&self) -> Result<u32, Error>;
     fn set_serial_baudrate(&self, baud: u32) -> Result<(), Error>;
     fn telemetry_json(&self) -> String {
         alloc::format!(
@@ -62,9 +61,6 @@ pub trait DeviceInfoProvider: Send + Sync {
     }
 }
 
-/// 默认串口波特率原子存储。
-static SERIAL_BAUDRATE: AtomicU32 = AtomicU32::new(115200);
-
 /// 串口主数据流与属性子目录复合节点。
 pub struct SerialDeviceNode {
     provider: Arc<dyn DeviceInfoProvider>,
@@ -79,9 +75,9 @@ impl SerialDeviceNode {
         let p_baud_get = provider.clone();
         let p_baud_set = provider.clone();
         let baud_node = DynamicFileNode::read_write(
-            move || {
-                let baud = p_baud_get.get_serial_baudrate();
-                alloc::format!("{}\n", baud).into_bytes()
+            move || match p_baud_get.get_serial_baudrate() {
+                Ok(baud) => alloc::format!("{}\n", baud).into_bytes(),
+                Err(err) => alloc::format!("error:{}\n", err.to_errno()).into_bytes(),
             },
             move |buf| {
                 let s = core::str::from_utf8(buf).map_err(|_| Error::InvalidParam)?;
@@ -100,7 +96,15 @@ impl SerialDeviceNode {
             let mut writer = JsonWriter::new(&mut target);
             if let Ok(mut obj) = writer.start_object() {
                 let _ = obj.field_str("port", "COM1");
-                let _ = obj.field_u64("baudrate", baud as u64);
+                match baud {
+                    Ok(value) => {
+                        let _ = obj.field_u64("baudrate", value as u64);
+                    }
+                    Err(err) => {
+                        let _ = obj.field_null("baudrate");
+                        let _ = obj.field_i64("error", -(err.to_errno() as i64));
+                    }
+                }
                 let _ = obj.field_u64("data_bits", 8);
                 let _ = obj.field_str("parity", "none");
                 let _ = obj.field_u64("stop_bits", 1);
