@@ -41,6 +41,7 @@ limine = { version = "0.1", features = ["requests-section"] }
 flanterm_rust = { path = "../../vendor/flanterm_rust" }
 klib = { path = "../klib" }
 drv = { path = "../drv" }
+fs = { path = "../fs" }
 arch = { path = "../arch/arch" }
 arch-x86_64 = { path = "../arch/arch-x86_64" }
 mm = { path = "../mm" }

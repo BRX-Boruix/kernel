@@ -359,15 +359,101 @@ pub fn init() {
     let devfs = Arc::new(DevFS::new(Arc::new(KernelDeviceProvider)));
     mount_table.mount("/devices", devfs).expect("mount devfs");
 
-    // M6.4：将内核可执行程序装入 /binaries 虚拟目录（VFS 直接加载支持）
-    if let Ok(init_node) = mount_table.create_file("/binaries/init.elf", Permissions::read_exec()) {
-        let _ = init_node.write_at(0, include_bytes!("../init.elf"));
-    }
-    if let Ok(shell_node) = mount_table.create_file("/binaries/shell.elf", Permissions::read_exec())
-    {
-        let _ = shell_node.write_at(0, include_bytes!("../shell.elf"));
-    }
+    // M13/#13：真实磁盘链路——EXT2 挂载到 /binaries。挂载失败时 /binaries
+    // 保持空目录，init 加载将显式失败并可见；绝不回退到编译期嵌入副本。
+    let disk_mounted = try_mount_ext2_binaries(&mount_table);
 
     VFS_ROOT.call_once(|| mount_table);
-    klib::info!("[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /binaries populated");
+    if disk_mounted {
+        klib::info!("[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /binaries = EXT2(ata0)");
+    } else {
+        klib::info!("[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /binaries EMPTY (no persistent disk)");
+    }
+}
+
+/// drv 块设备 → fs::ByteDevice 桥接（只读路径足够；EXT2 驱动本身只读）。
+struct DrvByteBridge(&'static dyn drv::DeviceOps);
+
+impl fs::ByteDevice for DrvByteBridge {
+    fn read_bytes(&self, offset: u64, out: &mut [u8]) -> usize {
+        self.0.as_io().map(|io| io.read_at(offset, out)).unwrap_or(0)
+    }
+    fn byte_len(&self) -> Option<u64> {
+        self.0.as_io().and_then(|io| io.size())
+    }
+}
+
+/// 尝试从注册表首个持久块设备挂载 EXT2 到 /binaries（C13.1+C13.2+#13）。
+///
+/// 链路：DriverHub → volatile 拒载（C13.2 前置条件）→ MBR 首分区 →
+/// EXT2 超级块校验 → mount。任何一步失败都返回 false 并留下可见日志，
+/// 绝不伪造挂载成功。
+fn try_mount_ext2_binaries(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
+    let count = drv::DriverHub::device_count();
+    for i in 0..count {
+        let Some(info) = drv::DriverHub::device_info_at(i) else {
+            continue;
+        };
+        if info.kind != drv::DeviceKind::Block {
+            continue;
+        }
+        let name = info.name;
+        // C13.2 前置条件（#15 评估结论）：易失载体禁止冒充持久文件系统。
+        if info.volatile {
+            klib::warn!(
+                "[ext2] refuse to mount '{}' as EXT2 backing: volatile=true (data would not survive reboot)",
+                name
+            );
+            return false;
+        }
+        let Some(ops) = drv::DriverHub::device_at(i) else {
+            continue;
+        };
+        let bridge: Arc<dyn fs::ByteDevice> = Arc::new(DrvByteBridge(ops));
+        let mut sector = [0u8; 512];
+        if bridge.read_bytes(0, &mut sector) < 512 {
+            klib::warn!("[ext2] '{}' LBA0 short read, no MBR", name);
+            return false;
+        }
+        let first = match fs::mbr::parse_mbr(&sector) {
+            Ok(mbr) => mbr.first_partition(),
+            Err(e) => {
+                klib::warn!("[ext2] '{}' MBR parse failed: {:?}", name, e);
+                return false;
+            }
+        };
+        let Some(part) = first else {
+            klib::warn!("[ext2] '{}' has no MBR partition entries", name);
+            return false;
+        };
+        let part_start_byte = part.start_lba as u64 * 512;
+        let ext2 = match fs::ext2::Ext2Fs::open(bridge, part_start_byte) {
+            Ok(f) => f,
+            Err(e) => {
+                klib::warn!(
+                    "[ext2] '{}' partition lba={} is not a valid EXT2: {:?}",
+                    name,
+                    part.start_lba,
+                    e
+                );
+                return false;
+            }
+        };
+        match mount_table.mount("/binaries", Arc::new(ext2)) {
+            Ok(()) => {
+                klib::info!(
+                    "[ext2] mounted '{}' partition start_lba={} at /binaries (read-only)",
+                    name,
+                    part.start_lba
+                );
+                return true;
+            }
+            Err(e) => {
+                klib::error!("[ext2] mount /binaries failed: {:?}", e);
+                return false;
+            }
+        }
+    }
+    klib::warn!("[ext2] no persistent block device registered; /binaries stays empty");
+    false
 }

@@ -2599,12 +2599,30 @@ pub fn test_vfs_m64() {
     let root = vfs_init::root();
 
     // 1. 校验 /binaries/init.elf 与 /binaries/shell.elf 存在于 VFS 中
-    let init_node = root
-        .resolve("/binaries/init.elf", true)
-        .expect("resolve /binaries/init.elf");
-    let shell_node = root
-        .resolve("/binaries/shell.elf", true)
-        .expect("resolve /binaries/shell.elf");
+    // M13/#13：binaries 唯一来源是持久盘 EXT2。裸盘环境（无 -hda 或仅
+    // volatile 回退盘）合法地没有 binaries——此时必须证明确实不存在
+    // 持久块设备才允许跳过；有持久盘却读不到则照常断言失败。
+    let (init_node, shell_node) = match (
+        root.resolve("/binaries/init.elf", true),
+        root.resolve("/binaries/shell.elf", true),
+    ) {
+        (Ok(i), Ok(s)) => (i, s),
+        _ => {
+            let persistent = (0..drv::DriverHub::device_count()).any(|i| {
+                drv::DriverHub::device_info_at(i)
+                    .map(|info| info.kind == drv::DeviceKind::Block && !info.volatile)
+                    .unwrap_or(false)
+            });
+            assert!(
+                !persistent,
+                "a persistent block device exists but EXT2 did not populate /binaries"
+            );
+            info!(
+                "[test-vfs-m64] no persistent disk in this environment; binaries assertions honestly skipped"
+            );
+            return;
+        }
+    };
 
     let init_meta = init_node.metadata().expect("init meta");
     let shell_meta = shell_node.metadata().expect("shell meta");
@@ -2862,9 +2880,10 @@ pub fn test_driver_hub_m72() {
                     let ata_stats = ata_io.io_stats().expect("ata must expose real io stats");
                     let aw0 = ata_stats.sectors_written();
                     let ar0 = ata_stats.sectors_read();
-                    // C13.1 排雷：LBA0 是 MBR 保留区，块设备读写自检必须使用
-                    // 设备尾部 scratch 扇区（两种身份均满足 size>=64KiB）。
-                    let scratch_off = dev.size().expect("ata size known") - 512;
+                    // C13.1 排雷：LBA0 是 MBR 保留区，块设备读写自检使用盘中部
+                    // scratch 扇区（避开 MBR/FS 元数据区与末端边界）。
+                    let size = dev.size().expect("ata size known");
+                    let scratch_off = (size / 2) / 512 * 512;
                     let mut test_buf = [0u8; 512];
                     test_buf[0..4].copy_from_slice(b"BRX!");
                     let written = dev.write_at(scratch_off, &test_buf);

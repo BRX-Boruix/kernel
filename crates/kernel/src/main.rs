@@ -379,18 +379,27 @@ fn init_display() {
     info!("[display] terminal init returned");
 }
 
-/// 嵌入的用户程序 ELF 池（SDK 构建时由 `libsys` + `init`/`shell` 编译生成，
-/// 经 `include_bytes!` 在编译期嵌入）。`exec` 系统调用按索引加载运行。
-///
-/// 索引与 libsys `nr::PROG_*` 对齐：0 = init（PID 1），1 = shell（PID 2）。
-static PROGRAMS: &[&[u8]] = &[
-    include_bytes!("../init.elf"),
-    include_bytes!("../shell.elf"),
-];
+/// 从已挂载的 /binaries 读取程序 ELF（M13/#13：唯一来源是真实磁盘 EXT2，
+/// 不再存在编译期嵌入副本）。内建索引：0 = init.elf，1 = shell.elf。
+pub fn program_elf(idx: usize) -> Option<alloc::vec::Vec<u8>> {
+    const NAMES: [&str; 2] = ["init.elf", "shell.elf"];
+    let name = NAMES.get(idx)?;
+    read_binary_from_binaries(name)
+}
 
-/// 取嵌入程序池中第 `idx` 个 ELF（越界返回 `None`）。
-pub fn program_elf(idx: usize) -> Option<&'static [u8]> {
-    PROGRAMS.get(idx).copied()
+/// 从 /binaries/<name> 经 VFS 读出完整文件内容；任何失败返回 None（可见、不伪造）。
+pub fn read_binary_from_binaries(name: &str) -> Option<alloc::vec::Vec<u8>> {
+    let root = crate::vfs_init::root();
+    let path = alloc::format!("/binaries/{}", name);
+    let node = root.resolve(&path, true).ok()?;
+    let size = node.metadata().ok()?.size as usize;
+    if size == 0 {
+        return None;
+    }
+    let mut buf = alloc::vec![0u8; size];
+    let n = node.read_at(0, &mut buf).ok()?;
+    buf.truncate(n);
+    Some(buf)
 }
 
 /// panic 时的 CPU id 读取器：LAPIC 已映射才读，否则返回 0（早期未就绪安全）。
@@ -414,8 +423,18 @@ fn start_init() -> ! {
     use mm::user_space::UserAddressSpace;
 
     info!("[kmain] booting user init (PID 1) ...");
-    // 编译期嵌入 init.elf（SDK 构建时由 libsys+init 编译生成）。
-    let elf_bytes = include_bytes!("../init.elf");
+    // M13/#13：init.elf 来自真实磁盘链路（disk.img → ATA → MBR → EXT2 →
+    // /binaries）。磁盘缺失或镜像无效时显式失败并 idle 停机——绝不静默
+    // 回退到编译期嵌入副本（该副本已退役）。
+    let Some(elf_bytes) = read_binary_from_binaries("init.elf") else {
+        error!("[kmain] init: /binaries/init.elf unavailable (no persistent disk or invalid EXT2 image)");
+        info!("[kmain] reached idle loop");
+        CurrentArch::halt();
+    };
+    info!(
+        "[kmain] init: loaded {} bytes from /binaries/init.elf via EXT2",
+        elf_bytes.len()
+    );
 
     let mut us = match UserAddressSpace::<X86PageTable>::new() {
         Ok(us) => us,
@@ -425,7 +444,7 @@ fn start_init() -> ! {
             CurrentArch::halt();
         }
     };
-    let loaded = match loader::load(elf_bytes, &mut us, &[]) {
+    let loaded = match loader::load(&elf_bytes, &mut us, &[]) {
         Ok(l) => l,
         Err(e) => {
             error!("[kmain] init: load init.elf failed: {:?}", e);

@@ -409,7 +409,7 @@ fn sys_exec(frame: &mut InterruptFrame) -> u64 {
             1 => "/binaries/shell.elf",
             _ => {
                 if let Some(bytes) = crate::program_elf(arg1 as usize) {
-                    return spawn_elf_image(bytes, arg_ptr, arg_len, arg1 as usize);
+                    return spawn_elf_image(&bytes, arg_ptr, arg_len, arg1 as usize);
                 }
                 return pack_err(Error::InvalidParam);
             }
@@ -428,7 +428,7 @@ fn sys_exec(frame: &mut InterruptFrame) -> u64 {
             }
             Err(_) => {
                 if let Some(bytes) = crate::program_elf(arg1 as usize) {
-                    return spawn_elf_image(bytes, arg_ptr, arg_len, arg1 as usize);
+                    return spawn_elf_image(&bytes, arg_ptr, arg_len, arg1 as usize);
                 }
                 return pack_err(Error::NotFound);
             }

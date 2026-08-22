@@ -70,6 +70,7 @@ dependencies = [
  "arch-x86_64",
  "drv",
  "flanterm_rust",
+ "fs",
  "ipc",
  "klib",
  "limine",
