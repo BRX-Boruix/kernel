@@ -482,12 +482,16 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: usi
         Ok(l) => l,
         Err(e) => return pack_err(e),
     };
-    match task::spawn(loaded.entry, loaded.user_stack_top, us) {
+    // exec 派生的是**当前调用进程的子进程**（C7.1）：登记真实 ppid，
+    // 使 waitpid/退出码交付对 shell 前台等待等场景成立。
+    let parent_pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+    match task::spawn_with_ppid(parent_pid, loaded.entry, loaded.user_stack_top, us) {
         Ok(pid) => {
             klib::info!(
-                "[syscall] exec prog={} -> pid={} entry={:#x}",
+                "[syscall] exec prog={} -> pid={} (ppid={}) entry={:#x}",
                 idx_or_tag,
                 pid,
+                parent_pid,
                 loaded.entry
             );
             pack_ok(pid as u64)
@@ -540,35 +544,45 @@ fn sys_brk(frame: &mut InterruptFrame) -> u64 {
 /// `task_wait(target_pid, timeout_ns)` (ADR-014: SYS_TASK_WAIT / 0x32)
 /// - target_pid == 0 && timeout_ns == 0: yield_now 主动让出 CPU
 /// - target_pid == 0 && timeout_ns > 0: sleep 精准时钟挂起睡眠
-/// - target_pid > 0: waitpid 等待子任务
-fn sys_task_wait(frame: &mut InterruptFrame) -> u64 {
+/// - target_pid > 0: waitpid——等待**自己的直接子进程**退出（C7.1/#7）：
+///   子已 zombie → 同步收尸返回其真实退出码；子仍在运行 → 真阻塞（Blocked），
+///   返回 [`DispatchResult::Switched`]——子进程 exit 时内核把退出码写入本
+///   进程保存帧 rax 并唤醒，iretq 后用户态直接拿到；入口禁止回写占位值。
+///   目标非亲生/不存在/已收尸 → `NotFound`（errno 2，klib 错误表无 ECHILD
+///   的最近语义）；无其他就绪进程可切时拒绝阻塞 → `WouldBlock`。
+fn sys_task_wait(frame: &mut InterruptFrame) -> DispatchResult {
     let target_pid = frame.rdi as usize;
     let timeout_ns = frame.rsi;
 
     if target_pid == 0 && timeout_ns == 0 {
         task::yield_now(frame);
-        return pack_ok(0);
+        return done(pack_ok(0));
     }
 
     if target_pid == 0 && timeout_ns > 0 {
         klib::time::sleep_nanos(timeout_ns);
-        return pack_ok(0);
+        return done(pack_ok(0));
     }
 
-    // 等待子任务退出（占位，当前单核直接返回 OK）
-    pack_ok(0)
+    match task::waitpid(target_pid, frame) {
+        Ok(task::Waited::Code(code)) => done(pack_ok(code)),
+        Ok(task::Waited::Blocked) => DispatchResult::Switched,
+        Err(e) => done(pack_err(e)),
+    }
 }
 
 /// `exit(code)`：终止当前进程并调度到下一个就绪进程（多进程场景）。
 ///
-/// 经 `scheduler::exit_current` 回收当前进程槽位并改写 `frame` 为下一个就绪
-/// 进程的保存帧；返回后 `syscall_entry` 的 iretq 进入目标进程。若所有进程都
-/// 退出则停机。返回值为填充占位（当前进程已死，实际由 iretq 接管）。
+/// 经 `scheduler::exit_current(frame, code)` 统一终止核心处理：有活父且父
+/// 阻塞 waitpid 时交付退出码并唤醒父，否则 zombie 保留/按无父回收。若还有
+/// 就绪进程，改写 `frame` 为下一个就绪进程的保存帧；返回后 `syscall_entry`
+/// 的 iretq 进入目标进程。若所有进程都退出则 idle halt 等待。返回值为填充
+/// 占位（当前进程已死，实际由 iretq 接管）。
 fn sys_exit(frame: &mut InterruptFrame) -> u64 {
     let code = frame.rdi;
     let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
     klib::info!("[syscall] process {} exit(code={})", pid, code);
-    task::exit_current(frame);
+    task::exit_current(frame, code);
     0
 }
 
@@ -631,38 +645,57 @@ fn sys_driver_claim(frame: &mut InterruptFrame) -> u64 {
 
 // ---------- 分发 ----------
 
-/// 按系统调用号分发到具体实现。返回打包后的结果（写回 `frame.rax`）。
-fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
+/// 分发结果：`Done(v)` = 正常返回值（写回 `frame.rax` 带回调用进程）；
+/// `Switched` = 处理器已把 `*frame` **整体替换**为下一进程的保存帧并切换
+/// （waitpid 阻塞 / exit 切换）。此时 `frame.rax` 属于目标进程语义
+/// （如 waitpid 交付的退出码），入口**必须禁止**再写返回值——否则会用
+/// 占位值覆盖交付结果/目标进程现场。
+enum DispatchResult {
+    Done(u64),
+    Switched,
+}
+
+/// 普通处理器结果包装。
+fn done(v: u64) -> DispatchResult {
+    DispatchResult::Done(v)
+}
+
+/// 按系统调用号分发到具体实现。
+fn dispatch(nr: u64, frame: &mut InterruptFrame) -> DispatchResult {
     match nr as u32 {
         // STREAM Domain (0x10)
-        SYS_STREAM_CREATE => sys_open(frame),
-        SYS_STREAM_READ => sys_read(frame),
-        SYS_STREAM_WRITE => sys_write(frame),
-        SYS_STREAM_CLOSE => sys_close(frame),
+        SYS_STREAM_CREATE => done(sys_open(frame)),
+        SYS_STREAM_READ => done(sys_read(frame)),
+        SYS_STREAM_WRITE => done(sys_write(frame)),
+        SYS_STREAM_CLOSE => done(sys_close(frame)),
 
         // MEMORY Domain (0x20)
-        SYS_MEMORY_MAP => sys_mmap(frame),
-        SYS_MEMORY_GROW => sys_brk(frame),
-        SYS_MEMORY_UNMAP => sys_munmap(frame),
+        SYS_MEMORY_MAP => done(sys_mmap(frame)),
+        SYS_MEMORY_GROW => done(sys_brk(frame)),
+        SYS_MEMORY_UNMAP => done(sys_munmap(frame)),
 
         // TASK Domain (0x30)
-        SYS_TASK_SPAWN => sys_exec(frame),
+        SYS_TASK_SPAWN => done(sys_exec(frame)),
         SYS_TASK_WAIT => sys_task_wait(frame),
-        SYS_TASK_SIGNAL => sys_kill(frame),
-        SYS_TASK_EXIT => sys_exit(frame),
+        SYS_TASK_SIGNAL => done(sys_kill(frame)),
+        // exit 已切换到下一进程（或进入 idle），永不以正常值返回。
+        SYS_TASK_EXIT => {
+            sys_exit(frame);
+            DispatchResult::Switched
+        }
 
         // VFS Domain (0x40)
-        SYS_ENTRY_CREATE => sys_mkdir(frame),
-        SYS_ENTRY_READ => sys_readdir(frame),
-        SYS_ENTRY_DELETE => sys_unlink(frame),
+        SYS_ENTRY_CREATE => done(sys_mkdir(frame)),
+        SYS_ENTRY_READ => done(sys_readdir(frame)),
+        SYS_ENTRY_DELETE => done(sys_unlink(frame)),
 
         // DEVICE Domain (0x50)
-        SYS_DRIVER_REGISTER => sys_driver_register(frame),
-        SYS_DRIVER_CLAIM => sys_driver_claim(frame),
+        SYS_DRIVER_REGISTER => done(sys_driver_register(frame)),
+        SYS_DRIVER_CLAIM => done(sys_driver_claim(frame)),
 
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);
-            pack_err(Error::NotSupported)
+            done(pack_err(Error::NotSupported))
         }
     }
 }
@@ -671,9 +704,12 @@ fn dispatch(nr: u64, frame: &mut InterruptFrame) -> u64 {
 
 /// `int 0x80` 软中断处理回调（注册为 `register_soft_interrupt_handler`）。
 ///
-/// 从 `InterruptFrame` 读 `rax`（系统调用号）与参数寄存器，分发执行后把结果
-/// 写回 `frame.rax`，返回 `true` 让 `iretq` 把结果带回用户态。
-/// `exit` 不返回（停机），故不会执行到返回语句。
+/// 从 `InterruptFrame` 读 `rax`（系统调用号）与参数寄存器，分发执行：
+/// - [`DispatchResult::Done`]：把结果写回 `frame.rax`，iretq 带回调用进程；
+/// - [`DispatchResult::Switched`]：`*frame` 已是下一进程保存帧，其 rax 由
+///   调度语义负责（如 waitpid 交付的子进程退出码），不得覆盖。
+///
+/// 返回 `true` 让 `iretq` 把（可能的）新现场带回目标用户态。
 pub extern "C" fn syscall_entry(frame: &mut InterruptFrame) -> bool {
     let nr = frame.rax;
     // 进入/返回 trace 仅在自检构建开启（避免每条 syscall 生产刷屏）。
@@ -685,9 +721,16 @@ pub extern "C" fn syscall_entry(frame: &mut InterruptFrame) -> bool {
         frame.rsi,
         frame.rdx
     );
-    let ret = dispatch(nr, frame);
-    #[cfg(feature = "kernel-tests")]
-    klib::info!("[syscall] nr={:#x} -> {:#x}", nr, ret);
-    frame.rax = ret;
+    match dispatch(nr, frame) {
+        DispatchResult::Done(ret) => {
+            #[cfg(feature = "kernel-tests")]
+            klib::info!("[syscall] nr={:#x} -> {:#x}", nr, ret);
+            frame.rax = ret;
+        }
+        DispatchResult::Switched => {
+            #[cfg(feature = "kernel-tests")]
+            klib::info!("[syscall] nr={:#x} -> <switched>", nr);
+        }
+    }
     true
 }

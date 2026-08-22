@@ -289,6 +289,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_hub_m72();
 
+    // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_waitpid_core();
+
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。
     mm::frame_allocator::set_cpu_id_reader(|| {
@@ -333,6 +337,11 @@ unsafe fn kmain_body() -> ! {
     // 注册键盘输入回调：有按键时唤醒阻塞在 `read` 的进程（如 shell）。arch 层
     // 不反向依赖 kernel，经函数指针解耦（指向 `task::wake_kbd`）。
     arch_x86_64::keyboard::set_input_callback(task::wake_kbd);
+
+    // C7.1/#7：waitpid 真实父子链停机验收（kernel-test-waitpid 显式启用；
+    // 验收后停机、不返回主流程，故必须放在 start_init 之前）。
+    #[cfg(feature = "kernel-test-waitpid")]
+    tests::test_waitpid_e2e(); // 永不返回
 
     // 生产化：进入用户态 init（PID 1），而非内核 idle 停机。加载 init.elf →
     // spawn → `scheduler::start` 永不返回；init 经 syscall 与内核交互、退出。

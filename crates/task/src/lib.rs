@@ -18,7 +18,8 @@ pub use process::{
     process_page_fault_handler, set_current_proc,
 };
 pub use scheduler::{
-    block_current, block_for_kbd, exit_current, get_process_snapshot, kill_pid, process_snapshots,
-    ps_snapshot, spawn, start, tick, wake, wake_kbd, yield_now,
+    Waited, block_current, block_for_kbd, exit_current, get_process_snapshot, kill_pid,
+    process_snapshots, ps_snapshot, spawn, spawn_with_ppid, start, tick, waitpid, wake, wake_kbd,
+    yield_now,
 };
 pub use signals::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTERM, signal_for_exception, signal_name};

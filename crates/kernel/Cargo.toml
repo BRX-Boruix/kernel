@@ -8,14 +8,17 @@ edition.workspace = true
 real-hw = ["task/real-hw"]
 # 编译带自检测试（kernel::tests）的内核。默认关闭；SDK 的
 # `build --test` / `br --test` 会显式启用该 feature。
-kernel-tests = []
+# 透传 task/kernel-tests：启用 scheduler::test_hooks（waitpid 核心单测钩子）。
+kernel-tests = ["task/kernel-tests"]
 # M3.3 用户态异常停机验收：进程在用户态触发 #UD 后由"进程终止"处理器
 # 接管并停机（验收后停，不返回主流程）。因会卡住后续启动，默认关闭；
 # SDK 的 `--test-m3.3` 显式启用。隐含 kernel-tests。
-kernel-test-m33 = ["kernel-tests"]
+# 透传 task/kernel-test-m33：启用 ProcessTable::run。
+kernel-test-m33 = ["kernel-tests", "task/kernel-test-m33"]
 # M4.1 syscall 停机验收：用户代码经 `int 0x80` 调用 write/now/exit 等，
 # 验证 syscall ABI 全链路（验收后停，不返回主流程）。隐含 kernel-tests。
-kernel-test-m41 = ["kernel-tests"]
+# 透传 task/kernel-test-m41：启用 ProcessTable::run。
+kernel-test-m41 = ["kernel-tests", "task/kernel-test-m41"]
 # M4.2 调度器停机验收：多进程 RR 轮转（验收后停，不返回主流程）。隐含 kernel-tests。
 kernel-test-m42 = ["kernel-tests"]
 # M4.3 静态 ELF 加载验收：加载 ELF 镜像并运行（验收后停，不返回主流程）。隐含 kernel-tests。
@@ -26,6 +29,10 @@ kernel-test-m44 = ["kernel-tests"]
 # M5 写时复制（COW）验收：`clone_cow` 派生共享用户区的子地址空间（纯内存
 # 逻辑，返回主流程继续启动）。隐含 kernel-tests。
 kernel-test-m5 = ["kernel-tests"]
+# C7.1/#7 waitpid 停机验收：真实父子进程经 int 0x80 全链路——父进程
+# SYS_TASK_WAIT 阻塞、子进程 SYS_TASK_EXIT(42)、父进程被交付退出码后
+# 校验 rax==42 并回写标记（验收后停，不返回主流程）。隐含 kernel-tests。
+kernel-test-waitpid = ["kernel-tests"]
 
 [build-dependencies]
 

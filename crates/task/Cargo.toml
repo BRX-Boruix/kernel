@@ -6,6 +6,13 @@ edition.workspace = true
 [features]
 # QEMU TCG 默认需要较长的虚拟时间片；启用此项时改为真机档位（每个 LAPIC tick 调度）。
 real-hw = []
+# 内核自检模式：启用 scheduler::test_hooks（C7.1 waitpid 核心机制单测钩子）。
+# 由 kernel crate 的 kernel-tests feature 透传，生产构建不含测试钩子。
+kernel-tests = []
+# M3.3/M4.1 停机验收：启用 ProcessTable::run（单进程停机模型遗留入口）。
+# 由 kernel crate 的同名 feature 透传。
+kernel-test-m33 = []
+kernel-test-m41 = []
 
 [dependencies]
 klib = { path = "../klib" }

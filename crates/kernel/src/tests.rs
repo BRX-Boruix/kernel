@@ -783,10 +783,11 @@ fn syscall_user_code() -> [u8; 200] {
 /// exit 打印后停机。
 #[cfg(feature = "kernel-test-m41")]
 pub fn test_syscall() {
-    use crate::process::ProcessTable;
+    // process 拆为 task crate 后原 `crate::process` 失效，按现路径修复。
     use arch::VirtAddr;
     use arch_x86_64::paging::X86PageTable;
     use mm::user_space::UserAddressSpace;
+    use task::ProcessTable;
     use usermode_syscall::*;
 
     info!("[syscall-test] === M4.1: syscall via int 0x80 ===");
@@ -925,10 +926,11 @@ fn sched_user_code() -> [u8; 96] {
 /// 串口应看到 A/B/C 交替打印（穿插顺序可非严格周期，但三个都出现）。
 #[cfg(feature = "kernel-test-m42")]
 pub fn test_scheduler() {
-    use crate::scheduler;
+    // task 拆为独立 crate 后原 `crate::scheduler` 失效，按现路径修复。
     use arch::VirtAddr;
     use arch_x86_64::paging::X86PageTable;
     use mm::user_space::UserAddressSpace;
+    use task::scheduler;
     use usermode_sched::*;
 
     info!("[sched-test] === M4.2: multi-process RR scheduling ===");
@@ -1380,10 +1382,10 @@ fn usermode_fault_code() -> [u8; 26] {
 /// 单进程场景下停机。
 #[cfg(feature = "kernel-test-m33")]
 extern "C" fn user_fault_handler(frame: &mut arch_x86_64::interrupts::InterruptFrame) {
-    let sig = crate::signals::signal_for_exception(frame.vector);
+    let sig = task::signals::signal_for_exception(frame.vector);
     klib::info!(
         "[signal] user process terminated by {} (vector={:#x}) at rip={:#x} cs={:#x}",
-        crate::signals::signal_name(sig),
+        task::signals::signal_name(sig),
         frame.vector,
         frame.rip,
         frame.cs
@@ -1401,8 +1403,8 @@ extern "C" fn user_fault_handler(frame: &mut arch_x86_64::interrupts::InterruptF
 /// 注册的处理器被调用 → 打印"用户进程异常终止"并停机（验收后停，不返回主流程）。
 #[cfg(feature = "kernel-test-m33")]
 pub fn test_spawn_user_fault() {
-    use crate::process::ProcessTable;
     use mm::user_space::UserAddressSpace;
+    use task::ProcessTable;
     use usermode::{CODE_ADDR, MAGIC_ADDR};
 
     info!("[test-fault] === M3.3: user exception terminates process ===");
@@ -2012,9 +2014,12 @@ fn build_test_elf() -> alloc::vec::Vec<u8> {
 /// 验收依据（串口日志）：`[elf] loaded ...`、`Hello from ELF!`、`exit` 停机日志。
 #[cfg(feature = "kernel-test-m43")]
 pub fn test_elf_loader() {
-    use crate::{elf, scheduler};
+    // task/loader 拆为独立 crate 后原 `crate::scheduler`/`crate::elf` 失效；
+    // 此处按现路径修复（loader::load 与旧 elf::load 同签名）。
     use arch_x86_64::paging::X86PageTable;
+    use loader as elf;
     use mm::user_space::UserAddressSpace;
+    use task::scheduler;
 
     info!("[elf-test] === M4.3: static ELF loader ===");
 
@@ -2045,9 +2050,12 @@ pub fn test_elf_loader() {
 /// kernel version / heap break 十六进制输出、`exit(code=0)` 停机。
 #[cfg(feature = "kernel-test-m44")]
 pub fn test_userspace_elf() {
-    use crate::{elf, scheduler};
+    // task/loader 拆为独立 crate 后原 `crate::scheduler`/`crate::elf` 失效；
+    // 此处按现路径修复（loader::load 与旧 elf::load 同签名）。
     use arch_x86_64::paging::X86PageTable;
+    use loader as elf;
     use mm::user_space::UserAddressSpace;
+    use task::scheduler;
 
     info!("[userspace] === M4.4: real userspace binary (libsys + init) ===");
 
@@ -3024,4 +3032,373 @@ pub fn test_driver_hub_m72() {
     info!("[test-driver-hub-m72] UIO zero-panic crash isolation OK");
 
     info!("[test-driver-hub-m72] PASS");
+}
+
+// ---- C7.1/#7：waitpid 真实现验收 ----
+
+/// C7.1 核心机制单测（纯表级：真实终止/收尸/阻塞决策逻辑，不做 CPU 切换）。
+///
+/// 覆盖矩阵：
+/// 1. 对抗参数：未知 pid / 非亲生进程 / 反向父子 → NotFound；
+/// 2. 子仍在运行时非阻塞收尸尝试 → WouldBlock；
+/// 3. zombie：父未等待时保留 Exit 槽位并保存退出码；收尸取码后槽位释放、
+///    重复收尸 NotFound；
+/// 4. 无父（含父已死）终止 → 立即回收；
+/// 5. 孤儿级联：父被回收时其 zombie 子女一并回收；
+/// 6. 阻塞交付：父 Blocked 登记 waiting_for → 子终止即 delivered，退出码
+///    写入父 saved.rax（含 64 位逐字节校验）、父置 Ready、waiting_for 清除；
+/// 7. waiting_for 独占期间通用 wake 必须无效（防提前唤醒带占位 rax 返回）；
+/// 8. 阻塞拒绝：无其他有效就绪进程时回滚登记并如实返回 WouldBlock（防自锁）。
+#[cfg(feature = "kernel-tests")]
+pub fn test_waitpid_core() {
+    use klib::error::Error;
+    use task::TaskState;
+    use task::scheduler::test_hooks as th;
+
+    info!("[test-waitpid-core] === C7.1/#7: zombie / reap / block decision core ===");
+
+    // 钩子进程带哑入口（0x1000），绝不可被 tick 真调度执行。block_on_child
+    // 会把表级 current 切到钩子进程，若此时 LAPIC tick 到来，tick 会把
+    // Ready 哑进程的初始帧 iretq 进 0x1000 → Page Fault。故全程关中断，
+    // 测试结束后清场再恢复（中途 assert 失败即 panic 停机，无需恢复）。
+    arch_x86_64::interrupts::disable();
+
+    // ---- 1. 建立父子关系 + 对抗参数 ----
+    let root = th::spawn_child_of(0).expect("spawn root");
+    let child = th::spawn_child_of(root).expect("spawn child");
+    assert_ne!(root, child, "pids must be distinct");
+    assert!(th::probe(child).is_some(), "child must be registered");
+    assert!(
+        matches!(th::try_reap(root, 999_999), Err(Error::NotFound)),
+        "unknown pid must be NotFound"
+    );
+    let outsider = th::spawn_child_of(0).expect("spawn outsider");
+    assert!(
+        matches!(th::try_reap(root, outsider), Err(Error::NotFound)),
+        "non-child pid must be NotFound"
+    );
+    assert!(
+        matches!(th::try_reap(child, root), Err(Error::NotFound)),
+        "reverse parent-child must be NotFound"
+    );
+
+    // ---- 2. 子仍在运行 → WouldBlock ----
+    assert!(
+        matches!(th::try_reap(root, child), Err(Error::WouldBlock)),
+        "running child must not be reapable"
+    );
+
+    // ---- 3. zombie 保留 + 收尸 ----
+    assert_eq!(
+        th::terminate(child, 42),
+        "zombie",
+        "parent idle: keep zombie"
+    );
+    let (st, wf, _) = th::probe(child).expect("zombie probed");
+    assert_eq!(st, TaskState::Exit, "zombie state must be Exit");
+    assert_eq!(wf, None, "zombie must not hold wait registration");
+    assert_eq!(
+        th::try_reap(root, child).ok(),
+        Some(42),
+        "reap returns code"
+    );
+    assert!(th::probe(child).is_none(), "reaped slot must be freed");
+    assert!(
+        matches!(th::try_reap(root, child), Err(Error::NotFound)),
+        "double reap must be NotFound"
+    );
+    info!("[test-waitpid-core] zombie keep/reap/double-reap OK");
+
+    // ---- 4. 无父直接回收 ----
+    let p2 = th::spawn_child_of(0).expect("spawn p2");
+    let k1 = th::spawn_child_of(p2).expect("spawn k1");
+    assert_eq!(th::terminate(p2, 0), "reclaimed", "rootless exit reclaims");
+    assert!(th::probe(p2).is_none());
+    assert_eq!(
+        th::terminate(k1, 7),
+        "reclaimed",
+        "dead-parent child must reclaim immediately"
+    );
+    assert!(th::probe(k1).is_none());
+    info!("[test-waitpid-core] parentless immediate reclaim OK");
+
+    // ---- 5. 孤儿级联 ----
+    let g = th::spawn_child_of(0).expect("spawn g");
+    let z = th::spawn_child_of(g).expect("spawn z");
+    assert_eq!(th::terminate(z, 5), "zombie");
+    assert_eq!(th::terminate(g, 3), "reclaimed");
+    assert!(th::probe(g).is_none());
+    assert!(th::probe(z).is_none(), "orphan zombie must cascade-reclaim");
+    info!("[test-waitpid-core] orphan zombie cascade OK");
+
+    // ---- 6. 阻塞登记与交付 ----
+    let pa = th::spawn_child_of(0).expect("spawn pa");
+    let kid = th::spawn_child_of(pa).expect("spawn kid");
+    assert!(
+        matches!(th::block_on_child(pa, kid), Ok(task::Waited::Blocked)),
+        "block registers and reports Blocked"
+    );
+    let (st, wf, _) = th::probe(pa).expect("blocked parent probed");
+    assert_eq!(st, TaskState::Blocked);
+    assert_eq!(wf, Some(kid));
+    // waiting_for 独占期间通用唤醒无效：
+    task::wake(pa);
+    let (st2, wf2, _) = th::probe(pa).expect("still probed");
+    assert_eq!(st2, TaskState::Blocked, "generic wake must not fire waiter");
+    assert_eq!(wf2, Some(kid));
+    assert_eq!(th::terminate(kid, 99), "delivered", "wake+deliver on exit");
+    assert!(th::probe(kid).is_none(), "delivery reaps child immediately");
+    let (st3, wf3, rax3) = th::probe(pa).expect("delivered parent probed");
+    assert_eq!(st3, TaskState::Ready, "parent must be schedulable again");
+    assert_eq!(wf3, None, "wait registration must be cleared");
+    assert_eq!(rax3, 99, "exit code must land in parent saved rax");
+    info!("[test-waitpid-core] block + delivery (code 99) OK");
+
+    // ---- 7. 64 位退出码逐字节交付 ----
+    const BIG: u64 = 0xDEAD_BEEF_CAFE_0001;
+    let pc = th::spawn_child_of(0).expect("spawn pc");
+    let kd = th::spawn_child_of(pc).expect("spawn kd");
+    assert!(matches!(
+        th::block_on_child(pc, kd),
+        Ok(task::Waited::Blocked)
+    ));
+    assert_eq!(th::terminate(kd, BIG), "delivered");
+    let (_, _, rax4) = th::probe(pc).expect("pc probed");
+    assert_eq!(rax4, BIG, "u64 exit code must be byte-exact");
+    info!("[test-waitpid-core] 64-bit byte-exact delivery OK");
+
+    // ---- 8. 阻塞拒绝路径（无其他就绪进程 → 回滚 + WouldBlock）----
+    th::reset_all();
+    let ph = th::spawn_child_of(0).expect("spawn ph");
+    let kh = th::spawn_child_of(ph).expect("spawn kh");
+    // 让唯一的其他进程进入与 waitpid 无关的阻塞（如等键盘），使父无可切。
+    assert!(th::simulate_blocked(kh), "kh must become Blocked");
+    assert!(
+        matches!(th::block_on_child(ph, kh), Err(Error::WouldBlock)),
+        "blocking with no runnable peer must honestly refuse"
+    );
+    let (st5, wf5, _) = th::probe(ph).expect("ph probed after refusal");
+    assert_eq!(st5, TaskState::Running, "refusal must restore Running");
+    assert_eq!(wf5, None, "refusal must clear registration");
+    info!("[test-waitpid-core] deadlock-refusal (WouldBlock) OK");
+
+    // ---- 清场：不留测试进程（next_pid 保持单调即可）----
+    let cleared = th::reset_all();
+    info!(
+        "[test-waitpid-core] cleanup: cleared {} test procs",
+        cleared
+    );
+    assert!(th::probe(root).is_none() || cleared > 0);
+    arch_x86_64::interrupts::enable();
+    info!("[test-waitpid-core] PASS");
+}
+
+/// C7.1/#7 E2E 停机验收的常量地址（随 `kernel-test-waitpid` feature 编译）。
+#[cfg(feature = "kernel-test-waitpid")]
+mod usermode_waitpid {
+    /// 用户代码页。
+    pub const CODE_ADDR: u64 = 0x0000_0000_9000_0000;
+    /// 消息页：byte[0]='*'（成功标记），byte[1]='!'（失败标记）。
+    pub const MSG_ADDR: u64 = 0x0000_0000_9500_0000;
+    pub const STACK_TOP: u64 = 0x0000_0000_4000_0000;
+    pub const MSG: &[u8] = b"*!";
+    /// 子进程先行睡眠时长：500ms ≈ 50 个 LAPIC tick（100Hz），保证父进程
+    /// 在子进程退出前完成阻塞登记（tick 抢占切换的真实链路）。
+    pub const CHILD_SLEEP_NS: u64 = 500_000_000;
+}
+
+/// E2E 子进程机器码：`task_wait(0, 500ms)` 真实睡眠 → `exit(42)`。
+///
+/// 睡眠期间被 LAPIC tick 抢占切换是必然事件（50 tick >> 时间片），父进程
+/// 得以在子进程退出前阻塞登记，从而走"阻塞 → 交付"全链路。
+#[cfg(feature = "kernel-test-waitpid")]
+fn waitpid_child_code(sleep_ns: u64) -> [u8; 96] {
+    let mut c = [0x90u8; 96];
+    let mut i = 0;
+    macro_rules! emit {
+        ($($b:expr),*) => { $( c[i] = $b; i += 1; )* };
+    }
+    macro_rules! imm64 {
+        ($op:expr, $v:expr) => {{
+            emit!(0x48, $op);
+            c[i..i + 8].copy_from_slice(&($v as u64).to_le_bytes());
+            i += 8;
+        }};
+    }
+    // SYS_TASK_WAIT(0x32)：target_pid=0, timeout=sleep_ns → 精确睡眠
+    imm64!(0xB8, 0x32u64);
+    imm64!(0xBF, 0u64); // rdi = 0
+    imm64!(0xBE, sleep_ns); // rsi = timeout_ns
+    emit!(0xCD, 0x80);
+    // SYS_TASK_EXIT(0x34)：exit(42)
+    imm64!(0xB8, 0x34u64);
+    imm64!(0xBF, 42u64);
+    emit!(0xCD, 0x80);
+    emit!(0x0F, 0x0B); // ud2 不应到达
+    c
+}
+
+/// E2E 父进程机器码：`task_wait(child_pid)` 阻塞等待 → 校验 rax==42 →
+/// 成功经 stream write 输出 '*'（ASCII 42，退出码逐字节可见）；失败输出 '!'
+/// 后 `exit(7)`。最后 `exit(0)` 停机。
+#[cfg(feature = "kernel-test-waitpid")]
+fn waitpid_parent_code(child_pid: usize) -> [u8; 192] {
+    use usermode_waitpid::{MSG_ADDR, STACK_TOP};
+    let mut c = [0x90u8; 192];
+    let mut i = 0;
+    macro_rules! emit {
+        ($($b:expr),*) => { $( c[i] = $b; i += 1; )* };
+    }
+    macro_rules! imm64 {
+        ($op:expr, $v:expr) => {{
+            emit!(0x48, $op);
+            c[i..i + 8].copy_from_slice(&($v as u64).to_le_bytes());
+            i += 8;
+        }};
+    }
+    macro_rules! write_seq {
+        ($off:expr) => {{
+            imm64!(0xB8, 0x13u64); // SYS_STREAM_WRITE
+            imm64!(0xBF, 1u64); // fd = stdout
+            imm64!(0xBE, MSG_ADDR); // rsi = buf
+            imm64!(0xBA, 1u64); // rdx = len 1
+            emit!(0x49, 0xC7, 0xC2); // mov r10, $off（imm32 符号扩展）
+            c[i..i + 4].copy_from_slice(&($off as u32).to_le_bytes());
+            i += 4;
+            emit!(0xCD, 0x80);
+        }};
+    }
+    macro_rules! exit_seq {
+        ($code:expr) => {{
+            imm64!(0xB8, 0x34u64); // SYS_TASK_EXIT
+            imm64!(0xBF, $code as u64);
+            emit!(0xCD, 0x80);
+        }};
+    }
+    let _ = STACK_TOP;
+    // SYS_TASK_WAIT(0x32)：target=child_pid → 真阻塞，醒来 rax=退出码
+    imm64!(0xB8, 0x32u64);
+    imm64!(0xBF, child_pid as u64);
+    imm64!(0xBE, 0u64); // rsi = timeout（target!=0 时无意义，显式 0）
+    emit!(0xCD, 0x80);
+    // cmp rax, 42
+    emit!(0x48, 0x81, 0xF8);
+    c[i..i + 4].copy_from_slice(&42u32.to_le_bytes());
+    i += 4;
+    // jne fail（disp8 回填）
+    let jne_disp_pos = i + 1;
+    emit!(0x75, 0x00);
+    // ---- 成功路径：write('*')（offset 0）→ exit(0) ----
+    write_seq!(u64::MAX); // offset = u64::MAX（流式追加语义）
+    exit_seq!(0u8);
+    emit!(0x0F, 0x0B);
+    c[jne_disp_pos] = (i - jne_disp_pos - 1) as u8;
+    // ---- 失败路径：write('!')（offset 1）→ exit(0xDEAD) ----
+    // 退出码取非常规值：若串口出现 exit(code=57325) 即证明失败路径真实执行，
+    // 同时排除陈旧引导介质干扰（旧版此值为 7）。
+    write_seq!(1u64);
+    exit_seq!(0xDEADu64);
+    emit!(0x0F, 0x0B);
+    c
+}
+
+/// E2E 公共：构造独立用户地址空间（代码/消息/栈各一物理帧）。
+/// 返回 (地址空间, 代码帧物理基址) —— 供调用方回填内建立即数。
+#[cfg(feature = "kernel-test-waitpid")]
+fn waitpid_build_space(
+    code: &[u8],
+    msg: &[u8],
+) -> (mm::user_space::UserAddressSpace<X86PageTable>, u64) {
+    use arch::VirtAddr;
+    use mm::user_space::UserAddressSpace;
+    use usermode_waitpid::*;
+
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let code_frame = mm::allocate_frame().expect("code frame").start_paddr();
+    let msg_frame = mm::allocate_frame().expect("msg frame").start_paddr();
+    let stack_frame = mm::allocate_frame().expect("stack frame").start_paddr();
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), (code_frame + off) as *mut u8, code.len());
+        core::ptr::copy_nonoverlapping(msg.as_ptr(), (msg_frame + off) as *mut u8, msg.len());
+    }
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+    us.map_user(
+        VirtAddr::new(CODE_ADDR),
+        VirtAddr::new(CODE_ADDR + 0x1000),
+        PageSize::Size4K,
+        PageFlags::empty().writable().executable().user(),
+        &[code_frame],
+    )
+    .expect("map code");
+    us.map_user(
+        VirtAddr::new(MSG_ADDR),
+        VirtAddr::new(MSG_ADDR + 0x1000),
+        PageSize::Size4K,
+        PageFlags::empty().writable().user(),
+        &[msg_frame],
+    )
+    .expect("map msg");
+    us.map_user(
+        VirtAddr::new(STACK_TOP - 0x1000),
+        VirtAddr::new(STACK_TOP),
+        PageSize::Size4K,
+        PageFlags::empty().writable().user(),
+        &[stack_frame],
+    )
+    .expect("map stack");
+    (us, code_frame)
+}
+
+/// C7.1/#7 E2E：真实父子进程 waitpid 全链路（停机验收，永不返回）。
+///
+/// 编排（确定性单遍）：先 spawn **子**进程（`sleep 500ms` → `exit(42)`），
+/// 再 spawn **父**进程（`waitpid(child)`）。调度器从子进程启动；子进程在
+/// 睡眠中被 LAPIC tick 抢占切换，父进程得以执行 `SYS_TASK_WAIT` 并真阻塞；
+/// 子进程睡醒 `exit(42)` 时内核把 42 写入父保存帧 rax 并唤醒父；父恢复后
+/// 校验 `rax==42`，成功则向串口输出 `*`（ASCII 42 —— 退出码逐字节可见），
+/// 最后 `exit(0)` 进入 idle。
+///
+/// 日志验收锚点：`[test-waitpid-e2e]` setup 行、子 `[syscall] ... exit(code=42)`、
+/// 串口字符 `*`、父 `[syscall] ... exit(code=0)`；全程无 PANIC/assert。
+#[cfg(feature = "kernel-test-waitpid")]
+pub fn test_waitpid_e2e() {
+    use task::{spawn_with_ppid, start};
+    use usermode_waitpid::*;
+
+    info!("[test-waitpid-e2e] === C7.1/#7: real parent-child waitpid chain ===");
+    info!(
+        "[test-waitpid-e2e] plan: child sleeps {}ms then exit(42); parent blocks on waitpid",
+        CHILD_SLEEP_NS / 1_000_000
+    );
+
+    // 先 spawn 父进程（ppid=0，内核根）拿到确定 pid；再 spawn **子**进程并
+    // 登记真实 ppid —— 父子关系是 waitpid 的前提（此前装配误将两者都设为
+    // ppid=0，waitpid 如实返回 NotFound，恰好端到端验证了错误路径）。
+    // 就绪队列顺序 [parent, child]：调度器从父进程启动，其第一条指令即
+    // SYS_TASK_WAIT 阻塞登记（此时子进程已在表中、未退出），切到子进程；
+    // 子进程睡眠中被 tick 抢占/睡醒 exit(42) 时交付退出码并唤醒父进程。
+    let (parent_us, parent_code_pa) = waitpid_build_space(&waitpid_parent_code(0), MSG);
+    let parent_pid = spawn_with_ppid(0, CODE_ADDR, STACK_TOP, parent_us).expect("spawn e2e parent");
+    let (child_us, _child_code_pa) = waitpid_build_space(&waitpid_child_code(CHILD_SLEEP_NS), b"C");
+    let child_pid =
+        spawn_with_ppid(parent_pid, CODE_ADDR, STACK_TOP, child_us).expect("spawn e2e child");
+    assert_ne!(parent_pid, child_pid, "pids must differ");
+    // 回填父进程代码页内的 child_pid 立即数：mov rdi 的 imm64 位于固定
+    // 偏移 12（mov rax,0x32 占 10 字节 + mov rdi 操作码 2 字节），小端。
+    // 偏移 12 非 8 字节对齐，须用 write_unaligned；代码页尚未执行，
+    // 经 HHDM 直写物理帧安全。
+    {
+        let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+        const RDI_IMM_OFFSET: u64 = 12;
+        unsafe {
+            let p = (parent_code_pa + off + RDI_IMM_OFFSET) as *mut u64;
+            core::ptr::write_unaligned(p, child_pid as u64);
+        }
+    }
+    info!(
+        "[test-waitpid-e2e] child pid={} (sleep->exit 42), parent pid={} (waitpid->verify 42)",
+        child_pid, parent_pid
+    );
+
+    start(); // 永不返回
 }
