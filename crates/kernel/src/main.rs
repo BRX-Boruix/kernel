@@ -288,6 +288,8 @@ unsafe fn kmain_body() -> ! {
     tests::test_vfs_m65();
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_hub_m72();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_ata_tail_probe();
 
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]

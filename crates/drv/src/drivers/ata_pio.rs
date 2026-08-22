@@ -42,7 +42,9 @@ fn status_read() -> u8 {
 }
 
 fn wait_not_busy() -> bool {
-    for _ in 0..10_000 {
+    // 预算依据：每次轮询是一次 VM exit 级 inb；QEMU 对冷文件首次回写
+    // （新建镜像首启）可能超过 1 万次窗口，20 万次给出数百毫秒上限。
+    for _ in 0..200_000 {
         let s = status_read();
         if s == 0xFF {
             return false;
@@ -113,15 +115,31 @@ pub fn identify_ata() -> Option<u64> {
 }
 
 fn ata_read_sector(lba: u64, out: &mut [u8; 512]) -> bool {
-    for _ in 0..3 {
+    for attempt in 0..3 {
         if !wait_not_busy() {
+            klib::error!(
+                "[ata_pio] read lba={} attempt={} failed: device stuck BSY (10k polls)",
+                lba,
+                attempt
+            );
             continue;
         }
         select_drive_lba(lba);
         set_lba_regs(lba, 1);
         outb(ATA_COMMAND, ATA_CMD_READ_SECTORS);
         let st = status_read();
-        if st == 0xFF || (st & ATA_SR_ERR) != 0 || (st & ATA_SR_DF) != 0 || !wait_drq() {
+        let drq_ok = wait_drq();
+        if st == 0xFF || (st & ATA_SR_ERR) != 0 || (st & ATA_SR_DF) != 0 || !drq_ok {
+            // 失败诊断：status 原值 + 各标志位拆解（ERR=0x01 DF=0x20 DRQ=0x08）。
+            klib::error!(
+                "[ata_pio] read lba={} attempt={} failed: status={:#04x} err={} df={} drq_wait={}",
+                lba,
+                attempt,
+                st,
+                st & ATA_SR_ERR != 0,
+                st & ATA_SR_DF != 0,
+                drq_ok
+            );
             continue;
         }
         for i in 0..256 {
@@ -149,10 +167,28 @@ fn ata_write_sector(lba: u64, data: &[u8; 512]) -> bool {
             let word = (data[i * 2] as u16) | ((data[i * 2 + 1] as u16) << 8);
             outw(ATA_DATA, word);
         }
+        // 完成等待：最后一个数据字写出后，设备置 BSY 把缓冲落盘
+        // （QEMU 经异步下半区提交宿主文件）。必须等到命令真正结束再返回，
+        // 否则紧随其后的读命令会在 BSY 上撞车——这正是“末端 LBA 读返回 0”
+        // 的真实根因：与 LBA 位置无关，任何写后立即读都可能触发。
+        if !wait_not_busy() {
+            klib::error!(
+                "[ata_pio] write lba={} failed: device stuck BSY after data phase",
+                lba
+            );
+            continue;
+        }
         let st = status_read();
         if (st & ATA_SR_ERR) == 0 && (st & ATA_SR_DF) == 0 {
             return true;
         }
+        klib::error!(
+            "[ata_pio] write lba={} failed: status={:#04x} err={} df={}",
+            lba,
+            st,
+            st & ATA_SR_ERR != 0,
+            st & ATA_SR_DF != 0
+        );
     }
     false
 }

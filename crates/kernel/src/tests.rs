@@ -3303,6 +3303,53 @@ pub fn test_driver_hub_m72() {
 /// 7. waiting_for 独占期间通用 wake 必须无效（防提前唤醒带占位 rax 返回）；
 /// 8. 阻塞拒绝：无其他有效就绪进程时回滚登记并如实返回 WouldBlock（防自锁）。
 #[cfg(feature = "kernel-tests")]
+/// 末端 LBA 读诊断探针（kernel-tests 专用，调查 QEMU IDE 尾扇区读返回 0）。
+pub fn test_ata_tail_probe() {
+    info!("[test-ata-tail-probe] === ATA tail LBA diagnosis ===");
+    let count = drv::DriverHub::device_count();
+    let mut found = None;
+    for i in 0..count {
+        if let Some(info) = drv::DriverHub::device_info_at(i) {
+            if info.name == "ata0" {
+                found = Some(i);
+                break;
+            }
+        }
+    }
+    let Some(idx) = found else {
+        info!("[test-ata-tail-probe] no hardware ata0 present; skipped");
+        return;
+    };
+    let Some(dev) = drv::DriverHub::device_at(idx) else {
+        return;
+    };
+    let total = dev.size().expect("ata size known") / 512;
+    info!(
+        "[test-ata-tail-probe] total_sectors={} probing mid + last three",
+        total
+    );
+    for (label, lba) in [
+        ("mid", total / 2),
+        ("total-3", total - 3),
+        ("total-2", total - 2),
+        ("tail", total - 1),
+    ] {
+        let off = lba * 512;
+        let mut wbuf = [0u8; 512];
+        let marker = (lba as u32) | 0x5A000000;
+        wbuf[0..4].copy_from_slice(&marker.to_le_bytes());
+        let wn = dev.write_at(off, &wbuf);
+        let mut rbuf = [0u8; 512];
+        let rn = dev.read_at(off, &mut rbuf);
+        let ok = rn == 512 && rbuf[0..4] == wbuf[0..4];
+        info!(
+            "[test-ata-tail-probe] lba={} ({}) write={} read={} match={}",
+            lba, label, wn, rn, ok
+        );
+    }
+    info!("[test-ata-tail-probe] done");
+}
+
 pub fn test_waitpid_core() {
     use klib::error::Error;
     use task::TaskState;
