@@ -43,6 +43,15 @@ name = "flanterm_rust"
 version = "0.1.0"
 
 [[package]]
+name = "fs"
+version = "0.1.0"
+dependencies = [
+ "klib",
+ "spin",
+ "vfs",
+]
+
+[[package]]
 name = "ipc"
 version = "0.1.0"
 dependencies = [

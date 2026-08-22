@@ -2862,14 +2862,17 @@ pub fn test_driver_hub_m72() {
                     let ata_stats = ata_io.io_stats().expect("ata must expose real io stats");
                     let aw0 = ata_stats.sectors_written();
                     let ar0 = ata_stats.sectors_read();
+                    // C13.1 排雷：LBA0 是 MBR 保留区，块设备读写自检必须使用
+                    // 设备尾部 scratch 扇区（两种身份均满足 size>=64KiB）。
+                    let scratch_off = dev.size().expect("ata size known") - 512;
                     let mut test_buf = [0u8; 512];
                     test_buf[0..4].copy_from_slice(b"BRX!");
-                    let written = dev.write_at(0, &test_buf);
-                    assert_eq!(written, 512, "ata write_at sector 0");
+                    let written = dev.write_at(scratch_off, &test_buf);
+                    assert_eq!(written, 512, "ata write_at scratch sector");
                     let mut read_buf = [0u8; 512];
-                    let read_n = dev.read_at(0, &mut read_buf);
-                    assert_eq!(read_n, 512, "ata read_at sector 0");
-                    assert_eq!(&read_buf[0..4], b"BRX!", "ata sector 0 content match");
+                    let read_n = dev.read_at(scratch_off, &mut read_buf);
+                    assert_eq!(read_n, 512, "ata read_at scratch sector");
+                    assert_eq!(&read_buf[0..4], b"BRX!", "ata scratch sector content match");
                     assert_eq!(
                         ata_stats.sectors_written(),
                         aw0 + 1,
