@@ -42,6 +42,9 @@ const KSTACK_SIZE: usize = 65536;
 /// 内核栈分配阶：2^4 = 16 帧。
 const KSTACK_ORDER: usize = 4;
 
+/// PCB 内保存的进程名上限；与 shell/ELF 路径缓冲无关，超长名在创建时明确拒绝。
+const PROCESS_NAME_MAX: usize = 63;
+
 /// 用户态段选择子（RPL=3），对齐 process.rs 的 launch 约定。
 const UCODE_RPL3: u16 = arch_x86_64::gdt::UCODE | 3;
 const UDATA_RPL3: u16 = arch_x86_64::gdt::UDATA | 3;
@@ -70,6 +73,10 @@ struct ProcEntry {
     saved: InterruptFrame,
     /// 独立内核栈顶（TSS.RSP0；该进程用户态中断进入内核时切到此栈）。
     kstack_top: u64,
+    /// 真实可执行程序名的 UTF-8 字节（固定容量，避免 PCB 额外堆分配）。
+    name: [u8; PROCESS_NAME_MAX],
+    /// `name` 中有效字节数。
+    name_len: u8,
     /// 父进程 pid（C7.1）。`0` = 内核直接创建（无父；如 init、内核测试根进程）。
     /// pid 不复用（`next_pid` 单调递增），故父 pid 恒可用作槽位索引。
     ppid: usize,
@@ -146,22 +153,40 @@ fn initial_frame(entry_rip: u64, user_stack_top: u64) -> InterruptFrame {
 /// "启动帧"（供首次调度从 saved 恢复）。返回 pid。内核直接创建的进程无父
 /// （`ppid = 0`）；由用户进程派生的子进程须走 [`spawn_with_ppid`]。
 pub fn spawn(
+    name: &str,
     entry_rip: u64,
     user_stack_top: u64,
     addr_space: UserAddressSpace<X86PageTable>,
 ) -> Result<usize, Error> {
-    spawn_with_ppid(0, entry_rip, user_stack_top, addr_space)
+    spawn_with_ppid(0, name, entry_rip, user_stack_top, addr_space)
 }
 
-/// 创建一个进程并登记其父进程（C7.1 父子关系单点）。
+/// 校验并拷贝程序名进定长 PCB 缓冲。
 ///
-/// `ppid` 为父进程 pid；`0` 表示内核直创（无收尸人，退出即回收）。
+/// 空名、超长名或非法 UTF-8 一律拒绝——PCB 不允许出现占位名或被截断的假名。
+fn store_name(name: &str) -> Result<([u8; PROCESS_NAME_MAX], u8), Error> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > PROCESS_NAME_MAX || core::str::from_utf8(bytes).is_err() {
+        return Err(Error::InvalidParam);
+    }
+    let mut buf = [0u8; PROCESS_NAME_MAX];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    Ok((buf, bytes.len() as u8))
+}
+
+/// 创建一个进程并登记其父进程与真实程序名（C7.1 父子关系 + C1.1 名称单点）。
+///
+/// `ppid` 为父进程 pid；`0` 表示内核直创（无收尸人，退出即回收）。`name`
+/// 必须是调用方提供的真实可执行程序名（如 `init.elf`、`shell.elf`），
+/// ProcFS 直接展示该值，不再按 pid 推断。
 pub fn spawn_with_ppid(
     ppid: usize,
+    name: &str,
     entry_rip: u64,
     user_stack_top: u64,
     addr_space: UserAddressSpace<X86PageTable>,
 ) -> Result<usize, Error> {
+    let (name_buf, name_len) = store_name(name)?;
     let mut s = SCHED.lock();
     // 父必须真实存在且非 zombie，否则拒绝建立虚假父子关系（零伪数据）。
     if ppid != 0 {
@@ -188,6 +213,8 @@ pub fn spawn_with_ppid(
         proc,
         saved: initial_frame(entry_rip, user_stack_top),
         kstack_top,
+        name: name_buf,
+        name_len,
         ppid,
         exit_code: 0,
         waiting_for: None,
@@ -818,6 +845,12 @@ pub fn ps_snapshot(buf: *mut u8, cap: usize) -> usize {
     n
 }
 
+/// 从 PCB 定长缓冲还原程序名（`&str` 生命周期绑定槽位锁）。
+fn entry_name(entry: &ProcEntry) -> &str {
+    // store_name 只接受合法 UTF-8，故此处解码不可能失败。
+    core::str::from_utf8(&entry.name[..entry.name_len as usize]).unwrap_or("?")
+}
+
 /// 收集所有存活进程的快照列表（供 ProcFS 使用）。
 pub fn process_snapshots() -> Vec<vfs::ProcessSnapshot> {
     let s = SCHED.lock();
@@ -834,19 +867,12 @@ pub fn process_snapshots() -> Vec<vfs::ProcessSnapshot> {
                 TaskState::Blocked => "Blocked",
                 TaskState::Exit => "Exit",
             };
-            let name = if pid == 1 {
-                alloc::string::String::from("init")
-            } else if pid == 2 {
-                alloc::string::String::from("shell")
-            } else {
-                alloc::format!("proc-{}", pid)
-            };
             list.push(vfs::ProcessSnapshot {
                 pid,
-                name,
+                name: alloc::string::String::from(entry_name(e)),
                 state: alloc::string::String::from(state_str),
-                memory_bytes: 65536, // 预设/统计页表映射
-                threads: 1,
+                // C1.2：真实记账值来自该进程地址空间的区域账本，O(区域数)。
+                memory_bytes: e.proc.addr_space().used_bytes(),
             });
         }
     }
@@ -866,19 +892,11 @@ pub fn get_process_snapshot(pid: usize) -> Option<vfs::ProcessSnapshot> {
         TaskState::Blocked => "Blocked",
         TaskState::Exit => "Exit",
     };
-    let name = if pid == 1 {
-        alloc::string::String::from("init")
-    } else if pid == 2 {
-        alloc::string::String::from("shell")
-    } else {
-        alloc::format!("proc-{}", pid)
-    };
     Some(vfs::ProcessSnapshot {
         pid,
-        name,
+        name: alloc::string::String::from(entry_name(entry)),
         state: alloc::string::String::from(state_str),
-        memory_bytes: 65536,
-        threads: 1,
+        memory_bytes: entry.proc.addr_space().used_bytes(),
     })
 }
 
@@ -988,19 +1006,32 @@ pub fn start() -> ! {
 pub mod test_hooks {
     use super::*;
 
-    /// 以 `ppid` 创建测试进程（哑入口/栈，永不被调度执行——就绪队列项在
+    /// 以 `ppid` 创建指定名称的测试进程（哑入口/栈，永不被调度执行——就绪队列项在
     /// probe/清理前不会被消费，因为内核主线程不跑 `scheduler::start`）。
-    pub fn spawn_child_of(ppid: usize) -> Result<usize, Error> {
-        spawn_with_ppid(ppid, 0x1000, 0x5000, dummy_space()?)
+    pub fn spawn_named_child_of(ppid: usize, name: &str) -> Result<usize, Error> {
+        spawn_with_ppid(ppid, name, 0x1000, 0x5000, dummy_space()?)
     }
 
-    /// 进程状态探针：(状态, waiting_for, saved.rax)。
-    pub fn probe(pid: usize) -> Option<(TaskState, Option<usize>, u64)> {
+    /// 进程状态探针：(状态, 名称, waiting_for, saved.rax)。名称为 PCB 缓冲拷贝。
+    pub fn probe(pid: usize) -> Option<(TaskState, alloc::string::String, Option<usize>, u64)> {
+        let s = SCHED.lock();
+        s.procs.get(pid).and_then(|p| p.as_ref()).map(|e| {
+            (
+                e.proc.state(),
+                alloc::string::String::from(entry_name(e)),
+                e.waiting_for,
+                e.saved.rax,
+            )
+        })
+    }
+
+    /// 真实内存记账探针（C1.2 验收用）：返回该进程地址空间 used_bytes()。
+    pub fn probe_memory_bytes(pid: usize) -> Option<u64> {
         let s = SCHED.lock();
         s.procs
             .get(pid)
             .and_then(|p| p.as_ref())
-            .map(|e| (e.proc.state(), e.waiting_for, e.saved.rax))
+            .map(|e| e.proc.addr_space().used_bytes())
     }
 
     /// 终止 `pid`（真实核心路径），返回终止分支名（测试断言用）。

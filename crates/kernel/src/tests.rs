@@ -978,7 +978,7 @@ pub fn test_scheduler() {
             &[stack_frame],
         )
         .expect("map stack");
-        let pid = scheduler::spawn(CODE_ADDR, STACK_TOP, us).expect("scheduler spawn");
+        let pid = scheduler::spawn("sched.elf", CODE_ADDR, STACK_TOP, us).expect("scheduler spawn");
         info!("[sched-test] spawned pid={} tag={}", pid, ch as char);
     }
 
@@ -1202,11 +1202,11 @@ pub fn test_ipc() {
     info!("[ipc-test] === M5: shared memory + pipe ===");
 
     // ---- 1. 共享内存 ----
-    let shm_id = crate::ipc::shm_create(0x1000).expect("shm_create");
+    let shm_id = ipc::shm_create(0x1000).expect("shm_create");
     let mut as_a = UserAddressSpace::<X86PageTable>::new().expect("addr space a");
     let mut as_b = UserAddressSpace::<X86PageTable>::new().expect("addr space b");
-    let va = crate::ipc::shm_map(shm_id, &mut as_a).expect("shm_map a");
-    let vb = crate::ipc::shm_map(shm_id, &mut as_b).expect("shm_map b");
+    let va = ipc::shm_map(shm_id, &mut as_a).expect("shm_map a");
+    let vb = ipc::shm_map(shm_id, &mut as_b).expect("shm_map b");
     // 两地址空间映射到同一物理帧（共享）。
     let phys_a = as_a
         .translate(VirtAddr::new(va))
@@ -1229,13 +1229,13 @@ pub fn test_ipc() {
     let seen = unsafe { core::ptr::read_volatile((phys_b + off) as *const u64) };
     assert_eq!(seen, 0x1234_ABCDu64, "write via A visible via B");
     // A 解映射后，B 仍可访问（帧归 shm 对象，不是 A）。
-    crate::ipc::shm_unmap(shm_id, &mut as_a).expect("shm_unmap a");
+    ipc::shm_unmap(shm_id, &mut as_a).expect("shm_unmap a");
     let seen2 = unsafe { core::ptr::read_volatile((phys_b + off) as *const u64) };
     assert_eq!(seen2, 0x1234_ABCDu64, "frame alive after A unmaps");
     info!("[ipc-test] shm shared write/read + refcount unmap OK");
 
     // ---- 2. 管道（数据流 + 非死锁） ----
-    let pipe_id = crate::ipc::pipe_create().expect("pipe_create");
+    let pipe_id = ipc::pipe_create().expect("pipe_create");
     let mut frame = arch_x86_64::interrupts::InterruptFrame {
         r15: 0,
         r14: 0,
@@ -1263,11 +1263,11 @@ pub fn test_ipc() {
     let mut src = [0u8; 8];
     src[..5].copy_from_slice(b"hello");
     let n =
-        crate::ipc::pipe_write(&mut frame, pipe_id, src.as_ptr() as u64, 5).expect("pipe_write");
+        ipc::pipe_write(&mut frame, pipe_id, src.as_ptr() as u64, 5).expect("pipe_write");
     assert_eq!(n, 5, "wrote 5 bytes");
     let mut dst = [0u8; 8];
     let n =
-        crate::ipc::pipe_read(&mut frame, pipe_id, dst.as_mut_ptr() as u64, 8).expect("pipe_read");
+        ipc::pipe_read(&mut frame, pipe_id, dst.as_mut_ptr() as u64, 8).expect("pipe_read");
     assert_eq!(n, 5, "read 5 bytes");
     assert_eq!(&dst[..5], b"hello", "pipe content preserved");
     info!(
@@ -1277,13 +1277,13 @@ pub fn test_ipc() {
         core::str::from_utf8(&dst[..5]).unwrap()
     );
     // 空管道读：无数据、无进程可阻塞 → WouldBlock（不死锁）。
-    let e = crate::ipc::pipe_read(&mut frame, pipe_id, dst.as_mut_ptr() as u64, 4).unwrap_err();
+    let e = ipc::pipe_read(&mut frame, pipe_id, dst.as_mut_ptr() as u64, 4).unwrap_err();
     assert_eq!(
         e,
         klib::error::Error::WouldBlock,
         "empty pipe read -> WouldBlock"
     );
-    crate::ipc::pipe_close(pipe_id).expect("pipe_close");
+    ipc::pipe_close(pipe_id).expect("pipe_close");
     info!("[ipc-test] PASS");
 }
 
@@ -2033,7 +2033,7 @@ pub fn test_elf_loader() {
         loaded.entry, loaded.user_stack_top
     );
 
-    let pid = scheduler::spawn(loaded.entry, loaded.user_stack_top, us).expect("spawn");
+    let pid = scheduler::spawn("elf-test.elf", loaded.entry, loaded.user_stack_top, us).expect("spawn");
     info!("[elf-test] spawned pid={} from ELF", pid);
 
     // 启动调度器（永不返回：用户程序 write 后 exit 停机）。
@@ -2070,7 +2070,7 @@ pub fn test_userspace_elf() {
         loaded.entry, loaded.user_stack_top
     );
 
-    let pid = scheduler::spawn(loaded.entry, loaded.user_stack_top, us).expect("spawn");
+    let pid = scheduler::spawn("init.elf", loaded.entry, loaded.user_stack_top, us).expect("spawn");
     info!("[userspace] spawned pid={} from init.elf", pid);
 
     // 启动调度器（永不返回：init 打印信息后 exit 停机）。
@@ -2445,6 +2445,14 @@ pub fn test_vfs_m63() {
         .expect("read /processes/list");
     let s1 = core::str::from_utf8(&buf[..n1]).expect("utf8 /processes/list");
     assert!(s1.starts_with('['), "process list must be a JSON array");
+    // #2：内核无线程概念，ProcFS 不得再对外报告 threads 字段，也不得出现
+    // 预设 65536 假内存。真实 init 进程此时可能尚未 spawn，故名称断言放在
+    // start_init 之后的 init 用户态日志链路验证（见 kmain/init 输出）。
+    assert!(!s1.contains("threads"), "threads field must be gone");
+    assert!(
+        !s1.contains(r#""memory_bytes":65536"#),
+        "fake constant memory must be gone"
+    );
     info!("[test-vfs-m63] /processes/list JSON output: {}", s1.trim());
 
     // 2. SysFS 验证 (/system/cpu, /system/memory, /system/kernel)
@@ -3109,15 +3117,34 @@ pub fn test_waitpid_core() {
     arch_x86_64::interrupts::disable();
 
     // ---- 1. 建立父子关系 + 对抗参数 ----
-    let root = th::spawn_child_of(0).expect("spawn root");
-    let child = th::spawn_child_of(root).expect("spawn child");
+    let root = th::spawn_named_child_of(0, "init.elf").expect("spawn root");
+    let child = th::spawn_named_child_of(root, "child.elf").expect("spawn child");
     assert_ne!(root, child, "pids must be distinct");
+    let (_, root_name, _, _) = th::probe(root).expect("root probed");
+    assert_eq!(
+        root_name, "init.elf",
+        "PCB must keep the caller-supplied program name"
+    );
+    assert!(
+        th::spawn_named_child_of(0, "").is_err(),
+        "empty program name must be rejected"
+    );
+    let long_name = alloc::format!("{}x", "n".repeat(63));
+    assert!(
+        th::spawn_named_child_of(0, &long_name).is_err(),
+        "over-long program name must be rejected"
+    );
+    let ok_name = "n".repeat(63);
+    let named_ok = th::spawn_named_child_of(0, &ok_name).expect("63-byte name accepted");
+    let (_, ok_probe_name, _, _) = th::probe(named_ok).expect("named probed");
+    assert_eq!(ok_probe_name, ok_name.as_str());
+    info!("[test-waitpid-core] C1.1 name boundary (empty/64/63) OK");
     assert!(th::probe(child).is_some(), "child must be registered");
     assert!(
         matches!(th::try_reap(root, 999_999), Err(Error::NotFound)),
         "unknown pid must be NotFound"
     );
-    let outsider = th::spawn_child_of(0).expect("spawn outsider");
+    let outsider = th::spawn_named_child_of(0, "t.elf").expect("spawn outsider");
     assert!(
         matches!(th::try_reap(root, outsider), Err(Error::NotFound)),
         "non-child pid must be NotFound"
@@ -3139,8 +3166,9 @@ pub fn test_waitpid_core() {
         "zombie",
         "parent idle: keep zombie"
     );
-    let (st, wf, _) = th::probe(child).expect("zombie probed");
+    let (st, name, wf, _) = th::probe(child).expect("zombie probed");
     assert_eq!(st, TaskState::Exit, "zombie state must be Exit");
+    assert_eq!(name, "child.elf", "zombie keeps its real program name");
     assert_eq!(wf, None, "zombie must not hold wait registration");
     assert_eq!(
         th::try_reap(root, child).ok(),
@@ -3155,8 +3183,8 @@ pub fn test_waitpid_core() {
     info!("[test-waitpid-core] zombie keep/reap/double-reap OK");
 
     // ---- 4. 无父直接回收 ----
-    let p2 = th::spawn_child_of(0).expect("spawn p2");
-    let k1 = th::spawn_child_of(p2).expect("spawn k1");
+    let p2 = th::spawn_named_child_of(0, "t.elf").expect("spawn p2");
+    let k1 = th::spawn_named_child_of(p2, "k1.elf").expect("spawn k1");
     assert_eq!(th::terminate(p2, 0), "reclaimed", "rootless exit reclaims");
     assert!(th::probe(p2).is_none());
     assert_eq!(
@@ -3168,8 +3196,8 @@ pub fn test_waitpid_core() {
     info!("[test-waitpid-core] parentless immediate reclaim OK");
 
     // ---- 5. 孤儿级联 ----
-    let g = th::spawn_child_of(0).expect("spawn g");
-    let z = th::spawn_child_of(g).expect("spawn z");
+    let g = th::spawn_named_child_of(0, "t.elf").expect("spawn g");
+    let z = th::spawn_named_child_of(g, "z.elf").expect("spawn z");
     assert_eq!(th::terminate(z, 5), "zombie");
     assert_eq!(th::terminate(g, 3), "reclaimed");
     assert!(th::probe(g).is_none());
@@ -3177,23 +3205,24 @@ pub fn test_waitpid_core() {
     info!("[test-waitpid-core] orphan zombie cascade OK");
 
     // ---- 6. 阻塞登记与交付 ----
-    let pa = th::spawn_child_of(0).expect("spawn pa");
-    let kid = th::spawn_child_of(pa).expect("spawn kid");
+    let pa = th::spawn_named_child_of(0, "t.elf").expect("spawn pa");
+    let kid = th::spawn_named_child_of(pa, "kid.elf").expect("spawn kid");
     assert!(
         matches!(th::block_on_child(pa, kid), Ok(task::Waited::Blocked)),
         "block registers and reports Blocked"
     );
-    let (st, wf, _) = th::probe(pa).expect("blocked parent probed");
+    let (st, name, wf, _) = th::probe(pa).expect("blocked parent probed");
     assert_eq!(st, TaskState::Blocked);
     assert_eq!(wf, Some(kid));
+    assert!(!name.is_empty(), "blocked parent keeps its name");
     // waiting_for 独占期间通用唤醒无效：
     task::wake(pa);
-    let (st2, wf2, _) = th::probe(pa).expect("still probed");
+    let (st2, _, wf2, _) = th::probe(pa).expect("still probed");
     assert_eq!(st2, TaskState::Blocked, "generic wake must not fire waiter");
     assert_eq!(wf2, Some(kid));
     assert_eq!(th::terminate(kid, 99), "delivered", "wake+deliver on exit");
     assert!(th::probe(kid).is_none(), "delivery reaps child immediately");
-    let (st3, wf3, rax3) = th::probe(pa).expect("delivered parent probed");
+    let (st3, _, wf3, rax3) = th::probe(pa).expect("delivered parent probed");
     assert_eq!(st3, TaskState::Ready, "parent must be schedulable again");
     assert_eq!(wf3, None, "wait registration must be cleared");
     assert_eq!(rax3, 99, "exit code must land in parent saved rax");
@@ -3201,31 +3230,53 @@ pub fn test_waitpid_core() {
 
     // ---- 7. 64 位退出码逐字节交付 ----
     const BIG: u64 = 0xDEAD_BEEF_CAFE_0001;
-    let pc = th::spawn_child_of(0).expect("spawn pc");
-    let kd = th::spawn_child_of(pc).expect("spawn kd");
+    let pc = th::spawn_named_child_of(0, "t.elf").expect("spawn pc");
+    let kd = th::spawn_named_child_of(pc, "kd.elf").expect("spawn kd");
     assert!(matches!(
         th::block_on_child(pc, kd),
         Ok(task::Waited::Blocked)
     ));
     assert_eq!(th::terminate(kd, BIG), "delivered");
-    let (_, _, rax4) = th::probe(pc).expect("pc probed");
+    let (_, _, _, rax4) = th::probe(pc).expect("pc probed");
     assert_eq!(rax4, BIG, "u64 exit code must be byte-exact");
     info!("[test-waitpid-core] 64-bit byte-exact delivery OK");
 
     // ---- 8. 阻塞拒绝路径（无其他就绪进程 → 回滚 + WouldBlock）----
     th::reset_all();
-    let ph = th::spawn_child_of(0).expect("spawn ph");
-    let kh = th::spawn_child_of(ph).expect("spawn kh");
+    let ph = th::spawn_named_child_of(0, "t.elf").expect("spawn ph");
+    let kh = th::spawn_named_child_of(ph, "kh.elf").expect("spawn kh");
     // 让唯一的其他进程进入与 waitpid 无关的阻塞（如等键盘），使父无可切。
     assert!(th::simulate_blocked(kh), "kh must become Blocked");
     assert!(
         matches!(th::block_on_child(ph, kh), Err(Error::WouldBlock)),
         "blocking with no runnable peer must honestly refuse"
     );
-    let (st5, wf5, _) = th::probe(ph).expect("ph probed after refusal");
+    let (st5, _, wf5, _) = th::probe(ph).expect("ph probed after refusal");
     assert_eq!(st5, TaskState::Running, "refusal must restore Running");
     assert_eq!(wf5, None, "refusal must clear registration");
     info!("[test-waitpid-core] deadlock-refusal (WouldBlock) OK");
+
+    // ---- 9. C1.2：快照内存值 = 地址空间区域账本 ----
+    // dummy_space() 映射 1 页 4K；快照必须等于该真实记账而非任何预设常量。
+    let mem_root = th::spawn_named_child_of(0, "mem.elf").expect("spawn mem root");
+    let expected = 4096u64;
+    assert_eq!(
+        th::probe_memory_bytes(mem_root),
+        Some(expected),
+        "snapshot memory must equal used_bytes of the address space"
+    );
+    let snaps = task::process_snapshots();
+    let snap = snaps.iter().find(|s| s.pid == mem_root).expect("snapshot found");
+    assert_eq!(
+        snap.memory_bytes, expected,
+        "ProcFS snapshot must carry the real accounting"
+    );
+    assert_eq!(snap.name, "mem.elf");
+    assert_eq!(
+        task::get_process_snapshot(mem_root).map(|s| s.memory_bytes),
+        Some(expected)
+    );
+    info!("[test-waitpid-core] C1.2 real memory accounting OK");
 
     // ---- 清场：不留测试进程（next_pid 保持单调即可）----
     let cleared = th::reset_all();
@@ -3423,10 +3474,12 @@ pub fn test_waitpid_e2e() {
     // SYS_TASK_WAIT 阻塞登记（此时子进程已在表中、未退出），切到子进程；
     // 子进程睡眠中被 tick 抢占/睡醒 exit(42) 时交付退出码并唤醒父进程。
     let (parent_us, parent_code_pa) = waitpid_build_space(&waitpid_parent_code(0), MSG);
-    let parent_pid = spawn_with_ppid(0, CODE_ADDR, STACK_TOP, parent_us).expect("spawn e2e parent");
+    let parent_pid = spawn_with_ppid(0, "e2e-parent.elf", CODE_ADDR, STACK_TOP, parent_us)
+        .expect("spawn e2e parent");
     let (child_us, _child_code_pa) = waitpid_build_space(&waitpid_child_code(CHILD_SLEEP_NS), b"C");
     let child_pid =
-        spawn_with_ppid(parent_pid, CODE_ADDR, STACK_TOP, child_us).expect("spawn e2e child");
+        spawn_with_ppid(parent_pid, "e2e-child.elf", CODE_ADDR, STACK_TOP, child_us)
+            .expect("spawn e2e child");
     assert_ne!(parent_pid, child_pid, "pids must differ");
     // 回填父进程代码页内的 child_pid 立即数：mov rdi 的 imm64 位于固定
     // 偏移 12（mov rax,0x32 占 10 字节 + mov rdi 操作码 2 字节），小端。

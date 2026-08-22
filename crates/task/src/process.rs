@@ -181,9 +181,7 @@ impl<PT: PageTable> Process<PT> {
     pub fn context_mut(&mut self) -> &mut TaskContext {
         &mut self.context
     }
-    /// 只读访问用户地址空间。
-    /// 仅 M3.3 停机验收使用，随 `kernel-test-m33` feature 编译。
-    #[cfg(feature = "kernel-test-m33")]
+    /// 只读访问用户地址空间（快照/统计等只读路径使用）。
     pub fn addr_space(&self) -> &UserAddressSpace<PT> {
         &self.addr_space
     }

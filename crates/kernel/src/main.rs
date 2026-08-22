@@ -437,7 +437,7 @@ fn start_init() -> ! {
         "[kmain] init: entry={:#x} stack_top={:#x}",
         loaded.entry, loaded.user_stack_top
     );
-    let pid = match task::spawn(loaded.entry, loaded.user_stack_top, us) {
+    let pid = match task::spawn("init.elf", loaded.entry, loaded.user_stack_top, us) {
         Ok(p) => p,
         Err(e) => {
             error!("[kmain] init: spawn failed: {:?}", e);

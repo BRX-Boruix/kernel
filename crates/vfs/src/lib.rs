@@ -175,17 +175,15 @@ mod tests {
             alloc::vec![
                 ProcessSnapshot {
                     pid: 1,
-                    name: alloc::string::String::from("init"),
+                    name: alloc::string::String::from("init.elf"),
                     state: alloc::string::String::from("Running"),
                     memory_bytes: 65536,
-                    threads: 1,
                 },
                 ProcessSnapshot {
                     pid: 2,
-                    name: alloc::string::String::from("shell"),
+                    name: alloc::string::String::from("shell.elf"),
                     state: alloc::string::String::from("Ready"),
                     memory_bytes: 131072,
-                    threads: 1,
                 },
             ]
         }
@@ -194,10 +192,9 @@ mod tests {
             if pid == 1 {
                 Some(ProcessSnapshot {
                     pid: 1,
-                    name: alloc::string::String::from("init"),
+                    name: alloc::string::String::from("init.elf"),
                     state: alloc::string::String::from("Running"),
                     memory_bytes: 65536,
-                    threads: 1,
                 })
             } else {
                 None
@@ -267,8 +264,10 @@ mod tests {
         let mut buf = [0u8; 512];
         let n = list_file.read_at(0, &mut buf).unwrap();
         let s = core::str::from_utf8(&buf[..n]).unwrap();
-        assert!(s.contains(r#""name":"init""#));
-        assert!(s.contains(r#""name":"shell""#));
+        assert!(s.contains(r#""name":"init.elf""#));
+        assert!(s.contains(r#""name":"shell.elf""#));
+        // #2：内核无线程概念，ProcFS 不得再对外报告 threads 字段。
+        assert!(!s.contains("threads"));
 
         let status_file = mount_table.resolve("/processes/1/status", true).unwrap();
         let n2 = status_file.read_at(0, &mut buf).unwrap();

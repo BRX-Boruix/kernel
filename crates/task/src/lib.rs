@@ -22,4 +22,6 @@ pub use scheduler::{
     process_snapshots, ps_snapshot, spawn, spawn_with_ppid, start, tick, waitpid, wake, wake_kbd,
     yield_now,
 };
+#[cfg(feature = "kernel-tests")]
+pub use scheduler::test_hooks;
 pub use signals::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTERM, signal_for_exception, signal_name};

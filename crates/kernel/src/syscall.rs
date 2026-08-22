@@ -474,6 +474,28 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: usi
         l
     };
     let cmd = &cmd[..cmd_len];
+    // C1.1：程序名取自真实加载来源（VFS 路径末段或内建索引名），非 pid 推断。
+    let prog_name: alloc::string::String = match idx_or_tag {
+        0 => alloc::string::String::from("init.elf"),
+        1 => alloc::string::String::from("shell.elf"),
+        tag if tag < 16 => alloc::format!("program-{tag}"),
+        _ => {
+            // 路径字符串模式：idx_or_tag 即用户态路径指针。
+            let path = match copy_path_from_user(idx_or_tag as u64, 4096) {
+                Ok(p) => p,
+                Err(e) => return pack_err(e),
+            };
+            let trimmed = path.trim_end_matches('\0');
+            let last = trimmed
+                .rsplit('/')
+                .find(|seg| !seg.is_empty())
+                .unwrap_or(trimmed);
+            if last.is_empty() || last.len() > 63 {
+                return pack_err(Error::InvalidParam);
+            }
+            alloc::string::String::from(last)
+        }
+    };
     let Ok(mut us) = mm::user_space::UserAddressSpace::<arch_x86_64::paging::X86PageTable>::new()
     else {
         return pack_err(Error::OutOfMemory);
@@ -485,11 +507,11 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: usi
     // exec 派生的是**当前调用进程的子进程**（C7.1）：登记真实 ppid，
     // 使 waitpid/退出码交付对 shell 前台等待等场景成立。
     let parent_pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
-    match task::spawn_with_ppid(parent_pid, loaded.entry, loaded.user_stack_top, us) {
+    match task::spawn_with_ppid(parent_pid, &prog_name, loaded.entry, loaded.user_stack_top, us) {
         Ok(pid) => {
             klib::info!(
                 "[syscall] exec prog={} -> pid={} (ppid={}) entry={:#x}",
-                idx_or_tag,
+                prog_name,
                 pid,
                 parent_pid,
                 loaded.entry

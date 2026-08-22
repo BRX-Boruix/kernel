@@ -242,6 +242,19 @@ where
         self.pt.paddr()
     }
 
+    /// 已声明用户虚拟区域的总字节数（O(区域数)）。
+    ///
+    /// 这是地址空间的唯一进程内存统计来源：固定 ELF/栈映射与尚未 fault-in 的
+    /// 堆、匿名 mmap 预留区都按其声明范围计入；已 `munmap` 的范围已从 `areas`
+    /// 移除，因而不会残留在统计中。共享内存拥有独立对象生命周期，不属于此账本。
+    pub fn used_bytes(&self) -> u64 {
+        self.areas
+            .lock()
+            .iter()
+            .map(|area| area.end.as_u64() - area.start.as_u64())
+            .sum()
+    }
+
     /// 已声明的用户区域数（诊断用）。
     pub fn area_count(&self) -> usize {
         self.areas.lock().len()
