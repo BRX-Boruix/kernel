@@ -359,7 +359,7 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                 o.end()
             })
             .expect("Vec-backed display mode JSON serialization cannot fail");
-        let mut s = target
+        let s = target
             .into_string()
             .expect("display mode JSON keys are ASCII");
         // 行尾换行由 DevFS 读取闭包统一追加（单点契约，审计 #9）——

@@ -3,8 +3,15 @@ name = "loader"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# 用户地址空间装载后端：接入 arch/mm 的帧分配、HHDM 与页表映射。
+# 默认关闭——host 单测（`cargo test -p loader`）只编译纯 ELF 解析/段规划
+# 层（LA4 测试化的结构前提：裸机依赖不进 host 构建图）；内核启用本
+# feature 获得完整的 `load` 入口。
+user-space = ["dep:mm", "dep:arch", "dep:arch-x86_64"]
+
 [dependencies]
 klib = { path = "../klib" }
-arch = { path = "../arch/arch" }
-arch-x86_64 = { path = "../arch/arch-x86_64" }
-mm = { path = "../mm" }
+arch = { path = "../arch/arch", optional = true }
+arch-x86_64 = { path = "../arch/arch-x86_64", optional = true }
+mm = { path = "../mm", optional = true }

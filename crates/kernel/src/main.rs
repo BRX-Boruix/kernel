@@ -380,6 +380,11 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();
 
+    // loader1/LA4：ELF 加载器恶意镜像拒绝面对抗自检（纯加载验证，不 spawn，
+    // 返回主流程继续启动；放在 SMP 之前保持单核确定性）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_loader_adversarial();
+
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。
     mm::frame_allocator::set_cpu_id_reader(|| {

@@ -3413,7 +3413,7 @@ pub fn test_vfs_m65() {
     let big_node = root
         .create_file(big_path, Permissions::read_write())
         .expect("create big file");
-    let mut chunk = [0xAAu8; 4096];
+    let chunk = [0xAAu8; 4096];
     for i in 0..4 {
         big_node
             .write_at((i * 4096) as u64, &chunk)
@@ -4100,6 +4100,465 @@ pub fn test_ata_tail_probe() {
         );
     }
     info!("[test-ata-tail-probe] done");
+}
+
+// ---------- loader1/LA4：ELF 加载器对抗输入自检 ----------
+
+/// 对抗用最小 ET_EXEC 骨架的可覆写字段（LA4：单点定义，变体经字段覆写产生，
+/// 禁止为每个用例复制一份构造器）。
+#[derive(Clone, Copy)]
+struct LoaderElfSpec {
+    entry: u64,
+    /// e_phoff 原始值（不做任何修正——对抗变体直接写非法值）。
+    phoff: u64,
+    phnum: u16,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    /// 段 flags（默认 RX；覆写为 RWX 用于 W^X 告警放行语义验证）。
+    p_flags: u32,
+}
+
+impl LoaderElfSpec {
+    /// 合法基线：单 PT_LOAD 段 @0x400000，filesz 跨页边界（bss + 尾页垫零验证面），
+    /// entry 落在段内。
+    const BASE: Self = Self {
+        entry: 0x40_0000,
+        phoff: 64,
+        phnum: 1,
+        p_offset: 120, // EHDR(64) + 1 × PHDR(56)
+        p_vaddr: 0x40_0000,
+        p_filesz: 0x10,
+        p_memsz: 0x1008, // 页尾 [memsz, page_end) 是分配器残留清零验证区（LM2）
+        p_flags: 5,      // PF_R | PF_X
+    };
+}
+
+/// ELF64 头写入器（[`build_loader_elf`] 与 [`build_two_segment_elf`] 的
+/// 单点表头来源，S15：同一定义禁止两份手写副本各自漂移）。
+#[cfg(feature = "kernel-tests")]
+fn push_ehdr(elf: &mut alloc::vec::Vec<u8>, entry: u64, phoff: u64, phnum: u16) {
+    elf.extend_from_slice(&[0x7f, b'E', b'L', b'F']);
+    elf.push(2); // EI_CLASS = ELFCLASS64
+    elf.push(1); // EI_DATA = ELFDATA2LSB
+    elf.push(1); // EI_VERSION
+    elf.extend_from_slice(&[0u8; 9]); // e_ident 其余
+    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    elf.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine = EM_X86_64
+    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    elf.extend_from_slice(&entry.to_le_bytes());
+    elf.extend_from_slice(&phoff.to_le_bytes());
+    elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    elf.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    elf.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    elf.extend_from_slice(&phnum.to_le_bytes());
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+}
+
+/// 单个 PT_LOAD 程序头写入器（消费方同 [`push_ehdr`]）。
+#[cfg(feature = "kernel-tests")]
+fn push_phdr(
+    elf: &mut alloc::vec::Vec<u8>,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_flags: u32,
+) {
+    elf.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    elf.extend_from_slice(&p_flags.to_le_bytes());
+    elf.extend_from_slice(&p_offset.to_le_bytes());
+    elf.extend_from_slice(&p_vaddr.to_le_bytes());
+    elf.extend_from_slice(&0u64.to_le_bytes()); // p_paddr
+    elf.extend_from_slice(&p_filesz.to_le_bytes());
+    elf.extend_from_slice(&p_memsz.to_le_bytes());
+    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+}
+
+/// 按规格组装 ELF64 镜像：头(64B) + 单程序头(56B) + 16 字节 0xA5 段内容。
+/// 头内字段一律取自 spec（含非法值），文件体保持合法形状——保证"只有被测
+/// 字段是变量"。
+#[cfg(feature = "kernel-tests")]
+fn build_loader_elf(spec: &LoaderElfSpec) -> alloc::vec::Vec<u8> {
+    let mut elf = alloc::vec::Vec::new();
+    push_ehdr(&mut elf, spec.entry, spec.phoff, spec.phnum);
+    push_phdr(
+        &mut elf,
+        spec.p_offset,
+        spec.p_vaddr,
+        spec.p_filesz,
+        spec.p_memsz,
+        spec.p_flags,
+    );
+    // 段内容：可辨识的非零字节（拷贝路径验证 + 清零断言的对照面）
+    elf.extend_from_slice(&[0xA5; 16]);
+    elf
+}
+
+/// 组装双 PT_LOAD 镜像（配额越线用例的专属形状）：两段均为 filesz=0 的纯
+/// bss 段，memsz 相同、vaddr 连续。单段镜像在定义上无法跨越**按地址空间
+/// 累计**的区域配额（mm::user_space `MAX_USER_AREA_TOTAL_BYTES`），此形状
+/// 不可由单程序头的 [`LoaderElfSpec`] 派生，故独立成最小构造器。
+#[cfg(feature = "kernel-tests")]
+fn build_two_segment_elf(seg_bytes: u64) -> alloc::vec::Vec<u8> {
+    const SEG_A_VADDR: u64 = 0x40_0000;
+    const RX_FLAGS: u32 = 5; // PF_R | PF_X，与 LoaderElfSpec::BASE 同口径
+    let mut elf = alloc::vec::Vec::new();
+    push_ehdr(&mut elf, SEG_A_VADDR, 64, 2);
+    push_phdr(&mut elf, 0, SEG_A_VADDR, 0, seg_bytes, RX_FLAGS);
+    push_phdr(&mut elf, 0, SEG_A_VADDR + seg_bytes, 0, seg_bytes, RX_FLAGS);
+    elf
+}
+
+/// 断言 `loader::load` 以**恰好**期望的错误变体拒绝；任何其他结果（含意外
+/// 成功、内核 panic）都是失败。每次调用使用全新地址空间，错误路径的帧回收
+/// 由 Drop 负责（loader1 §五已确认的全量回收语义）。
+#[cfg(feature = "kernel-tests")]
+fn expect_loader_reject(elf: &[u8], cmd: &[u8], want: klib::error::Error, ctx: &str) {
+    use mm::user_space::UserAddressSpace;
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
+    match loader::load(elf, &mut us, cmd) {
+        Err(e) if e == want => info!("[test-loader] {} rejected: {:?}", ctx, e),
+        Ok(_) => panic!("[test-loader] {}: malicious image unexpectedly loaded", ctx),
+        Err(e) => panic!("[test-loader] {}: expected Err({:?}), got Err({:?})", ctx, want, e),
+    }
+}
+
+/// 经页表翻译读取用户页一个字节（HHDM 直读物理帧）。
+///
+/// 注意：`PageTable::translate` 返回的是**叶层条目的页基址物理地址**
+/// （`entry_paddr` 按页大小掩码），不包含页内偏移；页内偏移必须由调用方
+/// 补回，掩码取自 arch 页大小抽象（audit-r2 S2/S13：测试代码不豁免
+/// 零魔法值纪律）。此前漏算偏移会让任意页内探测都退化为读帧首字节。
+#[cfg(feature = "kernel-tests")]
+fn read_user_byte(us: &mm::user_space::UserAddressSpace<X86PageTable>, v: u64) -> u8 {
+    let pa = us
+        .translate(arch::VirtAddr::new(v))
+        .unwrap_or_else(|| panic!("[test-loader] translate({:#x}) failed", v));
+    let page_off_mask = arch::PageSize::Size4K.bytes() - 1;
+    let phys = pa.as_u64() + (v & page_off_mask);
+    unsafe { (arch::phys_to_virt(phys) as *const u8).read_volatile() }
+}
+
+/// loader1/LA4：恶意/畸形 ELF 拒绝面对抗自检。
+///
+/// 用户可控字节在内核态被解析的最前线（loader1 §一~§三全部修复项）：
+/// 1. 畸形头：截断镜像 / 坏魔数 / 错 class → 显式拒绝而非索引越界；
+/// 2. 越界表（L1）：e_phoff 超出镜像、落在 ELF 头区内、算术回绕、表声明
+///    计数超出文件——一律 InvalidParam，绝不允许切片越界 panic；
+/// 3. 越界段读（L2）：p_offset+p_filesz 超出镜像 → 拒绝（否则内核堆内存
+///    被拷进用户页 = 机密性泄露）；
+/// 4. 溢出与越半区（L3）：p_vaddr+p_memsz 回绕、映射范围超出用户半区 →
+///    checked 算术拒绝；合法但巨大的段把物理帧池真抽干 → 优雅
+///    OutOfMemory（S31 资源耗尽轴，含 Drop 全额归还的恢复证明）；两段各自
+///    低于、合计超过单地址空间区域配额 → NoSpace，且失败段已收集帧当场
+///    全额退还帧池（audit-r2 F1 回归，allocated_frames 包络断言）；
+/// 5. 无可装载段（LD2）：头表合法但 phnum=0 → ExecFormat（ENOEXEC）；
+/// 6. 入口校验（LM3）：e_entry 不在任何已加载段内 → 拒绝；
+/// 7. 命令行边界（LA3/KM5）：恰好占满字符串区容量（放不下 NUL）→
+///    ArgListTooLong，容量-1 可正常加载；
+/// 8. 正常路径回归：合法镜像加载成功，file 内容逐字节可读，bss 区间与
+///    尾页垫零区间全为零（LM2）。
+///
+/// 注：PHYS_OFFSET 未初始化分支（LA1）在自检内核中不可达——偏移在 mm::init
+/// 阶段必被写入，无法在活内核上注入"缺失"状态；该路径由代码审查保证。
+pub fn test_loader_adversarial() {
+    use klib::error::Error;
+    use mm::user_space::{USER_STACK_TOP, UserAddressSpace};
+
+    info!("[test-loader] === loader1/LA4: malicious & malformed ELF rejection ===");
+
+    const CMD_CAPACITY: usize = 512; // 与 syscall CMD_BUF_BYTES 上限一致（跨层边界）
+    const FILE_LEN: usize = 64 + 56 + 16;
+
+    // -- 1. 畸形头 --
+    expect_loader_reject(&[0x7f, b'E', b'L', b'F'], &[], Error::InvalidParam, "truncated image");
+    let mut magic = build_loader_elf(&LoaderElfSpec::BASE);
+    magic[0] = 0x00;
+    expect_loader_reject(&magic, &[], Error::InvalidParam, "bad magic");
+    let mut class = build_loader_elf(&LoaderElfSpec::BASE);
+    class[4] = 1; // ELFCLASS32
+    expect_loader_reject(&class, &[], Error::NotSupported, "wrong EI_CLASS");
+
+    // -- 2. 程序头表越界（L1）--
+    let spec = LoaderElfSpec {
+        phoff: FILE_LEN as u64 + 0x1000,
+        ..LoaderElfSpec::BASE
+    };
+    expect_loader_reject(
+        &build_loader_elf(&spec),
+        &[],
+        Error::InvalidParam,
+        "phoff beyond image",
+    );
+    let spec = LoaderElfSpec {
+        phoff: 8, // 落在 e_ident 内：表不得与 ELF 头重叠
+        ..LoaderElfSpec::BASE
+    };
+    expect_loader_reject(
+        &build_loader_elf(&spec),
+        &[],
+        Error::InvalidParam,
+        "phoff inside ELF header",
+    );
+    let spec = LoaderElfSpec {
+        phoff: u64::MAX - 7, // phoff + phnum*phentsize 回绕
+        ..LoaderElfSpec::BASE
+    };
+    expect_loader_reject(
+        &build_loader_elf(&spec),
+        &[],
+        Error::InvalidParam,
+        "phoff table arithmetic overflow",
+    );
+    let spec = LoaderElfSpec {
+        phnum: 2, // 表声明 2 项，文件只装得下 1 项
+        ..LoaderElfSpec::BASE
+    };
+    expect_loader_reject(
+        &build_loader_elf(&spec),
+        &[],
+        Error::InvalidParam,
+        "program header table overruns image",
+    );
+
+    // -- 3. 段拷贝越界读（L2）：p_offset+p_filesz 超出镜像 = 内核堆泄露面 --
+    let spec = LoaderElfSpec {
+        p_filesz: 0x1_0000,
+        p_memsz: 0x1_0000,
+        ..LoaderElfSpec::BASE
+    };
+    expect_loader_reject(
+        &build_loader_elf(&spec),
+        &[],
+        Error::InvalidParam,
+        "p_filesz extends past image",
+    );
+
+    // -- 4. 地址算术溢出 / 越用户半区（L3）--
+    let spec = LoaderElfSpec {
+        p_vaddr: 0xFFFF_FFFF_FFFF_F000,
+        p_filesz: 0,
+        p_memsz: 0x2000,
+        ..LoaderElfSpec::BASE
+    };
+    expect_loader_reject(
+        &build_loader_elf(&spec),
+        &[],
+        Error::InvalidParam,
+        "p_vaddr + p_memsz overflows",
+    );
+    let spec = LoaderElfSpec {
+        p_vaddr: 0x1000,
+        p_memsz: 0x9000_0000_0000, // page_end 越出用户半区上界
+        ..LoaderElfSpec::BASE
+    };
+    expect_loader_reject(
+        &build_loader_elf(&spec),
+        &[],
+        Error::OutOfRange,
+        "segment beyond user half",
+    );
+
+    // -- 4b. 物理帧池真耗尽（L3/S31 资源耗尽轴）：合法但巨大的段把自检
+    // 环境的可用帧抽干，必须优雅收敛为 OutOfMemory（绝不 panic / alloc
+    // abort）；错误返回后 Vec Drop 全额归还已分配帧——后续用例正常分配
+    // 即回收正确性的内建证明。需求量取 120MiB ≥ 可用池上界（QEMU -m 128M
+    // 扣除内核/页表占用），保证必然触底。--
+    {
+        const EXHAUST_DEMAND_BYTES: u64 = 120 * 1024 * 1024;
+        let spec = LoaderElfSpec {
+            p_vaddr: 0x1000, // 页对齐低位起点（校验面：合法但巨大）
+            p_filesz: 0x10,
+            p_memsz: EXHAUST_DEMAND_BYTES,
+            ..LoaderElfSpec::BASE
+        };
+        expect_loader_reject(
+            &build_loader_elf(&spec),
+            &[],
+            Error::OutOfMemory,
+            "physical frame pool exhausted",
+        );
+    }
+
+    // -- 4c. 无任何可装载段（LD2/ENOEXEC）：头与表全部合法但没有 PT_LOAD，
+    // 语义是"这份镜像无法作为可执行内容"而非参数坏 --
+    let spec = LoaderElfSpec {
+        phnum: 0,
+        ..LoaderElfSpec::BASE
+    };
+    expect_loader_reject(
+        &build_loader_elf(&spec),
+        &[],
+        Error::ExecFormat,
+        "no PT_LOAD segments",
+    );
+
+    // -- 4d. 累计用户区配额越线 + 错误路径帧退款（audit-r2 F1 回归）：
+    //    两段各 QUOTA_SEG_BYTES——单段低于 MAX_USER_AREA_TOTAL_BYTES(64MiB)、
+    //    合计 66MiB 越线 ⇒ 第二段的 map_user 必须在配额闸门处以 NoSpace
+    //    拒绝（而非帧池 OutOfMemory 掩盖）。核心断言是资源完整性：失败段
+    //    collect_frames 已收集的全部物理帧必须当场退还帧池，「建地址空间 →
+    //    load 失败 → Drop」整个包络前后的 allocated_frames 严格相等。
+    //    两次独立尝试：首次兼作内核堆预热——frames Vec 的容量增长可能触发
+    //    一次性堆扩张（帧计数上升不可逆，属分配器设计内行为而非泄漏），
+    //    故首试只记录包络差；第二次处于热态，包络内任何净差都是泄漏。
+    //    预修复时每次尝试独立漏掉整段帧，故回归强度不受首试放宽影响。--
+    {
+        const QUOTA_SEG_BYTES: u64 = 33 * 1024 * 1024;
+        let attempt = |label: &str, strict_frames: bool| {
+            let s0 = mm::frame_stats().allocated_frames;
+            let mut us =
+                UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
+            let elf = build_two_segment_elf(QUOTA_SEG_BYTES);
+            match loader::load(&elf, &mut us, &[]) {
+                Err(e) if e == Error::NoSpace => {
+                    info!("[test-loader] {} rejected: {:?}", label, e);
+                }
+                Ok(_) => panic!(
+                    "[test-loader] {}: quota-exceeding image unexpectedly loaded",
+                    label
+                ),
+                Err(e) => panic!(
+                    "[test-loader] {}: expected Err(NoSpace), got Err({:?})",
+                    label, e
+                ),
+            }
+            drop(us);
+            let s1 = mm::frame_stats().allocated_frames;
+            if strict_frames {
+                assert_eq!(
+                    s1, s0,
+                    "[test-loader] {}: frame leak on quota-reject path: {} frames unreturned",
+                    label,
+                    s1.saturating_sub(s0)
+                );
+            } else {
+                info!(
+                    "[test-loader] {}: envelope delta {} frames (warm-up; one-time heap growth tolerated)",
+                    label,
+                    s1.saturating_sub(s0)
+                );
+            }
+        };
+        attempt("quota reject attempt 1 (heap warm-up)", false);
+        attempt("quota reject attempt 2 (exact refund)", true);
+        info!("[test-loader] quota-exceeding image rejected, frames fully refunded");
+    }
+
+    // -- 5. 入口不在任何已加载段内（LM3）--
+    let spec = LoaderElfSpec {
+        entry: 0x50_0000,
+        ..LoaderElfSpec::BASE
+    };
+    expect_loader_reject(
+        &build_loader_elf(&spec),
+        &[],
+        Error::InvalidParam,
+        "entry outside loaded segments",
+    );
+
+    // -- 5b. W^X 冲突段告警放行（LM4/D9 政策语义）：加载必须成功而非拒绝，
+    // 串口日志同步出现 [elf] ... both writable and executable 告警。--
+    {
+        let spec = LoaderElfSpec {
+            p_flags: 7, // PF_R | PF_W | PF_X（W 与 X 同时置位才触发 D9 告警）
+            ..LoaderElfSpec::BASE
+        };
+        let elf = build_loader_elf(&spec);
+        let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
+        match loader::load(&elf, &mut us, &[]) {
+            Ok(_) => info!("[test-loader] W+X segment loads with warn (D9 policy)"),
+            Err(e) => panic!("[test-loader] W+X segment must load per D9 policy, got {:?}", e),
+        }
+    }
+
+    // -- 6. 命令行容量边界（LA3/KM5）：截断改为显式拒绝 --
+    let full_cmd = [b'a'; CMD_CAPACITY];
+    expect_loader_reject(
+        &build_loader_elf(&LoaderElfSpec::BASE),
+        &full_cmd,
+        Error::ArgListTooLong,
+        "cmd fills entire string area (NUL won't fit)",
+    );
+    {
+        // 容量-1：最大合法命令行，正常加载且字符串完整落地（含 NUL）。
+        let max_cmd = [b'a'; CMD_CAPACITY - 1];
+        let elf = build_loader_elf(&LoaderElfSpec::BASE);
+        let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
+        let loaded = match loader::load(&elf, &mut us, &max_cmd) {
+            Ok(l) => l,
+            Err(e) => panic!("[test-loader] capacity-1 cmd must load, got {:?}", e),
+        };
+        assert_eq!(
+            loaded.user_stack_top,
+            USER_STACK_TOP - 0x220,
+            "rsp must sit at STR area minus 0x20"
+        );
+        let str_base = USER_STACK_TOP - 0x200;
+        for (i, b) in max_cmd.iter().enumerate() {
+            assert_eq!(
+                read_user_byte(&us, str_base + i as u64),
+                *b,
+                "cmd byte {} mismatch",
+                i
+            );
+        }
+        assert_eq!(
+            read_user_byte(&us, str_base + CMD_CAPACITY as u64 - 1),
+            0,
+            "cmd NUL terminator missing"
+        );
+        info!("[test-loader] capacity-1 cmd loads, string+NUL intact");
+    }
+
+    // -- 7. 正常路径回归 + bss/尾页垫零验证（LM2）--
+    {
+        let elf = build_loader_elf(&LoaderElfSpec::BASE);
+        let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
+        let loaded = match loader::load(&elf, &mut us, &[]) {
+            Ok(l) => l,
+            Err(e) => panic!("[test-loader] baseline ELF must load, got {:?}", e),
+        };
+        assert_eq!(loaded.entry, LoaderElfSpec::BASE.entry, "entry mismatch");
+        assert_eq!(
+            loaded.user_stack_top,
+            USER_STACK_TOP - 16,
+            "empty-cmd rsp mismatch"
+        );
+        // file 内容真实落地
+        assert_eq!(
+            read_user_byte(&us, LoaderElfSpec::BASE.p_vaddr),
+            0xA5,
+            "first file byte not copied"
+        );
+        // bss：[vaddr+filesz, 下一页边界) 全零
+        let bss_lo = LoaderElfSpec::BASE.p_vaddr + LoaderElfSpec::BASE.p_filesz;
+        for off in bss_lo..0x40_1000 {
+            assert_eq!(
+                read_user_byte(&us, off),
+                0,
+                "bss byte at {:#x} not zero",
+                off
+            );
+        }
+        // 第二页整页含 memsz 之外的垫零区 [memsz, page_end)：分配器残留不得外泄
+        for off in 0x40_1000..0x40_2000 {
+            assert_eq!(
+                read_user_byte(&us, off),
+                0,
+                "page-1 byte at {:#x} (incl. pad beyond p_memsz) not zero",
+                off
+            );
+        }
+        info!("[test-loader] baseline load OK, bss + tail-pad pages verified zero");
+    }
+
+    info!("[test-loader] PASS");
 }
 
 /// C7.1 核心机制单测（纯表级：真实终止/收尸/阻塞决策逻辑，不做 CPU 切换）。

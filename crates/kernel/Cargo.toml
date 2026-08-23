@@ -47,6 +47,6 @@ mm = { path = "../mm" }
 vfs = { path = "../vfs" }
 task = { path = "../task" }
 ipc = { path = "../ipc" }
-loader = { path = "../loader" }
+loader = { path = "../loader", features = ["user-space"] }
 term = { path = "../term" }
 spin = "0.9"

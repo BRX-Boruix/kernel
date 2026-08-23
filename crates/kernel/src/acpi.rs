@@ -97,6 +97,11 @@ pub fn hpet_info() -> Option<(u64, u64)> {
 
 /// FADT 解析产物观测出口（审计 B25：短表分级解析此前零测试佐证）。
 /// 返回 `(fadt_phys, dsdt_phys, pm1a_port)`；未初始化/解析失败时为全 0。
+///
+/// 仅 `kernel-tests` 构建存在：唯一调用方是 tests::test_acpi_parse_tables
+/// （QEMU 裸机自检，经 kmain feature 门进入）。非测试构建中该出口无生产
+/// 读者，不设门即报死码——按零死代码纪律随调用方同门，而非压制警告。
+#[cfg(feature = "kernel-tests")]
 pub fn fadt_summary() -> (u64, u64, u16) {
     (
         FADT_ADDR.load(Ordering::Acquire),

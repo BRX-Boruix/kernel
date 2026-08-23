@@ -59,6 +59,13 @@ pub enum Error {
     /// 以此拒绝——字符流没有"位置"可言，静默忽略偏移会把 pwrite/pread
     /// 伪装成顺序读写。
     IllegalSeek,
+    /// exec 格式错误（ENOEXEC）：镜像可解析但不含任何可装载内容。
+    ///
+    /// LD2：与 [`Error::NotSupported`] 的分界——ExecFormat 表达"这份镜像
+    /// 永远无法作为本加载器的可执行内容"（没有任何 PT_LOAD 段）；
+    /// NotSupported 保留给"能力未实现"（如 ET_DYN/PIE 待里程碑、未来
+    /// 架构后端），二者对用户的处置含义不同（换文件 vs 等待升级）。
+    ExecFormat,
     /// 过渡用：携带原始错误描述字符串（迁移完成后移除）。
     Msg(&'static str),
 }
@@ -85,6 +92,7 @@ impl Error {
             Error::ArgListTooLong => 7,    // E2BIG
             Error::TooManySymlinks => 40,  // ELOOP
             Error::IllegalSeek => 29,      // ESPIPE
+            Error::ExecFormat => 8,        // ENOEXEC
             Error::Msg(_) => 22,           // EINVAL
         }
     }
@@ -118,6 +126,7 @@ impl core::fmt::Display for Error {
             Error::ArgListTooLong => f.write_str("argument list too long"),
             Error::TooManySymlinks => f.write_str("too many levels of symbolic links"),
             Error::IllegalSeek => f.write_str("illegal seek"),
+            Error::ExecFormat => f.write_str("exec format error"),
             Error::Msg(s) => f.write_str(s),
         }
     }
@@ -134,6 +143,8 @@ mod tests {
     fn variants_equality() {
         assert_eq!(Error::OutOfMemory, Error::OutOfMemory);
         assert_ne!(Error::OutOfMemory, Error::InvalidParam);
+        assert_eq!(Error::ExecFormat, Error::ExecFormat);
+        assert_ne!(Error::ExecFormat, Error::NotSupported);
         assert_ne!(Error::Msg("a"), Error::Msg("b"));
         assert_eq!(Error::Msg("a"), Error::Msg("a"));
     }
@@ -142,6 +153,7 @@ mod tests {
     fn display_text() {
         assert_eq!(format!("{}", Error::OutOfMemory), "out of memory");
         assert_eq!(format!("{}", Error::NoSpace), "no space");
+        assert_eq!(format!("{}", Error::ExecFormat), "exec format error");
         assert_eq!(
             format!("{}", Error::Msg("no free mmap region")),
             "no free mmap region"
@@ -165,6 +177,7 @@ mod tests {
         assert_eq!(Error::Io.to_errno(), 5); // EIO
         assert_eq!(Error::NameTooLong.to_errno(), 36); // ENAMETOOLONG
         assert_eq!(Error::ArgListTooLong.to_errno(), 7); // E2BIG
+        assert_eq!(Error::ExecFormat.to_errno(), 8); // ENOEXEC
         assert_eq!(Error::IllegalSeek.to_errno(), 29); // ESPIPE
         assert_eq!(Error::Msg("x").to_errno(), 22); // EINVAL
     }
