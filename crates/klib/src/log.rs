@@ -75,8 +75,13 @@ fn enabled(l: LogLevel) -> bool {
 
 /// 环形日志缓冲行数（崩溃回读最后 N 条）。
 pub const RING_LINES: usize = 64;
-/// 每条日志最大字节数（超长截断）。
-pub const LINE_CAP: usize = 256;
+/// 每条日志最大字节数（超长**显式截断**：追加 `...[truncated]` 标记，
+/// 经 [`crate::console::truncation_count`] 可观测——KM3：静默截断即伪交付）。
+///
+/// 默认值理由（S17）：512 B 为审查实测下游需求所定——mm/pci/vfs_init 的
+/// 遥测 JSON 行、ata_pio 寄存器 dump 行普遍接近或超过旧值 256；环形缓冲
+/// 静态代价 64×512B=32KiB `.bss`，对自检环境（-m 128M）与真实平台均可忽略。
+pub const LINE_CAP: usize = 512;
 
 /// 环形日志缓冲：中断安全锁保护（多核 + 中断上下文安全）。
 /// 行以 `[u8; LINE_CAP]` 存储，`\0` 结尾（多余部分为零填充）。
@@ -88,15 +93,19 @@ static LOG_RING: IrqSpinLock<RingBuffer<[u8; LINE_CAP], RING_LINES>> =
 /// 1. 无论是否达到输出阈值，先把格式化结果记录进环形缓冲（崩溃回读需要）；
 /// 2. 达到阈值才转发到统一 console。
 pub fn __log(level: LogLevel, args: fmt::Arguments) {
-    // 格式化进栈缓冲。行总是以 `\n` 结尾（内容过长时截断，
-    // 为换行符保留 1 字节）；环形缓冲与 console 输出共用这份数据。
+    // 格式化进栈缓冲；超长时由 truncate_finish 回退到字符边界并追加
+    // 截断标记（KM1/KM3：截断必须可见、可观测，且绝不产生非法 UTF-8）。
     let mut buf = [0u8; LINE_CAP];
     let mut w = crate::console::StackWriter {
         buf: &mut buf,
         len: 0,
+        truncated: false,
     };
     let _ = fmt::Write::write_fmt(&mut w, args);
-    let n = w.len.min(LINE_CAP - 1);
+    let (raw_len, truncated) = (w.len, w.truncated);
+    drop(w); // 结束对 buf 的可变借用，收尾需要重借
+    // 为行尾换行符保留 1 字节（reserve=1）。
+    let n = crate::console::truncate_finish(&mut buf, raw_len, truncated, 1);
     buf[n] = b'\n';
 
     {
@@ -111,36 +120,33 @@ pub fn __log(level: LogLevel, args: fmt::Arguments) {
 
     if enabled(level) {
         // 输出到统一 console：复用已格式化的行（`buf[..=n]` 含 `\n`），
-        // 避免二次格式化。注意不能直接用 `write_fmt(args)`——那会丢失
-        // 行尾换行（T2 回归，串口日志全部挤成一行）。
-        let s = core::str::from_utf8(&buf[..=n]).unwrap_or("");
-        crate::console::write_str(s);
+        // 避免二次格式化（T2 回归教训）。经原始字节路径下发——收尾已保证
+        // 字符边界完整，文本 sink 的 lossy 转换走零分配 Borrowed 分支；
+        // 此前 from_utf8().unwrap_or("") 在切点落进多字节字符时会整行蒸发。
+        crate::console::write_bytes(&buf[..=n]);
     }
 }
 
-/// 按从旧到新的顺序回读环形日志缓冲（读后清空）。
+/// 按从旧到新的顺序**流式回放**环形日志缓冲（读后清空）。
 ///
 /// 用于 panic/崩溃时打印最后 N 条日志。输出到统一 console。
+/// KA2 修复：此前把全部行先聚合进 `LINE_CAP*4`（1KB）栈缓冲再一次性输出，
+/// 只能装下最旧的 ~4 行——恰好丢掉被 panic 打断前最后发生、诊断价值最高
+/// 的日志。现改为逐行弹出、逐行直写：不设聚合缓冲，行数再多也完整回放，
+/// 时序天然保持从旧到新；每行字节在入环时已保证字符边界完整，经
+/// [`crate::console::write_bytes`] 下发无校验丢失面。
 /// 锁语义：环形缓冲被其它上下文持有时**跳过回读**而非自旋——panic 路径可能
 /// 正是那个持锁者中断路径的受害者，自旋等自己 = 永久死锁（kernel1.md KA1）。
 /// 代价是崩溃现场缺一段日志，可接受；主诊断（panic 消息 + 回溯）不经过此锁。
 pub fn dump_crash_log() {
-    use core::fmt::Write as _;
     let Some(ring) = LOG_RING.try_lock() else {
         crate::console::write_str("[crashlog] ring buffer lock held; skipping dump\n");
         return;
     };
-    let mut out = [0u8; LINE_CAP * 4];
-    let mut w = crate::console::StackWriter {
-        buf: &mut out,
-        len: 0,
-    };
     while let Some(line) = ring.pop() {
         let n = line.iter().position(|&b| b == 0).unwrap_or(line.len());
-        let _ = w.write_str(core::str::from_utf8(&line[..n]).unwrap_or(""));
+        crate::console::write_bytes(&line[..n]);
     }
-    let len = w.len; // 先释放对 out 的借用再读取
-    crate::console::write_str(core::str::from_utf8(&out[..len]).unwrap_or(""));
 }
 
 // ---------- 级别宏 ----------
@@ -286,5 +292,100 @@ mod tests {
         __log(LogLevel::Warn, format_args!("pre-crash {}", 42));
         dump_crash_log(); // 只验证不 panic（无 sink 时空转）
         set_level(LogLevel::Info);
+    }
+
+    // ---- KM1/KM3/KA2：溢出治理与崩溃回读的回归面 ----
+
+    /// console 捕获 sink：把全部输出字节收进进程内缓冲，供断言。
+    static CAPTURE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    fn capture_sink(s: &str) {
+        CAPTURE.lock().unwrap().extend_from_slice(s.as_bytes());
+    }
+    /// 注册捕获 sink（幂等；注册后全程驻留——console 无注销 API，
+    /// 其余测试只清空 CAPTURE 不受残留影响）。
+    fn ensure_capture_sink() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let registered: fn(&str) = capture_sink;
+            assert!(crate::console::register(registered), "capture sink slot");
+        });
+    }
+
+    #[test]
+    fn truncation_carries_marker_and_counts() {
+        let _g = TEST_LOCK.lock().unwrap();
+        ensure_capture_sink();
+        CAPTURE.lock().unwrap().clear();
+        LOG_RING.lock().clear();
+        set_level(LogLevel::Info); // 让 console 路径同步走一遍
+        let before = crate::console::truncation_count();
+        let long = "x".repeat(LINE_CAP * 2);
+        __log(LogLevel::Info, format_args!("{long}"));
+        // 截断计数恰好 +1（KM3 可观测性）
+        assert_eq!(crate::console::truncation_count(), before + 1);
+        // 环形缓冲内的行带标记、不超容量、以换行结尾
+        let lines = drain_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with(" ...[truncated]\n"), "got tail {:?}", &lines[0][lines[0].len() - 24..]);
+        assert!(lines[0].len() <= LINE_CAP);
+    }
+
+    #[test]
+    fn truncation_cut_lands_on_char_boundary() {
+        let _g = TEST_LOCK.lock().unwrap();
+        LOG_RING.lock().clear();
+        // 多字节字符铺满超限：旧实现在任意字节位截断，切进字符内部时
+        // console 路径整行蒸发；新实现必须回退到边界再打标记。
+        let long = "你".repeat(LINE_CAP);
+        __log(LogLevel::Info, format_args!("{long}"));
+        let lines = drain_lines();
+        assert_eq!(lines.len(), 1);
+        let body = lines[0].strip_suffix('\n').unwrap();
+        let prefix = body.strip_suffix(" ...[truncated]").expect("marker present");
+        // 标记之前的前缀必须是合法 UTF-8（无半个字符的残骸）
+        assert!(core::str::from_utf8(prefix.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn dump_replays_every_line_oldest_to_newest() {
+        let _g = TEST_LOCK.lock().unwrap();
+        ensure_capture_sink();
+        set_level(LogLevel::Off); // 输出全关：capture 里只应有 dump 回放内容
+        LOG_RING.lock().clear();
+        CAPTURE.lock().unwrap().clear();
+        for i in 0..RING_LINES {
+            __log(LogLevel::Debug, format_args!("crash-line-{:03}", i));
+        }
+        assert_eq!(LOG_RING.lock().len(), RING_LINES);
+        dump_crash_log();
+        let text = String::from_utf8(CAPTURE.lock().unwrap().clone()).unwrap();
+        // KA2 核心：全部 N 行完整回放（不再被聚合缓冲裁掉最新现场），
+        // 且时序从旧到新。
+        for i in 0..RING_LINES {
+            assert!(
+                text.contains(&format!("crash-line-{i:03}")),
+                "line {i} missing from replay"
+            );
+        }
+        let first = text.find("crash-line-000").unwrap();
+        let last = text.find("crash-line-063").unwrap();
+        assert!(first < last, "replay must be oldest-to-newest");
+        // 读后清空语义保持
+        assert!(LOG_RING.lock().is_empty());
+        set_level(LogLevel::Info);
+    }
+
+    #[test]
+    fn within_cap_line_never_marked_or_counted() {
+        let _g = TEST_LOCK.lock().unwrap();
+        LOG_RING.lock().clear();
+        let before = crate::console::truncation_count();
+        let ok = "y".repeat(LINE_CAP - 32);
+        __log(LogLevel::Info, format_args!("{ok}"));
+        let lines = drain_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains("[truncated]"));
+        assert_eq!(crate::console::truncation_count(), before, "no spurious count");
     }
 }

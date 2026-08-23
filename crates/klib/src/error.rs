@@ -5,11 +5,13 @@
 //! 边界铺路（[`Error::to_errno`]）。
 //!
 //! 设计要点：
-//! - 零分配：全部变体为 unit / `&'static str`，`Copy` 语义，可在中断上下文使用；
-//! - 过渡兼容：[`Error::Msg`] 保留迁移期间的原始字符串信息，`From<&'static str>`
-//!   保证旧调用点 `"..."`.into()` 不破坏编译；迁移完成后移除；
+//! - 零分配：全部变体为 unit，`Copy` 语义，可在中断上下文使用；
 //! - 动态上下文（地址、长度、id 等运行时数值）由调用方经 `klib::log` 输出，
-//!   不塞进 `Err`（保持错误零分配、可比较）。
+//!   不塞进 `Err`（保持错误零分配、可比较）；
+//! - 过渡态终点记录（klib1 KM5）：曾经的 `Msg(&'static str)` 变体与
+//!   `From<&'static str>` 桥接已在全部生产调用点迁移到具名变体后**整体
+//!   移除**——过渡设计"迁移完成后移除"的成文承诺兑现，杜绝过渡态常态化。
+//!   新代码一律用具名变体；确需新语义时扩展枚举而非复活字符串通道。
 
 /// 内核统一错误码。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,8 +68,13 @@ pub enum Error {
     /// NotSupported 保留给"能力未实现"（如 ET_DYN/PIE 待里程碑、未来
     /// 架构后端），二者对用户的处置含义不同（换文件 vs 等待升级）。
     ExecFormat,
-    /// 过渡用：携带原始错误描述字符串（迁移完成后移除）。
-    Msg(&'static str),
+    /// 只读文件系统（EROFS）：对结构性只读的介质/挂载态执行写访问。
+    ///
+    /// 与 [`Error::PermissionDenied`] 的分界：PermissionDenied 是**调用者
+    /// 身份/权限不足**（EACCES，换个身份即可行）；ReadOnly 是**对象本身
+    /// 处于只读状态**（EROFS，任何调用者都不可写）。klib1 KM5 预置变体，
+    /// fs 层错误源接线随 fs1 立项落地。
+    ReadOnly,
 }
 
 impl Error {
@@ -93,15 +100,8 @@ impl Error {
             Error::TooManySymlinks => 40,  // ELOOP
             Error::IllegalSeek => 29,      // ESPIPE
             Error::ExecFormat => 8,        // ENOEXEC
-            Error::Msg(_) => 22,           // EINVAL
+            Error::ReadOnly => 30,         // EROFS
         }
-    }
-}
-
-impl From<&'static str> for Error {
-    /// 过渡映射：旧调用点 `"...".into()` 直接可用，信息保留在 [`Error::Msg`]。
-    fn from(s: &'static str) -> Self {
-        Error::Msg(s)
     }
 }
 
@@ -127,7 +127,7 @@ impl core::fmt::Display for Error {
             Error::TooManySymlinks => f.write_str("too many levels of symbolic links"),
             Error::IllegalSeek => f.write_str("illegal seek"),
             Error::ExecFormat => f.write_str("exec format error"),
-            Error::Msg(s) => f.write_str(s),
+            Error::ReadOnly => f.write_str("read-only file system"),
         }
     }
 }
@@ -145,8 +145,8 @@ mod tests {
         assert_ne!(Error::OutOfMemory, Error::InvalidParam);
         assert_eq!(Error::ExecFormat, Error::ExecFormat);
         assert_ne!(Error::ExecFormat, Error::NotSupported);
-        assert_ne!(Error::Msg("a"), Error::Msg("b"));
-        assert_eq!(Error::Msg("a"), Error::Msg("a"));
+        assert_eq!(Error::ReadOnly, Error::ReadOnly);
+        assert_ne!(Error::ReadOnly, Error::PermissionDenied);
     }
 
     #[test]
@@ -155,15 +155,9 @@ mod tests {
         assert_eq!(format!("{}", Error::NoSpace), "no space");
         assert_eq!(format!("{}", Error::ExecFormat), "exec format error");
         assert_eq!(
-            format!("{}", Error::Msg("no free mmap region")),
-            "no free mmap region"
+            format!("{}", Error::ReadOnly),
+            "read-only file system"
         );
-    }
-
-    #[test]
-    fn from_static_str_preserves_message() {
-        let e: Error = "stack too large".into();
-        assert_eq!(e, Error::Msg("stack too large"));
     }
 
     #[test]
@@ -179,7 +173,7 @@ mod tests {
         assert_eq!(Error::ArgListTooLong.to_errno(), 7); // E2BIG
         assert_eq!(Error::ExecFormat.to_errno(), 8); // ENOEXEC
         assert_eq!(Error::IllegalSeek.to_errno(), 29); // ESPIPE
-        assert_eq!(Error::Msg("x").to_errno(), 22); // EINVAL
+        assert_eq!(Error::ReadOnly.to_errno(), 30); // EROFS
     }
 
     #[test]
@@ -193,7 +187,7 @@ mod tests {
 
     #[test]
     fn usable_in_result() {
-        let r: Result<(), Error> = Err("user region out of range".into());
+        let r: Result<(), Error> = Err(Error::OutOfRange);
         assert!(r.is_err());
         let r2: Result<(), Error> = Err(Error::OutOfMemory);
         assert_eq!(r2.unwrap_err(), Error::OutOfMemory);

@@ -89,8 +89,13 @@ impl Xoshiro256 {
     }
 
     /// 在 `[lo, hi)` 区间无偏采样（拒绝采样，避免取模偏差）。
+    ///
+    /// KD2：空区间断言是**无条件的**——`debug_assert` 在 release 下降级为
+    /// `hi - lo == 0` 的 `% 0`，内核上下文即 #DE 异常停机；受控 panic 的
+    /// 报错现场（含调用栈与区间值）远优于算术异常。每次调用的比较成本
+    /// 相对拒绝采样循环可忽略。
     pub fn gen_range(&mut self, lo: u64, hi: u64) -> u64 {
-        debug_assert!(lo < hi, "gen_range requires lo < hi");
+        assert!(lo < hi, "gen_range requires lo < hi, got [{lo}, {hi})");
         let range = hi - lo;
         // 阈值：丢弃 r 使得 r % range 偏向的尾部区间（range 整除 2^64 时阈值为 0）。
         let threshold = range.wrapping_neg() % range;
@@ -353,6 +358,15 @@ mod tests {
         for b in buckets {
             assert!(b > 700, "bucket too small: {b} (distribution skewed?)");
         }
+    }
+
+    /// KD2 回归钉：空区间必须**无条件**受控 panic（含 release），
+    /// 绝不允许降级为 `% 0` 的 #DE 算术异常停机。
+    #[test]
+    #[should_panic(expected = "gen_range requires lo < hi")]
+    fn gen_range_empty_interval_panics() {
+        let mut r = Xoshiro256::new(11);
+        let _ = r.gen_range(5, 5);
     }
 
     #[test]

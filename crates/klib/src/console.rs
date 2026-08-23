@@ -178,31 +178,95 @@ pub fn write_bytes(bytes: &[u8]) {
 
 /// 把 `fmt::Arguments` 格式化后输出到所有 sink。
 ///
-/// 用栈缓冲承载格式化结果（`no_std` 友好），超长内容截断。
-/// 日志级别宏（`info!`/`warn!`/`error!`/`debug!`）与 `format_args!`
-/// 调用方都经此转发。
+/// 用栈缓冲承载格式化结果（`no_std` 友好），超长内容**显式截断**：
+/// 追加 `...[truncated]` 标记并使 [`truncation_count`] 计数（KM1/KM3
+/// 溢出治理——静默蒸发不可接受）。结果经 [`write_bytes`] 原始字节路径
+/// 下发：即使历史遗留的切点落在多字节字符内部，串口也按字节透明转发，
+/// 绝不因 UTF-8 校验失败而丢弃整段输出。
 pub fn write_fmt(args: fmt::Arguments) {
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; FMT_CAP];
     let mut w = StackWriter {
         buf: &mut buf,
         len: 0,
+        truncated: false,
     };
     let _ = fmt::Write::write_fmt(&mut w, args);
-    let len = w.len;
-    write_str(core::str::from_utf8(&buf[..len]).unwrap_or(""));
+    let (raw_len, truncated) = (w.len, w.truncated);
+    drop(w); // 结束对 buf 的可变借用，收尾需要重借
+    let len = truncate_finish(&mut buf, raw_len, truncated, 0);
+    write_bytes(&buf[..len]);
 }
 
-/// 栈缓冲 `fmt::Write` 实现，供 [`write_fmt`] 使用。
+/// `write_fmt` 的栈缓冲容量。
+///
+/// 默认值理由（S17）：1024 B 覆盖现有全部 stdout 单次写调用且栈开销
+/// 可忽略；stdout 是用户数据通路，容量不足属调用方契约问题而非本层
+/// 截断对象——超限仍会标记截断（见 [`truncation_count`]）。
+pub const FMT_CAP: usize = 1024;
+
+/// 截断标记（ASCII，保证标记自身永不落入多字节切点）。
+pub(crate) const TRUNCATION_MARKER: &[u8] = b" ...[truncated]";
+
+/// 输出管线截断总次数（log 行与 `write_fmt` 两条路径共用）。
+static CONSOLE_TRUNCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// 已发生的输出截断总次数（诊断观测口：非零即有日志/输出曾被裁剪）。
+pub fn truncation_count() -> usize {
+    CONSOLE_TRUNCATIONS.load(Ordering::Relaxed)
+}
+
+/// 截断收尾（溢出治理的单点实现，[`write_fmt`] 与 `log::__log` 共用）。
+///
+/// 未截断时原样返回 `len`。发生截断时：
+/// 1. 截断计数 +1（可见性纪律：静默丢弃即伪交付）；
+/// 2. 长度回退到 UTF-8 字符边界（`buf[len]` 不是续字节为止，至多退 3 字节）；
+/// 3. 追加 [`TRUNCATION_MARKER`]（`reserve` 为调用方要求保留的尾部空间，
+///    如 log 行的换行符）。
+pub(crate) fn truncate_finish(
+    buf: &mut [u8],
+    len: usize,
+    truncated: bool,
+    reserve: usize,
+) -> usize {
+    if !truncated {
+        return len;
+    }
+    CONSOLE_TRUNCATIONS.fetch_add(1, Ordering::Relaxed);
+    debug_assert!(
+        buf.len() >= reserve + TRUNCATION_MARKER.len(),
+        "buffer too small for truncation marker"
+    );
+    let cap = buf.len().saturating_sub(reserve + TRUNCATION_MARKER.len());
+    let mut n = len.min(cap);
+    while n > 0 && buf[n] & 0xC0 == 0x80 {
+        // 切点落在多字节字符内部：回退直到 buf[n] 是某字符的首字节。
+        n -= 1;
+    }
+    buf[n..n + TRUNCATION_MARKER.len()].copy_from_slice(TRUNCATION_MARKER);
+    n + TRUNCATION_MARKER.len()
+}
+
+/// 栈缓冲 `fmt::Write` 实现，供 [`write_fmt`] 与 `log` 使用。
+///
+/// 缓冲写满后继续写入只更新 [`StackWriter::truncated`] 标志而不 panic/
+/// 报错——格式化结果的完整性由调用方经 [`truncate_finish`] 收尾声明，
+/// 本类型只负责如实记录「发生过裁剪」这一事实。
 pub struct StackWriter<'a> {
     pub buf: &'a mut [u8],
     pub len: usize,
+    /// 是否有内容因缓冲不足被裁剪（KM1：截断必须可见）。
+    pub truncated: bool,
 }
 
 impl fmt::Write for StackWriter<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let n = core::cmp::min(s.len(), self.buf.len() - self.len);
+        let room = self.buf.len() - self.len;
+        let n = core::cmp::min(s.len(), room);
         self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
         self.len += n;
+        if n < s.len() {
+            self.truncated = true;
+        }
         Ok(())
     }
 }
