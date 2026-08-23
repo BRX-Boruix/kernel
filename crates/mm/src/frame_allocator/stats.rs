@@ -63,6 +63,16 @@ macro_rules! counter_stats {
     }};
 }
 
+/// 物理分配器碎片统计。
+///
+/// `free_percpu_by_order` 仅覆盖**当前 CPU** 缓存（所有权不变量，mm1.md MA1）；
+/// 其它 CPU 缓存中的空闲页不在此列，消费方不得把该字段当作全系统 per-CPU 总和。
+///
+/// 审计 B8 投影裁决：SysFS `memory_json`（vfs_init.rs）**只**消费全局
+/// `allocated_frames` 派生值，不投影本字段——percpu 语义（当前核私有视图）
+/// 与 sysfs"全系统状态文件"的读者预期不符，宁缺勿谎。未来若要暴露 per-CPU
+/// 视图，必须以显式 `per_cpu_free_bytes` 字段名 + 文档标注采样语义，不得
+/// 混入 capacity/allocated/free 全局三元组。
 #[derive(Debug, Clone)]
 pub struct PmmFragStats {
     pub max_order: usize,
@@ -90,8 +100,13 @@ pub fn frag_stats() -> PmmFragStats {
         }
     });
 
-    for cpu in 0..PER_CPU.cpu_count() {
-        PER_CPU.with_cache(cpu, |cache| {
+    // per-CPU 部分只读**当前 CPU** 槽的计数（所有权不变量，mm1.md MA1：
+    // with_cache 是无锁裸指针转发，跨槽读取在多核下是数据竞争）。诊断统计
+    // 宁可少报其它 CPU 的缓存页，也不破坏属主排他性。
+    let current_cpu = super::current_cpu_id();
+    debug_assert!(current_cpu < PER_CPU.cpu_count(), "cpu slot out of range");
+    if current_cpu < PER_CPU.cpu_count() {
+        PER_CPU.with_cache(current_cpu, |cache| {
             for order in 0..MAX_ORDER {
                 free_percpu[order] += cache.counts[order] as usize;
             }

@@ -158,9 +158,9 @@ pub fn init() -> Option<AcpiInfo> {
         klib::info!("[acpi] HPET: not present");
     }
 
-    // 解析 FADT 关键字段。
+    // 解析 FADT 关键字段（表过短等异常 → 整体放弃 ACPI 信息，绝不带垃圾值）。
     let fadt_va = phys_to_virt(fadt_addr);
-    let fadt = parse_fadt(fadt_va);
+    let fadt = parse_fadt(fadt_va)?;
     klib::info!(
         "[acpi] FADT: dsdt={:#x} pm1a_cnt={:#x} pm1b_cnt={:#x} reset={:?}",
         fadt.dsdt_addr,
@@ -211,43 +211,92 @@ struct Fadt {
     reset_reg: Option<(u8, u16, u32)>,
 }
 
-/// 解析 FADT（字段偏移按 ACPI 6.x FADT 布局）。
-fn parse_fadt(va: u64) -> Fadt {
-    // SAFETY: `va` 指向已验证的 FADT 表（长度 ≥ 244）。
-    let b = unsafe { core::slice::from_raw_parts(va as *const u8, 244) };
+/// 解析 FADT 关键字段（字段偏移按 ACPI 6.x FADT 布局）。
+///
+/// AM5：先读表头取**实际**长度，再按长度逐字段解析——遗留固件可能提供
+/// 短于现代布局的 FADT（QEMU 实测为 ACPI 1.0 的 116 字节），按现代布局
+/// 盲读会越过表尾读到相邻物理内存并把垃圾当真值上送 AcpiInfo。正确处置
+/// 不是整表拒绝（那会把真实存在的 DSDT/PM1 控制块一并丢弃，导致 HPET/
+/// 时钟精度连锁丢失——实测 sleep_us 精度断言失败），而是"字段存在才读取"：
+/// - len ≥ 44：DSDT u32 @40；
+/// - len ≥ 148：X_DSDT u64 @140（仅当 u32 字段为 0 时采用）；
+/// - len ≥ 70：PM1a/PM1b_CNT_BLK u32 @64/@68；
+/// - len ≥ 129：RESET_REG GAS @116 + RESET_VALUE @128。
+fn parse_fadt(va: u64) -> Option<Fadt> {
+    /// 各消费字段的最低表长要求（最深偏移 + 字段宽度）。
+    const LEN_DSDT32: usize = 44;
+    const LEN_PM1_CNT: usize = 70;
+    const LEN_X_DSDT: usize = 148;
+    const LEN_RESET: usize = 129;
 
-    // DSDT 地址：FADT offset 40（32 位）优先；offset 140 的 64 位扩展字段
-    // 只在 32 位字段为 0 时才用（QEMU 的 64 位字段常为厂商字符串残留，
-    // 如 "BXPC" 会被误读为地址）。
-    let dsdt32 = u32::from_le_bytes([b[40], b[41], b[42], b[43]]);
-    let dsdt64 = u64::from_le_bytes([
-        b[140], b[141], b[142], b[143], b[144], b[145], b[146], b[147],
-    ]);
-    let dsdt_addr = if dsdt32 != 0 { dsdt32 as u64 } else { dsdt64 };
+    let hdr_slice =
+        unsafe { core::slice::from_raw_parts(va as *const u8, SDT_HEADER_LEN) };
+    let hdr = parse_sdt_header(hdr_slice)?;
+    let actual_len = hdr.length as usize;
+    if actual_len < LEN_DSDT32 {
+        klib::warn!(
+            "[acpi] FADT too short to contain any usable field: length={actual_len}, need>={LEN_DSDT32}"
+        );
+        return None;
+    }
 
+    // SAFETY: `va` 指向 HHDM 已映射物理页；以下每个 from_raw_parts 的长度
+    // 都不超过表头声明的实际 length（逐段校验过），不越界。
+    // DSDT 地址：offset 40 的 32 位字段优先；offset 140 的 64 位扩展字段
+    // 只在 32 位字段为 0 且表足够长时才用（QEMU 的 64 位字段常为厂商字符
+    // 串残留，如 "BXPC" 会被误读为地址）。
+    let b32 = unsafe { core::slice::from_raw_parts(va as *const u8, LEN_DSDT32) };
+    let dsdt32 = u32::from_le_bytes([b32[40], b32[41], b32[42], b32[43]]);
+    let dsdt_addr = if actual_len >= LEN_X_DSDT {
+        let b = unsafe { core::slice::from_raw_parts(va as *const u8, LEN_X_DSDT) };
+        let dsdt64 = u64::from_le_bytes([
+            b[140], b[141], b[142], b[143], b[144], b[145], b[146], b[147],
+        ]);
+        if dsdt32 != 0 { dsdt32 as u64 } else { dsdt64 }
+    } else {
+        dsdt32 as u64
+    };
+
+    if actual_len < LEN_PM1_CNT {
+        klib::warn!(
+            "[acpi] FADT lacks PM1a/PM1b_CNT_BLK (length={actual_len} < {LEN_PM1_CNT}); power management unavailable"
+        );
+        return Some(Fadt {
+            dsdt_addr,
+            pm1a_cnt: 0,
+            pm1b_cnt: 0,
+            reset_reg: None,
+        });
+    }
+    let b = unsafe { core::slice::from_raw_parts(va as *const u8, LEN_PM1_CNT) };
     // PM1 控制块端口（4 字节字段，端口在低 16 位）：
     // offset 64 = PM1a_CNT_BLK，offset 68 = PM1b_CNT_BLK。
     let pm1a_cnt = u16::from_le_bytes([b[64], b[65]]);
     let pm1b_cnt = u16::from_le_bytes([b[68], b[69]]);
 
-    // Reset 寄存器：offset 116 的 GAS（12 字节）+ offset 128 的 reset 值。
-    let (reg_offset, val_offset) = (116, 128);
-    let reg_space = b[reg_offset];
-    let reg_port = u16::from_le_bytes([b[reg_offset + 4], b[reg_offset + 5]]);
-    let reset_value = b[val_offset];
-    // GAS 的 address_space：0 = System Memory，1 = System I/O。
-    let reset_reg = if reg_space == 1 && reg_port != 0 {
-        Some((reg_space, reg_port, reset_value as u32))
+    // Reset 寄存器：offset 116 的 GAS（12 字节）+ offset 128 的 reset 值；
+    // 仅当表实际包含该区域（len ≥ 129）时解析，短表一律 None。
+    let reset_reg = if actual_len >= LEN_RESET {
+        let b = unsafe { core::slice::from_raw_parts(va as *const u8, LEN_RESET) };
+        let reg_space = b[116];
+        let reg_port = u16::from_le_bytes([b[120], b[121]]);
+        let reset_value = b[128];
+        // GAS 的 address_space：0 = System Memory，1 = System I/O。
+        if reg_space == 1 && reg_port != 0 {
+            Some((reg_space, reg_port, reset_value as u32))
+        } else {
+            None
+        }
     } else {
         None
     };
 
-    Fadt {
+    Some(Fadt {
         dsdt_addr,
         pm1a_cnt,
         pm1b_cnt,
         reset_reg,
-    }
+    })
 }
 
 // ---------- 单元测试 ----------

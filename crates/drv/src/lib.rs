@@ -4,6 +4,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
 
@@ -27,7 +29,10 @@ pub use event::{
     DeviceEvent, EventSubscriber, pending_event_count, pop_event, publish_event, subscribe_events,
 };
 pub use hub::DriverHub;
-pub use uio::{UioDriverEntry, uio_is_device_claimed, uio_on_process_exit, uio_register_driver};
+pub use uio::{
+    UioDriverEntry, device_mmio_window, publish_device_window, uio_claim_device,
+    uio_device_window_of, uio_is_device_claimed, uio_on_process_exit, uio_register_driver,
+};
 
 #[cfg(test)]
 mod tests {

@@ -24,22 +24,30 @@ unsafe impl Sync for BootHeapStorage {}
 /// 静态引导堆存储。
 static BOOT_HEAP: BootHeapStorage = BootHeapStorage(UnsafeCell::new([0; BOOT_HEAP_SIZE]));
 
-/// 堆增长源：`fn(order: u32) -> u64`。
+/// 堆增长源：`fn(order: u32) -> Option<u64>`。
 ///
-/// 返回 `2^order` 个连续物理页**映射后的虚拟地址基址**（可直接读写），
-/// 失败返回 0。由内核注入（内部调用物理帧分配器 + `phys_to_virt`）。
+/// 成功返回 `2^order` 个连续物理页**映射后的虚拟地址基址**（可直接读写），
+/// 失败（物理内存耗尽）返回 `None`。由内核注入（内部调用物理帧分配器 +
+/// `phys_to_virt`）。KM11：以 `Option` 表达"没有"，不使用魔法 0 哨兵——
+/// 虚拟基址 0 是非法映射值纯属巧合，类型化失败才不依赖巧合。
 static GROW_ALLOC: AtomicUsize = AtomicUsize::new(0);
 
 /// 注入堆增长源（内核在物理帧分配器就绪后调用）。
-pub fn set_grow_allocator(f: fn(u32) -> u64) {
+pub fn set_grow_allocator(f: fn(u32) -> Option<u64>) {
     GROW_ALLOC.store(f as usize, Ordering::SeqCst);
 }
 
-use crate::sync::spin::SpinMutex;
+use crate::sync::irq::IrqSpinLock;
 
 /// 全局堆：内部持有 buddy `Heap`，OOM 时按需增长。
+///
+/// 锁必须是**中断安全**的 `IrqSpinLock`：LAPIC tick 处理程序（ISR 上下文）
+/// 会经调度器回调/定时器队列进入分配路径，若主流程持普通自旋锁期间被 tick
+/// 打断、而 ISR 路径再次申请同一把锁，本 CPU 将永久自旋（实测死锁现场：
+/// RIP 停在 `SpinMutex<Heap>::lock`，tick 向量滞留 IRR 无法交付）。关中断
+/// 持锁使临界区对 ISR 原子，代价是持锁期间延迟中断——堆临界区极短。
 struct KernelHeap {
-    inner: SpinMutex<Heap<32>>,
+    inner: IrqSpinLock<Heap<32>>,
 }
 
 unsafe impl GlobalAlloc for KernelHeap {
@@ -73,7 +81,7 @@ unsafe impl GlobalAlloc for KernelHeap {
 /// 全局堆分配器（OOM 时自动按需增长）。
 #[global_allocator]
 static HEAP_ALLOCATOR: KernelHeap = KernelHeap {
-    inner: SpinMutex::new(Heap::empty()),
+    inner: IrqSpinLock::new(Heap::empty()),
 };
 
 /// 堆增长：当 buddy 堆 OOM 时，按需从物理帧分配器取页并加入堆。
@@ -83,7 +91,7 @@ fn grow_heap(heap: &mut Heap<32>, layout: &Layout) -> bool {
     if f == 0 {
         return false; // 增长源未注入：无能为力
     }
-    let alloc_fn: fn(u32) -> u64 = unsafe { core::mem::transmute(f) };
+    let alloc_fn: fn(u32) -> Option<u64> = unsafe { core::mem::transmute(f) };
 
     // 需要多少字节（至少一页，向上取整到页）
     let need = layout.size().max(4096);
@@ -92,21 +100,29 @@ fn grow_heap(heap: &mut Heap<32>, layout: &Layout) -> bool {
     // 不再 clamp：物理帧分配器本身支持大 order，单次增长就能满足任意大小的
     // 连续需求（受限仅在于物理内存是否足够），避免一次性大分配反复失败。
     // 为减少碎片并提高命中率，额外放宽到能容纳 pages 的 2 倍（若 order 允许）。
+    //
+    // 审计 B20 论证：order 硬上限 MAX_GROW_ORDER ⇒ 下方 `1usize << order`
+    // 与 `* PAGE_BYTES` 在 64 位 usize 无溢出（2^31 页 × 4KiB = 8TiB，远超
+    // 真实物理内存、必先被帧分配器拒绝）；order 来源为 leading_zeros 推导，
+    // 本身不可能超过 usize::BITS-1，上限截断是唯一进入分配的路径。
+    const MAX_GROW_ORDER: u32 = 31;
     let mut order: u32 = if pages <= 1 {
         0
     } else {
         usize::BITS as u32 - 1 - (pages - 1).leading_zeros()
     };
-    // 放宽一级以获得更大的连续块（降低碎片），但保持 32 位安全上限
-    if order < 31 {
+    // 放宽一级以获得更大的连续块（降低碎片），但保持安全上限
+    if order < MAX_GROW_ORDER {
         order += 1;
     }
+    debug_assert!(order <= MAX_GROW_ORDER);
 
-    let base = alloc_fn(order);
-    if base == 0 {
+    // 增长源以 Option 报告失败（物理内存耗尽 / 帧分配器拒绝）。
+    let Some(base) = alloc_fn(order) else {
         return false;
-    }
-    let bytes = (1usize << order) * 4096;
+    };
+    const PAGE_BYTES: usize = 4096;
+    let bytes = (1usize << order) * PAGE_BYTES;
     // 把新页加入堆（buddy 内部切块管理，支持多次 add_to_heap 添加非连续区域）
     unsafe { heap.add_to_heap(base as usize, base as usize + bytes) };
     true

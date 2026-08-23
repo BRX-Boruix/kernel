@@ -18,6 +18,7 @@ pub mod page_cache;
 pub mod path;
 pub mod procfs;
 pub mod ramfs;
+pub mod stdio;
 pub mod sysfs;
 
 pub use devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
@@ -28,6 +29,7 @@ pub use mount::MountTable;
 pub use page_cache::{HUGE_PAGE_SIZE, PAGE_SIZE, PageCache, PageCacheStats};
 pub use path::Path;
 pub use procfs::{ProcFS, ProcessInfoProvider, ProcessSnapshot};
+pub use stdio::{set_stdin_source, set_stdout_sink, stderr_handle, stdin_handle, stdout_handle};
 pub use sysfs::{SysFS, SystemInfoProvider};
 #[cfg(test)]
 mod tests {
@@ -265,6 +267,10 @@ mod tests {
                 r#"{"error":"nic_stats_unsupported","device":"mock-nic"}"#,
             )
         }
+        fn display_mode_json(&self) -> alloc::string::String {
+            // mock 真值：DevFS 层必须原样透传，不得注入自己的缺省分辨率。
+            alloc::string::String::from(r#"{"width":640,"height":480,"bpp":16}"#)
+        }
     }
 
     #[test]
@@ -357,13 +363,19 @@ mod tests {
         let s8 = core::str::from_utf8(&buf[..n8]).unwrap();
         assert!(s8.contains(r#""baudrate":9600"#));
 
-        // 显示器分辨率 mode JSON
+        // 显示器分辨率 mode JSON：必须逐字透传 Provider 真值（DevFS 层无
+        // 自己的分辨率缺省值），写路径如实 NotSupported（模式切换未实现）。
         let mode_file = mount_table
             .resolve("/devices/displays/primary/mode", true)
             .unwrap();
         let n9 = mode_file.read_at(0, &mut buf).unwrap();
         let s9 = core::str::from_utf8(&buf[..n9]).unwrap();
-        assert!(s9.contains(r#""width":1024"#));
+        assert!(s9.contains(r#""width":640"#));
+        assert_eq!(
+            mode_file.write_at(0, b"{}"),
+            Err(Error::NotSupported),
+            "mode write must honestly refuse: mode switching is not implemented"
+        );
 
         // DMYGH #16：storage/net 遥测节点必须原样透传 Provider 的真实数据，
         // DevFS 层不得注入任何设备名或计数。

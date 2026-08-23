@@ -3,24 +3,8 @@
 //! 提供基于 DriverStage 四阶段生命周期与 DriverHub 集中调度的核心硬件驱动注册。
 
 use core::sync::atomic::{AtomicUsize, Ordering};
-use drv::{BusType, Device, DeviceInfo, DeviceKind, DeviceOps, DriverHub, DriverStage, IoDevice};
+use drv::{BusType, DeviceInfo, DeviceKind, DriverHub, DriverStage};
 use klib::info;
-
-/// Framebuffer 设备对象。
-struct FramebufferDevice;
-impl Device for FramebufferDevice {
-    fn name(&self) -> &'static str {
-        "framebuffer"
-    }
-    fn kind(&self) -> DeviceKind {
-        DeviceKind::Display
-    }
-    fn as_io(&self) -> Option<&dyn IoDevice> {
-        Some(self)
-    }
-}
-impl IoDevice for FramebufferDevice {}
-static FRAMEBUFFER_DEV: FramebufferDevice = FramebufferDevice;
 
 /// Limine framebuffer 指针。
 static FRAMEBUFFER_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -47,7 +31,9 @@ fn init_framebuffer(_hub: &DriverHub) {
             // C15.1：帧缓冲是易失显示面，内容不持久。
             volatile: true,
         },
-        Some(&FRAMEBUFFER_DEV),
+        // KM7：无 I/O 操作集 → dev=None。显示能力不冒充字节流通道；
+        // 驱动名绑定保留（framebuffer 驱动负责终端初始化，与 IO 无关）。
+        None,
         Some("framebuffer"),
     );
     info!("[driver_hub] framebuffer terminal & display registered");
@@ -83,4 +69,20 @@ pub fn init() {
 /// 注册 Framebuffer 指针供 Core 阶段或即时终端使用。
 pub fn register_framebuffer(fb: &limine::Framebuffer) {
     FRAMEBUFFER_PTR.store(fb as *const limine::Framebuffer as usize, Ordering::Release);
+}
+
+/// 真实显示几何 `(width, height, bpp)`——直接读取 Limine 注册的 framebuffer
+/// 描述符，是 `/devices/displays/primary/mode` 的唯一数据源。
+/// 未注册（指针为 0）返回 None：调用方必须显式处理缺席，禁止编造缺省分辨率
+/// （vfs1 R1 / kernel1 KM12：虚构 1024x768 已废除）。刷新率 Limine 不披露，
+/// 不在任何投影中输出。
+pub fn framebuffer_geometry() -> Option<(u64, u64, u64)> {
+    let p = FRAMEBUFFER_PTR.load(Ordering::Acquire);
+    if p == 0 {
+        return None;
+    }
+    // SAFETY：指针来自 init_display 阶段注册的 Limine framebuffer 描述符，
+    // bootloader 保证其生命周期覆盖整个内核运行期；此处只读前几个整型字段。
+    let fb: &limine::Framebuffer = unsafe { &*(p as *const limine::Framebuffer) };
+    Some((fb.width as u64, fb.height as u64, fb.bpp as u64))
 }

@@ -53,13 +53,17 @@ fn cmos_read(reg: u8) -> u8 {
     inb(CMOS_DATA)
 }
 
-/// 等待 RTC 更新完成（避免撕裂值）。最多轮询 ~2ms。
+/// 等待 RTC 更新完成（避免撕裂值）。
+///
+/// AD4 修正：上限为 **~20ms**（10,000 次轮询 × 每次 CMOS 端口读写约 2µs），
+/// 而非旧注释的 "~2ms"；正常更新周期 1ms 内完成，20ms 仅是防御性上界。
 fn wait_not_updating() {
-    for _ in 0..10_000 {
+    /// 轮询次数上界（每次迭代含一次状态寄存器端口读，约 2µs/次）。
+    const UIP_POLL_ROUNDS: usize = 10_000;
+    for _ in 0..UIP_POLL_ROUNDS {
         if cmos_read(REG_STATUS_A) & UIP == 0 {
             return;
         }
-        // 约 2us 一次，总计 ~20ms 上限（正常更新周期 1ms 内完成）。
     }
 }
 

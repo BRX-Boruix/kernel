@@ -18,8 +18,9 @@ use spin::Once;
 use allocator_core::{LazyBuddyAllocator, MAX_ORDER, ORDER_4K};
 use percpu_cache::{FreeListTable, PerCpuCache, PerCpuCacheSet};
 
-pub use allocator_core::{ORDER_1G, ORDER_2M};
-pub use compact::compact_now;
+pub use allocator_core::{FRAME_SIZE_BYTES, HUGE_FRAME_SIZE_BYTES, ORDER_1G, ORDER_2M};
+pub use compact::{compact_now, ipi_drain_current_cpu, set_remote_drain};
+pub use init::dropped_uninit_frames;
 pub use refcount::{count as frame_refcount, decref as frame_decref, incref as frame_incref};
 pub use stats::reset_stats as reset_frame_stats;
 pub use stats::{FrameAllocatorStats, PmmFragStats, frag_stats, reset_stats, stats};
@@ -120,8 +121,15 @@ pub fn allocate_frames(order: usize) -> Option<PhysFrame> {
 
 /// Deallocate a physical frame
 ///
-/// 先递减引用计数；仅当引用降到 0 才真正归还物理帧分配器（COW 安全）。
+/// **先校验后变更**（审计 #7）：pfn 越界/孔洞检查必须发生在任何帧元数据
+/// 解引用（含 refcount 的 refs_cell）之前——孔洞地址流入引用计数即对
+/// null+offset 野指针 RMW。校验通过后先递减引用计数；仅当引用降到 0 才
+/// 真正归还物理帧分配器（COW 安全）。
 pub fn deallocate_frame(frame: PhysFrame) {
+    let pfn = frame.start_paddr() as usize / 4096;
+    if !ALLOCATOR.pfn_managed(pfn) {
+        return;
+    }
     if refcount::decref(frame.start_paddr()) {
         ALLOCATOR.deallocate(frame);
     }

@@ -1,11 +1,8 @@
 //! ACPI 表解析接线（T6）：把 ACPI 子系统登记到设备/驱动框架 DriverHub。
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, Ordering};
 use drv::{BusType, DeviceInfo, DeviceKind, DriverHub};
 use klib::info;
-
-/// 是否已成功初始化。
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// RSDP 版本（0 = 未初始化）。
 static RSDP_REVISION: AtomicU8 = AtomicU8::new(0);
@@ -32,7 +29,6 @@ pub fn init() {
             DSDT_ADDR.store(info.dsdt_addr, Ordering::Release);
             PM1A_CNT.store(info.pm1a_cnt, Ordering::Release);
             PM1B_CNT.store(info.pm1b_cnt, Ordering::Release);
-            INITIALIZED.store(true, Ordering::Release);
 
             DriverHub::register_device_info(
                 DeviceInfo {
@@ -85,10 +81,26 @@ pub fn init() {
     }
 }
 
-/// 返回 HPET 物理基址与时钟周期（飞秒）。
-pub fn hpet_info() -> (u64, u64) {
+/// 返回 HPET 物理基址与时钟周期（飞秒）；无 HPET 表时为 `None`。
+///
+/// KM11：原 `(0, 0)` 元组哨兵改为 `Option`——"没有"是独立于取值域的状态，
+/// 用魔法零值表达会把合法基址 0（理论可映射）与缺失混为一谈。
+pub fn hpet_info() -> Option<(u64, u64)> {
+    let base = HPET_BASE.load(Ordering::Acquire);
+    let period = HPET_PERIOD_FS.load(Ordering::Acquire);
+    if base == 0 || period == 0 {
+        None
+    } else {
+        Some((base, period))
+    }
+}
+
+/// FADT 解析产物观测出口（审计 B25：短表分级解析此前零测试佐证）。
+/// 返回 `(fadt_phys, dsdt_phys, pm1a_port)`；未初始化/解析失败时为全 0。
+pub fn fadt_summary() -> (u64, u64, u16) {
     (
-        HPET_BASE.load(Ordering::Acquire),
-        HPET_PERIOD_FS.load(Ordering::Acquire),
+        FADT_ADDR.load(Ordering::Acquire),
+        DSDT_ADDR.load(Ordering::Acquire),
+        PM1A_CNT.load(Ordering::Acquire),
     )
 }

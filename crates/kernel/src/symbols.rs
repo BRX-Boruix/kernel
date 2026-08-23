@@ -11,6 +11,27 @@ use core::str;
 
 include!("symbols_generated.rs");
 
+/// 符号表快照是否陈旧（KM13）。
+///
+/// `SYMBOLS_EPOCH` 由 SDK 构建路径写入生成文件（本次构建的唯一标识），
+/// `BORUIX_SYMBOLS_BUILD_EPOCH` 由 build.rs 从同一构建的环境注入。两者相等
+/// 才能证明"嵌入符号表与本二进制同源"。直连 `cargo build` 使用 checked-in
+/// 快照时两者必然失配——此时 .text 布局可能已漂移，panic 回溯会给出**错误
+/// 函数名**（比空表更有害），故必须在启动横幅如实告警。
+pub fn snapshot_stale() -> bool {
+    /// 环境变量缺失/不可解析时的裁决值（审计 B11）：取 u64::MAX = **恒判
+    /// 陈旧**。解析失败意味着构建环境注入链断裂，符号表来源不可证——
+    /// 宁可每次启动多打一条陈旧告警（诚实），也绝不借"恰好等于 0"静默
+    /// 伪装成同源（S09：解析失败归零与真值 0 混淆正是该红线禁止的）。
+    /// 与 parse_ms 的编译期 assert 同一纪律家族。
+    const UNPARSEABLE_EPOCH: u64 = u64::MAX;
+    const BUILD_EPOCH: u64 = match u64::from_str_radix(env!("BORUIX_SYMBOLS_BUILD_EPOCH"), 10) {
+        Ok(v) => v,
+        Err(_) => UNPARSEABLE_EPOCH,
+    };
+    SYMBOLS_EPOCH != BUILD_EPOCH
+}
+
 /// 一个 `fmt::Write`，写入固定大小的字节缓冲（栈上）。
 pub struct BufWriter<'a> {
     pub buf: &'a mut [u8],

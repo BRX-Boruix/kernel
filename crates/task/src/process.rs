@@ -34,13 +34,17 @@ use mm::user_space::UserAddressSpace;
 static CURRENT_PROC: AtomicUsize = AtomicUsize::new(0);
 
 /// 进程缺页处理入口：转发给当前运行进程的 UserAddressSpace::handle_page_fault。
+///
+/// extern "C" ABI 边界（arch 中断链交付裸错误码）；位解读在边界处一次完成——
+/// 包装为 x86_64 的语义视图类型后再进入 mm 策略层（MM6：mm 不手解位编码）。
 pub extern "C" fn process_page_fault_handler(vaddr: u64, error_code: u64) -> bool {
     let p = CURRENT_PROC.load(Ordering::Acquire);
     if p == 0 {
         return false;
     }
     let proc = unsafe { &mut *(p as *mut Process<X86PageTable>) };
-    proc.addr_space_mut().handle_page_fault(vaddr, error_code)
+    let code = arch_x86_64::paging::PageFaultCode::new(error_code);
+    proc.addr_space_mut().handle_page_fault(vaddr, code)
 }
 
 /// 记录当前运行进程（`run` 进入用户态前设置）。
@@ -110,6 +114,15 @@ impl<PT: PageTable> Process<PT> {
         kernel_stack_top: u64,
         addr_space: UserAddressSpace<PT>,
     ) -> Self {
+        // KM1：三条标准流是**真实的表内句柄**（0=stdin 键盘源、1=stdout、
+        // 2=stderr，均由 vfs::stdio 提供）——syscall 层不再有 fd 号特判，
+        // "保留 0/1/2"从跨 crate 心照不宣变为结构事实。close 保护仍是
+        // syscall 层显式策略：无 dup/redirect 机制前关闭标准流不可恢复。
+        let fd_table = alloc::vec![
+            Some(vfs::stdio::stdin_handle()),
+            Some(vfs::stdio::stdout_handle()),
+            Some(vfs::stdio::stderr_handle()),
+        ];
         Process {
             pid,
             state: TaskState::Ready,
@@ -118,25 +131,39 @@ impl<PT: PageTable> Process<PT> {
             kernel_stack_top,
             entry_rip,
             user_stack_top,
-            fd_table: Vec::new(),
+            fd_table,
         }
     }
 
+    /// 每进程文件描述符上限（KA7/S33 量化：POSIX NOFILE 传统量级）。
+    ///
+    /// 无上限的 Vec 增长允许用户循环 open 无限吃内核堆——单进程资源消耗
+    /// 必须有显式边界。超限返回 `Error::NoSpace`（ENOSPC，错误表"表满"语义，
+    /// 映射决策成文；klib 无 EMFILE，取语义最近项）。
+    pub const MAX_FDS: usize = 1024;
+
     /// 分配新的文件描述符（返回分配的 fd 编号）。
-    pub fn alloc_fd(&mut self, handle: vfs::file_handle::FileHandle) -> usize {
+    ///
+    /// KM1：0/1/2 槽位由 [`Process::new`] 装入标准流句柄，扫描自然跳过
+    /// 占用槽——不再需要 `fd >= 3` 魔法数字条件。
+    /// KA7：无空槽且表长已达 [`Self::MAX_FDS`] 时如实上抛
+    /// [`Error::NoSpace`]，绝不无界增长；已关闭槽位的复用不受上限挤压。
+    pub fn alloc_fd(
+        &mut self,
+        handle: vfs::file_handle::FileHandle,
+    ) -> Result<usize, klib::error::Error> {
         for (fd, slot) in self.fd_table.iter_mut().enumerate() {
-            // 跳过 0, 1, 2（保留给标准 IO）
-            if fd >= 3 && slot.is_none() {
+            if slot.is_none() {
                 *slot = Some(handle);
-                return fd;
+                return Ok(fd);
             }
         }
-        while self.fd_table.len() < 3 {
-            self.fd_table.push(None);
+        if self.fd_table.len() >= Self::MAX_FDS {
+            return Err(klib::error::Error::NoSpace);
         }
         let fd = self.fd_table.len();
         self.fd_table.push(Some(handle));
-        fd
+        Ok(fd)
     }
 
     /// 获取指定 fd 句柄的只读引用。

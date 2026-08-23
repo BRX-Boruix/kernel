@@ -18,6 +18,10 @@
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+extern crate alloc;
+
+use alloc::string::String;
+
 /// 控制台输出接口：每种输出设备（串口、framebuffer 终端…）实现一份。
 pub trait Console {
     /// 设备名（调试/统计用）。
@@ -30,6 +34,17 @@ pub trait Console {
     fn write_byte(&self, b: u8) {
         let s = core::str::from_utf8(core::slice::from_ref(&b)).unwrap_or("\u{FFFD}");
         self.write_str(s);
+    }
+
+    /// 输出**原始字节流**（K5 完全体）。
+    ///
+    /// 字节透明设备（串口）覆写本方法原样发出，用户输出数据零销毁；
+    /// 纯文本设备（framebuffer 终端）保持缺省实现——整段按 UTF-8 lossy
+    /// 转换后走 [`Console::write_str`]，这是文本介质的固有约束而非数据
+    /// 销毁决策。stdout 字节路径经此方法下发。
+    fn write_bytes(&self, bytes: &[u8]) {
+        let s = String::from_utf8_lossy(bytes);
+        self.write_str(&s);
     }
 
     /// 冲刷（对带缓冲设备有用；默认空操作）。
@@ -139,6 +154,24 @@ pub fn write_str(s: &str) {
                 core::mem::transmute::<(usize, usize), &'static dyn Console>((data, vtable))
             };
             c.write_str(s);
+        }
+    }
+}
+
+/// 把**原始字节流**输出到所有已注册 sink（K5 完全体：stdout 字节路径）。
+///
+/// 字节透明 sink（串口）原样发出；文本 sink 经各自 lossy 缺省转换。
+/// 转发纪律与 [`write_str`] 一致：只转发、不跨 sink 持锁。
+pub fn write_bytes(bytes: &[u8]) {
+    let n = SINK_COUNT.load(Ordering::Acquire);
+    for i in 0..n {
+        let data = SINKS[i].data.load(Ordering::Acquire);
+        if data != 0 {
+            let vtable = SINKS[i].vtable.load(Ordering::Acquire);
+            let c: &'static dyn Console = unsafe {
+                core::mem::transmute::<(usize, usize), &'static dyn Console>((data, vtable))
+            };
+            c.write_bytes(bytes);
         }
     }
 }

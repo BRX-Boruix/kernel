@@ -209,8 +209,19 @@ global_asm!(
     isr_noerr 46
     isr_noerr 47
 
+    // MA1b：IPI 邮箱向量（0x40）。跨核 per-CPU 缓存排空的投递通道。
+    isr_noerr 64
+
+    // KA1：跨核停机向量（0x41）。panic 现场广播给其它 CPU，收到即永久停机。
+    isr_noerr 65
+
     // 软件中断 0x80（无错误码）：用户态软中断/系统调用入口（M2.5.4 / M3）。
     isr_noerr 128
+
+    // LAPIC 伪中断向量 255（0xFF，无错误码）：SVR 使能后伪中断会以此向量
+    // 送达 CPU，IDT 必须存在对应表项——否则查表越界触发 #GP → #DF 级联停机
+    // （arch1.md AA3）。处理策略在 Rust 分发端：按规范不发送 EOI、静默返回。
+    isr_noerr 255
 
     .global x86_64_load_idt
     x86_64_load_idt:
@@ -492,6 +503,18 @@ pub fn register_user_exception_handler(h: UserExceptionHandler) {
     let _ = USER_EXCEPTION_HANDLER.call_once(|| h);
 }
 
+/// 内核态 #PF 检查器（KA3）：内核态缺页进入通用"CPU EXCEPTION 停机"路径
+/// **之前**调用。返回 `true` 表示检查器已完全处置（如识别为内核栈守护页
+/// 命中并停机报告），分发端直接返回；`false` 落入通用致命路径。
+/// 架构层不认识内核符号布局，故经函数指针注入。
+pub type KernelFaultInspector = fn(cr2: u64) -> bool;
+static KERNEL_FAULT_INSPECTOR: spin::Once<KernelFaultInspector> = spin::Once::new();
+
+/// 注册内核态 #PF 检查器（kernel 层启动早期调用一次）。
+pub fn register_kernel_fault_inspector(f: KernelFaultInspector) {
+    let _ = KERNEL_FAULT_INSPECTOR.call_once(|| f);
+}
+
 /// 调度器 tick 回调（M4.2）：每次 LAPIC 定时器中断（IRQ0）后调用。
 ///
 /// 由调度器注册（kernel 层）。回调持有 `&mut InterruptFrame`，可**整体改写**
@@ -508,6 +531,100 @@ pub fn register_scheduler_tick(h: SchedulerTickHandler) {
     SCHEDULER_TICK.store(h as usize, Ordering::SeqCst);
 }
 
+/// IPI 邮箱向量（MA1b）：跨核请求的投递通道（当前唯一用途 = per-CPU 缓存
+/// 排空请求）。避开 32..47（8259 IRQ 重映射区）与 0x80（syscall）。
+pub const IPI_VECTOR: u8 = 0x40;
+
+/// 跨核停机向量（KA1）：panic 现场广播给其它 CPU，收到即永久停机。
+/// 与 IPI_VECTOR 同避让纪律。
+pub const IPI_HALT_VECTOR: u8 = 0x41;
+
+/// x86-64 异常向量号（SDM Vol.3 §6.3.1）：页错误（#PF，有错误码 + CR2）。
+/// 分发路径按此号路由补页回调 / 内核故障检查器 / CR2 打印。
+pub const VECTOR_PAGE_FAULT: u64 = 14;
+
+/// x86-64 异常向量号（SDM Vol.3 §6.3.1）：双重错误（#DF，有错误码，
+/// IST 切换）。打印时附带内核栈溢出提示。
+pub const VECTOR_DOUBLE_FAULT: u64 = 8;
+
+/// IPI 到达回调（MA1b）：目标 CPU 在中断上下文执行（中断门，IF 已关）。
+/// 回调须短小、不睡眠、只触碰本 CPU 私有数据。
+pub type IpiHandler = fn();
+static IPI_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
+/// 注册 IPI 到达回调（kernel 层把 mm 的"排空本核缓存"接进来）。
+pub fn register_ipi_handler(h: IpiHandler) {
+    IPI_HANDLER.store(h as usize, Ordering::SeqCst);
+}
+
+fn dispatch_ipi() {
+    let f = IPI_HANDLER.load(Ordering::Acquire);
+    if f != 0 {
+        // 指针来自 register_ipi_handler 写入的合法 'static 函数地址。
+        let h = unsafe { core::mem::transmute::<usize, IpiHandler>(f) };
+        h();
+    }
+    // Fixed IPI 置位 ISR，必须 EOI，否则后续同向量中断被 LAPIC 挂起。
+    crate::lapic::end_of_interrupt();
+}
+
+/// 跨核停机处理（KA1）：中断门下 IF 已关，hlt 永久睡眠——本核不再参与任何
+/// 执行，直到下一次 CPU Reset。不 EOI：无恢复路径，挂起位无意义。
+fn dispatch_ipi_halt() -> ! {
+    loop {
+        // SAFETY: 特权指令停机；中断已被中断门关闭，hlt 永久阻塞。
+        unsafe { core::arch::asm!("hlt") }
+    }
+}
+
+/// LAPIC 伪中断向量（SVR 低 8 位）。
+///
+/// 伪中断到达时 ISR 位**不置位**，按 Intel SDM §10.9 不需要 EOI；处理器只
+/// 要求 IDT 存在该向量的表项。分发到此向量时静默返回即可。
+pub const SPURIOUS_VECTOR: u16 = 0xFF;
+
+/// 裸串口格式化输出（AM7）：绕过 klib console sink 链与全部锁，供致命异常
+/// 诊断使用。栈上 128B 缓冲、零堆分配；截断优于死锁/丢诊断。
+fn raw_serial_fmt(args: core::fmt::Arguments) {
+    use core::fmt::Write as _;
+    /// 单行诊断缓冲上限：异常字段（名称/十六进制值）最长不超过此值。
+    const RAW_DIAG_CAP: usize = 128;
+    struct RawWriter<'a> {
+        buf: &'a mut [u8],
+        len: usize,
+    }
+    impl core::fmt::Write for RawWriter<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let room = self.buf.len() - self.len;
+            let mut n = bytes.len().min(room);
+            // 审计 B23：截断必须落在 UTF-8 字符边界——多字节序列被拦腰截断
+            // 后，下方 from_utf8_unchecked 即 UB。UTF-8 续字节特征 (b & 0xC0)
+            // == 0x80：n 回退到首字节为止。当前全部实参为 ASCII 十六进制/
+            // 字段名（边界天然成立），此处回退是契约的机器强制而非信任。
+            while n > 0 && bytes[n] & 0xC0 == 0x80 {
+                n -= 1;
+            }
+            self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+            self.len += n;
+            Ok(())
+        }
+    }
+    let mut buf = [0u8; RAW_DIAG_CAP];
+    let len = {
+        let mut w = RawWriter {
+            buf: &mut buf,
+            len: 0,
+        };
+        let _ = w.write_fmt(args);
+        w.len
+    };
+    // 截断回退可能把 len 停在缓冲内已有内容的字符中间？不会——每次
+    // write_str 只追加完整 &str 或其字符边界前缀，len 永远停在边界。
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[..len]) };
+    crate::serial::write_str(s);
+}
+
 /// 分发入口（由汇编 `interrupt_common_stub` 调用）。
 ///
 /// `frame` 指向保存的寄存器区。
@@ -516,11 +633,29 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
     let frame = unsafe { &mut *frame };
     let vector = frame.vector;
 
+    if vector == SPURIOUS_VECTOR as u64 {
+        // LAPIC 伪中断：无 ISR 位、无需 EOI，静默吞掉（arch1.md AA3）。
+        // 不走外部中断路径：该路径按 (vector-32) 索引 16 项 IRQ 表并给 8259
+        // 发 EOI，对 0xFF 全部不适用。
+        return;
+    }
+
+    if vector == IPI_VECTOR as u64 {
+        // MA1b：IPI 邮箱——回调处理本核请求后向 LAPIC EOI。
+        dispatch_ipi();
+        return;
+    }
+
+    if vector == IPI_HALT_VECTOR as u64 {
+        // KA1：跨核停机请求——永久停住本核（不返回）。
+        dispatch_ipi_halt();
+    }
+
     if vector < 32 {
         // CPU 异常：先关中断，避免嵌套
         disable();
 
-        if vector == 14 {
+        if vector == VECTOR_PAGE_FAULT {
             // 页错误：仅**用户态**缺页交给已注册的 #PF 回调（按需分页 / COW）。
             // 内核态 #PF（含 SMAP/SMEP 违规、访问未映射内核地址）一律视为致命
             // 错误，不交给用户态补页处理器——否则可能被 `cow_pages` 记账误命中
@@ -546,24 +681,38 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             }
         }
 
-        // 内核态异常（或未注册用户态处理器）：打印并停机
-        klib::info!("");
-        klib::info!("========== CPU EXCEPTION ==========");
-        klib::info!("exception: {}", exception_name(vector as u8));
-        klib::info!("  vector: {:#x}", vector);
-        klib::info!("  rip:    {:#x}", frame.rip);
-        if vector == 14 {
+        // KA3：内核态 #PF 先过注册的检查器（如内核栈守护页识别）。检查器
+        // 处置完毕（返回 true）则不再落入下方通用致命路径。
+        if frame.cs & 3 == 0 && vector == VECTOR_PAGE_FAULT {
+            let cr2 = crate::mmio::cr2();
+            if let Some(insp) = KERNEL_FAULT_INSPECTOR.get() {
+                if insp(cr2) {
+                    return;
+                }
+            }
+        }
+
+        // 内核态异常（或未注册用户态处理器）：打印并停机。
+        // AM7：诊断走**裸串口**而非 klib::info!——后者经 console sink 注册链
+        // 与各 sink 锁；若崩溃根源正是 console/锁/堆，这条链可能死锁或丢字，
+        // 违背"停机前必有诊断"的自我承诺。裸串口是同 crate 内最短依赖路径，
+        // 不经过任何锁与堆。
+        raw_serial_fmt(format_args!("\n========== CPU EXCEPTION ==========\n"));
+        raw_serial_fmt(format_args!("exception: {}\n", exception_name(vector as u8)));
+        raw_serial_fmt(format_args!("  vector: {:#x}\n", vector));
+        raw_serial_fmt(format_args!("  rip:    {:#x}\n", frame.rip));
+        if vector == VECTOR_PAGE_FAULT {
             let cr2 = crate::mmio::cr2();
             // 未注册/未处理/内核态：打印 CR2 并停机
-            klib::info!("  cr2:    {:#x}", cr2);
-            klib::info!("  error:  P={:#x}", frame.error_code);
+            raw_serial_fmt(format_args!("  cr2:    {:#x}\n", cr2));
+            raw_serial_fmt(format_args!("  error:  P={:#x}\n", frame.error_code));
         }
-        if vector == 8 {
+        if vector == VECTOR_DOUBLE_FAULT {
             // Double Fault：打印错误码（0 表示外部中断/软件引起的 DF）
-            klib::info!("  error:  {:#x}", frame.error_code);
-            klib::info!("  (Double Fault - possible kernel stack overflow)");
+            raw_serial_fmt(format_args!("  error:  {:#x}\n", frame.error_code));
+            raw_serial_fmt(format_args!("  (Double Fault - possible kernel stack overflow)\n"));
         }
-        klib::info!("==================================");
+        raw_serial_fmt(format_args!("==================================\n"));
         crate::halt_forever();
     } else if vector == 0x80 {
         // 软中断：交给已注册的 handler（M2.5.4 进入用户态冒烟 / M3 syscall 雏形）。
@@ -572,7 +721,8 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
                 return; // 已处理，iretq 返回触发点
             }
         }
-        klib::info!("========== UNHANDLED SOFT INTERRUPT (0x80) ==========");
+        // AM7：致命诊断走裸串口（理由见上方 CPU EXCEPTION 分支注释）。
+        raw_serial_fmt(format_args!("========== UNHANDLED SOFT INTERRUPT (0x80) ==========\n"));
         crate::halt_forever();
     } else {
         // 外部中断（32..47 → IRQ0..15）。共享中断：依次调用该 IRQ 的全部
@@ -637,8 +787,16 @@ unsafe extern "C" {
 ///
 /// bootloader（Limine）可能以 lazy-FPU 方式启动，CR0.TS=1。此时任何 x87/MMX/SSE
 /// 指令都会触发 #NM（Device Not Available）异常。内核未实现 FPU 惰性切换，
-/// 这里直接清除 TS，让浮点指令始终可用（单核下无需保存/恢复 FPU 状态）。
-/// 同时置 MP（monitor coprocessor）与 NE（native error），规范 FPU 行为。
+/// 这里直接清除 TS，让浮点指令始终可用；同时置 MP（monitor coprocessor）
+/// 与 NE（native error），规范 FPU 行为。
+///
+/// 并发前提（arch1.md AM1 修正：原注释误称"单核下无需保存/恢复"）：本内核
+/// 当前**没有任何上下文使用 FPU 状态跨切换存活**——内核代码不碰浮点，用户
+/// 进程由静态 ELF 加载器生成且当前不发射 SSE 依赖的用户代码路径，AP 空转
+/// 循环亦不执行浮点指令。因此"不清 TS、不做保存/恢复"在现状下偶然安全。
+/// 一旦任何执行流开始真实使用浮点/SSE，必须先实现 per-task FPU 状态保存
+/// （XSAVE/XRSTOR 或 lazy #NM 切换），届时本函数的语义需重新设计——这不是
+/// 设计保证，而是现状记录。
 pub fn enable_fpu() {
     unsafe {
         let cr0: u64;
@@ -694,7 +852,7 @@ pub fn init() {
         // 避免异常处理中再次异常导致 Triple Fault 重启。其余不用 IST（0）。
         for vector in 0..32u16 {
             let handler = get_isr_addr(vector);
-            let ist = if vector == 8 { IST_DF as u8 } else { 0 };
+            let ist = if vector == VECTOR_DOUBLE_FAULT as u16 { IST_DF as u8 } else { 0 };
             (*idt_ptr).entries[vector as usize].set_handler(handler, IDT_FLAG_TRAP, ist);
         }
         // 32~47：外部中断，中断门（不用 IST）
@@ -706,12 +864,41 @@ pub fn init() {
         // 用户态 `int 0x80` 可触发进入内核。
         let handler = get_isr_addr(0x80);
         (*idt_ptr).entries[0x80].set_handler(handler, IDT_FLAG_TRAP_USER, 0);
+        // 0xFF：LAPIC 伪中断向量（arch1.md AA3）。SVR 使能该向量后，伪中断
+        // 到达时 CPU 照常查 IDT；缺表项 = #GP → #DF 级联停机。中断门 + 分发端
+        // 静默返回（无需 EOI）。
+        let handler = get_isr_addr(SPURIOUS_VECTOR);
+        (*idt_ptr).entries[SPURIOUS_VECTOR as usize].set_handler(handler, IDT_FLAG_INTERRUPT, 0);
+        // MA1b：IPI 邮箱向量 0x40。中断门；分发端调用注册回调后向 LAPIC EOI。
+        let handler = get_isr_addr(IPI_VECTOR as u16);
+        (*idt_ptr).entries[IPI_VECTOR as usize].set_handler(handler, IDT_FLAG_INTERRUPT, 0);
+        // KA1：跨核停机向量 0x41。中断门；收到即永久停机（无需 EOI——本核
+        // 不再恢复执行）。
+        let handler = get_isr_addr(IPI_HALT_VECTOR as u16);
+        (*idt_ptr).entries[IPI_HALT_VECTOR as usize].set_handler(handler, IDT_FLAG_INTERRUPT, 0);
 
-        let idtr = Idtr {
-            limit: (core::mem::size_of::<Idt>() - 1) as u16,
-            base: idt_ptr as u64,
-        };
+        let idtr = build_idtr();
         x86_64_load_idt(&idtr as *const Idtr);
+    }
+}
+
+/// MA1b：在**当前 CPU** 上重新加载全局 IDT。
+///
+/// IDT 内存是全体 CPU 共享的静态表，但 IDTR 是 per-CPU 寄存器——AP 在
+/// `ap_entry` 中必须自行 `lidt`，否则该核上任何中断（含 IPI）都查不到
+/// 向量表直落三重故障。须在开中断之前调用。
+pub fn reload_idt_current_cpu() {
+    unsafe {
+        let idtr = build_idtr();
+        x86_64_load_idt(&idtr as *const Idtr);
+    }
+}
+
+/// 构造指向共享静态 IDT 的 IDTR。
+fn build_idtr() -> Idtr {
+    Idtr {
+        limit: (core::mem::size_of::<Idt>() - 1) as u16,
+        base: &raw const IDT as u64,
     }
 }
 
@@ -770,6 +957,9 @@ fn get_isr_addr(vector: u16) -> u64 {
         fn isr_45();
         fn isr_46();
         fn isr_47();
+        fn isr_64();
+        fn isr_65();
+        fn isr_255();
     }
 
     const HANDLERS: [unsafe extern "C" fn(); 48] = [
@@ -783,6 +973,18 @@ fn get_isr_addr(vector: u16) -> u64 {
     // 软中断向量 0x80 使用独立的 isr_128 入口。
     if vector == 0x80 {
         return isr_128 as *const () as usize as u64;
+    }
+    // MA1b：IPI 邮箱向量 0x40（isr_64）。
+    if vector == IPI_VECTOR as u16 {
+        return isr_64 as *const () as usize as u64;
+    }
+    // KA1：跨核停机向量 0x41（isr_65）。
+    if vector == IPI_HALT_VECTOR as u16 {
+        return isr_65 as *const () as usize as u64;
+    }
+    // 伪中断向量 0xFF 同样在固定表之外（isr_255）。
+    if vector == SPURIOUS_VECTOR {
+        return isr_255 as *const () as usize as u64;
     }
     HANDLERS[vector as usize] as *const () as usize as u64
 }

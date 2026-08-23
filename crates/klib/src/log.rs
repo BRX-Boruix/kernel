@@ -121,9 +121,15 @@ pub fn __log(level: LogLevel, args: fmt::Arguments) {
 /// 按从旧到新的顺序回读环形日志缓冲（读后清空）。
 ///
 /// 用于 panic/崩溃时打印最后 N 条日志。输出到统一 console。
+/// 锁语义：环形缓冲被其它上下文持有时**跳过回读**而非自旋——panic 路径可能
+/// 正是那个持锁者中断路径的受害者，自旋等自己 = 永久死锁（kernel1.md KA1）。
+/// 代价是崩溃现场缺一段日志，可接受；主诊断（panic 消息 + 回溯）不经过此锁。
 pub fn dump_crash_log() {
     use core::fmt::Write as _;
-    let ring = LOG_RING.lock();
+    let Some(ring) = LOG_RING.try_lock() else {
+        crate::console::write_str("[crashlog] ring buffer lock held; skipping dump\n");
+        return;
+    };
     let mut out = [0u8; LINE_CAP * 4];
     let mut w = crate::console::StackWriter {
         buf: &mut out,

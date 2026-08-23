@@ -177,6 +177,14 @@ impl LazyBuddyAllocator {
                 break;
             }
 
+            // 守卫：buddy 可能落在**无元数据的内存孔洞**（memmap 中不可用的
+            // 区段，其块元数据从未分配）。孔洞邻居不可合并——解引用空元数据
+            // 即近空指针崩溃。本基准设施（S33）的碎片化负载首次踩爆此潜伏缺陷：
+            // api.rs 的 deallocate 入口有同款检查，合并路径此前缺失。
+            if unsafe { self.block_ptr(buddy_pfn / cfg.frames_per_block) }.is_null() {
+                break;
+            }
+
             let pfn_shard = Self::shard_for_pfn(pfn);
             let buddy_shard = Self::shard_for_pfn(buddy_pfn);
 

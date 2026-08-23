@@ -1,4 +1,4 @@
-use spin::{Mutex, Once};
+use spin::Once;
 
 use super::allocator_core::MAX_ORDER;
 
@@ -62,7 +62,11 @@ impl FreeList {
 }
 
 pub(crate) struct FreeListShards {
-    pub(crate) shards: [Mutex<FreeList>; super::allocator_core::SHARD_COUNT],
+    /// 分片链表锁必须**中断安全**（审计 #5）：跨核排空 IPI 在目标核的
+    /// 中断上下文里取这些锁合并空闲帧；若为普通 Mutex，目标核进程上下文
+    /// 持任一分片锁瞬间被 IPI 打断即自旋等自己被抢占上下文的锁——该核
+    /// 永久硬挂。IrqSpinLock 令持锁期间 IF=0，IPI 只能等锁释放后再入。
+    pub(crate) shards: [klib::sync::irq::IrqSpinLock<FreeList>; super::allocator_core::SHARD_COUNT],
 }
 
 pub(crate) struct FreeListTable {
@@ -81,7 +85,7 @@ impl ReserveList {
 
 impl FreeListShards {
     pub(crate) fn new() -> Self {
-        let shards = core::array::from_fn(|_| Mutex::new(FreeList::new()));
+        let shards = core::array::from_fn(|_| klib::sync::irq::IrqSpinLock::new(FreeList::new()));
         Self { shards }
     }
 }

@@ -38,12 +38,27 @@ pub enum Error {
     IsDirectory,
     /// 权限拒绝。
     PermissionDenied,
+    /// 坏地址：用户缓冲区未映射 / 未驻留 / 对访问意图权限不足（EFAULT）。
+    ///
+    /// 与 [`Error::OutOfRange`] 的分界：OutOfRange 是**参数值本身**超出允许
+    /// 区间（如指针落在内核半区）；BadAddress 是区间合法但**页表不支持本次
+    /// 访问**（未分配、按需页未触碰、只读页遇写意图）。syscall 层的用户缓冲
+    /// 预校验（arch1.md AR1a）以此错误码上抛，替代"内核态 #PF 一律停机"。
+    BadAddress,
     /// 目录非空（删除非空目录）。
     NotEmpty,
     /// 文件名或路径超长。
     NameTooLong,
+    /// 参数列表超长（E2BIG）：exec 类调用的命令行超出内核单次拷贝上限。
+    /// KM5：静默截断会把被裁剪的命令行伪装成完整交付，宁可显式失败。
+    ArgListTooLong,
     /// 软链接层级过深（死循环）。
     TooManySymlinks,
+    /// 对不可定位的数据流（管道/终端/键盘等字符流）执行了定位访问
+    /// （ESPIPE）。KM17：stdio 特判路径收到非"顺序 I/O 哨兵"的显式偏移时
+    /// 以此拒绝——字符流没有"位置"可言，静默忽略偏移会把 pwrite/pread
+    /// 伪装成顺序读写。
+    IllegalSeek,
     /// 过渡用：携带原始错误描述字符串（迁移完成后移除）。
     Msg(&'static str),
 }
@@ -64,9 +79,12 @@ impl Error {
             Error::NotDirectory => 20,     // ENOTDIR
             Error::IsDirectory => 21,      // EISDIR
             Error::PermissionDenied => 13, // EACCES
+            Error::BadAddress => 14,       // EFAULT
             Error::NotEmpty => 39,         // ENOTEMPTY
             Error::NameTooLong => 36,      // ENAMETOOLONG
+            Error::ArgListTooLong => 7,    // E2BIG
             Error::TooManySymlinks => 40,  // ELOOP
+            Error::IllegalSeek => 29,      // ESPIPE
             Error::Msg(_) => 22,           // EINVAL
         }
     }
@@ -94,9 +112,12 @@ impl core::fmt::Display for Error {
             Error::NotDirectory => f.write_str("not a directory"),
             Error::IsDirectory => f.write_str("is a directory"),
             Error::PermissionDenied => f.write_str("permission denied"),
+            Error::BadAddress => f.write_str("bad address"),
             Error::NotEmpty => f.write_str("directory not empty"),
             Error::NameTooLong => f.write_str("name too long"),
+            Error::ArgListTooLong => f.write_str("argument list too long"),
             Error::TooManySymlinks => f.write_str("too many levels of symbolic links"),
+            Error::IllegalSeek => f.write_str("illegal seek"),
             Error::Msg(s) => f.write_str(s),
         }
     }
@@ -139,8 +160,12 @@ mod tests {
         assert_eq!(Error::InvalidParam.to_errno(), 22); // EINVAL
         assert_eq!(Error::NotFound.to_errno(), 2); // ENOENT
         assert_eq!(Error::AlreadyExists.to_errno(), 17); // EEXIST
+        assert_eq!(Error::BadAddress.to_errno(), 14); // EFAULT
         assert_eq!(Error::NoSpace.to_errno(), 28); // ENOSPC
         assert_eq!(Error::Io.to_errno(), 5); // EIO
+        assert_eq!(Error::NameTooLong.to_errno(), 36); // ENAMETOOLONG
+        assert_eq!(Error::ArgListTooLong.to_errno(), 7); // E2BIG
+        assert_eq!(Error::IllegalSeek.to_errno(), 29); // ESPIPE
         assert_eq!(Error::Msg("x").to_errno(), 22); // EINVAL
     }
 

@@ -13,7 +13,8 @@
 //!   适合 PCI BAR 等任意对齐、小块设备寄存器。
 
 use crate::paging::{
-    ADDR_MASK, FLAG_LARGE, FLAG_PRESENT, FLAG_WRITABLE, flush_tlb, index_at, page_levels,
+    ADDR_MASK, FLAG_LARGE, FLAG_PCD, FLAG_PRESENT, FLAG_WRITABLE, flush_tlb, index_at,
+    page_levels,
 };
 use arch::PageSize;
 use arch::phys_to_virt;
@@ -23,6 +24,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 const PAGE_2M: u64 = 0x20_0000;
 /// 4KB 页大小。
 const PAGE_4K: u64 = 0x1000;
+
+/// 设备 MMIO 映射统一虚拟基址（内核高半区）。
+///
+/// LAPIC/HPET 等 MMIO 区域不在 Limine HHDM 内（HHDM 只覆盖 RAM），由本模块
+/// 经 `map_phys*` 自行建立页表映射。所有设备映射的虚拟地址都必须落在同一
+/// 高半区基址上——此前 lapic/hpet 各自硬编码该常量（arch1.md AA2），偏移一变
+/// 两处同时静默错映射。取值 = bit47 置位的高半区起点，与
+/// [`crate::paging::KERNEL_HALF_START`]（顶层条目 256..512）的分界一致，
+/// 保证这些映射随内核半区在所有地址空间共享。
+pub const DEVICE_MMIO_VIRT_BASE: u64 = 0xffff_8000_0000_0000;
 
 // ---- MMIO volatile 访问原语（供 lapic、paging 等复用）----
 
@@ -134,9 +145,16 @@ pub fn map_phys(phys: u64, virt: u64, size: PageSize) -> bool {
         table_phys = next;
     }
 
-    // 设置叶层条目：物理地址 + present + writable（+ large 若大页）
+    // 设置叶层条目：物理地址 + present + writable（+ large 若大页）。
+    //
+    // 审计 B24：设备内存必须 **PCD（bit4，不可缓存）**——本函数的全部调用方
+    // （LAPIC、HPET、早期 MMIO）映射的都是寄存器窗口，读有副作用，缓存/
+    // 投机语义不可接受。此前未置 PCD 时正确性靠 MTRR 默认 UC 巧合兜底；
+    // 现在属性由映射点显式声明，与 paging.rs entry_from_flags 的
+    // device_memory 语义同源（SDM Vol.3 §11.5）。
     let leaf_idx = index_at(leaf_level, levels, virt);
-    let mut entry = (phys & !mask) | FLAG_PRESENT | FLAG_WRITABLE;
+    let mut entry =
+        (phys & !mask) | FLAG_PRESENT | FLAG_WRITABLE | FLAG_PCD;
     if large {
         entry |= FLAG_LARGE;
     }

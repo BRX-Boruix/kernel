@@ -10,7 +10,7 @@
 //! 硬件上 LAPIC id 可能稀疏（0,8,16,…）甚至超过槽位上限，直接用会冲突。
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
 use crate::gdt;
@@ -24,6 +24,16 @@ static SMP_REQUEST: SmpRequest = SmpRequest::new(0);
 
 /// 已启动的 CPU 数量（原子）。
 static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// AD5：因防御分支（槽位非法/资源未初始化/越界）自行停机的 AP 数。
+/// 供 BSP 超时归因：`wait_all_online` 缺口 = target - online，若
+/// `ap_self_halted() > 0` 则缺口中有已知自杀者（配置问题），而非纯启动慢。
+static AP_SELF_HALTED: AtomicUsize = AtomicUsize::new(0);
+
+/// 读取因防御分支自停的 AP 计数。
+pub fn ap_self_halted() -> usize {
+    AP_SELF_HALTED.load(Ordering::Acquire)
+}
 
 /// 系统总 CPU 数（由 init 记录）。
 static TOTAL_CPUS: AtomicUsize = AtomicUsize::new(1);
@@ -75,9 +85,31 @@ fn alloc_stack_frames(order: u32) -> u64 {
 /// 避免真机上稀疏 LAPIC id 对固定数取模产生冲突。
 static LAPIC_TO_SLOT: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
 
+/// 紧凑 CPU 槽位 → LAPIC id 反查表（MA1b：IPI 目标寻址需要从槽位还原
+/// LAPIC id）。槽位 0（BSP）由 init 写入，AP 在上线时写入自己的槽位。
+static SLOT_TO_LAPIC: [AtomicU32; 256] = [const { AtomicU32::new(u32::MAX) }; 256];
+
+/// 记录槽位 → LAPIC id 映射（BSP init 与 ap_entry 各写自己的槽位一次）。
+fn record_slot_lapic(slot: usize, lapic_id: u32) {
+    LAPIC_TO_SLOT[(lapic_id & 0xFF) as usize].store(slot, Ordering::Release);
+    SLOT_TO_LAPIC[slot & 0xFF].store(lapic_id, Ordering::Release);
+}
+
 /// 查询 LAPIC id 对应的紧凑 CPU 槽位。
 pub fn slot_of_lapic(lapic_id: u32) -> usize {
     LAPIC_TO_SLOT[(lapic_id & 0xFF) as usize].load(Ordering::Relaxed)
+}
+
+/// 查询紧凑 CPU 槽位对应的 LAPIC id（MA1b：IPI 目标寻址）。
+/// 未上线/非法槽位返回 `None`。
+pub fn lapic_id_of_slot(slot: usize) -> Option<u32> {
+    match SLOT_TO_LAPIC.get(slot) {
+        Some(v) => {
+            let id = v.load(Ordering::Acquire);
+            if id == u32::MAX { None } else { Some(id) }
+        }
+        None => None,
+    }
 }
 
 /// 从 Limine SMP 响应读取系统总 CPU 数（可在 `init` 前调用，用于预分配 per-CPU 结构）。
@@ -117,8 +149,11 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
     // 取出本 CPU 的 LAPIC id（用于日志 + 更新映射）
     let lapic_id = lapic::current_lapic_id();
 
-    // 防御：槽位非法/越界则停机，避免访问动态资源越界
+    // 防御：槽位非法/越界则停机，避免访问动态资源越界。
+    // AD5：自杀前原子上报——BSP 的 wait_all_online 超时归因需要区分
+    // "AP 还没起来"与"AP 起来了但发现配置非法而自停"。
     if slot == 0 {
+        AP_SELF_HALTED.fetch_add(1, Ordering::AcqRel);
         klib::info!("[smp] AP slot invalid (0): lapic={}", lapic_id as u64);
         loop {
             crate::interrupts::halt();
@@ -128,12 +163,14 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
 
     let resources = AP_RESOURCES.lock();
     let Some(res) = resources.as_ref() else {
+        AP_SELF_HALTED.fetch_add(1, Ordering::AcqRel);
         klib::info!("[smp] AP resources not initialized");
         loop {
             crate::interrupts::halt();
         }
     };
     if arr_idx >= res.kstack_paddrs.len() {
+        AP_SELF_HALTED.fetch_add(1, Ordering::AcqRel);
         klib::info!("[smp] AP slot out of range: {}", slot as u64);
         loop {
             crate::interrupts::halt();
@@ -152,10 +189,14 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
     );
     drop(resources);
 
-    // 记录本 CPU 的 LAPIC id → 槽位映射（供帧缓存索引）
-    LAPIC_TO_SLOT[(lapic_id & 0xFF) as usize].store(slot, Ordering::Release);
+    // 记录本 CPU 的 LAPIC id ↔ 槽位双向映射（供帧缓存索引与 IPI 寻址）
+    record_slot_lapic(slot, lapic_id);
 
     gdt::setup_cpu(gdt_ptr, tss_ptr, kstack_top, df_stack_top);
+
+    // MA1b：AP 必须自行加载共享 IDT——IDTR 是 per-CPU 寄存器，未加载时
+    // 本核任何中断（含 IPI）都查不到向量表直落三重故障。须在开中断前。
+    crate::interrupts::reload_idt_current_cpu();
 
     // AP 上也开启 SMEP/SMAP（CR4 是 per-CPU），与 BSP 保持一致的隔离策略。
     crate::cpu::enable_smep_smap();
@@ -255,7 +296,7 @@ pub fn init() {
     );
 
     // BSP 槽位 0（默认即 0，显式置位以便清晰）
-    LAPIC_TO_SLOT[(bsp_lapic & 0xFF) as usize].store(0, Ordering::Release);
+    record_slot_lapic(0, bsp_lapic);
 
     // BSP 计入（Release：保证后续 goto_address 写入对 AP 可见）
     CPU_COUNT.store(1, Ordering::Release);
@@ -308,6 +349,17 @@ pub fn wait_all_online(target: usize, timeout_ms: usize) -> usize {
     while cpu_count() < target {
         let elapsed = crate::lapic::ticks().saturating_sub(start_ticks);
         if elapsed >= timeout_ticks {
+            // AD5：超时时区分归因——有 AP 自杀（配置非法）与纯启动慢是
+            // 两类完全不同的故障，日志必须能分辨。
+            let halted = ap_self_halted();
+            if halted > 0 {
+                klib::warn!(
+                    "[smp] wait_all_online timeout: {} online / {} target, {} AP(s) self-halted on invalid config",
+                    cpu_count(),
+                    target,
+                    halted
+                );
+            }
             break;
         }
         core::hint::spin_loop();

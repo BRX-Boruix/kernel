@@ -301,19 +301,32 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
     set_current_proc(proc_ptr);
 }
 
+/// 调度切换动作结果（KA6：bool+frame 形状的枚举化收口）。
+///
+/// "是否已把 CPU 现场换成别的进程"必须由类型系统强制调用方处理——bool 返回值
+/// 可以被无视，漏翻成普通返回会把 rax=0 之类的值写进**下一进程**的保存现场
+/// （K1b 记录的原始事故）。`Switched` 分支下调用方禁止再触碰 frame。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SwitchOutcome {
+    /// 已切走：`*frame` 已整体替换为下一进程保存帧；调用方必须以"已切换"
+    /// 纪律收尾（syscall 层即 `DispatchResult::Switched`），不得再写 frame。
+    Switched,
+    /// 未切换：现场仍是当前进程，调用方可正常读写 frame 并回写返回值。
+    NotSwitched,
+}
+
 /// `yield()`：当前进程**主动**让出 CPU，切换到下一个就绪进程。
 ///
 /// 与 [`tick`] 的被动时间片切换不同，这是进程主动请求让出：保存当前帧并把
 /// 进程放回就绪队列尾，取下一个就绪进程切换。若就绪队列里只有当前进程
 /// （无可让出），则恢复 Running 继续运行——`yield` 对调用进程等价于空操作。
-/// 返回 `true` 表示已切换（frame 已被改写为下一进程帧）；`false` 表示未切换。
 ///
 /// `yield` 的返回值 `0` 写回当前进程帧再保存，故进程下次恢复时 `rax=0`，
 /// 用户态 `yield()` 正确返回 0。
-pub fn yield_now(frame: &mut InterruptFrame) -> bool {
+pub fn yield_now(frame: &mut InterruptFrame) -> SwitchOutcome {
     let mut s = SCHED.lock();
     let Some(cur_pid) = s.current else {
-        return false; // 内核 idle/主线程不参与让出
+        return SwitchOutcome::NotSwitched; // 内核 idle/主线程不参与让出
     };
 
     // 写回 yield 返回值 0，随 saved 保存；进程下次恢复时 rax=0。
@@ -326,7 +339,7 @@ pub fn yield_now(frame: &mut InterruptFrame) -> bool {
 
     // 从就绪队列取下一个。
     let Some(next_pid) = s.ready.pop_front() else {
-        return false; // 无可调度进程（不应发生）
+        return SwitchOutcome::NotSwitched; // 无可调度进程（不应发生）
     };
 
     if cur_pid == next_pid {
@@ -334,7 +347,7 @@ pub fn yield_now(frame: &mut InterruptFrame) -> bool {
         if let Some(slot) = s.procs[next_pid].as_mut() {
             slot.proc.set_state(TaskState::Running);
         }
-        return false;
+        return SwitchOutcome::NotSwitched;
     }
 
     // 切换到 next 进程（与 tick 相同的切换逻辑）。
@@ -348,7 +361,7 @@ pub fn yield_now(frame: &mut InterruptFrame) -> bool {
     arch_x86_64::mmio::write_cr3(cr3);
     gdt::set_rsp0(ktop);
     set_current_proc(proc_ptr);
-    true
+    SwitchOutcome::Switched
 }
 
 /// 阻塞当前进程（IPC 等待用）：保存帧并置 `Blocked`，切换到下一个就绪进程。
@@ -379,10 +392,22 @@ fn pop_ready(s: &mut Scheduler) -> Option<usize> {
     None
 }
 
-pub fn block_current(frame: &mut InterruptFrame) -> bool {
+/// 阻塞当前进程（IPC 等待用）：保存帧并置 `Blocked`，切换到下一个就绪进程。
+///
+/// 与 [`yield_now`] 不同，当前进程**不**放回就绪队列，而是置 `Blocked`（等待某
+/// 事件，如管道数据/空间）。需 [`wake`] 显式唤醒才回到就绪队列。
+///
+/// 返回 [`SwitchOutcome::NotSwitched`] 表示无可调度进程可切（就绪队列空，只有
+/// 当前进程）：此时**不应**阻塞（否则系统无进程能唤醒它，死锁），调用方应返回
+/// `WouldBlock` 等错误而非强行让出。`Switched` 表示已切走（frame 已改写为下一
+/// 进程帧，调用方不得再触碰）。
+///
+/// 注意：调用方**必须先释放**持有的 IPC 表锁再调用本函数（阻塞切走时若仍持锁，
+/// 下一进程会在同一把 IrqSpinLock 上自旋死锁）。
+pub fn block_current(frame: &mut InterruptFrame) -> SwitchOutcome {
     let mut s = SCHED.lock();
     let Some(cur_pid) = s.current else {
-        return false; // 内核 idle/主线程不参与阻塞
+        return SwitchOutcome::NotSwitched; // 内核 idle/主线程不参与阻塞
     };
     if let Some(slot) = s.procs[cur_pid].as_mut() {
         slot.saved = *frame;
@@ -390,14 +415,14 @@ pub fn block_current(frame: &mut InterruptFrame) -> bool {
     }
     // 取下一个有效就绪进程（跳过已退出残留引用）。
     let Some(next_pid) = pop_ready(&mut s) else {
-        return false; // 无可调度进程：调用方不应阻塞
+        return SwitchOutcome::NotSwitched; // 无可调度进程：调用方不应阻塞
     };
     if cur_pid == next_pid {
         // 仅当前进程自身：不阻塞（保持 Running 继续）。
         if let Some(slot) = s.procs[next_pid].as_mut() {
             slot.proc.set_state(TaskState::Running);
         }
-        return false;
+        return SwitchOutcome::NotSwitched;
     }
     let slot = s.procs[next_pid].as_mut().expect("ready proc exists");
     slot.proc.set_state(TaskState::Running);
@@ -409,33 +434,67 @@ pub fn block_current(frame: &mut InterruptFrame) -> bool {
     arch_x86_64::mmio::write_cr3(cr3);
     gdt::set_rsp0(ktop);
     set_current_proc(proc_ptr);
-    true
+    SwitchOutcome::Switched
 }
 
-/// 阻塞等待键盘输入的进程 pid（`u32::MAX` 表示无）。`sys_read` 缓冲空时登记，
-/// 键盘中断经回调 [`wake_kbd`] 唤醒。单 waiter（stdin 仅一个读者，即 shell）。
+/// 阻塞等待键盘输入的进程 pid（`u32::MAX` 表示无）。`block_for_kbd` 以 CAS
+/// 登记唯一等待者，键盘中断经回调 [`wake_kbd`] 唤醒；第二个并发 stdin 读者
+/// 得到 Busy（EAGAIN），不顶掉既有等待者。
 static KBD_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// [`block_for_kbd`] 的结果。
+pub enum BlockKbdOutcome {
+    /// 已切走：`frame` **整体**变为下一进程的保存帧。调用方必须以
+    /// `DispatchResult::Switched` 收尾，不得再写返回值（kernel1.md K1a：
+    /// 写 rax 会污染目标进程现场）。
+    Switched,
+    /// 键盘已有并发等待者：本进程未阻塞、帧未动，调用方应返回 WouldBlock
+    /// （kernel1.md KM15：stdin 单读者仲裁）。
+    Busy,
+}
 
 /// 阻塞当前进程等待键盘输入（`read` syscall 缓冲空时调用）。
 ///
-/// 登记 [`KBD_WAITER`] 后把当前进程置 `Blocked`（不回就绪队列），切到下一个就绪
-/// 进程；若**无其他就绪进程**（单 shell 场景），进入 idle halt 等待键盘中断唤醒——
+/// 以 CAS 登记 [`KBD_WAITER`]（唯一等待者）：已有等待者时不阻塞、返回
+/// [`BlockKbdOutcome::Busy`]——第二个并发 stdin 读者得到 EAGAIN 而不是把
+/// 第一个等待者顶掉（KM15）。CAS 在调度锁内完成，消除"登记后、置 Blocked
+/// 前"被 wake_kbd 抢先唤醒的丢失唤醒窗口；该窗口内若真被唤醒，本进程已带
+/// Ready 状态在就绪队列里，pop_ready 取回自身时走"仅当前进程"分支恢复
+/// 运行，语义收敛为一次空 read 重试。
+///
+/// 登记成功后把当前进程置 `Blocked`（不回就绪队列），切到下一个就绪进程；
+/// 若**无其他就绪进程**（单 shell 场景），进入 idle halt 等待键盘中断唤醒——
 /// 键盘 handler 经 [`wake_kbd`] 把本进程放回就绪队列，idle 循环检测到后切回。
 /// 被唤醒后用户态 `read` 重试即可取到字符（消除空转 + 刷屏）。
-///
-/// 切换成功后改写 `*frame` 并 `return false`：控制流回到 `syscall_entry`，由其
-/// `iretq` 进入目标进程用户态（与 `block_current` 相同机制）。函数虽声明返回
-/// 值，但切换发生后 CPU 不再回到此处，故返回值不会被真正消费。
-pub fn block_for_kbd(frame: &mut InterruptFrame) -> bool {
+pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
     let mut s = SCHED.lock();
     let cur_pid = s.current.expect("block_for_kbd outside process");
+    // 审计 B19：pid → u32 截断论证。pid 即进程槽表下标（固定容量，远小于
+    // 2^32），恒可无损装入 u32；u32::MAX 是 KBD_WAITER 的"空槽"哨兵，与
+    // 任何合法 pid 不相交。断言即哨兵撞车防线——若未来放宽 pid 空间先改
+    // 此处语义。
+    assert!(
+        cur_pid < u32::MAX as usize,
+        "pid {} collides with KBD_WAITER sentinel",
+        cur_pid
+    );
+    if KBD_WAITER
+        .compare_exchange(
+            u32::MAX,
+            cur_pid as u32,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return BlockKbdOutcome::Busy;
+    }
     if let Some(slot) = s.procs[cur_pid].as_mut() {
         slot.saved = *frame;
         slot.proc.set_state(TaskState::Blocked);
     }
     s.current = None;
     clear_current_proc();
-    KBD_WAITER.store(cur_pid as u32, core::sync::atomic::Ordering::Release);
 
     // 取下一个有效就绪进程切换（跳过已退出残留引用）。
     match pop_ready(&mut s) {
@@ -451,11 +510,18 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> bool {
             arch_x86_64::mmio::write_cr3(cr3);
             gdt::set_rsp0(ktop);
             set_current_proc(proc_ptr);
-            return false; // frame 已改，由 syscall_entry iret 切换
+            BlockKbdOutcome::Switched // frame 已改，由 syscall_entry iret 切换
         }
         None => {
             drop(s);
             // 无就绪进程：idle halt 等键盘中断唤醒（先释放锁再 halt，使中断可达）。
+            //
+            // 审计 B17 单核不变式（S21 显式化）：本路径假设**全系统只有本核
+            // 执行调度决策**——KBD_WAITER 唯一等待者 + "pop_ready 得到的
+            // next 必是刚被唤醒者"都依赖没有第二个 CPU 同时在 pop。当前
+            // SMP 拓扑下 AP 不进入本函数（调度仅 BSP tick/block 路径驱动，
+            // 见 smp.rs AP 入口无 scheduler 接线）；若未来引入 AP 调度，
+            // 本段必须先改造为跨核唤醒协议，否则切错进程 = 永久阻塞。
             arch_x86_64::interrupts::enable();
             loop {
                 // 极短持锁检查是否有进程被唤醒；空则释放锁后 halt（中断可用）。
@@ -480,15 +546,14 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> bool {
             arch_x86_64::mmio::write_cr3(cr3);
             gdt::set_rsp0(ktop);
             set_current_proc(proc_ptr);
-            return false; // frame 已改，由 syscall_entry iret 切换
+            BlockKbdOutcome::Switched // frame 已改，由 syscall_entry iret 切换
         }
     }
 }
 
 /// 键盘有输入时唤醒阻塞的进程（由 arch 键盘 handler 经回调调用）。
 ///
-/// 取出 [`KBD_WAITER`] 登记的 pid，将其置 `Ready` 并入就绪队列。调度器下次调度
-/// （tick ≤10ms 或 idle 循环立即）切回该进程，使其 `read` 重试取到字符。
+/// 取出 [`KBD_WAITER`] 登记的 pid，将其置 `Ready` 并入就绪队列。调度器下次调度/// （tick ≤10ms 或 idle 循环立即）切回该进程，使其 `read` 重试取到字符。
 /// 在中断上下文调用，持锁时间极短（仅入队）。
 pub fn wake_kbd() {
     let p = KBD_WAITER.swap(u32::MAX, core::sync::atomic::Ordering::AcqRel);
@@ -505,6 +570,43 @@ pub fn wake_kbd() {
         slot.proc.set_state(TaskState::Ready);
         s.ready.push_back(p as usize);
     }
+}
+
+// ---------- B21/KM15 测试钩子（仅 kernel-tests 构建存在）----------
+
+/// 预占 KBD_WAITER（审计 B21：使 `block_for_kbd` 的 Busy 分支在单核测试中
+/// 可达——Busy 语义 = 第二并发 stdin 读者得到 EAGAIN，此前零测试佐证）。
+/// 仅编译进 kernel-tests；运行时路径零足迹。
+#[cfg(feature = "kernel-tests")]
+pub fn debug_occupy_kbd_waiter(pid: u32) -> bool {
+    KBD_WAITER
+        .compare_exchange(
+            u32::MAX,
+            pid,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// 释放 [`debug_occupy_kbd_waiter`] 的占用（恢复空槽哨兵）。
+#[cfg(feature = "kernel-tests")]
+pub fn debug_release_kbd_waiter() {
+    KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+}
+
+/// 设置调度器视角的当前进程（审计 B21：`block_for_kbd` 从 [`SCHED`] 的
+/// `current` 取等待者 pid——仅装 per-cpu current 不够）。Busy 分支在触达
+/// 进程槽表之前即返回，pid 无需对应真实槽位。
+#[cfg(feature = "kernel-tests")]
+pub fn debug_set_scheduler_current(pid: usize) {
+    SCHED.lock().current = Some(pid);
+}
+
+/// 清除调度器当前进程（与上者配对的测试收尾）。
+#[cfg(feature = "kernel-tests")]
+pub fn debug_clear_scheduler_current() {
+    SCHED.lock().current = None;
 }
 
 // ---------- C7.1 终止核心：zombie / 退出码交付 / 孤儿级联 ----------
@@ -872,7 +974,7 @@ pub fn process_snapshots() -> Vec<vfs::ProcessSnapshot> {
                 name: alloc::string::String::from(entry_name(e)),
                 state: alloc::string::String::from(state_str),
                 // C1.2：真实记账值来自该进程地址空间的区域账本，O(区域数)。
-                memory_bytes: e.proc.addr_space().used_bytes(),
+                memory_bytes: e.proc.addr_space().declared_bytes(),
             });
         }
     }
@@ -896,7 +998,7 @@ pub fn get_process_snapshot(pid: usize) -> Option<vfs::ProcessSnapshot> {
         pid,
         name: alloc::string::String::from(entry_name(entry)),
         state: alloc::string::String::from(state_str),
-        memory_bytes: entry.proc.addr_space().used_bytes(),
+        memory_bytes: entry.proc.addr_space().declared_bytes(),
     })
 }
 
@@ -1025,13 +1127,13 @@ pub mod test_hooks {
         })
     }
 
-    /// 真实内存记账探针（C1.2 验收用）：返回该进程地址空间 used_bytes()。
+    /// 真实内存记账探针（C1.2 验收用）：返回该进程地址空间 declared_bytes()（MM7：虚拟预留量，非 RSS）。
     pub fn probe_memory_bytes(pid: usize) -> Option<u64> {
         let s = SCHED.lock();
         s.procs
             .get(pid)
             .and_then(|p| p.as_ref())
-            .map(|e| e.proc.addr_space().used_bytes())
+            .map(|e| e.proc.addr_space().declared_bytes())
     }
 
     /// 终止 `pid`（真实核心路径），返回终止分支名（测试断言用）。

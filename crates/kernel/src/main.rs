@@ -7,7 +7,6 @@ mod acpi;
 mod drivers;
 mod ipc_init;
 mod panic;
-mod pci;
 mod symbols;
 mod syscall;
 mod vfs_init;
@@ -16,7 +15,7 @@ mod vfs_init;
 mod tests;
 
 use arch::Platform;
-use klib::{error, info};
+use klib::{error, info, warn};
 use limine::{BaseRevision, FramebufferRequest};
 
 use arch_x86_64::X86_64Arch as CurrentArch;
@@ -30,32 +29,58 @@ static BASE_REVISION: BaseRevision = BaseRevision::new(6);
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new(0);
 
 /// 内核堆增长源：从物理帧分配器分配连续页并映射到虚拟地址。
-/// 返回 `2^order` 个连续物理页映射后的虚拟地址基址（0 表示失败）。
-fn heap_grow_source(order: u32) -> u64 {
+/// 成功返回 `2^order` 个连续物理页映射后的虚拟地址基址；耗尽返回 `None`
+/// （KM11：类型化失败，不用魔法 0 哨兵）。
+fn heap_grow_source(order: u32) -> Option<u64> {
     mm::frame_allocator::allocate_frames(order as usize)
         .map(|f| arch::phys_to_virt(f.start_paddr()))
-        .unwrap_or(0)
 }
 
-/// 内核主栈大小（1MB）。kmain 及后续所有调用都在此栈上运行，
-/// 避免 Limine 提供的初始引导栈过小导致深调用（如 flanterm）溢出。
+// KA3：栈边界由链接器脚本唯一提供（.kernel_main_stack NOLOAD 段 + 紧贴
+// 栈底的守护页）。Rust 侧只引用符号地址，不再持有任何栈数组静态——
+// 数组静态的对齐/落位曾两次肇事（KD9 奇地址栈、KA3 无守护页）。
+unsafe extern "C" {
+    static __kstack_guard_base: u8;
+    static __kstack_guard_top: u8;
+    static __kstack_base: u8;
+    static __kstack_top: u8;
+}
+
+/// 内核主栈大小（字节）：与 linker.ld `.kernel_main_stack` 段内的
+/// `. += 0x100000` 配对。启动时经 [`assert_stack_layout`] 复核两侧一致。
 const KMAIN_STACK_SIZE: usize = 1024 * 1024;
 
-/// 内核主栈（静态分配，位于 .bss）。
-static mut KMAIN_STACK: [u8; KMAIN_STACK_SIZE] = [0; KMAIN_STACK_SIZE];
+/// 启动期复核链接器给出的栈布局与 Rust 侧预期一致（KA3 防漂移）。
+fn assert_stack_layout() {
+    let guard_base = core::ptr::addr_of!(__kstack_guard_base) as usize;
+    let guard_top = core::ptr::addr_of!(__kstack_guard_top) as usize;
+    let base = core::ptr::addr_of!(__kstack_base) as usize;
+    let top = core::ptr::addr_of!(__kstack_top) as usize;
+    assert!(
+        guard_top == base && top - base == KMAIN_STACK_SIZE,
+        "kernel stack layout mismatch: linker vs rust"
+    );
+    // 守护页恰为一页且紧贴栈底。页尺寸单一出处 = x86-64 页粒度（4KiB，
+    // SDM Vol.3 §4.2）；linker.ld 的守护页段长按同一粒度编写，此处断言即
+    // 两侧漂移的运行期哨兵（审计 B13：非独立魔法值，是跨侧一致性的检查点）。
+    const PAGE_SIZE_BYTES: usize = 4096;
+    assert!(
+        guard_top - guard_base == PAGE_SIZE_BYTES,
+        "guard page must be one page"
+    );
+}
 
 /// 真正的内核入口：先切换到自己的大栈，再进入 kmain 主体。
 /// Limine 跳转到的 `kmain`（见下方 no_mangle 函数）会做栈切换。
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain() -> ! {
-    // 切换到我们自己的大栈（栈顶）。
-    // 用汇编把 rsp 切换到 KMAIN_STACK 顶部，同时保留返回地址以便切换后正常执行。
+    // 切换到我们自己的大栈（链接器符号 __kstack_top）。
     unsafe {
         core::arch::asm!(
             "mov {stack}, rsp",
             "mov rsp, {stack_top}",
             stack = out(reg) _,
-            stack_top = in(reg) (&raw mut KMAIN_STACK).cast::<u8>().add(KMAIN_STACK_SIZE) as usize,
+            stack_top = in(reg) (core::ptr::addr_of!(__kstack_top) as usize),
             options(nostack),
         );
     }
@@ -67,18 +92,26 @@ unsafe fn kmain_body() -> ! {
     // 初始化 panic 子系统（注入架构名和停机函数，尽早）
     panic::init(CurrentArch::name(), CurrentArch::halt);
 
+    // MD4：快照内核根页表（此刻 CR3 指向 Limine 建立的内核表，且尚无任何
+    // 用户地址空间存在）。此后所有进程表的高半区都派生自它——销毁活动地址
+    // 空间前切回此表即可安全归还顶层页表，不再慢性泄漏。必须在任何
+    // activate() 之前；重复调用会被 debug_assert 拦下。
+    arch_x86_64::paging::snapshot_kernel_root();
+
     // 初始化堆分配器（按需映射动态堆）——必须在任何 alloc 前
     klib::allocator::init();
 
     // 初始化架构（串口等）
     CurrentArch::init();
     // 注入 panic 平台辅助：回退串口（独立于 klib console 层，确保早期 panic 可见）、
-    // CPU id（LAPIC 未映射时返回 0，避免读未映射寄存器二次 #PF）、屏幕输出。
+    // CPU id（LAPIC 未映射时返回 0，避免读未映射寄存器二次 #PF）、屏幕输出，
+    // 以及 panic 入口的静默动作（本 CPU 关中断，KA1）。
     panic::set_panic_output(
         arch_x86_64::serial::write_str as fn(&str),
         panic_cpu_id,
         term::write_str as fn(&str),
     );
+    panic::set_panic_quiesce(arch_x86_64::interrupts::disable);
     // 显示前置要素（堆分配器 + Limine framebuffer + 驱动框架）均已就绪：
     // 立即启动 framebuffer 终端，比任何 test 都靠前，方便屏幕实时看日志。
     init_display();
@@ -124,13 +157,34 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_frame_alloc();
 
-    // 注入页表页分配器/释放器与 HHDM 偏移（虚拟内存层使用）
-    let phys_offset = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
-    arch_x86_64::paging::init(
-        mm::mapper::mm_alloc_frame,
-        mm::mapper::mm_dealloc_frame,
-        phys_offset,
-    );
+    // 注入页表页分配器/释放器（KA5：HHDM 偏移不再经死参数传递——它由
+    // mm::init 从 Limine HHDM response 写入 arch::PHYS_OFFSET，paging::init
+    // 内部以 debug_assert 固化"已就绪"前置，顺序回归即刻可见）。
+    arch_x86_64::paging::init(mm::mapper::mm_alloc_frame, mm::mapper::mm_dealloc_frame);
+
+    // KA3：内核栈守护页生效三步——
+    // ① 复核链接器布局与 Rust 预期一致；
+    // ② 注册内核态 #PF 检查器（识别守护页命中并显式停机报告）；
+    // ③ 解映射守护页。必须放在 paging::init 之后：Limine 以 2MB 大页映射
+    //    内核映像，解映射单页需要 unmap 的**大页拆分**能力，而拆分要分配
+    //    页表页帧——帧分配注入完成前调用必然失败。
+    // 此后派生的所有进程页表继承该空洞，守护对所有执行流生效。
+    assert_stack_layout();
+    arch_x86_64::interrupts::register_kernel_fault_inspector(kernel_fault_inspect);
+    {
+        use arch::PageTable as _;
+        let guard_base = core::ptr::addr_of!(__kstack_guard_base) as u64;
+        // 包装当前活动页表（CR3）执行解映射；unmap 内含 TLB 失效（AM6）。
+        let mut pt = <arch_x86_64::paging::X86PageTable as arch::ActivePageTable>::current();
+        // 解映射失败即启动失败：守护页失效等价于放弃溢出检测面，宁可不带病运行。
+        pt.unmap(arch::VirtAddr::new(guard_base))
+            .expect("failed to unmap kernel stack guard page");
+        klib::info!(
+            "[kmain] kernel stack guard armed at {:#x}..{:#x}",
+            guard_base,
+            core::ptr::addr_of!(__kstack_guard_top) as u64
+        );
+    }
     // T7：验证 4KB 页级通用 MMIO 映射（PCI BAR 等任意对齐小块设备寄存器用）。
     // 映射 VGA 文本缓冲（物理 0xB8000，4KB 对齐）到高半区虚拟地址并读写确认。
     // 需在 paging::init 之后（依赖页表页分配器注入）。
@@ -141,8 +195,13 @@ unsafe fn kmain_body() -> ! {
     // acpi::init() 已解析（hpet_info）；映射依赖页表页分配器（paging::init）。
     // HPET 为备选：主时钟源仍是 LAPIC 100Hz，无 HPET 时优雅降级。
     {
-        let (hpet_base, hpet_period) = acpi::hpet_info();
-        arch_x86_64::hpet::init(hpet_base, hpet_period);
+        match acpi::hpet_info() {
+            Some((hpet_base, hpet_period)) => {
+                let _ready = arch_x86_64::hpet::init(hpet_base, hpet_period);
+            }
+            // KM11：无 HPET 表是独立状态（Option），不再以 (0,0) 哨兵表达。
+            None => info!("[kmain] no HPET table; keeping LAPIC timer as sole clock source"),
+        }
     }
     // 验证虚拟内存页表映射
     #[cfg(feature = "kernel-tests")]
@@ -150,6 +209,9 @@ unsafe fn kmain_body() -> ! {
     // M1：验证用户地址空间（独立页表 + 用户映射 + 切换）
     #[cfg(feature = "kernel-tests")]
     tests::test_user_address_space();
+    // KA7 第二层（RLIMIT_AS 语义）：区域总量配额——超限 NoSpace、拒绝零副作用。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_user_addr_quota();
     // M1.3：验证按需分页（demand paging：#PF → 补页）
     #[cfg(feature = "kernel-tests")]
     tests::test_demand_paging();
@@ -205,6 +267,15 @@ unsafe fn kmain_body() -> ! {
     // 单调性/与 LAPIC tick 对齐。HPET 已在 paging::init 后初始化。
     #[cfg(feature = "kernel-tests")]
     tests::test_hpet();
+    // 审计 B25：ACPI 表解析（FADT 短表分级 + HPET 布局探测）真固件端到端断言。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_acpi_parse_tables();
+
+    // S33 量化验收（mm1.md benchmark 设施立项）：PMM 标准负载基准——
+    // 结构断言定成败，时延/时钟换算指标如实打印供审阅。以 HPET 为测量钟，
+    // 故排在 test_hpet 之后。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_pmm_bench();
 
     // T7：验证通用 IRQ 注册/分配（共享中断）：IRQ0 上已有 LAPIC 定时器 handler，
     // 再注册观察者共享同一 IRQ，验证多 handler 分发互不干扰。依赖 tick 运行。
@@ -271,6 +342,18 @@ unsafe fn kmain_body() -> ! {
     // M6.1：初始化 VFS 根挂载表与 RESTful 目录骨架。
     vfs_init::init();
 
+    // KM1：标准流数据链路接线——stdin 源 = 键盘缓冲、stdout/stderr sink =
+    // console。此后 fd 0/1/2 是每进程 fd 表内的真实句柄，syscall 层无任何
+    // fd 号特判。
+    vfs::stdio::set_stdin_source(stdin_source);
+    vfs::stdio::set_stdout_sink(klib::console::write_bytes);
+
+    // 审计 B14/B21：SYS_MEMORY_QUERY 全链路覆盖 + stdin Busy→EAGAIN 语义 +
+    // fd 表 MAX_FDS 上限拒绝。（必须在 stdio 接线之后：B21 臂依赖真实的
+    // stdin 源——接线前 StdinNode 读路径如实 NotSupported。）
+    #[cfg(feature = "kernel-tests")]
+    tests::test_syscall_memquery_and_stdin_busy();
+
     // 运行 M6.1 / M6.2 / M6.3 / M6.4 / M6.5 VFS 自检测试（在 kernel-tests feature 启用时）。
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m61();
@@ -280,6 +363,8 @@ unsafe fn kmain_body() -> ! {
     tests::test_syscall_std_stream_close();
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_munmap();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_syscall_usercopy_faults();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m63();
     #[cfg(feature = "kernel-tests")]
@@ -313,12 +398,25 @@ unsafe fn kmain_body() -> ! {
     info!("[kmain] initializing SMP");
     arch_x86_64::smp::init();
     let total = arch_x86_64::smp::total_cpus();
-    // 等待所有 AP 上线，超时 2 秒（基于 LAPIC 定时器真实时间）
-    let online = arch_x86_64::smp::wait_all_online(total, 2_000);
+    // KD4：AP 上线等待上界常量化。时基是 LAPIC 定时器真实时间；2s 足够
+    // 覆盖 TCG 慢速启动与真机 INIT-SIPI 延迟，超时按实际在线数降级继续。
+    const AP_ONLINE_TIMEOUT_MS: usize = 2_000;
+    let online = arch_x86_64::smp::wait_all_online(total, AP_ONLINE_TIMEOUT_MS);
     info!(
         "[kmain] SMP done, {} cpus online (target {})",
         online, total
     );
+
+    // MA1b：IPI 邮箱接线——跨核 per-CPU 缓存排空。mm 保持架构中立，经
+    // 函数指针注入投递通道（LAPIC Fixed ICI + 槽位反查）；目标核侧的
+    // "排空本核缓存"回调注册进 arch 中断分发（向量 0x40）。须在 SMP 完成
+    // 之后注册，保证所有槽位的 LAPIC id 反查已就绪。
+    mm::set_remote_drain(remote_drain_via_ipi);
+    arch_x86_64::interrupts::register_ipi_handler(mm::ipi_drain_current_cpu);
+
+    // KA1：panic 跨核停机接线（向量 0x41）——诊断输出前停住其它在线核，
+    // 防止它们继续分配/拿锁/交错输出。同样依赖 SMP 完成后的槽位反查。
+    panic::set_cross_core_halt(halt_other_cpus_via_ipi);
 
     // 内核全部组件加载完成（测试若开启也已全部通过）：打印版本横幅。
     info!("============================================================");
@@ -326,15 +424,30 @@ unsafe fn kmain_body() -> ! {
     info!("Git Commit: {}", env!("BORUIX_GIT_COMMIT"));
     info!("Build Timestamp: {}", env!("BORUIX_BUILD_TIMESTAMP"));
     info!("============================================================");
+    // KM13：符号表快照溯源。直连 cargo build 会使用 checked-in 快照——
+    // .text 布局漂移后 panic 回溯给出错误函数名，比空表更有害；此处如实
+    // 告警而非静默放行。SDK 构建路径两遍编译同纪元，不触发。
+    if symbols::snapshot_stale() {
+        warn!(
+            "[kmain] symbol snapshot stale (epoch {} != build {}): panic backtrace \
+             names may be wrong; rebuild via SDK (`sdk.main.py build`) to refresh",
+            symbols::SYMBOLS_EPOCH,
+            env!("BORUIX_SYMBOLS_BUILD_EPOCH")
+        );
+    }
 
-    // 阶段 B：使能外部中断路由（IOAPIC 把键盘 IRQ1 送到 vector 33）并初始化
-    // PS/2 8042 键盘驱动（注册 IRQ1 handler → 扫描码译码 → 输入缓冲）。
-    // 放在所有测试之后（避免干扰 LAPIC tick 时序测试）、进入 init 之前，
-    // 使 shell REPL 能接收键盘输入。
-    arch_x86_64::ioapic::init();
+    // 阶段 B：使能外部中断路由（IMCR 切回 PIC 模式，8259 输出经 LINT0 进
+    // LAPIC）并初始化 PS/2 8042 键盘驱动（注册 IRQ1 handler → 扫描码译码 →
+    // 输入缓冲）。放在所有测试之后（避免干扰 LAPIC tick 时序测试）、进入
+    // init 之前，使 shell REPL 能接收键盘输入。
+    // AD2：原 `ioapic::init` 改名 `imcr::switch_to_pic_mode`——该调用从不
+    // 编程 I/O APIC，真实职责只有 IMCR 切换。
+    arch_x86_64::imcr::switch_to_pic_mode();
     // IMCR 切到 PIC 模式会让 QEMU 重置 8259 掩码，须在切换后重新解屏蔽键盘
     // IRQ1（其余保持屏蔽：IRQ0 timer 由 LAPIC 接管）。否则键盘中断被 8259 屏蔽。
-    arch_x86_64::pic::set_mask(0xFFFD);
+    // KD4：掩码位型常量化——8259 掩码寄存器按位取"1=屏蔽"，仅清 IRQ1 位。
+    const PIC_MASK_ALL_EXCEPT_IRQ1: u16 = !(1u16 << 1);
+    arch_x86_64::pic::set_mask(PIC_MASK_ALL_EXCEPT_IRQ1);
     arch_x86_64::keyboard::init();
     // 注册键盘输入回调：有按键时唤醒阻塞在 `read` 的进程（如 shell）。arch 层
     // 不反向依赖 kernel，经函数指针解耦（指向 `task::wake_kbd`）。
@@ -359,6 +472,66 @@ unsafe fn kmain_body() -> ! {
 /// - `panic::set_panic_output`：早期 panic 的屏幕输出已接线。
 ///
 /// 成功初始化后，屏幕 sink 注册进 console，后续所有内核日志同时输出到串口与屏幕。
+// KA3：内核态 #PF 检查器——CR2 落在守护页即"内核主栈向下溢出"。
+// 返回 true 表示已处置（裸串口报告 + 停机），中断分发不再走通用致命路径。
+// 裸串口输出：溢出现场可能正是 console/堆/锁损坏，诊断必须走最短依赖路径
+// （与 AM7 同一纪律）。
+fn kernel_fault_inspect(cr2: u64) -> bool {
+    let gbase = core::ptr::addr_of!(__kstack_guard_base) as u64;
+    let gtop = core::ptr::addr_of!(__kstack_guard_top) as u64;
+    if cr2 >= gbase && cr2 < gtop {
+        arch_x86_64::serial::write_str(
+            "\n========== KERNEL STACK OVERFLOW ==========\n",
+        );
+        arch_x86_64::serial::write_str("kernel main stack guard page hit (downward overflow)\n");
+        arch_x86_64::serial::write_str("===========================================\n");
+        CurrentArch::halt();
+    }
+    false
+}
+
+// MA1b：跨核排空投递适配——槽位 → LAPIC id 反查后发 Fixed IPI（向量 0x40）。
+// 返回 false = 槽位未上线或发送队列超限，mm 侧按"跳过该核"降级。
+fn remote_drain_via_ipi(slot: usize) -> bool {
+    match arch_x86_64::smp::lapic_id_of_slot(slot) {
+        Some(lapic_id) => arch_x86_64::lapic::send_fixed_ipi(lapic_id, arch_x86_64::interrupts::IPI_VECTOR),
+        None => false,
+    }
+}
+
+// KA1：panic 跨核停机——向除本核外的全部已上线槽位广播停机 IPI（0x41）。
+// 发送失败（目标失联）静默跳过：panic 路径上无法恢复，诊断照常输出。
+fn halt_other_cpus_via_ipi() {
+    let me = arch_x86_64::lapic::current_lapic_id();
+    let count = arch_x86_64::smp::cpu_count();
+    for slot in 0..count {
+        if let Some(id) = arch_x86_64::smp::lapic_id_of_slot(slot) {
+            if id != me {
+                let _ = arch_x86_64::lapic::send_fixed_ipi(
+                    id,
+                    arch_x86_64::interrupts::IPI_HALT_VECTOR,
+                );
+            }
+        }
+    }
+}
+
+// KM1：stdin 批量源适配——把键盘单字符 pop 排空进调用方缓冲，返回读取
+// 字节数（0 = 缓冲空，vfs::stdio::StdinNode 据此返回 WouldBlock）。
+fn stdin_source(buf: &mut [u8]) -> usize {
+    let mut n = 0usize;
+    while n < buf.len() {
+        match arch_x86_64::keyboard::pop() {
+            Some(ch) => {
+                buf[n] = ch;
+                n += 1;
+            }
+            None => break,
+        }
+    }
+    n
+}
+
 fn init_display() {
     // 获取 framebuffer（limine 0.1: get_response() 返回 Ptr<FramebufferResponse>）
     let Some(resp) = FRAMEBUFFER_REQUEST.get_response().get() else {
@@ -381,15 +554,9 @@ fn init_display() {
     info!("[display] terminal init returned");
 }
 
-/// 从已挂载的 /binaries 读取程序 ELF（M13/#13：唯一来源是真实磁盘 EXT2，
-/// 不再存在编译期嵌入副本）。内建索引：0 = init.elf，1 = shell.elf。
-pub fn program_elf(idx: usize) -> Option<alloc::vec::Vec<u8>> {
-    const NAMES: [&str; 2] = ["init.elf", "shell.elf"];
-    let name = NAMES.get(idx)?;
-    read_binary_from_binaries(name)
-}
-
 /// 从 /binaries/<name> 经 VFS 读出完整文件内容；任何失败返回 None（可见、不伪造）。
+/// KM3：原 program_elf(idx) 已删除——它与 sys_exec 小索引模式解析同一路径，
+/// 回退链是死亡分支；内建程序加载统一走 sys_exec 的 VFS 路径。
 pub fn read_binary_from_binaries(name: &str) -> Option<alloc::vec::Vec<u8>> {
     let root = crate::vfs_init::root();
     let path = alloc::format!("/binaries/{}", name);
@@ -400,7 +567,17 @@ pub fn read_binary_from_binaries(name: &str) -> Option<alloc::vec::Vec<u8>> {
     }
     let mut buf = alloc::vec![0u8; size];
     let n = node.read_at(0, &mut buf).ok()?;
-    buf.truncate(n);
+    // KM4：短读不是部分成功——元数据声称 size 字节而设备只交付 n<size 时
+    // 显式报错（错误可见），绝不静默截断后把残缺镜像喂给 ELF 加载器。
+    if n != size {
+        klib::error!(
+            "[binaries] short read on {}: metadata size={} but device returned {}",
+            path,
+            size,
+            n
+        );
+        return None;
+    }
     Some(buf)
 }
 
@@ -415,8 +592,10 @@ fn panic_cpu_id() -> u32 {
 
 /// 生产化启动：加载 init 用户程序（PID 1）并进入调度器，永不返回。
 ///
-/// init.elf 由 SDK 在构建时编译 `libsys` + `init` 生成，经 `include_bytes!`
-/// 在编译期嵌入。流程：解析 ELF → 装载到用户地址空间 → `scheduler::spawn`
+/// init.elf 由 SDK 在构建时编译 `libsys` + `init` 生成，经磁盘链路加载
+/// （KD1 修正：旧注释称"经 include_bytes! 编译期嵌入"——嵌入副本已退役，
+/// 现存 include_bytes! 仅在 test_userspace_elf 测试中引用 ../init.elf）。
+/// 流程：解析 ELF → 装载到用户地址空间 → `scheduler::spawn`
 /// 创建 PID 1 → `scheduler::start` 进入 init 用户态（tick 轮转，init 经 syscall
 /// 交互/退出）。init 加载/生成任一环节失败则回退到内核 idle 循环停机（错误
 /// 可见，不 panic）——保证启动失败时行为可观测、不静默。

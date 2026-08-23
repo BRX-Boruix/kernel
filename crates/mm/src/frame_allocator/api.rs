@@ -60,16 +60,16 @@ impl LazyBuddyAllocator {
         None
     }
 
-    pub fn deallocate(&self, frame: PhysFrame) {
-        self.dealloc_calls.fetch_add(1, Ordering::Relaxed);
-        let pfn = frame.start_paddr() as usize / 4096;
+    /// 释放前校验：pfn 越界或落在无元数据孔洞（memmap 不可用区段）时
+    /// 告警并返回 false。**必须在任何帧元数据解引用（含 refcount）之前
+    /// 调用**（审计 #7）：孔洞地址流入 refs_cell 是对 null+offset 的野
+    /// 指针 RMW。mod.rs 公开入口与本入口共用此单点校验（S15）。
+    pub(crate) fn pfn_managed(&self, pfn: usize) -> bool {
         let cfg = self.config();
-
         if pfn >= cfg.total_frames {
             warn!("PMM: Deallocate out of bounds pfn {}", pfn);
-            return;
+            return false;
         }
-
         // 无元数据（孔洞）检查：必须在读取帧元数据前完成，避免空指针解引用。
         let block_idx = pfn / cfg.frames_per_block;
         if unsafe { self.block_ptr(block_idx) }.is_null() {
@@ -77,6 +77,16 @@ impl LazyBuddyAllocator {
                 "PMM: Deallocate frame with no metadata (hole?): pfn {}",
                 pfn
             );
+            return false;
+        }
+        true
+    }
+
+    pub fn deallocate(&self, frame: PhysFrame) {
+        self.dealloc_calls.fetch_add(1, Ordering::Relaxed);
+        let pfn = frame.start_paddr() as usize / 4096;
+
+        if !self.pfn_managed(pfn) {
             return;
         }
 

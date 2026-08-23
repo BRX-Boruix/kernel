@@ -1,6 +1,12 @@
 //! PCI 总线枚举与设备控制模块（BusType::Pci，BAR 自省与遥测支持，M10.1）。
 //!
 //! 支持通过 I/O 端口 0xCF8 / 0xCFC 进行 Legacy PCI 配置空间扫描、BARs 解析与读写。
+//!
+//! KM6：设备注册名唯一化——旧实现按类别命名（两台同类别设备重名），而
+//! DriverHub 的 name-based 查找（`pci_location_of`、UIO claim、DevFS 投影）
+//! 以名字区分设备，重名使查找永远命中第一台。现注册名为
+//! `<类别描述>-<bus>-<device>-<function>`（经 `Box::leak` 常驻；注册表条目
+//! 本就终生存在，数量受扫描空间上界约束）。
 
 use crate::device::{BusType, DeviceInfo, DeviceKind};
 use crate::driver::DriverStage;
@@ -11,6 +17,30 @@ use klib::info;
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 const ENABLE_BIT: u32 = 0x8000_0000;
+
+/// PCI 配置空间类代码（offset 0x0B）：海量存储（IDE/AHCI/NVMe 等）。
+const PCI_CLASS_MASS_STORAGE: u8 = 0x01;
+/// PCI 配置空间类代码：网络控制器。
+const PCI_CLASS_NETWORK: u8 = 0x02;
+/// PCI 配置空间类代码：显示控制器。
+const PCI_CLASS_DISPLAY: u8 = 0x03;
+/// PCI 配置空间类代码：桥接设备（host/ISA/PCI-to-PCI 桥）。
+const PCI_CLASS_BRIDGE: u8 = 0x06;
+/// PCI 配置空间类代码：简单通信控制器（串口等）。
+const PCI_CLASS_SIMPLE_COMM: u8 = 0x07;
+
+/// 海量存储子类（offset 0x0A）：IDE 控制器。
+const PCI_SUBCLASS_IDE: u8 = 0x01;
+/// 海量存储子类：SATA（AHCI 模式）。
+const PCI_SUBCLASS_SATA: u8 = 0x06;
+/// 网络子类：以太网控制器。
+const PCI_SUBCLASS_ETHERNET: u8 = 0x00;
+/// 显示子类：VGA 兼容控制器。
+const PCI_SUBCLASS_VGA: u8 = 0x00;
+/// 桥接子类：Host bridge。
+const PCI_SUBCLASS_HOST_BRIDGE: u8 = 0x00;
+/// 桥接子类：ISA bridge。
+const PCI_SUBCLASS_ISA_BRIDGE: u8 = 0x01;
 
 pub fn read_config_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     let address = ENABLE_BIT
@@ -150,26 +180,28 @@ pub fn inspect_pci_bars(bus: u8, device: u8, function: u8) -> [PciBar; 6] {
 
 fn kind_for_class(class_code: u8) -> DeviceKind {
     match class_code {
-        0x01 => DeviceKind::Block,
-        0x02 => DeviceKind::Net,
-        0x03 => DeviceKind::Display,
-        0x07 => DeviceKind::Char,
+        PCI_CLASS_MASS_STORAGE => DeviceKind::Block,
+        PCI_CLASS_NETWORK => DeviceKind::Net,
+        PCI_CLASS_DISPLAY => DeviceKind::Display,
+        PCI_CLASS_SIMPLE_COMM => DeviceKind::Char,
         _ => DeviceKind::Misc,
     }
 }
 
+/// 按类别给出设备描述性基础名（KM6：仅作唯一注册名的前缀，不再单独充当
+/// 注册名——同类别多设备重名会破坏 name-based 查找）。
 pub fn name_for_device(class_code: u8, subclass: u8) -> &'static str {
     match (class_code, subclass) {
-        (0x01, 0x01) => "pci-ide-storage",
-        (0x01, 0x06) => "pci-sata-ahci",
-        (0x01, _) => "pci-mass-storage",
-        (0x02, 0x00) => "pci-ethernet",
-        (0x02, _) => "pci-network",
-        (0x03, 0x00) => "pci-vga-display",
-        (0x03, _) => "pci-display",
-        (0x06, 0x00) => "pci-host-bridge",
-        (0x06, 0x01) => "pci-isa-bridge",
-        (0x06, _) => "pci-bridge",
+        (PCI_CLASS_MASS_STORAGE, PCI_SUBCLASS_IDE) => "pci-ide-storage",
+        (PCI_CLASS_MASS_STORAGE, PCI_SUBCLASS_SATA) => "pci-sata-ahci",
+        (PCI_CLASS_MASS_STORAGE, _) => "pci-mass-storage",
+        (PCI_CLASS_NETWORK, PCI_SUBCLASS_ETHERNET) => "pci-ethernet",
+        (PCI_CLASS_NETWORK, _) => "pci-network",
+        (PCI_CLASS_DISPLAY, PCI_SUBCLASS_VGA) => "pci-vga-display",
+        (PCI_CLASS_DISPLAY, _) => "pci-display",
+        (PCI_CLASS_BRIDGE, PCI_SUBCLASS_HOST_BRIDGE) => "pci-host-bridge",
+        (PCI_CLASS_BRIDGE, PCI_SUBCLASS_ISA_BRIDGE) => "pci-isa-bridge",
+        (PCI_CLASS_BRIDGE, _) => "pci-bridge",
         _ => "pci-device",
     }
 }
@@ -197,10 +229,15 @@ pub fn scan_pci_bus() -> usize {
 
                 let location = ((bus as u32) << 16) | ((device as u32) << 8) | (function as u32);
                 let kind = kind_for_class(class_code);
-                let name = name_for_device(class_code, subclass);
-                // C15.1：只有海量存储类（PCI class 0x01）硬件背后存在可持久化
-                // 介质；其余类别的设备一律保守披露为易失，禁止伪装持久存储。
-                let is_mass_storage = class_code == 0x01;
+                // KM6：唯一注册名 = 类别描述 + PCI 位置（泄漏为 'static，
+                // 注册表条目本就终生存在）。
+                let base = name_for_device(class_code, subclass);
+                let name: &'static str = alloc::boxed::Box::leak(
+                    alloc::format!("{base}-{bus:02x}-{device:02x}-{function}").into_boxed_str(),
+                );
+                // C15.1：只有海量存储类硬件背后存在可持久化介质；其余类别
+                // 的设备一律保守披露为易失，禁止伪装持久存储。
+                let is_mass_storage = class_code == PCI_CLASS_MASS_STORAGE;
 
                 DriverHub::register_device_info(
                     DeviceInfo {
@@ -218,6 +255,24 @@ pub fn scan_pci_bus() -> usize {
                     None,
                     None,
                 );
+
+                // K2：把该设备的第一个 MMIO BAR 发布为 UIO 可认领的物理窗口
+                // （设备物理资源是内核登记事实，用户 claim 只能映射这里登记
+                // 过的窗口）。发布失败不阻断设备注册，但必须留痕。
+                let bars = inspect_pci_bars(bus, device, function);
+                let window = bars.iter().find_map(|bar| match *bar {
+                    PciBar::Mmio32 { addr, size, .. } => Some((addr as u64, size as u64)),
+                    PciBar::Mmio64 { addr, size, .. } => Some((addr, size)),
+                    _ => None,
+                });
+                if let Some((phys, size)) = window {
+                    if let Err(e) = crate::publish_device_window(name, phys, size) {
+                        info!(
+                            "[pci] device window publish skipped for {}: {:?}",
+                            name, e
+                        );
+                    }
+                }
 
                 info!(
                     "[pci] {:02x}:{:02x}.{} vendor={:04x} device={:04x} class={:02x}:{:02x} ({})",

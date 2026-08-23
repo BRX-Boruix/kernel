@@ -20,11 +20,23 @@ use klib::sync::irq::IrqSpinLock;
 /// 管道默认容量（字节，环形缓冲）。
 pub const PIPE_CAPACITY: usize = 4096;
 
+/// 阻塞请求的结果（KA6：bool+frame 形状的枚举化收口）。
+///
+/// bool 返回值可被调用方无视——`Switched` 分支下 `*frame` 已整体替换为下一
+/// 进程保存现场，任何"照常返回值"的处理都会写穿目标进程；枚举强制 match。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockOutcome {
+    /// 已切走：`*frame` 是下一进程现场，调用方不得再触碰 frame/rax。
+    Switched,
+    /// 拒绝阻塞（无可调度进程可切）：现场未动，调用方应如实报 `WouldBlock`。
+    Refused,
+}
+
 /// 调度器与进程回调 Provider（解耦 IPC 与 Task/Scheduler 的循环依赖）。
 pub trait IpcTaskNotifier: Send + Sync {
     fn current_pid(&self) -> usize;
     fn wake_process(&self, pid: usize);
-    fn block_current_process(&self, frame: &mut InterruptFrame) -> bool;
+    fn block_current_process(&self, frame: &mut InterruptFrame) -> BlockOutcome;
 }
 
 static NOTIFIER: spin::Mutex<Option<&'static dyn IpcTaskNotifier>> = spin::Mutex::new(None);
@@ -136,11 +148,11 @@ pub fn pipe_create() -> Result<u64, Error> {
     Ok(id)
 }
 
-fn try_block(frame: &mut InterruptFrame) -> bool {
+fn try_block(frame: &mut InterruptFrame) -> BlockOutcome {
     if let Some(notifier) = *NOTIFIER.lock() {
         notifier.block_current_process(frame)
     } else {
-        false
+        BlockOutcome::Refused
     }
 }
 
@@ -186,8 +198,11 @@ pub fn pipe_write(frame: &mut InterruptFrame, id: u64, src: u64, len: u64) -> Re
             }
             pipe.write_waiters.push(pid);
         }
-        if !try_block(frame) {
-            return Err(Error::WouldBlock);
+        // KA6：穷尽匹配切换结果——Refused 才是 WouldBlock；Switched 分支下
+        // frame 已是下一进程现场，循环回到顶部以新现场重试，禁止再碰 frame。
+        match try_block(frame) {
+            BlockOutcome::Refused => return Err(Error::WouldBlock),
+            BlockOutcome::Switched => {}
         }
     }
 }
@@ -223,8 +238,10 @@ pub fn pipe_read(frame: &mut InterruptFrame, id: u64, dst: u64, len: u64) -> Res
             }
             pipe.read_waiters.push(pid);
         }
-        if !try_block(frame) {
-            return Err(Error::WouldBlock);
+        // KA6：同 pipe_write——穷尽匹配，Refused 如实上抛 WouldBlock。
+        match try_block(frame) {
+            BlockOutcome::Refused => return Err(Error::WouldBlock),
+            BlockOutcome::Switched => {}
         }
     }
 }

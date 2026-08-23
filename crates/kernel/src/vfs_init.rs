@@ -12,6 +12,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use arch::Platform;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Once;
 
 use vfs::devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
@@ -84,31 +85,74 @@ impl SystemInfoProvider for KernelSystemProvider {
     }
 
     fn memory_json(&self) -> String {
+        // KM9：与 cpu_json 统一走 JsonWriter（旧 format! 手拼 JSON 是同文件
+        // 双风格之一）；页帧字节数取 mm 常量，不再内联 4096/2097152 魔数。
         let total_f = mm::total_frames();
         let stats = mm::frame_stats();
-        let total_bytes = total_f as u64 * 4096;
-        let allocated_bytes = stats.allocated_frames as u64 * 4096;
+        let total_bytes = total_f as u64 * mm::FRAME_SIZE_BYTES;
+        let allocated_bytes = stats.allocated_frames as u64 * mm::FRAME_SIZE_BYTES;
         let free_bytes = total_bytes.saturating_sub(allocated_bytes);
-        format!(
-            r#"{{"capacity_bytes":{},"allocated_bytes":{},"free_bytes":{},"page_size":4096,"huge_page_size":2097152}}"#,
-            total_bytes, allocated_bytes, free_bytes
-        )
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        writer
+            .start_object()
+            .and_then(|mut o| {
+                o.field_u64("capacity_bytes", total_bytes)?;
+                o.field_u64("allocated_bytes", allocated_bytes)?;
+                o.field_u64("free_bytes", free_bytes)?;
+                o.field_u64("page_size", mm::FRAME_SIZE_BYTES)?;
+                o.field_u64("huge_page_size", mm::HUGE_FRAME_SIZE_BYTES)?;
+                o.end()
+            })
+            .expect("Vec-backed memory JSON serialization cannot fail");
+        target
+            .into_string()
+            .expect("memory JSON keys are ASCII")
     }
 
     fn kernel_json(&self) -> String {
+        // KM9：JsonWriter 统一风格；env! 值经 field_str 自动转义。
+        // 构建时间戳是 build.rs 注入的毫秒级十进制数——保持原 JSON 数值类型，
+        // 以 const fn 在编译期解析为 u64（非数字输入会在编译期失败，而非
+        // 运行时伪造 0）。
+        /// 编译期解析十进制时间戳；非数字字节触发编译错误。
+        const fn parse_ms(s: &str) -> u64 {
+            let bytes = s.as_bytes();
+            let mut v = 0u64;
+            let mut i = 0;
+            while i < bytes.len() {
+                assert!(bytes[i].is_ascii_digit(), "non-decimal build timestamp");
+                v = v * 10 + (bytes[i] - b'0') as u64;
+                i += 1;
+            }
+            v
+        }
+        const BUILD_TIMESTAMP_MS: u64 = parse_ms(env!("BORUIX_BUILD_TIMESTAMP"));
         let version = env!("CARGO_PKG_VERSION");
         let commit = env!("BORUIX_GIT_COMMIT");
-        let timestamp = env!("BORUIX_BUILD_TIMESTAMP");
         let uptime_ms = klib::time::now_millis();
-        format!(
-            r#"{{"name":"BORUIX","version":"{}","git_commit":"{}","build_timestamp":{},"uptime_ms":{}}}"#,
-            version, commit, timestamp, uptime_ms
-        )
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        writer
+            .start_object()
+            .and_then(|mut o| {
+                o.field_str("name", "BORUIX")?;
+                o.field_str("version", version)?;
+                o.field_str("git_commit", commit)?;
+                o.field_u64("build_timestamp", BUILD_TIMESTAMP_MS)?;
+                o.field_u64("uptime_ms", uptime_ms)?;
+                o.end()
+            })
+            .expect("Vec-backed kernel JSON serialization cannot fail");
+        target
+            .into_string()
+            .expect("kernel JSON keys and env values are UTF-8")
     }
 }
 
 /// 内核 DevFS Provider 实现。
 struct KernelDeviceProvider;
+
 
 impl DeviceInfoProvider for KernelDeviceProvider {
     fn list_devices(&self) -> Vec<DeviceInfo> {
@@ -123,8 +167,10 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                     drv::BusType::Unknown => "Unknown",
                 };
                 let bound = drv::DriverHub::device_driver_at(i)
-                    .map(|s| String::from(s))
-                    .or(Some(String::from("attached")));
+                    .map(String::from)
+                    // K4：查不到绑定驱动时如实报 "unbound"，绝不伪造 "attached"
+                    // ——绑定状态是用户可见的治理数据，必须来自注册表真值。
+                    .or(Some(String::from("unbound")));
                 let class_val = ((info.class_code as u32) << 16)
                     | ((info.subclass as u32) << 8)
                     | (info.prog_if as u32);
@@ -143,18 +189,28 @@ impl DeviceInfoProvider for KernelDeviceProvider {
     }
 
     fn serial_read(&self, buf: &mut [u8]) -> Result<usize, klib::error::Error> {
+        use drv::drivers::serial::COM1_DEVICE_NAME;
         if buf.is_empty() {
             return Ok(0);
         }
         let count = drv::DriverHub::device_count();
         for i in 0..count {
             if let Some(info) = drv::DriverHub::device_info_at(i) {
-                if info.name == "serial-com1" {
+                if info.name == COM1_DEVICE_NAME {
                     if let Some(ops) = drv::DriverHub::device_at(i) {
                         return Ok(ops.read(buf));
                     }
                 }
             }
+        }
+        // KM8：框架设备缺席不是静默降级的理由——直连 UART 回退必须留下
+        // 可见痕迹（首次触发 warn 一次，避免每次 read 刷屏）。
+        static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+        if !FALLBACK_WARNED.swap(true, Ordering::SeqCst) {
+            klib::warn!(
+                "[devfs] '{}' not found in DriverHub; falling back to direct UART path",
+                COM1_DEVICE_NAME
+            );
         }
         if let Some(b) = arch_x86_64::serial::read_byte() {
             buf[0] = b;
@@ -165,15 +221,24 @@ impl DeviceInfoProvider for KernelDeviceProvider {
     }
 
     fn serial_write(&self, buf: &[u8]) -> Result<usize, klib::error::Error> {
+        use drv::drivers::serial::COM1_DEVICE_NAME;
         let count = drv::DriverHub::device_count();
         for i in 0..count {
             if let Some(info) = drv::DriverHub::device_info_at(i) {
-                if info.name == "serial-com1" {
+                if info.name == COM1_DEVICE_NAME {
                     if let Some(ops) = drv::DriverHub::device_at(i) {
                         return Ok(ops.write(buf));
                     }
                 }
             }
+        }
+        // KM8：同 serial_read——回退可见。
+        static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+        if !FALLBACK_WARNED.swap(true, Ordering::SeqCst) {
+            klib::warn!(
+                "[devfs] '{}' not found in DriverHub; falling back to direct UART path",
+                COM1_DEVICE_NAME
+            );
         }
         for &b in buf {
             arch_x86_64::serial::write_byte(b);
@@ -190,20 +255,35 @@ impl DeviceInfoProvider for KernelDeviceProvider {
     }
 
     fn telemetry_json(&self) -> String {
+        // K3：本内核不存在设备健康检查子系统，"status":"healthy" 是凭空捏造。
+        // 遵循同文件 storage/net 的诚实纪律（DMYGH #16）：只输出真实可得
+        // 的事实（注册表计数、运行时长），不编造健康结论。待未来引入真实
+        // 健康探测后，status 字段必须由该探测结果驱动。KM9：JsonWriter 风格。
         let count = drv::DriverHub::device_count();
         let drv_count = drv::DriverHub::driver_count();
-        format!(
-            r#"{{"status":"healthy","total_devices":{},"total_drivers":{},"uptime_ms":{}}}"#,
-            count,
-            drv_count,
-            klib::time::now_millis()
-        )
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        writer
+            .start_object()
+            .and_then(|mut o| {
+                o.field_u64("total_devices", count as u64)?;
+                o.field_u64("total_drivers", drv_count as u64)?;
+                o.field_u64("uptime_ms", klib::time::now_millis())?;
+                o.end()
+            })
+            .expect("Vec-backed telemetry JSON serialization cannot fail");
+        target
+            .into_string()
+            .expect("telemetry JSON keys are ASCII")
     }
 
     fn storage_status_json(&self) -> String {
         // DMYGH #16：主块设备 = 注册表中第一个 Block 类设备（天然兼容 #15
         // 双身份 ata0 / ata0-ramfallback）；计数直读驱动 IoStats，无影子副本。
         // 无设备、无 IO 操作集或无计数来源均输出显式错误，绝不编造健康值。
+        // KM9：JsonWriter 统一风格（替代 format! 手拼 + JsonStr 转义）。
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
         let count = drv::DriverHub::device_count();
         for i in 0..count {
             let Some(info) = drv::DriverHub::device_info_at(i) else {
@@ -213,37 +293,101 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                 continue;
             }
             let name = info.name;
-            let Some(ops) = drv::DriverHub::device_at(i) else {
-                return format!(r#"{{"error":"no_io_ops","device":"{}"}}"#, name);
-            };
-            let Some(io) = ops.as_io() else {
-                return format!(r#"{{"error":"no_io_ops","device":"{}"}}"#, name);
-            };
-            return match io.io_stats() {
-                Some(st) => format!(
-                    r#"{{"device":"{}","volatile":{},"sectors_read":{},"sectors_written":{}}}"#,
-                    name,
-                    info.volatile,
-                    st.sectors_read(),
-                    st.sectors_written()
-                ),
-                None => format!(r#"{{"error":"no_counter","device":"{}"}}"#, name),
-            };
+            let outcome: Result<(), ()> = (|| {
+                let Some(ops) = drv::DriverHub::device_at(i) else {
+                    return error_object(&mut writer, "no_io_ops", name);
+                };
+                let Some(io) = ops.as_io() else {
+                    return error_object(&mut writer, "no_io_ops", name);
+                };
+                match io.io_stats() {
+                    Some(st) => {
+                        let mut obj = writer.start_object()?;
+                        obj.field_str("device", name)?;
+                        obj.field_bool("volatile", info.volatile)?;
+                        obj.field_u64("sectors_read", st.sectors_read())?;
+                        obj.field_u64("sectors_written", st.sectors_written())?;
+                        obj.end()
+                    }
+                    None => error_object(&mut writer, "no_counter", name),
+                }
+            })();
+            outcome.expect("Vec-backed storage JSON serialization cannot fail");
+            return target
+                .into_string()
+                .expect("storage JSON keys and device names are UTF-8");
         }
-        String::from(r#"{"error":"no_block_device"}"#)
+        writer
+            .start_object()
+            .and_then(|mut o| {
+                o.field_str("error", "no_block_device")?;
+                o.end()
+            })
+            .expect("Vec-backed storage JSON serialization cannot fail");
+        return target
+            .into_string()
+            .expect("storage JSON keys are ASCII");
+
+        /// 写入 `{"error":<code>,"device":<name>}` 错误对象（KM9 辅助）。
+        fn error_object<T: klib::json::JsonTarget>(
+            writer: &mut klib::json::JsonWriter<T>,
+            code: &str,
+            name: &str,
+        ) -> Result<(), ()> {
+            let mut obj = writer.start_object()?;
+            obj.field_str("error", code)?;
+            obj.field_str("device", name)?;
+            obj.end()
+        }
+    }
+
+    /// 真实显示几何直通：唯一数据源是 Limine 注册的 framebuffer 描述符
+    /// （drivers::framebuffer_geometry）。缺席时显式报错；刷新率 Limine 不
+    /// 披露，宁缺毋假不输出 refresh_hz（vfs1 R1 / KM12：编造的 1024x768@60 已废除）。
+    fn display_mode_json(&self) -> String {
+        let Some((w, h, bpp)) = crate::drivers::framebuffer_geometry() else {
+            return alloc::string::String::from(r#"{"error":"no_display_info"}"#);
+        };
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        writer
+            .start_object()
+            .and_then(|mut o| {
+                o.field_u64("width", w)?;
+                o.field_u64("height", h)?;
+                o.field_u64("bpp", bpp)?;
+                o.end()
+            })
+            .expect("Vec-backed display mode JSON serialization cannot fail");
+        let mut s = target
+            .into_string()
+            .expect("display mode JSON keys are ASCII");
+        // 行尾换行由 DevFS 读取闭包统一追加（单点契约，审计 #9）——
+        // provider 返回裸 JSON，双侧追加即双换行。
+        s
     }
 
     fn net_stats_json(&self) -> String {
         // DMYGH #16：尚无真实 NIC 数据路径。若存在 Net 类设备则如实报告其
         // 统计不受支持；一个都没有则报告 no_net_device。禁止编造收发统计。
+        // KM9：JsonWriter 统一风格。
         let count = drv::DriverHub::device_count();
         for i in 0..count {
             if let Some(info) = drv::DriverHub::device_info_at(i) {
                 if info.kind == drv::DeviceKind::Net {
-                    return format!(
-                        r#"{{"error":"nic_stats_unsupported","device":"{}"}}"#,
-                        info.name
-                    );
+                    let mut target = klib::json::VecTarget::new();
+                    let mut writer = klib::json::JsonWriter::new(&mut target);
+                    writer
+                        .start_object()
+                        .and_then(|mut o| {
+                            o.field_str("error", "nic_stats_unsupported")?;
+                            o.field_str("device", info.name)?;
+                            o.end()
+                        })
+                        .expect("Vec-backed net JSON serialization cannot fail");
+                    return target
+                        .into_string()
+                        .expect("net JSON keys and device names are UTF-8");
                 }
             }
         }
@@ -253,13 +397,23 @@ impl DeviceInfoProvider for KernelDeviceProvider {
     fn pci_bars_json(&self, dev_name: &str) -> String {
         // C5.1/#5：经 DriverHub 反查设备名 → PCI 位置 → inspect_pci_bars。
         // 不存在或非 PCI 设备返回错误 JSON，禁止回退到固定设备。
+        // KM9：not_found 路径同样走 JsonWriter（替代 format! + JsonStr）。
         let (bus, device, function) = match drv::DriverHub::pci_location_of(dev_name) {
             Some(loc) => loc,
             None => {
-                return format!(
-                    r#"{{"error":"not_found","device":"{}"}}"#,
-                    dev_name
-                );
+                let mut target = klib::json::VecTarget::new();
+                let mut writer = klib::json::JsonWriter::new(&mut target);
+                writer
+                    .start_object()
+                    .and_then(|mut o| {
+                        o.field_str("error", "not_found")?;
+                        o.field_str("device", dev_name)?;
+                        o.end()
+                    })
+                    .expect("Vec-backed pci bars JSON serialization cannot fail");
+                return target
+                    .into_string()
+                    .expect("pci bars JSON keys and device names are UTF-8");
             }
         };
         let bars = drv::pci::inspect_pci_bars(bus, device, function);
@@ -310,9 +464,11 @@ impl DeviceInfoProvider for KernelDeviceProvider {
             }
             let _ = arr.end();
         }
-        let bytes = target.into_bytes();
-        let s = core::str::from_utf8(&bytes).unwrap_or("[]");
-        String::from(s)
+        // KM9：JsonWriter 只产出 ASCII + 转义串，UTF-8 转换不可能失败；
+        // 旧 `unwrap_or("[]")` 会把内部错误静默伪装成空列表，已删除。
+        target
+            .into_string()
+            .expect("pci bars JSON serialization is ASCII-safe")
     }
 }
 
@@ -383,11 +539,13 @@ impl fs::ByteDevice for DrvByteBridge {
     }
 }
 
-/// 尝试从注册表首个持久块设备挂载 EXT2 到 /binaries（C13.1+C13.2+#13）。
+/// 尝试从注册表的持久块设备挂载 EXT2 到 /binaries（C13.1+C13.2+#13）。
 ///
 /// 链路：DriverHub → volatile 拒载（C13.2 前置条件）→ MBR 首分区 →
-/// EXT2 超级块校验 → mount。任何一步失败都返回 false 并留下可见日志，
-/// 绝不伪造挂载成功。
+/// EXT2 超级块校验 → mount。**单设备失败只淘汰该设备**（KM10 修复：原实现
+/// 在 volatile/短读/MBR 失败时直接 `return false`，放弃全部后续候选——一旦
+/// 未来出现"第一块易失 + 第二块持久"的注册顺序，持久盘将被静默跳过），
+/// 全部候选耗尽才返回 false 并留下可见日志，绝不伪造挂载成功。
 fn try_mount_ext2_binaries(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
     let count = drv::DriverHub::device_count();
     for i in 0..count {
@@ -398,13 +556,14 @@ fn try_mount_ext2_binaries(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
             continue;
         }
         let name = info.name;
-        // C13.2 前置条件（#15 评估结论）：易失载体禁止冒充持久文件系统。
+        // C13.2 前置条件（#15 评估结论）：易失载体禁止冒充持久文件系统；
+        // 该设备不合格，继续考察下一候选。
         if info.volatile {
             klib::warn!(
-                "[ext2] refuse to mount '{}' as EXT2 backing: volatile=true (data would not survive reboot)",
+                "[ext2] skip '{}': volatile=true (data would not survive reboot)",
                 name
             );
-            return false;
+            continue;
         }
         let Some(ops) = drv::DriverHub::device_at(i) else {
             continue;
@@ -412,31 +571,31 @@ fn try_mount_ext2_binaries(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
         let bridge: Arc<dyn fs::ByteDevice> = Arc::new(DrvByteBridge(ops));
         let mut sector = [0u8; 512];
         if bridge.read_bytes(0, &mut sector) < 512 {
-            klib::warn!("[ext2] '{}' LBA0 short read, no MBR", name);
-            return false;
+            klib::warn!("[ext2] skip '{}': LBA0 short read, no MBR", name);
+            continue;
         }
         let first = match fs::mbr::parse_mbr(&sector) {
             Ok(mbr) => mbr.first_partition(),
             Err(e) => {
-                klib::warn!("[ext2] '{}' MBR parse failed: {:?}", name, e);
-                return false;
+                klib::warn!("[ext2] skip '{}': MBR parse failed: {:?}", name, e);
+                continue;
             }
         };
         let Some(part) = first else {
-            klib::warn!("[ext2] '{}' has no MBR partition entries", name);
-            return false;
+            klib::warn!("[ext2] skip '{}': no MBR partition entries", name);
+            continue;
         };
         let part_start_byte = part.start_lba as u64 * 512;
         let ext2 = match fs::ext2::Ext2Fs::open(bridge, part_start_byte) {
             Ok(f) => f,
             Err(e) => {
                 klib::warn!(
-                    "[ext2] '{}' partition lba={} is not a valid EXT2: {:?}",
+                    "[ext2] skip '{}': partition lba={} is not a valid EXT2: {:?}",
                     name,
                     part.start_lba,
                     e
                 );
-                return false;
+                continue;
             }
         };
         match mount_table.mount("/binaries", Arc::new(ext2)) {
@@ -448,12 +607,13 @@ fn try_mount_ext2_binaries(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
                 );
                 return true;
             }
+            // mount 点被占等全局性失败与设备无关，直接终止。
             Err(e) => {
                 klib::error!("[ext2] mount /binaries failed: {:?}", e);
                 return false;
             }
         }
     }
-    klib::warn!("[ext2] no persistent block device registered; /binaries stays empty");
+    klib::warn!("[ext2] no mountable persistent block device; /binaries stays empty");
     false
 }

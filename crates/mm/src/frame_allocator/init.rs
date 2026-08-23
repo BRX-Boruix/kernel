@@ -16,19 +16,34 @@
 
 use core::mem::size_of;
 use core::slice;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-use klib::{info, warn};
+use klib::info;
 use limine::{MemmapEntry, MemoryMapEntryType, NonNullPtr};
 
 use super::allocator_core::{
-    AllocatorConfig, BuddyFrame, L1_ENTRIES, L1_SHIFT, L2_ENTRIES, L2_MASK, MetadataPool,
-    UninitRegion, align_4k,
+    AllocatorConfig, BuddyFrame, FRAME_SIZE_BYTES, L1_ENTRIES, L1_SHIFT, L2_ENTRIES, L2_MASK,
+    MetadataPool, UninitRegion, align_4k,
 };
 use super::percpu_cache::FreeListTable;
 use super::{FREE_LISTS, LazyBuddyAllocator};
 
 /// Buffer for uninit regions count to handle fragmentation
 const PADDING_REGIONS: usize = 16;
+
+/// MM4 可观测性：uninit 槽位彻底耗尽时（分裂登记后仍放不下）被丢弃的物理
+/// 帧计数。正常布局下该值为 0；非 0 即容量公式被真实布局击穿的证据。
+///
+/// 审计 B7 观测通道如实说明：唯一自增点（:672）紧邻容量 panic——计数非零
+/// 的系统**必然已响亮失败**，本出口的消费者是崩溃现场/事后内核镜像检查，
+/// 而非存活系统的运行时指标（那类"恒 0 的活体观测口"才是 S25 禁止的死
+/// 出口）。若未来把丢弃改为非致命降级，必须同步把本计数接入 sysfs 投影。
+static DROPPED_UNINIT_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// 读取初始化期被丢弃的可用帧计数（MM4 可观测性出口）。
+pub fn dropped_uninit_frames() -> usize {
+    DROPPED_UNINIT_FRAMES.load(Ordering::Relaxed)
+}
 
 /// 读 TSC（相对耗时用；时钟源注入前的早期计时）。
 ///
@@ -389,9 +404,15 @@ impl LazyBuddyAllocator {
             let pool_end = pool_paddr + metadata_pool_size;
 
             // Initialize pointers
+            // MD1：PHYS_OFFSET 未设置与其余初始化失败同哲学——显式 panic。
+            // 原实现的静默 `return` 会留下 FREE_LISTS 已建、config 未建的
+            // 半成品状态，后续分配路径以更难诊断的方式爆炸。
             let phys_offset = match arch::PHYS_OFFSET.get() {
                 Some(v) => *v,
-                None => return,
+                None => panic!(
+                    "PMM: PHYS_OFFSET not initialized (HHDM response missing); \
+                     frame allocator cannot map metadata structures"
+                ),
             };
             // 一级表（L1）：`*mut *mut BuddyFrame` 数组，初始全 null。
             // 二级表在 process_range 触及对应 L1 项时按需分配。
@@ -649,7 +670,24 @@ impl LazyBuddyAllocator {
                         );
                         *region_idx += 1;
                     } else {
-                        warn!("PMM: Dropping usable memory region (uninit regions full)");
+                        // MM4：槽位彻底耗尽。容量公式 usable×2+PADDING 被真实
+                        // 布局击穿属于异常：显式计数并 panic，绝不带着"少了
+                        // 一块可用内存"的账本静默继续启动（旧实现只 warn 后
+                        // 把该段 RAM 永久出局，所有后续统计随之失真）。
+                        DROPPED_UNINIT_FRAMES.fetch_add(
+                            (end_pfn - start_pfn) as usize,
+                            Ordering::Relaxed,
+                        );
+                        panic!(
+                            "PMM: uninit region array exhausted; dropping {} frames \
+                             (pfn {}..{} phys 0x{:x}-0x{:x}). Memory layout exceeds \
+                             capacity formula (usable_regions*2+padding); sizing must be fixed.",
+                            end_pfn - start_pfn,
+                            start_pfn,
+                            end_pfn,
+                            start_pfn * FRAME_SIZE_BYTES as usize,
+                            end_pfn * FRAME_SIZE_BYTES as usize
+                        );
                     }
                 }
             }

@@ -20,6 +20,18 @@ fn main() {
     // 注入版本横幅所需的构建元数据（BORUIX KERNEL v.x.y.z / Git Commit / Build Timestamp）
     emit_git_commit();
     emit_build_timestamp();
+    emit_symbols_epoch();
+}
+
+/// KM13：注入符号纪元（SDK 构建路径为本次构建的唯一标识；直连 cargo build
+/// 无此环境变量时注入 0）。内核运行时将其与嵌入符号表自带的 SYMBOLS_EPOCH
+/// 比对——不一致即快照陈旧，启动横幅如实告警（见 symbols.rs）。
+fn emit_symbols_epoch() {
+    // 声明环境输入：否则 build 脚本输出被缓存，SDK 第二遍编译不会因该
+    // 环境变量出现而重跑，纪元永远停留在首次值。
+    println!("cargo:rerun-if-env-changed=BORUIX_SYMBOLS_EPOCH");
+    let epoch = std::env::var("BORUIX_SYMBOLS_EPOCH").unwrap_or_else(|_| "0".to_string());
+    println!("cargo:rustc-env=BORUIX_SYMBOLS_BUILD_EPOCH={epoch}");
 }
 
 /// 注入 git 当前 HEAD 提交 hash（非 git 仓库或命令失败时注入 "Not Found"）。

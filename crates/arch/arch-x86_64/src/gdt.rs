@@ -185,12 +185,19 @@ global_asm!(
     ts = const TSS_SEL as usize,
 );
 
+/// 页对齐栈存储（与 kernel::main 的 KMAIN_STACK 同族修复：裸 `[u8; N]`
+/// 静态对齐为 1，链接器可落在奇地址；TSS.RSP0/IST 栈顶从非对齐地址出发
+/// 会破坏 Rust ABI 栈对齐约定，且 Double Fault 栈错位会让本该兜底的 #DF
+/// 处理器自身再次故障）。页对齐是栈存储的成文要求。
+#[repr(C, align(4096))]
+struct PageAlignedStack<const N: usize>([u8; N]);
+
 /// BSP（引导核）使用的 GDT/TSS/内核栈。
 static mut BSP_GDT: Gdt = Gdt::new();
 static mut BSP_TSS: Tss = Tss::new();
-static mut BSP_KSTACK: [u8; KSTACK_SIZE] = [0; KSTACK_SIZE];
+static mut BSP_KSTACK: PageAlignedStack<KSTACK_SIZE> = PageAlignedStack([0; KSTACK_SIZE]);
 /// BSP 的 Double Fault 中断栈。
-static mut BSP_DF_STACK: [u8; DF_STACK_SIZE] = [0; DF_STACK_SIZE];
+static mut BSP_DF_STACK: PageAlignedStack<DF_STACK_SIZE> = PageAlignedStack([0; DF_STACK_SIZE]);
 
 /// 计算内核栈顶地址：栈起始地址 + 字节长度。
 #[inline]
@@ -217,9 +224,13 @@ pub fn setup_cpu(gdt: *mut Gdt, tss: *mut Tss, kstack_top: u64, df_stack_top: u6
 ///
 /// 必须在允许使用全局静态变量的早期（堆初始化前即可）调用。
 pub fn init() {
-    let kstack_top = stack_top(core::ptr::addr_of!(BSP_KSTACK) as *const u8, KSTACK_SIZE);
+    // SAFETY：仅取静态栈存储的地址（不访问内容），字段投影按 2024 版规则入 unsafe。
+    let kstack_top = stack_top(
+        unsafe { core::ptr::addr_of!(BSP_KSTACK.0) } as *const u8,
+        KSTACK_SIZE,
+    );
     let df_stack_top = stack_top(
-        core::ptr::addr_of!(BSP_DF_STACK) as *const u8,
+        unsafe { core::ptr::addr_of!(BSP_DF_STACK.0) } as *const u8,
         DF_STACK_SIZE,
     );
     let gdt_ptr = core::ptr::addr_of_mut!(BSP_GDT);

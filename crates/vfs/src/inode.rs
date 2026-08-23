@@ -79,6 +79,11 @@ impl Permissions {
         bits
     }
 
+    /// 按位解码权限。
+    ///
+    /// KD7 成文策略（宽松掩码）：未知高位静默忽略（与 OpenFlags::from_bits
+    /// 同一族决策——位集演进不破坏旧二进制）；需要严格语义时调用方自行做
+    /// to_bits 往返比对。位分配见 [`Self::to_bits`]。
     pub const fn from_bits(bits: u32) -> Self {
         Self {
             readable: (bits & (1 << 0)) != 0,
@@ -118,6 +123,19 @@ pub trait INode: Send + Sync {
     /// 写数据（从指定 offset 开始）。
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Error> {
         Err(Error::NotSupported)
+    }
+
+    /// 是否可定位（KM17/KM1）：字符流节点返回 `false`——syscall 层据此对
+    /// 非顺序偏移如实报 `IllegalSeek`，而不是靠 fd 号魔法数字判断。
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    /// 空读时是否应阻塞等待键盘输入（KM1/K1a）：仅标准输入为 `true`。
+    /// syscall 层把该类句柄的 `WouldBlock` 翻译为登记等待者并切换进程，
+    /// 其余句柄的 `WouldBlock` 如实上抛。
+    fn interactive_input(&self) -> bool {
+        false
     }
 
     /// 获取元数据。

@@ -9,6 +9,17 @@ use spin::RwLock;
 
 use crate::inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
 
+/// 单文件最大字节数（KA7/S33 量化：RamFS 内容驻留内核堆，单进程经
+/// SYS_ENTRY_WRITE 循环扩写即可无界吃堆——8MiB 覆盖全部现存用户程序与
+/// 测试产物，同时把"一个文件拖垮内核内存"变成显式 ENOSPC）。超限返回
+/// [`Error::NoSpace`]。
+pub const RAMFS_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 单目录最大条目数（KA7/S33：create/mkdir/symlink 无配额时用户可无限
+/// 创建目录项。4096 条 × 目录项开销 ≈ 数百 KiB 堆，边界明确且远超正常
+/// 用量）。超限返回 [`Error::NoSpace`]。
+pub const RAMFS_MAX_ENTRIES_PER_DIR: usize = 4096;
+
 /// RamFS 内部节点数据。
 enum RamNodeData {
     File {
@@ -104,7 +115,17 @@ impl INode for RamINode {
                 let end = (offset as usize)
                     .checked_add(buf.len())
                     .ok_or(Error::OutOfRange)?;
+                // KA7：文件大小配额 + 分配失败诚实化。try_reserve 先验证
+                // 堆可满足增长需求——Vec::resize 的 OOM 路径是直接 panic，
+                // 用户态一次越界写绝不能把内核推过那条路。
+                if end as u64 > RAMFS_MAX_FILE_BYTES {
+                    return Err(Error::NoSpace);
+                }
                 if end > c.len() {
+                    let grow = end - c.len();
+                    if c.try_reserve(grow).is_err() {
+                        return Err(Error::OutOfMemory);
+                    }
                     c.resize(end, 0);
                 }
                 let start = offset as usize;
@@ -127,7 +148,17 @@ impl INode for RamINode {
     fn truncate(&self, size: u64) -> Result<(), Error> {
         match &self.data {
             RamNodeData::File { content } => {
+                // KA7：truncate 扩容与 write_at 同一配额与 OOM 纪律。
+                if size > RAMFS_MAX_FILE_BYTES {
+                    return Err(Error::NoSpace);
+                }
                 let mut c = content.write();
+                if size as usize > c.len() {
+                    let grow = size as usize - c.len();
+                    if c.try_reserve(grow).is_err() {
+                        return Err(Error::OutOfMemory);
+                    }
+                }
                 c.resize(size as usize, 0);
                 drop(c);
                 let mut meta = self.meta.write();
@@ -158,6 +189,10 @@ impl INode for RamINode {
                 if c.contains_key(name) {
                     return Err(Error::AlreadyExists);
                 }
+                // KA7：目录条目配额（create/mkdir/symlink 三入口同一防线）。
+                if c.len() >= RAMFS_MAX_ENTRIES_PER_DIR {
+                    return Err(Error::NoSpace);
+                }
                 let file = RamINode::new_file(perm);
                 c.insert(name.to_string(), file.clone());
                 Ok(file)
@@ -172,6 +207,9 @@ impl INode for RamINode {
                 let mut c = children.write();
                 if c.contains_key(name) {
                     return Err(Error::AlreadyExists);
+                }
+                if c.len() >= RAMFS_MAX_ENTRIES_PER_DIR {
+                    return Err(Error::NoSpace);
                 }
                 let dir = RamINode::new_dir(perm);
                 c.insert(name.to_string(), dir.clone());
@@ -233,6 +271,9 @@ impl INode for RamINode {
                 let mut c = children.write();
                 if c.contains_key(name) {
                     return Err(Error::AlreadyExists);
+                }
+                if c.len() >= RAMFS_MAX_ENTRIES_PER_DIR {
+                    return Err(Error::NoSpace);
                 }
                 let link = RamINode::new_symlink(target);
                 c.insert(name.to_string(), link.clone());

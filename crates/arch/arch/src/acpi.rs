@@ -204,7 +204,11 @@ pub fn parse_hpet(buf: &[u8]) -> Option<Hpet> {
     }
     let page_protect = if buf.len() >= 76 { buf[72] & 0x03 } else { 0 };
 
-    // 基址必须非 0。时钟周期允许为 0（驱动从硬件寄存器读取）。
+    // 基址必须非 0。这不是"拒绝魔法值"的形式主义：物理地址 0 是 x86 实模式
+    // 中断向量表/BIOS 数据区（ACPI 规范中 HPET 基址合法域为 MMIO 空间，
+    // 0xFED0_0000 起），基址解析为 0 = 三种布局全部探测失败的**信号**而非
+    // 真实地址——如实 None，由上层走"HPET 缺席"降级路径（审计 B12 裁决）。
+    // 时钟周期允许为 0（驱动从硬件寄存器读取）。
     if base_addr == 0 {
         return None;
     }

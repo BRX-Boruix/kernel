@@ -93,12 +93,13 @@ pub fn end_of_interrupt(irq: u8) {
 /// 键盘 IRQ1 屏蔽**（bit1=0），其余（含 IRQ0 timer、IRQ2 级联）保持屏蔽。
 ///
 /// 本项目键盘走 **8259 → LAPIC LINT0 (ExtINT)** 路径（QEMU `pc` 机器最可靠的
-/// 外部中断源）：`ioapic::init` 把 IMCR 切到 PIC 模式使 8259 输出连 LINT0，
-/// `lapic::init` 把 LINT0 配为 ExtINT 接收；此处解屏蔽 IRQ1 才能让其到达 CPU。
-/// IRQ0（timer）由 LAPIC 自身定时器接管，故保持屏蔽。
+/// 外部中断源）：`imcr::switch_to_pic_mode` 把 IMCR 切到 PIC 模式使 8259 输出
+/// 连 LINT0，`lapic::init` 把 LINT0 配为 ExtINT 接收；此处解屏蔽 IRQ1 才能让
+/// 其到达 CPU。IRQ0（timer）由 LAPIC 自身定时器接管，故保持屏蔽。
 pub fn init() {
     remap();
     // 仅 IRQ1（键盘）使能（bit1=0），其余（含 IRQ0 timer、IRQ2 级联）屏蔽。
-    set_mask(0xFFFD);
+    const MASK_ALL_EXCEPT_IRQ1: u16 = !(1u16 << 1);
+    set_mask(MASK_ALL_EXCEPT_IRQ1);
     klib::info!("[pic] 8259 remapped, IRQ1 (kbd) unmasked");
 }

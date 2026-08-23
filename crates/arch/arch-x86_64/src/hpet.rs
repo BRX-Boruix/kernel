@@ -61,8 +61,8 @@ pub fn init(base_phys: u64, acpi_period_fs: u64) -> bool {
         return false;
     }
 
-    // 与 LAPIC 相同的模式：物理地址 + 高半区偏移作为虚拟地址。
-    let virt = base_phys | 0xffff_8000_0000_0000;
+    // 与 LAPIC 相同的模式：统一设备映射基址（mmio::DEVICE_MMIO_VIRT_BASE）。
+    let virt = base_phys | mmio::DEVICE_MMIO_VIRT_BASE;
     if !mmio::map_phys_4k(base_phys, virt) {
         klib::warn!("[hpet] map {:#x} failed", base_phys);
         return false;

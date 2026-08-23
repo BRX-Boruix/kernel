@@ -4,25 +4,41 @@
 //! 并在串口输出完成后尝试输出到 framebuffer 屏幕，最后停机。
 //! 架构相关的信息（架构名、停机方式、回退串口、CPU id、屏幕输出）由入口
 //! crate 通过 `init`/`set_panic_output` 注入，保持本模块架构无关。
+//!
+//! KM14：注入槽位全部为 [`spin::Once`]——早期单线程阶段一次性写入，之后
+//! 只读。`Once::get()` 对已完成的 Once 是无锁原子读，panic 路径不会阻塞在
+/// 任何锁上；原 `AtomicUsize` + 裸 `transmute` 往返（fn↔usize ×5、架构名
+/// ptr+len 原子对）整类不安全转换随之消除。
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use spin::Once;
 
 use crate::symbols;
 
-/// 停机函数（由入口注入，绑定具体架构的 halt）
+/// 停机函数（由入口注入，绑定具体架构的 halt）。
 type HaltFn = fn() -> !;
-static HALT_FN: AtomicUsize = AtomicUsize::new(0);
+static HALT_FN: Once<HaltFn> = Once::new();
 
-/// 架构名字符串（指针 + 长度，由入口注入）
-static ARCH_NAME_PTR: AtomicUsize = AtomicUsize::new(0);
-static ARCH_NAME_LEN: AtomicUsize = AtomicUsize::new(0);
+/// 架构名字符串（由入口注入）。
+static ARCH_NAME: Once<&'static str> = Once::new();
 
 /// 回退串口写函数 `fn(&str)`（绕过 klib 的 console 层，保证早期 panic 可见）。
-static SERIAL_WRITE: AtomicUsize = AtomicUsize::new(0);
+static SERIAL_WRITE: Once<fn(&str)> = Once::new();
 /// 当前 CPU id 读取器 `fn() -> u32`（未注入/未就绪时返回 0）。
-static CPU_ID_READER: AtomicUsize = AtomicUsize::new(0);
-/// framebuffer 屏幕输出 `fn(&str)`（未初始化/未注入时为 0，静默跳过）。
-static SCREEN_WRITE: AtomicUsize = AtomicUsize::new(0);
+static CPU_ID_READER: Once<fn() -> u32> = Once::new();
+/// framebuffer 屏幕输出 `fn(&str)`（未初始化/未注入时静默跳过）。
+static SCREEN_WRITE: Once<fn(&str)> = Once::new();
+/// 静默函数 `fn()`（关本 CPU 中断；未注入时跳过——早期 panic 本就无中断可关）。
+///
+/// kernel1.md KA1：panic 处理全程必须在本 CPU 关中断下进行。中断开着时，
+/// dump_crash_log / 屏幕输出路径上的锁（日志环形缓冲、终端锁）可能被被打断
+/// 的持有者占着，或 LAPIC tick 在 panic 现场上再次触发调度改写现场。
+static QUIESCE_FN: Once<fn()> = Once::new();
+
+/// 跨核停机函数 `fn()`（KA1：向其它在线 CPU 广播停机 IPI；未注入/单核跳过）。
+///
+/// 多核 panic 现场上其它核仍在跑：继续分配内存、拿锁、改共享状态，甚至
+/// 也进入 panic 交错输出。诊断输出前先停住它们。
+static CROSS_HALT_FN: Once<fn()> = Once::new();
 
 /// 默认停机（未注入前：死循环）
 fn default_halt() -> ! {
@@ -33,9 +49,8 @@ fn default_halt() -> ! {
 
 /// 初始化 panic 子系统：注入架构名和停机函数。应在内核早期调用。
 pub fn init(arch_name: &'static str, halt: HaltFn) {
-    ARCH_NAME_PTR.store(arch_name.as_ptr() as usize, Ordering::SeqCst);
-    ARCH_NAME_LEN.store(arch_name.len(), Ordering::SeqCst);
-    HALT_FN.store(halt as usize, Ordering::SeqCst);
+    ARCH_NAME.call_once(|| arch_name);
+    HALT_FN.call_once(|| halt);
 }
 
 /// 注入 panic 时的平台辅助：回退串口、CPU id、屏幕输出。
@@ -44,60 +59,47 @@ pub fn init(arch_name: &'static str, halt: HaltFn) {
 /// `cpu_id` 返回当前 CPU 的 LAPIC id（未就绪时须自行返回 0，避免读未映射寄存器）。
 /// `screen` 向 framebuffer 输出（未初始化时可安全空操作）。
 pub fn set_panic_output(serial: fn(&str), cpu_id: fn() -> u32, screen: fn(&str)) {
-    SERIAL_WRITE.store(serial as usize, Ordering::SeqCst);
-    CPU_ID_READER.store(cpu_id as usize, Ordering::SeqCst);
-    SCREEN_WRITE.store(screen as usize, Ordering::SeqCst);
+    SERIAL_WRITE.call_once(|| serial);
+    CPU_ID_READER.call_once(|| cpu_id);
+    SCREEN_WRITE.call_once(|| screen);
+}
+
+/// 注入 panic 静默函数（本 CPU 关中断）。由入口 crate 在中断子系统就绪后接线；
+/// 未注入时 panic 入口跳过（早期阶段无中断可关）。
+pub fn set_panic_quiesce(f: fn()) {
+    QUIESCE_FN.call_once(|| f);
+}
+
+/// 注入跨核停机函数（KA1）。由入口 crate 在 SMP 初始化完成后接线；
+/// 未注入时 panic 入口跳过（单核/极早期无其它核可停）。
+pub fn set_cross_core_halt(f: fn()) {
+    CROSS_HALT_FN.call_once(|| f);
 }
 
 fn halt() -> ! {
-    let f = HALT_FN.load(Ordering::SeqCst);
-    if f == 0 {
-        default_halt()
-    } else {
-        unsafe { core::mem::transmute::<usize, HaltFn>(f)() }
+    match HALT_FN.get().copied() {
+        None => default_halt(),
+        Some(f) => f(),
     }
 }
 
 fn arch_name() -> &'static str {
-    let ptr = ARCH_NAME_PTR.load(Ordering::SeqCst);
-    let len = ARCH_NAME_LEN.load(Ordering::SeqCst);
-    if ptr == 0 {
-        "unknown"
-    } else {
-        unsafe {
-            core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr as *const u8, len))
-        }
-    }
+    ARCH_NAME.get().copied().unwrap_or("unknown")
 }
 
 /// 取回退串口函数（未注入则 None）。
 fn serial_write() -> Option<fn(&str)> {
-    let f = SERIAL_WRITE.load(Ordering::SeqCst);
-    if f == 0 {
-        None
-    } else {
-        Some(unsafe { core::mem::transmute::<usize, fn(&str)>(f) })
-    }
+    SERIAL_WRITE.get().copied()
 }
 
 /// 当前 CPU id（未注入/未就绪返回 0）。
 fn cpu_id() -> u32 {
-    let f = CPU_ID_READER.load(Ordering::SeqCst);
-    if f == 0 {
-        0
-    } else {
-        unsafe { core::mem::transmute::<usize, fn() -> u32>(f)() }
-    }
+    CPU_ID_READER.get().map(|f| f()).unwrap_or(0)
 }
 
 /// 屏幕输出（未注入则跳过）。
 fn screen_write() -> Option<fn(&str)> {
-    let f = SCREEN_WRITE.load(Ordering::SeqCst);
-    if f == 0 {
-        None
-    } else {
-        Some(unsafe { core::mem::transmute::<usize, fn(&str)>(f) })
-    }
+    SCREEN_WRITE.get().copied()
 }
 
 /// 把 panic 信息（架构、CPU、消息、位置）格式化为单条消息。
@@ -135,7 +137,10 @@ fn write_backtrace(out: &mut [u8]) -> &str {
         core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack));
     }
     let mut valid = 0usize;
-    for i in 0..32 {
+    // KD4：回溯帧数上限常量化。内核调用链深度远小于此值；上限同时防御
+    // 损坏帧链导致的长时间空转（配合下方单调性检查双保险）。
+    const BACKTRACE_MAX_FRAMES: usize = 32;
+    for i in 0..BACKTRACE_MAX_FRAMES {
         let next: usize;
         let ret: usize;
         unsafe {
@@ -165,9 +170,21 @@ fn write_backtrace(out: &mut [u8]) -> &str {
     core::str::from_utf8(&out[..len]).unwrap_or("")
 }
 
-/// Panic handler：打印诊断信息到串口与屏幕，然后停机。
+/// Panic handler：关中断（KA1）、打印诊断信息到串口与屏幕，然后停机。
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // 0. 本 CPU 关中断：后续诊断路径会拿日志环形缓冲锁 / 终端锁，且 tick
+    //    不得再在 panic 现场上触发调度。未注入（极早期）时跳过。
+    if let Some(f) = QUIESCE_FN.get().copied() {
+        f();
+    }
+    // 0.5 跨核停机（KA1）：其它核仍在跑会继续分配/拿锁/改共享状态，甚至
+    //     进入 panic 交错输出——诊断输出前先停住它们。须在本 CPU 关中断
+    //     之后（现场稳定）执行；未注入/单核跳过。
+    if let Some(f) = CROSS_HALT_FN.get().copied() {
+        f();
+    }
+
     let mut buf = [0u8; 2048];
     let msg = build_msg(&mut buf, info);
 

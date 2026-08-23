@@ -30,6 +30,11 @@ const LSR_DATA_READY: u8 = 1 << 0;
 const LSR_TX_EMPTY: u8 = 1 << 5;
 /// 防止缺失/故障 UART 令验收永久自旋；这是寄存器轮询次数，不是伪造超时成功。
 const LOOPBACK_POLL_LIMIT: usize = 1_000_000;
+/// TX 空等待的轮询上限（arch1.md AM2）：与环回验收同哲学——UART 挂死时
+/// 宁可丢弃本字节也不能持串口锁永久自旋（多核下会拖死全部 CPU）。
+/// 这是寄存器轮询次数，不是伪造超时成功；耗尽即放弃该字节且不记日志
+/// （warn! 会经 console 回到本写路径，构成递归）。
+const TX_POLL_LIMIT: usize = 1_000_000;
 
 /// 保存当前中断状态并关中断（写串口期间禁用本 CPU 中断）。
 ///
@@ -229,6 +234,60 @@ pub fn loopback_test(byte: u8) -> Result<(), Error> {
     }
 }
 
+/// 回环收发缓冲上限（K5 验收载荷长度界）。
+const LOOPBACK_BURST_MAX: usize = 8;
+
+/// K5 完全体验收：经 [`klib::console::Console::write_bytes`] 字节透明路径的
+/// 真实回环收发。
+///
+/// 与 [`loopback_test`] 同一 loopback 纪律，但发送端是被测对象本身——
+/// SerialConsole 的字节接口。非 UTF-8 序列（如 0xFF 0xFE）必须**原样**到达
+/// 线路；旧 lossy 路径会把它替换成 U+FFFD（EF BF BD）而使本测试失败。
+/// 载荷不得含 `\n`（字节路径按线路纪律展开为 `\r\n`，回读长度会变）。
+pub fn write_bytes_loopback_test(bytes: &[u8]) -> Result<(), Error> {
+    if bytes.is_empty() || bytes.len() > LOOPBACK_BURST_MAX {
+        return Err(Error::InvalidParam);
+    }
+    let saved = irq_save();
+    LOCK.acquire();
+    let base = com_base();
+    let mcr = inb(base + REG_MODEM_CONTROL);
+    outb(base + REG_MODEM_CONTROL, mcr | MCR_LOOPBACK);
+    LOCK.release(); // 让被测的字节路径自行持锁（LOCK 不可重入）
+
+    // 被测对象：Console trait 的字节接口（SerialConsole 的覆写实现）。
+    use klib::console::Console as _;
+    SERIAL_CONSOLE.write_bytes(bytes);
+
+    LOCK.acquire();
+    let mut received = [0u8; LOOPBACK_BURST_MAX];
+    let mut ok = true;
+    for slot in received.iter_mut().take(bytes.len()) {
+        let mut ready = false;
+        for _ in 0..LOOPBACK_POLL_LIMIT {
+            if inb(base + REG_LINE_STATUS) & LSR_DATA_READY != 0 {
+                ready = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !ready {
+            ok = false;
+            break;
+        }
+        *slot = inb(base + REG_DATA_OR_DLL);
+    }
+    outb(base + REG_MODEM_CONTROL, mcr);
+    LOCK.release();
+    irq_restore(saved);
+
+    if ok && &received[..bytes.len()] == bytes {
+        Ok(())
+    } else {
+        Err(Error::Io)
+    }
+}
+
 /// 探测可用的串口，返回其基址。找不到则回退 COM1。
 ///
 /// 经典探测法：写 0xAE 到 SCR（scratch 寄存器，偏移 7），若可读回 0xAE
@@ -258,10 +317,21 @@ fn com_base() -> u16 {
 }
 
 /// 等待发送保持寄存器空（LSR bit 5），随后写一个字节。
+///
+/// 轮询上限 [`TX_POLL_LIMIT`]：耗尽说明 UART 硬件挂死，放弃本字节以释放
+/// 串口锁（持锁永久自旋会让多核全部卡死，arch1.md AM2）。正常 UART 在
+/// 波特率级别的时间内必然腾空，远达不到上限。
 #[inline]
 fn putc_wait(byte: u8) {
     let com = com_base();
-    while inb(com + REG_LINE_STATUS) & LSR_TX_EMPTY == 0 {}
+    let mut polled = 0usize;
+    while inb(com + REG_LINE_STATUS) & LSR_TX_EMPTY == 0 {
+        polled += 1;
+        if polled >= TX_POLL_LIMIT {
+            return;
+        }
+        core::hint::spin_loop();
+    }
     outb(com, byte);
 }
 
@@ -305,6 +375,21 @@ pub fn write_str(s: &str) {
     irq_restore(saved);
 }
 
+/// 直接写入原始字节流到串口（\n 转 \r\n）。带锁 + 关中断。**字节透明**：
+/// 非 UTF-8 序列原样到达线路，零销毁（K5 完全体）。
+pub fn write_bytes(bytes: &[u8]) {
+    let saved = irq_save();
+    LOCK.acquire();
+    for &b in bytes {
+        if b == b'\n' {
+            putc_wait(b'\r');
+        }
+        putc_wait(b);
+    }
+    LOCK.release();
+    irq_restore(saved);
+}
+
 /// 串口控制台：`klib::console::Console` 的实现（统一 console 的串口 sink）。
 pub struct SerialConsole;
 
@@ -320,6 +405,10 @@ impl klib::console::Console for SerialConsole {
     }
     fn write_byte(&self, b: u8) {
         crate::serial::write_byte(b);
+    }
+    // K5 完全体：串口是字节透明设备——覆写缺省 lossy 转发，原始字节直达线路。
+    fn write_bytes(&self, bytes: &[u8]) {
+        crate::serial::write_bytes(bytes);
     }
     fn flush(&self) {}
 }

@@ -38,7 +38,6 @@ kernel-test-waitpid = ["kernel-tests"]
 
 [dependencies]
 limine = { version = "0.1", features = ["requests-section"] }
-flanterm_rust = { path = "../../vendor/flanterm_rust" }
 klib = { path = "../klib" }
 drv = { path = "../drv" }
 fs = { path = "../fs" }

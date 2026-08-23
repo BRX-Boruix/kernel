@@ -77,6 +77,12 @@ impl OpenFlags {
         bits
     }
 
+    /// 按位解码打开标志。
+    ///
+    /// KD7 成文策略（宽松掩码）：`bits` 中不属于本 ABI 的未知高位被**静默
+    /// 忽略**（逐位提取，不做 EINVAL）。这是有意选择而非疏漏——标志集随内核
+    /// 版本演进，旧二进制携带新内核不认识的位不应导致打开失败；调用方如需
+    /// 严格校验可先经 [`Self::to_bits`] 往返比对丢弃的位。位分配见 [`Self::to_bits`]。
     pub const fn from_bits(bits: u32) -> Self {
         Self {
             read: (bits & (1 << 0)) != 0,

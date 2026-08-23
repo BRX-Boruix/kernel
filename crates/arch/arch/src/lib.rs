@@ -15,7 +15,6 @@ pub mod addr;
 pub mod cpu;
 pub mod hhdm;
 pub mod paging;
-pub mod pci;
 pub mod task;
 pub mod timer;
 
@@ -23,8 +22,7 @@ pub use acpi::{Rsdp, SdtHeader};
 pub use addr::{PhysAddr, PhysFrame, VirtAddr};
 pub use cpu::{Cpu, CpuFeature};
 pub use hhdm::{PHYS_OFFSET, phys_to_virt, virt_to_phys};
-pub use paging::{ActivePageTable, PageFlags, PageSize, PageTable};
-pub use pci::{Pci, PciDeviceInfo};
+pub use paging::{ActivePageTable, PageFaultCode, PageFlags, PageSize, PageTable};
 pub use task::{TaskContext, switch_to};
 pub use timer::{Timer, TimerCallback};
 

@@ -47,6 +47,10 @@ static LAPIC_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 
 // LAPIC 寄存器偏移
 const LAPIC_SVR: usize = 0xF0; // Spurious Interrupt Vector
+/// SVR 的 APIC 软件使能位（bit 8）。
+const SVR_APIC_ENABLE: u32 = 1 << 8;
+/// 伪中断向量：与 IDT 表项/分发端共用 [`interrupts::SPURIOUS_VECTOR`] 单点定义。
+const SPURIOUS_VECTOR_SVR: u32 = interrupts::SPURIOUS_VECTOR as u32;
 const LAPIC_TIMER: usize = 0x320; // LVT Timer
 const LAPIC_TIMER_DIV: usize = 0x3E0; // 分频
 const LAPIC_TIMER_INIT: usize = 0x380; // Initial Count
@@ -115,6 +119,43 @@ fn lapic_rmw(reg: usize, clear_bits: u32, set_bits: u32) {
 /// 发送 EOI 给 LAPIC。
 pub fn end_of_interrupt() {
     lapic_write(LAPIC_EOI, 0);
+}
+
+/// ICR（中断命令寄存器）偏移与字段（Intel SDM §10.6）。
+const LAPIC_ICR_LOW: usize = 0x300;
+const LAPIC_ICR_HIGH: usize = 0x310;
+/// Delivery Status（bit12，只读）：1 = 发送进行中。写入前必须为空闲。
+const ICR_SEND_PENDING: u32 = 1 << 12;
+/// Level/Assert（bit14）：Fixed 投递要求置位。
+const ICR_LEVEL_ASSERT: u32 = 1 << 14;
+/// Destination 目标 APIC id 位于 ICR 高半寄存器 bits 31:24。
+const ICR_DEST_SHIFT: u32 = 24;
+/// 等待发送队列排空的有界轮询上限（AM2 与 serial TX 同一防自旋纪律）：
+/// 正常一次总线投递在数十周期内完成；超限说明目标不存在或总线异常，
+/// 放弃本次发送并如实上报失败，绝不永久自旋拖死发起核。
+const ICI_SEND_POLL_LIMIT: u32 = 1_000_000;
+
+/// 向指定 LAPIC id 发送 Fixed 模式 IPI（MA1b）。
+///
+/// 返回 `true` = 已成功发出；`false` = LAPIC 未映射或发送队列未在有界轮询
+/// 内排空（调用方按失败处理，如降级为本地排空并告警）。
+pub fn send_fixed_ipi(dest_lapic_id: u32, vector: u8) -> bool {
+    if !is_mapped() {
+        return false;
+    }
+    // SDM §10.6.1 写入次序：先写高半（目标），后写低半（触发发送）。
+    lapic_write(
+        LAPIC_ICR_HIGH,
+        (dest_lapic_id & 0xFF) << ICR_DEST_SHIFT,
+    );
+    for _ in 0..ICI_SEND_POLL_LIMIT {
+        if lapic_read(LAPIC_ICR_LOW) & ICR_SEND_PENDING == 0 {
+            lapic_write(LAPIC_ICR_LOW, (vector as u32) | ICR_LEVEL_ASSERT);
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
 }
 
 /// 配置 LAPIC LINT0 为 ExtINT 模式接收 8259 中断。
@@ -222,8 +263,9 @@ pub fn init() {
     } else {
         DEFAULT_LAPIC_PHYS
     };
-    // 映射到高半区虚拟地址：基址 + 高半区偏移（复用与 HHDM 相同的顶层索引）。
-    let virt = phys | 0xffff_8000_0000_0000;
+    // 映射到高半区虚拟地址：统一设备映射基址（mmio::DEVICE_MMIO_VIRT_BASE，
+    // arch1.md AA2：不再各文件硬编码 HHDM 形状的魔数）。
+    let virt = phys | mmio::DEVICE_MMIO_VIRT_BASE;
     LAPIC_VIRT.store(virt, Ordering::Relaxed);
 
     // 把 LAPIC 物理地址映射到高半区虚拟地址
@@ -233,8 +275,9 @@ pub fn init() {
     }
     klib::info!("[lapic] mapped to {:#x}", virt);
 
-    // 1. 使能 LAPIC（SVR，向量 0xFF）
-    lapic_rmw(LAPIC_SVR, 0x100, 0x100 | 0xFF);
+    // 1. 使能 LAPIC（SVR，伪中断向量 = interrupts::SPURIOUS_VECTOR，
+    //    IDT 已在 interrupts::init 填充对应表项——arch1.md AA3）
+    lapic_rmw(LAPIC_SVR, SVR_APIC_ENABLE, SVR_APIC_ENABLE | SPURIOUS_VECTOR_SVR);
 
     // 2. 校准 LAPIC 总线频率（用 PIT 实测，而非硬编码）
     let bus_freq = calibrate_bus_freq();

@@ -18,9 +18,9 @@ pub use process::{
     process_page_fault_handler, set_current_proc,
 };
 pub use scheduler::{
-    Waited, block_current, block_for_kbd, exit_current, get_process_snapshot, kill_pid,
-    process_snapshots, ps_snapshot, spawn, spawn_with_ppid, start, tick, waitpid, wake, wake_kbd,
-    yield_now,
+    SwitchOutcome, Waited, block_current, block_for_kbd, exit_current, get_process_snapshot,
+    kill_pid, process_snapshots, ps_snapshot, spawn, spawn_with_ppid, start, tick, waitpid, wake,
+    wake_kbd, yield_now,
 };
 #[cfg(feature = "kernel-tests")]
 pub use scheduler::test_hooks;

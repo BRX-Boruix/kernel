@@ -16,9 +16,24 @@
 use arch::PageFlags;
 use arch_x86_64::interrupts::InterruptFrame;
 use klib::error::Error;
-use mm::user_space::{USER_BASE, USER_TOP};
+use mm::user_space::{USER_BASE, USER_TOP, UserAccess};
 
 use task::current_proc_mut;
+
+// ---------- 用户缓冲区资源边界（kernel1.md K7 / arch1.md AR1） ----------
+
+/// 单次内核↔用户拷贝块的字节上限。
+///
+/// 选择依据（S17 默认值论证）：用户态一次 `read`/`write` 的合理工作集远小于
+/// 该值（stdio 缓冲通常 4KiB~64KiB）；超过上限的传输由分块循环完成，语义是
+/// 允许的短读/短写而非失败。该上限把"用户参数直通堆分配"的最坏单次分配钉在
+/// 常量上，杜绝传一个巨大 len 即触发内核 OOM panic 或耗尽物理内存的攻击面
+/// （kernel1.md K7）。取值对齐常见页级缓存的整数倍，避免块内碎片拷贝。
+const SYSCALL_COPY_CHUNK_BYTES: u64 = 1024 * 1024;
+
+/// 路径类 syscall 参数（mkdir/unlink/readdir 等）的路径拷贝上限。
+/// 与单页缓冲对齐：一页足够容纳任何合法内核路径，超长在拷贝层如实报错。
+const PATH_PARAM_MAX: usize = 4096;
 
 // ---------- syscall 号（域 + 操作二维编码） ----------
 
@@ -93,16 +108,69 @@ fn pack_err(e: Error) -> u64 {
 
 // ---------- 具体 syscall 实现 ----------
 
+/// 单次 syscall 用户缓冲长度上限（审计 B2：逐页预校验的 CPU 有界性）。
+///
+/// `validate_user_range` 对区间**逐页**走页表，len 无上限 = 用户一个 read
+/// 就能让内核空转 ~2^34 次页表查询。上限取 64MiB——与单地址空间配额
+/// （MAX_USER_AREA_TOTAL_BYTES）同量级，覆盖全部合法批量 IO；超出即参数
+/// 错误（InvalidParam），调用方分次提交。Linux 同型先例：MAX_RW_COUNT。
+const MAX_SYSCALL_BUF_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 预校验当前进程的用户缓冲区 `[buf, buf + len)` 对 `access` 意图可访问
+/// （arch1.md AR1a EFAULT 路线的统一入口）。
+///
+/// 三层检查：
+/// 1. **长度上限**——超过 [`MAX_SYSCALL_BUF_BYTES`] 直接 InvalidParam：
+///    页表预校验逐页执行，必须保证其迭代次数有界（B2）；
+/// 2. **窗口检查**——区间必须整体落在用户半区 `[USER_BASE, USER_TOP)`，
+///    越界属参数值错误，返回 [`Error::OutOfRange`]；
+/// 3. **页表预校验**——经 [`mm::user_space::UserAddressSpace::is_range_mapped`]
+///    逐页确认已映射、带 user 位、写意图另需可写位；不满足返回
+///    [`Error::BadAddress`]（EFAULT）。
+///
+/// 任何 STAC 拷贝（`copy_from_user`/`copy_to_user`）之前必须先通过本校验：
+/// arch 层对内核态 #PF 一律停机，这里放过一个野指针就是放过了整机死机。
+fn validate_user_range(buf: u64, len: u64, access: UserAccess) -> Result<(), Error> {
+    if len > MAX_SYSCALL_BUF_BYTES {
+        return Err(Error::InvalidParam);
+    }
+    let Some(end) = buf.checked_add(len) else {
+        return Err(Error::OutOfRange);
+    };
+    if buf < USER_BASE || end > USER_TOP {
+        return Err(Error::OutOfRange);
+    }
+    let Some(proc) = current_proc_mut() else {
+        return Err(Error::NotFound);
+    };
+    if proc.addr_space().is_range_mapped(buf, len, access) {
+        Ok(())
+    } else {
+        Err(Error::BadAddress)
+    }
+}
+
 /// 从用户空间拷贝以 null 结尾的路径字符串。
+///
+/// 逐字节读取并在**首次跨入每个新页**时对该页做读意图预校验：路径长度上限
+/// 内的任何未映射页都会在校验层被拦下并返回 [`Error::BadAddress`]，而不是
+/// 在内核态触发 #PF。
 fn copy_path_from_user(path_ptr: u64, max_len: usize) -> Result<alloc::string::String, Error> {
     if path_ptr < USER_BASE || path_ptr >= USER_TOP {
         return Err(Error::OutOfRange);
     }
+    const PAGE_SIZE: u64 = 0x1000;
+    let mut validated_page_end = path_ptr & !(PAGE_SIZE - 1);
     let mut bytes = alloc::vec::Vec::new();
     let mut cur = path_ptr;
     while bytes.len() < max_len {
         if cur >= USER_TOP {
             return Err(Error::OutOfRange);
+        }
+        if cur >= validated_page_end {
+            // 跨入新页：整页做一次读意图校验（含本页与后续页边界对齐）。
+            validate_user_range(cur, 1, UserAccess::Read)?;
+            validated_page_end = (cur & !(PAGE_SIZE - 1)) + PAGE_SIZE;
         }
         let mut byte = [0u8; 1];
         unsafe {
@@ -123,7 +191,7 @@ fn sys_open(frame: &mut InterruptFrame) -> u64 {
     let flags_bits = frame.rsi as u32;
     let perm_bits = frame.rdx as u32;
 
-    let path = match copy_path_from_user(path_ptr, 4096) {
+    let path = match copy_path_from_user(path_ptr, PATH_PARAM_MAX) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
     };
@@ -134,8 +202,17 @@ fn sys_open(frame: &mut InterruptFrame) -> u64 {
 
     let inode = match root.resolve(&path, true) {
         Ok(n) => {
-            if flags.truncate && flags.write {
-                let _ = n.truncate(0);
+            if flags.truncate {
+                // kernel1.md K8：截断失败必须上抛，绝不能 `let _ =` 吞错——
+                // 吞错会让调用者相信文件已清空而实际内容原样保留（伪成功）。
+                // O_TRUNC 无写位：POSIX 语义要求截断以写权限为前提；本内核
+                // 选择显式拒绝（EINVAL）并成文于 ABI 注释，而非静默不生效。
+                if !flags.write {
+                    return pack_err(Error::InvalidParam);
+                }
+                if let Err(e) = n.truncate(0) {
+                    return pack_err(e);
+                }
             }
             n
         }
@@ -150,8 +227,11 @@ fn sys_open(frame: &mut InterruptFrame) -> u64 {
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
-    let fd = proc.alloc_fd(handle);
-    pack_ok(fd as u64)
+    // KA7：fd 表满（每进程上限）如实 ENOSPC，绝不无界吃内核堆。
+    match proc.alloc_fd(handle) {
+        Ok(fd) => pack_ok(fd as u64),
+        Err(e) => pack_err(e),
+    }
 }
 
 /// `close(fd)`：关闭用户分配的文件描述符。
@@ -177,7 +257,7 @@ fn sys_close(frame: &mut InterruptFrame) -> u64 {
 fn sys_mkdir(frame: &mut InterruptFrame) -> u64 {
     let path_ptr = frame.rdi;
     let perm_bits = frame.rsi as u32;
-    let path = match copy_path_from_user(path_ptr, 4096) {
+    let path = match copy_path_from_user(path_ptr, PATH_PARAM_MAX) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
     };
@@ -192,7 +272,7 @@ fn sys_mkdir(frame: &mut InterruptFrame) -> u64 {
 /// `unlink(path_ptr)`：删除文件或空目录。
 fn sys_unlink(frame: &mut InterruptFrame) -> u64 {
     let path_ptr = frame.rdi;
-    let path = match copy_path_from_user(path_ptr, 4096) {
+    let path = match copy_path_from_user(path_ptr, PATH_PARAM_MAX) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
     };
@@ -209,7 +289,7 @@ fn sys_readdir(frame: &mut InterruptFrame) -> u64 {
     let buf_ptr = frame.rsi;
     let max_bytes = frame.rdx as usize;
 
-    let path = match copy_path_from_user(path_ptr, 4096) {
+    let path = match copy_path_from_user(path_ptr, PATH_PARAM_MAX) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
     };
@@ -225,27 +305,46 @@ fn sys_readdir(frame: &mut InterruptFrame) -> u64 {
         Err(e) => return pack_err(e),
     };
 
-    // 格式化为换行分隔的名字与大小列表（或直接写入紧凑字节流）
-    // 格式：`name:type:size\n`
-    let mut out = alloc::string::String::new();
-    for e in &entries {
-        use core::fmt::Write;
-        let t = match e.node_type {
+    // 格式化为换行分隔的名字与大小列表。
+    // 格式：`name:type:size\n`。KM5：只交付**完整行**——放不下整条的尾部
+    // 条目整体省略，绝不把半行 `name:type:` 交给调用方破坏协议成帧；返回
+    // 字节数 < 完整列表长度即表示还有剩余条目（分页语义，成文）。
+    /// readdir 单条记录的类型标签（协议字段）。
+    const fn type_tag(t: vfs::inode::INodeType) -> &'static str {
+        match t {
             vfs::inode::INodeType::Directory => "dir",
             vfs::inode::INodeType::RegularFile => "file",
             vfs::inode::INodeType::Symlink => "link",
             vfs::inode::INodeType::CharacterDevice => "chardev",
             vfs::inode::INodeType::BlockDevice => "blkdev",
             vfs::inode::INodeType::Fifo => "fifo",
-        };
-        let _ = write!(out, "{}:{}:{}\n", e.name, t, e.size);
+        }
+    }
+    let mut out = alloc::string::String::new();
+    for e in &entries {
+        use core::fmt::Write;
+        let mut line = alloc::string::String::new();
+        if write!(line, "{}:{}:{}\n", e.name, type_tag(e.node_type), e.size).is_err() {
+            // String 写入不可能失败（alloc::fmt 无分配错误路径），保守跳过。
+            continue;
+        }
+        if out.len() + line.len() > max_bytes {
+            break;
+        }
+        out.push_str(&line);
+    }
+    // 审计 B10：缓冲连**第一条**都放不下时返回 0 会与 EOF/空目录不可区分
+    // ——大目录静默丢条目。按 POSIX getdents 惯例以 EINVAL 如实拒绝：调用
+    // 方加大缓冲重试即可；只有 entries 为空（真 EOF）才返回 0。
+    if out.is_empty() && !entries.is_empty() {
+        return pack_err(Error::InvalidParam);
     }
 
     let bytes = out.as_bytes();
-    let n = bytes.len().min(max_bytes);
+    let n = bytes.len();
     if n > 0 {
-        if buf_ptr < USER_BASE || buf_ptr + (n as u64) > USER_TOP {
-            return pack_err(Error::OutOfRange);
+        if let Err(e) = validate_user_range(buf_ptr, n as u64, UserAccess::Write) {
+            return pack_err(e);
         }
         unsafe {
             arch_x86_64::mmio::copy_to_user(buf_ptr, bytes.as_ptr(), n);
@@ -264,136 +363,195 @@ fn sys_write(frame: &mut InterruptFrame) -> u64 {
     let len = frame.rdx;
     let offset = frame.r10;
 
-    // 校验 [buf, buf+len) 完全落在用户半区，避免越界读内核地址。
-    let Some(end) = buf.checked_add(len) else {
-        return pack_err(Error::OutOfRange);
-    };
-    if buf < USER_BASE || end > USER_TOP {
-        return pack_err(Error::OutOfRange);
+    if len == 0 {
+        return pack_ok(0);
     }
 
-    // 标准输出 / 标准错误
-    if fd == 1 || fd == 2 {
-        const CHUNK: usize = 4096;
-        let mut chunk = [0u8; CHUNK];
-        let mut off = 0usize;
-        while off < len as usize {
-            let n = core::cmp::min(len as usize - off, CHUNK);
-            unsafe {
-                arch_x86_64::mmio::copy_from_user(chunk.as_mut_ptr(), buf + off as u64, n);
-            }
-            let s = core::str::from_utf8(&chunk[..n]).unwrap_or("\u{FFFD}");
-            klib::console::write_str(s);
-            off += n;
-        }
-        return pack_ok(len);
-    }
-
-    // 普通文件描述符
+    // KM1：无 fd 号特判——1/2 与普通句柄走同一条路，stdout/stderr 节点在
+    // write_at 内直发字节（K5 完全体：串口 sink 字节透明，文本 sink 自行
+    // lossy），syscall 层零转换。
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
     let Some(handle) = proc.get_fd(fd as usize) else {
         return pack_err(Error::InvalidParam);
     };
-
-    let mut kbuf = alloc::vec![0u8; len as usize];
-    unsafe {
-        arch_x86_64::mmio::copy_from_user(kbuf.as_mut_ptr(), buf, len as usize);
+    // KM17：字符流不可定位。可定位性来自节点真值（is_seekable），不再依赖
+    // fd 号魔法数字；除顺序写哨兵外的任何偏移以 ESPIPE 如实拒绝。
+    if !handle.inode.is_seekable() && offset != STREAM_OFFSET_CURRENT {
+        return pack_err(Error::IllegalSeek);
     }
 
-    if offset == STREAM_OFFSET_CURRENT {
-        match handle.write(&kbuf) {
-            Ok(n) => pack_ok(n as u64),
-            Err(e) => pack_err(e),
+    let want = core::cmp::min(len, SYSCALL_COPY_CHUNK_BYTES) as usize;
+    let mut kbuf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if kbuf.try_reserve_exact(want).is_err() {
+        return pack_err(Error::OutOfMemory);
+    }
+    kbuf.resize(want, 0);
+    let chunk_cap = want as u64;
+
+    let mut total = 0u64;
+    while total < len {
+        let n = core::cmp::min(len - total, chunk_cap);
+        // S19：buf/offset 与 total 均为用户可控 u64，回绕即错误地址——
+        // checked 失败如实 InvalidParam，绝不静默写错偏移（release 无溢出
+        // 检查，裸加法回绕=错址写报成功）。
+        let Some(ubuf) = buf.checked_add(total) else {
+            if total == 0 {
+                return pack_err(Error::InvalidParam);
+            }
+            return pack_ok(total); // 已写部分有效，短写交付
+        };
+        let Some(fpos) = offset.checked_add(total) else {
+            if total == 0 {
+                return pack_err(Error::InvalidParam);
+            }
+            return pack_ok(total);
+        };
+        if let Err(e) = validate_user_range(ubuf, n, UserAccess::Read) {
+            if total == 0 {
+                return pack_err(e);
+            }
+            // 已成功写出部分后校验失败：以短写语义交付已写字节数。
+            return pack_ok(total);
         }
-    } else {
-        match handle.pwrite(offset, &kbuf) {
-            Ok(n) => pack_ok(n as u64),
-            Err(e) => pack_err(e),
+        unsafe {
+            arch_x86_64::mmio::copy_from_user(kbuf.as_mut_ptr(), ubuf, n as usize);
+        }
+        let wrote = if offset == STREAM_OFFSET_CURRENT {
+            handle.write(&kbuf[..n as usize])
+        } else {
+            handle.pwrite(fpos, &kbuf[..n as usize])
+        };
+        match wrote {
+            Ok(w) => {
+                total += w as u64;
+                if (w as u64) < n {
+                    break; // 设备短写：如实上报已写数量
+                }
+            }
+            Err(e) => {
+                if total == 0 {
+                    return pack_err(e);
+                }
+                break; // 已写部分有效，按短写交付
+            }
         }
     }
+    pack_ok(total)
 }
 
 /// `read(fd, buf, len, offset)`：从 stdin 键盘或用户 FD 句柄读取。
 ///
 /// ABI 约定：仅 [`STREAM_OFFSET_CURRENT`] 表示顺序读；`offset=0` 以及任意其他
 /// 偏移均为定位读（`pread`），不会推进句柄当前位置。
-fn sys_read(frame: &mut InterruptFrame) -> u64 {
+///
+/// 返回 [`DispatchResult`]：stdin 阻塞路径会把 `*frame` 整体切换为下一进程
+/// 现场（K1a），此时入口不得再写 rax——返回值语义由 [`DispatchResult`]
+/// 显式表达，杜绝 bool 被调用方无视。
+fn sys_read(frame: &mut InterruptFrame) -> DispatchResult {
     let fd = frame.rdi;
     let buf = frame.rsi;
     let len = frame.rdx;
     let offset = frame.r10;
     if len == 0 {
-        return pack_ok(0);
-    }
-    // 校验 [buf, buf+len) 落在用户半区。
-    let Some(end) = buf.checked_add(len) else {
-        return pack_err(Error::OutOfRange);
-    };
-    if buf < USER_BASE || end > USER_TOP {
-        return pack_err(Error::OutOfRange);
+        return done(pack_ok(0));
     }
 
-    // 标准输入 stdin (0)
-    if fd == 0 {
-        let mut got = 0usize;
-        let mut tmp = [0u8; 64];
-        while got < len as usize && got < tmp.len() {
-            match arch_x86_64::keyboard::pop() {
-                Some(ch) => {
-                    tmp[got] = ch;
-                    got += 1;
-                }
-                None => break,
-            }
-        }
-        if got == 0 {
-            task::block_for_kbd(frame);
-            return pack_ok(0);
-        }
-        unsafe {
-            arch_x86_64::mmio::copy_to_user(buf, tmp.as_ptr(), got);
-        }
-        return pack_ok(got as u64);
-    }
-
-    // 普通文件描述符
+    // KM1：无 fd 号特判——0 与普通句柄走同一条路。stdin 节点空读返回
+    // WouldBlock，下方按节点真值（interactive_input）翻译为阻塞切换。
     let Some(proc) = current_proc_mut() else {
-        return pack_err(Error::NotFound);
+        return done(pack_err(Error::NotFound));
     };
     let Some(handle) = proc.get_fd(fd as usize) else {
-        return pack_err(Error::InvalidParam);
+        return done(pack_err(Error::InvalidParam));
     };
+    // KM17：字符流不可定位，可定位性来自节点真值。
+    if !handle.inode.is_seekable() && offset != STREAM_OFFSET_CURRENT {
+        return done(pack_err(Error::IllegalSeek));
+    }
 
-    let mut kbuf = alloc::vec![0u8; len as usize];
-    if offset == STREAM_OFFSET_CURRENT {
-        match handle.read(&mut kbuf) {
-            Ok(n) => {
-                unsafe {
-                    arch_x86_64::mmio::copy_to_user(buf, kbuf.as_ptr(), n);
-                }
-                pack_ok(n as u64)
+    let want = core::cmp::min(len, SYSCALL_COPY_CHUNK_BYTES) as usize;
+    let mut kbuf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if kbuf.try_reserve_exact(want).is_err() {
+        return done(pack_err(Error::OutOfMemory));
+    }
+    kbuf.resize(want, 0);
+    let chunk_cap = want as u64;
+
+    let mut total = 0u64;
+    while total < len {
+        let n = core::cmp::min(len - total, chunk_cap);
+        // S19：同 write 路径——用户可控 u64 加法一律 checked。
+        let Some(ubuf) = buf.checked_add(total) else {
+            if total == 0 {
+                return done(pack_err(Error::InvalidParam));
             }
-            Err(e) => pack_err(e),
-        }
-    } else {
-        match handle.pread(offset, &mut kbuf) {
-            Ok(n) => {
-                unsafe {
-                    arch_x86_64::mmio::copy_to_user(buf, kbuf.as_ptr(), n);
-                }
-                pack_ok(n as u64)
+            break; // 已读部分有效，短读交付
+        };
+        let Some(fpos) = offset.checked_add(total) else {
+            if total == 0 {
+                return done(pack_err(Error::InvalidParam));
             }
-            Err(e) => pack_err(e),
+            break;
+        };
+        let chunk = &mut kbuf[..n as usize];
+        let got = if offset == STREAM_OFFSET_CURRENT {
+            handle.read(chunk)
+        } else {
+            handle.pread(fpos, chunk)
+        };
+        match got {
+            Ok(0) => break, // EOF（total==0 时即原始 EOF 语义）
+            Ok(r) => {
+                if let Err(e) = validate_user_range(ubuf, r as u64, UserAccess::Write) {
+                    if total == 0 {
+                        return done(pack_err(e));
+                    }
+                    break; // 先读到的部分有效，按短读交付
+                }
+                unsafe {
+                    arch_x86_64::mmio::copy_to_user(ubuf, kbuf.as_ptr(), r);
+                }
+                total += r as u64;
+                if (r as u64) < n {
+                    break; // 设备短读：如实交付已读数量
+                }
+            }
+            Err(e) => {
+                // KM1/K1a：交互输入句柄（stdin）空读的 WouldBlock → 登记唯一
+                // 等待者并阻塞切走。Busy = 已有并发 stdin 读者，如实返回
+                // EAGAIN 而不是把对方顶掉（KM15）；Switched = 帧已整体切换，
+                // 禁止再写 rax（K1a）。唤醒后用户 read 重试取字符。
+                if total == 0 && e == Error::WouldBlock && handle.inode.interactive_input() {
+                    return match task::block_for_kbd(frame) {
+                        task::scheduler::BlockKbdOutcome::Switched => DispatchResult::Switched,
+                        task::scheduler::BlockKbdOutcome::Busy => done(pack_err(Error::WouldBlock)),
+                    };
+                }
+                if total == 0 {
+                    return done(pack_err(e));
+                }
+                break; // 已读部分有效，按短读交付
+            }
         }
     }
+    done(pack_ok(total))
 }
 
-/// `exec(prog, cmd)`：加载程序（可为 VFS 路径字符串指针，或内建索引）为新进程并运行。
+/// `exec(prog, cmd)`：加载程序（VFS 路径字符串指针，或内建索引）为新进程并运行。
 ///
-/// 优先从 VFS（如 `/binaries/shell.elf`）读取 ELF 数据，全面升级为基于 VFS 的动态装载；
-/// 如果参数为小数值索引（如 0, 1），则自动解析为对应内建路径 `/binaries/init.elf` / `/binaries/shell.elf`。
+/// ABI（libsys nr.rs `task_spawn`）：`prog` 为用户态路径字符串指针；仅
+/// [`BUILTIN_INDEX_INIT`] / [`BUILTIN_INDEX_SHELL`] 两个小整数被解释为内建
+/// 程序索引，映射到 `/binaries/init.elf` / `/binaries/shell.elf`。ELF 数据
+/// 唯一来源是真实磁盘 EXT2。
+///
+/// KM3：删除原"小索引 VFS resolve 失败后回退 program_elf(idx)"死亡分支——
+/// 两者解析同一路径必然同样失败，且 `program_elf` 对 idx≥2 恒为 None；
+/// 回退链只会把同一个 NotFound 伪装成两条路径都试过的假象。
+/// KD8：同步删除无名魔数边界 `arg1 < 16`——内建索引实际只有 {0,1} 两项，
+/// 2..15 恒失败；现在除两个命名内建索引外一切值都按其 ABI 本义（路径指针）
+/// 处理，野指针由 copy_path_from_user 预校验如实拒绝。
 fn sys_exec(frame: &mut InterruptFrame) -> u64 {
     let arg1 = frame.rdi;
     let arg_ptr = frame.rsi;
@@ -402,72 +560,81 @@ fn sys_exec(frame: &mut InterruptFrame) -> u64 {
     let root = crate::vfs_init::root();
 
     // 1. 获取 ELF 字节数据
-    let elf_data: alloc::vec::Vec<u8> = if arg1 < 16 {
-        // 小索引模式兼容
-        let path = match arg1 {
-            0 => "/binaries/init.elf",
-            1 => "/binaries/shell.elf",
-            _ => {
-                if let Some(bytes) = crate::program_elf(arg1 as usize) {
-                    return spawn_elf_image(&bytes, arg_ptr, arg_len, arg1 as usize);
+    let elf_data: alloc::vec::Vec<u8> = match arg1 {
+        BUILTIN_INDEX_INIT | BUILTIN_INDEX_SHELL => {
+            let path = if arg1 == BUILTIN_INDEX_INIT {
+                "/binaries/init.elf"
+            } else {
+                "/binaries/shell.elf"
+            };
+            match root.resolve(path, true) {
+                Ok(inode) => {
+                    let meta = match inode.metadata() {
+                        Ok(m) => m,
+                        Err(e) => return pack_err(e),
+                    };
+                    let mut buf = alloc::vec![0u8; meta.size as usize];
+                    if let Err(e) = inode.read_at(0, &mut buf) {
+                        return pack_err(e);
+                    }
+                    buf
                 }
-                return pack_err(Error::InvalidParam);
-            }
-        };
-        match root.resolve(path, true) {
-            Ok(inode) => {
-                let meta = match inode.metadata() {
-                    Ok(m) => m,
-                    Err(e) => return pack_err(e),
-                };
-                let mut buf = alloc::vec![0u8; meta.size as usize];
-                if let Err(e) = inode.read_at(0, &mut buf) {
-                    return pack_err(e);
-                }
-                buf
-            }
-            Err(_) => {
-                if let Some(bytes) = crate::program_elf(arg1 as usize) {
-                    return spawn_elf_image(&bytes, arg_ptr, arg_len, arg1 as usize);
-                }
-                return pack_err(Error::NotFound);
+                Err(e) => return pack_err(e),
             }
         }
-    } else {
-        // 路径字符串模式
-        let path = match copy_path_from_user(arg1, 4096) {
-            Ok(p) => p,
-            Err(e) => return pack_err(e),
-        };
-        match root.resolve(&path, true) {
-            Ok(inode) => {
-                let meta = match inode.metadata() {
-                    Ok(m) => m,
-                    Err(e) => return pack_err(e),
-                };
-                let mut buf = alloc::vec![0u8; meta.size as usize];
-                if let Err(e) = inode.read_at(0, &mut buf) {
-                    return pack_err(e);
+        // 路径字符串模式：arg1 即用户态路径指针
+        _ => {
+            let path = match copy_path_from_user(arg1, PATH_PARAM_MAX) {
+                Ok(p) => p,
+                Err(e) => return pack_err(e),
+            };
+            match root.resolve(&path, true) {
+                Ok(inode) => {
+                    let meta = match inode.metadata() {
+                        Ok(m) => m,
+                        Err(e) => return pack_err(e),
+                    };
+                    let mut buf = alloc::vec![0u8; meta.size as usize];
+                    if let Err(e) = inode.read_at(0, &mut buf) {
+                        return pack_err(e);
+                    }
+                    buf
                 }
-                buf
+                Err(e) => return pack_err(e),
             }
-            Err(e) => return pack_err(e),
         }
     };
 
-    spawn_elf_image(&elf_data, arg_ptr, arg_len, arg1 as usize)
+    spawn_elf_image(&elf_data, arg_ptr, arg_len, arg1)
 }
 
-fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: usize) -> u64 {
+/// 内建程序索引：init（与 libsys nr::PROG_* 约定同源；内核不依赖
+/// 用户态 crate，双侧常量注释互指）。
+const BUILTIN_INDEX_INIT: u64 = 0;
+/// 内建程序索引：shell。
+const BUILTIN_INDEX_SHELL: u64 = 1;
+
+fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64) -> u64 {
+    /// prog_name 末段长度上限（超长拒绝，防注册表/日志被撑爆）。
+    const PROG_NAME_MAX_LEN: usize = 63;
+    /// 命令行缓冲容量。KM5：超出即 E2BIG 显式失败——静默截断会把被裁剪的
+    /// 命令行伪装成完整交付。
+    const CMD_BUF_BYTES: usize = 512;
+    if arg_len as usize > CMD_BUF_BYTES {
+        return pack_err(Error::ArgListTooLong);
+    }
     // 拷命令行到内核缓冲（带 SMAP 安全的 copy_from_user）。空命令行 → 正常启动。
-    let mut cmd = [0u8; 512];
+    let mut cmd = [0u8; CMD_BUF_BYTES];
     let cmd_len = if arg_len == 0 {
         0
     } else {
-        if arg_ptr < USER_BASE || arg_ptr + arg_len > USER_TOP {
-            return pack_err(Error::OutOfRange);
+        // E2BIG 守卫已保证 arg_len ≤ CMD_BUF_BYTES，此处不再截断。
+        let l = arg_len as usize;
+        // 命令行缓冲同样经预校验（AR1）：野指针在此返回 EFAULT 而非内核态
+        // #PF 停机。
+        if let Err(e) = validate_user_range(arg_ptr, l as u64, UserAccess::Read) {
+            return pack_err(e);
         }
-        let l = core::cmp::min(arg_len as usize, cmd.len());
         unsafe {
             arch_x86_64::mmio::copy_from_user(cmd.as_mut_ptr(), arg_ptr, l);
         }
@@ -476,12 +643,11 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: usi
     let cmd = &cmd[..cmd_len];
     // C1.1：程序名取自真实加载来源（VFS 路径末段或内建索引名），非 pid 推断。
     let prog_name: alloc::string::String = match idx_or_tag {
-        0 => alloc::string::String::from("init.elf"),
-        1 => alloc::string::String::from("shell.elf"),
-        tag if tag < 16 => alloc::format!("program-{tag}"),
+        BUILTIN_INDEX_INIT => alloc::string::String::from("init.elf"),
+        BUILTIN_INDEX_SHELL => alloc::string::String::from("shell.elf"),
+        // 路径字符串模式：idx_or_tag 即用户态路径指针。
         _ => {
-            // 路径字符串模式：idx_or_tag 即用户态路径指针。
-            let path = match copy_path_from_user(idx_or_tag as u64, 4096) {
+            let path = match copy_path_from_user(idx_or_tag, PATH_PARAM_MAX) {
                 Ok(p) => p,
                 Err(e) => return pack_err(e),
             };
@@ -490,7 +656,7 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: usi
                 .rsplit('/')
                 .find(|seg| !seg.is_empty())
                 .unwrap_or(trimmed);
-            if last.is_empty() || last.len() > 63 {
+            if last.is_empty() || last.len() > PROG_NAME_MAX_LEN {
                 return pack_err(Error::InvalidParam);
             }
             alloc::string::String::from(last)
@@ -551,6 +717,55 @@ fn sys_munmap(frame: &mut InterruptFrame) -> u64 {
     }
 }
 
+/// `memory_query(addr, out_ptr)`（KM2：SYS_MEMORY_QUERY / 0x22）。
+///
+/// libsys 契约早已声明该调用号而内核分发表缺席——用户调用落入 unknown-nr，
+/// 属"契约有了、实现缺席"。本实现查询 `addr` 所在 4KB 页的页表真值并写入
+/// `out_ptr`（8 字节 u64 位图，须为可写用户缓冲）：
+/// - 位图值 `0` = 未映射（含 demand 区已声明但未触碰——查询只读页表，
+///   绝不触发补页）；
+/// - `MEMQ_PRESENT | [MEMQ_USER] | [MEMQ_WRITABLE]` = 已映射页的实际属性。
+///
+/// 位值与 libsys `nr::MEMQ_*` 双侧定义、注释互指（同 STREAM_OFFSET_CURRENT
+/// 模式：内核不依赖用户态 crate）。
+fn sys_memory_query(frame: &mut InterruptFrame) -> u64 {
+    /// 查询结果位图：页表项 present。
+    const MEMQ_PRESENT: u64 = 1 << 0;
+    /// 查询结果位图：用户态可访问。
+    const MEMQ_USER: u64 = 1 << 1;
+    /// 查询结果位图：可写。
+    const MEMQ_WRITABLE: u64 = 1 << 2;
+    /// out_ptr 指向的位图字节数（u64）。
+    const OUT_LEN: u64 = 8;
+
+    let addr = frame.rdi;
+    let out_ptr = frame.rsi;
+
+    if let Err(e) = validate_user_range(out_ptr, OUT_LEN, UserAccess::Write) {
+        return pack_err(e);
+    }
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let bits = match proc.addr_space().query_page(addr) {
+        Some(q) => {
+            let mut b = MEMQ_PRESENT;
+            if q.user {
+                b |= MEMQ_USER;
+            }
+            if q.writable {
+                b |= MEMQ_WRITABLE;
+            }
+            b
+        }
+        None => 0,
+    };
+    unsafe {
+        arch_x86_64::mmio::copy_to_user(out_ptr, bits.to_le_bytes().as_ptr(), OUT_LEN as usize);
+    }
+    pack_ok(0)
+}
+
 /// `brk(new)`：调整当前进程堆断点（0 = 仅查询）。
 fn sys_brk(frame: &mut InterruptFrame) -> u64 {
     let new = frame.rdi;
@@ -577,8 +792,14 @@ fn sys_task_wait(frame: &mut InterruptFrame) -> DispatchResult {
     let timeout_ns = frame.rsi;
 
     if target_pid == 0 && timeout_ns == 0 {
-        task::yield_now(frame);
-        return done(pack_ok(0));
+        // K1b/KA6：yield_now 返回 Switched 时 `*frame` 已被整体替换为下一进程
+        // 保存帧（yield 返回值 0 由调度器写入被保存帧，scheduler.rs），此处若再以
+        // Done(0) 收尾会把 rax=0 写穿目标进程现场。枚举强制穷尽匹配，漏翻
+        // 编译期即不可能；NotSwitched 才是普通的 Done(0)。
+        match task::yield_now(frame) {
+            task::SwitchOutcome::Switched => return DispatchResult::Switched,
+            task::SwitchOutcome::NotSwitched => return done(pack_ok(0)),
+        }
     }
 
     if target_pid == 0 && timeout_ns > 0 {
@@ -627,6 +848,10 @@ fn sys_driver_register(frame: &mut InterruptFrame) -> u64 {
     }
     let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
     let mut name_buf = [0u8; 32];
+    // 设备名缓冲同样经预校验（AR1）：野指针返回 EFAULT 而非内核态 #PF 停机。
+    if let Err(e) = validate_user_range(name_ptr as u64, len as u64, UserAccess::Read) {
+        return pack_err(e);
+    }
     unsafe {
         arch_x86_64::mmio::copy_from_user(name_buf.as_mut_ptr(), name_ptr as u64, len);
     }
@@ -634,35 +859,67 @@ fn sys_driver_register(frame: &mut InterruptFrame) -> u64 {
         Ok(s) => s,
         Err(_) => return pack_err(Error::InvalidParam),
     };
-    match drv::uio_register_driver(pid, dev_name, 0, 0) {
+    // KA4：注册即唯一认领声明——签名不再携带 MMIO 坐标（设备物理资源是
+    // 内核登记事实，不是用户可自报字段）。
+    match drv::uio_register_driver(pid, dev_name) {
         Ok(id) => pack_ok(id as u64),
         Err(e) => pack_err(e),
     }
 }
 
 /// `driver_claim(uio_id, mmio_base, size) -> user_vaddr` (M11.1)
+///
+/// K2 + KA4 完整闭环：
+/// ① 授权半程——`uio_id` 精确定位 + 调用者归属校验（NotFound / PermissionDenied）；
+/// ② 映射半程——从内核登记表解析该设备的 MMIO 物理窗口（用户自报的
+///    `mmio_base/size` 参数**从不具效力**），经 `map_mmio_user` 以不可缓存
+///    页真实映射进当前进程地址空间，返回用户虚拟地址。
+/// 设备未发布窗口（如无 MMIO BAR 的设备）→ NotSupported；窗口映射失败按
+/// mm 错误如实上抛。绝不以匿名内存伪装映射成功。
 fn sys_driver_claim(frame: &mut InterruptFrame) -> u64 {
-    let _uio_id = frame.rdi as usize;
-    let mmio_base = frame.rsi;
-    let size = frame.rdx;
-
+    let uio_id = frame.rdi as usize;
+    let _mmio_base = frame.rsi;
+    let _size = frame.rdx;
+    let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+    // 授权半程：id 存在性 + 归属校验。
+    if let Err(e) = drv::uio_claim_device(uio_id, pid) {
+        klib::info!(
+            "[uio] driver_claim({}) denied for pid={}: {:?}",
+            uio_id,
+            pid,
+            e
+        );
+        return pack_err(e);
+    }
+    // 从登记表取该设备（= 认领的设备名）的真实 MMIO 窗口。
+    let Some((phys, len)) = drv::uio_device_window_of(uio_id) else {
+        klib::info!(
+            "[uio] driver_claim({}) authorized but device publishes no MMIO window",
+            uio_id
+        );
+        return pack_err(Error::NotSupported);
+    };
+    // 映射半程：设备帧 → 用户空间（PCD 不可缓存）。
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
-
-    let flags = PageFlags::empty().writable().user();
-    let user_vaddr = match proc.addr_space_mut().mmap_user(size, flags) {
-        Ok(addr) => addr,
-        Err(e) => return pack_err(e),
-    };
-
-    klib::info!(
-        "[uio] claimed MMIO mapped: phys={:#x} -> user_vaddr={:#x} (size={})",
-        mmio_base,
-        user_vaddr,
-        size
-    );
-    pack_ok(user_vaddr)
+    match proc.addr_space_mut().map_mmio_user(phys, len) {
+        Ok(vaddr) => {
+            klib::info!(
+                "[uio] claim mapped: pid={} uio_id={} phys={:#x} len={:#x} -> user {:#x}",
+                pid,
+                uio_id,
+                phys,
+                len,
+                vaddr
+            );
+            pack_ok(vaddr)
+        }
+        Err(e) => {
+            klib::info!("[uio] claim mapping failed: {:?}", e);
+            pack_err(e)
+        }
+    }
 }
 
 // ---------- 分发 ----------
@@ -687,12 +944,14 @@ fn dispatch(nr: u64, frame: &mut InterruptFrame) -> DispatchResult {
     match nr as u32 {
         // STREAM Domain (0x10)
         SYS_STREAM_CREATE => done(sys_open(frame)),
-        SYS_STREAM_READ => done(sys_read(frame)),
+        // read 可能阻塞切换（stdin），自带 DispatchResult 语义（K1a）。
+        SYS_STREAM_READ => sys_read(frame),
         SYS_STREAM_WRITE => done(sys_write(frame)),
         SYS_STREAM_CLOSE => done(sys_close(frame)),
 
         // MEMORY Domain (0x20)
         SYS_MEMORY_MAP => done(sys_mmap(frame)),
+        SYS_MEMORY_QUERY => done(sys_memory_query(frame)),
         SYS_MEMORY_GROW => done(sys_brk(frame)),
         SYS_MEMORY_UNMAP => done(sys_munmap(frame)),
 

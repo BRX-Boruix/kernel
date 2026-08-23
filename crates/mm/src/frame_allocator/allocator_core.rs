@@ -31,6 +31,13 @@ pub const ORDER_2M: usize = 9;
 /// Huge page size (1GB) order
 pub const ORDER_1G: usize = 18;
 
+/// 单个 order-0 页帧的字节数（4KiB，x86-64 基础页）。
+///
+/// KM9：SysFS memory_json 等投影层统一引用本常量，不再内联 4096 魔数。
+pub const FRAME_SIZE_BYTES: u64 = 4096;
+/// 大页字节数 = `FRAME_SIZE_BYTES << ORDER_2M`（2MiB）。
+pub const HUGE_FRAME_SIZE_BYTES: u64 = FRAME_SIZE_BYTES << ORDER_2M;
+
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FrameState {
@@ -47,12 +54,19 @@ pub(crate) enum FrameState {
 }
 
 /// Metadata for a physical frame
+///
+/// MA2：COW 引用计数下沉为每帧字段 `refs`（原全局 `Mutex<BTreeMap>` 退役）。
+/// 布局上 `refs` 恰好落入 flags 与 next 之间的对齐空隙——结构体尺寸不变。
+/// 并发模型见 refcount.rs 模块文档。
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct BuddyFrame {
     pub(crate) order: u8,
     pub(crate) state: FrameState,
     pub(crate) flags: u8,
+    /// COW 引用计数：0 = 未登记（按语义 1 处理），≥1 = 真实共享计数。
+    /// 仅在 `state == Allocated` 时有意义；空闲帧的该字段归分配器所有。
+    pub(crate) refs: u32,
     // Using index for next pointer to avoid pointer complexity in static array
     pub(crate) next: Option<usize>,
     pub(crate) prev: Option<usize>,
@@ -60,12 +74,21 @@ pub(crate) struct BuddyFrame {
 
 pub(crate) const BF_MIGRATABLE: u8 = 1 << 0;
 
+// MA2 布局不变量：refs 必须落在 flags 与 next 之间的对齐空隙内——
+// 引用计数下沉不得增大 BuddyFrame（否则元数据池按帧放大、违背
+// "24B 级/帧零堆开销"的设计承诺）。违反即编译期失败。
+const _: () = assert!(
+    core::mem::offset_of!(BuddyFrame, refs) + core::mem::size_of::<u32>()
+        <= core::mem::offset_of!(BuddyFrame, next)
+);
+
 impl BuddyFrame {
     pub(crate) const fn new() -> Self {
         Self {
             order: 0,
             state: FrameState::Allocated,
             flags: BF_MIGRATABLE,
+            refs: 0,
             next: None,
             prev: None,
         }
@@ -318,11 +341,15 @@ impl LazyBuddyAllocator {
     }
 
     /// 取得某 order 下指定 shard 的全局链表锁，并计入一次全局链表操作。
+    ///
+    /// 返回中断安全 guard（审计 #5）：持锁期间 IF=0，跨核排空 IPI 在目标
+    /// 核的中断上下文里取同一把锁时，只能等进程上下文放锁后再入——普通
+    /// Mutex 在此场景是"自旋等自己被抢占上下文"的永久死锁。
     pub(crate) fn lock_global_list(
         &self,
         order: usize,
         shard: usize,
-    ) -> spin::MutexGuard<'_, FreeList> {
+    ) -> klib::sync::irq::IrqSpinLockGuard<'_, FreeList> {
         let lists = FREE_LISTS.get().expect("PMM free lists not initialized");
         self.global_list_ops.fetch_add(1, Ordering::Relaxed);
         lists.orders[order].shards[shard].lock()

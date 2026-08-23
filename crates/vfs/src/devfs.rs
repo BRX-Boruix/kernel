@@ -40,11 +40,9 @@ pub trait DeviceInfoProvider: Send + Sync {
     fn get_serial_baudrate(&self) -> Result<u32, Error>;
     fn set_serial_baudrate(&self, baud: u32) -> Result<(), Error>;
     fn telemetry_json(&self) -> String {
-        alloc::format!(
-            r#"{{"status":"healthy","devices_count":{},"uptime_ms":{}}}"#,
-            self.list_devices().len(),
-            klib::time::now_millis()
-        )
+        // vfs1 R2：无真实健康数据源时禁止断言 "healthy"——与 storage/net 默认
+        // 实现同一诚实化策略，未覆写的 Provider 得到显式错误而非伪状态。
+        alloc::string::String::from(r#"{"error":"no_telemetry_source"}"#)
     }
     fn pci_bars_json(&self, dev_name: &str) -> String {
         // DMYGH #16：无真实 BAR 数据源时必须显式报错，禁止编造端口/大小。
@@ -61,6 +59,14 @@ pub trait DeviceInfoProvider: Send + Sync {
     /// 网络统计在真实 NIC 数据路径落地前只允许显式 unsupported。
     fn net_stats_json(&self) -> String {
         alloc::string::String::from(r#"{"error":"no_net_stats"}"#)
+    }
+    /// 显示模式必须是真实 framebuffer 几何（来自注册的显示设备真值）；
+    /// 无真实数据源时显式报错，禁止编造缺省分辨率（vfs1 R1 / kernel1 KM12）。
+    ///
+    /// 行尾契约（审计 #9）：**provider 返回裸内容、不带尾换行**；读取闭包
+    /// 统一追加单个 `\n`。任何一侧自行追加即双换行——字节级测试锁定此契约。
+    fn display_mode_json(&self) -> String {
+        alloc::string::String::from(r#"{"error":"no_display_info"}"#)
     }
 }
 
@@ -213,28 +219,19 @@ impl DevFS {
         root.add_child("serial-com1", serial_node);
 
         // 3. /devices/displays/primary/mode
+        // KM12/vfs1 R1：mode 内容整体透传 Provider 的真实几何——DevFS 层
+        // 不再持有任何编造的 1024x768 缺省值。写路径如实拒绝：内核未实现
+        // 模式切换，接受任意 JSON 并谎报成功是伪承诺。构造用 read_only——
+        // 节点无写能力即只读节点（write_at 得 EACCES），名实相符（审计 B28；
+        // 旧 read_write+恒拒闭包让权限位与真实能力相矛盾）。
         let displays_dir = Arc::new(DynamicDirNode::new());
         let primary_dir = Arc::new(DynamicDirNode::new());
-        let mode_node = Arc::new(DynamicFileNode::read_write(
-            || {
-                let mut target = VecTarget::new();
-                let mut writer = JsonWriter::new(&mut target);
-                if let Ok(mut obj) = writer.start_object() {
-                    let _ = obj.field_u64("width", 1024);
-                    let _ = obj.field_u64("height", 768);
-                    let _ = obj.field_u64("bpp", 32);
-                    let _ = obj.field_u64("refresh_hz", 60);
-                    let _ = obj.end();
-                }
-                let mut bytes = target.into_bytes();
-                bytes.push(b'\n');
-                bytes
-            },
-            |buf| {
-                let _ = core::str::from_utf8(buf).map_err(|_| Error::InvalidParam)?;
-                Ok(buf.len())
-            },
-        ));
+        let p_mode = provider.clone();
+        let mode_node = Arc::new(DynamicFileNode::read_only(move || {
+            let mut json = p_mode.display_mode_json().into_bytes();
+            json.push(b'\n');
+            json
+        }));
         primary_dir.add_child("mode", mode_node);
         displays_dir.add_child("primary", primary_dir);
         root.add_child("displays", displays_dir);

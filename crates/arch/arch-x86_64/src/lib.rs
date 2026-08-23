@@ -10,13 +10,12 @@ pub mod acpi;
 pub mod cpu;
 pub mod gdt;
 pub mod hpet;
+pub mod imcr;
 pub mod interrupts;
-pub mod ioapic;
 pub mod keyboard;
 pub mod lapic;
 pub mod mmio;
 pub mod paging;
-pub mod pci;
 pub mod pic;
 pub mod port;
 pub mod rtc;
@@ -30,7 +29,8 @@ use arch::Platform;
 /// x86-64 架构平台
 pub struct X86_64Arch;
 
-/// 永久停机（关闭中断后 hlt 循环）。
+/// 永久停机（关中断后 pause 空转——非 hlt：见 `interrupts::halt_forever` 的
+/// 可调试性论证，AD1 修正旧注释"关闭中断后 hlt 循环"的过时描述）。
 pub fn halt_forever() -> ! {
     crate::interrupts::halt_forever()
 }

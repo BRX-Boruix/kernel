@@ -24,11 +24,20 @@ static FRAME_ALLOC: Once<extern "C" fn() -> u64> = Once::new();
 /// 由内核注入（实际调用 `mm` 的释放接口）。
 static FRAME_DEALLOC: Once<extern "C" fn(u64)> = Once::new();
 
-/// 注入页表页分配与释放。HHDM 偏移由 `arch::hhdm::PHYS_OFFSET` 统一持有。
-pub fn init(alloc: extern "C" fn() -> u64, dealloc: extern "C" fn(u64), phys_offset: u64) {
+/// 注入页表页分配与释放。
+///
+/// KA5 修正：删除原第三参数 `phys_offset`——它是误导性死参。HHDM 偏移由
+/// `arch::PHYS_OFFSET` 统一持有，且**只能**由 mm 从 Limine hhdm response
+/// 填充（mm::init 先于本函数执行，此处的 `call_once` 永远是 no-op；一旦
+/// 初始化顺序重构，调用者传入的 0 会静默生效把物理地址当虚拟指针）。
+/// 现以 debug_assert 固化"偏移必须已就绪"的前置契约，顺序回归即刻可见。
+pub fn init(alloc: extern "C" fn() -> u64, dealloc: extern "C" fn(u64)) {
+    debug_assert!(
+        arch::PHYS_OFFSET.get().is_some(),
+        "paging::init requires PHYS_OFFSET set by mm::init (HHDM response) beforehand"
+    );
     let _ = FRAME_ALLOC.call_once(|| alloc);
     let _ = FRAME_DEALLOC.call_once(|| dealloc);
-    let _ = arch::PHYS_OFFSET.call_once(|| phys_offset);
 }
 
 /// 分配一个物理帧并返回其物理地址（0 表示失败）。
@@ -48,9 +57,11 @@ pub(crate) fn dealloc_frame(paddr: u64) {
 
 // ---- 页表标志 ----
 
-pub(crate) const FLAG_PRESENT: u64 = 1 << 0;
-pub(crate) const FLAG_WRITABLE: u64 = 1 << 1;
+pub(crate) const FLAG_PRESENT: u64 = 1 << 0;pub(crate) const FLAG_WRITABLE: u64 = 1 << 1;
 pub(crate) const FLAG_USER: u64 = 1 << 2;
+/// PCD（Page Cache Disable，bit4）：设备内存页必须置位——读设备寄存器有
+/// 副作用，可缓存映射允许投机预读破坏硬件语义（K2 map_mmio_user）。
+pub(crate) const FLAG_PCD: u64 = 1 << 4;
 pub(crate) const FLAG_LARGE: u64 = 1 << 7;
 pub(crate) const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
@@ -69,6 +80,10 @@ fn entry_from_flags(flags: PageFlags, large: bool) -> u64 {
     }
     if flags.bits() & (1 << 2) != 0 {
         e |= FLAG_USER;
+    }
+    // 设备内存语义（PageFlags::device_memory，bit3）→ PCD：不可缓存。
+    if flags.bits() & (1 << 3) != 0 {
+        e |= FLAG_PCD;
     }
     // NX：未显式授予执行权限（PageFlags::executable，bit 63）的页一律不可执行
     if flags.bits() & (1 << 63) == 0 {
@@ -296,9 +311,18 @@ impl arch::PageTable for X86PageTable {
             }
         }
 
-        // 在叶层写条目
+        // 在叶层写条目。先检查既有叶项：present 即拒绝（AlreadyExists）——
+        // 静默覆写会把"换映射"伪装成普通映射成功，且旧映射若 TLB 热还会继续
+        // 被命中（arch1.md AM6）。需要更换映射的调用方必须先显式 `unmap`
+        // （它自带 flush 与空表回收），使"替换"成为可审计的独立动作。
+        // 检查粒度为叶层条目本身；中间层冲突不在本检查范围（当前全部调用方
+        // 均遵守先 unmap 后 map 的纪律）。
         let leaf_idx = index_at(leaf_level, levels, v);
         let large = leaf_level + 1 < levels; // 非最低层即大页
+        let existing = unsafe { self.table_at(table_phys, leaf_idx) };
+        if existing & FLAG_PRESENT != 0 {
+            return Err(klib::error::Error::AlreadyExists);
+        }
         let base = if large {
             // 大页：按页大小对齐物理地址
             let shift = 12 + (levels - 1 - leaf_level) * 9;
@@ -308,13 +332,54 @@ impl arch::PageTable for X86PageTable {
         };
         let entry_val = base | entry_from_flags(flags, large);
         unsafe { self.table_set(table_phys, leaf_idx, entry_val) };
+        // 新建映射同样 invlpg：该虚拟地址可能残留陈旧的 TLB 条目（如刚被
+        // unmap 的旧映射在其它 CPU/路径上的残影），刷新是廉价的无害操作。
+        flush_tlb(v);
         Ok(())
     }
 
     fn unmap(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, Self::Error> {
         let v = vaddr.as_u64();
-        let (entries, leaf, levels) =
-            unsafe { self.walk(v) }.ok_or(klib::error::Error::NotFound)?;
+        let (entries, leaf, levels) = unsafe { self.walk(v) }.ok_or(klib::error::Error::NotFound)?;
+        // 内核半区标记：叶项**清除**对两半区都合法（内核自身映射管理，如
+        // KA3 守护页布防）；但中间页表页**回收**只允许用户半区（见下）。
+        let kernel_half = index_at(0, levels, v) >= KERNEL_HALF_START;
+
+        // 大页叶（leaf+1 < levels）：整条目覆盖多页，直接清除会把整个大页
+        // 区域一起失映射。正确语义 = 拆分：分配下一级表页，把大页按 4KB 粒度
+        // 展开继承（基址 + 原标志、去 LARGE 位），装回父级后对目标 4K 页
+        // 递归走常规路径。拆分失败（无帧）如实上抛 OutOfMemory，绝不静默
+        // 扩大破坏面。
+        //
+        // 审计 B22：本展开**仅对 2M 叶正确**（leaf == levels-2：下一级恰为
+        // PT）。1G 叶（leaf < levels-2）需要两级展开（先建 PD 再建 PT），
+        // 现算法会把 1G 基址当 2M 基址展开成 512 个"指向 base+i*4K 的表项"
+        // ——语义完全错误的页表。如实拒绝而非产出错误映射；当前系统无 1G
+        // unmap 调用方（1G 仅 mmio 早期建图，不经本路径销毁），拒绝即未来
+        // 新调用方的编译期/运行期哨兵。
+        if leaf + 2 < levels {
+            return Err(klib::error::Error::NotSupported.into());
+        }
+        if leaf + 1 < levels {
+            let huge = entries[leaf];
+            let parent_phys =
+                if leaf == 0 { self.pml4 } else { entries[leaf - 1] & ADDR_MASK };
+            let new_table = alloc_frame().ok_or(klib::error::Error::OutOfMemory)?;
+            let tv = phys_to_virt(new_table) as *mut u64;
+            unsafe { core::ptr::write_bytes(tv, 0, 512) };
+            // 子表各 4K 项：物理地址 = 大页基址 + i*4K；标志继承并去 LARGE。
+            let inherited = huge & !ADDR_MASK & !FLAG_LARGE & !FLAG_PRESENT;
+            for i in 0..512usize {
+                let chunk = entry_paddr(huge, leaf, levels) + (i as u64) * 0x1000;
+                unsafe { tv.add(i).write_volatile(chunk | inherited | FLAG_PRESENT) };
+            }
+            let leaf_idx = index_at(leaf, levels, v);
+            unsafe { self.table_set(parent_phys, leaf_idx, new_table | inherited | FLAG_PRESENT) };
+            flush_tlb(v);
+            // 拆分后重走：现在命中 4K 叶，进入下方常规清除与回收路径。
+            return self.unmap(vaddr);
+        }
+
         // 清掉叶层条目：父表 = 上一层的下一级表（顶层时为自身）
         let parent_phys = if leaf == 0 {
             self.pml4
@@ -332,12 +397,8 @@ impl arch::PageTable for X86PageTable {
         // 地址空间隔离（ADR-007）：`new()` 派生页表时复制了内核高半区顶层条目，
         // 其指向的中间页表页**跨地址空间共享**。因此只有**用户半区**的页表页是
         // 本地址空间私有的、可回收；内核半区页表页绝不能在此释放（否则破坏其它
-        // 进程的内核映射）。用户地址空间也不应解映射内核半区，这里一并拒绝。
-        let top_idx = index_at(0, levels, v);
-        if top_idx >= KERNEL_HALF_START {
-            return Err(klib::error::Error::InvalidParam);
-        }
-        if leaf == levels - 1 && levels >= 3 {
+        // 进程的内核映射）——内核半区只清叶项、永不回收。
+        if !kernel_half && leaf == levels - 1 && levels >= 3 {
             // 从 PT 的父层（leaf-1）开始，逐级向上回收已空的中间页表页；
             // 一直收到 level 1（PDPT），但**不回收顶层页表页**（level 0 / PML4）——
             // 顶层由 `UserAddressSpace::destroy` 统一释放，此处若释放会破坏同地址
@@ -376,6 +437,28 @@ impl arch::PageTable for X86PageTable {
         Some(PhysAddr::new(entry_paddr(entries[leaf], leaf, levels)))
     }
 
+    fn translate_with_flags(&self, vaddr: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
+        let (entries, leaf, levels) = unsafe { self.walk(vaddr.as_u64()) }?;
+        let entry = entries[leaf];
+        // 从叶层条目重建抽象层 PageFlags（entry_from_flags 的逆）：
+        // bit1=W、bit2=U/S；NX=bit63 置位表示不可执行，故可执行 = NX 未置位。
+        // present 已由 walk() 保证。
+        let mut flags = PageFlags::empty();
+        if entry & FLAG_WRITABLE != 0 {
+            flags = flags.writable();
+        }
+        if entry & FLAG_USER != 0 {
+            flags = flags.user();
+        }
+        if entry & FLAG_PCD != 0 {
+            flags = flags.device_memory();
+        }
+        if entry & (1 << 63) == 0 {
+            flags = flags.executable();
+        }
+        Some((PhysAddr::new(entry_paddr(entry, leaf, levels)), flags))
+    }
+
     fn paddr(&self) -> u64 {
         self.pml4
     }
@@ -384,10 +467,103 @@ impl arch::PageTable for X86PageTable {
     fn current_paddr() -> u64 {
         mmio::cr3() & !0xFFF
     }
+
+    /// 切回启动期快照的内核根页表（MD4）。
+    fn switch_to_kernel_root() -> bool {
+        switch_to_kernel_root()
+    }
 }
 
 /// 刷新 TLB 中一个虚拟地址。
 #[inline]
 pub(crate) fn flush_tlb(vaddr: u64) {
     unsafe { core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags)) };
+}
+
+// ---- #PF 错误码语义（mm1.md MM6 后半：位编码知识归本层所有）----
+
+/// x86_64 #PF error code 原始位定义（SDM §4.7）。
+///
+/// `pub` 仅供 **extern "C" ABI 边界**构造原始错误码（如测试直接调用
+/// `page_fault_entry(vaddr, ec)`）；进入策略层必须走 [`PageFaultCode::new`]
+/// 包装，策略代码禁止引用这些常量。
+pub const PF_EC_PRESENT: u64 = 1 << 0;
+pub const PF_EC_WRITE: u64 = 1 << 1;
+pub const PF_EC_USER: u64 = 1 << 2;
+pub const PF_EC_RSVD: u64 = 1 << 3;
+pub const PF_EC_INSN: u64 = 1 << 4;
+
+/// x86_64 #PF error code 的类型化包装。
+///
+/// 原始错误码只允许在 extern "C" ABI 边界（中断栈帧 → 处理器注册链）以
+/// u64 存在；进入策略层（`mm::handle_page_fault`）前必须经 [`PageFaultCode::new`]
+/// 包装为语义视图，位解读只发生在下方 trait impl 一处。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PageFaultCode(u64);
+
+impl PageFaultCode {
+    /// 包装中断路径交付的原始错误码。
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// 取出原始位（仅供日志/透传，禁止策略层解码）。
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl arch::PageFaultCode for PageFaultCode {
+    fn is_write(self) -> bool {
+        self.0 & PF_EC_WRITE != 0
+    }
+    fn is_user(self) -> bool {
+        self.0 & PF_EC_USER != 0
+    }
+    fn is_present(self) -> bool {
+        self.0 & PF_EC_PRESENT != 0
+    }
+    fn is_instruction_fetch(self) -> bool {
+        self.0 & PF_EC_INSN != 0
+    }
+}
+
+/// 保留位违规查询（x86 特有语义：bit3）。策略层经 [`arch::PageFaultCode`]
+/// 四轴即可完成全部判定；本方法仅供诊断路径使用。
+impl PageFaultCode {
+    pub const fn is_reserved_violation(self) -> bool {
+        self.0 & PF_EC_RSVD != 0
+    }
+}
+
+// ---- 内核根页表（mm1.md MD4：销毁活动地址空间前的"回家表"）----
+
+/// 启动期快照的内核根页表物理基址。
+///
+/// kmain 在**任何用户地址空间存在之前**调用 [`snapshot_kernel_root`] 一次；
+/// 此后每个进程页表的内核半区都派生自该表（`X86PageTable::new` 复制当前表
+/// 高半区顶层条目），它因此是唯一可长期驻留、销毁任意用户表后仍有效的根。
+static KERNEL_ROOT: Once<u64> = Once::new();
+
+/// 快照当前 CR3 为内核根页表（整个运行期恰好一次）。
+///
+/// 只允许 kmain 入口调用——晚于任何 `UserAddressSpace::activate` 就会把
+/// 用户表误当内核根，debug_assert 当场暴露该顺序回归。
+pub fn snapshot_kernel_root() {
+    debug_assert!(
+        KERNEL_ROOT.get().is_none(),
+        "kernel root must be snapshotted exactly once, before any user address space exists"
+    );
+    KERNEL_ROOT.call_once(|| mmio::cr3() & !0xFFF);
+}
+
+/// 切回内核根页表。返回是否成功（未快照 = false 且不动 CR3）。
+pub fn switch_to_kernel_root() -> bool {
+    match KERNEL_ROOT.get() {
+        Some(root) => {
+            mmio::write_cr3(*root);
+            true
+        }
+        None => false,
+    }
 }

@@ -6,8 +6,9 @@
 //! - 供内核 `read` syscall（stdin=0）从缓冲取字节；
 //! - 支持 Shift 组合（普通/上档两套键位映射）。
 //!
-//! 外部中断路由：QEMU APIC 模式下由 IOAPIC 把 IRQ1 送到 vector 33；本驱动
-//! 假设中断已使能（由 `ioapic::enable_keyboard_irq` 完成），handler 自行 EOI。
+//! 外部中断路由：QEMU `pc` 机器下 IRQ1 走 **8259 → LAPIC LINT0 (ExtINT)**
+//! 路径（`pic::init` 重映射解屏蔽 + `imcr::switch_to_pic_mode` 切模式 +
+//! `lapic::init` 配 LINT0），本驱动假设中断已使能，handler 自行 EOI。
 
 use crate::interrupts;
 use crate::port::{inb, outb};
@@ -24,6 +25,10 @@ const CMD_SELF_TEST: u8 = 0xAA; // 自检
 // 键盘命令（写到数据端口）
 const KB_CMD_ACK: u8 = 0xFA;
 const KB_ENABLE_SCAN: u8 = 0xF4; // 开扫描（键盘响应 ACK 后开始）
+/// 扫描码集选择命令前缀（后随集合号，如 0x01 = Set 1）。
+const KB_CMD_SCANCODE_SET: u8 = 0xF0;
+/// 扫描码集 1（本驱动 KEYMAP 的译码基准）。
+const KB_SCANCODE_SET1: u8 = 0x01;
 
 // 控制器配置字节位
 const CFG_IRQ_ENABLE: u8 = 0x01; // bit0：键盘 IRQ1 使能
@@ -34,7 +39,7 @@ const STATUS_OUTPUT_FULL: u8 = 0x01; // 输出缓冲满（可读数据）
 const STATUS_INPUT_FULL: u8 = 0x02; // 输入缓冲满（忙）
 const STATUS_SELF_TEST_OK: u8 = 0x04; // 自检通过
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// 简单 SPSC 环形缓冲（写入=IRQ1 中断，读取=syscall）。
 const BUF_CAP: usize = 128;
@@ -71,11 +76,14 @@ fn wait_output_full() -> bool {
     false
 }
 
-/// 读 8042 配置字节。
-fn read_cfg() -> u8 {
+/// 读 8042 配置字节。超时返回 `None`（读不到真值时宁可报错，不返回垃圾）。
+fn read_cfg() -> Option<u8> {
     outb(CMD_PORT, CMD_READ_CTRL);
-    wait_output_full();
-    inb(DATA_PORT)
+    if wait_output_full() {
+        Some(inb(DATA_PORT))
+    } else {
+        None
+    }
 }
 
 /// 写 8042 配置字节。
@@ -102,6 +110,11 @@ fn send_kbd_cmd(cmd: u8) -> u8 {
 // ---------- 扫描码译码 ----------
 
 /// 扫描码 → ASCII（无 Shift 时）。索引 = 扫描码（Set 1，~0x01..=0x58）。
+///
+/// AD3 披露：当前译码为主键盘**子集**——CapsLock/Ctrl/Alt/功能键/F 键均未
+/// 实现（按下被静默丢弃，不进输入缓冲），双表结构（KEYMAP/KEYMAP_SHIFT）
+/// 貌似完整键位支持，实际只覆盖可打印字符 + Esc/Tab/Backspace/Enter。
+/// 扩展键位时须同步补 0xE0 前缀路径（该路径已存在但仅处理方向键）。
 const KEYMAP: [u8; 0x80] = {
     let mut m = [0u8; 0x80];
     m[0x01] = 27; // Esc
@@ -219,6 +232,15 @@ const SC_RSHIFT: u8 = 0x36;
 /// `0xE0` 扩展前缀标志：现代 101 键键盘的方向键/编辑键/小键盘（NumLock 关）/
 /// 右 Ctrl/Alt 等以 `0xE0 0xXX` 双字节序列发送。IRQ 每中断只读 1 字节，须跨中断
 /// 缓存前缀，待下一字节到达再合成完整键码。
+///
+/// E0 安全前提（AM4 补记，审计 #4 按现路由重写）：本静态 `mut` 仅在 IRQ1
+/// 中断上下文读写。IRQ1 的现役投递路径是 **8259 PIC → LAPIC LINT0
+/// (ExtINT)**（见 imcr.rs / pic.rs / lapic.rs 三处配合）——8259 是单输出
+/// 设备，其输出只连到**一个** CPU 的 LINT0，不存在 IOAPIC 式多目标均衡，
+/// 因此同一中断天然单投递、不会跨核并发重入；同核重入也不可能（handler
+/// EOI 前后 IF=0）。访问点不持任何普通自旋锁，无优先级反转死锁路径。
+/// 若未来引入多队列/多键盘路由（IOAPIC 回归），必须先改为 per-CPU 或
+/// IrqSpinLock 保护。
 static mut E0_PREFIX: bool = false;
 
 /// 译码结果：无输出 / 单个 ASCII 字节 / 一段（转义序列，静态生命周期）。
@@ -327,16 +349,29 @@ fn notify_input() {
 }
 
 /// 压入一个字符到缓冲（IRQ1 中断上下文调用）。
+///
+/// AM4：缓冲满时的静默丢弃不再无痕——累计进 [`DROPPED_KEYS`] 计数器，
+/// 诊断/自检可经 [`dropped_keys()`] 观察真实丢失量，而不是假装输入无损。
 fn push(ch: u8) {
     let w = WRITE_INDEX.load(Ordering::Relaxed);
     let r = READ_INDEX.load(Ordering::Relaxed);
     if w.wrapping_sub(r) >= BUF_CAP {
-        return; // 满，丢弃（避免覆盖未读）
+        // 满，丢弃（避免覆盖未读）——但留下计数痕迹。
+        DROPPED_KEYS.fetch_add(1, Ordering::Relaxed);
+        return;
     }
     BUF_DATA[w % BUF_CAP].store(ch as u32, Ordering::Relaxed);
     WRITE_INDEX.store(w + 1, Ordering::Release);
     BUF_INIT.store(1, Ordering::Release);
     notify_input(); // 唤醒阻塞在 read 的进程
+}
+
+/// 因缓冲满而被丢弃的键字节总数（单调递增）。
+static DROPPED_KEYS: AtomicU64 = AtomicU64::new(0);
+
+/// 返回至今因缓冲满被丢弃的键字节数（AM4 诊断接口）。
+pub fn dropped_keys() -> u64 {
+    DROPPED_KEYS.load(Ordering::Relaxed)
 }
 
 /// 弹出一个字符（read syscall 调用）。无数据返回 None。
@@ -425,14 +460,34 @@ pub fn init() -> bool {
     //    开启 8042 的 Set2→Set1 翻译会让 backspace(Set2 0x66) 等码在翻译环节被
     //    丢弃（翻译表无对应项），导致删除键收不到扫描码。故关闭翻译，并随后把
     //    键盘切到 Set 1，使所有键（含 backspace 0x0e）直通。
-    let mut cfg = read_cfg();
+    let Some(mut cfg) = read_cfg() else {
+        klib::info!("[kbd] config byte read timed out");
+        return false;
+    };
     cfg |= CFG_IRQ_ENABLE;
     cfg &= !CFG_TRANSLATE;
     write_cfg(cfg);
 
     // 3. 切换键盘到扫描码集 1（Set 1），再开扫描。顺序：F0 01 切 Set1，F4 开扫描。
-    let _ = send_kbd_cmd(0xF0);
-    let _ = send_kbd_cmd(0x01);
+    //    两条命令的 ACK 都必须验证（arch1.md AM3）：翻译已关闭的前提是键盘真的
+    //    切到了 Set 1——静默失败会让键盘留在 Set 2，所有键以错误码进缓冲且无
+    //    诊断。任一 ACK 不符即判初始化失败，绝不带病上岗。
+    let ack_set = send_kbd_cmd(KB_CMD_SCANCODE_SET);
+    if ack_set != KB_CMD_ACK {
+        klib::info!(
+            "[kbd] scancode-set cmd ack mismatch (0x{:02x})",
+            ack_set
+        );
+        return false;
+    }
+    let ack_val = send_kbd_cmd(KB_SCANCODE_SET1);
+    if ack_val != KB_CMD_ACK {
+        klib::info!(
+            "[kbd] scancode-set 1 ack mismatch (0x{:02x})",
+            ack_val
+        );
+        return false;
+    }
     if wait_input_empty() {
         outb(DATA_PORT, KB_ENABLE_SCAN);
         // 等 ACK（0xFA）；可能需先清多余输出。
@@ -443,7 +498,11 @@ pub fn init() -> bool {
         };
         if ack != KB_CMD_ACK {
             klib::info!("[kbd] enable-scan ack mismatch (0x{:02x})", ack);
+            return false;
         }
+    } else {
+        klib::info!("[kbd] input buffer never drained before enable-scan");
+        return false;
     }
 
     // 4. 注册 IRQ1 handler。
