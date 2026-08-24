@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod acpi;
 pub mod cpu;
+pub mod fpu;
 pub mod gdt;
 pub mod hpet;
 pub mod imcr;

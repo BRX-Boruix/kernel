@@ -1,24 +1,31 @@
-#![allow(dead_code)]
-
 //! 进程控制块（PCB）与进程表（M3.1）。
 //!
-//! M3 引入"进程模型"。本模块提供：
-//! - `TaskState`：进程状态（就绪/运行/阻塞/退出）。
+//! 本模块提供：
+//! - `TaskState`：进程状态（就绪/运行/阻塞/退出）——含展示名与数值编码的
+//!   **单点映射**（[`TaskState::label`] / [`TaskState::as_u8`]，task1 KM3）；
 //! - `Process<PT>`：进程控制块——pid、状态、上下文、独立用户地址空间、内核栈、
-//!   用户态入口与用户栈顶。
+//!   用户态入口与用户栈顶、标准流句柄表；
 //! - `ProcessTable<PT>`：进程表——pid 分配/回收 + 进程存储。
 //!
 //! 架构抽象（ADR-007）：`PT: PageTable` 泛型使进程逻辑不绑定具体架构。
-//! 进程持有 `UserAddressSpace<PT>`（M1 的独立地址空间），内核栈由调用方提供
-//! （M3 单核简单模型下可共用全局内核栈，M4 调度时再独立分配）。
 //!
-//! 生产化（boot→init）后本模块无条件编译；`ProcessTable`（泛型表）当前主要
-//! 供测试使用，调度器自建 `ProcEntry` 池不依赖它——部分成员在生产侧无调用方，
-//! 用文件级 `allow(dead_code)` 与 scheduler/elf/signals 保持一致（避免警告）。
+//! **与 scheduler 的职责边界（task1 KA1 处置：从自嘲注释升级为成文设计）**：
+//! - `Scheduler`（scheduler.rs 的 `ProcEntry` 池）是**唯一生产路径**——
+//!   多进程 RR 调度、waitpid/zombie、信号终止全部走它；
+//! - `ProcessTable` 是 **PCB 单元级测试夹具 + M3.3/M4.1 单进程停机验收
+//!   入口**（SDK `--test-m33/--test-m41` 停机验收流依赖其 `run`/`launch`）。
+//!   它刻意不做调度、不持锁、pid 可复用——与 Scheduler 的"pid 单调不复用
+//!   （ppid 即槽位索引不变式）"是**两种有意的语义**，不是实现漂移。
+//!   合并为单实现的唯一路径是把 SDK 六条里程碑停机验收流迁到调度器，
+//!   该迁移立项时本边界随之消解；在此之前，两侧文档互为交叉引用，
+//!   禁止在 ProcessTable 上新增生产语义。
+//!
+//! 用户段选择子/RFLAGS 构造的单点定义见 [`user_code_selector`] 等函数
+//! （task1 KM5：原 scheduler/process 两处重复收敛于此）。
+//!
+//! `CURRENT_PROC` 裸指针别名模型的安全论证见模块尾部
+//! "CURRENT_PROC 别名纪律"一节（task1 KA3）。
 
-// Box 仅 `run`（M3.3/M4.1 单进程停机模型）使用。
-#[cfg(any(feature = "kernel-test-m33", feature = "kernel-test-m41"))]
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -26,6 +33,27 @@ use arch::PageTable;
 use arch::task::TaskContext;
 use arch_x86_64::paging::X86PageTable;
 use mm::user_space::UserAddressSpace;
+
+// Box 仅 `run`（M3.3/M4.1 单进程停机模型）使用。
+#[cfg(any(feature = "kernel-test-m33", feature = "kernel-test-m41"))]
+use alloc::boxed::Box;
+
+/// 用户态代码段选择子（RPL=3）。
+///
+/// KM5 单点：scheduler 启动帧与本模块 launch 共用此构造，禁止再写
+/// 内联 `UCODE | 3`。位合成依据：x86 段选择子低 2 位为 RPL，置 11B
+/// 即请求特权级 3（ADR-007：多平台化时此构造迁入 arch 抽象层）。
+pub const fn user_code_selector() -> u16 {
+    arch_x86_64::gdt::UCODE | 3
+}
+
+/// 用户态数据段选择子（RPL=3）。同 [`user_code_selector`]。
+pub const fn user_data_selector() -> u16 {
+    arch_x86_64::gdt::UDATA | 3
+}
+
+/// 进入用户态的初始 RFLAGS：IF=1（开中断）、IOPL=0（禁 I/O）、保留位 1 恒为 1。
+pub const USER_RFLAGS: u64 = 0x0000_0000_0000_0202;
 
 // M4.1：当前运行进程的裸指针（syscall 经它访问进程地址空间/退出）。
 // 采用"进程被 `run` 从表取出并 `Box::leak` 为 `'static`，再记录地址"模型：
@@ -57,9 +85,11 @@ pub fn clear_current_proc() {
     CURRENT_PROC.store(0, Ordering::Release);
 }
 
-/// 当前运行进程的可变引用（syscall 在中断上下文访问，单进程无并发）。
+/// 当前运行进程的可变引用（syscall 在中断上下文访问）。
 ///
-/// 进程对象由 `Box::leak` 保证 `'static` 存活，返回 `&'static mut` 安全。
+/// 签名保留 `&'static mut`：进程对象确为 `'static` 存活（Box::leak 模型或
+/// 调度器槽内稳定地址），该签名描述的是**生命周期事实**；别名安全性不靠
+/// 生命周期表达，而靠下节纪律维持（task1 KA3）。
 pub fn current_proc_mut() -> Option<&'static mut Process<X86PageTable>> {
     let p = CURRENT_PROC.load(Ordering::Acquire);
     if p == 0 {
@@ -80,6 +110,31 @@ pub enum TaskState {
     Blocked,
     /// 已退出（等待回收）。
     Exit,
+}
+
+impl TaskState {
+    /// ps 快照 ABI 的数值编码（单点，task1 KM3）。
+    ///
+    /// 编码即用户态契约：1=Ready 2=Running 3=Blocked 0=Exit
+    /// （`ps_snapshot` 8 字节条目第 5 字节）。禁止调用方自行 match 重排。
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            TaskState::Ready => 1,
+            TaskState::Running => 2,
+            TaskState::Blocked => 3,
+            TaskState::Exit => 0,
+        }
+    }
+
+    /// ProcFS 展示名（单点，task1 KM3）。
+    pub const fn label(self) -> &'static str {
+        match self {
+            TaskState::Ready => "Ready",
+            TaskState::Running => "Running",
+            TaskState::Blocked => "Blocked",
+            TaskState::Exit => "Exit",
+        }
+    }
 }
 
 /// 进程控制块（PCB）。
@@ -223,8 +278,9 @@ impl<PT: PageTable> Process<PT> {
     /// 调用方无需预先 `activate()`。永不返回（用户态经中断/异常回到内核；
     /// 进程退出时由内核停机/回收）。
     ///
-    /// 注：cs/ss 用当前平台（x86_64）的 Ring3 段选择子并带 RPL=3。
-    /// 多平台化时应改为 `arch` 抽象层提供的用户段常量或注入函数（ADR-007）。
+    /// 注：cs/ss 用 [`user_code_selector`] / [`user_data_selector`] 单点构造
+    /// （task1 KM5）。多平台化时应迁入 `arch` 抽象层（ADR-007 半成品，
+    /// 迁移点已收敛到 process.rs 顶部三个定义，届时只动一处）。
     ///
     /// **M4.1 单进程停机模型遗留**：M4.2 起由调度器（`scheduler`）接管进程
     /// 运行，本方法仅 M3.3/M4.1 停机验收使用，随对应 feature 编译。
@@ -239,11 +295,10 @@ impl<PT: PageTable> Process<PT> {
         let cr3 = self.addr_space.page_table_paddr();
         let frame = TrapFrame {
             rip: self.entry_rip,
-            cs: (arch_x86_64::gdt::UCODE | 3) as u64,
-            // RFLAGS: IF=1（开中断）、IOPL=0（禁 I/O）、保留位 1 恒为 1
-            rflags: 0x0000_0000_0000_0202,
+            cs: user_code_selector() as u64,
+            rflags: USER_RFLAGS,
             rsp: self.user_stack_top,
-            ss: (arch_x86_64::gdt::UDATA | 3) as u64,
+            ss: user_data_selector() as u64,
             cr3,
         };
         arch::task::enter_usermode(&frame);
@@ -274,12 +329,18 @@ impl<PT: PageTable> ProcessTable<PT> {
     }
 
     /// 分配一个 pid（优先复用回收槽，否则递增）。
+    ///
+    /// task1 KM6：与 Scheduler::alloc_pid 同款 checked_add 机器强制——
+    /// 本表为测试夹具，pid 空间耗尽同样属编程错误而非运行错误。
     fn alloc_pid(&mut self) -> usize {
         if let Some(pid) = self.free.pop() {
             pid
         } else {
             let pid = self.next_pid;
-            self.next_pid += 1;
+            self.next_pid = self
+                .next_pid
+                .checked_add(1)
+                .expect("pid space exhausted (u64 overflow)");
             pid
         }
     }
@@ -380,3 +441,28 @@ impl ProcessTable<X86PageTable> {
         leaked.launch();
     }
 }
+
+// ---------------------------------------------------------------------------
+// CURRENT_PROC 别名纪律（task1 KA3：从散落注释收拢为单点成文论证）
+//
+// `CURRENT_PROC` 是指向当前运行进程的裸地址。绕过 Rust 别名规则的裸构造
+// `&mut` 在以下**全部成立**时是健全的：
+//
+// 1. **单点存在性**：任一时刻至多一个进程是"当前进程"（`s.current` 与
+//    本指针由同一段持锁代码原子地共同更新；置 None 与清指针成对出现）。
+// 2. **写者收敛**：对该进程的内核态可变访问只发生在两类上下文——
+//    a) 当前进程自己的 syscall 处理路径（经 `current_proc_mut()` 即取即用，
+//       借用不跨越任何可能改写 CURRENT_PROC 的调度调用）；
+//    b) 调度器持 SCHED 锁的切换/终止决策点。
+//    两类上下文在单核上不可能并发（中断上下文 vs 被打断路径互斥于 IF/
+//    锁序），故不存在两个活跃 `&mut` 同时解引用的窗口。
+// 3. **生命周期**：指针目标要么 Box::leak（停机模型），要么活在 SCHED 池
+//    槽位中且槽位置 None（terminate/reap/reset）与清 CURRENT_PROC 在同一
+//    持锁临界区内完成——悬空窗口不存在于可观察路径。
+// 4. **无跨抢占缓存**（ADR-017 后的强化不变式）：禁止把 `current_proc_mut()`
+//    返回值存进任何存活超过"当前 syscall 处理"的结构或寄存器级变量。
+//    违反此条的代码即违反本纪律，审查按红线处理。
+//
+// 缺页处理器（`process_page_fault_handler`）同样受 1–3 约束：它在中断
+// 上下文即取即用，不缓存引用。
+// ---------------------------------------------------------------------------

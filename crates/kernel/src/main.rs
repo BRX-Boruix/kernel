@@ -384,6 +384,17 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();
 
+    // task1：K1 抢占门控（ADR-017）/ K3 内核栈回收 / K2 FPU 隔离
+    // （纯表级 + 钩子驱动，返回主流程继续启动）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_task_tick_gate();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_task_kstack_reclaim();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_task_fpu_isolation();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_task_block_fpu_handoff();
+
     // loader1/LA4：ELF 加载器恶意镜像拒绝面对抗自检（纯加载验证，不 spawn，
     // 返回主流程继续启动；放在 SMP 之前保持单核确定性）。
     #[cfg(feature = "kernel-tests")]

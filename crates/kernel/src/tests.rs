@@ -4765,6 +4765,241 @@ pub fn test_waitpid_core() {
     info!("[test-waitpid-core] PASS");
 }
 
+// ---------- task1：K1 门控（ADR-017）/ K3 内核栈回收 / K2 FPU 隔离 ----------
+
+/// ADR-017 红绿锁定（task1 K1）：tick 的 CPL 门控。
+///
+/// 红证语义：无门控时，内核态帧（cs&3==0）同样推进时间片并触发 RR 切换——
+/// "内核态 tick 必须零调度效果"的断言即失败。绿证：门控后内核态 tick 连续
+/// TIMESLICE×2 次不产生任何状态迁移；用户态帧至多 2×TIMESLICE+2 次内完成
+/// 一次真实切换（current 迁移 + 目标 Running）。
+pub fn test_task_tick_gate() {
+    use arch_x86_64::interrupts::InterruptFrame;
+    use task::TaskState;
+    use task::scheduler::{TIMESLICE_TICKS, test_hooks as th};
+
+    info!("[test-task-gate] === ADR-017: tick CPL gating ===");
+    // 与 waitpid 核心单测同款卫生：全程关中断，防真实 IRQ0 打进确定性序列。
+    arch_x86_64::interrupts::disable();
+    th::reset_all();
+
+    let a = th::spawn_named_child_of(0, "gate-a.elf").expect("spawn gate-a");
+    let b = th::spawn_named_child_of(0, "gate-b.elf").expect("spawn gate-b");
+    task::scheduler::debug_set_scheduler_current(a);
+
+    // 内核态帧：CPL0。连续 2×TIMESLICE 次 tick 必须**整体不可见**于调度。
+    let mut frame = InterruptFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+        vector: 32, error_code: 0,
+        rip: 0xDEAD_0000, cs: 0x08, rflags: 0x202, rsp: 0, ss: 0x10,
+    };
+    for _ in 0..(TIMESLICE_TICKS * 2) {
+        task::tick(&mut frame);
+    }
+    assert_eq!(
+        th::debug_current_pid(),
+        Some(a),
+        "kernel-mode ticks must not schedule (ADR-017)"
+    );
+    assert_eq!(th::probe(a).map(|p| p.0), Some(TaskState::Ready));
+    assert_eq!(th::probe(b).map(|p| p.0), Some(TaskState::Ready));
+
+    // 用户态帧：RPL3。至多 2×TIMESLICE+2 次内必发生一次真实轮转。
+    frame.cs = task::process::user_code_selector() as u64;
+    let mut switched = false;
+    for _ in 0..(TIMESLICE_TICKS * 2 + 2) {
+        task::tick(&mut frame);
+        if th::debug_current_pid() != Some(a) {
+            switched = true;
+            break;
+        }
+    }
+    assert!(switched, "user-mode ticks must drive the RR switch");
+    let cur = th::debug_current_pid().expect("current after switch");
+    assert_eq!(th::probe(cur).map(|p| p.0), Some(TaskState::Running));
+
+    task::scheduler::debug_clear_scheduler_current();
+    th::reset_all();
+    arch_x86_64::interrupts::enable();
+    info!("[test-task-gate] PASS");
+}
+
+/// K3 资源闭环锁定：spawn 消耗的每进程内核栈帧（16 帧/进程）必须在
+/// 终止 + 回收队列清空后全额回到空闲池。红证语义：旧实现 FrameRange
+/// 随手丢弃、全 crate 无释放点——终止后 allocated_frames 永不回落。
+pub fn test_task_kstack_reclaim() {
+    use task::scheduler::test_hooks as th;
+
+    info!("[test-task-kstack] === K3: per-process kernel stack reclaim ===");
+    arch_x86_64::interrupts::disable();
+    th::reset_all();
+
+    let s0 = mm::frame_stats().allocated_frames;
+    let pids = [
+        th::spawn_named_child_of(0, "ks-a.elf").expect("spawn ks-a"),
+        th::spawn_named_child_of(0, "ks-b.elf").expect("spawn ks-b"),
+        th::spawn_named_child_of(0, "ks-c.elf").expect("spawn ks-c"),
+    ];
+    let s1 = mm::frame_stats().allocated_frames;
+    assert!(
+        s1 >= s0 + pids.len() * 16,
+        "each spawn must consume >=16 kstack frames (+addr-space pages)"
+    );
+    info!(
+        "[test-task-kstack] spawned {}: frames {} -> {} (+{})",
+        pids.len(), s0, s1, s1 - s0
+    );
+
+    // 真实终止路径：ppid=0 → Reclaimed（槽位退役、栈帧入延迟回收队列）。
+    for pid in pids {
+        assert_eq!(th::terminate(pid, 0), "reclaimed");
+    }
+    // reset_all 清空队列（含哑地址空间 Drop）→ 全量归还。
+    th::reset_all();
+    let s2 = mm::frame_stats().allocated_frames;
+    assert_eq!(
+        s2, s0,
+        "kstack + address-space frames must fully return after exit+drain"
+    );
+    info!("[test-task-kstack] reclaimed to baseline {} OK", s2);
+
+    arch_x86_64::interrupts::enable();
+    info!("[test-task-kstack] PASS");
+}
+
+/// K2 隔离锁定：两块 PCB FPU 保存区在交错 save 下互不污染；恢复路径走
+/// 生产同款 fxrstor64。红证语义：无保存区/共享区实现下 B 的快照必然覆盖
+/// A，A 的恢复值 == MB ≠ MA。
+pub fn test_task_fpu_isolation() {
+    use task::scheduler::test_hooks as th;
+
+    info!("[test-task-fpu] === K2: FPU area isolation across PCBs ===");
+    arch_x86_64::interrupts::disable();
+    th::reset_all();
+
+    let a = th::spawn_named_child_of(0, "fpu-a.elf").expect("spawn fpu-a");
+    let b = th::spawn_named_child_of(0, "fpu-b.elf").expect("spawn fpu-b");
+
+    const MA: u64 = 0x4059_0000_0000_0001; // 双精度可表示的任意标记
+    const MB: u64 = 0x405A_0000_0000_0002;
+    // 交错保存：A 快照 MA → B 快照 MB。B 的保存不得触碰 A 的保存区。
+    assert!(th::debug_fpu_save(a, MA));
+    assert!(th::debug_fpu_save(b, MB));
+    // 从 A 区恢复：必须拿回 MA（而非被 B 覆盖后的 MB 或 CPU 残留值）。
+    let ra = th::debug_fpu_restore(a).expect("restore a");
+    assert_eq!(ra, MA, "area A must survive interleaved save of B");
+    let rb = th::debug_fpu_restore(b).expect("restore b");
+    assert_eq!(rb, MB, "area B must round-trip byte-exact");
+    info!("[test-task-fpu] A={:#x} B={:#x} isolated OK", ra, rb);
+
+    th::reset_all();
+    arch_x86_64::interrupts::enable();
+    info!("[test-task-fpu] PASS");
+}
+
+/// 审计 R5-F1/F2 红绿锁定：IPC 阻塞路径（block_current）的 FPU 交接 +
+/// 新进程模板的强零化语义。
+///
+/// F1 断言对：block_current 切走阻塞者时必须①把其**活寄存器**快照进自己
+/// 的保存区（否则唤醒后恢复陈旧快照＝伪现场）、②切入方必须执行 fxrstor
+/// （否则 CPU 携带上一进程残值继续运行＝跨进程泄漏）。红证语义（旧内联
+/// 尾部只切 CR3/RSP0/CURRENT）：两条断言同时落红。
+/// F2 断言：新 spawn 进程的保存区经模板初始化后 XMM0 必须为**零**
+/// （POSIX exec 语义：新映像从初始化向量状态起步，而非内核执行瞬间的残渣）。
+pub fn test_task_block_fpu_handoff() {
+    use task::scheduler::test_hooks as th;
+
+    info!("[test-task-block-fpu] === R5-F1/F2: block_current FPU handoff ===");
+    arch_x86_64::interrupts::disable();
+    th::reset_all();
+
+    // xmm0 直读直写助手（显式破坏声明，防编译器跨语句持有 SSE 值）。
+    fn set_xmm0(v: u64) {
+        unsafe {
+            core::arch::asm!(
+                "movq xmm0, {v}",
+                v = in(reg) v,
+                out("xmm0") _,
+                options(nomem, nostack)
+            );
+        }
+    }
+    fn get_xmm0() -> u64 {
+        let out: u64;
+        unsafe {
+            core::arch::asm!(
+                "movq {o}, xmm0",
+                o = out(reg) out,
+                out("xmm0") _,
+                options(nomem, nostack)
+            );
+        }
+        out
+    }
+
+    // ---- F2：新进程模板强零化 ----
+    // 模板是全启动期懒单例——先重置缓存，再把现场弄脏（MA 进 a 区 + 活寄
+    // 存器），后 spawn c。c 的初始向量态必须是零而不是此刻内核现场的残值。
+    th::debug_reset_fpu_template();
+    let a = th::spawn_named_child_of(0, "blk-a.elf").expect("spawn blk-a");
+    assert!(th::debug_fpu_save(a, 0x1111_1111_1111_1111));
+    set_xmm0(0x2222_2222_2222_2222);
+    let c = th::spawn_named_child_of(0, "blk-c.elf").expect("spawn blk-c");
+    let cxmm = th::debug_fpu_restore(c).expect("restore c");
+    set_xmm0(0); // 清理：不留脏现场给后续断言
+    assert_eq!(
+        cxmm, 0,
+        "fresh process must start from zeroed vector state (F2)"
+    );
+    info!("[test-task-block-fpu] template zeroing OK");
+
+    // ---- F1：block_current 的 save/restore 双半交接 ----
+    let b = th::spawn_named_child_of(0, "blk-b.elf").expect("spawn blk-b");
+    const MA: u64 = 0x4061_0000_0000_000A;
+    const MB: u64 = 0x4062_0000_0000_000B;
+    const MC: u64 = 0x4063_0000_0000_000C;
+    assert!(th::debug_fpu_save(a, MA));
+    assert!(th::debug_fpu_save(b, MB));
+    // 场景装填：current=A，队列仅含 B（spawn 已入队，重设为仅 B）。
+    task::scheduler::debug_set_scheduler_current(a);
+    th::debug_set_ready_queue(&[b]);
+
+    set_xmm0(MC); // A 阻塞瞬间的"活寄存器"
+    let mut frame = arch_x86_64::interrupts::InterruptFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+        vector: 0x80, error_code: 0,
+        rip: 0x1000, cs: task::process::user_code_selector() as u64,
+        rflags: 0x202, rsp: 0x4000_0000, ss: task::process::user_data_selector() as u64,
+    };
+    assert!(
+        matches!(
+            task::block_current(&mut frame),
+            task::SwitchOutcome::Switched
+        ),
+        "block_current must switch to the queued peer"
+    );
+    // 半程①：CPU 现在必须携带 B 的恢复值 MB——fxrstor 确实执行了。
+    assert_eq!(
+        get_xmm0(),
+        MB,
+        "incoming process must have its FPU state restored (no cross-process leak)"
+    );
+    // 半程②：A 的保存区必须收到阻塞瞬间活寄存器 MC——save 确实执行了。
+    let archived_a = th::debug_fpu_restore(a).expect("restore a");
+    set_xmm0(0);
+    assert_eq!(
+        archived_a, MC,
+        "blocking process must archive its live FP registers before switching away"
+    );
+
+    task::scheduler::debug_clear_scheduler_current();
+    th::reset_all();
+    arch_x86_64::interrupts::enable();
+    info!("[test-task-block-fpu] PASS");
+}
+
 /// C7.1/#7 E2E 停机验收的常量地址（随 `kernel-test-waitpid` feature 编译）。
 #[cfg(feature = "kernel-test-waitpid")]
 mod usermode_waitpid {

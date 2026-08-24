@@ -783,20 +783,18 @@ unsafe extern "C" {
     fn x86_64_load_idt(idtr: *const Idtr);
 }
 
-/// 启用 FPU/SSE：清除 CR0.TS（Task Switched）。
+/// 启用 FPU/SSE：清 CR0.TS、置 MP/NE，并置 CR4.OSFXSR。
 ///
 /// bootloader（Limine）可能以 lazy-FPU 方式启动，CR0.TS=1。此时任何 x87/MMX/SSE
-/// 指令都会触发 #NM（Device Not Available）异常。内核未实现 FPU 惰性切换，
-/// 这里直接清除 TS，让浮点指令始终可用；同时置 MP（monitor coprocessor）
-/// 与 NE（native error），规范 FPU 行为。
+/// 指令都会触发 #NM（Device Not Available）异常。这里直接清除 TS，让浮点指令
+/// 始终可用；同时置 MP（monitor coprocessor）与 NE（native error），规范 FPU
+/// 行为；CR4.OSFXSR（bit9）声明 OS 保存 SSE 状态——未置位时任何 SSE 指令 #UD。
 ///
-/// 并发前提（arch1.md AM1 修正：原注释误称"单核下无需保存/恢复"）：本内核
-/// 当前**没有任何上下文使用 FPU 状态跨切换存活**——内核代码不碰浮点，用户
-/// 进程由静态 ELF 加载器生成且当前不发射 SSE 依赖的用户代码路径，AP 空转
-/// 循环亦不执行浮点指令。因此"不清 TS、不做保存/恢复"在现状下偶然安全。
-/// 一旦任何执行流开始真实使用浮点/SSE，必须先实现 per-task FPU 状态保存
-/// （XSAVE/XRSTOR 或 lazy #NM 切换），届时本函数的语义需重新设计——这不是
-/// 设计保证，而是现状记录。
+/// 跨任务 FPU 状态语义（task1 K2 落地后的设计事实，取代旧的"偶然安全"记录）：
+/// **eager 全量保存**——每次任务切出/切入由 task 调度器经 [`crate::fpu`] 的
+/// fxsave64/fxrstor64 完成，每进程持独立 [`crate::fpu::FpuArea`]。本函数只负责
+/// 一次性建立硬件前提（TS=0、EM=0、OSFXSR=1）且此后不得再置 TS；若未来改动
+/// 引入 TS 惰性方案，必须同步废弃 task 侧 eager 接线，两者不可并存。
 pub fn enable_fpu() {
     unsafe {
         let cr0: u64;
@@ -804,6 +802,12 @@ pub fn enable_fpu() {
         // 清 TS(bit3)，置 MP(bit1) 与 NE(bit5)
         let new = (cr0 & !(1 << 3)) | (1 << 1) | (1 << 5);
         core::arch::asm!("mov cr0, {}", in(reg) new, options(nomem, nostack));
+
+        // CR4.OSFXSR(bit9)：向 CPU 声明 OS 在任务切换时保存 SSE 现场。
+        // 未置位时 SSE 指令一律 #UD——FXSAVE/FXRSTOR 与用户 SSE 代码的共同前提。
+        let mut cr4 = crate::mmio::read_cr4();
+        cr4 |= 1 << 9;
+        crate::mmio::write_cr4(cr4);
     }
 }
 

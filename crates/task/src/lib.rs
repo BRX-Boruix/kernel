@@ -24,4 +24,6 @@ pub use scheduler::{
 };
 #[cfg(feature = "kernel-tests")]
 pub use scheduler::test_hooks;
-pub use signals::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTERM, signal_for_exception, signal_name};
+pub use signals::{
+    SIGBUS, SIGFPE, SIGILL, SIGKILL, SIGSEGV, SIGTERM, signal_for_exception, signal_name,
+};

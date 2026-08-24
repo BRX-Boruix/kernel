@@ -189,7 +189,6 @@ dependencies = [
  "drv",
  "klib",
  "mm",
- "spin",
  "vfs",
 ]
 
