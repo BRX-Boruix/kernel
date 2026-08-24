@@ -3618,7 +3618,7 @@ pub fn test_driver_hub_m72() {
         }
     }
 
-    // 4. 验证 PCI 总线设备与自动 Attach 与智能竞标得分（M8.1）
+    // 4. 验证 PCI 总线设备与自动候选仲裁与绑定（M8.1；DR1a 候选语义）
     let mut pci_dev_count = 0;
     let mut bound_pci_count = 0;
     for i in 0..dev_count {
@@ -3629,8 +3629,15 @@ pub fn test_driver_hub_m72() {
                     let score = DriverHub::device_driver_score_at(i);
                     bound_pci_count += 1;
                     assert!(score >= 50, "bound driver must have score >= 50");
+                    // DR1a（ADR-022 §1）：PCI 类绑定全部来自 pci_classes
+                    // 候选登记器——必须以候选身份呈现，绝不伪装成已接管。
+                    assert!(
+                        DriverHub::device_driver_is_candidate(i),
+                        "pci-class binding must be presented as candidate, driver={}",
+                        driver
+                    );
                     info!(
-                        "[test-driver-hub-m72] PCI device bound (bidding): name={} driver={} score={} vendor={:04x}:{:04x}",
+                        "[test-driver-hub-m72] PCI device candidate binding: name={} candidate={} score={} vendor={:04x}:{:04x}",
                         info.name, driver, score, info.vendor_id, info.device_id
                     );
                 }
@@ -3847,8 +3854,11 @@ pub fn test_driver_hub_m72() {
         prog_if: 0x00,
         volatile: true, // 非海量存储类 PCI 设备，按 C15.1 规则披露为易失
     };
-    DriverHub::register_device_info(hotplug_net_dev, None, None);
+    DriverHub::register_device_info(hotplug_net_dev, None, None)
+        .expect("hotplug device registration must succeed below capacity");
     assert_eq!(DriverHub::device_count(), initial_dev_count + 1);
+    // DA4：稠密不变量下新条目位于表顶（注册前 count 即其索引）
+    let hotplug_idx = DriverHub::device_count() - 1;
 
     // 验证事件总线接收到 DeviceArrived 事件
     let mut found_arrived = false;
@@ -3865,14 +3875,18 @@ pub fn test_driver_hub_m72() {
         "must publish DeviceArrived event for hotplug device"
     );
 
-    // 动态竞标仲裁并绑定
+    // 动态候选仲裁并绑定
     DriverHub::attach_all();
-    let hotplug_idx = DriverHub::device_capacity() - 1;
     let bound_drv = DriverHub::device_driver_at(hotplug_idx);
     let bound_score = DriverHub::device_driver_score_at(hotplug_idx);
     assert_eq!(bound_drv, Some("pci-net"));
     assert_eq!(bound_score, 95);
-    info!("[test-driver-hub-m72] Hotplug In & Bidding OK: bound=pci-net score=95");
+    // DR1a：热插拔竞标胜出同样是候选登记
+    assert!(
+        DriverHub::device_driver_is_candidate(hotplug_idx),
+        "hotplug pci-net binding must be candidate"
+    );
+    info!("[test-driver-hub-m72] Hotplug In & Bidding OK: candidate=pci-net score=95");
 
     // (2) 验证驱动在线热重载 (Live Driver Reloading)
     let reloaded = DriverHub::reload_device_driver("pci-hotplug-nic");
@@ -5299,4 +5313,291 @@ pub fn test_waitpid_e2e() {
     );
 
     start(); // 永不返回
+}
+
+/// drv1 整改自检（ADR-022）：注册表契约、候选呈现、事件丢弃账目与
+/// sectors_touched 溢出纪律。
+///
+/// **必须位于测试序列末位**：DM1 验证需要把驱动表填满，而驱动没有移除
+/// 通道——填满后的表不可逆；本测试之后的任何驱动注册都会得到如实的
+/// `Err(NoSpace)`（这正是新契约的行为）。设备表经 swap-remove 全量清理，
+/// 状态完全恢复。
+pub fn test_drv1_remediation() {
+    use drv::drivers::ata_pio::LBA28_MAX_SECTORS;
+    use drv::{sectors_touched, DeviceEvent, DeviceInfo};
+
+    info!("[test-drv1] === drv1 remediation: registry contracts & honesty ===");
+
+    // ---- 1. DD1：sectors_touched 饱和公式边界矩阵（含溢出域）----
+    // 基础语义与既有口径逐项一致。
+    assert_eq!(sectors_touched(0, 0), 0);
+    assert_eq!(sectors_touched(512, 0), 0);
+    assert_eq!(sectors_touched(0, 1), 1);
+    assert_eq!(sectors_touched(0, 512), 1);
+    assert_eq!(sectors_touched(1024, 1024), 2);
+    assert_eq!(sectors_touched(0, 513), 2);
+    assert_eq!(sectors_touched(511, 2), 2);
+    // 断言纠错（DDX2）：区间 [511,1024) 只跨一次块边界 = 2 块。
+    // 旧断言写 3 且旧公式实得 2——该矩阵从未被真正执行过（宿主测试层
+    // 从未编译），迁移到真机后以正确值钉死。
+    assert_eq!(sectors_touched(511, 513), 2, "[511,1024) touches blocks {{0,1}}");
+    assert_eq!(sectors_touched(u64::MAX - 600, 100), 2);
+    // 溢出域：任何组合不得 panic/回绕。
+    assert_eq!(
+        sectors_touched(u64::MAX, 1),
+        1,
+        "single byte at address-space end touches exactly one block"
+    );
+    assert_eq!(
+        sectors_touched(511, u64::MAX),
+        u64::MAX / 512 + 1,
+        "misaligned full-domain span saturates at the last block"
+    );
+    // 末块塌缩：offset 距地址空间顶端仅 100 字节，len 饱和截断后 last_byte
+    // 与 offset 同落最终块（[2^64-512, 2^64-1]），触碰块数恰为 1。
+    assert_eq!(
+        sectors_touched(u64::MAX - 100, u64::MAX),
+        1,
+        "tail-span saturation collapses into the single final block"
+    );
+    info!("[test-drv1] DD1 sectors_touched saturation matrix OK");
+
+    // ---- 2. DA4 + DM1（设备侧）：稠密枚举契约 + 表满如实报错 ----
+    let base_count = drv::DriverHub::device_count();
+    let max_devices = 64usize; // drv::hub MAX_DEVICES（pub 常量经 DriverHub 容量语义验证）
+    let mut filled = 0usize;
+    let mut first_overflow = false;
+    for i in 0..max_devices {
+        let name: &'static str = leak_name(format_args!("drv1-fill-dev-{}", i));
+        let info = fill_dev_info(name);
+        match drv::DriverHub::register_device_info(info, None, None) {
+            Ok(()) => filled += 1,
+            Err(e) => {
+                first_overflow = true;
+                info!(
+                    "[test-drv1] device table full at fill #{}: {:?} (DM1 honest rejection)",
+                    i, e
+                );
+                break;
+            }
+        }
+    }
+    assert!(first_overflow, "device table must eventually reject with NoSpace");
+    assert_eq!(
+        drv::DriverHub::device_count(),
+        base_count + filled,
+        "counter must equal live entries (no phantom increments)"
+    );
+
+    // 中部拔除 → swap-remove 压缩 → 尾部设备仍可枚举（旧实现静默跳过）。
+    let tail_name = drv::DriverHub::device_info_at(drv::DriverHub::device_count() - 1)
+        .expect("tail entry present")
+        .name;
+    let mid_name = "drv1-fill-dev-1";
+    assert!(
+        drv::DriverHub::unregister_device_by_name(mid_name),
+        "mid dummy unregister must succeed"
+    );
+    let after = drv::DriverHub::device_count();
+    let mut seen_tail = false;
+    for i in 0..after {
+        let Some(info) = drv::DriverHub::device_info_at(i) else {
+            panic!("dense invariant violated: hole at index {}", i);
+        };
+        if info.name == tail_name {
+            seen_tail = true;
+        }
+    }
+    assert!(seen_tail, "surviving tail device must remain visible after mid-table removal (DA4)");
+    // 压缩后的表顶槽位可立即复用。
+    assert!(
+        drv::DriverHub::register_device_info(fill_dev_info(leak_name(format_args!("drv1-fill-dev-reuse"))), None, None)
+            .is_ok(),
+        "compacted registry must accept a new registration"
+    );
+    assert_eq!(drv::DriverHub::device_count(), after + 1);
+
+    // 清理全部填充设备，注册表恢复基线（swap-remove 保证计数回落）。
+    for i in 0..filled {
+        let _ = drv::DriverHub::unregister_device_by_name(leak_name(format_args!("drv1-fill-dev-{}", i)));
+    }
+    let _ = drv::DriverHub::unregister_device_by_name("drv1-fill-dev-reuse");
+    assert_eq!(
+        drv::DriverHub::device_count(),
+        base_count,
+        "cleanup must restore baseline device count"
+    );
+    info!("[test-drv1] DA4+DM1 dense registry contract OK");
+
+    // ---- 3. DM1（驱动侧）：驱动表填满 → 精确 NoSpace，计数无谎言 ----
+    // （不可逆状态：本测试因此固定在序列末位。）
+    while drv::DriverHub::driver_count() < 32 {
+        let name: &'static str = leak_name(format_args!("drv1-fill-drv-{}", drv::DriverHub::driver_count()));
+        drv::DriverHub::register_driver(name, drv::DriverStage::Late, |_| {})
+            .expect("driver registration below capacity must succeed");
+    }
+    assert_eq!(drv::DriverHub::driver_count(), 32);
+    let overflow = drv::DriverHub::register_driver(
+        "drv1-overflow-drv",
+        drv::DriverStage::Late,
+        |_| {},
+    );
+    assert!(
+        matches!(overflow, Err(klib::error::Error::NoSpace)),
+        "overflowing driver registration must report NoSpace, got {:?}",
+        overflow
+    );
+    assert_eq!(
+        drv::DriverHub::driver_count(),
+        32,
+        "failed registration must not bump the counter"
+    );
+    info!("[test-drv1] DM1 driver-table honest capacity boundary OK");
+
+    // ---- 4. DR1a：DevFS 候选呈现 ----
+    let root = crate::vfs_init::root();
+    let list_node = root.resolve("/devices/list", true).expect("resolve /devices/list");
+    let mut buf = [0u8; 4096];
+    let n = list_node.read_at(0, &mut buf).expect("read /devices/list");
+    let list_str = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    assert!(
+        list_str.contains("\"driver\":\"candidate:pci-net(unimplemented)\""),
+        "e1000 binding must be presented as candidate in DevFS, got: {}",
+        list_str.trim()
+    );
+    assert!(
+        !list_str.contains("\"driver\":\"pci-net\""),
+        "bare pci-net presentation would be a false 'attached' claim"
+    );
+    // ata0 由 ata_pio 在 init 中真实接管（identify 完成），必须保持真驱动呈现。
+    if list_str.contains("\"name\":\"ata0\"") {
+        assert!(
+            list_str.contains("\"driver\":\"ata_pio\""),
+            "real hardware takeover must not be downgraded to candidate"
+        );
+    }
+    info!("[test-drv1] DR1a candidate presentation OK");
+
+    // ---- 5. DA3：BAR 只读缓存 + pci_location_of 对抗分支 ----
+    let net_name = (0..drv::DriverHub::device_count()).find_map(|i| {
+        drv::DriverHub::device_info_at(i)
+            .filter(|info| info.kind == drv::DeviceKind::Net && info.bus == drv::BusType::Pci)
+            .map(|info| info.name)
+    });
+    if let Some(net_name) = net_name {
+        let bars = drv::pci::cached_pci_bars(net_name);
+        assert!(
+            bars.is_some(),
+            "scanned PCI device must have cached BAR probe results"
+        );
+        // 反查一致性：每个 PCI 注册设备的 location 解码与反查结果一致。
+        for i in 0..drv::DriverHub::device_count() {
+            if let Some(info) = drv::DriverHub::device_info_at(i) {
+                if info.bus == drv::BusType::Pci {
+                    let expect = (
+                        ((info.location >> 16) & 0xFF) as u8,
+                        ((info.location >> 8) & 0xFF) as u8,
+                        (info.location & 0xFF) as u8,
+                    );
+                    assert_eq!(
+                        drv::DriverHub::pci_location_of(info.name),
+                        Some(expect),
+                        "reverse lookup must round-trip the registered BDF"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        drv::DriverHub::pci_location_of("nonexistent-device"),
+        None,
+        "unknown name must not yield a location"
+    );
+    assert_eq!(
+        drv::DriverHub::pci_location_of("ps2-keyboard"),
+        None,
+        "non-PCI device must not return a PCI location"
+    );
+    assert_eq!(drv::pci::cached_pci_bars("nonexistent-device"), None);
+    info!("[test-drv1] DA3 BAR cache + reverse-lookup adversarial OK");
+
+    // ---- 6. DM4：事件环形日志丢弃账目可见 ----
+    // 前置：环形日志是全局单例，启动注册与前序各节（DA4 填表/拔除）发布的
+    // 拓扑事件此刻已把它填满（count==CAPACITY）。先排空并钉死空起点，
+    // 否则满环上每次 push 都会淘汰最旧并计入丢弃，测量窗口不成立。
+    while drv::pop_event().is_some() {}
+    let dropped_before = drv::dropped_event_count();
+    assert_eq!(
+        drv::pending_event_count(),
+        0,
+        "drop-accounting measurement window must start from an empty ring"
+    );
+    let mk = |name: &'static str| {
+        DeviceEvent::DeviceArrived(DeviceInfo {
+            name,
+            ..fill_dev_info(name)
+        })
+    };
+    for i in 0..70u32 {
+        let name: &'static str = if i % 2 == 0 { "drv1-evt-a" } else { "drv1-evt-b" };
+        drv::publish_event(mk(name));
+    }
+    let dropped_delta = drv::dropped_event_count() - dropped_before;
+    assert_eq!(
+        dropped_delta, 6,
+        "70 events into a 64-slot ring must account exactly 6 drops"
+    );
+    assert_eq!(drv::pending_event_count(), 64);
+    let mut popped = 0;
+    while drv::pop_event().is_some() {
+        popped += 1;
+    }
+    assert_eq!(popped, 64);
+    info!("[test-drv1] DM4 event ring drop accounting OK");
+
+    // ---- 7. DA2 后置条件：当前环境 ATA 盘容量不超 LBA28 域 ----
+    let ata_idx = (0..drv::DriverHub::device_count()).find_map(|i| {
+        drv::DriverHub::device_info_at(i)
+            .filter(|info| info.name == "ata0")
+            .map(|_| i)
+    });
+    match ata_idx {
+        Some(idx) => {
+            let dev = drv::DriverHub::device_at(idx).expect("ata0 exposes ops");
+            if let Some(size) = dev.size() {
+                assert!(
+                    size / 512 <= LBA28_MAX_SECTORS,
+                    "hardware ata0 capacity must stay within the LBA28 domain (guard postcondition)"
+                );
+                info!("[test-drv1] DA2 guard postcondition OK ({} sectors <= {})", size / 512, LBA28_MAX_SECTORS);
+            }
+        }
+        None => info!(
+            "[test-drv1] no hardware ata0 in this environment; guard postcondition vacuously holds"
+        ),
+    }
+
+    info!("[test-drv1] PASS");
+}
+
+/// 构造填充用设备描述符（测试专用，Misc/Virtual/易失）。
+fn fill_dev_info(name: &'static str) -> drv::DeviceInfo {
+    drv::DeviceInfo {
+        name,
+        kind: drv::DeviceKind::Misc,
+        bus: drv::BusType::Virtual,
+        location: 0,
+        vendor_id: 0,
+        device_id: 0,
+        class_code: 0,
+        subclass: 0,
+        prog_if: 0,
+        volatile: true,
+    }
+}
+
+/// 测试专用名称常驻化（DriverHub 注册名是 &'static str；泄漏量与测试
+/// 填充条目一一对应，随注册表条目同生命周期，无额外驻留）。
+fn leak_name(args: core::fmt::Arguments<'_>) -> &'static str {
+    alloc::boxed::Box::leak(alloc::format!("{}", args).into_boxed_str())
 }

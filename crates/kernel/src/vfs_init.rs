@@ -166,11 +166,22 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                     drv::BusType::Virtual => "Virtual",
                     drv::BusType::Unknown => "Unknown",
                 };
-                let bound = drv::DriverHub::device_driver_at(i)
-                    .map(String::from)
+                // DR1a（ADR-022 §1）：绑定状态按注册表真值双态呈现——
+                // 真实接管 = "driver:<name>"；竞标胜出但驱动未实现硬件控制
+                // = "candidate:<name>(unimplemented)"。用户态可据此编程，
+                // 绝不把候选登记伪装成已挂接的驱动。
+                let bound = match drv::DriverHub::device_driver_at(i) {
+                    Some(driver_name) => {
+                        if drv::DriverHub::device_driver_is_candidate(i) {
+                            Some(format!("candidate:{}(unimplemented)", driver_name))
+                        } else {
+                            Some(String::from(driver_name))
+                        }
+                    }
                     // K4：查不到绑定驱动时如实报 "unbound"，绝不伪造 "attached"
                     // ——绑定状态是用户可见的治理数据，必须来自注册表真值。
-                    .or(Some(String::from("unbound")));
+                    None => Some(String::from("unbound")),
+                };
                 let class_val = ((info.class_code as u32) << 16)
                     | ((info.subclass as u32) << 8)
                     | (info.prog_if as u32);
@@ -395,28 +406,32 @@ impl DeviceInfoProvider for KernelDeviceProvider {
     }
 
     fn pci_bars_json(&self, dev_name: &str) -> String {
-        // C5.1/#5：经 DriverHub 反查设备名 → PCI 位置 → inspect_pci_bars。
-        // 不存在或非 PCI 设备返回错误 JSON，禁止回退到固定设备。
-        // KM9：not_found 路径同样走 JsonWriter（替代 format! + JsonStr）。
-        let (bus, device, function) = match drv::DriverHub::pci_location_of(dev_name) {
-            Some(loc) => loc,
-            None => {
-                let mut target = klib::json::VecTarget::new();
-                let mut writer = klib::json::JsonWriter::new(&mut target);
-                writer
-                    .start_object()
-                    .and_then(|mut o| {
-                        o.field_str("error", "not_found")?;
-                        o.field_str("device", dev_name)?;
-                        o.end()
-                    })
-                    .expect("Vec-backed pci bars JSON serialization cannot fail");
-                return target
-                    .into_string()
-                    .expect("pci bars JSON keys and device names are UTF-8");
-            }
+        // C5.1/#5：经 DriverHub 反查设备名 → PCI 位置。
+        // DA3（ADR-022 §4）：BAR 数据只读**扫描期缓存**——本属性文件每次
+        // 读取都不再触碰配置空间（inspect_pci_bars 的写全 1 手法对活动
+        // 设备是破坏性写，已私有化为扫描期单次执行）。缓存缺席（非扫描期
+        // 注册的 PCI 设备）如实报 no_bar_probe，禁止现场补探测或编造空数组。
+        let error_json = |code: &str| {
+            let mut target = klib::json::VecTarget::new();
+            let mut writer = klib::json::JsonWriter::new(&mut target);
+            writer
+                .start_object()
+                .and_then(|mut o| {
+                    o.field_str("error", code)?;
+                    o.field_str("device", dev_name)?;
+                    o.end()
+                })
+                .expect("Vec-backed pci bars JSON serialization cannot fail");
+            target
+                .into_string()
+                .expect("pci bars JSON keys and device names are UTF-8")
         };
-        let bars = drv::pci::inspect_pci_bars(bus, device, function);
+        if drv::DriverHub::pci_location_of(dev_name).is_none() {
+            return error_json("not_found");
+        }
+        let Some(bars) = drv::pci::cached_pci_bars(dev_name) else {
+            return error_json("no_bar_probe");
+        };
         let mut target = klib::json::VecTarget::new();
         let mut writer = klib::json::JsonWriter::new(&mut target);
         if let Ok(mut arr) = writer.start_array() {

@@ -1,8 +1,18 @@
 //! 统一驱动中枢引擎（DriverHub Central Registry & Lifecycle Engine）。
 //!
-//! 提供线程安全的驱动与设备集中注册表、4 阶段严格生命周期触发、多驱动竞标与热插拔/热重载支持（M8 ~ M9）。
+//! 提供线程安全的驱动与设备集中注册表、4 阶段严格生命周期触发、类匹配候选
+//! 仲裁与热插拔/热重载支持（M8 ~ M9）。
+//!
+//! 契约要点（ADR-022）：
+//! - **稠密不变量**（DA4）：设备表 `[0..DEVICE_COUNT)` 全稠密，拔除走
+//!   swap-remove 压缩；`0..device_count()` 枚举永远完整覆盖全部设备。
+//! - **诚实容量边界**（DM1）：注册族返回 `Result`，表满报 `NoSpace`，
+//!   计数器只在条目写入成功后推进——计数即真值。
+//! - **候选语义**（DR1a）：竞标胜出 ≠ 硬件接管。是否真实控制硬件由
+//!   [`DriverEntry::controls_hardware`] 声明，DevFS 按 candidate 前缀呈现。
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::{Acquire, AcqRel, Release}};
+use klib::error::Error;
 use klib::{info, warn};
 use spin::Mutex;
 
@@ -13,12 +23,23 @@ use crate::event::{DeviceEvent, publish_event};
 pub const MAX_DRIVERS: usize = 32;
 pub const MAX_DEVICES: usize = 64;
 
+/// 显式带驱动名注册设备时的绑定分。
+///
+/// 该路径的驱动在注册前已在自己的 init 中完成真实初始化与接管
+/// （ata_pio identify、键盘控制器就绪等），绑定关系先于竞标存在；
+/// 分数取标准类驱动档位（ADR-022 §1 的分数语义），不是仲裁产物。
+const EXPLICIT_BIND_SCORE: u8 = 50;
+
 #[derive(Clone, Copy)]
 pub struct DeviceEntry {
     pub info: DeviceInfo,
     pub dev: Option<&'static dyn DeviceOps>,
+    /// 绑定记录：竞标胜出的候选名，或注册时显式声明的接管驱动名。
     pub driver_name: Option<&'static str>,
     pub driver_score: u8,
+    /// 绑定是否代表**真实硬件接管**（ADR-022 §1）。`false` = 候选登记
+    /// （candidate-only），DevFS 以 `candidate:` 前缀呈现。
+    pub driver_controls_hardware: bool,
 }
 
 static DRIVER_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -34,12 +55,21 @@ pub struct DriverHub;
 
 impl DriverHub {
     /// 注册一个基础阶段驱动。
-    pub fn register_driver(name: &'static str, stage: DriverStage, init: fn(&DriverHub)) {
-        let idx = DRIVER_COUNT.fetch_add(1, Ordering::Relaxed);
-        if idx >= MAX_DRIVERS {
-            return;
-        }
+    ///
+    /// 表满返回 [`Error::NoSpace`]（DM1：拒绝必须可见，计数器不虚增）。
+    /// 本入口无 attach 司槽，条目的 `controls_hardware` 恒为 true（init 即
+    /// 全部工作），该值不参与任何决策路径。
+    pub fn register_driver(name: &'static str, stage: DriverStage, init: fn(&DriverHub)) -> Result<(), Error> {
         let mut list = DRIVERS.lock();
+        let idx = DRIVER_COUNT.load(Acquire);
+        if idx >= MAX_DRIVERS {
+            drop(list);
+            warn!(
+                "[driver_hub] driver table full ({}); registration of '{}' rejected",
+                MAX_DRIVERS, name
+            );
+            return Err(Error::NoSpace);
+        }
         list[idx] = DriverEntry {
             name,
             stage,
@@ -48,100 +78,121 @@ impl DriverHub {
             score_probe: None,
             attach: None,
             detach: None,
+            controls_hardware: true,
         };
+        DRIVER_COUNT.store(idx + 1, Release);
+        Ok(())
     }
 
     /// 注册一个带 probe/attach 动态设备匹配能力的驱动。
+    ///
+    /// ADR-008 哲学五点名的未来 LKM 注册入口：静态链接阶段驱动同样经此
+    /// 注册，动态模块加载落地时接口保持不变。表满返回 [`Error::NoSpace`]。
     pub fn register_driver_ops(
         name: &'static str,
         stage: DriverStage,
         init: fn(&DriverHub),
         probe: Option<fn(&DriverHub, &DeviceInfo) -> bool>,
         attach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
-    ) {
-        let idx = DRIVER_COUNT.fetch_add(1, Ordering::Relaxed);
-        if idx >= MAX_DRIVERS {
-            return;
-        }
-        let mut list = DRIVERS.lock();
-        list[idx] = DriverEntry {
-            name,
-            stage,
-            init,
-            probe,
-            score_probe: None,
-            attach,
-            detach: None,
-        };
+    ) -> Result<(), Error> {
+        Self::register_driver_full(name, stage, init, None, probe, attach, None, true)
     }
 
-    /// 注册一个带显式竞标打分（score_probe）的智能驱动（M8.1）。
-    pub fn register_driver_bidding(
-        name: &'static str,
-        stage: DriverStage,
-        init: fn(&DriverHub),
-        score_probe: Option<fn(&DriverHub, &DeviceInfo) -> u8>,
-        attach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
-    ) {
-        Self::register_driver_full(name, stage, init, score_probe, attach, None);
-    }
-
-    /// 注册一个全功能生命周期驱动（含竞标打分、Attach 与 Detach 热插拔支持，M9.2）。
+    /// 注册一个全功能生命周期驱动（含候选打分、Attach 与 Detach 热插拔支持，M9.2）。
+    ///
+    /// `controls_hardware` 必须如实声明（ADR-022 §1）：attach 完成真实硬件
+    /// 接管传 `true`；仅作候选登记（无 BAR 映射/中断/状态创建）传 `false`，
+    /// DevFS 将以 `candidate:{name}(unimplemented)` 呈现其绑定。
+    #[allow(clippy::too_many_arguments)]
     pub fn register_driver_full(
         name: &'static str,
         stage: DriverStage,
         init: fn(&DriverHub),
         score_probe: Option<fn(&DriverHub, &DeviceInfo) -> u8>,
+        probe: Option<fn(&DriverHub, &DeviceInfo) -> bool>,
         attach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
         detach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
-    ) {
-        let idx = DRIVER_COUNT.fetch_add(1, Ordering::Relaxed);
-        if idx >= MAX_DRIVERS {
-            return;
-        }
+        controls_hardware: bool,
+    ) -> Result<(), Error> {
         let mut list = DRIVERS.lock();
+        let idx = DRIVER_COUNT.load(Acquire);
+        if idx >= MAX_DRIVERS {
+            drop(list);
+            warn!(
+                "[driver_hub] driver table full ({}); registration of '{}' rejected",
+                MAX_DRIVERS, name
+            );
+            return Err(Error::NoSpace);
+        }
         list[idx] = DriverEntry {
             name,
             stage,
             init,
-            probe: None,
+            probe,
             score_probe,
             attach,
             detach,
+            controls_hardware,
         };
+        DRIVER_COUNT.store(idx + 1, Release);
+        Ok(())
     }
 
-    /// 向中枢注册一个已发现的硬件设备实例，并向拓扑事件总线发布 `DeviceArrived` 事件（M9.1）。
+    /// 向中枢注册一个已发现的硬件设备实例，并向拓扑事件日志发布
+    /// `DeviceArrived` 事件（M9.1）。
+    ///
+    /// `driver_name` 为 `Some` 时表示该设备由具名驱动在自身 init 中完成
+    /// 真实初始化后登记（C15.1 论述原泛型入口 `register_device`/
+    /// `register_device_bus` 已并入此处：持久化证据必须由携带完整元数据的
+    /// 本入口显式声明，无法证明持久化的设备填 `volatile: true` 保守披露）。
+    /// 表满返回 [`Error::NoSpace`]（DM1）。
     pub fn register_device_info(
         info: DeviceInfo,
         dev: Option<&'static dyn DeviceOps>,
         driver_name: Option<&'static str>,
-    ) {
-        let idx = DEVICE_COUNT.fetch_add(1, Ordering::Relaxed);
+    ) -> Result<(), Error> {
+        let mut list = DEVICES.lock();
+        let idx = DEVICE_COUNT.load(Acquire);
         if idx >= MAX_DEVICES {
-            return;
+            drop(list);
+            warn!(
+                "[driver_hub] device table full ({}); registration of '{}' rejected",
+                MAX_DEVICES, info.name
+            );
+            return Err(Error::NoSpace);
         }
-        {
-            let mut list = DEVICES.lock();
-            list[idx] = Some(DeviceEntry {
-                info,
-                dev,
-                driver_name,
-                driver_score: if driver_name.is_some() { 50 } else { 0 },
-            });
-        }
+        list[idx] = Some(DeviceEntry {
+            info,
+            dev,
+            driver_name,
+            driver_score: if driver_name.is_some() {
+                EXPLICIT_BIND_SCORE
+            } else {
+                0
+            },
+            driver_controls_hardware: driver_name.is_some(),
+        });
+        DEVICE_COUNT.store(idx + 1, Release);
+        drop(list);
         // 发布拓扑接入事件
         publish_event(DeviceEvent::DeviceArrived(info));
+        Ok(())
     }
 
-    /// 动态拔除/下线一个硬件设备（Hotplug Out），安全解绑驱动并发布 `DeviceDeparted` 事件（M9.1 & M9.2）。
+    /// 动态拔除/下线一个硬件设备（Hotplug Out），安全解绑并发布
+    /// `DeviceDeparted` 事件（M9.1 & M9.2）。
+    ///
+    /// 移除采用 **swap-remove 索引压缩**（ADR-022 §5 / DA4）：尾条目前移
+    /// 补位，`[0..DEVICE_COUNT)` 保持全稠密——`0..device_count()` 枚举在
+    /// 中部拔除后依然完整，尾部设备不再被静默跳过。
     pub fn unregister_device_by_name(name: &str) -> bool {
-        let dev_count = DEVICE_COUNT.load(Ordering::Relaxed);
+        let dev_count = DEVICE_COUNT.load(Acquire);
         let hub = DriverHub;
 
         for idx in 0..dev_count {
             let mut matched_info: Option<DeviceInfo> = None;
             let mut matched_drv_name: Option<&'static str> = None;
+            let mut matched_controls_hw = false;
 
             {
                 let devices = DEVICES.lock();
@@ -149,6 +200,7 @@ impl DriverHub {
                     if entry.info.name == name {
                         matched_info = Some(entry.info);
                         matched_drv_name = entry.driver_name;
+                        matched_controls_hw = entry.driver_controls_hardware;
                     }
                 }
             }
@@ -156,7 +208,7 @@ impl DriverHub {
             if let Some(info) = matched_info {
                 // 1. 如果已绑定驱动，先调用驱动的 detach 进行安全解绑
                 if let Some(drv_name) = matched_drv_name {
-                    let drv_count = DRIVER_COUNT.load(Ordering::Relaxed);
+                    let drv_count = DRIVER_COUNT.load(Acquire);
                     let drivers = DRIVERS.lock();
                     for drv in drivers.iter().take(drv_count) {
                         if drv.name == drv_name {
@@ -166,22 +218,31 @@ impl DriverHub {
                                     drv_name, info.name
                                 );
                             }
-                            info!(
-                                "[driver_hub] detached driver={} from device={}",
-                                drv_name, info.name
-                            );
+                            if matched_controls_hw {
+                                info!(
+                                    "[driver_hub] detached driver={} from device={}",
+                                    drv_name, info.name
+                                );
+                            } else {
+                                info!(
+                                    "[driver_hub] candidacy released: driver={} record removed from device={} (candidate-only)",
+                                    drv_name, info.name
+                                );
+                            }
                             break;
                         }
                     }
                 }
 
-                // 2. 清除设备条目
+                // 2. 索引压缩移除（swap-remove，稠密不变量）
                 {
                     let mut devices = DEVICES.lock();
-                    devices[idx] = None;
+                    let last = DEVICE_COUNT.load(Acquire) - 1;
+                    devices[idx] = devices[last].take();
+                    DEVICE_COUNT.store(last, Release);
                 }
 
-                // 3. 向事件总线广播拔除事件
+                // 3. 向事件日志广播拔除事件
                 publish_event(DeviceEvent::DeviceDeparted(info));
                 info!("[driver_hub] hotplug: device={} departed safely", name);
                 return true;
@@ -191,9 +252,10 @@ impl DriverHub {
         false
     }
 
-    /// 驱动在线热重载（Live Reloading）：安全解绑当前驱动 -> 重新执行竞标仲裁并绑定（M9.2）。
+    /// 驱动在线热重载（Live Reloading）：安全解绑当前绑定 -> 重新执行候选
+    /// 仲裁并记录胜者（M9.2）。
     pub fn reload_device_driver(name: &str) -> bool {
-        let dev_count = DEVICE_COUNT.load(Ordering::Relaxed);
+        let dev_count = DEVICE_COUNT.load(Acquire);
         let hub = DriverHub;
 
         for idx in 0..dev_count {
@@ -211,9 +273,9 @@ impl DriverHub {
             }
 
             if let Some(info) = target_info {
-                // 1. Detach 解绑
+                // 1. Detach 解绑（候选条目的 detach 是纯记录操作，恒 Ok）
                 if let Some(drv_name) = current_drv {
-                    let drv_count = DRIVER_COUNT.load(Ordering::Relaxed);
+                    let drv_count = DRIVER_COUNT.load(Acquire);
                     let drivers = DRIVERS.lock();
                     for drv in drivers.iter().take(drv_count) {
                         if drv.name == drv_name {
@@ -229,10 +291,11 @@ impl DriverHub {
                     if let Some(entry) = devices.get_mut(idx).and_then(|e| e.as_mut()) {
                         entry.driver_name = None;
                         entry.driver_score = 0;
+                        entry.driver_controls_hardware = false;
                     }
                 }
 
-                // 3. 重新竞标仲裁与绑定
+                // 3. 重新候选仲裁与记录
                 let attached = Self::arbitrate_and_attach_device(idx);
                 info!(
                     "[driver_hub] hot-reload device={} result={}",
@@ -245,58 +308,13 @@ impl DriverHub {
         false
     }
 
-    /// 注册一个现成的 DeviceOps 实例。
-    ///
-    /// 泛型入口无从得知设备的持久化证据，按 C15.1 保守披露 `volatile: true`；
-    /// 可证明持久化的硬件必须改用 `register_device_info` 显式声明。
-    pub fn register_device(dev: &'static dyn DeviceOps) {
-        Self::register_device_info(
-            DeviceInfo {
-                name: dev.name(),
-                kind: dev.kind(),
-                bus: BusType::Unknown,
-                location: 0,
-                vendor_id: 0,
-                device_id: 0,
-                class_code: 0,
-                subclass: 0,
-                prog_if: 0,
-                volatile: true,
-            },
-            Some(dev),
-            None,
-        );
-    }
-
-    /// 注册指定总线类型的 DeviceOps 实例。
-    ///
-    /// 持久化证据与总线类型无关，泛型入口同样保守披露 `volatile: true`。
-    pub fn register_device_bus(dev: &'static dyn DeviceOps, bus: BusType) {
-        Self::register_device_info(
-            DeviceInfo {
-                name: dev.name(),
-                kind: dev.kind(),
-                bus,
-                location: 0,
-                vendor_id: 0,
-                device_id: 0,
-                class_code: 0,
-                subclass: 0,
-                prog_if: 0,
-                volatile: true,
-            },
-            Some(dev),
-            None,
-        );
-    }
-
     /// 按设备名反查 PCI 位置（bus, device, function）。
     ///
     /// 遍历已注册设备，找到名称匹配且 `bus == BusType::Pci` 的条目，
     /// 从 `location` 字段解码出 `(bus, device, function)`。非 PCI 设备或
     /// 未知名称返回 `None`，绝不回退到固定设备。
     pub fn pci_location_of(name: &str) -> Option<(u8, u8, u8)> {
-        let dev_count = DEVICE_COUNT.load(Ordering::Relaxed);
+        let dev_count = DEVICE_COUNT.load(Acquire);
         let devices = DEVICES.lock();
         for entry in devices.iter().take(dev_count).flatten() {
             if entry.info.bus == BusType::Pci && entry.info.name == name {
@@ -310,26 +328,22 @@ impl DriverHub {
         None
     }
 
-    /// 返回当前已注册的有效设备总数。
+    /// 当前已注册的有效设备总数（= 注册表稠密前缀长度）。
+    ///
+    /// 不变量（ADR-022 §5）：拔除经 swap-remove 压缩，表中无洞；
+    /// `0..device_count()` 与各 `*_at(index)` 访问器构成同一枚举契约。
     pub fn device_count() -> usize {
-        let max_idx = DEVICE_COUNT.load(Ordering::Relaxed);
-        let list = DEVICES.lock();
-        list.iter().take(max_idx).filter(|e| e.is_some()).count()
+        DEVICE_COUNT.load(Acquire)
     }
 
-    /// 返回最大分配的设备槽位上限。
-    pub fn device_capacity() -> usize {
-        DEVICE_COUNT.load(Ordering::Relaxed)
-    }
-
-    /// 返回当前已注册的驱动总数。
+    /// 返回当前已注册的驱动总数（驱动表无移除通道，恒等于稠密长度）。
     pub fn driver_count() -> usize {
-        DRIVER_COUNT.load(Ordering::Relaxed)
+        DRIVER_COUNT.load(Acquire)
     }
 
     /// 获取指定索引的设备信息。
     pub fn device_info_at(index: usize) -> Option<DeviceInfo> {
-        if index >= DEVICE_COUNT.load(Ordering::Relaxed) {
+        if index >= DEVICE_COUNT.load(Acquire) {
             return None;
         }
         let list = DEVICES.lock();
@@ -338,7 +352,7 @@ impl DriverHub {
 
     /// 获取指定索引的设备操作集。
     pub fn device_at(index: usize) -> Option<&'static dyn DeviceOps> {
-        if index >= DEVICE_COUNT.load(Ordering::Relaxed) {
+        if index >= DEVICE_COUNT.load(Acquire) {
             return None;
         }
         let list = DEVICES.lock();
@@ -347,7 +361,7 @@ impl DriverHub {
 
     /// 获取指定索引设备绑定的驱动名称。
     pub fn device_driver_at(index: usize) -> Option<&'static str> {
-        if index >= DEVICE_COUNT.load(Ordering::Relaxed) {
+        if index >= DEVICE_COUNT.load(Acquire) {
             return None;
         }
         let list = DEVICES.lock();
@@ -358,7 +372,7 @@ impl DriverHub {
 
     /// 获取指定索引设备当前绑定驱动的竞标得分。
     pub fn device_driver_score_at(index: usize) -> u8 {
-        if index >= DEVICE_COUNT.load(Ordering::Relaxed) {
+        if index >= DEVICE_COUNT.load(Acquire) {
             return 0;
         }
         let list = DEVICES.lock();
@@ -368,24 +382,62 @@ impl DriverHub {
             .unwrap_or(0)
     }
 
+    /// 指定索引设备的绑定是否为**候选登记**（竞标胜出但驱动未实现硬件
+    /// 接管，ADR-022 §1）。未绑定或越界返回 `false`——`false` 不代表
+    /// 真实接管，呈现方必须先确认 [`Self::device_driver_at`] 非 None。
+    pub fn device_driver_is_candidate(index: usize) -> bool {
+        if index >= DEVICE_COUNT.load(Acquire) {
+            return false;
+        }
+        let list = DEVICES.lock();
+        list.get(index)
+            .and_then(|e| e.as_ref())
+            .map(|entry| entry.driver_name.is_some() && !entry.driver_controls_hardware)
+            .unwrap_or(false)
+    }
+
     fn ensure_registered() {
-        if REGISTERED.swap(true, Ordering::Relaxed) {
+        if REGISTERED.swap(true, AcqRel) {
             return;
         }
-        crate::drivers::serial::register_serial_driver();
-        crate::drivers::keyboard::register_keyboard_driver();
-        crate::drivers::cmos::register_cmos_driver();
-        crate::drivers::pseudo::register_pseudo_driver();
-        crate::drivers::ata_pio::register_ata_driver();
-        crate::drivers::ramdisk::register_ramdisk_driver();
-        crate::drivers::pci_bus::register_pci_bus_driver();
-        crate::drivers::pci_classes::register_pci_class_drivers();
+        // DM1：内建驱动注册结果逐一显式处理——表满等失败必须留痕，
+        // 静默丢弃不复存在。
+        let registrations = [
+            (
+                "serial",
+                crate::drivers::serial::register_serial_driver(),
+            ),
+            (
+                "keyboard",
+                crate::drivers::keyboard::register_keyboard_driver(),
+            ),
+            ("cmos", crate::drivers::cmos::register_cmos_driver()),
+            ("pseudo", crate::drivers::pseudo::register_pseudo_driver()),
+            ("ata_pio", crate::drivers::ata_pio::register_ata_driver()),
+            (
+                "ramdisk",
+                crate::drivers::ramdisk::register_ramdisk_driver(),
+            ),
+            ("pci-bus", crate::drivers::pci_bus::register_pci_bus_driver()),
+            (
+                "pci-class-candidates",
+                crate::drivers::pci_classes::register_pci_class_drivers(),
+            ),
+        ];
+        for (name, outcome) in registrations {
+            if let Err(e) = outcome {
+                warn!(
+                    "[driver_hub] builtin driver '{}' registration failed: {:?}",
+                    name, e
+                );
+            }
+        }
     }
 
     /// 触发指定生命周期阶段的所有驱动初始化。
     pub fn init_stage(stage: DriverStage) {
         Self::ensure_registered();
-        let count = DRIVER_COUNT.load(Ordering::Relaxed);
+        let count = DRIVER_COUNT.load(Acquire);
         let list = DRIVERS.lock();
         let hub = DriverHub;
         for entry in list.iter().take(count) {
@@ -400,7 +452,11 @@ impl DriverHub {
         }
     }
 
-    /// 执行多驱动竞标打分与最高分择优绑定，支持故障自动降级回退（M8.1 & M8.2 核心仲裁引擎）。
+    /// 执行类匹配候选仲裁：收集全部非零打分候选，按分数降序择优记录，
+    /// attach 失败自动降级回退次优（M8.1 & M8.2 仲裁引擎）。
+    ///
+    /// 胜出只意味着**绑定记录成立**；是否真实接管硬件由候选的
+    /// `controls_hardware` 声明决定（ADR-022 §1），日志按此分支措辞。
     pub fn arbitrate_and_attach_device(dev_idx: usize) -> bool {
         let info = {
             let devices = DEVICES.lock();
@@ -410,7 +466,7 @@ impl DriverHub {
             }
         };
 
-        let drv_count = DRIVER_COUNT.load(Ordering::Relaxed);
+        let drv_count = DRIVER_COUNT.load(Acquire);
         let hub = DriverHub;
 
         // 1. 收集所有驱动对该设备的竞标打分 (score, driver_entry)
@@ -443,7 +499,7 @@ impl DriverHub {
             }
         }
 
-        // 3. 从最高分驱动开始尝试 attach，若失败则原地降级回退到次高分驱动（M8.2 故障隔离与 Fallback）
+        // 3. 从最高分候选开始尝试 attach，若失败则原地降级回退到次高分候选（M8.2 故障隔离与 Fallback）
         for (score, drv) in bids.iter().take(bid_len).flatten() {
             info!(
                 "[driver_hub] bidding: device={} evaluating candidate driver={} (score={})",
@@ -451,14 +507,22 @@ impl DriverHub {
             );
             match drv.attach(&hub, &info) {
                 Ok(()) => {
-                    info!(
-                        "[driver_hub] arbitrated winner: attached driver={} (score={}) to device={}",
-                        drv.name, score, info.name
-                    );
+                    if drv.controls_hardware {
+                        info!(
+                            "[driver_hub] arbitrated winner: attached driver={} (score={}) to device={}",
+                            drv.name, score, info.name
+                        );
+                    } else {
+                        info!(
+                            "[driver_hub] candidate selected: driver={} (score={}) recorded for device={} (no hardware control implemented)",
+                            drv.name, score, info.name
+                        );
+                    }
                     let mut devices = DEVICES.lock();
                     if let Some(entry) = devices.get_mut(dev_idx).and_then(|e| e.as_mut()) {
                         entry.driver_name = Some(drv.name);
                         entry.driver_score = *score;
+                        entry.driver_controls_hardware = drv.controls_hardware;
                     }
                     return true;
                 }
@@ -474,9 +538,9 @@ impl DriverHub {
         false
     }
 
-    /// 遍历所有未绑定的设备，自动运行智能竞标仲裁与绑定。
+    /// 遍历所有未绑定的设备，自动运行候选仲裁并记录胜者。
     pub fn attach_all() {
-        let dev_count = DEVICE_COUNT.load(Ordering::Relaxed);
+        let dev_count = DEVICE_COUNT.load(Acquire);
         for idx in 0..dev_count {
             let is_unbound = {
                 let devices = DEVICES.lock();
@@ -502,7 +566,7 @@ impl DriverHub {
         Self::init_stage(DriverStage::Core);
     }
 
-    /// 外设探测与自动绑定阶段（PCI Scan, ATA, PCI Drivers）。
+    /// 外设探测与候选仲裁阶段（PCI Scan, ATA, PCI Class Candidates）。
     pub fn init_devices() {
         Self::init_stage(DriverStage::Devices);
         Self::attach_all();

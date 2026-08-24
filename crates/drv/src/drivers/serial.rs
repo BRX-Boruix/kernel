@@ -1,8 +1,9 @@
 //! Early 阶段：COM1 串口控制台驱动（Platform CharDevice）。
 
-use crate::device::{BusType, CharDevice, Device, DeviceInfo, DeviceKind, DeviceOps, IoDevice};
+use crate::device::{BusType, Device, DeviceInfo, DeviceKind, IoDevice};
 use crate::driver::DriverStage;
 use crate::hub::DriverHub;
+use klib::error::Error;
 
 /// COM1 串口设备在 DriverHub / DevFS 中的唯一注册名。
 ///
@@ -46,9 +47,9 @@ impl IoDevice for SerialDevice {
 
 pub static SERIAL_DEV: SerialDevice = SerialDevice;
 
-pub fn init_serial(hub: &DriverHub) {
+pub fn init_serial(_hub: &DriverHub) {
     arch_x86_64::serial::init();
-    DriverHub::register_device_info(
+    if let Err(e) = DriverHub::register_device_info(
         DeviceInfo {
             name: COM1_DEVICE_NAME,
             kind: DeviceKind::Char,
@@ -64,9 +65,12 @@ pub fn init_serial(hub: &DriverHub) {
         },
         Some(&SERIAL_DEV),
         Some("serial"),
-    );
+    ) {
+        // DM1：注册失败必须可见（DevFS/serial_read 将走 KM8 直连回退路径）。
+        klib::error!("[serial] device registration failed: {:?}", e);
+    }
 }
 
-pub fn register_serial_driver() {
-    DriverHub::register_driver("serial", DriverStage::Early, init_serial);
+pub fn register_serial_driver() -> Result<(), Error> {
+    DriverHub::register_driver("serial", DriverStage::Early, init_serial)
 }

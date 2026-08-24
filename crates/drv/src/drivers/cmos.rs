@@ -9,6 +9,7 @@
 use crate::device::{BusType, Device, DeviceInfo, DeviceKind, IoDevice};
 use crate::driver::DriverStage;
 use crate::hub::DriverHub;
+use klib::error::Error;
 
 pub struct CmosDevice;
 
@@ -65,7 +66,7 @@ impl IoDevice for CmosDevice {
 pub static CMOS_DEV: CmosDevice = CmosDevice;
 
 pub fn init_cmos(_hub: &DriverHub) {
-    DriverHub::register_device_info(
+    if let Err(e) = DriverHub::register_device_info(
         DeviceInfo {
             name: "cmos-rtc",
             kind: DeviceKind::Misc,
@@ -81,9 +82,12 @@ pub fn init_cmos(_hub: &DriverHub) {
         },
         Some(&CMOS_DEV),
         Some("cmos"),
-    );
+    ) {
+        // DM1：注册失败必须可见，静默丢设备不复存在。
+        klib::error!("[cmos] device registration failed: {:?}", e);
+    }
 }
 
-pub fn register_cmos_driver() {
-    DriverHub::register_driver("cmos", DriverStage::Core, init_cmos);
+pub fn register_cmos_driver() -> Result<(), Error> {
+    DriverHub::register_driver("cmos", DriverStage::Core, init_cmos)
 }

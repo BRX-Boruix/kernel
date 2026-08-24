@@ -9,12 +9,18 @@ use klib::error::Error;
 ///
 /// `len == 0` 恒为 0；跨界部分扇区按实际触碰的去重块数计。
 /// 该公式是内存型后端（ramdisk / ATA 回退盘）扇区计数的唯一口径。
+///
+/// 溢出纪律（drv1 DD1）：区间末端经 `saturating_add` 截断在地址域末端
+/// （`u64::MAX`），任何 `(offset, len)` 组合都不溢出、不回绕——大 `len`
+/// 的语义是"区间延伸到地址空间尽头为止"，与越界写回退到介质尾的行为一致。
 pub fn sectors_touched(offset: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    let span = offset % 512 + len;
-    (span + 511) / 512
+    let first_block = offset / 512;
+    // len >= 1 ⇒ len - 1 无下溢；末端饱和截断，见上。
+    let last_byte = offset.saturating_add(len - 1);
+    last_byte / 512 - first_block + 1
 }
 
 /// 块设备真实 I/O 计数（DMYGH C16.1）。
@@ -86,9 +92,6 @@ pub trait IoDevice: Send + Sync {
         } else {
             Err(Error::Io)
         }
-    }
-    fn poll(&self) -> bool {
-        false
     }
     fn size(&self) -> Option<u64> {
         None

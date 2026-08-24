@@ -30,7 +30,7 @@ pub fn init() {
             PM1A_CNT.store(info.pm1a_cnt, Ordering::Release);
             PM1B_CNT.store(info.pm1b_cnt, Ordering::Release);
 
-            DriverHub::register_device_info(
+            if let Err(e) = DriverHub::register_device_info(
                 DeviceInfo {
                     name: "acpi-fadt",
                     kind: DeviceKind::Misc,
@@ -46,7 +46,9 @@ pub fn init() {
                 },
                 None,
                 Some("acpi"),
-            );
+            ) {
+                klib::error!("[acpi] fadt device registration failed: {:?}", e);
+            }
 
             info!("[acpi] initialized (rev={})", info.rsdp_revision);
 
@@ -54,7 +56,7 @@ pub fn init() {
             if let Some(h) = info.hpet {
                 HPET_BASE.store(h.base_addr, Ordering::Release);
                 HPET_PERIOD_FS.store(h.counter_clock_period_fs as u64, Ordering::Release);
-                DriverHub::register_device_info(
+                if let Err(e) = DriverHub::register_device_info(
                     DeviceInfo {
                         name: "hpet",
                         kind: DeviceKind::Misc,
@@ -70,7 +72,9 @@ pub fn init() {
                     },
                     None,
                     Some("hpet"),
-                );
+                ) {
+                    klib::error!("[acpi] hpet device registration failed: {:?}", e);
+                }
             } else {
                 klib::info!("[acpi] no HPET table");
             }

@@ -7,12 +7,18 @@
 //! 以名字区分设备，重名使查找永远命中第一台。现注册名为
 //! `<类别描述>-<bus>-<device>-<function>`（经 `Box::leak` 常驻；注册表条目
 //! 本就终生存在，数量受扫描空间上界约束）。
+//!
+//! BAR 探测一次性纪律（ADR-022 §4 / DA3）：BAR 尺寸测量采用"写全 1 读回"
+//! 的规范手法，对活动设备是**破坏性配置空间写**。本模块只在扫描枚举期对
+//! 每设备执行一次探测并把结果存入 [`cached_pci_bars`] 只读缓存；DevFS 等
+//! 消费方一律读缓存——"读一个属性文件"永远不再触碰设备配置空间。
 
 use crate::device::{BusType, DeviceInfo, DeviceKind};
 use crate::driver::DriverStage;
 use crate::hub::DriverHub;
 use arch_x86_64::port::{inl, outl};
-use klib::info;
+use klib::{error::Error, info, warn};
+use spin::Mutex;
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -110,8 +116,12 @@ pub enum PciBar {
     None,
 }
 
-/// 解析指定 PCI 设备的 6 个 BAR 配置空间。
-pub fn inspect_pci_bars(bus: u8, device: u8, function: u8) -> [PciBar; 6] {
+/// 解析指定 PCI 设备的 6 个 BAR 配置空间（**破坏性探测，仅限扫描期调用**）。
+///
+/// 采用"写全 1 读回"规范手法测量 BAR 尺寸——对已由驱动接管的设备执行会
+/// 瞬时破坏其配置空间。本函数私有化（ADR-022 §4），唯一调用方是
+/// [`scan_pci_bus`] 的枚举路径；运行期消费一律走 [`cached_pci_bars`]。
+fn inspect_pci_bars(bus: u8, device: u8, function: u8) -> [PciBar; 6] {
     let mut bars = [PciBar::None; 6];
     let mut i = 0;
 
@@ -142,7 +152,17 @@ pub fn inspect_pci_bars(bus: u8, device: u8, function: u8) -> [PciBar; 6] {
             let bar_type = (orig_val >> 1) & 0x03;
             let prefetchable = (orig_val & (1 << 3)) != 0;
 
-            if bar_type == 2 && i + 1 < 6 {
+            if bar_type == 2 && i + 1 >= 6 {
+                // DD4b：末槽（slot 5）64-bit BAR 没有配对的高位槽，按规范属
+                // 畸形配置。如实拒绝解析并留痕——静默按 32 位误读会把高位
+                // 基址/尺寸整个读错。
+                warn!(
+                    "[pci] malformed config: 64-bit BAR in final slot {:02x}:{:02x}.{} (no paired high dword); skipped",
+                    bus, device, function
+                );
+                bars[i] = PciBar::None;
+                i += 1;
+            } else if bar_type == 2 {
                 // 64-bit MMIO
                 let next_offset = 0x10 + ((i + 1) as u8) * 4;
                 let orig_high = read_config_u32(bus, device, function, next_offset);
@@ -176,6 +196,32 @@ pub fn inspect_pci_bars(bus: u8, device: u8, function: u8) -> [PciBar; 6] {
     }
 
     bars
+}
+
+/// BAR 探测缓存条目：扫描期一次性探测的结果（ADR-022 §4）。
+struct BarCacheEntry {
+    name: &'static str,
+    bars: [PciBar; 6],
+}
+
+/// 缓存容量与 DriverHub 设备表一致：每个成功注册的 PCI 设备至多一条，
+/// 不存在溢出路径；越界即内核缺陷信号，warn 留痕后放弃缓存该条目。
+const MAX_BAR_CACHE: usize = 64;
+static BAR_CACHE: Mutex<[Option<BarCacheEntry>; MAX_BAR_CACHE]> =
+    Mutex::new([const { None }; MAX_BAR_CACHE]);
+
+/// 查询设备扫描期缓存的 BAR 解析结果（只读，零配置空间访问）。
+///
+/// 仅 [`scan_pci_bus`] 注册过的 PCI 设备有条目；非扫描路径注册的 PCI 设备
+/// 返回 `None`——调用方必须显式处理缺席（DevFS 报 `no_bar_probe` 错误），
+/// 禁止现场补探测或编造空结果。
+pub fn cached_pci_bars(dev_name: &str) -> Option<[PciBar; 6]> {
+    let cache = BAR_CACHE.lock();
+    cache.iter().find_map(|slot| {
+        slot.as_ref()
+            .filter(|e| e.name == dev_name)
+            .map(|e| e.bars)
+    })
 }
 
 fn kind_for_class(class_code: u8) -> DeviceKind {
@@ -239,7 +285,7 @@ pub fn scan_pci_bus() -> usize {
                 // 的设备一律保守披露为易失，禁止伪装持久存储。
                 let is_mass_storage = class_code == PCI_CLASS_MASS_STORAGE;
 
-                DriverHub::register_device_info(
+                if DriverHub::register_device_info(
                     DeviceInfo {
                         name,
                         kind,
@@ -254,12 +300,32 @@ pub fn scan_pci_bus() -> usize {
                     },
                     None,
                     None,
-                );
+                )
+                .is_err()
+                {
+                    // DM1：设备表满等注册失败必须留痕；未注册的设备不进入
+                    // BAR 缓存，避免产生任何查不到属主的探测记录。
+                    warn!(
+                        "[pci] device {} registration rejected (device table full); skipping",
+                        name
+                    );
+                    continue;
+                }
 
-                // K2：把该设备的第一个 MMIO BAR 发布为 UIO 可认领的物理窗口
-                // （设备物理资源是内核登记事实，用户 claim 只能映射这里登记
-                // 过的窗口）。发布失败不阻断设备注册，但必须留痕。
+                // K2 + DA3：对该设备执行唯一一次 BAR 探测，结果入只读缓存；
+                // 第一个 MMIO 窗口发布为 UIO 可认领的物理窗口（设备物理资源
+                // 是内核登记事实）。发布失败不阻断设备注册，但必须留痕。
                 let bars = inspect_pci_bars(bus, device, function);
+                {
+                    let mut cache = BAR_CACHE.lock();
+                    match cache.iter_mut().find(|s| s.is_none()) {
+                        Some(slot) => *slot = Some(BarCacheEntry { name, bars }),
+                        None => warn!(
+                            "[pci] BAR cache full; probe result for {} not cached (kernel defect signal)",
+                            name
+                        ),
+                    }
+                }
                 let window = bars.iter().find_map(|bar| match *bar {
                     PciBar::Mmio32 { addr, size, .. } => Some((addr as u64, size as u64)),
                     PciBar::Mmio64 { addr, size, .. } => Some((addr, size)),
@@ -293,6 +359,6 @@ pub fn init_pci_bus(_hub: &DriverHub) {
     scan_pci_bus();
 }
 
-pub fn register_pci_bus_driver() {
-    DriverHub::register_driver("pci-bus", DriverStage::Devices, init_pci_bus);
+pub fn register_pci_bus_driver() -> Result<(), Error> {
+    DriverHub::register_driver("pci-bus", DriverStage::Devices, init_pci_bus)
 }

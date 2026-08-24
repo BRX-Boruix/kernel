@@ -7,6 +7,7 @@ use crate::device::{
 };
 use crate::driver::DriverStage;
 use crate::hub::DriverHub;
+use klib::error::Error;
 use spin::Mutex;
 
 /// Ramdisk 的实际可写容量。静态后端占用 BSS；该常量同时决定存储数组、
@@ -54,7 +55,10 @@ impl IoDevice for RamdiskDevice {
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> usize {
-        // 兼容旧的短写风格接口；新调用方应使用 write_at_checked 获得精确错误码。
+        // 成文契约（drv1 DD4a）：本方法是遗留短写风格接口的兼容适配——
+        // 签名本身无法承载错误类型，`Err -> 0` 的映射是该签名的固有损失，
+        // 不是吞错缺陷。实现原语是 [`Self::write_at_checked`]；**新调用方
+        // 一律使用 checked 接口**获得可程序化的失败原因（OutOfRange 等）。
         self.write_at_checked(offset, data).unwrap_or(0)
     }
 
@@ -99,7 +103,7 @@ pub static RAMDISK_DEV: RamdiskDevice = RamdiskDevice {
 };
 
 pub fn init_ramdisk(_hub: &DriverHub) {
-    DriverHub::register_device_info(
+    if let Err(e) = DriverHub::register_device_info(
         DeviceInfo {
             name: "ramdisk0",
             kind: DeviceKind::Block,
@@ -115,9 +119,11 @@ pub fn init_ramdisk(_hub: &DriverHub) {
         },
         Some(&RAMDISK_DEV),
         Some("ramdisk"),
-    );
+    ) {
+        klib::error!("[ramdisk] device registration failed: {:?}", e);
+    }
 }
 
-pub fn register_ramdisk_driver() {
-    DriverHub::register_driver("ramdisk", DriverStage::Late, init_ramdisk);
+pub fn register_ramdisk_driver() -> Result<(), Error> {
+    DriverHub::register_driver("ramdisk", DriverStage::Late, init_ramdisk)
 }

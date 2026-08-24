@@ -15,6 +15,7 @@ mod vfs_init;
 mod tests;
 
 use arch::Platform;
+use core::sync::atomic::{AtomicBool, Ordering};
 use klib::{error, info, warn};
 use limine::{BaseRevision, FramebufferRequest};
 
@@ -402,6 +403,11 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_loader_adversarial();
 
+    // drv1 整改自检（ADR-022）：注册表契约/候选呈现/事件丢弃账目。
+    // **必须位于测试序列末位**——驱动表填满验证不可逆（见函数文档）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_drv1_remediation();
+
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。
     mm::frame_allocator::set_cpu_id_reader(|| {
@@ -540,7 +546,31 @@ fn halt_other_cpus_via_ipi() {
 
 // KM1：stdin 批量源适配——把键盘单字符 pop 排空进调用方缓冲，返回读取
 // 字节数（0 = 缓冲空，vfs::stdio::StdinNode 据此返回 WouldBlock）。
+//
+// DM5 单一消费点纪律（ADR-022 §8）：键盘队列唯一合法消费点是 DriverHub
+// 注册的 ps2-keyboard 设备 read。stdin 经 Hub 按名转发到同一扇门；设备
+// 缺席（框架未就绪等）走 KM8 同款可见回退——直连 arch pop + 一次告警，
+// 内核内部不存在第二条绕过设备的隐藏通道。
 fn stdin_source(buf: &mut [u8]) -> usize {
+    use drv::drivers::keyboard::PS2_KEYBOARD_DEVICE_NAME;
+
+    let count = drv::DriverHub::device_count();
+    for i in 0..count {
+        if let Some(info) = drv::DriverHub::device_info_at(i) {
+            if info.name == PS2_KEYBOARD_DEVICE_NAME {
+                if let Some(ops) = drv::DriverHub::device_at(i) {
+                    return ops.read(buf);
+                }
+            }
+        }
+    }
+    static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+    if !FALLBACK_WARNED.swap(true, Ordering::SeqCst) {
+        warn!(
+            "[stdin] '{}' not found in DriverHub; falling back to direct keyboard queue",
+            PS2_KEYBOARD_DEVICE_NAME
+        );
+    }
     let mut n = 0usize;
     while n < buf.len() {
         match arch_x86_64::keyboard::pop() {

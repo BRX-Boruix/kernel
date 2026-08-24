@@ -1,8 +1,9 @@
 //! Core/Late 阶段：伪设备实现（/devices/null, /devices/zero）。
 
-use crate::device::{BusType, CharDevice, Device, DeviceInfo, DeviceKind, DeviceOps, IoDevice};
+use crate::device::{BusType, Device, DeviceInfo, DeviceKind, IoDevice};
 use crate::driver::DriverStage;
 use crate::hub::DriverHub;
+use klib::error::Error;
 
 pub struct NullDevice;
 
@@ -63,7 +64,8 @@ pub static NULL_DEV: NullDevice = NullDevice;
 pub static ZERO_DEV: ZeroDevice = ZeroDevice;
 
 pub fn init_pseudo(_hub: &DriverHub) {
-    DriverHub::register_device_info(
+    // DM1：两个注册结果逐一显式处理，失败留痕不静默。
+    if let Err(e) = DriverHub::register_device_info(
         DeviceInfo {
             name: "null",
             kind: DeviceKind::Char,
@@ -79,9 +81,11 @@ pub fn init_pseudo(_hub: &DriverHub) {
         },
         Some(&NULL_DEV),
         Some("pseudo"),
-    );
+    ) {
+        klib::error!("[pseudo] null device registration failed: {:?}", e);
+    }
 
-    DriverHub::register_device_info(
+    if let Err(e) = DriverHub::register_device_info(
         DeviceInfo {
             name: "zero",
             kind: DeviceKind::Char,
@@ -97,9 +101,11 @@ pub fn init_pseudo(_hub: &DriverHub) {
         },
         Some(&ZERO_DEV),
         Some("pseudo"),
-    );
+    ) {
+        klib::error!("[pseudo] zero device registration failed: {:?}", e);
+    }
 }
 
-pub fn register_pseudo_driver() {
-    DriverHub::register_driver("pseudo", DriverStage::Core, init_pseudo);
+pub fn register_pseudo_driver() -> Result<(), Error> {
+    DriverHub::register_driver("pseudo", DriverStage::Core, init_pseudo)
 }

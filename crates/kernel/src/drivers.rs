@@ -40,7 +40,7 @@ fn init_framebuffer(_hub: &DriverHub) {
     if term::init(&info).is_ok() {
         let _ = klib::console::register_console(&term::TERMINAL_CONSOLE);
     }
-    DriverHub::register_device_info(
+    if let Err(e) = DriverHub::register_device_info(
         DeviceInfo {
             name: "framebuffer",
             kind: DeviceKind::Display,
@@ -58,14 +58,21 @@ fn init_framebuffer(_hub: &DriverHub) {
         // 驱动名绑定保留（framebuffer 驱动负责终端初始化，与 IO 无关）。
         None,
         Some("framebuffer"),
-    );
+    ) {
+        // DM1（ADR-022 §5）：注册失败必须可见，静默丢设备不复存在。
+        error!("[driver_hub] framebuffer device registration failed: {:?}", e);
+    }
     info!("[driver_hub] framebuffer terminal & display registered");
 }
 
 /// 初始化 DriverHub 驱动框架（Early & Core 阶段）。
 pub fn init() {
     // 注册 Framebuffer 驱动
-    DriverHub::register_driver("framebuffer", DriverStage::Core, init_framebuffer);
+    if let Err(e) = DriverHub::register_driver("framebuffer", DriverStage::Core, init_framebuffer)
+    {
+        // DM1（ADR-022 §5）：注册失败必须可见。
+        error!("[driver_hub] framebuffer driver registration failed: {:?}", e);
+    }
 
     // 触发 Early 阶段（串口控制台）
     DriverHub::init_early();

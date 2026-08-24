@@ -32,16 +32,25 @@ pub trait Driver: Send + Sync {
         false
     }
 
-    /// 驱动竞标打分（0~100 分制，M8.1 核心）：
-    /// - 0: 不匹配/不支持
-    /// - 20~40: 通用回退驱动（Fallback / Generic）
-    /// - 50~70: 标准 Class 驱动（如 PCI-IDE, Standard 16550 UART）
-    /// - 80~100: 专用厂商加速优化驱动（如 Intel AHCI / VirtIO 加速驱动）
+    /// 驱动竞标打分（0~100 分制，M8.1）。
+    ///
+    /// 分数语义（ADR-022 §1，DM6 现实描述）：分数是**类匹配优先级常量**——
+    /// 0 表示不支持；非零表示该驱动能作为该设备的候选参与仲裁。当前生态
+    /// 每个设备类恰有一个投标者（`drivers/pci_classes.rs`），厂商专用行
+    /// （如 0x8086:0x100E）仅作预留区分度，不代表存在另一条已实现的优化
+    /// 路径；多候选降级回退目前只有测试构造场景。文档不得暗示生产环境
+    /// 存在多档竞争生态。
     fn score_probe(&self, hub: &DriverHub, dev: &DeviceInfo) -> u8 {
         if self.probe(hub, dev) { 50 } else { 0 }
     }
 
-    /// 探测成功后实例化驱动并绑定设备（返回 Ok(()) 表示绑定成功，Err(()) 触发自动降级）。
+    /// 候选胜出后的绑定确认。
+    ///
+    /// 返回 `Ok(())` 表示接受绑定记录。注意（ADR-022 §1）：Ok 只代表
+    /// **候选登记成功**，是否真实接管硬件由 [`DriverEntry::controls_hardware`]
+    /// 声明——未实现硬件控制的驱动（如 pci_classes 三候选）在此只完成
+    /// 登记，不做任何硬件触碰，DevFS 以 candidate 前缀如实呈现。
+    /// Err(()) 触发仲裁降级回退到次高分候选。
     fn attach(&self, _hub: &DriverHub, _dev: &DeviceInfo) -> Result<(), ()> {
         Ok(())
     }
@@ -62,6 +71,11 @@ pub struct DriverEntry {
     pub score_probe: Option<fn(&DriverHub, &DeviceInfo) -> u8>,
     pub attach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
     pub detach: Option<fn(&DriverHub, &DeviceInfo) -> Result<(), ()>>,
+    /// 该驱动 attach 成功后是否**真实接管硬件**（BAR 映射/中断注册/设备
+    /// 状态创建，ADR-022 §1）。`false` = 候选登记专用（candidate-only）：
+    /// 仲裁可胜出、注册表留名记分，但 DevFS 以 `candidate:` 前缀如实呈现，
+    /// 日志不使用 "attached" 措辞。未实现硬件控制的驱动必须如实声明 false。
+    pub controls_hardware: bool,
 }
 
 fn noop(_hub: &DriverHub) {}
@@ -75,6 +89,7 @@ impl DriverEntry {
         score_probe: None,
         attach: None,
         detach: None,
+        controls_hardware: false,
     };
 }
 
