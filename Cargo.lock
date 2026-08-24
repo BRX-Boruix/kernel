@@ -199,8 +199,6 @@ version = "0.1.0"
 dependencies = [
  "flanterm_rust",
  "klib",
- "limine",
- "spin",
 ]
 
 [[package]]

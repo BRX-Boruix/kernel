@@ -18,22 +18,14 @@ const FLANTERM_FB_FONT_GLYPHS: usize = 256;
 /// 一次性诊断标志：若在绘制时发现 `framebuffer` 指针为 0，置位。
 ///
 /// `framebuffer` 仅在 `flanterm_fb_init` 构造时写入一次，之后无任何代码清零；
-/// 变 0 说明 leaked 的 `FlantermContext` 被内核堆踩踏（早期被破坏的调度器在
-/// CR3 切换后 panic / 用失效 `proc_ptr` 写入曾导致）。由 terminal 层读取并报告。
-pub static FB_NULL_SEEN: AtomicBool = AtomicBool::new(false);
+/// 变 0 说明 leaked 的 `FlantermContext` 被内核堆踩踏。经 [`fb_null_seen`]
+/// 查询接口对外披露（term1 T12：诊断状态以函数暴露而非公开全局，读取方
+/// 与置位方解耦，后续可替换为事件回调而不破坏 API）。
+static FB_NULL_SEEN: AtomicBool = AtomicBool::new(false);
 
-/// 自愈：若 `framebuffer` 指针被踩踏清零，用初始化时保存的地址恢复，避免绘制崩溃。
-///
-/// `framebuffer` 仅在 `flanterm_fb_init` 写入一次；此处仅在其被外部野写清零时
-/// 兜底恢复，不掩盖根因（真正的堆踩踏仍需定位），仅防止内核因此 page fault 停机。
-/// 返回 `true` 表示确实发生了清零并已被恢复（供上层一次性报告根因）。
-pub fn flanterm_fb_check_and_restore(ctx: &mut FlantermContext, expected: *mut u32) -> bool {
-    if ctx.backend.framebuffer.is_null() && !expected.is_null() {
-        ctx.backend.framebuffer = expected;
-        true
-    } else {
-        false
-    }
+/// 查询「绘制时是否遇到过 NULL framebuffer 指针」（一次性闩，置位不复位）。
+pub fn fb_null_seen() -> bool {
+    FB_NULL_SEEN.load(Ordering::Relaxed)
 }
 
 #[derive(Copy, Clone)]
@@ -184,6 +176,7 @@ unsafe fn plot_char(
 ) {
     // 防御性保护：framebuffer 指针若为 null（疑似内核堆被踩），记录一次性标志
     // 并跳过绘制，避免 page fault 崩溃。正常情形下由 limine 提供且非 null。
+    // 上层经 fb_null_seen() 查询并向日志报告（term1 T2：只观测、不自愈）。
     if fb.framebuffer.is_null() {
         FB_NULL_SEEN.store(true, Ordering::Relaxed);
         return;

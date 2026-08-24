@@ -4,7 +4,7 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use drv::{BusType, DeviceInfo, DeviceKind, DriverHub, DriverStage};
-use klib::info;
+use klib::{error, info};
 
 /// Limine framebuffer 指针。
 static FRAMEBUFFER_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -15,8 +15,31 @@ fn init_framebuffer(_hub: &DriverHub) {
         return;
     }
     let fb: &limine::Framebuffer = unsafe { &*(p as *const limine::Framebuffer) };
-    term::init(fb);
-    let _ = klib::console::register_console(&term::TERMINAL_CONSOLE);
+    // term1 T9：协议类型 → 表现层值结构的转换收敛在内核侧（S14），
+    // term 不认识 limine 类型。
+    let Some(addr) = fb.address.as_ptr() else {
+        error!("[driver_hub] framebuffer address is null; terminal not initialized");
+        return;
+    };
+    let info = term::FbInfo {
+        addr: addr as usize,
+        width: fb.width,
+        height: fb.height,
+        pitch: fb.pitch,
+        bpp: fb.bpp,
+        memory_model: fb.memory_model,
+        red_mask_size: fb.red_mask_size,
+        red_mask_shift: fb.red_mask_shift,
+        green_mask_size: fb.green_mask_size,
+        green_mask_shift: fb.green_mask_shift,
+        blue_mask_size: fb.blue_mask_size,
+        blue_mask_shift: fb.blue_mask_shift,
+    };
+    // term1 T3：init 失败即诚实降级为纯串口，且不注册屏幕 sink——
+    // 注册死 sink 等于向 console 层伪装屏幕可用。
+    if term::init(&info).is_ok() {
+        let _ = klib::console::register_console(&term::TERMINAL_CONSOLE);
+    }
     DriverHub::register_device_info(
         DeviceInfo {
             name: "framebuffer",

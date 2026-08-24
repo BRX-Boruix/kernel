@@ -119,6 +119,10 @@ unsafe fn kmain_body() -> ! {
     // 串口驱动 `init` 在此完成统一 console 串口 sink 的注册（不再手动接线），
     // 此后所有内核日志先汇聚到 console 再转发。
     drivers::init();
+    // term1 T8：产品横幅由调用方持有（表现层库不做产品文案），经统一
+    // console 下发——串口与屏幕同步可见。
+    klib::console::write_str("Hello, BORUIX!\r\n");
+    klib::console::write_str("Kernel M0 is running.\r\n");
     info!(
         "[kmain] serial & driver hub initialized (arch={})",
         CurrentArch::name()

@@ -30,7 +30,13 @@ pub trait Console {
     /// 输出整串文本（含 `\n`，`\r\n` 转换由实现自行处理）。
     fn write_str(&self, s: &str);
 
-    /// 输出单个原始字节（默认按 UTF-8 单字节文本转发）。
+    /// 输出单个原始字节。
+    ///
+    /// 契约（term1 T5 成文）：本接口仅承载**单字节自足**的文本——ASCII
+    /// 字符或调用方明确意图发送的控制字节。多字节 UTF-8 字符不得按字节
+    /// 逐个喂入：单字节视角下续字节是非法序列，将按 U+FFFD 如实转换
+    /// （宁可替换标记，不伪造完整字符）。多字节内容一律走
+    /// [`Console::write_str`] / [`Console::write_bytes`] 整段路径。
     fn write_byte(&self, b: u8) {
         let s = core::str::from_utf8(core::slice::from_ref(&b)).unwrap_or("\u{FFFD}");
         self.write_str(s);
