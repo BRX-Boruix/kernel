@@ -24,10 +24,16 @@ pub trait ByteDevice: Send + Sync {
 }
 
 /// 测试与宿主验证用的内存字节设备。
+///
+/// fs1 FD4：仅存在于测试域（`#[cfg(test)]`）——内核侧生产编译不含此结构
+/// （内核经 DrvByteBridge 注入真实 drv 适配器，从未引用 Mock），宿主测试
+/// 由本 crate 的 tests 模块使用。零死代码纪律。
+#[cfg(test)]
 pub struct MockByteDevice {
     data: spin::Mutex<alloc::vec::Vec<u8>>,
 }
 
+#[cfg(test)]
 impl MockByteDevice {
     pub fn new(data: alloc::vec::Vec<u8>) -> Self {
         Self {
@@ -36,6 +42,7 @@ impl MockByteDevice {
     }
 }
 
+#[cfg(test)]
 impl ByteDevice for MockByteDevice {
     fn read_bytes(&self, offset: u64, out: &mut [u8]) -> usize {
         let data = self.data.lock();

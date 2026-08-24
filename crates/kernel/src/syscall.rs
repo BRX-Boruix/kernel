@@ -318,6 +318,7 @@ fn sys_readdir(frame: &mut InterruptFrame) -> u64 {
             vfs::inode::INodeType::CharacterDevice => "chardev",
             vfs::inode::INodeType::BlockDevice => "blkdev",
             vfs::inode::INodeType::Fifo => "fifo",
+            vfs::inode::INodeType::Socket => "sock",
         }
     }
     let mut out = alloc::string::String::new();

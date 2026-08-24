@@ -75,6 +75,14 @@ pub enum Error {
     /// 处于只读状态**（EROFS，任何调用者都不可写）。klib1 KM5 预置变体，
     /// fs 层错误源接线随 fs1 立项落地。
     ReadOnly,
+    /// 文件系统结构性损坏（EUCLEAN/EFSCORRUPTED）：已读到的盘上数据自身
+    /// 违反格式契约（块指针越界、目录项自相矛盾等）。
+    ///
+    /// 与 [`Error::Io`] 的分界：Io 表达传输失败/介质边界（短读、设备尾，
+    /// 换源或重试语义上可能解决）；Corrupt 表达**数据已完整读到但内容非法**
+    /// （重试无意义，需要 fsck）。fs1 FA3b 接线——此前五类 EXT2 故障被
+    /// 压扁成单一 Io，用户态无法区分介质尾与结构损坏。
+    Corrupt,
 }
 
 impl Error {
@@ -101,6 +109,7 @@ impl Error {
             Error::IllegalSeek => 29,      // ESPIPE
             Error::ExecFormat => 8,        // ENOEXEC
             Error::ReadOnly => 30,         // EROFS
+            Error::Corrupt => 117,         // EUCLEAN (EFSCORRUPTED)
         }
     }
 }
@@ -128,6 +137,7 @@ impl core::fmt::Display for Error {
             Error::IllegalSeek => f.write_str("illegal seek"),
             Error::ExecFormat => f.write_str("exec format error"),
             Error::ReadOnly => f.write_str("read-only file system"),
+            Error::Corrupt => f.write_str("structure needs cleaning"),
         }
     }
 }
@@ -147,6 +157,8 @@ mod tests {
         assert_ne!(Error::ExecFormat, Error::NotSupported);
         assert_eq!(Error::ReadOnly, Error::ReadOnly);
         assert_ne!(Error::ReadOnly, Error::PermissionDenied);
+        assert_eq!(Error::Corrupt, Error::Corrupt);
+        assert_ne!(Error::Corrupt, Error::Io);
     }
 
     #[test]
@@ -158,6 +170,7 @@ mod tests {
             format!("{}", Error::ReadOnly),
             "read-only file system"
         );
+        assert_eq!(format!("{}", Error::Corrupt), "structure needs cleaning");
     }
 
     #[test]
@@ -174,6 +187,7 @@ mod tests {
         assert_eq!(Error::ExecFormat.to_errno(), 8); // ENOEXEC
         assert_eq!(Error::IllegalSeek.to_errno(), 29); // ESPIPE
         assert_eq!(Error::ReadOnly.to_errno(), 30); // EROFS
+        assert_eq!(Error::Corrupt.to_errno(), 117); // EUCLEAN
     }
 
     #[test]

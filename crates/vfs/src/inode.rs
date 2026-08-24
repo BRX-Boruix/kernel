@@ -14,6 +14,9 @@ pub enum INodeType {
     BlockDevice,
     Symlink,
     Fifo,
+    /// 套接字节点。fs1 FA1：EXT2 mode 忠实映射要求七类盘上类型全部可表示
+    /// ——缺 Socket 会把 0xC000 静默错报成别的类别（S09 禁伪数据）。
+    Socket,
 }
 
 /// 现代能力权限标签（ADR-011，淘汰 755/644）。
