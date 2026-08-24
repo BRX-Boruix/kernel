@@ -8,4 +8,7 @@ klib = { path = "../klib" }
 arch = { path = "../arch/arch" }
 arch-x86_64 = { path = "../arch/arch-x86_64" }
 mm = { path = "../mm" }
-spin = "0.9"
+
+[features]
+# 与全仓约定一致：kernel-tests 打开测试专用探针（debug_shm_refs 等）。
+kernel-tests = []

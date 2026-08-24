@@ -522,16 +522,45 @@ fn pop_ready(s: &mut Scheduler, exclude: usize) -> Option<usize> {
 /// 下一进程会在同一把 IrqSpinLock 上自旋死锁）。
 pub fn block_current(frame: &mut InterruptFrame) -> SwitchOutcome {
     let mut s = SCHED.lock();
+    block_current_locked(&mut s, frame, &mut || true)
+}
+
+/// 原子阻塞变体（ipc1 IA2a / 审计 R6-F2）：与 [`block_current`] 相同的阻塞
+/// 语义，但在**调度锁内**先执行 `register`——返回 false（等待者查重拒绝/
+/// 目标消失/**唤醒条件在登记点已复检为真**）则不阻塞、零副作用地返回
+/// NotSwitched。
+///
+/// 这把"登记等待者"与"置 Blocked"合并为对唤醒方不可分割的单步。lost-wakeup
+/// 的两侧论证：唤醒方的 "消费 + drain + wake" 若发生在本方循环条件检查之后、
+/// 登记之前，登记点持同一把锁的**条件复检**会看见翻转并拒绝入睡；若发生在
+/// 置 Blocked 之后，wake 正常生效。窗口不存在——与 `block_for_kbd` 的 CAS
+/// 纪律同源。
+///
+/// 锁序：本函数持 SCHED 期间回调可能取 IPC 表锁（SCHED → IPC 表，单向）；
+/// 唤醒方一律在表锁外调用 wake，反向边不存在。
+pub fn block_current_with(
+    frame: &mut InterruptFrame,
+    register: &mut dyn FnMut() -> bool,
+) -> SwitchOutcome {
+    let mut s = SCHED.lock();
+    block_current_locked(&mut s, frame, register)
+}
+
+/// 共享阻塞主体：`s` 必须已锁；`register` 在确认存在可切换目标后、置
+/// Blocked 前执行。prev=Some(cur) 交由 cpu_switch_locked 归档浮点现场
+/// （审计 R5-F1 纪律在阻塞路径的原生形态）。
+fn block_current_locked(
+    s: &mut Scheduler,
+    frame: &mut InterruptFrame,
+    register: &mut dyn FnMut() -> bool,
+) -> SwitchOutcome {
     let Some(cur_pid) = s.current else {
         return SwitchOutcome::NotSwitched; // 内核 idle/主线程不参与阻塞
     };
-    if let Some(slot) = s.procs[cur_pid].as_mut() {
-        slot.saved = *frame;
-        slot.proc.set_state(TaskState::Blocked);
-    }
-    // 取下一个有效就绪进程（跳过已退出残留引用）。
-    let Some(next_pid) = pop_ready(&mut s, usize::MAX) else {
-        return SwitchOutcome::NotSwitched; // 无可调度进程：调用方不应阻塞
+    // 取下一个有效就绪进程（跳过已退出残留引用）。无同伴则不登记、不阻塞：
+    // 强行阻塞将无人唤醒（自锁），调用方应返回 WouldBlock。
+    let Some(next_pid) = pop_ready(s, usize::MAX) else {
+        return SwitchOutcome::NotSwitched;
     };
     if cur_pid == next_pid {
         // 仅当前进程自身：不阻塞（保持 Running 继续）。
@@ -540,15 +569,22 @@ pub fn block_current(frame: &mut InterruptFrame) -> SwitchOutcome {
         }
         return SwitchOutcome::NotSwitched;
     }
+    // 调度锁内的登记点：失败即整体放弃，现场未动、表零副作用。
+    if !register() {
+        return SwitchOutcome::NotSwitched;
+    }
+    if let Some(slot) = s.procs[cur_pid].as_mut() {
+        slot.saved = *frame;
+        slot.proc.set_state(TaskState::Blocked);
+        // 浮点归档不在此处执行：cpu_switch_locked(prev=Some) 是唯一的 prev
+        // 现场快照点（审计 R6-F3 附带消除双重 fxsave 冗余——两次 save 之间
+        // 虽无内核代码触碰 XMM（sdk/check-no-sse.py 已证），但冗余写会让
+        // "哪一次是权威归档"变得不可辨认）。
+    }
     let slot = s.procs[next_pid].as_mut().expect("ready proc exists");
     slot.proc.set_state(TaskState::Running);
     *frame = slot.saved;
-    // 审计 R5-F1：切换必须走单点收口——prev=Some(cur_pid) 使 cpu_switch_locked
-    // 先把阻塞者此刻的活浮点现场快照进其 PCB（否则唤醒后恢复的是陈旧快照，
-    // 用户态浮点数据静默回退），再对切入方执行 fxrstor（否则 CPU 携带上一
-    // 进程的 XMM 残值继续运行＝跨进程泄漏）。本函数曾漏迁此单点，红证
-    // `[test-task-block-fpu]` 双断言落红锁定。
-    cpu_switch_locked(&mut s, Some(cur_pid), next_pid);
+    cpu_switch_locked(s, Some(cur_pid), next_pid);
     SwitchOutcome::Switched
 }
 

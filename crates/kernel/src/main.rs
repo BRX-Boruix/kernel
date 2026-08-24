@@ -394,6 +394,8 @@ unsafe fn kmain_body() -> ! {
     tests::test_task_fpu_isolation();
     #[cfg(feature = "kernel-tests")]
     tests::test_task_block_fpu_handoff();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_ipc1_semantics();
 
     // loader1/LA4：ELF 加载器恶意镜像拒绝面对抗自检（纯加载验证，不 spawn，
     // 返回主流程继续启动；放在 SMP 之前保持单核确定性）。

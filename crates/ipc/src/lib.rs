@@ -3,7 +3,34 @@
 //! 设计（RESTful 资源观，对齐 syscall 二维编码 ADR-003）：
 //! - **共享内存（shm）**：`shm_create(size) -> id` 分配一组物理帧登记为对象；
 //!   `shm_map(id) -> addr` 把对象帧映射进调用进程地址空间；`shm_unmap(id)` 解除映射。
-//! - **管道（pipe）**：`pipe_create() -> id` 建环形缓冲；`pipe_read` / `pipe_write` 阻塞读写。
+//! - **管道（pipe）**：`pipe_create() -> id` 建环形缓冲；`pipe_read` / `pipe_write`
+//!   必要时阻塞读写。
+//!
+//! ## 用户缓冲边界契约（ipc1 IR1 / ADR-018）
+//!
+//! 本 crate 的管道 API 是用户缓冲的合法入口，但**绝不裸解引用用户指针**：
+//! 所有拷贝经 [`validate_user_range`]（窗口 + 逐页页表预校验，复用 mm 单点
+//! `is_range_mapped`）通过后，才在 SMAP 放行窗口内整块 memcpy（复用 arch
+//! 的 copy_from_user/copy_to_user，ipc1 ID3）。校验失败如实上抛
+//! `BadAddress`/`OutOfRange`，不存在内核态 #PF 路径。
+//!
+//! ## 阻塞原子性契约（ipc1 IA2a + 审计 R6-F2）
+//!
+//! 等待者登记与置 Blocked 在调度锁内由
+//! [`IpcTaskNotifier::block_with_registration`] 原子完成，且**登记点持表锁
+//! 复检唤醒条件**——条件在登记与主循环检查之间被唤醒方翻转时，复检置位
+//! ready 通道、本方不入册直接重试。因此唤醒方的 "消费 + drain + wake" 无论
+//! 发生在本方循环检查之前还是之后，都不可能造成信号丢失：发生在前 ⇒ 复检
+//! 看见条件为真；发生在后 ⇒ 本方已在册且 Blocked，wake 正常生效。经典
+//! lost-wakeup 窗口不存在。唤醒侧先收集后 wake，PIPE→SCHED 反向锁边已根除。
+//! 锁序全局单向：NOTIFIER → SCHED → PIPE_TABLE。
+//!
+//! ## shm 映射记账契约（ipc1 IA1 / ADR-019）
+//!
+//! `refs` 数的是**跨全部地址空间的存活映射条目**：fork 继承按条目增记、
+//! 地址空间销毁按条目递减、显式 unmap 移除一条递减一。归零即对象与帧一并
+//! 回收。钩子入口 [`shm_on_mappings_acquired`] / [`shm_on_mappings_released`]
+//! 由 kernel 适配层实现 mm 的 `ShmMappingHooks` 后接线。
 
 #![no_std]
 
@@ -13,12 +40,25 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use arch::PageSize;
 use arch_x86_64::interrupts::InterruptFrame;
 use klib::error::Error;
 use klib::sync::irq::IrqSpinLock;
 
 /// 管道默认容量（字节，环形缓冲）。
+///
+/// 为什么是 4096：与单页粒度一致——管道数据通常伴随页对齐的用户缓冲流动，
+/// 容量取页大小使"单次写满管道"与"单次校验页数"同为 1 页量级；亦与 Linux
+/// pipe buffer 的页粒度传统一致。容量不是并发上限（那是 [`MAX_PIPE_WAITERS`]），
+/// 只影响单轮搬运的切块大小（ipc1 ID1 选择理由成文）。
 pub const PIPE_CAPACITY: usize = 4096;
+
+/// 单管道每方向等待者上限（ipc1 IM6）。
+///
+/// 为什么是 64：远超单用户玩具内核同一管道上并发阻塞读者/写者的合理规模
+/// （进程总数受物理内存约束在两位数量级），同时把等待 Vec 的增长钉死在常数
+/// ——用户态忙轮询重试无法再借重复登记线性吃尽内核堆。
+pub const MAX_PIPE_WAITERS: usize = 64;
 
 /// 阻塞请求的结果（KA6：bool+frame 形状的枚举化收口）。
 ///
@@ -28,18 +68,31 @@ pub const PIPE_CAPACITY: usize = 4096;
 pub enum BlockOutcome {
     /// 已切走：`*frame` 是下一进程现场，调用方不得再触碰 frame/rax。
     Switched,
-    /// 拒绝阻塞（无可调度进程可切）：现场未动，调用方应如实报 `WouldBlock`。
+    /// 拒绝阻塞（无可调度进程可切，或登记被拒）：现场未动、等待者未入册，
+    /// 调用方应如实报 `WouldBlock`。
     Refused,
 }
 
 /// 调度器与进程回调 Provider（解耦 IPC 与 Task/Scheduler 的循环依赖）。
+///
+/// 平台注记（ipc1 IM3 残余）：`block_with_registration` 的 frame 参数仍为
+/// arch-x86_64 具体类型——平台无关中断帧抽象是依赖地图 #6 的缺失前置组件，
+/// 在其立项前本 trait 边界是管道路径唯一的平台接触点（词汇表翻译收敛在
+/// kernel 适配层一次完成）。shm 路径已完全泛型化，无此残留。
 pub trait IpcTaskNotifier: Send + Sync {
     fn current_pid(&self) -> usize;
     fn wake_process(&self, pid: usize);
-    fn block_current_process(&self, frame: &mut InterruptFrame) -> BlockOutcome;
+    /// 原子阻塞原语：在**调度锁内**执行 `register`（返回 false = 登记被拒，
+    /// 此时不阻塞、零副作用），随后置 Blocked 并切换到下一就绪进程。语义与
+    /// 键盘路径 block_for_kbd 的 CAS 纪律同源（crate 级"阻塞原子性契约"）。
+    fn block_with_registration(
+        &self,
+        frame: &mut InterruptFrame,
+        register: &mut dyn FnMut() -> bool,
+    ) -> BlockOutcome;
 }
 
-static NOTIFIER: spin::Mutex<Option<&'static dyn IpcTaskNotifier>> = spin::Mutex::new(None);
+static NOTIFIER: IrqSpinLock<Option<&'static dyn IpcTaskNotifier>> = IrqSpinLock::new(None);
 
 pub fn set_ipc_notifier(notifier: &'static dyn IpcTaskNotifier) {
     *NOTIFIER.lock() = Some(notifier);
@@ -49,10 +102,20 @@ pub fn set_ipc_notifier(notifier: &'static dyn IpcTaskNotifier) {
 struct ShmObject {
     size: u64,
     frames: Vec<u64>,
+    /// 存活映射条目数（跨全部地址空间的 `shm_maps` 条目总数）。
+    ///
+    /// 记账语义（ipc1 IA1 / ADR-019）：refs 数的是**映射实例**而非 unmap
+    /// 调用次数——fork 继承按继承条目数增记（[`shm_on_mappings_acquired`]），
+    /// 地址空间销毁按销毁条目数递减（[`shm_on_mappings_released`]）。归零即
+    /// 对象连同帧一并回收。同进程重复 map 同一 id 会产生两个条目、两个引用，
+    /// 与两次 unmap 对称，无需 pid 参与记账即可保持守恒。
     refs: usize,
 }
 
 /// 管道对象：环形缓冲 + 读写阻塞等待者（按 pid 记）。
+///
+/// 不变式：同一 pid 至多出现一次（登记时查重，ipc1 IM6）；两表长度均不超过
+/// [`MAX_PIPE_WAITERS`]；close 时两表整体 drain 并逐个 wake（ipc1 IA2b）。
 struct PipeObject {
     buf: VecDeque<u8>,
     read_waiters: Vec<usize>,
@@ -61,24 +124,62 @@ struct PipeObject {
 
 static SHM_TABLE: IrqSpinLock<BTreeMap<u64, ShmObject>> = IrqSpinLock::new(BTreeMap::new());
 static PIPE_TABLE: IrqSpinLock<BTreeMap<u64, PipeObject>> = IrqSpinLock::new(BTreeMap::new());
+// id 从 1 起：0 预留给"无效句柄"哨兵语义，杜绝 id=0 与未初始化返回值混淆；
+// u64 回绕不可达论证（ipc1 ID2 / S19）：每次分配伴随至少一次堆分配与一次表
+// 插入，堆与表容量都比 2^64 早枯竭若干数量级，回绕在任何可达运行史上不会
+// 发生。fetch_add 的 Relaxed 序满足本计数器的唯一不变式——全序唯一性由
+// 单核 + 表锁临界区保证，无需 AcqRel 同步边。
 static NEXT_SHM: AtomicU64 = AtomicU64::new(1);
 static NEXT_PIPE: AtomicU64 = AtomicU64::new(1);
 
 // ---------- 共享内存 ----------
+
+/// 页对齐的 checked 版本（ipc1 IA3）：`size` 向上取整到 [`PageSize::Size4K`]，
+/// 加法回绕即溢出——返回 None 由调用方如实报错，绝不静默回绕出零页幻影对象。
+fn align_up_page_checked(size: u64) -> Option<u64> {
+    let page = PageSize::Size4K.bytes();
+    size.checked_add(page - 1).map(|v| v & !(page - 1))
+}
 
 /// `shm_create(size) -> id`：分配 `size`（向上取整到页）物理帧，登记为共享对象。
 pub fn shm_create(size: u64) -> Result<u64, Error> {
     if size == 0 {
         return Err(Error::InvalidParam);
     }
-    let size = (size + 0xFFF) & !0xFFF;
-    let npages = (size / 0x1000) as usize;
-    let mut frames = Vec::with_capacity(npages);
+    // IA3：checked 对齐。导致回绕的 size 属参数值越界（OutOfRange），
+    // 不是内部错误——debug 构建不再 panic，release 不再产生零页幻影对象。
+    let size = align_up_page_checked(size).ok_or(Error::OutOfRange)?;
+    // usize 宽度论证（ipc1 ID2 / S04+S19）：x86_64 上 u64→usize 无损；npages
+    // 受物理帧总量约束远早于宽度耗尽。
+    let page_bytes = PageSize::Size4K.bytes();
+    let npages = (size / page_bytes) as usize;
+    let mut frames: Vec<u64> = Vec::with_capacity(npages);
+    // IM1：中途 OOM 时逆序归还已成功分配的帧——错误路径的资源释放义务
+    // （S18）在 OOM 这种最需要回收的场景同样成立。
     for _ in 0..npages {
-        let f = mm::allocate_frame().ok_or(Error::OutOfMemory)?;
-        let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
-        unsafe { core::ptr::write_bytes((f.start_paddr() + off) as *mut u8, 0, 0x1000) };
-        frames.push(f.start_paddr());
+        match mm::allocate_frame() {
+            Some(f) => frames.push(f.start_paddr()),
+            None => {
+                for p in frames.iter().rev() {
+                    mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(*p));
+                }
+                return Err(Error::OutOfMemory);
+            }
+        }
+    }
+    // IM2：清零前显式确认 HHDM 偏移已初始化——PHYS_OFFSET 未设置属内核启动
+    // 不变式被破坏，与 mm1.md MD1 同款显式 panic 收口；绝无 off=0 写空指针
+    // 页的伪值降级路径。清零本身保证首映射内容确定（跨进程残留信息不泄漏）。
+    if arch::PHYS_OFFSET.get().copied().is_none() {
+        for p in frames.iter().rev() {
+            mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(*p));
+        }
+        panic!("ipc: PHYS_OFFSET unset before shm_create zeroing (HHDM not initialized)");
+    }
+    for p in frames.iter() {
+        unsafe {
+            core::ptr::write_bytes(arch::phys_to_virt(*p) as *mut u8, 0, page_bytes as usize)
+        };
     }
     let id = NEXT_SHM.fetch_add(1, Ordering::Relaxed);
     SHM_TABLE.lock().insert(
@@ -93,11 +194,75 @@ pub fn shm_create(size: u64) -> Result<u64, Error> {
     Ok(id)
 }
 
+/// 把 `ids` 中每个映射条目计为一个新存活引用（ipc1 IA1 fork 继承路径；
+/// 由 kernel 适配层实现 mm 的 ShmMappingHooks 后在本 crate 落账）。
+pub fn shm_on_mappings_acquired(ids: &[u64]) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut table = SHM_TABLE.lock();
+    for &id in ids {
+        match table.get_mut(&id) {
+            Some(obj) => obj.refs += 1,
+            // fork 继承列表只会来自先前成功的 map_shm，对象必然在册；缺失
+            // 意味着记账已被外部破坏——静默跳过会掩盖漂移，告警可见。
+            None => klib::warn!("[ipc] acquire hook: unknown shm id {}", id),
+        }
+    }
+}
+
+/// 把 `ids` 中每个映射条目的引用撤销；归零的对象连同帧一并回收
+/// （ipc1 IA1 销毁路径）。
+pub fn shm_on_mappings_released(ids: &[u64]) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut table = SHM_TABLE.lock();
+    for &id in ids {
+        let dead = match table.get_mut(&id) {
+            Some(obj) => {
+                obj.refs = obj.refs.saturating_sub(1);
+                obj.refs == 0
+            }
+            None => {
+                klib::warn!("[ipc] release hook: unknown shm id {}", id);
+                false
+            }
+        };
+        if dead {
+            if let Some(obj) = table.remove(&id) {
+                for p in obj.frames.iter().rev() {
+                    mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(*p));
+                }
+                klib::info!(
+                    "[ipc] last mapping of id={} gone, freed {} frames",
+                    id,
+                    obj.frames.len()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "kernel-tests")]
+/// 测试探针：读取对象当前存活引用数（IA1 记账断言用）。
+pub fn debug_shm_refs(id: u64) -> Option<usize> {
+    SHM_TABLE.lock().get(&id).map(|o| o.refs)
+}
+
+#[cfg(feature = "kernel-tests")]
+/// 测试探针：对象是否仍在册（回收断言用）。
+pub fn debug_shm_exists(id: u64) -> bool {
+    SHM_TABLE.lock().contains_key(&id)
+}
+
 /// `shm_map(id) -> addr`：把 shm 对象帧映射进调用进程地址空间。
-pub fn shm_map(
+///
+/// 泛型 `PT`（ipc1 IM3 可泛化半）：逻辑层不绑定具体架构页表实现。
+pub fn shm_map<PT: arch::PageTable>(
     id: u64,
-    addr_space: &mut mm::user_space::UserAddressSpace<arch_x86_64::paging::X86PageTable>,
-) -> Result<u64, Error> {
+    addr_space: &mut mm::user_space::UserAddressSpace<PT>,
+) -> Result<u64, PT::Error> {
     let mut table = SHM_TABLE.lock();
     let obj = table.get_mut(&id).ok_or(Error::NotFound)?;
     let vaddr = addr_space.map_shm(id, &obj.frames, obj.size)?;
@@ -106,28 +271,16 @@ pub fn shm_map(
     Ok(vaddr)
 }
 
-/// `shm_unmap(id)`：解除调用进程对该 shm 对象的映射。
-pub fn shm_unmap(
+/// `shm_unmap(id)`：解除调用进程对该 shm 对象的一次映射。
+///
+/// 按**映射条目**记账（ADR-019）：移除本空间的一条 `shm_maps` 条目并递减
+/// 一个引用；归零即回收。
+pub fn shm_unmap<PT: arch::PageTable>(
     id: u64,
-    addr_space: &mut mm::user_space::UserAddressSpace<arch_x86_64::paging::X86PageTable>,
-) -> Result<(), Error> {
+    addr_space: &mut mm::user_space::UserAddressSpace<PT>,
+) -> Result<(), PT::Error> {
     addr_space.unmap_shm(id)?;
-    let mut table = SHM_TABLE.lock();
-    let obj = table.get_mut(&id).ok_or(Error::NotFound)?;
-    obj.refs = obj.refs.saturating_sub(1);
-    if obj.refs == 0 {
-        let obj = table.remove(&id).expect("just fetched");
-        for &phys in obj.frames.iter() {
-            mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(phys));
-        }
-        klib::info!(
-            "[ipc] shm_unmap id={} freed {} frames",
-            id,
-            obj.frames.len()
-        );
-    } else {
-        klib::info!("[ipc] shm_unmap id={} refs now {}", id, obj.refs);
-    }
+    shm_on_mappings_released(core::slice::from_ref(&id));
     Ok(())
 }
 
@@ -144,16 +297,8 @@ pub fn pipe_create() -> Result<u64, Error> {
             write_waiters: Vec::new(),
         },
     );
-    klib::info!("[ipc] pipe_create id={}", id);
+    klib::info!("[ipc] pipe id={} created", id);
     Ok(id)
-}
-
-fn try_block(frame: &mut InterruptFrame) -> BlockOutcome {
-    if let Some(notifier) = *NOTIFIER.lock() {
-        notifier.block_current_process(frame)
-    } else {
-        BlockOutcome::Refused
-    }
 }
 
 fn current_pid() -> usize {
@@ -170,87 +315,275 @@ fn wake_proc(pid: usize) {
     }
 }
 
-/// `pipe_write(id, src, len)`：把 `len` 字节写入管道，必要时阻塞。
-pub fn pipe_write(frame: &mut InterruptFrame, id: u64, src: u64, len: u64) -> Result<u64, Error> {
+/// 用户缓冲区间预校验（ipc1 IR1 的单点入口）。
+///
+/// 三层检查与 syscall 层 validate_user_range 同源（B2 有界上限 → 用户半区
+/// 窗口 → mm 逐页意图校验）；管道路径单轮 chunk 天然 ≤ [`PIPE_CAPACITY`]，
+/// 上限在此防御未来调用形状变化。通过后才允许 SMAP 整块拷贝。
+fn validate_user_range<PT: arch::PageTable>(
+    space: &mm::user_space::UserAddressSpace<PT>,
+    buf: u64,
+    len: usize,
+    access: mm::user_space::UserAccess,
+) -> Result<(), Error> {
+    const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
+    if len as u64 > MAX_COPY_BYTES {
+        return Err(Error::InvalidParam);
+    }
+    let end = buf.checked_add(len as u64).ok_or(Error::OutOfRange)?;
+    if buf < mm::user_space::USER_BASE || end > mm::user_space::USER_TOP {
+        return Err(Error::OutOfRange);
+    }
+    if space.is_range_mapped(buf, len as u64, access) {
+        Ok(())
+    } else {
+        Err(Error::BadAddress)
+    }
+}
+
+/// 在调度锁内被回调执行的登记逻辑（ipc1 IA2a / 审计 R6-F2）。
+///
+/// 返回 false = 不入册不阻塞。两条拒绝路径：
+/// - **唤醒条件复检已满足**（写侧有空位/读侧有数据，`*ready` 置位）：本方
+///   无需入睡，调用方直接重试。这是 lost-wakeup 的根治点——主循环顶的
+///   条件检查与调度锁内的登记是两个临界区，其间唤醒方可能完成
+///   "消费 + drain(空表) + wake(无人可醒)"全套；只有**登记点持同一把锁
+///   复检条件**才能看见这个翻转。
+/// - 查重命中或超 [`MAX_PIPE_WAITERS`]（IM6 防线）。
+/// 管道不存在同样返回 false。所有 false 路径零副作用。
+fn register_waiter(
+    waiters: &mut Vec<usize>,
+    pid: usize,
+    cond_met: bool,
+    ready: &mut bool,
+) -> bool {
+    if cond_met {
+        *ready = true;
+        return false;
+    }
+    if waiters.contains(&pid) || waiters.len() >= MAX_PIPE_WAITERS {
+        return false;
+    }
+    waiters.push(pid);
+    true
+}
+
+/// 构造"在调度锁内把 pid 登记进管道 `id` 写等待者"的回调（IA2a）。
+/// `ready` 由调用方栈上持有：登记点发现有空位时置位（R6-F2 复检通道）。
+fn write_registrant<'a>(
+    id: u64,
+    pid: usize,
+    ready: &'a mut bool,
+) -> impl FnMut() -> bool + 'a {
+    move || {
+        let mut table = PIPE_TABLE.lock();
+        match table.get_mut(&id) {
+            Some(pipe) => register_waiter(
+                &mut pipe.write_waiters,
+                pid,
+                pipe.buf.len() < PIPE_CAPACITY,
+                ready,
+            ),
+            None => false,
+        }
+    }
+}
+
+/// 构造读方向的同款回调（IA2a；复检条件为"缓冲非空"）。
+fn read_registrant<'a>(id: u64, pid: usize, ready: &'a mut bool) -> impl FnMut() -> bool + 'a {
+    move || {
+        let mut table = PIPE_TABLE.lock();
+        match table.get_mut(&id) {
+            Some(pipe) => register_waiter(
+                &mut pipe.read_waiters,
+                pid,
+                !pipe.buf.is_empty(),
+                ready,
+            ),
+            None => false,
+        }
+    }
+}
+
+fn try_block(
+    frame: &mut InterruptFrame,
+    register: &mut dyn FnMut() -> bool,
+) -> BlockOutcome {
+    match *NOTIFIER.lock() {
+        Some(notifier) => notifier.block_with_registration(frame, register),
+        None => BlockOutcome::Refused,
+    }
+}
+
+/// `pipe_write(id, space, src, len)`：把 `len` 字节从**调用进程的用户缓冲**
+/// 写入管道，必要时阻塞。
+///
+/// `space` 是调用方的地址空间视图（未来的 syscall 包装层传入当前进程空间；
+/// 内核自测传测试空间）——本函数以它做预校验后整块拷贝，绝不裸解引用
+/// `src`（IR1）。POSIX 对齐（IM4）：目标不存在返回 NotFound（EBADF 同族）；
+/// 存在且 len==0 时 Ok(0)，无副作用、不唤醒任何人。
+pub fn pipe_write<PT: arch::PageTable>(
+    frame: &mut InterruptFrame,
+    id: u64,
+    space: &mm::user_space::UserAddressSpace<PT>,
+    src: u64,
+    len: u64,
+) -> Result<u64, Error> {
     let pid = current_pid();
     let len = len as usize;
     let mut written = 0usize;
     loop {
+        let wake_readers;
         {
             let mut table = PIPE_TABLE.lock();
             let Some(pipe) = table.get_mut(&id) else {
                 return Err(Error::NotFound);
             };
-            unsafe { arch_x86_64::mmio::stac() };
-            while written < len && pipe.buf.len() < PIPE_CAPACITY {
-                pipe.buf
-                    .push_back(unsafe { *((src + written as u64) as *const u8) });
-                written += 1;
+            if len == 0 {
+                return Ok(0);
             }
-            unsafe { arch_x86_64::mmio::clac() };
-            if written > 0 {
-                for w in pipe.read_waiters.drain(..) {
+            let free = PIPE_CAPACITY - pipe.buf.len();
+            let chunk = free.min(len - written);
+            if chunk > 0 {
+                validate_user_range(
+                    space,
+                    src + written as u64,
+                    chunk,
+                    mm::user_space::UserAccess::Read,
+                )?;
+                let mut staging = [0u8; PIPE_CAPACITY];
+                unsafe {
+                    arch_x86_64::mmio::copy_from_user(
+                        staging.as_mut_ptr(),
+                        src + written as u64,
+                        chunk,
+                    )
+                };
+                pipe.buf.extend(staging.iter().take(chunk).copied());
+                written += chunk;
+            }
+            // 先收集后唤醒（IA2a 锁序纪律）：wake 一律移出 PIPE_TABLE 临界区。
+            wake_readers = if written > 0 {
+                core::mem::take(&mut pipe.read_waiters)
+            } else {
+                Vec::new()
+            };
+            if written == len {
+                drop(table);
+                for w in wake_readers {
                     wake_proc(w);
                 }
-            }
-            if written == len {
                 return Ok(written as u64);
             }
-            pipe.write_waiters.push(pid);
         }
-        // KA6：穷尽匹配切换结果——Refused 才是 WouldBlock；Switched 分支下
-        // frame 已是下一进程现场，循环回到顶部以新现场重试，禁止再碰 frame。
-        match try_block(frame) {
-            BlockOutcome::Refused => return Err(Error::WouldBlock),
+        for w in wake_readers {
+            wake_proc(w);
+        }
+        // R6-F2：ready 置位 = 登记点复检发现唤醒条件已满足（主循环检查之后、
+        // 登记之前被唤醒方翻转）——直接重试，绝不带"条件已真"的认知入睡。
+        let mut ready = false;
+        let outcome = {
+            let mut register = write_registrant(id, pid, &mut ready);
+            try_block(frame, &mut register)
+        };
+        match outcome {
+            BlockOutcome::Refused => {
+                if ready {
+                    continue;
+                }
+                return Err(Error::WouldBlock);
+            }
             BlockOutcome::Switched => {}
         }
     }
 }
 
-/// `pipe_read(id, dst, len)`：从管道读 `len` 字节，必要时阻塞。
-pub fn pipe_read(frame: &mut InterruptFrame, id: u64, dst: u64, len: u64) -> Result<u64, Error> {
+/// `pipe_read(id, space, dst, len)`：从管道读 `len` 字节到**调用进程的用户
+/// 缓冲**，必要时阻塞。
+///
+/// 校验-拷贝纪律同 [`pipe_write`]（IR1）。POSIX 对齐（IM4）：目标不存在返回
+/// NotFound；存在但缓冲为空且 len==0 时 Ok(0)。注意 len==0 的检查在查表之后
+/// ——旧实现"查表前返回 Ok(0)"会把不存在的管道伪装成可读，属误导性伪成功。
+pub fn pipe_read<PT: arch::PageTable>(
+    frame: &mut InterruptFrame,
+    id: u64,
+    space: &mm::user_space::UserAddressSpace<PT>,
+    dst: u64,
+    len: u64,
+) -> Result<u64, Error> {
     let pid = current_pid();
     let len = len as usize;
-    if len == 0 {
-        return Ok(0);
-    }
-    let mut got = 0usize;
     loop {
         {
             let mut table = PIPE_TABLE.lock();
             let Some(pipe) = table.get_mut(&id) else {
                 return Err(Error::NotFound);
             };
-            unsafe { arch_x86_64::mmio::stac() };
-            while got < len && !pipe.buf.is_empty() {
-                let b = pipe.buf.pop_front().expect("nonempty");
-                unsafe { *((dst + got as u64) as *mut u8) = b };
-                got += 1;
+            if len == 0 {
+                return Ok(0);
             }
-            unsafe { arch_x86_64::mmio::clac() };
-            if got > 0 {
-                for w in pipe.write_waiters.drain(..) {
+            let chunk = pipe.buf.len().min(len);
+            if chunk > 0 {
+                // 校验先行：校验失败时缓冲零消费，语义与"读未发生"一致。
+                validate_user_range(
+                    space,
+                    dst,
+                    chunk,
+                    mm::user_space::UserAccess::Write,
+                )?;
+                let mut staging = [0u8; PIPE_CAPACITY];
+                for b in staging.iter_mut().take(chunk) {
+                    *b = pipe.buf.pop_front().expect("avail checked");
+                }
+                // 先收集后唤醒（同 write），唤醒在表锁之外。
+                let writers = core::mem::take(&mut pipe.write_waiters);
+                drop(table);
+                unsafe {
+                    arch_x86_64::mmio::copy_to_user(dst, staging.as_ptr(), chunk)
+                };
+                for w in writers {
                     wake_proc(w);
                 }
+                return Ok(chunk as u64);
             }
-            if got > 0 {
-                return Ok(got as u64);
-            }
-            pipe.read_waiters.push(pid);
         }
-        // KA6：同 pipe_write——穷尽匹配，Refused 如实上抛 WouldBlock。
-        match try_block(frame) {
-            BlockOutcome::Refused => return Err(Error::WouldBlock),
+        // R6-F2：同 write 侧——登记点复检"缓冲非空"，条件已真则重试不入睡。
+        let mut ready = false;
+        let outcome = {
+            let mut register = read_registrant(id, pid, &mut ready);
+            try_block(frame, &mut register)
+        };
+        match outcome {
+            BlockOutcome::Refused => {
+                if ready {
+                    continue;
+                }
+                return Err(Error::WouldBlock);
+            }
             BlockOutcome::Switched => {}
         }
     }
 }
 
 /// `pipe_close(id)`：销毁管道。
+///
+/// IA2b：close 前 drain 双向等待者并逐个 wake——正阻塞在本管道上的进程若
+/// 不被唤醒将永久悬挂（它们只可能被"对该管道的读写"唤醒，而对象即将消失）。
+/// 唤醒发生在表锁之外（锁序纪律）；被唤醒者循环顶部的查表会得到 NotFound，
+/// 如实以错误收场而非悬挂。
 pub fn pipe_close(id: u64) -> Result<(), Error> {
-    let mut table = PIPE_TABLE.lock();
-    if table.remove(&id).is_none() {
-        return Err(Error::NotFound);
+    let (readers, writers) = {
+        let mut table = PIPE_TABLE.lock();
+        match table.remove(&id) {
+            Some(pipe) => (pipe.read_waiters, pipe.write_waiters),
+            None => return Err(Error::NotFound),
+        }
+    };
+    for p in readers {
+        wake_proc(p);
+    }
+    for p in writers {
+        wake_proc(p);
     }
     klib::info!("[ipc] pipe_close id={}", id);
     Ok(())

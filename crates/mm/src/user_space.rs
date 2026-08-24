@@ -17,6 +17,7 @@ use arch::{
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use klib::error::Error;
+use klib::sync::irq::IrqSpinLock;
 
 use crate::{allocate_frame, deallocate_frame};
 
@@ -132,6 +133,52 @@ pub struct ShmMap {
     pub vaddr: u64,
     /// 结束虚拟地址（不含，页对齐）。
     pub end: u64,
+}
+
+/// shm 映射所有权钩子（ipc1 IA1 / ADR-019）。
+///
+/// mm 只负责"本地址空间持有哪些映射条目"的事实；**引用计数归 ipc 对象表所
+/// 有**——fork 继承与销毁清账时经本钩子通知对象所有方增减 refs。kernel 适配
+/// 层在 init 时注入实现（mm 不反向依赖 ipc，依赖方向保持单向）。
+pub trait ShmMappingHooks: Send + Sync {
+    /// 本地址空间新继承了 `ids` 中每条映射（fork 成功路径，每条目一个元素）。
+    fn on_mappings_acquired(&self, ids: &[u64]);
+    /// 本地址空间销毁，`ids` 中每条映射随之消失（每条目一个元素）。
+    fn on_mappings_released(&self, ids: &[u64]);
+}
+
+static SHM_HOOKS: IrqSpinLock<Option<&'static dyn ShmMappingHooks>> = IrqSpinLock::new(None);
+
+/// 注入 shm 所有权钩子（kernel 启动时一次）。未注入时 clone/destroy 的钩子
+/// 调用点以告警可见——静默跳过会掩盖 refs 漂移。
+pub fn set_shm_mapping_hooks(hooks: &'static dyn ShmMappingHooks) {
+    *SHM_HOOKS.lock() = Some(hooks);
+}
+
+fn shm_hooks_notify_acquired(ids: &[u64]) {
+    if ids.is_empty() {
+        return;
+    }
+    match SHM_HOOKS.lock().as_ref() {
+        Some(h) => h.on_mappings_acquired(ids),
+        None => klib::warn!(
+            "[mm] {} shm mapping(s) inherited but ShmMappingHooks not installed; refs not bumped",
+            ids.len()
+        ),
+    }
+}
+
+fn shm_hooks_notify_released(ids: &[u64]) {
+    if ids.is_empty() {
+        return;
+    }
+    match SHM_HOOKS.lock().as_ref() {
+        Some(h) => h.on_mappings_released(ids),
+        None => klib::warn!(
+            "[mm] {} shm mapping(s) destroyed but ShmMappingHooks not installed; refs not decremented",
+            ids.len()
+        ),
+    }
 }
 
 /// 用户地址空间：持有独立页表 `PT`，管理用户区。
@@ -665,10 +712,20 @@ where
             child_cow.push(cow);
         }
         *child.cow_pages.lock() = child_cow;
-        // 共享内存映射区：子地址空间独立页表，需重新映射同一批物理帧（不复制
-        // 记账引用——帧归 shm 对象，子进程映射不额外持有引用，保持简单）。
-        *child.shm_maps.lock() = self.shm_maps.lock().clone();
-        for m in self.shm_maps.lock().iter() {
+        // 共享内存映射区：子地址空间独立页表，需重新映射同一批物理帧。
+        // IA1（ADR-019）：子进程的每条继承映射都是一个**新的存活引用**——
+        // 经所有权钩子为子列表中每个条目向对象表增记 refs（旧注释"不额外
+        // 持有引用，保持简单"的决策已被审计推翻：它同时制造提前释放 UAF
+        // 与永久泄漏两个方向的灾难）。
+        //
+        // 审计 R6-F1 时序修正：子 shm_maps 必须在重映射**全部成功后**才赋值。
+        // 旧实现先整体克隆再逐条重映射，中途失败时被 Drop 的子空间会对已
+        // 填充列表逐条发 release——acquire 零次 / release N 次，saturating_sub
+        // 把 refs 压到 0，父进程仍存活的映射被提前回收（UAF/数据腐坏）。
+        // 改为失败路径子表恒空：destroy 零释放，与未发生的 acquire 天然对称；
+        // 已重映射的残余 PTE 随子页表顶层整体销毁，无需逐条清理。
+        let inherited: alloc::vec::Vec<ShmMap> = self.shm_maps.lock().clone();
+        for m in inherited.iter() {
             let npages = ((m.end - m.vaddr) / 0x1000) as usize;
             for i in 0..npages {
                 if let Some(phys) = self
@@ -684,6 +741,10 @@ where
                 }
             }
         }
+        *child.shm_maps.lock() = inherited.clone();
+        let inherited_ids: alloc::vec::Vec<u64> =
+            inherited.iter().map(|m| m.id).collect();
+        shm_hooks_notify_acquired(&inherited_ids);
         Ok(child)
     }
 
@@ -749,7 +810,9 @@ where
             }
         }
 
-        // 2. 共享内存区：仅清 PTE，不释放帧。
+        // 2. 共享内存区：仅清 PTE，不释放帧（帧归 shm 对象）。IA1（ADR-019）：
+        //    每条被销毁的映射经所有权钩子递减一个引用——否则任一进程不显式
+        //    unmap 即退出，对象 refs 永不归零，帧与条目永久滞留（泄漏半边）。
         let shms = self.shm_maps.lock().clone();
         for m in shms.iter() {
             let mut v = m.vaddr;
@@ -758,6 +821,10 @@ where
                 v += 0x1000;
             }
         }
+        let released_ids: alloc::vec::Vec<u64> = shms.iter().map(|m| m.id).collect();
+        drop(shms);
+        self.shm_maps.lock().clear();
+        shm_hooks_notify_released(&released_ids);
 
         // 3. 顶层页表页自身。MD4：本地址空间恰为活动 CR3 时不再保守泄漏——
         //    先经架构快照切回内核根页表（回家表与本表高半区映射一致，切换对

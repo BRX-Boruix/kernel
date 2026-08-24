@@ -59,7 +59,6 @@ dependencies = [
  "arch-x86_64",
  "klib",
  "mm",
- "spin",
 ]
 
 [[package]]

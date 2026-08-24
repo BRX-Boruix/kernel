@@ -1458,7 +1458,7 @@ pub fn test_ipc() {
     assert_eq!(seen2, 0x1234_ABCDu64, "frame alive after A unmaps");
     info!("[ipc-test] shm shared write/read + refcount unmap OK");
 
-    // ---- 2. 管道（数据流 + 非死锁） ----
+    // ---- 2. 管道（数据流 + 非死锁；ipc1 IR1 后走真实用户缓冲路径） ----
     let pipe_id = ipc::pipe_create().expect("pipe_create");
     let mut frame = arch_x86_64::interrupts::InterruptFrame {
         r15: 0,
@@ -1484,24 +1484,38 @@ pub fn test_ipc() {
         rsp: 0,
         ss: 0,
     };
-    let mut src = [0u8; 8];
-    src[..5].copy_from_slice(b"hello");
-    let n =
-        ipc::pipe_write(&mut frame, pipe_id, src.as_ptr() as u64, 5).expect("pipe_write");
+    // 用户缓冲页：映射一页 RW-user，经物理别名写入数据——pipe_write/read
+    // 从此走"预校验 + SMAP 整块拷贝"的真实用户地址路径（IR1 修复后形状）。
+    let mut user_buf = UserAddressSpace::<X86PageTable>::new().expect("buf space");
+    let buf_frame = mm::allocate_frame().expect("buf frame");
+    let buf_va: u64 = 0x0040_0000;
+    user_buf
+        .map_user(
+            VirtAddr::new(buf_va),
+            VirtAddr::new(buf_va + 0x1000),
+            arch::PageSize::Size4K,
+            arch::PageFlags::empty().writable().user(),
+            &[buf_frame.start_paddr()],
+        )
+        .expect("map_user buf");
+    let buf_kern = arch::phys_to_virt(buf_frame.start_paddr());
+    unsafe { core::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_kern as *mut u8, 5) };
+    let n = ipc::pipe_write(&mut frame, pipe_id, &user_buf, buf_va, 5).expect("pipe_write");
     assert_eq!(n, 5, "wrote 5 bytes");
-    let mut dst = [0u8; 8];
-    let n =
-        ipc::pipe_read(&mut frame, pipe_id, dst.as_mut_ptr() as u64, 8).expect("pipe_read");
+    let mut dst_page = [0u8; 8];
+    unsafe { core::ptr::copy_nonoverlapping(dst_page.as_ptr(), buf_kern as *mut u8, 8) };
+    let n = ipc::pipe_read(&mut frame, pipe_id, &user_buf, buf_va, 8).expect("pipe_read");
     assert_eq!(n, 5, "read 5 bytes");
-    assert_eq!(&dst[..5], b"hello", "pipe content preserved");
+    unsafe { core::ptr::copy_nonoverlapping(buf_kern as *const u8, dst_page.as_mut_ptr(), 8) };
+    assert_eq!(&dst_page[..5], b"hello", "pipe content preserved");
     info!(
         "[ipc-test] pipe wrote {} read {} payload='{}'",
         5,
         n,
-        core::str::from_utf8(&dst[..5]).unwrap()
+        core::str::from_utf8(&dst_page[..5]).unwrap()
     );
     // 空管道读：无数据、无进程可阻塞 → WouldBlock（不死锁）。
-    let e = ipc::pipe_read(&mut frame, pipe_id, dst.as_mut_ptr() as u64, 4).unwrap_err();
+    let e = ipc::pipe_read(&mut frame, pipe_id, &user_buf, buf_va, 4).unwrap_err();
     assert_eq!(
         e,
         klib::error::Error::WouldBlock,
@@ -1509,6 +1523,80 @@ pub fn test_ipc() {
     );
     ipc::pipe_close(pipe_id).expect("pipe_close");
     info!("[ipc-test] PASS");
+}
+
+/// ipc1 整改验收（kernel-tests，纯表级 + 钩子驱动）：
+/// - **IR1**：内核指针作为管道缓冲必须被预校验拒绝（BadAddress/OutOfRange）
+///   ——红证语义：旧实现裸解引用任意地址，本断言恒不成立；
+/// - **IA3**：shm_create 的 u64::MAX 级 size 必须 OutOfRange，绝不回绕出
+///   零页幻影对象；
+/// - **IM4**：len==0 与不存在 id 的语义对称——查表后判定，缺失一律 NotFound；
+/// - **IA1**：映射条目记账守恒——acquire/release 钩子增减 refs，归零即对象
+///   连同帧回收（debug_shm_exists 翻转）。
+pub fn test_ipc1_semantics() {
+    use klib::error::Error;
+    use mm::user_space::UserAddressSpace;
+    info!("[test-ipc1] === ipc1: boundary / overflow / parity / ownership ===");
+
+    let space = UserAddressSpace::<X86PageTable>::new().expect("space");
+    let pipe_id = ipc::pipe_create().expect("pipe_create");
+    let mut frame = arch_x86_64::interrupts::InterruptFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+        vector: 0x80, error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+
+    // IR1：内核态地址（.bss 数组，远超 USER_TOP）作源 → 必须被校验拦下。
+    let kernel_buf = [0u8; 4];
+    let e = ipc::pipe_write(
+        &mut frame, pipe_id, &space, kernel_buf.as_ptr() as u64, 4,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, Error::BadAddress | Error::OutOfRange),
+        "kernel pointer must be rejected by user-buffer validation, got {:?}",
+        e
+    );
+    info!("[test-ipc1] IR1 kernel-pointer rejection OK ({:?})", e);
+
+    // IM4：len==0 与 id 存在性的对称语义。
+    let n = ipc::pipe_write(&mut frame, pipe_id, &space, 0x1000, 0).expect("write len0 existing");
+    assert_eq!(n, 0, "len=0 write on live pipe is a no-op Ok(0)");
+    let e = ipc::pipe_read(&mut frame, pipe_id, &space, 0x1000, 0).expect("read len0 existing");
+    assert_eq!(e, 0);
+    let missing = u64::MAX - 7; // 不可能被分配到的哨兵 id
+    let e = ipc::pipe_read(&mut frame, missing, &space, 0x1000, 0).unwrap_err();
+    assert_eq!(e, Error::NotFound, "missing id must be NotFound even with len=0");
+    let e = ipc::pipe_write(&mut frame, missing, &space, 0x1000, 4).unwrap_err();
+    assert_eq!(e, Error::NotFound);
+    info!("[test-ipc1] IM4 len0/NotFound parity OK");
+
+    ipc::pipe_close(pipe_id).expect("close");
+
+    // IA3：溢出 size 如实越界；对象不得以零页形态入册。
+    let e = ipc::shm_create(u64::MAX).unwrap_err();
+    assert_eq!(e, Error::OutOfRange, "wrapping size must be OutOfRange");
+    let e = ipc::shm_create(u64::MAX - 0xFFE).unwrap_err();
+    assert_eq!(e, Error::OutOfRange, "near-wrap size must be OutOfRange");
+    info!("[test-ipc1] IA3 checked alignment OK");
+
+    // IA1：条目记账守恒。acquire×2 → refs=2；release×1 → 存活；release×1 →
+    // 归零回收（在册翻转为 false）。真实 fork/destroy 接线由 clone_cow 与
+    // destroy 内的钩子调用点承担（编译期保证），此处锁定记账协议本身。
+    let sid = ipc::shm_create(0x1000).expect("shm_create");
+    assert_eq!(ipc::debug_shm_refs(sid), Some(0), "fresh object has no mappings");
+    ipc::shm_on_mappings_acquired(&[sid, sid]);
+    assert_eq!(ipc::debug_shm_refs(sid), Some(2), "two inherited entries");
+    ipc::shm_on_mappings_released(&[sid]);
+    assert_eq!(ipc::debug_shm_refs(sid), Some(1), "one mapping released");
+    ipc::shm_on_mappings_released(&[sid]);
+    assert!(
+        !ipc::debug_shm_exists(sid),
+        "object must be reclaimed when last mapping dies"
+    );
+    info!("[test-ipc1] IA1 entry-accounting lifecycle OK");
+
+    info!("[test-ipc1] PASS");
 }
 
 /// M5：进程内存回收（exit 后释放页表/帧）。
