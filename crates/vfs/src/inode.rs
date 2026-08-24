@@ -1,4 +1,15 @@
-//! VFS 核心 INode 与文件系统抽象（ADR-011）。
+//! VFS 核心 INode 与文件系统抽象（ADR-011 / ADR-023）。
+//!
+//! ## 时间戳政策（vfs1 A3，ADR-023 §7 成文）
+//!
+//! `FileMetadata` 三个时间戳的语义按文件系统类别区分：
+//! - **RamFS**：真实存储，出生/写/条目变更均取 `klib::time` 单调毫秒
+//!   （单调钟非 wall clock——S03；wall clock 时间源接线是独立里程碑）；
+//! - **EXT2**：盘上真值（fs1 FM1：mtime/ctime 直读，created 恒 0 =
+//!   "rev1 无该字段"的成文事实）；
+//! - **无状态视图节点**（procfs/devfs/sysfs/dynamic/stdio）：恒 0。0 的
+//!   含义是"视图没有出生时刻"，不是伪造的时间零点（1970）。视图内容
+//!   每次读取都重新生成，任何时间戳都会是谎言。
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -143,6 +154,19 @@ pub trait INode: Send + Sync {
 
     /// 获取元数据。
     fn metadata(&self) -> Result<FileMetadata, Error>;
+
+    /// 廉价节点类型查询（ADR-023 §4 / vfs1 A5）。
+    ///
+    /// 路径解析热路径用它判定软链接/目录：**不得执行动态内容生成、堆
+    /// 分配或任何带副作用的计算**。历史上 resolve 用 `metadata()?.node_type`
+    /// 判定软链接，导致读一次 `/processes/N/status` 在解析阶段就把 JSON
+    /// 完整生成一遍再丢弃。默认实现退回 [`Self::metadata`] 以兼容第三方
+    /// 实现；本 crate 内全部实现必须提供零生成覆盖。
+    fn node_type(&self) -> INodeType {
+        self.metadata()
+            .map(|m| m.node_type)
+            .unwrap_or(INodeType::RegularFile)
+    }
 
     /// 截断/调整大小。
     fn truncate(&self, _size: u64) -> Result<(), Error> {

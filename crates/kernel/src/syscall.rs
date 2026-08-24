@@ -31,9 +31,17 @@ use task::current_proc_mut;
 /// （kernel1.md K7）。取值对齐常见页级缓存的整数倍，避免块内碎片拷贝。
 const SYSCALL_COPY_CHUNK_BYTES: u64 = 1024 * 1024;
 
-/// 路径类 syscall 参数（mkdir/unlink/readdir 等）的路径拷贝上限。
-/// 与单页缓冲对齐：一页足够容纳任何合法内核路径，超长在拷贝层如实报错。
-const PATH_PARAM_MAX: usize = 4096;
+/// 路径类 syscall 参数（mkdir/unlink/readdir 等）的用户路径字节上限
+/// （vfs1 M15 / ADR-023 §2 命名化）。
+///
+/// - 为什么存在边界：用户字符串必须有界，否则"路径直通堆分配"是无界
+///   DoS 面（与 SYSCALL_COPY_CHUNK_BYTES 同一纪律）；
+/// - 为什么是 4096：单页足够容纳本内核全部合法路径；超限**显式
+///   InvalidParam 拒绝而非静默截断**——ADR-011 §1.3 反对的是无界魔法数
+///   与静默截断，不是"存在显式边界"本身；
+/// - 与 PATH_PARAM_MAX 旧名的关系：更名以表达"用户输入上限"语义，
+///   内核内部路径不受此约束。
+const MAX_USER_PATH_BYTES: usize = 4096;
 
 // ---------- syscall 号（域 + 操作二维编码） ----------
 
@@ -191,7 +199,7 @@ fn sys_open(frame: &mut InterruptFrame) -> u64 {
     let flags_bits = frame.rsi as u32;
     let perm_bits = frame.rdx as u32;
 
-    let path = match copy_path_from_user(path_ptr, PATH_PARAM_MAX) {
+    let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
     };
@@ -223,7 +231,12 @@ fn sys_open(frame: &mut InterruptFrame) -> u64 {
         Err(e) => return pack_err(e),
     };
 
-    let handle = vfs::file_handle::FileHandle::new(inode, flags);
+    // vfs1 M4/M3：O_DIRECTORY 强制与 append 起点真值在 FileHandle::new
+    // 内完成；失败（目标非目录等）如实上抛，不再静默产出坏句柄。
+    let handle = match vfs::file_handle::FileHandle::new(inode, flags) {
+        Ok(h) => h,
+        Err(e) => return pack_err(e),
+    };
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
@@ -257,7 +270,7 @@ fn sys_close(frame: &mut InterruptFrame) -> u64 {
 fn sys_mkdir(frame: &mut InterruptFrame) -> u64 {
     let path_ptr = frame.rdi;
     let perm_bits = frame.rsi as u32;
-    let path = match copy_path_from_user(path_ptr, PATH_PARAM_MAX) {
+    let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
     };
@@ -272,7 +285,7 @@ fn sys_mkdir(frame: &mut InterruptFrame) -> u64 {
 /// `unlink(path_ptr)`：删除文件或空目录。
 fn sys_unlink(frame: &mut InterruptFrame) -> u64 {
     let path_ptr = frame.rdi;
-    let path = match copy_path_from_user(path_ptr, PATH_PARAM_MAX) {
+    let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
     };
@@ -289,7 +302,7 @@ fn sys_readdir(frame: &mut InterruptFrame) -> u64 {
     let buf_ptr = frame.rsi;
     let max_bytes = frame.rdx as usize;
 
-    let path = match copy_path_from_user(path_ptr, PATH_PARAM_MAX) {
+    let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
     };
@@ -585,7 +598,7 @@ fn sys_exec(frame: &mut InterruptFrame) -> u64 {
         }
         // 路径字符串模式：arg1 即用户态路径指针
         _ => {
-            let path = match copy_path_from_user(arg1, PATH_PARAM_MAX) {
+            let path = match copy_path_from_user(arg1, MAX_USER_PATH_BYTES) {
                 Ok(p) => p,
                 Err(e) => return pack_err(e),
             };
@@ -648,7 +661,7 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
         BUILTIN_INDEX_SHELL => alloc::string::String::from("shell.elf"),
         // 路径字符串模式：idx_or_tag 即用户态路径指针。
         _ => {
-            let path = match copy_path_from_user(idx_or_tag, PATH_PARAM_MAX) {
+            let path = match copy_path_from_user(idx_or_tag, MAX_USER_PATH_BYTES) {
                 Ok(p) => p,
                 Err(e) => return pack_err(e),
             };

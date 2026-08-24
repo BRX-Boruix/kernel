@@ -4,17 +4,25 @@
 //! - `/devices/list`：枚举所有已注册设备的 JSON 数组；
 //! - `/devices/serial-com1`：主数据通道，直接读写原始串口字节流；
 //! - `/devices/serial-com1/baudrate`：纯文本属性（写入调速，读取查询）；
-//! - `/devices/displays/primary/mode`：写入/读取 JSON 分辨率配置；
+//! - `/devices/displays/primary/mode`：读取 JSON 分辨率配置（真实几何）；
 //! - `/devices/pci/{bus:dev.func}/bars`：PCI BAR 寄存器结构化配置空间自省（JSON）；
 //! - `/devices/storage/{dev}/status`：块存储硬件健康与读写扇区遥测（JSON）；
 //! - `/devices/net/{dev}/stats`：网络设备收发包与带宽遥测（JSON）；
 //! - `/devices/telemetry`：全系统硬件运行态健康全景遥测聚合点（JSON）。
+//!
+//! ## 固定子树契约（vfs1 M7 / ADR-023 §6）
+//!
+//! 上述子树是**稳定查询接口命名空间**，不是设备存在性声明：节点恒在、
+//! 内容恒真。对应硬件缺席时读取得到显式 error JSON（如
+//! `{"error":"no_display_info"}`），写入按能力如实拒绝——用户态以内容
+//! 判断设备可用性，而非以节点是否存在判断。这使 DevFS 树形成为可编程
+//! 的稳定 ABI；未来热插拔投影在此命名空间内增删**具体设备实例**节点。
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use klib::error::Error;
-use klib::json::{JsonObject, JsonWriter, VecTarget};
+use klib::json::{JsonWriter, VecTarget};
 
 use crate::dynamic::{DynamicDirNode, DynamicFileNode};
 use crate::inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
@@ -91,6 +99,11 @@ impl SerialDeviceNode {
             move |buf| {
                 let s = core::str::from_utf8(buf).map_err(|_| Error::InvalidParam)?;
                 let baud: u32 = s.trim().parse().map_err(|_| Error::InvalidParam)?;
+                // M9（ADR-023 §6）：UART divisor 0 硬件非法——解析层显式
+                // 拒绝，绝不把"写了个 0"翻译成对硬件的未定义操作。
+                if baud == 0 {
+                    return Err(Error::InvalidParam);
+                }
                 p_baud_set.set_serial_baudrate(baud)?;
                 Ok(buf.len())
             },
@@ -109,9 +122,11 @@ impl SerialDeviceNode {
                     Ok(value) => {
                         let _ = obj.field_u64("baudrate", value as u64);
                     }
-                    Err(err) => {
+                    Err(_err) => {
+                        // M11（ADR-023 §6）：JSON 域错误统一字符串码；
+                        // 数值 errno 细节由 Provider 侧日志承担。
                         let _ = obj.field_null("baudrate");
-                        let _ = obj.field_i64("error", -(err.to_errno() as i64));
+                        let _ = obj.field_str("error", "no_serial_baudrate");
                     }
                 }
                 let _ = obj.field_u64("data_bits", 8);
@@ -149,8 +164,15 @@ impl INode for SerialDeviceNode {
         })
     }
 
+    /// A5：字符设备判型零成本。
+    fn node_type(&self) -> INodeType {
+        INodeType::CharacterDevice
+    }
+
+    /// M17（ADR-023 §6）：串口是字符流，截断语义不存在——成功码会掩盖
+    /// "什么都没发生"，如实 NotSupported。
     fn truncate(&self, _size: u64) -> Result<(), Error> {
-        Ok(())
+        Err(Error::NotSupported)
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn INode>, Error> {

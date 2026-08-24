@@ -110,6 +110,11 @@ impl INode for StdinNode {
         false
     }
 
+    /// A5：字符设备判型零成本。
+    fn node_type(&self) -> INodeType {
+        INodeType::CharacterDevice
+    }
+
     fn interactive_input(&self) -> bool {
         true
     }
@@ -143,6 +148,11 @@ impl INode for StdoutNode {
     fn is_seekable(&self) -> bool {
         false
     }
+
+    /// A5：字符设备判型零成本。
+    fn node_type(&self) -> INodeType {
+        INodeType::CharacterDevice
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -150,16 +160,23 @@ impl INode for StdoutNode {
 // ---------------------------------------------------------------------------
 
 /// fd 0：标准输入句柄（只读）。
+///
+/// `expect` 断言的是结构不变式：StdinNode::metadata 恒 Ok（字面量构造，
+/// 无错误路径），`FileHandle::new` 的 Result 化（vfs1 M3/M4）不为其引入
+/// 可达失败分支。若未来该不变式被破坏，此处 panic 即契约违反的诚实暴露。
 pub fn stdin_handle() -> FileHandle {
     FileHandle::new(Arc::new(StdinNode), OpenFlags::READ_ONLY)
+        .expect("stdin stream metadata is structurally infallible")
 }
 
-/// fd 1：标准输出句柄（只写）。
+/// fd 1：标准输出句柄（只写）。不变式论证同 [`stdin_handle`]。
 pub fn stdout_handle() -> FileHandle {
     FileHandle::new(Arc::new(StdoutNode), OpenFlags::WRITE_ONLY)
+        .expect("stdout stream metadata is structurally infallible")
 }
 
 /// fd 2：标准错误句柄（只写；当前与 stdout 共享 console 通道）。
 pub fn stderr_handle() -> FileHandle {
     FileHandle::new(Arc::new(StdoutNode), OpenFlags::WRITE_ONLY)
+        .expect("stderr stream metadata is structurally infallible")
 }

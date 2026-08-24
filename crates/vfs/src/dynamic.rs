@@ -93,6 +93,13 @@ impl INode for DynamicFileNode {
         Err(Error::PermissionDenied)
     }
 
+    /// A5：文件判型零成本——**绝不调用 generator**（metadata 的 size 字段
+    /// 才需要生成；类型判定进热路径，历史实现曾因此每次 resolve 全量
+    /// 生成动态内容后丢弃）。
+    fn node_type(&self) -> INodeType {
+        INodeType::RegularFile
+    }
+
     fn lookup(&self, _name: &str) -> Result<Arc<dyn INode>, Error> {
         Err(Error::NotDirectory)
     }
@@ -129,21 +136,12 @@ impl DynamicDirNode {
     }
 
     pub fn add_child(&self, name: &str, node: Arc<dyn INode>) {
+        // M13 成文（ADR-023 §6）：upsert 语义——同名子项被静默替换。这是
+        // 有意行为而非疏漏：DevFS/ProcFS 等投影重建路径依赖"以新换旧"
+        // 而不必先手工摘除。调用方若需排他创建，先 lookup 自查。
         let mut entries = self.entries.write();
         entries.retain(|(n, _)| n != name);
         entries.push((alloc::string::String::from(name), node));
-    }
-
-    pub fn remove_child(&self, name: &str) -> bool {
-        let mut entries = self.entries.write();
-        let before_len = entries.len();
-        entries.retain(|(n, _)| n != name);
-        entries.len() < before_len
-    }
-
-    pub fn clear_children(&self) {
-        let mut entries = self.entries.write();
-        entries.clear();
     }
 }
 
@@ -165,6 +163,11 @@ impl INode for DynamicDirNode {
             modified_time: 0,
             changed_time: 0,
         })
+    }
+
+    /// A5：目录判型零成本（entries 长度都不必读）。
+    fn node_type(&self) -> INodeType {
+        INodeType::Directory
     }
 
     fn truncate(&self, _size: u64) -> Result<(), Error> {

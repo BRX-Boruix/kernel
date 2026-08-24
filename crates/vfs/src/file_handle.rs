@@ -54,6 +54,16 @@ impl OpenFlags {
         directory: false,
     };
 
+    /// 追加写（O_APPEND 语义）：每次 write 的落点锚定当前真实大小。
+    pub const READ_WRITE_APPEND: Self = Self {
+        read: true,
+        write: true,
+        create: false,
+        truncate: false,
+        append: true,
+        directory: false,
+    };
+
     pub const fn to_bits(self) -> u32 {
         let mut bits = 0;
         if self.read {
@@ -103,17 +113,27 @@ pub struct FileHandle {
 }
 
 impl FileHandle {
-    pub fn new(inode: Arc<dyn INode>, flags: OpenFlags) -> Self {
+    /// 构造句柄（ADR-023 §5）。
+    ///
+    /// - **M4**：`flags.directory`（O_DIRECTORY）在此强制——目标非目录即
+    ///   `NotDirectory`。解析后无人执行的旗标等于不存在；
+    /// - **M3**：append 初始 offset 取自 inode 真实 size，metadata 失败
+    ///   如实上抛——旧 `unwrap_or(0)` 会把追加起点静默落回文件头，
+    ///   第一次写入就覆盖既有内容。
+    pub fn new(inode: Arc<dyn INode>, flags: OpenFlags) -> Result<Self, Error> {
+        if flags.directory && inode.node_type() != crate::inode::INodeType::Directory {
+            return Err(Error::NotDirectory);
+        }
         let initial_offset = if flags.append {
-            inode.metadata().map(|m| m.size).unwrap_or(0)
+            inode.metadata()?.size
         } else {
             0
         };
-        Self {
+        Ok(Self {
             inode,
             offset: AtomicU64::new(initial_offset),
             flags,
-        }
+        })
     }
 
     /// 流式读（自动推进 offset）。
@@ -128,6 +148,10 @@ impl FileHandle {
     }
 
     /// 流式写（自动推进 offset）。
+    ///
+    /// ADR-023 §1：注入全局页缓存时经 [`PageCache::write_cached`] 写穿
+    /// 并作废受影响缓存块（失效一致性策略的唯一合法写通道）；未注入时
+    /// 直写 inode。
     pub fn write(&self, buf: &[u8]) -> Result<usize, Error> {
         if !self.flags.write {
             return Err(Error::PermissionDenied);
@@ -139,7 +163,7 @@ impl FileHandle {
         } else {
             self.offset.load(Ordering::SeqCst)
         };
-        let n = self.inode.write_at(cur, buf)?;
+        let n = self.write_coordinated(cur, buf)?;
         self.offset.fetch_add(n as u64, Ordering::SeqCst);
         Ok(n)
     }
@@ -152,12 +176,20 @@ impl FileHandle {
         self.inode.read_at(offset, buf)
     }
 
-    /// 无状态定位写（pwrite，不影响句柄内部 offset）。
+    /// 无状态定位写（pwrite，不影响句柄内部 offset）。一致性语义同 [`Self::write`]。
     pub fn pwrite(&self, offset: u64, buf: &[u8]) -> Result<usize, Error> {
         if !self.flags.write {
             return Err(Error::PermissionDenied);
         }
-        self.inode.write_at(offset, buf)
+        self.write_coordinated(offset, buf)
+    }
+
+    /// 经全局缓存（若注入）的协调写落点。
+    fn write_coordinated(&self, offset: u64, buf: &[u8]) -> Result<usize, Error> {
+        match crate::page_cache::global_page_cache() {
+            Some(cache) => cache.write_cached(&self.inode, offset, buf),
+            None => self.inode.write_at(offset, buf),
+        }
     }
 
     /// 调整偏移量（Seek）。

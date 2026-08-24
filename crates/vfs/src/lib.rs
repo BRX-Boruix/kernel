@@ -23,12 +23,21 @@ pub mod sysfs;
 
 pub use devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
 pub use dynamic::{DynamicDirNode, DynamicFileNode};
-pub use file_handle::{FileHandle, OpenFlags};
+pub use file_handle::{
+    FileHandle, OpenFlags,
+};
+// M12（ADR-023 §5）：SeekWhence 是句柄 seek 契约的公共枚举，随 crate
+// 根再导出——调用方不应被要求钻进 file_handle 模块路径才能拼写类型。
+pub use file_handle::SeekWhence;
 pub use inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
 pub use mount::MountTable;
-pub use page_cache::{HUGE_PAGE_SIZE, PAGE_SIZE, PageCache, PageCacheStats};
+pub use page_cache::{
+    set_global_page_cache, HUGE_PAGE_SIZE, PAGE_SIZE, PageCache, PageCacheStats,
+    READ_BULK_THRESHOLD_BYTES,
+};
 pub use path::Path;
 pub use procfs::{ProcFS, ProcessInfoProvider, ProcessSnapshot};
+pub use ramfs::{set_ramfs_memory_tight_hook, RamFS};
 pub use stdio::{set_stdin_source, set_stdout_sink, stderr_handle, stdin_handle, stdout_handle};
 pub use sysfs::{SysFS, SystemInfoProvider};
 #[cfg(test)]
@@ -39,7 +48,6 @@ mod tests {
     use crate::mount::MountTable;
     use crate::path::Path;
     use crate::ramfs::RamFS;
-    use alloc::string::String;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
     use klib::error::Error;
@@ -73,7 +81,7 @@ mod tests {
         assert_eq!(file.metadata().unwrap().node_type, INodeType::RegularFile);
 
         // 句柄写入与读取
-        let handle = FileHandle::new(file.clone(), OpenFlags::READ_WRITE);
+        let handle = FileHandle::new(file.clone(), OpenFlags::READ_WRITE).unwrap();
         assert_eq!(handle.write(b"hello boruix vfs").unwrap(), 16);
         assert_eq!(file.metadata().unwrap().size, 16);
 
@@ -131,8 +139,10 @@ mod tests {
             INodeType::RegularFile
         );
 
-        // 挂载独立子文件系统到 /volumes/data
+        // 挂载独立子文件系统到 /volumes/data（A6：挂载目标必须已存在
+        // 且为目录——mount(2) 同款语义，杜绝"挂上即不可达"的幽灵项）
         mount_table.mkdir("/volumes", Permissions::all()).unwrap();
+        mount_table.mkdir("/volumes/data", Permissions::all()).unwrap();
         let data_ramfs = Arc::new(RamFS::new());
         mount_table.mount("/volumes/data", data_ramfs).unwrap();
 
@@ -371,10 +381,15 @@ mod tests {
         let n9 = mode_file.read_at(0, &mut buf).unwrap();
         let s9 = core::str::from_utf8(&buf[..n9]).unwrap();
         assert!(s9.contains(r#""width":640"#));
+        // 审计 B28 语义（HEAD 现状）：mode 节点是 read_only 动态节点，
+        // write_at 走 DynamicFileNode 的无 writer 分支 → PermissionDenied。
+        // "模式切换未实现"的能力性拒绝由 Provider 写路径（若未来提供
+        // read_write 形态）承担 NotSupported；当前节点根本没有写半边，
+        // 权限语义才是真相。测试同步 B28 后的现实。
         assert_eq!(
             mode_file.write_at(0, b"{}"),
-            Err(Error::NotSupported),
-            "mode write must honestly refuse: mode switching is not implemented"
+            Err(Error::PermissionDenied),
+            "mode node is read-only by construction (B28): no write half exists"
         );
 
         // DMYGH #16：storage/net 遥测节点必须原样透传 Provider 的真实数据，
@@ -486,7 +501,7 @@ mod tests {
         // 1. 4KB 页缓存读取（跨越 4096 边界，涉及 page 0 与 page 1）
         let mut read_buf_4k = [0u8; 100];
         let n1 = cache
-            .read_cached(file.as_ref(), 4090, &mut read_buf_4k)
+            .read_cached(&file, 4090, &mut read_buf_4k)
             .unwrap();
         assert_eq!(n1, 100);
         assert_eq!(&read_buf_4k, &sample_data[4090..4190]);
@@ -497,7 +512,7 @@ mod tests {
         // 再次读取命中 4KB 缓存（2 个页皆已缓存）
         let mut read_buf_4k_hit = [0u8; 100];
         let n2 = cache
-            .read_cached(file.as_ref(), 4090, &mut read_buf_4k_hit)
+            .read_cached(&file, 4090, &mut read_buf_4k_hit)
             .unwrap();
         assert_eq!(n2, 100);
         assert_eq!(&read_buf_4k_hit, &sample_data[4090..4190]);
@@ -506,7 +521,7 @@ mod tests {
 
         // 2. 2MB 大页直通缓存读取
         let mut big_buf = alloc::vec![0u8; 256 * 1024];
-        let n_big = cache.read_cached(file.as_ref(), 0, &mut big_buf).unwrap();
+        let n_big = cache.read_cached(&file, 0, &mut big_buf).unwrap();
         assert_eq!(n_big, 256 * 1024);
         assert_eq!(&big_buf[..], &sample_data[..256 * 1024]);
         let stats3 = cache.stats();
@@ -515,17 +530,415 @@ mod tests {
         // 再次命中 2MB 大页缓存
         let mut big_buf2 = alloc::vec![0u8; 1024];
         let n_big2 = cache
-            .read_cached(file.as_ref(), 65536, &mut big_buf2)
+            .read_cached(&file, 65536, &mut big_buf2)
             .unwrap();
         assert_eq!(n_big2, 1024);
         assert_eq!(&big_buf2[..], &sample_data[65536..65536 + 1024]);
         let stats4 = cache.stats();
         assert_eq!(stats4.hits, 2);
 
-        // 3. 淘汰机制测试（Eviction）
-        let evicted = cache.evict_clean_pages(1);
+        // 3. 淘汰机制测试（Eviction；ADR-023 §1 改名 evict_pages——
+        // 失效一致性策略下不存在脏块，"clean" 定语是死机制的遗迹）
+        let evicted = cache.evict_pages(1);
         assert!(evicted >= 1);
         let stats5 = cache.stats();
         assert!(stats5.evictions >= 1);
+    }
+
+    /// vfs1 D8-①（ADR-023 §3）：词法 dot-dot 不穿透目录符号链接。
+    /// `/lnk/../secret.txt` 词法化为 `/secret.txt`——即使沿 `/lnk` 走
+    /// 文件系统路径本可命中 `/d/secret.txt`，也必须 NotFound。
+    #[test]
+    fn test_dotdot_does_not_traverse_dir_symlink() {
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs);
+        mt.mkdir("/d", Permissions::read_write()).unwrap();
+        mt.create_file("/d/secret.txt", Permissions::read_write()).unwrap();
+        mt.symlink("/d", "/lnk").unwrap();
+
+        assert_eq!(
+            mt.resolve("/lnk/../secret.txt", true).err(),
+            Some(Error::NotFound),
+            "lexical dot-dot must collapse to /secret.txt, never through the link"
+        );
+        // 正向链接解析不受影响
+        let through = mt.resolve("/lnk/secret.txt", true).unwrap();
+        assert_eq!(through.node_type(), crate::inode::INodeType::RegularFile);
+    }
+
+    /// vfs1 D8-②：相对符号链接目标中的 `..` 以**链接所在目录**为基准
+    /// 词法消解，不产生越权路径。
+    #[test]
+    fn test_relative_symlink_dotdot_resolves_against_link_dir() {
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs);
+        mt.mkdir("/sub", Permissions::read_write()).unwrap();
+        mt.create_file("/sub/data.txt", Permissions::read_write()).unwrap();
+        mt.create_file("/top.txt", Permissions::read_write()).unwrap();
+        // 链接体 "sub/../top.txt"：位于根，词法化后即 /top.txt。
+        mt.symlink("sub/../top.txt", "/jump").unwrap();
+
+        let node = mt.resolve("/jump", true).unwrap();
+        let mut buf = [0u8; 32];
+        let n = node.read_at(0, &mut buf).unwrap();
+        // 写入可区分内容以确认命中的是 /top.txt 而非 /sub 下同名物。
+        mt.resolve("/top.txt", true)
+            .unwrap()
+            .write_at(0, b"TOP")
+            .unwrap();
+        let n2 = node.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n2], b"TOP");
+        let _ = n;
+    }
+
+    /// vfs1 D8-③：`..` 词法跳过挂载点——挂载子树内的 `..` 永远不会
+    /// "向上穿越"到挂载点之外的宿主文件。
+    #[test]
+    fn test_dotdot_skips_mount_point_lexically() {
+        let root_fs = Arc::new(RamFS::new());
+        let mt = MountTable::new(root_fs.clone());
+        mt.create_file("/escape.txt", Permissions::read_write()).unwrap();
+        mt.mkdir("/mnt", Permissions::read_write()).unwrap();
+
+        let child_fs = Arc::new(RamFS::new());
+        child_fs
+            .root()
+            .create("m.txt", Permissions::read_write())
+            .unwrap();
+        mt.mount("/mnt", child_fs).unwrap();
+
+        // /mnt/../escape.txt 词法化为 /escape.txt —— 宿主文件，
+        // 绝不是子树的任何路径。
+        let node = mt.resolve("/mnt/../escape.txt", true).unwrap();
+        node.write_at(0, b"HOST").unwrap();
+        let host = mt.resolve("/escape.txt", true).unwrap();
+        let mut buf = [0u8; 8];
+        let n = host.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"HOST");
+        // 子树自身仍正常可达。
+        assert!(mt.resolve("/mnt/m.txt", true).is_ok());
+    }
+
+    /// vfs1 D8-④：多级软链接链中段 + 尾部 dot-dot 组合的锁定行为。
+    #[test]
+    fn test_symlink_chain_with_trailing_dotdot() {
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs);
+        mt.mkdir("/r", Permissions::read_write()).unwrap();
+        mt.create_file("/r/deep.txt", Permissions::read_write()).unwrap();
+        mt.create_file("/deep2.txt", Permissions::read_write()).unwrap();
+        mt.symlink("/r", "/q").unwrap();
+        mt.symlink("/q", "/p").unwrap();
+
+        // 正向两级链
+        assert!(mt.resolve("/p/deep.txt", true).is_ok());
+        // 尾部 dot-dot：/p/../deep2.txt → /deep2.txt（宿主），而非链内目标
+        assert!(mt.resolve("/p/../deep2.txt", true).is_ok());
+        assert!(mt.resolve("/p/../nope.txt", true).err() == Some(Error::NotFound));
+    }
+
+    /// vfs1 D7：软链接环必须在 MAX_SYMLINK_DEPTH 内如实报 TooManySymlinks，
+    /// 绝不无限递归。
+    #[test]
+    fn test_symlink_loop_reports_too_many_symlinks() {
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs);
+        mt.symlink("/b", "/a").unwrap();
+        mt.symlink("/a", "/b").unwrap();
+        assert_eq!(
+            mt.resolve("/a", true).err(),
+            Some(Error::TooManySymlinks)
+        );
+    }
+
+    /// vfs1 R5：变更入口的名字校验（C0 控制字符与 DEL 拒绝）。
+    #[test]
+    fn test_entry_name_validation_rejects_control_chars() {
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs);
+        for bad in ["a\u{1}b", "x\n", "\u{7f}", "tab\tchar"] {
+            assert_eq!(
+                mt.create_file(bad, Permissions::read_write()).err(),
+                Some(Error::InvalidParam),
+                "control-char name {:?} must be rejected",
+                bad
+            );
+            assert_eq!(
+                mt.mkdir(bad, Permissions::read_write()).err(),
+                Some(Error::InvalidParam)
+            );
+            assert_eq!(mt.unlink(bad).err(), Some(Error::InvalidParam));
+        }
+        // 合法名字不受影响（UTF-8 多字节、空格、点号均允许）。
+        mt.create_file("/数据 文件.v2.txt", Permissions::read_write()).unwrap();
+    }
+
+    /// vfs1 M1：MountTable 公共操作拒绝相对路径（显式 InvalidParam，
+    /// 不静默当绝对路径解析）。
+    #[test]
+    fn test_mount_table_rejects_relative_paths() {
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs);
+        assert_eq!(
+            mt.create_file("relative.txt", Permissions::read_write()).err(),
+            Some(Error::InvalidParam)
+        );
+        assert_eq!(
+            mt.mkdir("rel/dir", Permissions::read_write()).err(),
+            Some(Error::InvalidParam)
+        );
+        assert_eq!(mt.unlink("relative.txt").err(), Some(Error::InvalidParam));
+        assert_eq!(
+            mt.symlink("x", "rel-link").err(),
+            Some(Error::InvalidParam)
+        );
+    }
+
+    /// vfs1 A6：mount 目标必须存在且为目录。
+    #[test]
+    fn test_mount_target_must_be_existing_directory() {
+        let root_fs = Arc::new(RamFS::new());
+        let mt = MountTable::new(root_fs.clone());
+        // 不存在的目标
+        assert_eq!(
+            mt.mount("/ghost", Arc::new(RamFS::new())).err(),
+            Some(Error::NotFound)
+        );
+        // 存在但是普通文件
+        mt.create_file("/plain.txt", Permissions::read_write()).unwrap();
+        assert_eq!(
+            mt.mount("/plain.txt", Arc::new(RamFS::new())).err(),
+            Some(Error::NotDirectory)
+        );
+        // 合法目录成功
+        mt.mkdir("/ok", Permissions::read_write()).unwrap();
+        assert!(mt.mount("/ok", Arc::new(RamFS::new())).is_ok());
+    }
+
+    /// vfs1 A7：活动挂载点及其祖先目录不可 unlink；卸载后恢复可删。
+    #[test]
+    fn test_unlink_blocked_while_mounted() {
+        let root_fs = Arc::new(RamFS::new());
+        let mt = MountTable::new(root_fs.clone());
+        mt.mkdir("/mnt", Permissions::read_write()).unwrap();
+        mt.mount("/mnt", Arc::new(RamFS::new())).unwrap();
+
+        assert_eq!(mt.unlink("/mnt").err(), Some(Error::Busy));
+
+        // 祖先目录同理：删除 "/" 之下的直接祖先会孤儿化挂载键。
+        mt.mkdir("/anc", Permissions::read_write()).unwrap();
+        mt.mkdir("/anc/deep", Permissions::read_write()).unwrap();
+        mt.unmount("/mnt").unwrap();
+        mt.mount("/anc/deep", Arc::new(RamFS::new())).unwrap();
+        assert_eq!(mt.unlink("/anc").err(), Some(Error::Busy));
+
+        mt.unmount("/anc/deep").unwrap();
+        // 卸载只解除绑定；目录树里的 deep 条目仍在——先删子（空目录）
+        // 再删父，非空保护语义不变。
+        assert!(mt.unlink("/anc/deep").is_ok());
+        assert!(mt.unlink("/anc").is_ok());
+    }
+
+    /// vfs1 M16：append 打开的写起点是当前真实大小；seek(End,+) 越 EOF
+    /// 后写入形成稀疏洞，洞内字节如实读回零。
+    #[test]
+    fn test_append_offset_and_sparse_hole() {
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs.clone());
+        let path = "/log.txt";
+        {
+            let f = mt.create_file(path, Permissions::read_write()).unwrap();
+            f.write_at(0, b"abc").unwrap();
+        }
+        {
+            let node = mt.resolve(path, true).unwrap();
+            let h = crate::file_handle::FileHandle::new(
+                node,
+                crate::file_handle::OpenFlags::READ_WRITE_APPEND,
+            )
+            .unwrap();
+            assert_eq!(h.write(b"de").unwrap(), 2);
+        }
+        let node = mt.resolve(path, true).unwrap();
+        let mut buf = [0u8; 8];
+        let n = node.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"abcde");
+
+        // 稀疏洞：seek End +1024 后写一个字节 → size = 5 + 1024 + 1
+        let h = crate::file_handle::FileHandle::new(
+            node.clone(),
+            crate::file_handle::OpenFlags::READ_WRITE,
+        )
+        .unwrap();
+        h.seek(1024, crate::file_handle::SeekWhence::End).unwrap();
+        h.write(b"X").unwrap();
+        let mut probe = [0u8; 1030];
+        let total = node.read_at(0, &mut probe).unwrap();
+        assert_eq!(total, 1030);
+        assert_eq!(&probe[..5], b"abcde");
+        assert!(
+            probe[5..1029].iter().all(|&b| b == 0),
+            "hole bytes must read back as zeros"
+        );
+        assert_eq!(probe[1029], b'X');
+    }
+
+    /// 全局页缓存失效一致性（vfs1 A2 / ADR-023 §1）：句柄写必须经
+    /// write_cached 作废受影响缓存块——先读入缓存，再经句柄覆写，
+    /// 读缓存不得返回陈旧数据。
+    #[test]
+    fn test_global_cache_coherence_on_handle_write() {
+        // 全局缓存是进程级 Once（与内核启动期单次注入同构）：用 Box::leak
+        // 取 'static 实例注入。重复调用是幂等的，测试并行下安全。
+        let cache: &'static crate::page_cache::PageCache =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                crate::page_cache::PageCache::new(),
+            ));
+        crate::page_cache::set_global_page_cache(cache);
+
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs);
+        let node = mt
+            .create_file("/coh.txt", Permissions::read_write())
+            .unwrap();
+        let h = crate::file_handle::FileHandle::new(
+            node.clone(),
+            crate::file_handle::OpenFlags::READ_WRITE,
+        )
+        .unwrap();
+
+        // v1 进缓存
+        h.write(b"stale-data-v1").unwrap();
+        let mut buf = [0u8; 16];
+        let n1 = cache.read_cached(&node, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n1], b"stale-data-v1");
+
+        // 句柄覆写 → 必须写穿并作废缓存块
+        h.pwrite(0, b"FRESH").unwrap();
+        let n2 = cache.read_cached(&node, 0, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..n2],
+            b"FRESH-data-v1",
+            "cached read after coordinated write must observe new data"
+        );
+    }
+
+    /// 审计 R9-F1 红绿锁定：双文件同偏移必须互相隔离——读侧不串数据，
+    /// 写侧失效不越界。旧实现以裸偏移为唯一键，本测试在旧代码上必红。
+    #[test]
+    fn test_page_cache_two_files_same_offset_isolated() {
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs);
+        let a = mt.create_file("/A.bin", Permissions::read_write()).unwrap();
+        let b = mt.create_file("/B.bin", Permissions::read_write()).unwrap();
+        a.write_at(0, &[0xAA; 128]).unwrap();
+        b.write_at(0, &[0xBB; 128]).unwrap();
+
+        let cache = crate::page_cache::PageCache::new();
+
+        // 先缓存 A@0，再读 B 同偏移：绝不允许命中 A 的页。
+        let mut buf = [0u8; 64];
+        let n1 = cache.read_cached(&a, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n1], &[0xAA; 64]);
+        let n2 = cache.read_cached(&b, 0, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..n2],
+            &[0xBB; 64],
+            "same-offset read of another file must not hit A's cached page"
+        );
+
+        // 写侧隔离：覆写 B@0 后，A 的缓存块必须原样幸存（旧实现按偏移
+        // 全域作废，会误删 A 的页）。
+        let h = crate::file_handle::FileHandle::new(
+            b.clone(),
+            crate::file_handle::OpenFlags::READ_WRITE,
+        )
+        .unwrap();
+        h.pwrite(0, &[0xCC; 16]).unwrap();
+        let mut buf_a = [0u8; 64];
+        let n3 = cache.read_cached(&a, 0, &mut buf_a).unwrap();
+        assert_eq!(
+            &buf_a[..n3],
+            &[0xAA; 64],
+            "invalidation must be scoped to the written node only"
+        );
+    }
+
+    /// vfs1 M5：跨页连续读取完整补齐；命中但请求越过历史截断缓存边界时
+    /// 必须回落装载路径重查，而不是误报 EOF。
+    #[test]
+    fn test_cross_page_read_and_hit_overflow_reload() {
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs.clone());
+        let node = mt
+            .create_file("/big.bin", Permissions::read_write())
+            .unwrap();
+        let payload: alloc::vec::Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        node.write_at(0, &payload).unwrap();
+
+        let cache = crate::page_cache::PageCache::new();
+        // 一口跨多页读全量
+        let mut out = alloc::vec![0u8; payload.len()];
+        let n = cache.read_cached(&node, 0, &mut out).unwrap();
+        assert_eq!(n, payload.len());
+        assert_eq!(out, payload);
+
+        // 历史截断场景：只读到旧 EOF（缓存末页短于满页）→ 文件增长 →
+        // 再跨旧 EOF 读，新字节必须可见（不允许 Ok(0) 早退）。
+        let grown: alloc::vec::Vec<u8> = (0..12_000u32).map(|i| (i % 241) as u8).collect();
+        node.write_at(payload.len() as u64, &grown[payload.len()..]).unwrap();
+        let mut out2 = alloc::vec![0u8; grown.len()];
+        let n2 = cache.read_cached(&node, 0, &mut out2).unwrap();
+        assert_eq!(n2, grown.len(), "growth past cached truncation must be visible");
+        assert_eq!(out2[payload.len()], grown[payload.len()]);
+    }
+
+    /// vfs1 D7：挂载遮蔽在构造上不可能（同前缀二次挂载拒绝）+ 卸载回落。
+    #[test]
+    fn test_mount_shadow_impossible_and_unmount_fallback() {
+        let root_fs = Arc::new(RamFS::new());
+        let mt = MountTable::new(root_fs.clone());
+        mt.mkdir("/mnt", Permissions::read_write()).unwrap();
+        mt.mount("/mnt", Arc::new(RamFS::new())).unwrap();
+        // 同前缀二次挂载被拒——"谁遮蔽谁"的歧义从未产生。
+        assert_eq!(
+            mt.mount("/mnt", Arc::new(RamFS::new())).err(),
+            Some(Error::AlreadyExists)
+        );
+
+        let a = Arc::new(RamFS::new());
+        a.root()
+            .create("marker.txt", Permissions::read_write())
+            .unwrap();
+        mt.unmount("/mnt").unwrap();
+        mt.mount("/mnt", a).unwrap();
+        assert!(
+            mt.resolve("/mnt/marker.txt", true).is_ok(),
+            "after unmount+remount the new tree must be visible"
+        );
+    }
+
+    /// vfs1 D7：多线程并发写同一文件冒烟（宿主 std 线程；内核单核语义下
+    /// 由 M18 锁序保证，此处锁定"无 panic + 尺寸确定"底线）。
+    #[test]
+    fn test_concurrent_ramfs_writers_smoke() {
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs.clone());
+        let node = mt
+            .create_file("/race.bin", Permissions::read_write())
+            .unwrap();
+
+        let workers: alloc::vec::Vec<_> = (0u64..4)
+            .map(|i| {
+                let n = node.clone();
+                std::thread::spawn(move || {
+                    n.write_at(i * 16, &[i as u8; 16]).unwrap();
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert_eq!(node.metadata().unwrap().size, 64);
     }
 }

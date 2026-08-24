@@ -353,6 +353,37 @@ unsafe fn kmain_body() -> ! {
     vfs::stdio::set_stdin_source(stdin_source);
     vfs::stdio::set_stdout_sink(klib::console::write_bytes);
 
+    // vfs1 A2/D4（ADR-023 §1/§7）：全局页缓存与 RamFS 内存水位钩子接线。
+    // - 全局缓存注入后，一切 FileHandle 写都经 write_cached 写穿并作废受
+    //   影响缓存块——失效一致性策略的唯一合法写通道自此闭合；
+    // - 水位钩子以 mm 紧急预留池真值为信号（低于容量 1/4 = 紧张），RamFS
+    //   大跨度增长据此先驱逐缓存再试，仍紧张如实 OutOfMemory。
+    {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static KERNEL_PAGE_CACHE: spin::Once<vfs::PageCache> = spin::Once::new();
+        let cache: &'static vfs::PageCache =
+            KERNEL_PAGE_CACHE.call_once(|| vfs::PageCache::new());
+        vfs::set_global_page_cache(cache);
+
+        /// 紧张阈值：紧急池容量（mm RESERVE_CAP_PAGES=32）的四分之一。
+        /// 低于它说明分配器已在吃兜底页，继续放任堆增长是自欺。
+        const RESERVE_TIGHT_FLOOR_PAGES: usize = mm::frame_allocator::RESERVE_CAP_PAGES / 4;
+        static WATERMARK_WARNED: AtomicBool = AtomicBool::new(false);
+        vfs::set_ramfs_memory_tight_hook(|| {
+            let count = mm::frame_stats().reserve_count;
+            if count < RESERVE_TIGHT_FLOOR_PAGES
+                && !WATERMARK_WARNED.swap(true, Ordering::Relaxed)
+            {
+                klib::warn!(
+                    "[vfs] memory watermark tight: reserve pool {} < {} pages",
+                    count,
+                    RESERVE_TIGHT_FLOOR_PAGES
+                );
+            }
+            count < RESERVE_TIGHT_FLOOR_PAGES
+        });
+    }
+
     // 审计 B14/B21：SYS_MEMORY_QUERY 全链路覆盖 + stdin Busy→EAGAIN 语义 +
     // fd 表 MAX_FDS 上限拒绝。（必须在 stdio 接线之后：B21 臂依赖真实的
     // stdin 源——接线前 StdinNode 读路径如实 NotSupported。）

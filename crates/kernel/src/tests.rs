@@ -2490,7 +2490,8 @@ pub fn test_vfs_m61() {
     let file_node = root
         .create_file("/config/kernel.json", Permissions::read_write())
         .expect("create file");
-    let handle = FileHandle::new(file_node.clone(), OpenFlags::READ_WRITE);
+    let handle = FileHandle::new(file_node.clone(), OpenFlags::READ_WRITE)
+        .expect("ramfs handle metadata is infallible");
     let payload = b"{\"arch\":\"x86_64\",\"version\":\"0.1.0\",\"status\":\"ok\"}";
     let written = handle.write(payload).expect("write payload");
     assert_eq!(written, payload.len());
@@ -2584,11 +2585,13 @@ pub fn test_vfs_m62() {
     let us = UserAddressSpace::<X86PageTable>::new().expect("user space");
     let mut proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, us);
 
-    let handle1 = FileHandle::new(file.clone(), OpenFlags::READ_WRITE);
+    let handle1 = FileHandle::new(file.clone(), OpenFlags::READ_WRITE)
+        .expect("ramfs handle metadata is infallible");
     let fd1 = proc.alloc_fd(handle1).expect("alloc fd 3");
     assert_eq!(fd1, 3, "first user fd must be 3");
 
-    let handle2 = FileHandle::new(file.clone(), OpenFlags::READ_ONLY);
+    let handle2 = FileHandle::new(file.clone(), OpenFlags::READ_ONLY)
+        .expect("ramfs handle metadata is infallible");
     let fd2 = proc.alloc_fd(handle2).expect("alloc fd 4");
     assert_eq!(fd2, 4, "second user fd must be 4");
 
@@ -2605,7 +2608,8 @@ pub fn test_vfs_m62() {
     assert!(proc.close_fd(fd1).is_some());
     assert!(proc.get_fd(fd1).is_none());
 
-    let handle3 = FileHandle::new(file.clone(), OpenFlags::READ_WRITE);
+    let handle3 = FileHandle::new(file.clone(), OpenFlags::READ_WRITE)
+        .expect("ramfs handle metadata is infallible");
     let fd3 = proc.alloc_fd(handle3).expect("realloc fd 3");
     assert_eq!(fd3, 3, "slot 3 must be reused after close");
 
@@ -3430,7 +3434,7 @@ pub fn test_vfs_m64() {
     let cache = PageCache::new();
     let mut header_buf = [0u8; 64];
     let n = cache
-        .read_cached(init_node.as_ref(), 0, &mut header_buf)
+        .read_cached(&init_node, 0, &mut header_buf)
         .expect("cached read");
     assert_eq!(n, 64);
     assert_eq!(
@@ -3442,7 +3446,7 @@ pub fn test_vfs_m64() {
     // 第二次读取必定命中缓存
     let mut header_buf2 = [0u8; 64];
     let n2 = cache
-        .read_cached(init_node.as_ref(), 0, &mut header_buf2)
+        .read_cached(&init_node, 0, &mut header_buf2)
         .expect("cached read 2");
     assert_eq!(n2, 64);
     assert_eq!(header_buf, header_buf2);
@@ -3454,9 +3458,10 @@ pub fn test_vfs_m64() {
         stats.total_pages, stats.hits, stats.misses
     );
 
-    // 3. 内存紧凑感知淘汰（Eviction）
-    let evicted = cache.evict_clean_pages(1);
-    assert!(evicted >= 1, "must successfully evict clean pages");
+    // 3. 内存紧凑感知淘汰（Eviction；ADR-023 §1 更名 evict_pages——
+    // 失效一致性策略下不存在脏块）
+    let evicted = cache.evict_pages(1);
+    assert!(evicted >= 1, "must successfully evict cached pages");
     let stats_evicted = cache.stats();
     assert_eq!(stats_evicted.evictions, evicted);
     info!("[test-vfs-m64] evicted clean pages: {}", evicted);
@@ -3513,12 +3518,12 @@ pub fn test_vfs_m65() {
     let cache = PageCache::new();
     let mut read_buf = [0u8; 4096];
     let n = cache
-        .read_cached(big_node.as_ref(), 0, &mut read_buf)
+        .read_cached(&big_node, 0, &mut read_buf)
         .expect("cached read");
     assert_eq!(n, 4096);
     assert_eq!(read_buf[0], 0xAA);
     let n2 = cache
-        .read_cached(big_node.as_ref(), 0, &mut read_buf)
+        .read_cached(&big_node, 0, &mut read_buf)
         .expect("hit read");
     assert_eq!(n2, 4096);
     let st = cache.stats();
@@ -3533,7 +3538,8 @@ pub fn test_vfs_m65() {
     open_node
         .write_at(0, b"Live data before unlink")
         .expect("write initial data");
-    let handle = FileHandle::new(open_node.clone(), OpenFlags::READ_WRITE);
+    let handle = FileHandle::new(open_node.clone(), OpenFlags::READ_WRITE)
+        .expect("ramfs handle metadata is infallible");
 
     // 删除路径条目
     root.unlink(unlinked_path).expect("unlink open file");

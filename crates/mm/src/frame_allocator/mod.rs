@@ -20,6 +20,7 @@ use percpu_cache::{FreeListTable, PerCpuCache, PerCpuCacheSet};
 
 pub use allocator_core::{FRAME_SIZE_BYTES, HUGE_FRAME_SIZE_BYTES, ORDER_1G, ORDER_2M};
 pub use compact::{compact_now, ipi_drain_current_cpu, set_remote_drain};
+pub use reserve::RESERVE_CAP_PAGES;
 pub use init::dropped_uninit_frames;
 pub use refcount::{count as frame_refcount, decref as frame_decref, incref as frame_incref};
 pub use stats::reset_stats as reset_frame_stats;

@@ -5,15 +5,11 @@
 //! - `/system/memory`：LazyBuddy 内存容量、已分配、空闲及紧急预留池状态 JSON；
 //! - `/system/kernel`：内核版本、启动时间及构建元数据 JSON。
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
-use klib::error::Error;
-use klib::json::{JsonObject, JsonWriter, VecTarget};
 
 use crate::dynamic::{DynamicDirNode, DynamicFileNode};
-use crate::inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
+use crate::inode::{FileSystem, INode};
 
 /// 系统信息 Provider Trait（由内核注入硬件与内存状态）。
 pub trait SystemInfoProvider: Send + Sync {

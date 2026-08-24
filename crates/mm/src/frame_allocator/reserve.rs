@@ -9,6 +9,13 @@ use klib::{info, warn};
 use super::LazyBuddyAllocator;
 use super::allocator_core::{FrameState, ORDER_4K};
 
+/// 紧急预留池容量上限（单位：4K 页）。
+///
+/// 固定上限保证 reserve 池只保留少量兜底页，不会随反复 churn 无限增长。
+/// 公开给内核层做水位判断（vfs1 D4 / ADR-023 §7：RamFS 水位钩子以
+/// "reserve_count 低于容量的四分之一"为紧张信号），避免阈值魔法值散落。
+pub const RESERVE_CAP_PAGES: usize = 32;
+
 impl LazyBuddyAllocator {
     pub(crate) fn reserve_pop(&self) -> Option<usize> {
         let mut list = self.reserve_list.lock();
@@ -24,10 +31,8 @@ impl LazyBuddyAllocator {
         None
     }
 
-    /// 紧急预留池容量上限（单位：4K 页）。
-    ///
-    /// 固定上限保证 reserve 池只保留少量兜底页，不会随反复 churn 无限增长。
-    const RESERVE_CAP: usize = 32;
+    /// 兼容名（历史关联常量）；真实容量见模块级 [`RESERVE_CAP_PAGES`]。
+    const RESERVE_CAP: usize = RESERVE_CAP_PAGES;
 
     pub(crate) fn reserve_push(&self, pfn: usize) {
         let mut list = self.reserve_list.lock();

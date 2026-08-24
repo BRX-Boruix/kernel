@@ -555,6 +555,13 @@ impl INode for Ext2Node {
         Err(Error::ReadOnly)
     }
 
+    /// A5（ADR-023 §4）：类型从缓存 mode 派生，零盘访问零分配——
+    /// metadata 的 Corrupt 语义在此退化为"未知模式按 RegularFile 兜底"，
+    /// 热路径判型不允许失败；完整校验仍由 metadata() 承担。
+    fn node_type(&self) -> INodeType {
+        node_type_of(self.inode.mode).unwrap_or(INodeType::RegularFile)
+    }
+
     /// 元数据：size/type/权限/时间全部来自盘上真值。
     ///
     /// 时间戳政策（fs1 FM1）：modified=mtime、changed=ctime 为盘上真值；

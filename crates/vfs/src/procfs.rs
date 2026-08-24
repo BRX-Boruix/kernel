@@ -8,7 +8,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use klib::error::Error;
-use klib::json::{JsonObject, JsonWriter, VecTarget};
+use klib::json::{JsonWriter, VecTarget};
 
 use crate::dynamic::{DynamicDirNode, DynamicFileNode};
 use crate::inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
@@ -68,6 +68,11 @@ impl INode for ProcRootNode {
         Err(Error::IsDirectory)
     }
 
+    /// A5：目录判型零成本。
+    fn node_type(&self) -> INodeType {
+        INodeType::Directory
+    }
+
     fn lookup(&self, name: &str) -> Result<Arc<dyn INode>, Error> {
         if name == "list" {
             let p = self.provider.clone();
@@ -98,25 +103,39 @@ impl INode for ProcRootNode {
             return Ok(Arc::new(node));
         }
 
-        // 解析 PID 目录
+        // 解析 PID 目录（M10，ADR-023 §6）：仅接受规范十进制形式——
+        // "007"/"+7" 会被 usize::from_str 静默接受并路由到 pid 7 的目录，
+        // 同一进程获得两个"合法名字"，目录枚举与 lookup 从此互相矛盾。
         if let Ok(pid) = name.parse::<usize>() {
-            if let Some(_) = self.provider.get_process(pid) {
+            let canonical = pid.to_string();
+            if canonical == name && self.provider.get_process(pid).is_some() {
                 let p = self.provider.clone();
                 let dir = DynamicDirNode::new();
                 let status_node = DynamicFileNode::read_only(move || {
                     let mut target = VecTarget::new();
                     let mut writer = JsonWriter::new(&mut target);
-                    if let Some(proc) = p.get_process(pid) {
-                        if let Ok(mut obj) = writer.start_object() {
-                            let _ = obj.field_u64("pid", proc.pid as u64);
-                            let _ = obj.field_str("name", &proc.name);
-                            let _ = obj.field_str("state", &proc.state);
-                            let _ = obj.field_u64("memory_bytes", proc.memory_bytes);
-                            let _ = obj.field_str(
-                                "uri",
-                                &alloc::format!("/processes/{}/status", proc.pid),
-                            );
-                            let _ = obj.end();
+                    match p.get_process(pid) {
+                        Some(proc) => {
+                            if let Ok(mut obj) = writer.start_object() {
+                                let _ = obj.field_u64("pid", proc.pid as u64);
+                                let _ = obj.field_str("name", &proc.name);
+                                let _ = obj.field_str("state", &proc.state);
+                                let _ = obj.field_u64("memory_bytes", proc.memory_bytes);
+                                let _ = obj.field_str(
+                                    "uri",
+                                    &alloc::format!("/processes/{}/status", proc.pid),
+                                );
+                                let _ = obj.end();
+                            }
+                        }
+                        None => {
+                            // M2（ADR-023 §6）：lookup 与本次读取之间进程
+                            // 可能已退出——输出显式错误 JSON。空 `{}` 会被
+                            // 解析成"合法的零字段状态"，是伪数据。
+                            if let Ok(mut obj) = writer.start_object() {
+                                let _ = obj.field_str("error", "process_exited");
+                                let _ = obj.end();
+                            }
                         }
                     }
                     let mut bytes = target.into_bytes();

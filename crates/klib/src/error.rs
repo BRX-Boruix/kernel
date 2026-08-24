@@ -83,6 +83,13 @@ pub enum Error {
     /// （重试无意义，需要 fsck）。fs1 FA3b 接线——此前五类 EXT2 故障被
     /// 压扁成单一 Io，用户态无法区分介质尾与结构损坏。
     Corrupt,
+    /// 资源忙（EBUSY）：操作此刻不可行，因目标被某项活动状态占用。
+    ///
+    /// 与 [`Error::WouldBlock`] 的分界：WouldBlock 表达"稍后重试可成"
+    /// 的非阻塞 I/O 暂态（EAGAIN）；Busy 表达**结构性占用**——重试不会
+    /// 自愈，必须先解除占用方（如删除一个仍是活动挂载点的目录：
+    /// vfs1 A7，先 unmount 才能删）。klib1 预置变体，vfs1 整改接线。
+    Busy,
 }
 
 impl Error {
@@ -110,6 +117,7 @@ impl Error {
             Error::ExecFormat => 8,        // ENOEXEC
             Error::ReadOnly => 30,         // EROFS
             Error::Corrupt => 117,         // EUCLEAN (EFSCORRUPTED)
+            Error::Busy => 16,             // EBUSY
         }
     }
 }
@@ -136,6 +144,7 @@ impl core::fmt::Display for Error {
             Error::TooManySymlinks => f.write_str("too many levels of symbolic links"),
             Error::IllegalSeek => f.write_str("illegal seek"),
             Error::ExecFormat => f.write_str("exec format error"),
+            Error::Busy => f.write_str("resource busy"),
             Error::ReadOnly => f.write_str("read-only file system"),
             Error::Corrupt => f.write_str("structure needs cleaning"),
         }
