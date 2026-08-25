@@ -16,9 +16,10 @@ pub mod mapper;
 pub mod user_space;
 
 pub use frame_allocator::{
-    FRAME_SIZE_BYTES, HUGE_FRAME_SIZE_BYTES, FrameAllocatorStats, PmmFragStats, allocate_frame,
-    allocate_frames, compact_now, deallocate_frame, frag_stats, frame_decref, frame_incref,
-    frame_refcount, init as init_frame, ipi_drain_current_cpu, reset_frame_stats,
+    CRITICAL_RESERVE_CAP_PAGES, FRAME_SIZE_BYTES, HUGE_FRAME_SIZE_BYTES, FrameAllocatorStats,
+    PmmFragStats, ReserveLevel, allocate_frame, allocate_frame_critical, allocate_frames,
+    allocate_frames_critical, compact_now, deallocate_frame, frag_stats, frame_decref,
+    frame_incref, frame_refcount, init as init_frame, ipi_drain_current_cpu, reset_frame_stats,
     set_remote_drain, stats as frame_stats, total_frames,
 };
 

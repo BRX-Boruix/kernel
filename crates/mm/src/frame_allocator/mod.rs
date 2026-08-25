@@ -20,7 +20,7 @@ use percpu_cache::{FreeListTable, PerCpuCache, PerCpuCacheSet};
 
 pub use allocator_core::{FRAME_SIZE_BYTES, HUGE_FRAME_SIZE_BYTES, ORDER_1G, ORDER_2M};
 pub use compact::{compact_now, ipi_drain_current_cpu, set_remote_drain};
-pub use reserve::RESERVE_CAP_PAGES;
+pub use reserve::{CRITICAL_RESERVE_CAP_PAGES, RESERVE_CAP_PAGES, ReserveLevel};
 pub use init::dropped_uninit_frames;
 pub use refcount::{count as frame_refcount, decref as frame_decref, incref as frame_incref};
 pub use stats::reset_stats as reset_frame_stats;
@@ -108,16 +108,37 @@ pub fn allocate_frame() -> Option<PhysFrame> {
     allocate_frames(ORDER_4K)
 }
 
+/// Allocate a physical frame from the Critical emergency pool (ADR-020 P2).
+///
+/// 页表页等"失败即不可恢复"的分配路径使用此入口，确保在常规 32 页紧急池
+/// 已被耗尽时仍有一份独立的 16 页备用池可兜底，与常规分配不竞争同一口锅。
+pub fn allocate_frame_critical() -> Option<PhysFrame> {
+    allocate_frames_critical(ORDER_4K)
+}
+
 /// Allocate physical frames with specific order
 pub fn allocate_frames(order: usize) -> Option<PhysFrame> {
     let f = ALLOCATOR.allocate(order)?;
-    // 登记该块内每帧的引用计数为 1（COW 共享会在此基础上 incref）。
-    // 仅登记 4K 帧粒度；块内未单独释放的残留登记由下次 init 覆盖，无碍。
+    Some(register_frames(f, order))
+}
+
+/// Allocate physical frames from the Critical emergency pool (ADR-020 P2).
+///
+/// 语义同 [`allocate_frames`]，但全局空闲耗尽后的兜底路径切换至
+/// Critical 紧急池——页表页、中断上下文等不可失败分配的安全阀。
+pub fn allocate_frames_critical(order: usize) -> Option<PhysFrame> {
+    let f = ALLOCATOR.allocate_with_level(order, ReserveLevel::Critical)?;
+    Some(register_frames(f, order))
+}
+
+/// 登记一块物理帧的引用计数（`allocate_frames` / `allocate_frames_critical`
+/// 的共享尾递归）。
+fn register_frames(f: PhysFrame, order: usize) -> PhysFrame {
     let n = 1usize << order;
     for i in 0..n {
         refcount::init(f.start_paddr() + (i * 4096) as u64);
     }
-    Some(f)
+    f
 }
 
 /// Deallocate a physical frame

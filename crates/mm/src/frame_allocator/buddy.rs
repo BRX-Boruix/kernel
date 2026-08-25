@@ -114,6 +114,34 @@ impl LazyBuddyAllocator {
         None
     }
 
+    /// 将 `[start_pfn, end_pfn)` 内的前导对齐间隙按最大对齐 2 幂分裂为高阶
+    /// buddy 块并归还全局空闲链表（隐式超级块分裂产物，ADR-020 P3）。
+    ///
+    /// 隐式超级块视角：uninit 区可视为一个拟 order-MAX 块；按 order 对齐
+    /// 切分后，前导间隙正是该块分裂出的高阶兄弟块——本函数用与 `alloc_from_list`
+    /// 高阶分裂完全一致的"最大对齐幂分割"把它们落回全局 buddy 链表。
+    /// 调用后 `end_pfn` 必按 `size` 对齐。
+    fn carve_align_gap(&self, start_pfn: usize, end_pfn: usize) {
+        let mut cursor = start_pfn;
+        while cursor < end_pfn {
+            let remaining = end_pfn - cursor;
+            let max_fit =
+                (usize::BITS as usize - 1 - remaining.leading_zeros() as usize)
+                    .min(MAX_ORDER - 1);
+            let align_limit = cursor.trailing_zeros() as usize;
+            let order_gap = core::cmp::min(max_fit, align_limit);
+
+            unsafe {
+                let mut cache = MetadataCache::new();
+                let frame = self.frame_ptr_with_cache(cursor, &mut cache);
+                self.reset_frame_with(frame, order_gap as u8);
+            }
+            self.free_and_merge(cursor, order_gap);
+
+            cursor += 1 << order_gap;
+        }
+    }
+
     pub(crate) fn alloc_from_uninit(&self, order: usize) -> Option<usize> {
         let size = 1 << order;
 
@@ -129,29 +157,16 @@ impl LazyBuddyAllocator {
                 let aligned_start = (region.start_pfn + size - 1) & !(size - 1);
 
                 if aligned_start + size <= region.end_pfn {
-                    // Handle alignment gap by freeing small blocks to buddy system
+                    // 前导对齐间隙 → 高阶兄弟块落回 buddy（隐式超级块分裂）
                     if aligned_start > region.start_pfn {
-                        let mut cursor = region.start_pfn;
-                        while cursor < aligned_start {
-                            let remaining = aligned_start - cursor;
-                            let max_fit =
-                                (usize::BITS as usize - 1 - remaining.leading_zeros() as usize)
-                                    .min(MAX_ORDER - 1);
-                            let align_limit = cursor.trailing_zeros() as usize;
-                            let order_gap = core::cmp::min(max_fit, align_limit);
-
-                            unsafe {
-                                let mut cache = MetadataCache::new();
-                                let frame = self.frame_ptr_with_cache(cursor, &mut cache);
-                                self.reset_frame_with(frame, order_gap as u8);
-                            }
-                            self.free_and_merge(cursor, order_gap);
-
-                            cursor += 1 << order_gap;
-                        }
+                        self.carve_align_gap(region.start_pfn, aligned_start);
                     }
 
                     let alloc_start = aligned_start;
+                    debug_assert!(
+                        alloc_start % size == 0,
+                        "P3 invariant: aligned carve must yield order-aligned start"
+                    );
 
                     if alloc_start + size == region.end_pfn {
                         uninit.regions[i] = None;

@@ -26,6 +26,7 @@ use super::allocator_core::{
     MetadataPool, UninitRegion, align_4k,
 };
 use super::percpu_cache::FreeListTable;
+use super::reserve::{CRITICAL_RESERVE_CAP_PAGES, RESERVE_CAP_PAGES};
 use super::{FREE_LISTS, LazyBuddyAllocator};
 
 /// Buffer for uninit regions count to handle fragmentation
@@ -552,7 +553,8 @@ impl LazyBuddyAllocator {
                 uninit.last_uninit_idx = 0;
             }
 
-            self.init_reserve(32);
+            self.init_reserve(RESERVE_CAP_PAGES);
+            self.init_reserve_critical(CRITICAL_RESERVE_CAP_PAGES);
 
             {
                 let total = timer.total();

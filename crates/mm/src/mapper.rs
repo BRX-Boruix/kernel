@@ -12,8 +12,11 @@ use crate::frame_allocator;
 /// MD3：删除原 `#[unsafe(no_mangle)]`——本函数从不经符号名引用（唯一调用点
 /// 以函数指针注入 `paging::init`），导出符号名只会制造"存在稳定内核 ABI"的
 /// 假象。extern "C" ABI 保留以匹配注入签名。
+///
+/// 注：页表页是"分配失败即不可恢复"路径（缺页处理中无帧即双重故障），
+/// 故使用 [`frame_allocator::allocate_frame_critical`]（ADR-020 P2）。
 pub extern "C" fn mm_alloc_frame() -> u64 {
-    match frame_allocator::allocate_frame() {
+    match frame_allocator::allocate_frame_critical() {
         Some(f) => f.start_paddr(),
         None => 0,
     }

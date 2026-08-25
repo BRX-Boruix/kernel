@@ -7,11 +7,24 @@ use klib::warn;
 use arch::PhysFrame;
 
 use super::allocator_core::{MAX_ORDER, ORDER_4K};
+use super::reserve::ReserveLevel;
 use super::{LazyBuddyAllocator, current_cpu_id};
 
 impl LazyBuddyAllocator {
-    /// Allocate a frame of order N
+    /// Allocate a frame of order N（等价于 [`Self::allocate_with_level`] 的
+    /// Regular 级别：既有行为，失败兜底取 Regular 紧急池）。
     pub fn allocate(&self, order: usize) -> Option<PhysFrame> {
+        self.allocate_with_level(order, ReserveLevel::Regular)
+    }
+
+    /// 按危急度级别分配帧（ADR-020 P2）。与 [`Self::allocate`] 的唯一差异：
+    /// 全局空闲耗尽后的兜底池按级别选择——Critical 分配取用独立的 Critical
+    /// 紧急池，杜绝与常规分配在 OOM 边缘抢同一口锅。
+    pub fn allocate_with_level(
+        &self,
+        order: usize,
+        level: ReserveLevel,
+    ) -> Option<PhysFrame> {
         if order >= MAX_ORDER {
             return None;
         }
@@ -25,7 +38,7 @@ impl LazyBuddyAllocator {
             .or_else(|| self.alloc_global(order, cpu))
             .or_else(|| {
                 if order == ORDER_4K {
-                    self.reserve_pop()
+                    self.reserve_pop_for(level)
                 } else {
                     None
                 }
