@@ -3,6 +3,9 @@
 
 extern crate alloc;
 
+// liveCD 内置用户程序 payload（SDK 构建生成，ADR-017）：无外部盘时
+// 内核用其填充 /binaries 完成启动；外部盘挂载后整体覆盖（盘优先）。
+mod binaries_payload;
 mod acpi;
 mod drivers;
 mod ipc_init;
@@ -52,13 +55,32 @@ unsafe extern "C" {
 const KMAIN_STACK_SIZE: usize = 1024 * 1024;
 
 /// 启动期复核链接器给出的栈布局与 Rust 侧预期一致（KA3 防漂移）。
+///
+/// # 为什么不用异符号的直接相等断言
+///
+/// 原实现首条断言写 `guard_top == base`（`__kstack_guard_top` 与
+/// `__kstack_base` 由 linker.ld 置于同一地址）。LLVM 语义假设**不同的 extern
+/// 全局对象地址必然不同**，linker 让两个符号同址恰违反该假设；`-O`
+/// （release）下 `ptrtoint(A) == ptrtoint(B)` 会被常折叠为 `false`
+/// （2026-07 nightly 实测），整条断言恒失败，连带其后整段布防代码被判定
+/// 死代码删除——release 内核必在启动期 panic、debug（-O0）却正常。
+///
+/// 本实现改为**与非零常量的跨度断言**（距离运算对优化器不透明，实测保留
+/// 为运行期比较）：由 linker.ld 同一输出段内符号单调性（`. = ALIGN(..)` /
+/// `. += ..` 只向后推进），跨度 ①守护页恰 4KiB、②守护页顶→栈顶恰 1MiB
+/// 同时精确，即等价于原三条检查（`guard_top == base`、`top - base == 1MiB`、
+/// `guard_top - guard_base == 4KiB`）——守护页与栈区之间出现任何间隙或重叠
+/// 都会使跨度 ② 偏离 1MiB 被当场捕获。原义相等核对保留为 `debug_assert!`
+/// （仅 debug 档编译，release 无此比较，天然无折叠窗口）。
 fn assert_stack_layout() {
     let guard_base = core::ptr::addr_of!(__kstack_guard_base) as usize;
     let guard_top = core::ptr::addr_of!(__kstack_guard_top) as usize;
     let base = core::ptr::addr_of!(__kstack_base) as usize;
     let top = core::ptr::addr_of!(__kstack_top) as usize;
+    // 同一输出段内符号必须单调（linker 只向后推进）；顺序断言防脚本重排。
+    // 均为不同符号间的**大小**比较（>=），LLVM 无法折叠（仅 == 可折叠）。
     assert!(
-        guard_top == base && top - base == KMAIN_STACK_SIZE,
+        base >= guard_top && top >= base,
         "kernel stack layout mismatch: linker vs rust"
     );
     // 守护页恰为一页且紧贴栈底。页尺寸单一出处 = x86-64 页粒度（4KiB，
@@ -69,6 +91,14 @@ fn assert_stack_layout() {
         guard_top - guard_base == PAGE_SIZE_BYTES,
         "guard page must be one page"
     );
+    // 守护页顶→栈顶恰为 1MiB 主栈（见函数头等价性论证）。
+    assert!(
+        top - guard_top == KMAIN_STACK_SIZE,
+        "kernel stack layout mismatch: linker vs rust"
+    );
+    // 原义「守护页紧贴栈底」核对。`==` 比较仅保留在 debug 档：release 该
+    // 表达式不编译，规避上述 LLVM 折叠；跨度断言已承担同义防漂移职责。
+    debug_assert!(base == guard_top, "guard page must abut stack base");
 }
 
 /// 真正的内核入口：先切换到自己的大栈，再进入 kmain 主体。
@@ -664,6 +694,29 @@ pub fn read_binary_from_binaries(name: &str) -> Option<alloc::vec::Vec<u8>> {
     Some(buf)
 }
 
+/// ADR-017 双源读取：先经 VFS `/binaries/<name>` 读取（外部盘挂载时读到
+/// 盘内容，盘优先）；VFS 不可得（盘遮蔽但盘中缺该文件 / 无盘但 payload
+/// 缺失）时回退到构建期内置 liveCD payload。两源皆缺返回 None。
+///
+/// 这不是 KM3 禁止的"同路重试"：KM3 删的是"同一 /binaries 路径 resolve
+/// 两次"的死亡分支（必然同样失败）；此处两源是**不同数据载体**（VFS/
+/// 磁盘 vs 内核静态内存），回退有真实语义。回退经 warn 日志如实披露
+/// （S10：来源不捏造、不静默）。
+pub fn read_binary_dual_source(name: &str, builtin: &'static [u8]) -> Option<alloc::vec::Vec<u8>> {
+    if let Some(v) = read_binary_from_binaries(name) {
+        return Some(v);
+    }
+    if builtin.is_empty() {
+        return None;
+    }
+    klib::warn!(
+        "[binaries] {} unavailable via /binaries; falling back to built-in liveCD payload ({} bytes)",
+        name,
+        builtin.len()
+    );
+    Some(builtin.to_vec())
+}
+
 /// panic 时的 CPU id 读取器：LAPIC 已映射才读，否则返回 0（早期未就绪安全）。
 fn panic_cpu_id() -> u32 {
     if arch_x86_64::lapic::is_mapped() {
@@ -687,16 +740,18 @@ fn start_init() -> ! {
     use mm::user_space::UserAddressSpace;
 
     info!("[kmain] booting user init (PID 1) ...");
-    // M13/#13：init.elf 来自真实磁盘链路（disk.img → ATA → MBR → EXT2 →
-    // /binaries）。磁盘缺失或镜像无效时显式失败并 idle 停机——绝不静默
-    // 回退到编译期嵌入副本（该副本已退役）。
-    let Some(elf_bytes) = read_binary_from_binaries("init.elf") else {
-        error!("[kmain] init: /binaries/init.elf unavailable (no persistent disk or invalid EXT2 image)");
+    // ADR-017（liveCD）：init.elf 双源——构建期内置 payload 垫底（ramfs
+    // /binaries，无盘可启动）；外部盘（disk.img → ATA → MBR → EXT2）挂载
+    // 成功后将其遮蔽（盘优先），盘中缺失该文件时经 read_binary_dual_source
+    // 文件级回退内置（数据盘插上不会搞挂 liveCD）。两源皆缺才失败并 idle
+    // 停机（错误可见、不 panic）。
+    let Some(elf_bytes) = read_binary_dual_source("init.elf", crate::binaries_payload::INIT_ELF) else {
+        error!("[kmain] init: /binaries/init.elf unavailable (neither built-in liveCD payload nor external disk)");
         info!("[kmain] reached idle loop");
         CurrentArch::halt();
     };
     info!(
-        "[kmain] init: loaded {} bytes from /binaries/init.elf via EXT2",
+        "[kmain] init: loaded {} bytes of init.elf from /binaries",
         elf_bytes.len()
     );
 

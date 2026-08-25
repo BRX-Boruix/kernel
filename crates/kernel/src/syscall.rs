@@ -558,7 +558,8 @@ fn sys_read(frame: &mut InterruptFrame) -> DispatchResult {
 /// ABI（libsys nr.rs `task_spawn`）：`prog` 为用户态路径字符串指针；仅
 /// [`BUILTIN_INDEX_INIT`] / [`BUILTIN_INDEX_SHELL`] 两个小整数被解释为内建
 /// 程序索引，映射到 `/binaries/init.elf` / `/binaries/shell.elf`。ELF 数据
-/// 唯一来源是真实磁盘 EXT2。
+/// 来自 VFS `/binaries`：构建期内置 liveCD payload 垫底，外部盘 EXT2 挂载
+/// 成功后整体覆盖（盘优先，ADR-017）。
 ///
 /// KM3：删除原"小索引 VFS resolve 失败后回退 program_elf(idx)"死亡分支——
 /// 两者解析同一路径必然同样失败，且 `program_elf` 对 idx≥2 恒为 None；
@@ -576,24 +577,18 @@ fn sys_exec(frame: &mut InterruptFrame) -> u64 {
     // 1. 获取 ELF 字节数据
     let elf_data: alloc::vec::Vec<u8> = match arg1 {
         BUILTIN_INDEX_INIT | BUILTIN_INDEX_SHELL => {
-            let path = if arg1 == BUILTIN_INDEX_INIT {
-                "/binaries/init.elf"
+            // 内建索引走统一双源读取（ADR-017 + read_binary_dual_source）：
+            // 外部盘遮蔽 /binaries 时盘上文件优先；盘中缺失则文件级回退到
+            // 内置 liveCD payload。与 KM3 无冲突——两源是不同数据载体
+            // （VFS/磁盘 vs 内核静态），非同路重复尝试（见 main.rs 该函数注）。
+            let (name, builtin) = if arg1 == BUILTIN_INDEX_INIT {
+                ("init.elf", crate::binaries_payload::INIT_ELF)
             } else {
-                "/binaries/shell.elf"
+                ("shell.elf", crate::binaries_payload::SHELL_ELF)
             };
-            match root.resolve(path, true) {
-                Ok(inode) => {
-                    let meta = match inode.metadata() {
-                        Ok(m) => m,
-                        Err(e) => return pack_err(e),
-                    };
-                    let mut buf = alloc::vec![0u8; meta.size as usize];
-                    if let Err(e) = inode.read_at(0, &mut buf) {
-                        return pack_err(e);
-                    }
-                    buf
-                }
-                Err(e) => return pack_err(e),
+            match crate::read_binary_dual_source(name, builtin) {
+                Some(v) => v,
+                None => return pack_err(Error::NotFound),
             }
         }
         // 路径字符串模式：arg1 即用户态路径指针

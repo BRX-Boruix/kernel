@@ -530,15 +530,65 @@ pub fn init() {
     let devfs = Arc::new(DevFS::new(Arc::new(KernelDeviceProvider)));
     mount_table.mount("/devices", devfs).expect("mount devfs");
 
-    // M13/#13：真实磁盘链路——EXT2 挂载到 /binaries。挂载失败时 /binaries
-    // 保持空目录，init 加载将显式失败并可见；绝不回退到编译期嵌入副本。
+    // ADR-017（liveCD 回归）：先以构建期内置 payload 填充 ramfs /binaries
+    // （无外部盘也可启动），随后尝试挂载外部盘 EXT2 —— 挂载成功即整体覆盖
+    // 内置（盘优先，U 盘上放新版/测试程序可生效）。两源皆缺时 /binaries
+    // 保持空目录，init 加载将显式失败并可见，绝不伪造成功。
+    populate_builtin_binaries(&mount_table);
     let disk_mounted = try_mount_ext2_binaries(&mount_table);
 
     VFS_ROOT.call_once(|| mount_table);
     if disk_mounted {
-        klib::info!("[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /binaries = EXT2(ata0)");
+        klib::info!(
+            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /binaries = EXT2 (external disk overrides built-in)"
+        );
     } else {
-        klib::info!("[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /binaries EMPTY (no persistent disk)");
+        klib::info!(
+            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /binaries = built-in liveCD payload (no external disk)"
+        );
+    }
+}
+
+/// liveCD 基线：把构建期嵌入的用户程序 payload（SDK 生成 `binaries_payload.rs`）
+/// 写入 ramfs `/binaries`——无外部盘时系统仍可启动（ADR-017）。外部盘随后
+/// 经 [`try_mount_ext2_binaries`] 挂载时以 mount 语义整体覆盖（盘优先）。
+/// 任一写入失败如实报错并继续（残留部分 payload 会使 init 加载失败可见，
+/// 不静默伪装成功）。
+fn populate_builtin_binaries(mount_table: &Arc<vfs::mount::MountTable>) {
+    for p in crate::binaries_payload::PAYLOADS {
+        let path = alloc::format!("/binaries/{}", p.name);
+        let node = match mount_table.create_file(&path, Permissions::readonly()) {
+            Ok(n) => n,
+            Err(e) => {
+                klib::error!("[vfs] built-in payload failed (create {}): {:?}", path, e);
+                continue;
+            }
+        };
+        if let Err(e) = node.write_at(0, p.data) {
+            klib::error!(
+                "[vfs] built-in payload failed (write {} {} bytes): {:?}",
+                path,
+                p.data.len(),
+                e
+            );
+            continue;
+        }
+        // KM4 同款纪律：RamFS 写入要么全量要么 Err，但署名长度不符仍须显式
+        // 报错——绝不静默把截断的 ELF 当作完整 payload 交给加载器。
+        if node.metadata().map(|m| m.size).unwrap_or(0) != p.data.len() as u64 {
+            klib::error!(
+                "[vfs] built-in payload size mismatch on {}: expected {} got {}",
+                path,
+                p.data.len(),
+                node.metadata().map(|m| m.size).unwrap_or(0)
+            );
+            continue;
+        }
+        klib::info!(
+            "[vfs] built-in liveCD payload: {} ({} bytes, read-only)",
+            p.name,
+            p.data.len()
+        );
     }
 }
 
@@ -629,6 +679,6 @@ fn try_mount_ext2_binaries(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
             }
         }
     }
-    klib::warn!("[ext2] no mountable persistent block device; /binaries stays empty");
+    klib::warn!("[ext2] no mountable persistent block device; built-in liveCD payload remains active");
     false
 }
