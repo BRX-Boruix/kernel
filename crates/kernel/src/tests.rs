@@ -2297,9 +2297,9 @@ fn build_test_elf() -> alloc::vec::Vec<u8> {
     // ---- 机器码：write(1, 0x401000, 16); exit(0) ----
     let msg: &[u8] = b"Hello from ELF!\n";
     let mut code: Vec<u8> = Vec::new();
-    // mov rax, 0x2002 (SYS_WRITE)
+    // mov rax, SYS_STREAM_WRITE (0x13)
     code.extend_from_slice(&[0x48, 0xB8]);
-    code.extend_from_slice(&0x2002u64.to_le_bytes());
+    code.extend_from_slice(&(crate::syscall::SYS_STREAM_WRITE as u64).to_le_bytes());
     // mov rdi, 1 (fd=stdout)
     code.extend_from_slice(&[0x48, 0xBF]);
     code.extend_from_slice(&1u64.to_le_bytes());
@@ -2311,9 +2311,9 @@ fn build_test_elf() -> alloc::vec::Vec<u8> {
     code.extend_from_slice(&(msg.len() as u64).to_le_bytes());
     // int 0x80
     code.extend_from_slice(&[0xCD, 0x80]);
-    // mov rax, 0x0003 (SYS_EXIT)
+    // mov rax, SYS_TASK_EXIT (0x34)
     code.extend_from_slice(&[0x48, 0xB8]);
-    code.extend_from_slice(&0x0003u64.to_le_bytes());
+    code.extend_from_slice(&(crate::syscall::SYS_TASK_EXIT as u64).to_le_bytes());
     // mov rdi, 0 (code=0)
     code.extend_from_slice(&[0x48, 0xBF]);
     code.extend_from_slice(&0u64.to_le_bytes());
