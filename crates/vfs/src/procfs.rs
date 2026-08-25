@@ -19,6 +19,8 @@ pub struct ProcessSnapshot {
     pub pid: usize,
     pub name: String,
     pub state: String,
+    /// 父进程 pid。`0` 表示无父（内核直创）。
+    pub ppid: usize,
     /// 已声明用户虚拟区域的字节数；来自地址空间区域账本，包含尚未 fault-in 的预留页。
     pub memory_bytes: u64,
 }
@@ -86,6 +88,7 @@ impl INode for ProcRootNode {
                             let _ = obj.field_u64("pid", proc.pid as u64);
                             let _ = obj.field_str("name", &proc.name);
                             let _ = obj.field_str("state", &proc.state);
+                            let _ = obj.field_u64("ppid", proc.ppid as u64);
                             let _ = obj.field_u64("memory_bytes", proc.memory_bytes);
                             let _ = obj.field_str(
                                 "uri",
@@ -120,6 +123,7 @@ impl INode for ProcRootNode {
                                 let _ = obj.field_u64("pid", proc.pid as u64);
                                 let _ = obj.field_str("name", &proc.name);
                                 let _ = obj.field_str("state", &proc.state);
+                                let _ = obj.field_u64("ppid", proc.ppid as u64);
                                 let _ = obj.field_u64("memory_bytes", proc.memory_bytes);
                                 let _ = obj.field_str(
                                     "uri",

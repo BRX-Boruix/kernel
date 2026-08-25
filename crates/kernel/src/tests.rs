@@ -4684,7 +4684,7 @@ pub fn test_waitpid_core() {
     let root = th::spawn_named_child_of(0, "init.elf").expect("spawn root");
     let child = th::spawn_named_child_of(root, "child.elf").expect("spawn child");
     assert_ne!(root, child, "pids must be distinct");
-    let (_, root_name, _, _) = th::probe(root).expect("root probed");
+    let (_, root_name, _, _, _) = th::probe(root).expect("root probed");
     assert_eq!(
         root_name, "init.elf",
         "PCB must keep the caller-supplied program name"
@@ -4700,7 +4700,7 @@ pub fn test_waitpid_core() {
     );
     let ok_name = "n".repeat(63);
     let named_ok = th::spawn_named_child_of(0, &ok_name).expect("63-byte name accepted");
-    let (_, ok_probe_name, _, _) = th::probe(named_ok).expect("named probed");
+    let (_, ok_probe_name, _, _, _) = th::probe(named_ok).expect("named probed");
     assert_eq!(ok_probe_name, ok_name.as_str());
     info!("[test-waitpid-core] C1.1 name boundary (empty/64/63) OK");
     assert!(th::probe(child).is_some(), "child must be registered");
@@ -4730,7 +4730,7 @@ pub fn test_waitpid_core() {
         "zombie",
         "parent idle: keep zombie"
     );
-    let (st, name, wf, _) = th::probe(child).expect("zombie probed");
+    let (st, name, wf, _, _) = th::probe(child).expect("zombie probed");
     assert_eq!(st, TaskState::Exit, "zombie state must be Exit");
     assert_eq!(name, "child.elf", "zombie keeps its real program name");
     assert_eq!(wf, None, "zombie must not hold wait registration");
@@ -4775,18 +4775,18 @@ pub fn test_waitpid_core() {
         matches!(th::block_on_child(pa, kid), Ok(task::Waited::Blocked)),
         "block registers and reports Blocked"
     );
-    let (st, name, wf, _) = th::probe(pa).expect("blocked parent probed");
+    let (st, name, wf, _, _) = th::probe(pa).expect("blocked parent probed");
     assert_eq!(st, TaskState::Blocked);
     assert_eq!(wf, Some(kid));
     assert!(!name.is_empty(), "blocked parent keeps its name");
     // waiting_for 独占期间通用唤醒无效：
     task::wake(pa);
-    let (st2, _, wf2, _) = th::probe(pa).expect("still probed");
+    let (st2, _, wf2, _, _) = th::probe(pa).expect("still probed");
     assert_eq!(st2, TaskState::Blocked, "generic wake must not fire waiter");
     assert_eq!(wf2, Some(kid));
     assert_eq!(th::terminate(kid, 99), "delivered", "wake+deliver on exit");
     assert!(th::probe(kid).is_none(), "delivery reaps child immediately");
-    let (st3, _, wf3, rax3) = th::probe(pa).expect("delivered parent probed");
+    let (st3, _, wf3, rax3, _) = th::probe(pa).expect("delivered parent probed");
     assert_eq!(st3, TaskState::Ready, "parent must be schedulable again");
     assert_eq!(wf3, None, "wait registration must be cleared");
     assert_eq!(rax3, 99, "exit code must land in parent saved rax");
@@ -4801,7 +4801,7 @@ pub fn test_waitpid_core() {
         Ok(task::Waited::Blocked)
     ));
     assert_eq!(th::terminate(kd, BIG), "delivered");
-    let (_, _, _, rax4) = th::probe(pc).expect("pc probed");
+    let (_, _, _, rax4, _) = th::probe(pc).expect("pc probed");
     assert_eq!(rax4, BIG, "u64 exit code must be byte-exact");
     info!("[test-waitpid-core] 64-bit byte-exact delivery OK");
 
@@ -4815,7 +4815,7 @@ pub fn test_waitpid_core() {
         matches!(th::block_on_child(ph, kh), Err(Error::WouldBlock)),
         "blocking with no runnable peer must honestly refuse"
     );
-    let (st5, _, wf5, _) = th::probe(ph).expect("ph probed after refusal");
+    let (st5, _, wf5, _, _) = th::probe(ph).expect("ph probed after refusal");
     assert_eq!(st5, TaskState::Running, "refusal must restore Running");
     assert_eq!(wf5, None, "refusal must clear registration");
     info!("[test-waitpid-core] deadlock-refusal (WouldBlock) OK");
@@ -4856,6 +4856,120 @@ pub fn test_waitpid_core() {
     );
     arch_x86_64::interrupts::enable();
     info!("[test-waitpid-core] PASS");
+}
+
+/// PID 1 契约验收：WAIT_ANY 语义、PID 1 防护、孤儿过继。
+///
+/// 全程关中断（同 test_waitpid_core 纪律），纯表级不涉及物理切换。
+pub fn test_init_contract() {
+    use task::scheduler::test_hooks as th;
+    use task::scheduler::WAIT_ANY;
+    use task::TaskState;
+    use klib::error::Error;
+
+    info!("[test-init-contract] === PID 1 contract: WAIT_ANY / protection / reparent ===");
+
+    arch_x86_64::interrupts::disable();
+
+    // ---- 1. WAIT_ANY: zombie child exists ----
+    let root = th::spawn_named_child_of(0, "root.elf").expect("spawn root");
+    let child = th::spawn_named_child_of(root, "child.elf").expect("spawn child");
+    th::terminate(child, 42);
+    // WAIT_ANY 应同步收割 zombie 子进程。
+    assert_eq!(
+        th::wait_any(root).ok(),
+        Some(task::Waited::Code(42)),
+        "WAIT_ANY must reap zombie child and return its exit code"
+    );
+    assert!(th::probe(child).is_none(), "WAIT_ANY reaped child must be freed");
+    info!("[test-init-contract] 1. WAIT_ANY zombie reap OK");
+
+    // ---- 2. WAIT_ANY: 阻塞登记 + 交付 ----
+    th::reset_all();
+    let pa = th::spawn_named_child_of(0, "pa.elf").expect("spawn pa");
+    let kid = th::spawn_named_child_of(pa, "kid.elf").expect("spawn kid");
+    // WAIT_ANY 阻塞等待。
+    assert!(
+        matches!(th::wait_any(pa), Ok(task::Waited::Blocked)),
+        "WAIT_ANY must block when no zombie but children exist"
+    );
+    let (st, _, wf, _, _) = th::probe(pa).expect("blocked parent probed");
+    assert_eq!(st, TaskState::Blocked);
+    assert_eq!(wf, Some(WAIT_ANY), "waiting_for must be WAIT_ANY sentinel");
+    // 子进程退出应交付给 WAIT_ANY 等待者。
+    assert_eq!(th::terminate(kid, 99), "delivered", "WAIT_ANY deliver on exit");
+    assert!(th::probe(kid).is_none(), "delivery reaps child");
+    let (st2, _, wf2, rax2, _) = th::probe(pa).expect("delivered parent probed");
+    assert_eq!(st2, TaskState::Ready, "parent must be schedulable again");
+    assert_eq!(wf2, None, "wait registration cleared");
+    assert_eq!(rax2, 99, "exit code in parent saved rax");
+    info!("[test-init-contract] 2. WAIT_ANY block+deliver OK");
+
+    // ---- 3. WAIT_ANY: 无子进程 → NotFound（ECHILD） ----
+    th::reset_all();
+    let solo = th::spawn_named_child_of(0, "solo.elf").expect("spawn solo");
+    assert!(
+        matches!(th::wait_any(solo), Err(Error::NotFound)),
+        "WAIT_ANY with no children must be NotFound"
+    );
+    info!("[test-init-contract] 3. WAIT_ANY no-child NotFound OK");
+
+    // ---- 4. PID 1 防护：kill_pid 拒绝 ----
+    th::reset_all();
+    // 注册一个假 init PID。
+    let fake_init = th::spawn_named_child_of(0, "fake_init.elf").expect("spawn fake_init");
+    task::set_init_pid(fake_init);
+    // 探活 sig=0 应放行。
+    assert_eq!(task::kill_pid(fake_init, 0, &mut dummy_frame()).ok(), Some(0));
+    // 真实信号应拒绝。
+    assert!(
+        matches!(task::kill_pid(fake_init, task::SIGKILL, &mut dummy_frame()), Err(Error::PermissionDenied)),
+        "kill(init, SIGKILL) must be PermissionDenied"
+    );
+    assert!(
+        matches!(task::kill_pid(fake_init, task::SIGTERM, &mut dummy_frame()), Err(Error::PermissionDenied)),
+        "kill(init, SIGTERM) must be PermissionDenied"
+    );
+    // 其他进程不受影响。
+    let other = th::spawn_named_child_of(fake_init, "other.elf").expect("spawn other");
+    assert!(
+        task::kill_pid(other, task::SIGKILL, &mut dummy_frame()).is_ok(),
+        "kill(non-init, SIGKILL) must succeed"
+    );
+    // probe 应确认 fake_init 仍在（未被误杀）。
+    assert!(th::probe(fake_init).is_some(), "fake_init must still be alive");
+    info!("[test-init-contract] 4. kill init protection OK");
+
+    // ---- 5. 孤儿过继 ----
+    th::reset_all();
+    task::set_init_pid(0); // 先清零，让测试自建场景
+    let parent = th::spawn_named_child_of(0, "parent.elf").expect("spawn parent");
+    let child = th::spawn_named_child_of(parent, "child.elf").expect("spawn child");
+    // 登记一个假 init PID 用于接收过继。
+    let init_pid = th::spawn_named_child_of(0, "init.elf").expect("spawn init");
+    task::set_init_pid(init_pid);
+    // parent 运行中死亡 → child 被过继给 init。
+    th::terminate(parent, 0);
+    assert!(th::probe(parent).is_none(), "parent must be reclaimed");
+    // child 应存活且 ppid 为 init_pid。
+    let (_, _, _, _, child_ppid) = th::probe(child).expect("child probed");
+    assert_eq!(child_ppid, init_pid, "orphan child must be reparented to init");
+    info!("[test-init-contract] 5. orphan reparenting OK");
+
+    // ---- 清场 ----
+    th::reset_all();
+    task::set_init_pid(0);
+    assert!(
+        th::probe(parent).is_none(),
+        "all test procs must be gone after reset_all"
+    );
+    arch_x86_64::interrupts::enable();
+    info!("[test-init-contract] PASS");
+}
+
+/// 哑中断帧（测试用，kill_pid 签名需要 frame 引用）。
+fn dummy_frame() -> arch_x86_64::interrupts::InterruptFrame {
+    unsafe { core::mem::zeroed() }
 }
 
 // ---------- task1：K1 门控（ADR-017）/ K3 内核栈回收 / K2 FPU 隔离 ----------

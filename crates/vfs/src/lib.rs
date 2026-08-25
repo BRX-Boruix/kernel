@@ -189,12 +189,14 @@ mod tests {
                     pid: 1,
                     name: alloc::string::String::from("init.elf"),
                     state: alloc::string::String::from("Running"),
+                    ppid: 0,
                     memory_bytes: 65536,
                 },
                 ProcessSnapshot {
                     pid: 2,
                     name: alloc::string::String::from("shell.elf"),
                     state: alloc::string::String::from("Ready"),
+                    ppid: 0,
                     memory_bytes: 131072,
                 },
             ]
@@ -206,6 +208,7 @@ mod tests {
                     pid: 1,
                     name: alloc::string::String::from("init.elf"),
                     state: alloc::string::String::from("Running"),
+                    ppid: 0,
                     memory_bytes: 65536,
                 })
             } else {

@@ -446,6 +446,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();
 
+    // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_init_contract();
+
     // task1：K1 抢占门控（ADR-017）/ K3 内核栈回收 / K2 FPU 隔离
     // （纯表级 + 钩子驱动，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
@@ -784,6 +788,8 @@ fn start_init() -> ! {
         }
     };
     info!("[kmain] init: spawned pid={} from init.elf", pid);
+    // 登记 init PID（PID 1 契约使用）。
+    task::set_init_pid(pid);
     // 启动调度器（永不返回）：进入 init 用户态，tick 轮转，init 经 syscall 退出。
     task::start();
 }

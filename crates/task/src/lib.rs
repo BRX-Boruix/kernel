@@ -19,8 +19,8 @@ pub use process::{
 };
 pub use scheduler::{
     SwitchOutcome, Waited, block_current, block_current_with, block_for_kbd, exit_current,
-    get_process_snapshot, kill_pid, process_snapshots, ps_snapshot, spawn, spawn_with_ppid,
-    start, tick, waitpid, wake, wake_kbd, yield_now,
+    get_process_snapshot, init_pid, kill_pid, process_snapshots, ps_snapshot, set_init_pid,
+    spawn, spawn_with_ppid, start, tick, waitpid, wake, wake_kbd, yield_now,
 };
 #[cfg(feature = "kernel-tests")]
 pub use scheduler::test_hooks;

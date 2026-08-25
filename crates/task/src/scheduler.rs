@@ -73,6 +73,11 @@ pub const TIMESLICE_TICKS: usize = 10;
 #[cfg(feature = "real-hw")]
 pub const TIMESLICE_TICKS: usize = 1;
 
+/// `TASK_WAIT(target=WAIT_ANY)` 哨兵：等待任意子进程退出（不限 pid）。
+/// 与 ADR-014 既有 `target==0→yield/sleep` 语义零冲突，
+/// `usize::MAX` 不可能是合法 pid（单调递增，物理不可达）。
+pub const WAIT_ANY: usize = usize::MAX;
+
 /// 单进程槽：进程对象 + 被中断时的完整帧 + 独立内核栈顶。
 struct ProcEntry {
     /// 进程控制块（含独立用户地址空间、上下文）。
@@ -203,6 +208,20 @@ impl Scheduler {
 }
 
 static SCHED: IrqSpinLock<Scheduler> = IrqSpinLock::new(Scheduler::new());
+
+/// 生产 init 进程的 PID（由 `start_init` 在 spawn 后登记）。
+/// 测试模式经 `test_hooks::reset_all` 复位为 0。`0` = 未登记（不保护）。
+static INIT_PID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 登记 init 进程的 PID。必须在 `start_init` 中 spawn init 后立即调用。
+pub fn set_init_pid(pid: usize) {
+    INIT_PID.store(pid, core::sync::atomic::Ordering::Release);
+}
+
+/// 返回已登记的 init 进程 PID；`0` 表示未登记（测试模式或未初始化）。
+pub fn init_pid() -> usize {
+    INIT_PID.load(core::sync::atomic::Ordering::Acquire)
+}
 
 /// 构造"初始中断帧"（模拟进程首次被调度前的中断保存点，供首次从 saved 恢复）。
 fn initial_frame(entry_rip: u64, user_stack_top: u64) -> InterruptFrame {
@@ -812,7 +831,9 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
         false
     } else {
         let ps = s.procs[ppid].as_mut().expect("parent reapable");
-        if ps.proc.state() == TaskState::Blocked && ps.waiting_for == Some(pid) {
+        if ps.proc.state() == TaskState::Blocked
+            && (ps.waiting_for == Some(pid) || ps.waiting_for == Some(WAIT_ANY))
+        {
             // 交付：退出码即 syscall 成功返回值（pack_ok(code) == code），
             // 直接写进父的保存帧 rax——父被调度回来 iretq 后用户态即刻拿到。
             ps.waiting_for = None;
@@ -852,6 +873,22 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
             }
         }
     }
+
+    // 孤儿过继：本进程的存活子女过继给 init（使它们有明确的收尸人）。
+    // 仅当 init 已登记且不是本进程自身时才执行（避免自指）。
+    let init = INIT_PID.load(core::sync::atomic::Ordering::Acquire);
+    if init != 0 && init != pid {
+        for i in 0..s.procs.len() {
+            if matches!(&s.procs[i], Some(e)
+                if e.ppid == pid && e.proc.state() != TaskState::Exit)
+            {
+                if let Some(slot) = s.procs[i].as_mut() {
+                    slot.ppid = init;
+                }
+            }
+        }
+    }
+
     outcome
 }
 
@@ -912,21 +949,43 @@ fn waitpid_inner(
     target_pid: usize,
     mut frame: Option<&mut InterruptFrame>,
 ) -> Result<Waited, Error> {
-    if target_pid == 0 || target_pid >= s.procs.len() {
-        return Err(Error::NotFound);
-    }
-    // 只能等待自己的直接子进程；pid 不复用 ⇒ 槽位索引即 pid。
-    let is_mine = matches!(s.procs.get(target_pid), Some(Some(e)) if e.ppid == cur);
-    if !is_mine {
-        return Err(Error::NotFound);
+    // ---- WAIT_ANY（等待任意子进程）分支 ----
+    if target_pid == WAIT_ANY {
+        // 1. 扫描所有子进程，如有 zombie 则收割（取第一个）。
+        for i in 0..s.procs.len() {
+            if matches!(&s.procs[i], Some(e)
+                if e.ppid == cur && e.proc.state() == TaskState::Exit)
+            {
+                let code = reap_child_locked(s, cur, i).expect("zombie confirmed");
+                return Ok(Waited::Code(code));
+            }
+        }
+        // 2. 无 zombie：检查是否至少有一个子进程存在。
+        let has_children = s.procs.iter().any(|p| {
+            matches!(p, Some(e) if e.ppid == cur)
+        });
+        if !has_children {
+            return Err(Error::NotFound); // 无子进程 = ECHILD 等价
+        }
+        // 3. 有子进程但无 zombie → 走阻塞路径（哨兵标记 WAIT_ANY）。
+    } else {
+        // ---- 单目标（既有）分支 ----
+        if target_pid == 0 || target_pid >= s.procs.len() {
+            return Err(Error::NotFound);
+        }
+        // 只能等待自己的直接子进程。
+        let is_mine = matches!(s.procs.get(target_pid), Some(Some(e)) if e.ppid == cur);
+        if !is_mine {
+            return Err(Error::NotFound);
+        }
+        if let Some(code) = reap_child_locked(s, cur, target_pid) {
+            return Ok(Waited::Code(code)); // zombie 同步收尸
+        }
     }
 
-    if let Some(code) = reap_child_locked(s, cur, target_pid) {
-        return Ok(Waited::Code(code)); // zombie 同步收尸
-    }
-
-    // 子进程仍在运行：真阻塞。先确认有其他**就绪**进程可接盘 CPU
-    // （Blocked/Exit 同伴都接不了盘），否则拒绝阻塞避免自锁。
+    // 阻塞等待（WAIT_ANY 与单目标共用阻塞逻辑）。
+    // 等待目标：WAIT_ANY 或具体 pid。
+    let wait_for = if target_pid == WAIT_ANY { WAIT_ANY } else { target_pid };
     let others_ready = s.ready.iter().any(|&p| {
         p != cur && matches!(s.procs.get(p), Some(Some(e)) if e.proc.state() == TaskState::Ready)
     });
@@ -942,7 +1001,7 @@ fn waitpid_inner(
     }
     {
         let slot = s.procs[cur].as_mut().expect("current proc exists");
-        slot.waiting_for = Some(target_pid);
+        slot.waiting_for = Some(wait_for);
         slot.proc.set_state(TaskState::Blocked);
         // 占位 rax 随 saved 保存；真实退出码由子进程终止路径覆写。
         // 测试钩子形态（frame=None）不保存帧：saved 保持初始值，交付路径覆写。
@@ -989,6 +1048,10 @@ fn pop_ready_filtered(s: &mut Scheduler, exclude: usize) -> Option<usize> {
 pub fn exit_current(frame: &mut InterruptFrame, code: u64) {
     let mut s = SCHED.lock();
     let cur_pid = s.current.expect("exit called outside process");
+    // PID 1 契约：init 不得退出（自杀即 panic）。
+    if cur_pid == init_pid() {
+        panic!("attempted to kill init (self-exit pid={})", cur_pid);
+    }
     let _ = terminate_locked(&mut s, cur_pid, code);
     s.current = None;
     clear_current_proc();
@@ -1087,6 +1150,7 @@ pub fn process_snapshots() -> Vec<vfs::ProcessSnapshot> {
                 pid,
                 name: alloc::string::String::from(entry_name(e)),
                 state: alloc::string::String::from(state_str),
+                ppid: e.ppid,
                 // C1.2：真实记账值来自该进程地址空间的区域账本，O(区域数)。
                 memory_bytes: e.proc.addr_space().declared_bytes(),
             });
@@ -1107,6 +1171,7 @@ pub fn get_process_snapshot(pid: usize) -> Option<vfs::ProcessSnapshot> {
         pid,
         name: alloc::string::String::from(entry_name(entry)),
         state: alloc::string::String::from(state_str),
+        ppid: entry.ppid,
         memory_bytes: entry.proc.addr_space().declared_bytes(),
     })
 }
@@ -1136,10 +1201,19 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
         if sig == 0 {
             return Ok(0); // 对自己探活
         }
+        // PID 1 契约：init 自杀被显式拒绝（exit_current 中会 panic，
+        // 此处先返回错误，避免 panic 对用户态进程的冲击）。
+        if target == init_pid() {
+            return Err(Error::PermissionDenied);
+        }
         // 自杀：走标准退出路径（zombie 化并切换）。exit_current 内部自行加锁，
         // 故此处不持锁调用。
         exit_current(frame, sig as u64);
         // 不返回
+    }
+    // PID 1 契约：禁止向他杀 init（探活 sig=0 放行）。
+    if target == init_pid() && sig != 0 {
+        return Err(Error::PermissionDenied);
     }
     // 校验目标存在且非 zombie。
     let mut s = SCHED.lock();
@@ -1227,8 +1301,8 @@ pub mod test_hooks {
         spawn_with_ppid(ppid, name, 0x1000, 0x5000, dummy_space()?)
     }
 
-    /// 进程状态探针：(状态, 名称, waiting_for, saved.rax)。名称为 PCB 缓冲拷贝。
-    pub fn probe(pid: usize) -> Option<(TaskState, alloc::string::String, Option<usize>, u64)> {
+    /// 进程状态探针：(状态, 名称, waiting_for, saved.rax, ppid)。名称为 PCB 缓冲拷贝。
+    pub fn probe(pid: usize) -> Option<(TaskState, alloc::string::String, Option<usize>, u64, usize)> {
         let s = SCHED.lock();
         s.procs.get(pid).and_then(|p| p.as_ref()).map(|e| {
             (
@@ -1236,6 +1310,7 @@ pub mod test_hooks {
                 alloc::string::String::from(entry_name(e)),
                 e.waiting_for,
                 e.saved.rax,
+                e.ppid,
             )
         })
     }
@@ -1277,6 +1352,13 @@ pub mod test_hooks {
         waitpid_inner(&mut s, parent, target, None)
     }
 
+    /// WAIT_ANY 等价：等待任意子进程。
+    /// 编译期仅当 `kernel-tests` 启用，与 `kernel-test-waitpid` 停机验收路径无关。
+    pub fn wait_any(parent: usize) -> Result<Waited, Error> {
+        let mut s = SCHED.lock();
+        waitpid_inner(&mut s, parent, WAIT_ANY, None)
+    }
+
     /// 清空全部测试进程，返回清除数量（防跨测试泄漏；next_pid 保持单调）。
     ///
     /// task1 KD3：同步复位 `KBD_WAITER`——否则上一个用例登记的键盘等待者
@@ -1300,6 +1382,7 @@ pub mod test_hooks {
         drop(s);
         drain_dead_kstacks();
         clear_current_proc();
+        INIT_PID.store(0, core::sync::atomic::Ordering::Release);
         n
     }
 
