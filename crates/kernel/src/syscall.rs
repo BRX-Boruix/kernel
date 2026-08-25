@@ -557,8 +557,8 @@ fn sys_read(frame: &mut InterruptFrame) -> DispatchResult {
 ///
 /// ABI（libsys nr.rs `task_spawn`）：`prog` 为用户态路径字符串指针；仅
 /// [`BUILTIN_INDEX_INIT`] / [`BUILTIN_INDEX_SHELL`] 两个小整数被解释为内建
-/// 程序索引，映射到 `/binaries/init.elf` / `/binaries/shell.elf`。ELF 数据
-/// 来自 VFS `/binaries`：构建期内置 liveCD payload 垫底，外部盘 EXT2 挂载
+/// 程序索引，映射到 `/programs/init.elf` / `/programs/shell.elf`。ELF 数据
+/// 来自 VFS `/programs`：构建期内置 liveCD payload 垫底，外部盘 EXT2 挂载
 /// 成功后整体覆盖（盘优先，ADR-017）。
 ///
 /// KM3：删除原"小索引 VFS resolve 失败后回退 program_elf(idx)"死亡分支——
@@ -578,7 +578,7 @@ fn sys_exec(frame: &mut InterruptFrame) -> u64 {
     let elf_data: alloc::vec::Vec<u8> = match arg1 {
         BUILTIN_INDEX_INIT | BUILTIN_INDEX_SHELL => {
             // 内建索引走统一双源读取（ADR-017 + read_binary_dual_source）：
-            // 外部盘遮蔽 /binaries 时盘上文件优先；盘中缺失则文件级回退到
+            // 外部盘遮蔽 /programs 时盘上文件优先；盘中缺失则文件级回退到
             // 内置 liveCD payload。与 KM3 无冲突——两源是不同数据载体
             // （VFS/磁盘 vs 内核静态），非同路重复尝试（见 main.rs 该函数注）。
             let (name, builtin) = if arg1 == BUILTIN_INDEX_INIT {

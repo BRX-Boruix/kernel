@@ -2451,7 +2451,7 @@ pub fn test_userspace_elf() {
 /// M6.1：验证 VFS 核心抽象与 RamFS 内存文件系统。
 ///
 /// 覆盖：
-/// 1. 根文件系统目录骨架完整性（/binaries, /config, /system, /users, /temporary, /volumes）。
+/// 1. 根文件系统目录骨架完整性（/programs, /config, /system, /users, /scratch, /volumes）。
 /// 2. 文件创建、句柄流式读写、Seek 与无状态 pread/pwrite。
 /// 3. 子目录创建、嵌套路径解析与目录项枚举（list_dir）。
 /// 4. 软链接创建与目标解析（symlink）。
@@ -2468,13 +2468,13 @@ pub fn test_vfs_m61() {
 
     let root = vfs_init::root();
 
-    // 1. 验证 RESTful 顶层目录骨架
+    // 1. 验证 RESTful 顶层目录骨架（词法规范 v2，ADR-005）
     for dir in &[
-        "/binaries",
+        "/programs",
         "/config",
         "/system",
         "/users",
-        "/temporary",
+        "/scratch",
         "/volumes",
     ] {
         let node = root.resolve(dir, true).expect("resolve skeleton dir");
@@ -2547,19 +2547,142 @@ pub fn test_vfs_m61() {
         INodeType::RegularFile
     );
 
-    // 6. 延迟删除与目录保护
-    root.mkdir("/temporary/trash", Permissions::all())
+    // 6. 延迟删除与目录保护（顺带验证词法 v2 官方短别名 /tmp → /scratch）
+    let tmp_alias = root.resolve("/tmp", true).expect("resolve /tmp alias");
+    assert_eq!(
+        tmp_alias.metadata().expect("meta").node_type,
+        INodeType::Directory,
+        "/tmp must resolve to /scratch through the official symlink"
+    );
+    root.mkdir("/scratch/trash", Permissions::all())
         .expect("mkdir trash");
-    root.create_file("/temporary/trash/item1", Permissions::all())
+    root.create_file("/scratch/trash/item1", Permissions::all())
         .expect("create trash item");
     assert!(
-        root.unlink("/temporary/trash").is_err(),
+        root.unlink("/scratch/trash").is_err(),
         "non-empty dir cannot be unlinked"
     );
-    root.unlink("/temporary/trash/item1").expect("unlink item");
-    root.unlink("/temporary/trash").expect("unlink empty dir");
+    root.unlink("/scratch/trash/item1").expect("unlink item");
+    root.unlink("/scratch/trash").expect("unlink empty dir");
 
     info!("[test-vfs-m61] PASS");
+}
+
+/// 词法规范 v2（ADR-005）命名 linter：把目录命名的词法契约变成可执行测试。
+///
+/// 规则：
+/// 1. 根命名空间的每个条目必须在登记词表 LEXICON 内——新增顶层目录必须先
+///    立字据（词性类别），杜绝 `/temporary` 式形容词名再次混入；
+/// 2. 集合类目录必须是复数可数名词，域类目录必须是单数/物质名词（词表登记
+///    即事实，词表本身受本测试与 ADR-005 文本双重约束）；
+/// 3. 官方短别名（热路径豁免，如 /tmp → /scratch）单列登记，不参与正名词法
+///    检查，但别名目标必须真实存在且为目录。
+///
+/// 未在词表登记的根条目 = 测试失败。想加新顶层目录？先改词表、再写 ADR。
+pub fn test_vfs_lexicon() {
+    use crate::vfs_init;
+    use vfs::inode::INodeType;
+
+    info!("[test-vfs-lexicon] === VFS naming lexicon linter (ADR-005 v2) ===");
+
+    // 登记词表：(名字, 是否集合复数)。false = 域目录（单数/物质名词）。
+    // scratch 是物质名词（临时存储空间，非可枚举实例），归入域目录。
+    const LEXICON: &[(&str, bool)] = &[
+        ("programs", true),
+        ("processes", true),
+        ("devices", true),
+        ("users", true),
+        ("volumes", true),
+        ("config", false),
+        ("system", false),
+        ("scratch", false),
+    ];
+
+    // 官方短别名（热路径豁免）：(别名, 正名)。正名必须存在于 LEXICON。
+    const ALIASES: &[(&str, &str)] = &[("tmp", "scratch")];
+
+    let targets: alloc::vec::Vec<&str> = LEXICON.iter().map(|(n, _)| *n).collect();
+
+    let root = vfs_init::root();
+    let root_inode = root.resolve("/", true).expect("resolve vfs root");
+    let entries = root_inode
+        .list_dir()
+        .expect("list root entries for lexicon check");
+    assert!(
+        !entries.is_empty(),
+        "root must expose skeleton entries to the lexicon linter"
+    );
+
+    for entry in &entries {
+        let name = entry.name.as_str();
+
+        // 官方短别名：验证目标存在即可，不参与词法判定。
+        if let Some((_, target)) = ALIASES.iter().find(|(a, _)| *a == name) {
+            assert!(
+                targets.contains(target),
+                "alias /{name} points to '{target}' which is not in LEXICON"
+            );
+            let node = root
+                .resolve(&alloc::format!("/{name}"), true)
+                .unwrap_or_else(|_| panic!("alias /{name} must resolve"));
+            assert_eq!(
+                node.metadata().expect("alias meta").node_type,
+                INodeType::Directory,
+                "alias /{name} must resolve to a directory"
+            );
+            continue;
+        }
+
+        // 正名：必须在词表中登记。
+        let &(_, is_plural) = LEXICON.iter().find(|(n, _)| *n == name).unwrap_or_else(|| {
+            panic!(
+                "root entry '/{name}' is not in the ADR-005 v2 lexicon; \
+                 register it (with part-of-speech class) or move it under a collection"
+            )
+        });
+
+        // 词法断言：集合类必须是复数名词。用最朴素的机械校验兜底：
+        // 复数集合名以 's' 结尾（当前词表全部满足；域目录豁免）。
+        if is_plural {
+            assert!(
+                name.ends_with('s'),
+                "collection dir '/{name}' must be a plural noun (ADR-005 v2 rule A)"
+            );
+        }
+
+        // 结构断言：根条目必须真的是目录。
+        assert_eq!(
+            entry.node_type,
+            INodeType::Directory,
+            "lexicon entry '/{name}' must be a directory at the root"
+        );
+    }
+
+    // 骨架完整性：词表中的每个名字都必须真实存在于根命名空间
+    // （防止词表与实际骨架漂移——改名忘了同步词表也会在这里爆）。
+    for (name, _) in LEXICON {
+        let node = root
+            .resolve(&alloc::format!("/{name}"), true)
+            .unwrap_or_else(|_| panic!("lexicon entry /{name} missing from root skeleton"));
+        assert_eq!(
+            node.metadata().expect("meta").node_type,
+            INodeType::Directory,
+            "lexicon entry /{name} must be a directory"
+        );
+    }
+    // 别名不得反客为主：正名删除后别名指向悬空是禁止状态。
+    for (alias, target) in ALIASES {
+        assert!(
+            targets.contains(target),
+            "alias /{alias} target invalid ('{target}' must be a canonical lexicon name)"
+        );
+    }
+
+    info!(
+        "[test-vfs-lexicon] PASS ({} lexicon names, {} aliases)",
+        LEXICON.len(),
+        ALIASES.len()
+    );
 }
 
 /// M6.2：验证进程文件描述符表（FD Table）与 IO 域系统调用。
@@ -3395,23 +3518,23 @@ pub fn test_vfs_m64() {
 
     let root = vfs_init::root();
 
-    // 1. 校验 /binaries/init.elf 与 /binaries/shell.elf 存在于 VFS 中
-    // ADR-017（liveCD）：/binaries 总有构建期内置 payload（无盘也能启动）；
+    // 1. 校验 /programs/init.elf 与 /programs/shell.elf 存在于 VFS 中
+    // ADR-017（liveCD）：/programs 总有构建期内置 payload（无盘也能启动）；
     // 持久盘存在时 EXT2 挂载整体覆盖（盘优先），两文件依旧存在。内置
     // payload 缺失即构建错误，直接断言失败——不再有"无盘则跳过"分支。
     let init_node = root
-        .resolve("/binaries/init.elf", true)
-        .expect("liveCD built-in init.elf must exist in /binaries");
+        .resolve("/programs/init.elf", true)
+        .expect("liveCD built-in init.elf must exist in /programs");
     let shell_node = root
-        .resolve("/binaries/shell.elf", true)
-        .expect("liveCD built-in shell.elf must exist in /binaries");
+        .resolve("/programs/shell.elf", true)
+        .expect("liveCD built-in shell.elf must exist in /programs");
 
     let init_meta = init_node.metadata().expect("init meta");
     let shell_meta = shell_node.metadata().expect("shell meta");
     assert!(init_meta.size > 0, "init.elf size must be > 0");
     assert!(shell_meta.size > 0, "shell.elf size must be > 0");
     info!(
-        "[test-vfs-m64] /binaries populated: init.elf ({} bytes), shell.elf ({} bytes)",
+        "[test-vfs-m64] /programs populated: init.elf ({} bytes), shell.elf ({} bytes)",
         init_meta.size, shell_meta.size
     );
 
@@ -3468,7 +3591,7 @@ pub fn test_vfs_m65() {
     let root = vfs_init::root();
 
     // 1. 深层长路径（嵌套 5 层目录、长路径名读写）
-    let mut current_dir = alloc::string::String::from("/temporary");
+    let mut current_dir = alloc::string::String::from("/scratch");
     for i in 0..5 {
         current_dir.push_str(&alloc::format!("/level_{}", i));
         root.mkdir(&current_dir, Permissions::all())
@@ -3487,7 +3610,7 @@ pub fn test_vfs_m65() {
     info!("[test-vfs-m65] deep path read/write OK");
 
     // 2. 16KB 文件读写与 Page Cache 跨页/大页直通命中
-    let big_path = "/temporary/big_payload.dat";
+    let big_path = "/scratch/big_payload.dat";
     let big_node = root
         .create_file(big_path, Permissions::read_write())
         .expect("create big file");
@@ -3516,7 +3639,7 @@ pub fn test_vfs_m65() {
     info!("[test-vfs-m65] 16KB file IO and PageCache cache hit OK");
 
     // 3. 文件被打开状态下 unlink 的生命周期验证（延迟释放）
-    let unlinked_path = "/temporary/open_and_delete.txt";
+    let unlinked_path = "/scratch/open_and_delete.txt";
     let open_node = root
         .create_file(unlinked_path, Permissions::read_write())
         .expect("create open file");

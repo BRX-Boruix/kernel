@@ -4,7 +4,9 @@
 extern crate alloc;
 
 // liveCD 内置用户程序 payload（SDK 构建生成，ADR-017）：无外部盘时
-// 内核用其填充 /binaries 完成启动；外部盘挂载后整体覆盖（盘优先）。
+// 内核用其填充 /programs 完成启动；外部盘挂载后整体覆盖（盘优先）。
+// 模块名 `binaries_payload` 为 SDK 生成产物契约名（见 sdk_build/build.py），
+// 沿用历史命名，用户态可见路径一律是 /programs。
 mod binaries_payload;
 mod acpi;
 mod drivers;
@@ -423,6 +425,9 @@ unsafe fn kmain_body() -> ! {
     // 运行 M6.1 / M6.2 / M6.3 / M6.4 / M6.5 VFS 自检测试（在 kernel-tests feature 启用时）。
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m61();
+    // 词法规范 v2（ADR-005）命名 linter：根命名空间词表契约。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_vfs_lexicon();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m62();
     #[cfg(feature = "kernel-tests")]
@@ -671,12 +676,12 @@ fn init_display() {
     info!("[display] terminal init returned");
 }
 
-/// 从 /binaries/<name> 经 VFS 读出完整文件内容；任何失败返回 None（可见、不伪造）。
+/// 从 /programs/<name> 经 VFS 读出完整文件内容；任何失败返回 None（可见、不伪造）。
 /// KM3：原 program_elf(idx) 已删除——它与 sys_exec 小索引模式解析同一路径，
 /// 回退链是死亡分支；内建程序加载统一走 sys_exec 的 VFS 路径。
-pub fn read_binary_from_binaries(name: &str) -> Option<alloc::vec::Vec<u8>> {
+pub fn read_binary_from_programs(name: &str) -> Option<alloc::vec::Vec<u8>> {
     let root = crate::vfs_init::root();
-    let path = alloc::format!("/binaries/{}", name);
+    let path = alloc::format!("/programs/{}", name);
     let node = root.resolve(&path, true).ok()?;
     let size = node.metadata().ok()?.size as usize;
     if size == 0 {
@@ -688,7 +693,7 @@ pub fn read_binary_from_binaries(name: &str) -> Option<alloc::vec::Vec<u8>> {
     // 显式报错（错误可见），绝不静默截断后把残缺镜像喂给 ELF 加载器。
     if n != size {
         klib::error!(
-            "[binaries] short read on {}: metadata size={} but device returned {}",
+            "[programs] short read on {}: metadata size={} but device returned {}",
             path,
             size,
             n
@@ -698,23 +703,23 @@ pub fn read_binary_from_binaries(name: &str) -> Option<alloc::vec::Vec<u8>> {
     Some(buf)
 }
 
-/// ADR-017 双源读取：先经 VFS `/binaries/<name>` 读取（外部盘挂载时读到
+/// ADR-017 双源读取：先经 VFS `/programs/<name>` 读取（外部盘挂载时读到
 /// 盘内容，盘优先）；VFS 不可得（盘遮蔽但盘中缺该文件 / 无盘但 payload
 /// 缺失）时回退到构建期内置 liveCD payload。两源皆缺返回 None。
 ///
-/// 这不是 KM3 禁止的"同路重试"：KM3 删的是"同一 /binaries 路径 resolve
+/// 这不是 KM3 禁止的"同路重试"：KM3 删的是"同一 /programs 路径 resolve
 /// 两次"的死亡分支（必然同样失败）；此处两源是**不同数据载体**（VFS/
 /// 磁盘 vs 内核静态内存），回退有真实语义。回退经 warn 日志如实披露
 /// （S10：来源不捏造、不静默）。
 pub fn read_binary_dual_source(name: &str, builtin: &'static [u8]) -> Option<alloc::vec::Vec<u8>> {
-    if let Some(v) = read_binary_from_binaries(name) {
+    if let Some(v) = read_binary_from_programs(name) {
         return Some(v);
     }
     if builtin.is_empty() {
         return None;
     }
     klib::warn!(
-        "[binaries] {} unavailable via /binaries; falling back to built-in liveCD payload ({} bytes)",
+        "[programs] {} unavailable via /programs; falling back to built-in liveCD payload ({} bytes)",
         name,
         builtin.len()
     );
@@ -745,17 +750,17 @@ fn start_init() -> ! {
 
     info!("[kmain] booting user init (PID 1) ...");
     // ADR-017（liveCD）：init.elf 双源——构建期内置 payload 垫底（ramfs
-    // /binaries，无盘可启动）；外部盘（disk.img → ATA → MBR → EXT2）挂载
+    // /programs，无盘可启动）；外部盘（disk.img → ATA → MBR → EXT2）挂载
     // 成功后将其遮蔽（盘优先），盘中缺失该文件时经 read_binary_dual_source
     // 文件级回退内置（数据盘插上不会搞挂 liveCD）。两源皆缺才失败并 idle
     // 停机（错误可见、不 panic）。
     let Some(elf_bytes) = read_binary_dual_source("init.elf", crate::binaries_payload::INIT_ELF) else {
-        error!("[kmain] init: /binaries/init.elf unavailable (neither built-in liveCD payload nor external disk)");
+        error!("[kmain] init: /programs/init.elf unavailable (neither built-in liveCD payload nor external disk)");
         info!("[kmain] reached idle loop");
         CurrentArch::halt();
     };
     info!(
-        "[kmain] init: loaded {} bytes of init.elf from /binaries",
+        "[kmain] init: loaded {} bytes of init.elf from /programs",
         elf_bytes.len()
     );
 

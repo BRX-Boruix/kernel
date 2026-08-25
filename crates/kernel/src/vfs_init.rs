@@ -492,10 +492,11 @@ pub fn init() {
     let ramfs = Arc::new(RamFS::new());
     let mount_table = Arc::new(MountTable::new(ramfs));
 
-    // 构建默认顶层骨架（全称 RESTful 集合）
+    // 构建默认顶层骨架（词法规范 v2，ADR-005：集合目录用复数名词，
+    // 域目录用单数物质名词，禁止形容词/缩写）
     mount_table
-        .mkdir("/binaries", Permissions::all())
-        .expect("mkdir /binaries");
+        .mkdir("/programs", Permissions::all())
+        .expect("mkdir /programs");
     mount_table
         .mkdir("/config", Permissions::all())
         .expect("mkdir /config");
@@ -512,11 +513,17 @@ pub fn init() {
         .mkdir("/users", Permissions::all())
         .expect("mkdir /users");
     mount_table
-        .mkdir("/temporary", Permissions::all())
-        .expect("mkdir /temporary");
+        .mkdir("/scratch", Permissions::all())
+        .expect("mkdir /scratch");
     mount_table
         .mkdir("/volumes", Permissions::all())
         .expect("mkdir /volumes");
+
+    // 词法规范 v2 热路径豁免：官方短别名 `/tmp` → 正名 `/scratch`。
+    // 符号链接长期稳定存在，但文档与代码主路径一律写正名。
+    mount_table
+        .symlink("/scratch", "/tmp")
+        .expect("symlink /tmp -> /scratch");
 
     // 挂载特殊文件系统
     let procfs = Arc::new(ProcFS::new(Arc::new(KernelProcessProvider)));
@@ -530,33 +537,33 @@ pub fn init() {
     let devfs = Arc::new(DevFS::new(Arc::new(KernelDeviceProvider)));
     mount_table.mount("/devices", devfs).expect("mount devfs");
 
-    // ADR-017（liveCD 回归）：先以构建期内置 payload 填充 ramfs /binaries
+    // ADR-017（liveCD 回归）：先以构建期内置 payload 填充 ramfs /programs
     // （无外部盘也可启动），随后尝试挂载外部盘 EXT2 —— 挂载成功即整体覆盖
-    // 内置（盘优先，U 盘上放新版/测试程序可生效）。两源皆缺时 /binaries
+    // 内置（盘优先，U 盘上放新版/测试程序可生效）。两源皆缺时 /programs
     // 保持空目录，init 加载将显式失败并可见，绝不伪造成功。
-    populate_builtin_binaries(&mount_table);
-    let disk_mounted = try_mount_ext2_binaries(&mount_table);
+    populate_builtin_programs(&mount_table);
+    let disk_mounted = try_mount_ext2_programs(&mount_table);
 
     VFS_ROOT.call_once(|| mount_table);
     if disk_mounted {
         klib::info!(
-            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /binaries = EXT2 (external disk overrides built-in)"
+            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /programs = EXT2 (external disk overrides built-in)"
         );
     } else {
         klib::info!(
-            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /binaries = built-in liveCD payload (no external disk)"
+            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /programs = built-in liveCD payload (no external disk)"
         );
     }
 }
 
 /// liveCD 基线：把构建期嵌入的用户程序 payload（SDK 生成 `binaries_payload.rs`）
-/// 写入 ramfs `/binaries`——无外部盘时系统仍可启动（ADR-017）。外部盘随后
-/// 经 [`try_mount_ext2_binaries`] 挂载时以 mount 语义整体覆盖（盘优先）。
+/// 写入 ramfs `/programs`——无外部盘时系统仍可启动（ADR-017）。外部盘随后
+/// 经 [`try_mount_ext2_programs`] 挂载时以 mount 语义整体覆盖（盘优先）。
 /// 任一写入失败如实报错并继续（残留部分 payload 会使 init 加载失败可见，
 /// 不静默伪装成功）。
-fn populate_builtin_binaries(mount_table: &Arc<vfs::mount::MountTable>) {
+fn populate_builtin_programs(mount_table: &Arc<vfs::mount::MountTable>) {
     for p in crate::binaries_payload::PAYLOADS {
-        let path = alloc::format!("/binaries/{}", p.name);
+        let path = alloc::format!("/programs/{}", p.name);
         let node = match mount_table.create_file(&path, Permissions::readonly()) {
             Ok(n) => n,
             Err(e) => {
@@ -604,14 +611,14 @@ impl fs::ByteDevice for DrvByteBridge {
     }
 }
 
-/// 尝试从注册表的持久块设备挂载 EXT2 到 /binaries（C13.1+C13.2+#13）。
+/// 尝试从注册表的持久块设备挂载 EXT2 到 /programs（C13.1+C13.2+#13）。
 ///
 /// 链路：DriverHub → volatile 拒载（C13.2 前置条件）→ MBR 首分区 →
 /// EXT2 超级块校验 → mount。**单设备失败只淘汰该设备**（KM10 修复：原实现
 /// 在 volatile/短读/MBR 失败时直接 `return false`，放弃全部后续候选——一旦
 /// 未来出现"第一块易失 + 第二块持久"的注册顺序，持久盘将被静默跳过），
 /// 全部候选耗尽才返回 false 并留下可见日志，绝不伪造挂载成功。
-fn try_mount_ext2_binaries(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
+fn try_mount_ext2_programs(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
     let count = drv::DriverHub::device_count();
     for i in 0..count {
         let Some(info) = drv::DriverHub::device_info_at(i) else {
@@ -663,10 +670,10 @@ fn try_mount_ext2_binaries(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
                 continue;
             }
         };
-        match mount_table.mount("/binaries", Arc::new(ext2)) {
+        match mount_table.mount("/programs", Arc::new(ext2)) {
             Ok(()) => {
                 klib::info!(
-                    "[ext2] mounted '{}' partition start_lba={} at /binaries (read-only)",
+                    "[ext2] mounted '{}' partition start_lba={} at /programs (read-only)",
                     name,
                     part.start_lba
                 );
@@ -674,7 +681,7 @@ fn try_mount_ext2_binaries(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
             }
             // mount 点被占等全局性失败与设备无关，直接终止。
             Err(e) => {
-                klib::error!("[ext2] mount /binaries failed: {:?}", e);
+                klib::error!("[ext2] mount /programs failed: {:?}", e);
                 return false;
             }
         }

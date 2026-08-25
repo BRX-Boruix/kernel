@@ -71,7 +71,7 @@ mod tests {
             .mkdir("/config", Permissions::all())
             .expect("mkdir");
         mount_table
-            .mkdir("/binaries", Permissions::all())
+            .mkdir("/programs", Permissions::all())
             .expect("mkdir");
 
         // 创建文件
@@ -485,10 +485,10 @@ mod tests {
     fn test_page_cache_2m_and_4k_eviction() {
         let ramfs = Arc::new(RamFS::new());
         let mount_table = Arc::new(MountTable::new(ramfs));
-        mount_table.mkdir("/binaries", Permissions::all()).unwrap();
+        mount_table.mkdir("/programs", Permissions::all()).unwrap();
 
         let file = mount_table
-            .create_file("/binaries/app.elf", Permissions::read_write())
+            .create_file("/programs/app.elf", Permissions::read_write())
             .unwrap();
 
         // 写入一段 2MB+ 的数据
