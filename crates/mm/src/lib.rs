@@ -5,7 +5,7 @@
 //! - 虚拟内存：页表抽象（经 arch 层）与地址空间
 //!
 //! 地址类型（`PhysAddr`/`VirtAddr`/`PhysFrame`）定义在 `arch` 抽象层，
-//! 使用方请从 `arch` 直接引入。
+//! `mm` 经 re-export 供外部使用（ADR-009-11）。
 
 #![no_std]
 
@@ -14,6 +14,8 @@ extern crate alloc;
 pub mod frame_allocator;
 pub mod mapper;
 pub mod user_space;
+
+pub use arch::{PhysAddr, PhysFrame, VirtAddr};
 
 pub use frame_allocator::{
     CRITICAL_RESERVE_CAP_PAGES, FRAME_SIZE_BYTES, HUGE_FRAME_SIZE_BYTES, FrameAllocatorStats,
