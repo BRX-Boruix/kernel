@@ -1239,4 +1239,55 @@ mod tests {
         assert_eq!(fs.read_inode(0), Err(Ext2Error::BadInode));
         assert_eq!(fs.read_inode(999999), Err(Ext2Error::BadInode));
     }
+
+    #[test]
+    fn test_ext2_read_at_eof_returns_zero() {
+        use vfs::inode::INode;
+        let (fs, hello, _) = open_fs();
+        let root = FileSystem::root(&fs);
+        let node = root.lookup("hello.txt").expect("present");
+        let meta = node.metadata().unwrap();
+        assert_eq!(meta.size, hello.len() as u64);
+        // offset >= size：EOF 语义 = 返回 0，绝不越界读。
+        let mut buf = [0xAAu8; 16];
+        let n = node
+            .read_at(hello.len() as u64 + 100, &mut buf)
+            .expect("EOF read is Ok(0)");
+        assert_eq!(n, 0, "read past EOF must return 0");
+    }
+
+    #[test]
+    fn test_ext2_read_crossing_eof_truncates() {
+        use vfs::inode::INode;
+        let (fs, hello, _) = open_fs();
+        let root = FileSystem::root(&fs);
+        let node = root.lookup("hello.txt").expect("present");
+        // 窗口从 'size-4' 开始、宽 16：只能读到尾部 4 字节，剩余按短读截断。
+        let mut buf = [0xAAu8; 16];
+        let n = node
+            .read_at(hello.len() as u64 - 4, &mut buf)
+            .expect("partial read is Ok");
+        assert_eq!(n, 4, "crossing-EOF read returns only available bytes");
+        assert_eq!(&buf[..4], &hello[hello.len() - 4..]);
+    }
+
+    #[test]
+    fn test_ext2_list_dir_on_regular_file_rejected() {
+        use vfs::inode::INode;
+        let (fs, _, _) = open_fs();
+        let root = FileSystem::root(&fs);
+        let node = root.lookup("hello.txt").expect("regular file present");
+        assert_eq!(node.list_dir().map(|_| ()).unwrap_err(), Error::NotDirectory);
+    }
+
+    #[test]
+    fn test_ext2_read_dir_as_file_rejected() {
+        use vfs::inode::INode;
+        let (fs, _, _) = open_fs();
+        let root = FileSystem::root(&fs);
+        // 根目录的 read_at 必须如实返回 IsDirectory——数据区只有目录项，
+        // 按字节读读出的是一堆无意义的结构编码，绝不能伪装成文件内容。
+        let mut buf = [0u8; 16];
+        assert_eq!(root.read_at(0, &mut buf).map(|_| ()).unwrap_err(), Error::IsDirectory);
+    }
 }
