@@ -23,6 +23,17 @@ pub struct DynamicFileNode {
     perms: Permissions,
 }
 
+/// 手写 Debug（D5 / ADR-023 §7）：安全摘要，不调用生成器/写入器。
+impl core::fmt::Debug for DynamicFileNode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DynamicFileNode")
+            .field("has_generator", &self.generator.is_some())
+            .field("has_writer", &self.writer.is_some())
+            .field("perms", &self.perms)
+            .finish()
+    }
+}
+
 impl DynamicFileNode {
     /// 创建只读动态节点（每次读取调用 generator 生成实时内容）。
     pub fn read_only<F>(generator: F) -> Self
@@ -125,6 +136,16 @@ impl INode for DynamicFileNode {
 pub struct DynamicDirNode {
     entries: RwLock<Vec<(alloc::string::String, Arc<dyn INode>)>>,
     perms: Permissions,
+}
+
+/// 手写 Debug（D5 / ADR-023 §7）：安全摘要，不枚举目录项内容。
+impl core::fmt::Debug for DynamicDirNode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DynamicDirNode")
+            .field("entry_count", &self.entries.read().len())
+            .field("perms", &self.perms)
+            .finish()
+    }
 }
 
 impl DynamicDirNode {

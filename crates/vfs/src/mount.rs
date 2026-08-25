@@ -47,6 +47,16 @@ pub struct MountTable {
     mounts: RwLock<BTreeMap<String, Arc<dyn FileSystem>>>,
 }
 
+/// 手写 Debug（D5 / ADR-023 §7）：安全摘要，不遍历内部数据。
+impl core::fmt::Debug for MountTable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MountTable")
+            .field("root_fs", &self.root_fs.name())
+            .field("mount_count", &self.mounts.read().len())
+            .finish()
+    }
+}
+
 impl MountTable {
     pub fn new(root_fs: Arc<dyn FileSystem>) -> Self {
         Self {

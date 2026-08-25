@@ -104,6 +104,19 @@ pub struct PageCache {
     evictions: AtomicUsize,
 }
 
+/// 手写 Debug（D5 / ADR-023 §7）：安全摘要，不倾倒缓存内容字节。
+impl core::fmt::Debug for PageCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageCache")
+            .field("pages_4k_count", &self.pages_4k.read().len())
+            .field("pages_huge_count", &self.pages_huge.read().len())
+            .field("hits", &self.hits)
+            .field("misses", &self.misses)
+            .field("evictions", &self.evictions)
+            .finish()
+    }
+}
+
 impl PageCache {
     pub fn new() -> Self {
         Self {
