@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "drv"
+name = "driver"
 version = "0.1.0"
 dependencies = [
  "arch-x86_64",
@@ -67,7 +67,7 @@ version = "0.1.0"
 dependencies = [
  "arch",
  "arch-x86_64",
- "drv",
+ "driver",
  "fs",
  "ipc",
  "klib",
@@ -185,7 +185,7 @@ version = "0.1.0"
 dependencies = [
  "arch",
  "arch-x86_64",
- "drv",
+ "driver",
  "klib",
  "mm",
  "vfs",

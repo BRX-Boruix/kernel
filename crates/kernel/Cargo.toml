@@ -40,7 +40,7 @@ kernel-test-waitpid = ["kernel-tests"]
 [dependencies]
 limine = { version = "0.1", features = ["requests-section"] }
 klib = { path = "../klib" }
-drv = { path = "../drv" }
+driver = { path = "../driver" }
 fs = { path = "../fs" }
 arch = { path = "../arch/arch" }
 arch-x86_64 = { path = "../arch/arch-x86_64" }

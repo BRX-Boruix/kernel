@@ -19,5 +19,5 @@ klib = { path = "../klib" }
 arch = { path = "../arch/arch" }
 arch-x86_64 = { path = "../arch/arch-x86_64" }
 mm = { path = "../mm" }
-drv = { path = "../drv" }
+driver = { path = "../driver" }
 vfs = { path = "../vfs" }
