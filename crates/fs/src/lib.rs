@@ -16,7 +16,7 @@ pub mod mbr;
 
 /// 块设备字节读后端最小抽象。
 ///
-/// 语义对齐 drv::IoDevice::read_at：返回实际读取字节数，短读/越界返回
+/// 语义对齐 driver::IoDevice::read_at：返回实际读取字节数，短读/越界返回
 /// 少于请求值或 0。fs 层据此实现重试与边界判定，绝不假设请求必然满足。
 pub trait ByteDevice: Send + Sync {
     fn read_bytes(&self, offset: u64, out: &mut [u8]) -> usize;

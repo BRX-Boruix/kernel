@@ -6,7 +6,7 @@ members = [
     "crates/mm",
     "crates/arch/arch",
     "crates/arch/arch-x86_64",
-    "crates/drv",
+    "crates/driver",
     "crates/fs",
     "crates/vfs",
     "crates/task",

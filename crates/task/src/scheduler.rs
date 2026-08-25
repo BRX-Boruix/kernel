@@ -846,14 +846,14 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
     };
 
     let outcome = if !parent_reapable(s, ppid) {
-        drv::uio_on_process_exit(pid);
+        driver::uio_on_process_exit(pid);
         if let Some(e) = s.procs[pid].take() {
             retire_entry(e);
         }
         Termination::Reclaimed
     } else if deliver {
         s.ready.push_back(ppid);
-        drv::uio_on_process_exit(pid);
+        driver::uio_on_process_exit(pid);
         if let Some(e) = s.procs[pid].take() {
             retire_entry(e);
         }
@@ -867,7 +867,7 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
         let orphan_zombie = matches!(&s.procs[i], Some(e)
             if e.ppid == pid && e.proc.state() == TaskState::Exit);
         if orphan_zombie {
-            drv::uio_on_process_exit(i);
+            driver::uio_on_process_exit(i);
             if let Some(e) = s.procs[i].take() {
                 retire_entry(e);
             }
@@ -906,7 +906,7 @@ fn reap_child_locked(s: &mut Scheduler, cur: usize, child: usize) -> Option<u64>
         return None;
     }
     let code = s.procs[child].as_ref().map(|e| e.exit_code).unwrap_or(0);
-    drv::uio_on_process_exit(child);
+    driver::uio_on_process_exit(child);
     if let Some(e) = s.procs[child].take() {
         retire_entry(e);
     }
@@ -1370,7 +1370,7 @@ pub mod test_hooks {
         let mut n = 0;
         for i in 0..s.procs.len() {
             if let Some(e) = s.procs[i].take() {
-                drv::uio_on_process_exit(i);
+                driver::uio_on_process_exit(i);
                 // 哑进程栈未被任何执行流触碰：就地归还安全且确定。
                 mm::deallocate_frame(e.kstack_frames);
                 n += 1;

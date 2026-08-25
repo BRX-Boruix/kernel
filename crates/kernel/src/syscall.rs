@@ -882,7 +882,7 @@ fn sys_driver_register(frame: &mut InterruptFrame) -> u64 {
     };
     // KA4：注册即唯一认领声明——签名不再携带 MMIO 坐标（设备物理资源是
     // 内核登记事实，不是用户可自报字段）。
-    match drv::uio_register_driver(pid, dev_name) {
+    match driver::uio_register_driver(pid, dev_name) {
         Ok(id) => pack_ok(id as u64),
         Err(e) => pack_err(e),
     }
@@ -903,7 +903,7 @@ fn sys_driver_claim(frame: &mut InterruptFrame) -> u64 {
     let _size = frame.rdx;
     let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
     // 授权半程：id 存在性 + 归属校验。
-    if let Err(e) = drv::uio_claim_device(uio_id, pid) {
+    if let Err(e) = driver::uio_claim_device(uio_id, pid) {
         klib::info!(
             "[uio] driver_claim({}) denied for pid={}: {:?}",
             uio_id,
@@ -913,7 +913,7 @@ fn sys_driver_claim(frame: &mut InterruptFrame) -> u64 {
         return pack_err(e);
     }
     // 从登记表取该设备（= 认领的设备名）的真实 MMIO 窗口。
-    let Some((phys, len)) = drv::uio_device_window_of(uio_id) else {
+    let Some((phys, len)) = driver::uio_device_window_of(uio_id) else {
         klib::info!(
             "[uio] driver_claim({}) authorized but device publishes no MMIO window",
             uio_id

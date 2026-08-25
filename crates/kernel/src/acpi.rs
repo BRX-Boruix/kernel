@@ -1,7 +1,7 @@
 //! ACPI 表解析接线（T6）：把 ACPI 子系统登记到设备/驱动框架 DriverHub。
 
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, Ordering};
-use drv::{BusType, DeviceInfo, DeviceKind, DriverHub};
+use driver::{BusType, DeviceInfo, DeviceKind, DriverHub};
 use klib::info;
 
 /// RSDP 版本（0 = 未初始化）。

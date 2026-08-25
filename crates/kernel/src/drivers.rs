@@ -3,7 +3,7 @@
 //! 提供基于 DriverStage 四阶段生命周期与 DriverHub 集中调度的核心硬件驱动注册。
 
 use core::sync::atomic::{AtomicUsize, Ordering};
-use drv::{BusType, DeviceInfo, DeviceKind, DriverHub, DriverStage};
+use driver::{BusType, DeviceInfo, DeviceKind, DriverHub, DriverStage};
 use klib::{error, info};
 
 /// Limine framebuffer 指针。

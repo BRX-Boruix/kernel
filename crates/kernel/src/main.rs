@@ -622,13 +622,13 @@ fn halt_other_cpus_via_ipi() {
 // 缺席（框架未就绪等）走 KM8 同款可见回退——直连 arch pop + 一次告警，
 // 内核内部不存在第二条绕过设备的隐藏通道。
 fn stdin_source(buf: &mut [u8]) -> usize {
-    use drv::drivers::keyboard::PS2_KEYBOARD_DEVICE_NAME;
+    use driver::drivers::keyboard::PS2_KEYBOARD_DEVICE_NAME;
 
-    let count = drv::DriverHub::device_count();
+    let count = driver::DriverHub::device_count();
     for i in 0..count {
-        if let Some(info) = drv::DriverHub::device_info_at(i) {
+        if let Some(info) = driver::DriverHub::device_info_at(i) {
             if info.name == PS2_KEYBOARD_DEVICE_NAME {
-                if let Some(ops) = drv::DriverHub::device_at(i) {
+                if let Some(ops) = driver::DriverHub::device_at(i) {
                     return ops.read(buf);
                 }
             }

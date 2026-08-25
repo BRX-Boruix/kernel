@@ -157,22 +157,22 @@ struct KernelDeviceProvider;
 impl DeviceInfoProvider for KernelDeviceProvider {
     fn list_devices(&self) -> Vec<DeviceInfo> {
         let mut list = Vec::new();
-        let count = drv::DriverHub::device_count();
+        let count = driver::DriverHub::device_count();
         for i in 0..count {
-            if let Some(info) = drv::DriverHub::device_info_at(i) {
+            if let Some(info) = driver::DriverHub::device_info_at(i) {
                 let bus_str = match info.bus {
-                    drv::BusType::Pci => "PCI",
-                    drv::BusType::Platform => "Platform",
-                    drv::BusType::Virtual => "Virtual",
-                    drv::BusType::Unknown => "Unknown",
+                    driver::BusType::Pci => "PCI",
+                    driver::BusType::Platform => "Platform",
+                    driver::BusType::Virtual => "Virtual",
+                    driver::BusType::Unknown => "Unknown",
                 };
                 // DR1a（ADR-022 §1）：绑定状态按注册表真值双态呈现——
                 // 真实接管 = "driver:<name>"；竞标胜出但驱动未实现硬件控制
                 // = "candidate:<name>(unimplemented)"。用户态可据此编程，
                 // 绝不把候选登记伪装成已挂接的驱动。
-                let bound = match drv::DriverHub::device_driver_at(i) {
+                let bound = match driver::DriverHub::device_driver_at(i) {
                     Some(driver_name) => {
-                        if drv::DriverHub::device_driver_is_candidate(i) {
+                        if driver::DriverHub::device_driver_is_candidate(i) {
                             Some(format!("candidate:{}(unimplemented)", driver_name))
                         } else {
                             Some(String::from(driver_name))
@@ -200,15 +200,15 @@ impl DeviceInfoProvider for KernelDeviceProvider {
     }
 
     fn serial_read(&self, buf: &mut [u8]) -> Result<usize, klib::error::Error> {
-        use drv::drivers::serial::COM1_DEVICE_NAME;
+        use driver::drivers::serial::COM1_DEVICE_NAME;
         if buf.is_empty() {
             return Ok(0);
         }
-        let count = drv::DriverHub::device_count();
+        let count = driver::DriverHub::device_count();
         for i in 0..count {
-            if let Some(info) = drv::DriverHub::device_info_at(i) {
+            if let Some(info) = driver::DriverHub::device_info_at(i) {
                 if info.name == COM1_DEVICE_NAME {
-                    if let Some(ops) = drv::DriverHub::device_at(i) {
+                    if let Some(ops) = driver::DriverHub::device_at(i) {
                         return Ok(ops.read(buf));
                     }
                 }
@@ -232,12 +232,12 @@ impl DeviceInfoProvider for KernelDeviceProvider {
     }
 
     fn serial_write(&self, buf: &[u8]) -> Result<usize, klib::error::Error> {
-        use drv::drivers::serial::COM1_DEVICE_NAME;
-        let count = drv::DriverHub::device_count();
+        use driver::drivers::serial::COM1_DEVICE_NAME;
+        let count = driver::DriverHub::device_count();
         for i in 0..count {
-            if let Some(info) = drv::DriverHub::device_info_at(i) {
+            if let Some(info) = driver::DriverHub::device_info_at(i) {
                 if info.name == COM1_DEVICE_NAME {
-                    if let Some(ops) = drv::DriverHub::device_at(i) {
+                    if let Some(ops) = driver::DriverHub::device_at(i) {
                         return Ok(ops.write(buf));
                     }
                 }
@@ -270,8 +270,8 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         // 遵循同文件 storage/net 的诚实纪律（DMYGH #16）：只输出真实可得
         // 的事实（注册表计数、运行时长），不编造健康结论。待未来引入真实
         // 健康探测后，status 字段必须由该探测结果驱动。KM9：JsonWriter 风格。
-        let count = drv::DriverHub::device_count();
-        let drv_count = drv::DriverHub::driver_count();
+        let count = driver::DriverHub::device_count();
+        let drv_count = driver::DriverHub::driver_count();
         let mut target = klib::json::VecTarget::new();
         let mut writer = klib::json::JsonWriter::new(&mut target);
         writer
@@ -295,17 +295,17 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         // KM9：JsonWriter 统一风格（替代 format! 手拼 + JsonStr 转义）。
         let mut target = klib::json::VecTarget::new();
         let mut writer = klib::json::JsonWriter::new(&mut target);
-        let count = drv::DriverHub::device_count();
+        let count = driver::DriverHub::device_count();
         for i in 0..count {
-            let Some(info) = drv::DriverHub::device_info_at(i) else {
+            let Some(info) = driver::DriverHub::device_info_at(i) else {
                 continue;
             };
-            if info.kind != drv::DeviceKind::Block {
+            if info.kind != driver::DeviceKind::Block {
                 continue;
             }
             let name = info.name;
             let outcome: Result<(), ()> = (|| {
-                let Some(ops) = drv::DriverHub::device_at(i) else {
+                let Some(ops) = driver::DriverHub::device_at(i) else {
                     return error_object(&mut writer, "no_io_ops", name);
                 };
                 let Some(io) = ops.as_io() else {
@@ -382,10 +382,10 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         // DMYGH #16：尚无真实 NIC 数据路径。若存在 Net 类设备则如实报告其
         // 统计不受支持；一个都没有则报告 no_net_device。禁止编造收发统计。
         // KM9：JsonWriter 统一风格。
-        let count = drv::DriverHub::device_count();
+        let count = driver::DriverHub::device_count();
         for i in 0..count {
-            if let Some(info) = drv::DriverHub::device_info_at(i) {
-                if info.kind == drv::DeviceKind::Net {
+            if let Some(info) = driver::DriverHub::device_info_at(i) {
+                if info.kind == driver::DeviceKind::Net {
                     let mut target = klib::json::VecTarget::new();
                     let mut writer = klib::json::JsonWriter::new(&mut target);
                     writer
@@ -426,10 +426,10 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                 .into_string()
                 .expect("pci bars JSON keys and device names are UTF-8")
         };
-        if drv::DriverHub::pci_location_of(dev_name).is_none() {
+        if driver::DriverHub::pci_location_of(dev_name).is_none() {
             return error_json("not_found");
         }
-        let Some(bars) = drv::pci::cached_pci_bars(dev_name) else {
+        let Some(bars) = driver::pci::cached_pci_bars(dev_name) else {
             return error_json("no_bar_probe");
         };
         let mut target = klib::json::VecTarget::new();
@@ -437,7 +437,7 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         if let Ok(mut arr) = writer.start_array() {
             for (i, bar) in bars.iter().enumerate() {
                 match bar {
-                    drv::pci::PciBar::IoPort { port, size } => {
+                    driver::pci::PciBar::IoPort { port, size } => {
                         let _ = arr.push_object(|obj| {
                             let _ = obj.field_u64("bar", i as u64);
                             let _ = obj.field_str("type", "io_port");
@@ -446,7 +446,7 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                             Ok(())
                         });
                     }
-                    drv::pci::PciBar::Mmio32 {
+                    driver::pci::PciBar::Mmio32 {
                         addr,
                         size,
                         prefetchable,
@@ -460,7 +460,7 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                             Ok(())
                         });
                     }
-                    drv::pci::PciBar::Mmio64 {
+                    driver::pci::PciBar::Mmio64 {
                         addr,
                         size,
                         prefetchable,
@@ -474,7 +474,7 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                             Ok(())
                         });
                     }
-                    drv::pci::PciBar::None => {}
+                    driver::pci::PciBar::None => {}
                 }
             }
             let _ = arr.end();
@@ -600,7 +600,7 @@ fn populate_builtin_programs(mount_table: &Arc<vfs::mount::MountTable>) {
 }
 
 /// drv 块设备 → fs::ByteDevice 桥接（只读路径足够；EXT2 驱动本身只读）。
-struct DrvByteBridge(&'static dyn drv::DeviceOps);
+struct DrvByteBridge(&'static dyn driver::DeviceOps);
 
 impl fs::ByteDevice for DrvByteBridge {
     fn read_bytes(&self, offset: u64, out: &mut [u8]) -> usize {
@@ -619,12 +619,12 @@ impl fs::ByteDevice for DrvByteBridge {
 /// 未来出现"第一块易失 + 第二块持久"的注册顺序，持久盘将被静默跳过），
 /// 全部候选耗尽才返回 false 并留下可见日志，绝不伪造挂载成功。
 fn try_mount_ext2_programs(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
-    let count = drv::DriverHub::device_count();
+    let count = driver::DriverHub::device_count();
     for i in 0..count {
-        let Some(info) = drv::DriverHub::device_info_at(i) else {
+        let Some(info) = driver::DriverHub::device_info_at(i) else {
             continue;
         };
-        if info.kind != drv::DeviceKind::Block {
+        if info.kind != driver::DeviceKind::Block {
             continue;
         }
         let name = info.name;
@@ -637,7 +637,7 @@ fn try_mount_ext2_programs(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
             );
             continue;
         }
-        let Some(ops) = drv::DriverHub::device_at(i) else {
+        let Some(ops) = driver::DriverHub::device_at(i) else {
             continue;
         };
         let bridge: Arc<dyn fs::ByteDevice> = Arc::new(DrvByteBridge(ops));

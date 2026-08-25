@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+pub mod bus;
 pub mod device;
 pub mod driver;
 pub mod drivers;
