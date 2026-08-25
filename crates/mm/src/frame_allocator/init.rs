@@ -49,10 +49,16 @@ pub fn dropped_uninit_frames() -> usize {
 /// 读 TSC（相对耗时用；时钟源注入前的早期计时）。
 ///
 /// 用编译器内建 `_rdtsc()`（比手写 inline asm 更稳，避免寄存器约束问题）。
+/// 非 x86 架构回退返回 0（计时不可用，分配器功能不受影响）。
 #[inline]
 fn rdtsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
     // SAFETY: rdtsc 是单条无副作用的指令，可安全内联。
-    unsafe { core::arch::x86_64::_rdtsc() }
+    unsafe {
+        return core::arch::x86_64::_rdtsc();
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    0
 }
 
 /// 探测 TSC 频率，返回 `(频率, 来源)`。
@@ -61,21 +67,29 @@ fn rdtsc() -> u64 {
 /// `tsc_hz = ECX*EBX/EAX`）；失败则尝试 leaf 0x16（EAX=处理器基频 MHz，近似）。
 /// 用 `core::arch::__cpuid` intrinsic（内联汇编不能用 rbx，LLVM 保留）。
 /// QEMU TCG 下 0x15/0x16 通常都不提供，此时返回 None（退化为纯 cycles）。
+/// 非 x86 架构直接返回 None（计时不可用，非关键）。
 fn tsc_hz() -> Option<(u64, &'static str)> {
-    // 0x15：精确 TSC 频率。
-    let r = core::arch::x86_64::__cpuid(0x15);
-    let (den, num, ref_hz) = (r.eax as u64, r.ebx as u64, r.ecx as u64);
-    if ref_hz != 0 && den != 0 {
-        let hz = ref_hz.saturating_mul(num) / den;
-        if hz != 0 {
-            return Some((hz, "cpuid 0x15"));
+    #[cfg(target_arch = "x86_64")]
+    {
+        // 0x15：精确 TSC 频率。
+        let r = core::arch::x86_64::__cpuid(0x15);
+        let (den, num, ref_hz) = (r.eax as u64, r.ebx as u64, r.ecx as u64);
+        if ref_hz != 0 && den != 0 {
+            let hz = ref_hz.saturating_mul(num) / den;
+            if hz != 0 {
+                return Some((hz, "cpuid 0x15"));
+            }
+        }
+        // 0x16：处理器基频（MHz），作为近似兜底。
+        let r = core::arch::x86_64::__cpuid(0x16);
+        let base_mhz = r.eax as u64;
+        if base_mhz != 0 {
+            return Some((base_mhz * 1_000_000, "cpuid 0x16 (approx)"));
         }
     }
-    // 0x16：处理器基频（MHz），作为近似兜底。
-    let r = core::arch::x86_64::__cpuid(0x16);
-    let base_mhz = r.eax as u64;
-    if base_mhz != 0 {
-        return Some((base_mhz * 1_000_000, "cpuid 0x16 (approx)"));
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // 非 x86 架构无 TSC/CPUID，返回 None（计时不可用）。
     }
     None
 }
