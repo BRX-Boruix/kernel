@@ -163,6 +163,12 @@ fn validate_user_range(buf: u64, len: u64, access: UserAccess) -> Result<(), Err
 /// 逐字节读取并在**首次跨入每个新页**时对该页做读意图预校验：路径长度上限
 /// 内的任何未映射页都会在校验层被拦下并返回 [`Error::BadAddress`]，而不是
 /// 在内核态触发 #PF。
+///
+/// 上限语义（ADR-011 §1.3 / ADR-023 §2 M15）：`max_len` 是**显式有界**——
+/// 从 `path_ptr` 起始的连续字节必须在 `max_len` 内出现 NUL 终止符，否则即
+/// 视为路径超长（或缺失终止符），**显式返回 [`Error::InvalidParam`] 而非
+/// 静默截断**。静默截断会把一条超长的路径伪装成完整交付，调用方无从得知
+/// 真值被丢弃。
 fn copy_path_from_user(path_ptr: u64, max_len: usize) -> Result<alloc::string::String, Error> {
     if path_ptr < USER_BASE || path_ptr >= USER_TOP {
         return Err(Error::OutOfRange);
@@ -171,6 +177,7 @@ fn copy_path_from_user(path_ptr: u64, max_len: usize) -> Result<alloc::string::S
     let mut validated_page_end = path_ptr & !(PAGE_SIZE - 1);
     let mut bytes = alloc::vec::Vec::new();
     let mut cur = path_ptr;
+    let mut terminated = false;
     while bytes.len() < max_len {
         if cur >= USER_TOP {
             return Err(Error::OutOfRange);
@@ -185,10 +192,15 @@ fn copy_path_from_user(path_ptr: u64, max_len: usize) -> Result<alloc::string::S
             arch_x86_64::mmio::copy_from_user(byte.as_mut_ptr(), cur, 1);
         }
         if byte[0] == 0 {
+            terminated = true;
             break;
         }
         bytes.push(byte[0]);
         cur += 1;
+    }
+    // 耗尽 max_len 仍未遇 NUL：路径超长或缺失终止符，显式拒绝，绝不静默截断。
+    if !terminated {
+        return Err(Error::InvalidParam);
     }
     alloc::string::String::from_utf8(bytes).map_err(|_| Error::InvalidParam)
 }
