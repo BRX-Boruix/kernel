@@ -4012,6 +4012,14 @@ pub fn test_driver_hub_m72() {
     let unregistered = DriverHub::unregister_device_by_name("pci-hotplug-nic");
     assert!(unregistered, "hotplug out must succeed");
     assert_eq!(DriverHub::device_count(), initial_dev_count);
+    // S26/S09 回归：本次移除的恰是最后注册的设备（idx == last）。
+    // 旧实现 `devices[idx] = devices[last].take()` 在 idx==last 时是自赋值
+    // ——设备未真正移除、残留在计数之后成为幽灵条目，却已发布 Departed
+    // 并返回 true（谎报成功）。此处必须验证原始槽位已清空，而非只看计数。
+    assert!(
+        !DriverHub::device_slot_occupied_raw(hotplug_idx),
+        "removed last device must leave its slot truly empty (no swap-remove self-assignment residue)"
+    );
 
     // 验证事件总线接收到 DeviceDeparted 事件
     let mut found_departed = false;

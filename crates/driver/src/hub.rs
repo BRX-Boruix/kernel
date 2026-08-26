@@ -238,7 +238,16 @@ impl DriverHub {
                 {
                     let mut devices = DEVICES.lock();
                     let last = DEVICE_COUNT.load(Acquire) - 1;
-                    devices[idx] = devices[last].take();
+                    if idx != last {
+                        // 仅当被移除设备不是末位时才需尾条前移补位。若 idx == last，
+                        // `devices[idx] = devices[last].take()` 是**自赋值**：先
+                        // take() 取走末条目置 None，又写回同一槽位——设备实际未
+                        // 被移除，计数却递减，谎报成功（S26/S09 回归：旧实现
+                        // 当待移除设备恰为最后一个时设备残留、计数脱钩）。
+                        devices[idx] = devices[last].take();
+                    } else {
+                        devices[idx] = None;
+                    }
                     DEVICE_COUNT.store(last, Release);
                 }
 
@@ -348,6 +357,18 @@ impl DriverHub {
         }
         let list = DEVICES.lock();
         list.get(index).and_then(|e| e.map(|entry| entry.info))
+    }
+
+    /// 测试诊断：直接检查原始槽位是否仍被设备占用（**不过滤** `DEVICE_COUNT`
+    /// 稠密前缀）。
+    ///
+    /// 用途：验证 swap-remove 后**无残留**——移除末位设备后，槽位必须真正
+    /// 清空（S26/S09 回归：旧实现在 `idx == last` 时自赋值，设备残留在
+    /// 计数之后成为幽灵条目）。生产构建不编译本访问器（`kernel-tests` feature）。
+    #[cfg(feature = "kernel-tests")]
+    pub fn device_slot_occupied_raw(index: usize) -> bool {
+        let list = DEVICES.lock();
+        list.get(index).and_then(|e| e.as_ref()).is_some()
     }
 
     /// 获取指定索引的设备操作集。

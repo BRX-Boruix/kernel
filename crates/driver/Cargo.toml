@@ -3,6 +3,11 @@ name = "driver"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# 内核自检模式：暴露测试诊断访问器（如移除后槽位残留检查）。
+# 由 kernel crate 的 kernel-tests feature 透传，生产构建不含测试钩子。
+kernel-tests = []
+
 [dependencies]
 klib = { path = "../klib" }
 arch-x86_64 = { path = "../arch/arch-x86_64" }
