@@ -234,7 +234,9 @@ pub(crate) fn truncate_finish(
     truncated: bool,
     reserve: usize,
 ) -> usize {
-    if !truncated {
+    if !truncated && len <= buf.len().saturating_sub(reserve) {
+        // 未截断且内容给收尾预留字节（reserve，如行尾换行符）留出了空间：
+        // 原样返回，容量完全够用。
         return len;
     }
     CONSOLE_TRUNCATIONS.fetch_add(1, Ordering::Relaxed);

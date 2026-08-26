@@ -285,6 +285,47 @@ mod tests {
     }
 
     #[test]
+    fn exact_capacity_line_reserves_newline_slot() {
+        let _g = TEST_LOCK.lock().unwrap();
+        LOG_RING.lock().clear();
+        // 恰好填满 LINE_CAP（未触发 StackWriter 截断标志）时，收尾必须
+        // 为行尾换行符预留 1 字节（S19 回归：旧实现 buf[LINE_CAP]=b'\n'
+        // 越界写，debug panic / release 内存破坏）。
+        let exactly = "x".repeat(LINE_CAP);
+        __log(LogLevel::Info, format_args!("{exactly}"));
+        let lines = drain_lines();
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert!(line.len() <= LINE_CAP, "recorded line exceeds LINE_CAP");
+        assert!(line.ends_with('\n'), "line must end with newline");
+        // 内容+换行超出 LINE_CAP 的容量，必须走显式截断标记（KM3：
+        // 静默截断即伪交付），而不是静默丢字节。
+        assert!(
+            line.contains("[truncated]"),
+            "capacity-overflow must be visibly truncated"
+        );
+    }
+
+    #[test]
+    fn one_short_of_capacity_is_not_truncated() {
+        let _g = TEST_LOCK.lock().unwrap();
+        LOG_RING.lock().clear();
+        // 内容恰好 LINE_CAP-1：与换行符合计 == LINE_CAP，应完整保留、
+        // 不得出现截断标记（防止修复误伤正常路径）。
+        let near = "y".repeat(LINE_CAP - 1);
+        __log(LogLevel::Info, format_args!("{near}"));
+        let lines = drain_lines();
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert!(line.ends_with('\n'));
+        assert!(
+            !line.contains("[truncated]"),
+            "LINE_CAP-1 content must not be truncated"
+        );
+        assert_eq!(line.len(), LINE_CAP, "content+newline should fill LINE_CAP");
+    }
+
+    #[test]
     fn dump_does_not_panic() {
         let _g = TEST_LOCK.lock().unwrap();
         set_level(LogLevel::Off);
