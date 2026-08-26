@@ -5003,10 +5003,12 @@ pub fn test_block_register_false_keeps_ready() {
     // 与 waitpid 核心单测同款卫生：全程关中断，防真实 IRQ0 打进确定性序列。
     arch_x86_64::interrupts::disable();
     th::reset_all();
+    let f0 = mm::frame_stats().allocated_frames;
 
     let current = th::spawn_named_child_of(0, "cur.elf").expect("spawn current");
     let peer = th::spawn_named_child_of(0, "peer.elf").expect("spawn peer");
     assert_ne!(current, peer, "pids must be distinct");
+    let f1 = mm::frame_stats().allocated_frames;
 
     // 直接驱动共享阻塞主体：current=A（表级）、队列仅含 B、register 恒 false。
     // 修复前：B 被弹出后丢失，队列空 → 返回 false（B 不在队中）；
@@ -5022,6 +5024,11 @@ pub fn test_block_register_false_keeps_ready() {
     assert_eq!(name, "peer.elf");
 
     th::reset_all();
+    let f3 = mm::frame_stats().allocated_frames;
+    info!(
+        "[test-block-register-false] frames: base={} spawned={} after-reset={}",
+        f0, f1, f3
+    );
     arch_x86_64::interrupts::enable();
     info!("[test-block-register-false] PASS");
 }

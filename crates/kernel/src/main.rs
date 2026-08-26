@@ -451,10 +451,6 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();
 
-    // S26 回归：block_current_with 登记点失败时已弹出的就绪进程必须重新入队。
-    #[cfg(feature = "kernel-tests")]
-    tests::test_block_register_false_keeps_ready();
-
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
     tests::test_init_contract();
@@ -471,6 +467,12 @@ unsafe fn kmain_body() -> ! {
     tests::test_task_block_fpu_handoff();
     #[cfg(feature = "kernel-tests")]
     tests::test_ipc1_semantics();
+
+    // S26 回归：block_current_with 登记点失败时已弹出的就绪进程必须重新入队。
+    // KS1: 必须放在 test_task_kstack_reclaim 之后，否则该测试的帧计数
+    // 对前序 spawn 敏感（顺序依赖）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_block_register_false_keeps_ready();
 
     // loader1/LA4：ELF 加载器恶意镜像拒绝面对抗自检（纯加载验证，不 spawn，
     // 返回主流程继续启动；放在 SMP 之前保持单核确定性）。
