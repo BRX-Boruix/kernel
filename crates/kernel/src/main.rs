@@ -451,6 +451,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();
 
+    // S26 回归：block_current_with 登记点失败时已弹出的就绪进程必须重新入队。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_block_register_false_keeps_ready();
+
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
     tests::test_init_contract();

@@ -590,6 +590,10 @@ fn block_current_locked(
     }
     // 调度锁内的登记点：失败即整体放弃，现场未动、表零副作用。
     if !register() {
+        // S26 回归：`next_pid` 已在上方被 `pop_ready` 弹出（仍为 Ready 态），
+        // 若直接返回将永久丢失该就绪进程（无人重新入队 → 饿死）。
+        // 必须把它放回就绪队列，保证"登记失败零副作用"成立。
+        s.ready.push_back(next_pid);
         return SwitchOutcome::NotSwitched;
     }
     if let Some(slot) = s.procs[cur_pid].as_mut() {
@@ -1207,9 +1211,12 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
             return Err(Error::PermissionDenied);
         }
         // 自杀：走标准退出路径（zombie 化并切换）。exit_current 内部自行加锁，
-        // 故此处不持锁调用。
+        // 故此处不持锁调用。exit_current 会把 `*frame` 改写为下一进程现场；
+        // 调用方（sys_kill）依此返回 Switched，本函数**必须立即返回**——
+        // 落入下方 he-kill 分支会对已死 target 返回 Err(InvalidParam)，
+        // 污染调用方对 frame 的后续处理（S26 回归）。
         exit_current(frame, sig as u64);
-        // 不返回
+        return Ok(0); // 不返回不可达：exit_current 是普通返回，切换由 iretq 完成
     }
     // PID 1 契约：禁止向他杀 init（探活 sig=0 放行）。
     if target == init_pid() && sig != 0 {
@@ -1457,6 +1464,26 @@ pub mod test_hooks {
             q.push_back(*p);
         }
         SCHED.lock().ready = q;
+    }
+
+    /// S26 回归验收：`block_current_with` 的登记点返回 false 时，已被
+    /// `pop_ready` 弹出的就绪进程必须放回队列（否则该进程永久饿死）。
+    ///
+    /// 真实 IPC 阻塞路径（`block_current_with` → 登记点复检失败）无法在
+    /// 自检中构造（需要真实管道竞态），故直接驱动共享主体
+    /// `block_current_locked`：current=A、队列仅含 B、register 恒返回
+    /// false。修复前 B 被弹出后直接丢失（返回 NotSwitched 但队列空）；
+    /// 修复后 B 重新入队。
+    ///
+    /// 返回 true 当且仅当：结果 NotSwitched **且** B 仍在就绪队列。
+    pub fn debug_block_register_false_keeps_ready(current: usize, peer: usize) -> bool {
+        let mut s = SCHED.lock();
+        s.ready.clear();
+        s.ready.push_back(peer);
+        s.current = Some(current);
+        let mut frame = initial_frame(0x400000, 0x7ffefffff000);
+        let outcome = block_current_locked(&mut s, &mut frame, &mut || false);
+        outcome == SwitchOutcome::NotSwitched && s.ready.contains(&peer)
     }
 
     /// 审计 R5-F2 验收钩子：丢弃 FPU 模板缓存，令下一次 spawn 重新快照。

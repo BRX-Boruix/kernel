@@ -4989,6 +4989,43 @@ pub fn test_waitpid_core() {
     info!("[test-waitpid-core] PASS");
 }
 
+/// S26 回归：`block_current_with` 登记点失败不得丢失已弹出的就绪进程。
+///
+/// 红证语义：旧实现 `pop_ready` 弹出 `next_pid` 后 `register()` 返回 false
+/// 即直接 `return NotSwitched`——被弹出的就绪进程既未调度也未重新入队，
+/// 永久饿死（无人唤醒它，ready 队列也不再包含它）。修复为登记失败时
+/// `push_back(next_pid)` 归还就绪队列。
+pub fn test_block_register_false_keeps_ready() {
+    use task::TaskState;
+    use task::scheduler::test_hooks as th;
+    info!("[test-block-register-false] === register-false must not drop a popped ready proc ===");
+
+    // 与 waitpid 核心单测同款卫生：全程关中断，防真实 IRQ0 打进确定性序列。
+    arch_x86_64::interrupts::disable();
+    th::reset_all();
+
+    let current = th::spawn_named_child_of(0, "cur.elf").expect("spawn current");
+    let peer = th::spawn_named_child_of(0, "peer.elf").expect("spawn peer");
+    assert_ne!(current, peer, "pids must be distinct");
+
+    // 直接驱动共享阻塞主体：current=A（表级）、队列仅含 B、register 恒 false。
+    // 修复前：B 被弹出后丢失，队列空 → 返回 false（B 不在队中）；
+    // 修复后：B 重新入队 → 返回 true。
+    assert!(
+        th::debug_block_register_false_keeps_ready(current, peer),
+        "register=false must re-queue the popped ready process (starvation)"
+    );
+
+    // 卫生收尾：探测确认 peer 仍为 Ready 且可被正常调度消费（非幽灵）。
+    let (st, name, ..) = th::probe(peer).expect("peer probed");
+    assert_eq!(st, TaskState::Ready, "peer must remain Ready after re-queue");
+    assert_eq!(name, "peer.elf");
+
+    th::reset_all();
+    arch_x86_64::interrupts::enable();
+    info!("[test-block-register-false] PASS");
+}
+
 /// PID 1 契约验收：WAIT_ANY 语义、PID 1 防护、孤儿过继。
 ///
 /// 全程关中断（同 test_waitpid_core 纪律），纯表级不涉及物理切换。
