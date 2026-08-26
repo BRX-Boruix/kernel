@@ -851,12 +851,28 @@ fn sys_exit(frame: &mut InterruptFrame) -> u64 {
 }
 
 /// `kill(pid, sig) -> 0`：向进程发送信号（终止 / 校验存在）。
-fn sys_kill(frame: &mut InterruptFrame) -> u64 {
+///
+/// **自杀必须返回 [`DispatchResult::Switched`] 而非 `Done`**（S26 回归）：
+/// `exit_current` 会把 `*frame` 整体改写为下一进程的保存帧并切走；若此处
+/// 返回 `Done(0)`，`syscall_entry` 会用 `frame.rax = 0` 覆盖**下一进程**的
+/// 现场（把自杀进程的返回值写进别人家）。与 `sys_exit` 同纪律：切换发生后
+/// 返回值语义交由调度接管。
+fn sys_kill(frame: &mut InterruptFrame) -> DispatchResult {
     let target = frame.rdi as usize;
     let sig = frame.rsi as u32;
+    // 自杀判定：target 即当前进程且是真实信号（非探活 sig=0）。init 自杀
+    // 由 kill_pid 的 PID1 防护拒绝（此处不自行 exit，避免绕过防护）。
+    let is_suicide = {
+        let cur = task::current_proc_mut().map(|p| p.pid());
+        cur == Some(target) && sig != 0 && target != task::init_pid()
+    };
+    if is_suicide {
+        task::exit_current(frame, sig as u64);
+        return DispatchResult::Switched;
+    }
     match task::kill_pid(target, sig, frame) {
-        Ok(_) => pack_ok(0),
-        Err(e) => pack_err(e),
+        Ok(_) => done(pack_ok(0)),
+        Err(e) => done(pack_err(e)),
     }
 }
 
@@ -979,7 +995,8 @@ fn dispatch(nr: u64, frame: &mut InterruptFrame) -> DispatchResult {
         // TASK Domain (0x30)
         SYS_TASK_SPAWN => done(sys_exec(frame)),
         SYS_TASK_WAIT => sys_task_wait(frame),
-        SYS_TASK_SIGNAL => done(sys_kill(frame)),
+        // kill 可能自杀切换（exit_current → Switched），自带 DispatchResult 语义。
+        SYS_TASK_SIGNAL => sys_kill(frame),
         // exit 已切换到下一进程（或进入 idle），永不以正常值返回。
         SYS_TASK_EXIT => {
             sys_exit(frame);
