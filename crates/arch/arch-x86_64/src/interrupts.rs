@@ -602,7 +602,10 @@ fn raw_serial_fmt(args: core::fmt::Arguments) {
             // 后，下方 from_utf8_unchecked 即 UB。UTF-8 续字节特征 (b & 0xC0)
             // == 0x80：n 回退到首字节为止。当前全部实参为 ASCII 十六进制/
             // 字段名（边界天然成立），此处回退是契约的机器强制而非信任。
-            while n > 0 && bytes[n] & 0xC0 == 0x80 {
+            // 仅在确实发生截断（n < bytes.len()）时才需回退；全量容纳
+            // （n == bytes.len()）时无切点，`bytes[n]` 越界读（S19 回归：
+            // 旧实现无条件读 bytes[n]，n==len 时 OOB panic）。
+            while n > 0 && n < bytes.len() && bytes[n] & 0xC0 == 0x80 {
                 n -= 1;
             }
             self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
