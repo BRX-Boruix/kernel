@@ -53,6 +53,23 @@ pub(crate) fn current_cpu_id() -> usize {
     }
 }
 
+/// 计算容纳 `need_frames` 个连续帧所需的最小 order（满足 2^order ≥ need_frames）。
+///
+/// 上限为 `MAX_ORDER - 1`（buddy 能分配的最大块）。`need_frames` 必须 ≥ 1。
+#[inline]
+fn order_for_need_frames(need_frames: usize) -> usize {
+    if need_frames <= 1 {
+        return 0;
+    }
+    // ceil(log2(need_frames)): 最小的 2^order ≥ need_frames。
+    // need_frames=2 → 2.next_power_of_two()=2 → trailing_zeros=1 → order=1 ✓
+    // 注意不可用 (need_frames-1)：1.next_power_of_two()=1（1 已是 2^0）→ order=0，
+    // 又回到旧 off-by-one。旧实现 (bits-1-(need_frames-1).leading_zeros()) 对
+    // need_frames=2 也只得 0，只分配 1 帧却写入 count 个 PerCpuCache → 越界写（S19 回归）。
+    let order = need_frames.next_power_of_two().trailing_zeros() as usize;
+    order.min(MAX_ORDER - 1)
+}
+
 /// 依据实际 CPU 数初始化 per-CPU 页帧缓存（自适应核数）。
 ///
 /// 缓存数组从**物理帧分配器**分配连续帧，经 HHDM 映射为 `&'static mut [PerCpuCache]`，
@@ -65,12 +82,7 @@ pub fn init_percpu_caches(cpu_count: usize) {
     // order 上限 MAX_ORDER-1：buddy 能分配的最大块（2^(MAX_ORDER-1) 帧）。
     let bytes = count * size_of::<PerCpuCache>();
     let need_frames = bytes.div_ceil(4096);
-    let order = if need_frames <= 1 {
-        0
-    } else {
-        let bits = usize::BITS as usize; // 64
-        (bits - 1 - (need_frames - 1).leading_zeros() as usize).min(MAX_ORDER - 1)
-    };
+    let order = order_for_need_frames(need_frames);
 
     // 注意：这里不能走公共 `allocate_frames`（会先查 per-CPU 缓存，而缓存此时
     // 尚未初始化 → panic）。直接走全局空闲列表分配缓存数组本身的物理帧。
@@ -154,5 +166,51 @@ pub fn deallocate_frame(frame: PhysFrame) {
     }
     if refcount::decref(frame.start_paddr()) {
         ALLOCATOR.deallocate(frame);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// order 必须满足最小覆盖：2^order ≥ need_frames（S19 回归——旧实现
+    /// 对 need_frames=2 得 order=0，只分配 1 帧却写入 count 个 PerCpuCache，
+    /// 越界写内存）。
+    #[test]
+    fn order_covers_need_frames() {
+        for need in 1..=64usize {
+            let order = order_for_need_frames(need);
+            let cap = 1usize << order;
+            assert!(
+                cap >= need,
+                "need_frames={need} -> order={order} (cap={cap}) under-covers"
+            );
+        }
+    }
+
+    /// 精确校验 off-by-one 触发的具体点：need_frames=2 必须给 order=1（2 帧），
+    /// 而不是旧实现的 0（1 帧）。
+    #[test]
+    fn two_frames_needs_order_one() {
+        assert_eq!(order_for_need_frames(2), 1, "need_frames=2 must allocate 2 frames");
+    }
+
+    /// 幂等边界：1 帧 order=0；2 的幂次仍取对数值（不浪费、不超配）。
+    #[test]
+    fn exact_powers_of_two() {
+        assert_eq!(order_for_need_frames(1), 0);
+        assert_eq!(order_for_need_frames(2), 1);
+        assert_eq!(order_for_need_frames(4), 2);
+        assert_eq!(order_for_need_frames(8), 3);
+        assert_eq!(order_for_need_frames(16), 4);
+    }
+
+    /// 非 2 的幂次向上取整到下一个 2 的幂。
+    #[test]
+    fn non_power_of_two_rounds_up() {
+        assert_eq!(order_for_need_frames(3), 2); // 2^2=4 >= 3
+        assert_eq!(order_for_need_frames(5), 3); // 2^3=8 >= 5
+        assert_eq!(order_for_need_frames(9), 4); // 2^4=16 >= 9
+        assert_eq!(order_for_need_frames(17), 5);
     }
 }
