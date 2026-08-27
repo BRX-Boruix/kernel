@@ -117,12 +117,15 @@ pub fn register_console(c: &'static dyn Console) -> bool {
         return false;
     }
     let (data, vtable) = unsafe { core::mem::transmute::<&'static dyn Console, (usize, usize)>(c) };
-    SINKS[idx].data.store(data, Ordering::SeqCst);
-    SINKS[idx].vtable.store(vtable, Ordering::SeqCst);
+    // S21 发布协议：**先写 vtable（Release），再写 data（Release）**。
+    // `data != 0` 是"发布完成"标志——读者（write_str）Acquire 读到 data != 0
+    // 时，vtable 必已发布可见，杜绝 `(data≠0, vtable==0)` 半发布组合导致的
+    // transmute 悬垂 vtable 崩溃。旧实现先写 data 后写 vtable，并发下可读到
+    // 半发布状态。
+    SINKS[idx].vtable.store(vtable, Ordering::Release);
+    SINKS[idx].data.store(data, Ordering::Release);
     true
 }
-
-/// 注册一个 `fn(&str)` 输出端（兼容便捷版，内部包装为 [`FnConsole`]）。
 pub fn register(f: SinkFn) -> bool {
     let idx = SINK_COUNT.fetch_add(1, Ordering::SeqCst);
     if idx >= MAX_SINKS {
@@ -135,8 +138,9 @@ pub fn register(f: SinkFn) -> bool {
         &*(&FN_POOL.slots[idx] as *const core::cell::UnsafeCell<FnConsole>).cast::<FnConsole>()
     };
     let (data, vtable) = unsafe { core::mem::transmute::<&'static dyn Console, (usize, usize)>(c) };
-    SINKS[idx].data.store(data, Ordering::SeqCst);
-    SINKS[idx].vtable.store(vtable, Ordering::SeqCst);
+    // S21 发布协议：同 register_console——先 vtable（Release）后 data（Release）。
+    SINKS[idx].vtable.store(vtable, Ordering::Release);
+    SINKS[idx].data.store(data, Ordering::Release);
     true
 }
 
