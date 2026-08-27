@@ -647,8 +647,15 @@ impl INode for Ext2Node {
             .into_iter()
             .map(|e| {
                 let node_type = node_type_of(e.mode).ok_or(Error::Corrupt)?;
+                // S02/S09：文件名是原始字节，非 UTF-8 即损坏。不得用
+                // from_utf8_lossy 静默替换为 U+FFFD——那会让展示名与
+                // lookup_in_dir 按原始字节的匹配不一致（伪数据）。如实
+                // 上抛 Corrupt。
+                let name = core::str::from_utf8(&e.name)
+                    .map_err(|_| Error::Corrupt)
+                    .map(String::from)?;
                 Ok(DirEntry {
-                    name: String::from_utf8_lossy(&e.name).into_owned(),
+                    name,
                     node_type,
                     size: e.size as u64,
                 })
@@ -663,7 +670,11 @@ impl INode for Ext2Node {
             return Err(Error::InvalidParam);
         }
         let raw = self.fs.read_link_target(&self.inode).map_err(ext2_to_klib)?;
-        Ok(String::from_utf8_lossy(&raw).into_owned())
+        // S02/S09：符号链接目标是非 UTF-8 时不得静默替换为 U+FFFD
+        // （伪数据）。如实上抛 Corrupt。
+        core::str::from_utf8(&raw)
+            .map(|s| String::from(s))
+            .map_err(|_| Error::Corrupt)
     }
 }
 
@@ -903,6 +914,30 @@ mod tests {
         // FA1(b)：symlink 不再被抹平成 RegularFile。
         assert_eq!(by_name("link").node_type, INodeType::Symlink);
         assert_eq!(by_name("longlink").node_type, INodeType::Symlink);
+    }
+
+    /// S02/S09 回归：非 UTF-8 文件名必须如实报 Corrupt，不得被
+    /// from_utf8_lossy 静默替换为 U+FFFD——那会让展示名与 lookup_in_dir
+    /// 按原始字节的匹配不一致（伪数据）。
+    #[test]
+    fn test_non_utf8_name_rejected_as_corrupt() {
+        use vfs::inode::INode;
+        let (img, _, _) = build_image();
+        let mut bad = img;
+        // 根目录块 20 里 "link" 项：第 5 个 put_de 从 off 76 起，名字字节在
+        // off 76+8=84（8 字节头：ino4+rec_len2+name_len1+ft1）。把名字首字节
+        // 改成非法 UTF-8（0xFF 单独不成序列）。
+        let base = (PART_START_LBA * SECTOR) as usize;
+        let dirblk = base + 20 * BS;
+        bad[dirblk + 84] = 0xFF;
+        let dev = Arc::new(MockByteDevice::new(bad));
+        let fs = Ext2Fs::open(dev, PART_START_LBA * SECTOR).expect("sb still valid");
+        let root = FileSystem::root(&fs);
+        let err = root.list_dir().map(|_| ()).unwrap_err();
+        assert_eq!(
+            err, Error::Corrupt,
+            "non-UTF8 filename must be reported as Corrupt, not lossy-replaced"
+        );
     }
 
     /// fs1 FM1：三时间戳中可得的两个必须是盘上真值；created_time=0 是
