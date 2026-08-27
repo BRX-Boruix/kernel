@@ -245,9 +245,23 @@ where
         }
         let mut vaddr = s;
         self.check_area_quota(e - s)?;
+        // S18：映射失败必须回滚已映射页。旧实现逐页 `pt.map(...)?`——
+        // 中途失败（如中间页表页分配 OOM）会留下**部分映射**且不记录
+        // 区域，调用方无从回收，泄漏页表项与页映射。失败时逆序解映射
+        // 已建页后再上抛，与 loader 段帧退款纪律一致。
         for &phys in phys_frames.iter().take(count as usize) {
-            self.pt
-                .map(VirtAddr::new(vaddr), PhysAddr::new(phys), size, uflags)?;
+            if let Err(err) = self
+                .pt
+                .map(VirtAddr::new(vaddr), PhysAddr::new(phys), size, uflags)
+            {
+                // 逆序解映射已成功建立的页，恢复映射前的页表状态。
+                let mut rollback = s;
+                while rollback < vaddr {
+                    let _ = self.pt.unmap(VirtAddr::new(rollback));
+                    rollback += page;
+                }
+                return Err(err);
+            }
             vaddr += page;
         }
         self.areas.lock().push(UserArea {
