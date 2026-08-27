@@ -112,6 +112,10 @@ pub struct FbBackend {
 
     old_cursor_x: usize,
     old_cursor_y: usize,
+
+    /// S32：滚动快照复用缓冲——每次滚动都新建 Vec 是热路径上的常驻分配
+    /// 且堆耗尽会 OOM abort。此缓冲按需增长一次后复用，消除逐次分配。
+    scroll_scratch: Vec<FlantermFbChar>,
 }
 
 pub type FlantermContext = FlantermCore<FbBackend>;
@@ -586,22 +590,29 @@ fn flanterm_fb_revscroll(ctx: &mut FlantermContext) {
 
     let fb = &mut ctx.backend;
 
-    // 先提取受影响区域当前可见字符的完整快照，杜绝循环迭代中 push_to_queue 修改 map 导致的读写踩踏
-    let mut snapshot = alloc::vec::Vec::with_capacity((bot - top) * cols);
-    for i in (top * cols)..(bot * cols) {
-        let c_val = if let Some(idx) = fb.map[i] {
+    // S32：快照复用缓冲（同 scroll——热路径不逐次新建 Vec、分配失败降级
+    // 而非 OOM abort）。
+    let need = (bot - top) * cols;
+    if fb.scroll_scratch.len() < need {
+        if fb.scroll_scratch.try_reserve(need - fb.scroll_scratch.len()).is_err() {
+            return;
+        }
+        fb.scroll_scratch.resize(need, FlantermFbChar { c: 0, fg: 0, bg: 0 });
+    }
+    for i in 0..need {
+        let src = top * cols + i;
+        fb.scroll_scratch[i] = if let Some(idx) = fb.map[src] {
             fb.queue[idx].c
         } else {
-            fb.grid[i]
+            fb.grid[src]
         };
-        snapshot.push(c_val);
     }
 
     // 向下移动 (bot - 1 down to top + 1)
     for y in (top + 1..bot).rev() {
         let src_rel_y = y - 1 - top;
         for x in 0..cols {
-            let c_val = snapshot[src_rel_y * cols + x];
+            let c_val = fb.scroll_scratch[src_rel_y * cols + x];
             push_to_queue(fb, rows, cols, &c_val, x, y);
         }
     }
@@ -628,22 +639,31 @@ fn flanterm_fb_scroll(ctx: &mut FlantermContext) {
 
     let fb = &mut ctx.backend;
 
-    // 先提取受影响区域当前可见字符的完整快照，杜绝循环迭代中 push_to_queue 修改 map 导致的读写踩踏
-    let mut snapshot = alloc::vec::Vec::with_capacity((bot - top) * cols);
-    for i in (top * cols)..(bot * cols) {
-        let c_val = if let Some(idx) = fb.map[i] {
+    // S32：快照复用缓冲。滚动是热路径（满屏滚动=每行一次），逐次新建 Vec
+    // 既常驻分配又堆耗尽 OOM abort。改用 `scroll_scratch` 复用缓冲并按需
+    // try_reserve 增长——分配失败时**降级**为直接滚动失败（保持可见性），
+    // 而非中止整个内核。
+    let need = (bot - top) * cols;
+    if fb.scroll_scratch.len() < need {
+        if fb.scroll_scratch.try_reserve(need - fb.scroll_scratch.len()).is_err() {
+            return;
+        }
+        fb.scroll_scratch.resize(need, FlantermFbChar { c: 0, fg: 0, bg: 0 });
+    }
+    for i in 0..need {
+        let src = top * cols + i;
+        fb.scroll_scratch[i] = if let Some(idx) = fb.map[src] {
             fb.queue[idx].c
         } else {
-            fb.grid[i]
+            fb.grid[src]
         };
-        snapshot.push(c_val);
     }
 
     // 向上移动 (top up to bot - 1)
     for y in top..(bot - 1) {
         let src_rel_y = y + 1 - top;
         for x in 0..cols {
-            let c_val = snapshot[src_rel_y * cols + x];
+            let c_val = fb.scroll_scratch[src_rel_y * cols + x];
             push_to_queue(fb, rows, cols, &c_val, x, y);
         }
     }
@@ -1187,6 +1207,7 @@ pub unsafe fn flanterm_fb_init(
         saved_state_cursor_y: 0,
         old_cursor_x: 0,
         old_cursor_y: 0,
+        scroll_scratch: Vec::new(),
     };
 
     let mut ctx = Box::new(flanterm_context_new(backend, rows, cols));
@@ -1396,6 +1417,7 @@ mod tests {
             saved_state_cursor_y: 0,
             old_cursor_x: 0,
             old_cursor_y: 0,
+            scroll_scratch: Vec::new(),
         };
         (backend, fb_buf)
     }
@@ -1487,6 +1509,43 @@ mod tests {
                 r.is_none(),
                 "S17: fb_init must reject a framebuffer too small to hold any glyph"
             );
+        }
+    }
+
+    /// S32 回归：向上滚动后内容整体上移、底行变空格，且滚动可正确读写
+    /// map/queue/grid 三层状态（快照逻辑不得踩踏）。
+    #[test]
+    fn scroll_moves_rows_up_and_blank_bottom() {
+        let (mut ctx, _fb) = test_ctx(80, 160); // 10 列 × 10 行
+        let cols = ctx.cols;
+        // 第 1 行（y=1）放一个字符 'A'（fg 固定），其余行空格。
+        let a = FlantermFbChar {
+            c: b'A' as u32,
+            fg: 0x00ff_0000,
+            bg: 0,
+        };
+        // 通过 push_to_queue 写入 (0,1)，让 grid/map/queue 一致。
+        push_to_queue(&mut ctx.backend, ctx.rows, cols, &a, 0, 1);
+        // 触发一次向上滚动。
+        ctx.scroll_top_margin = 0;
+        ctx.scroll_bottom_margin = ctx.rows;
+        flanterm_fb_scroll(&mut ctx);
+
+        // 滚动后原 (0,1) 的 'A' 应出现在 (0,0)（内容上移一行）。
+        let cell = visible(&ctx.backend, cols, 0, 0);
+        assert_eq!(cell.c, b'A' as u32, "scroll should move row 1 content up to row 0");
+        // 底行应为空格。
+        let last = visible(&ctx.backend, cols, 0, ctx.rows - 1);
+        assert_eq!(last.c, b' ' as u32, "scroll should blank the bottom row");
+    }
+
+    /// 读取某格当前可见字符（map 优先于 grid）。
+    fn visible(fb: &FbBackend, cols: usize, x: usize, y: usize) -> FlantermFbChar {
+        let i = y * cols + x;
+        if let Some(idx) = fb.map[i] {
+            fb.queue[idx].c
+        } else {
+            fb.grid[i]
         }
     }
 }
