@@ -182,6 +182,11 @@ pub(crate) mod raw {
         if spec.p_vaddr % page_size != 0 {
             return Err(Error::NotSupported);
         }
+        // S31/S20：不得映射 NULL 页。p_vaddr == 0 会把段落到地址 0——空指针
+        // 解引用将不触发故障（掩盖指针 bug）。必须显式拒绝。
+        if spec.p_vaddr == 0 {
+            return Err(Error::InvalidParam);
+        }
         if spec.p_memsz < spec.p_filesz {
             return Err(Error::InvalidParam);
         }
@@ -445,9 +450,25 @@ pub(crate) mod raw {
             assert_eq!(got.vaddr_end, TEST_USER_TOP);
         }
 
+        /// S31/S20 回归：`p_vaddr == 0` 会把段映射到 NULL 页——空指针解引用
+        /// 将不触发故障（掩盖指针 bug）。必须拒绝，不得映射地址 0。
         #[test]
-        fn plan_page_math_and_boundaries() {
-            // 跨页 bss：npages = 2，终点对齐到下一页界
+        fn plan_rejects_null_page_vaddr() {
+            let spec = SegmentSpec {
+                p_vaddr: 0,
+                p_offset: 120,
+                p_filesz: 16,
+                p_memsz: PAGE,
+            };
+            assert_eq!(
+                plan(136, spec),
+                Err(Error::InvalidParam),
+                "mapping the NULL page must be rejected"
+            );
+        }
+
+        #[test]
+        fn plan_page_math_and_boundaries() {            // 跨页 bss：npages = 2，终点对齐到下一页界
             let got = plan(136, BASE_SPEC).expect("base spec must pass");
             assert_eq!(
                 got,
