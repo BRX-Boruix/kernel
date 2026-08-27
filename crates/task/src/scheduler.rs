@@ -1023,6 +1023,15 @@ fn waitpid_inner(
     }
     if frame.is_some() {
         // 物理切换（FPU + CR3/RSP0/CURRENT 单点）；仅真实 syscall 形态执行。
+        // 先置 Running、改写 *frame 为下一进程保存帧，再切 CR3（与 yield_now
+        //  line 490-493 / exit_current line 1090-1093 同构）。缺失 *frame 替换
+        // 会导致 iretq 以当前进程帧返回用户态（当前已 Blocked），cr3 已是下一
+        // 进程页表 → 在错配的 RIP 下执行下一进程代码 → 用户态页错误（S26）。
+        let slot = s.procs[next_pid].as_mut().expect("ready proc exists");
+        slot.proc.set_state(TaskState::Running);
+        if let Some(f) = frame.as_deref_mut() {
+            *f = slot.saved;
+        }
         cpu_switch_locked(s, Some(cur), next_pid);
     } else {
         // 测试形态：目标进程标记 Running 以维持表级一致性（不切 CR3/RSP0）。
