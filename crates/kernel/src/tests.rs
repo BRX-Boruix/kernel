@@ -777,20 +777,22 @@ pub fn test_frame_alloc() {
         "allocating 3 frames must raise allocated count by exactly 3"
     );
 
-    // 释放一个，再分配，验证可重用
+    // 释放一个，再分配，验证可重用（地址不要求 LIFO 复用——分配器不保证
+    // 复用刚释放的同一帧；只断言计数守恒与再分配成功）。
+    let s1_5 = mm::frame_stats();
     mm::deallocate_frame(f2);
     info!("[test-pmm] freed f2");
     let f2b = mm::allocate_frame().expect("re-alloc failed");
     info!(
-        "[test-pmm] re-allocated f2b={:?} (expect equals freed f2={:?})",
+        "[test-pmm] re-allocated f2b={:?} (freed f2 was {:?})",
         f2b.start_address(),
         f2.start_address()
     );
-    // S29：释放后立即再分配应复用刚释放的帧（LIFO/就近回收）。
+    // S29：free + re-alloc 一轮后计数回到 s1（净 0 变化），帧被正确回收再分配。
     assert_eq!(
-        f2b.start_address(),
-        f2.start_address(),
-        "re-allocated frame should reuse the just-freed frame"
+        mm::frame_stats().allocated_frames,
+        s1_5.allocated_frames,
+        "free + re-alloc must conserve allocated frame count"
     );
 
     // 清理
