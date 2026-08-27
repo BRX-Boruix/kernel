@@ -142,9 +142,12 @@ pub trait PageTable {
     /// 顶层页表物理基址（= 装载到 CR3 等页表寄存器的值）。
     ///
     /// 用于进程进入用户态/调度切换时装载进程自己的页表（M2.1 扩展 TrapFrame
-    /// 的 `cr3` 字段）。默认返回 0；架构实现应返回真实页表物理基址。
+    /// 的 `cr3` 字段）。架构实现必须返回真实页表物理基址。
+    ///
+    /// S09：默认实现直接 panic（未实现），绝不静默返回 0——返回 0 会让调用方
+    /// 把 0 当作合法 CR3 装载而 triple fault，属"未实现伪装成有效值"。
     fn paddr(&self) -> u64 {
-        0
+        panic!("PageTable::paddr() must be overridden by the architecture");
     }
 
     /// 当前活动页表的顶层物理基址（= CR3 & ~0xFFF）。

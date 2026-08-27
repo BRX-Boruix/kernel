@@ -116,7 +116,9 @@ pub fn checksum_valid(data: &[u8]) -> bool {
 ///
 /// `entry_size`：RSDT 为 4（32 位物理地址），XSDT 为 8（64 位）。
 pub fn entry_count(header: &SdtHeader, entry_size: usize) -> usize {
-    if header.length as usize <= SDT_HEADER_LEN {
+    // S31：entry_size==0 时除法除零 panic——调用方传 0 即视为无条目，
+    // 绝不在不可信输入上做未守卫除法。
+    if header.length as usize <= SDT_HEADER_LEN || entry_size == 0 {
         return 0;
     }
     (header.length as usize - SDT_HEADER_LEN) / entry_size

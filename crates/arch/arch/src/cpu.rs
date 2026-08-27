@@ -113,6 +113,22 @@ impl CpuFeature {
     ];
 }
 
+// S04：编译期断言 ALL 与枚举判别式一一对应（覆盖全部 0..=Smap 判别式，
+// 且按升序无遗漏/重复）。新增枚举变体而忘同步 ALL 时此处编译失败，
+// 杜绝"新特性静默漏探测"。
+const _: () = {
+    let mut i = 0;
+    while i < CpuFeature::ALL.len() {
+        if CpuFeature::ALL[i] as u8 != i as u8 {
+            panic!("CpuFeature::ALL out of order or missing discriminant");
+        }
+        i += 1;
+    }
+    if CpuFeature::ALL.len() != CpuFeature::Smap as usize + 1 {
+        panic!("CpuFeature::ALL must cover every discriminant 0..=Smap");
+    }
+};
+
 /// CPU 特性/熵抽象接口（全静态方法，风格与 [`crate::Platform`] 一致）。
 pub trait Cpu {
     /// 探测并缓存 CPU 特性（应在 BSP 单线程阶段调用一次）。

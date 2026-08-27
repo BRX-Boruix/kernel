@@ -33,6 +33,8 @@ pub trait Timer {
 
     /// 注册一次性定时器：`delay_ns` 纳秒后调用 `callback(arg)`。
     /// 返回定时器 id；表满或时钟未就绪时返回 `None`。
+    /// S18：返回值（定时器 id，取消句柄）`#[must_use]`——忽略会失去取消能力。
+    #[must_use]
     fn set_timeout(delay_ns: u64, callback: TimerCallback, arg: usize) -> Option<u64>;
 
     /// 驱动软件定时器队列（硬件 tick 中断里调用）。到期回调在锁外执行。

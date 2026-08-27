@@ -14,7 +14,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// 布局由架构 crate 定义。为保持 `arch` 层不依赖具体架构，
 /// 这里用一个固定大小的字节缓冲表示，由架构实现填充。
-/// 当前大小容纳 x86_64 的 callee-saved 寄存器集（15 个 u64）。
+/// 当前大小容纳 x86_64 的上下文（16 个 u64：callee-saved 寄存器 +
+/// 栈指针 + 恢复点，见 arch-x86_64/src/task.rs）。
 pub struct TaskContext {
     buf: [u64; 16],
 }
@@ -42,6 +43,11 @@ type SwitchFn = extern "C" fn(&mut TaskContext, &mut TaskContext);
 static SWITCH_FN: AtomicUsize = AtomicUsize::new(0);
 
 /// 注入架构的上下文切换实现（架构 crate 在初始化时调用）。
+///
+/// S21 invariant：`f` 必须是合法 `SwitchFn`（汇编实现的 `extern "C"` 函数，
+/// 且其契约要求 `prev`/`next` 为有效 `TaskContext`）、`'static`、由**单线程
+/// BSP 启动阶段**一次性注入；此后在任意 CPU/中断上下文读取并 transmute 回
+/// 调用。错误注入非 SwitchFn 指针或并发重复注入会产生悬垂调用，未定义行为。
 pub fn set_switch_to(f: SwitchFn) {
     SWITCH_FN.store(f as usize, Ordering::SeqCst);
 }
@@ -98,6 +104,11 @@ pub fn enter_usermode(frame: &TrapFrame) -> ! {
 ///
 /// `#[inline(never)]`：保证稳定的调用栈帧（`x86_switch_to` 的裸汇编
 /// 依赖 `[rsp]` 返回地址，内联会破坏该语义）。
+///
+/// S21 invariant：`SWITCH_FN` 值必须由 [`set_switch_to`] 注入的合法
+/// `SwitchFn` 地址；`prev`/`next` 必须是有效的、已由架构上下文保存的
+/// `TaskContext`（不可为悬垂/重复借用）。`unsafe` transmute 在此成立的前提
+/// 是上述注入不变式（见 [`set_switch_to`]）。
 #[inline(never)]
 pub fn switch_to(prev: &mut TaskContext, next: &mut TaskContext) {
     let f = SWITCH_FN.load(Ordering::SeqCst);
