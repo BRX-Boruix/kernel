@@ -1049,6 +1049,22 @@ impl BackendOps for FbBackend {
     }
 }
 
+/// # Safety
+///
+/// - `framebuffer` must point to a valid, writable framebuffer of at least
+///   `pitch * height` bytes (for the native rotation) or `pitch * phys_height`
+///   bytes (when rotation is 90/270).
+/// - `canvas` must be either null or point to a valid writable buffer of
+///   size `width * height * 4` bytes (in the post-rotation coordinate system).
+/// - `ansi_colours`, `ansi_bright_colours`, `default_bg`, `default_fg`,
+///   `default_bg_bright`, `default_fg_bright` must be null or point to valid
+///   writable `u32` values.
+/// - `font` must be null (a built-in default is used) or point to a valid font
+///   bitmap of sufficient size for the specified `font_width × font_height`.
+/// - All pointer arguments must remain valid for the lifetime of the returned
+///   `FlantermContext`.
+/// - The caller is responsible for ensuring that the framebuffer and canvas
+///   are not aliased by any other mutable reference.
 pub unsafe fn flanterm_fb_init(
     framebuffer: *mut u32,
     mut width: usize,

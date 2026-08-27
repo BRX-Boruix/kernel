@@ -783,7 +783,11 @@ fn osc_finalize<B: BackendOps>(ctx: &mut FlantermCore<B>) {
         let mut osc_num: u64 = 0;
         let mut i = 0usize;
         while i < ctx.osc_buf_i && (b'0'..=b'9').contains(&ctx.osc_buf[i]) {
-            osc_num = osc_num * 10 + (ctx.osc_buf[i] - b'0') as u64;
+            // S19: u64 overflow guard — 20 digits is the max before overflow
+            // (ceil(log10(2^64)) = 20), and a valid OSC number is well below
+            // that.  Still, guard to prevent wraparound from a malformed or
+            // maliciously long numeric prefix.
+            osc_num = osc_num.saturating_mul(10).saturating_add((ctx.osc_buf[i] - b'0') as u64);
             i += 1;
         }
         if i < ctx.osc_buf_i && ctx.osc_buf[i] == b';' {
@@ -886,11 +890,13 @@ fn control_sequence_parse<B: BackendOps>(ctx: &mut FlantermCore<B>, c: u8) {
             return;
         }
         ctx.rrr = true;
-        if ctx.esc_values[ctx.esc_values_i] > u32::MAX / 10 {
-            return;
-        }
-        ctx.esc_values[ctx.esc_values_i] *= 10;
-        ctx.esc_values[ctx.esc_values_i] += (c - b'0') as u32;
+        // S19: 旧 `> u32::MAX / 10` 检查允许 `0x1999_999A` 通过
+        // （429496730 > 429496729），随后 `*10 + digit` 即溢出。
+        // 改用 saturating 算术，杜绝任何溢出路径（溢出后 saturate
+        // 到 u32::MAX，终端仍可正确运作）。
+        ctx.esc_values[ctx.esc_values_i] = ctx.esc_values[ctx.esc_values_i]
+            .saturating_mul(10)
+            .saturating_add((c - b'0') as u32);
         return;
     }
 
