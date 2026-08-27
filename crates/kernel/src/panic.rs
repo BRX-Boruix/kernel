@@ -140,7 +140,17 @@ fn write_backtrace(out: &mut [u8]) -> &str {
     // KD4：回溯帧数上限常量化。内核调用链深度远小于此值；上限同时防御
     // 损坏帧链导致的长时间空转（配合下方单调性检查双保险）。
     const BACKTRACE_MAX_FRAMES: usize = 32;
+    // S19：解引用前先校验帧指针是否落在内核高半区（合理内核栈/帧地址）。
+    // 旧实现无条件 `read_volatile(rbp)` / `.add(1)`——若首帧 rbp 是垃圾值
+    // （栈损坏/过早回溯），panioc 现场会二次故障（页错误/读非法内存），
+    // 把"可诊断的 panic"升级成"不可诊断的二次崩溃"。
+    let plausible_frame = |fp: usize| {
+        (fp >> 48) == 0xffff && fp != 0
+    };
     for i in 0..BACKTRACE_MAX_FRAMES {
+        if !plausible_frame(rbp) {
+            break;
+        }
         let next: usize;
         let ret: usize;
         unsafe {
@@ -157,7 +167,8 @@ fn write_backtrace(out: &mut [u8]) -> &str {
             let _ = w.write_str("\n");
             valid += 1;
         }
-        if next == 0 || next <= rbp {
+        // 下一帧指针必须仍为合理内核地址、严格单调增长且非 0，否则终止。
+        if !plausible_frame(next) || next <= rbp {
             break;
         }
         rbp = next;
