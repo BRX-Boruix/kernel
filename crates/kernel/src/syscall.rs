@@ -428,12 +428,19 @@ fn sys_write(frame: &mut InterruptFrame) -> u64 {
             }
             return pack_ok(total); // 已写部分有效，短写交付
         };
-        let Some(fpos) = offset.checked_add(total) else {
-            if total == 0 {
-                return pack_err(Error::InvalidParam);
+        // S19：fpos 仅**定位写**需要（offset != STREAM_OFFSET_CURRENT）。
+        // 顺序写哨兵 STREAM_OFFSET_CURRENT == u64::MAX，对其做
+        // `u64::MAX + total`（total≥1 时必然回绕）是错把哨兵当真实偏移，
+        // 误触发"短交付"把 >1MiB 的顺序写静默截断。顺序路径不推进 fpos，
+        // 直接走 handle.write() 的句柄内部 offset。
+        if offset != STREAM_OFFSET_CURRENT {
+            if offset.checked_add(total).is_none() {
+                if total == 0 {
+                    return pack_err(Error::InvalidParam);
+                }
+                return pack_ok(total); // 已写部分有效，短写交付
             }
-            return pack_ok(total);
-        };
+        }
         if let Err(e) = validate_user_range(ubuf, n, UserAccess::Read) {
             if total == 0 {
                 return pack_err(e);
@@ -447,6 +454,8 @@ fn sys_write(frame: &mut InterruptFrame) -> u64 {
         let wrote = if offset == STREAM_OFFSET_CURRENT {
             handle.write(&kbuf[..n as usize])
         } else {
+            // 已在上方保证 `offset + total` 不回绕，此处安全推进定位偏移。
+            let fpos = offset + total;
             handle.pwrite(fpos, &kbuf[..n as usize])
         };
         match wrote {
@@ -515,16 +524,23 @@ fn sys_read(frame: &mut InterruptFrame) -> DispatchResult {
             }
             break; // 已读部分有效，短读交付
         };
-        let Some(fpos) = offset.checked_add(total) else {
-            if total == 0 {
-                return done(pack_err(Error::InvalidParam));
+        // S19：同 write 路径——fpos 仅**定位读**需要。顺序读哨兵
+        // STREAM_OFFSET_CURRENT == u64::MAX，对其 `+total` 必然回绕，
+        // 误当真实偏移会把 >1MiB 的顺序读静默截断成 1MiB。
+        if offset != STREAM_OFFSET_CURRENT {
+            if offset.checked_add(total).is_none() {
+                if total == 0 {
+                    return done(pack_err(Error::InvalidParam));
+                }
+                break;
             }
-            break;
-        };
+        }
         let chunk = &mut kbuf[..n as usize];
         let got = if offset == STREAM_OFFSET_CURRENT {
             handle.read(chunk)
         } else {
+            // 已在上方保证 `offset + total` 不回绕，此处安全推进定位偏移。
+            let fpos = offset + total;
             handle.pread(fpos, chunk)
         };
         match got {

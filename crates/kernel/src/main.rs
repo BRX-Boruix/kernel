@@ -436,6 +436,9 @@ unsafe fn kmain_body() -> ! {
     tests::test_syscall_munmap();
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_usercopy_faults();
+    // S19：顺序读写超过单块上限不得截断（>1MiB 顺序 write 回绕短交付回归）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_syscall_seq_large_io();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m63();
     #[cfg(feature = "kernel-tests")]

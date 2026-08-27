@@ -3136,6 +3136,140 @@ pub fn test_syscall_usercopy_faults() {
     info!("[test-syscall-usercopy] PASS");
 }
 
+/// S19 回归：顺序读写（`STREAM_OFFSET_CURRENT`）超过单块上限不得被截断。
+///
+/// 旧实现把 `offset.checked_add(total)` 的 fpos 计算放在**无条件**路径上；
+/// 而顺序偏移 `STREAM_OFFSET_CURRENT == u64::MAX`，第二块（total≥1）时
+/// `u64::MAX + total` 必然溢出 → 误走"短交付"分支，>1MiB 的顺序 write/read
+/// 第二块起被静默丢弃，只交付 1MiB。修复：仅 `offset != CURRENT` 时才算
+/// fpos / 校验回绕。本测试写满 2MiB+16 到 RAMFS 文件，断言返回全长。
+pub fn test_syscall_seq_large_io() {
+    use alloc::boxed::Box;
+    use arch_x86_64::interrupts::InterruptFrame;
+    use task::Process;
+
+    info!("[test-syscall-seq-large] === S19: sequential IO > chunk must not truncate ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> InterruptFrame {
+        InterruptFrame {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rbp: 0,
+            rdi: a1,
+            rsi: a2,
+            rdx: a3,
+            rcx: 0,
+            rbx: 0,
+            rax: nr as u64,
+            vector: 0,
+            error_code: 0,
+            rip: 0,
+            cs: 0,
+            rflags: 0,
+            rsp: 0,
+            ss: 0,
+        }
+    }
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // 1MiB+16 顺序写源缓冲：mmap 后显式逐页补页，保证全区间驻留可读。
+    // S19 回归需要 len > SYSCALL_COPY_CHUNK_BYTES(1MiB)：1MiB+16 已触发
+    // 第二块（total≥1）fpos 回绕，足证截断修复；同时把测试自身帧/堆
+    // 扰动降到最低，避免推偏后续 test_loader_adversarial 的帧池水位。
+    const WRITE_LEN: u64 = 1024 * 1024 + 16;
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, WRITE_LEN, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(
+        map.rax < 0x8000_0000_0000_0000,
+        "mmap must succeed (not an error)"
+    );
+    let buf = map.rax;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        let mut a = buf;
+        while a < buf + WRITE_LEN {
+            p.addr_space_mut()
+                .handle_page_fault(a, arch_x86_64::paging::PageFaultCode::new(0));
+            a += 0x1000;
+        }
+    }
+
+    // 写路径串到缓冲起始（HHDM 别名写，SMAP 不适用；既有测试同法）。
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let path = b"/scratch/large_seq.bin\0";
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(buf))
+            .expect("buffer resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(path.as_ptr(), (pa + off) as *mut u8, path.len());
+    }
+
+    // 打开 /scratch/large_seq.bin：write|create|truncate（bit1|bit2|bit3 = 0b1110）。
+    let mut o = frame(
+        crate::syscall::SYS_STREAM_CREATE,
+        buf,
+        (1u32 << 1 | 1u32 << 2 | 1u32 << 3) as u64,
+        0,
+    );
+    assert!(crate::syscall::syscall_entry(&mut o));
+    assert!(
+        o.rax < 0x8000_0000_0000_0000,
+        "open/create must succeed"
+    );
+    let fd = o.rax;
+
+    // 顺序写 1MiB+16：修复前第二块 fpos 回绕 → 只交付 1MiB（红），
+    // 修复后必须交付全长。
+    let mut w = frame(crate::syscall::SYS_STREAM_WRITE, fd, buf, WRITE_LEN);
+    w.r10 = u64::MAX; // STREAM_OFFSET_CURRENT
+    assert!(crate::syscall::syscall_entry(&mut w));
+    assert_eq!(
+        w.rax, WRITE_LEN,
+        "sequential write >1MiB must deliver full length (S19: no truncation)"
+    );
+
+    // 清理：先关闭 fd（释放 inode 引用，提前归还 RAMFS 堆 Vec），
+    // 再 unlink 目录项，确保测试零资源残留（S18/S26：不得推偏后序测试）。
+    {
+        let mut c = frame(crate::syscall::SYS_STREAM_CLOSE, fd, 0, 0);
+        assert!(crate::syscall::syscall_entry(&mut c));
+        assert!(c.rax < 0x8000_0000_0000_0000, "close fd must succeed");
+    }
+    {
+        let root = crate::vfs_init::root();
+        root.unlink("/scratch/large_seq.bin")
+            .expect("[test-syscall-seq-large] cleanup unlink");
+    }
+
+    // 帧计数包络断言（S18/S26 零残留证明）：整个测试包络前后 allocated_frames
+    // 严格相等——任一帧泄漏都会推偏后序 test_loader_adversarial 的帧池水位。
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-syscall-seq-large] PASS");
+}
+
 /// B14/B21：SYS_MEMORY_QUERY 全链路覆盖 + stdin Busy→EAGAIN 语义锁定。
 ///
 /// - **B14**：已映射页查询返回 PRESENT|USER|WRITABLE 位图；未触碰 demand
