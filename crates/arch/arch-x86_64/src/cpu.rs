@@ -285,7 +285,9 @@ pub fn entropy_u64() -> Option<u64> {
     if let Some(v) = rdrand64() {
         return Some(v);
     }
-    Some(klib::time::now_nanos().rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15)
+    // S09：无真熵且时钟未就绪（now_nanos() 为 None）时如实返回 None，绝不
+    // 把确定性时间戳当熵垫底——确定性数据不是随机熵，用于密钥会破坏安全性。
+    klib::time::now_nanos().map(|n| n.rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15)
 }
 
 // ---------- SMEP / SMAP 硬件防护 ----------

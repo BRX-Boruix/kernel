@@ -10,15 +10,15 @@ use arch::timer::{Timer, TimerCallback};
 pub struct X8664Timer;
 
 impl Timer for X8664Timer {
-    fn now_nanos() -> u64 {
+    fn now_nanos() -> Option<u64> {
         klib::time::now_nanos()
     }
 
-    fn now_micros() -> u64 {
+    fn now_micros() -> Option<u64> {
         klib::time::now_micros()
     }
 
-    fn now_millis() -> u64 {
+    fn now_millis() -> Option<u64> {
         klib::time::now_millis()
     }
 

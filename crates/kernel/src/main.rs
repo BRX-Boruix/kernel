@@ -287,10 +287,11 @@ unsafe fn kmain_body() -> ! {
         "[kmain] RTC wall clock {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         rtc.year, rtc.month, rtc.day, rtc.hour, rtc.minute, rtc.second
     );
+    // 此时 LAPIC 定时器已注入时钟源，now_* 必为 Some。
     info!(
         "[kmain] monotonic clock ready: now={} ns ({} ms since boot)",
-        klib::time::now_nanos(),
-        klib::time::now_millis()
+        klib::time::now_nanos().expect("clock ready at kmain log"),
+        klib::time::now_millis().expect("clock ready at kmain log")
     );
     // 验证 arch::Timer 抽象（now/sleep/set_timeout），依赖 LAPIC tick 驱动。
     #[cfg(feature = "kernel-tests")]

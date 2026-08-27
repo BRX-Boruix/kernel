@@ -623,13 +623,13 @@ pub fn test_time_abstraction() {
     use arch_x86_64::timer::X8664Timer;
 
     // 1. 单调时钟：等 5 个 tick，验证 now_millis 确实增长。
-    let m0 = X8664Timer::now_millis();
+    let m0 = X8664Timer::now_millis().expect("clock ready in selftest");
     let t0 = arch_x86_64::lapic::ticks();
     while arch_x86_64::lapic::ticks().wrapping_sub(t0) < 5 {
         arch_x86_64::interrupts::enable();
         arch_x86_64::interrupts::halt();
     }
-    let m1 = X8664Timer::now_millis();
+    let m1 = X8664Timer::now_millis().expect("clock ready in selftest");
     info!(
         "[time] monotonic: {}ms -> {}ms (+{}ms, 5 ticks @100Hz = ~50ms)",
         m0,
@@ -719,9 +719,10 @@ pub fn test_time_abstraction() {
 pub fn test_sleep_accuracy() {
     info!("[sleep] entering test_sleep_accuracy");
     let target: u64 = 1_000_000_000; // 1 秒
-    let before = klib::time::now_nanos();
+    // 自检时 LAPIC 定时器已注入时钟源，now_* 必为 Some。
+    let before = klib::time::now_nanos().expect("clock ready in selftest");
     klib::time::sleep_nanos(target);
-    let after = klib::time::now_nanos();
+    let after = klib::time::now_nanos().expect("clock ready in selftest");
     let delta = after.saturating_sub(before);
     info!(
         "[sleep] sleep_nanos({}ns) -> now delta = {} ns ({} ms)",
@@ -1952,11 +1953,11 @@ pub fn test_shared_irq() {
     //    仍正常工作（时间推进）→ 共享分发互不干扰。
     let before_calls = SHARED_IRQ_CALLS.load(core::sync::atomic::Ordering::Relaxed);
     let ticks_before = arch_x86_64::lapic::ticks();
-    let t0 = X8664Timer::now_millis();
+    let t0 = X8664Timer::now_millis().expect("clock ready in selftest");
     klib::time::sleep_us(100_000); // 100ms ≈ 10 ticks
     let after_calls = SHARED_IRQ_CALLS.load(core::sync::atomic::Ordering::Relaxed);
     let ticks_after = arch_x86_64::lapic::ticks();
-    let t1 = X8664Timer::now_millis();
+    let t1 = X8664Timer::now_millis().expect("clock ready in selftest");
     // now_millis() 返回毫秒，无需再缩放。
     info!(
         "[irq] observer {} -> {} calls; lapic ticks {} -> {}; time {} -> {} ms over 100ms sleep",

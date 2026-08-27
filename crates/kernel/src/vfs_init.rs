@@ -130,7 +130,7 @@ impl SystemInfoProvider for KernelSystemProvider {
         const BUILD_TIMESTAMP_MS: u64 = parse_ms(env!("BORUIX_BUILD_TIMESTAMP"));
         let version = env!("CARGO_PKG_VERSION");
         let commit = env!("BORUIX_GIT_COMMIT");
-        let uptime_ms = klib::time::now_millis();
+        let uptime_ms = klib::time::now_millis().unwrap_or(0);
         let mut target = klib::json::VecTarget::new();
         let mut writer = klib::json::JsonWriter::new(&mut target);
         writer
@@ -279,7 +279,7 @@ impl DeviceInfoProvider for KernelDeviceProvider {
             .and_then(|mut o| {
                 o.field_u64("total_devices", count as u64)?;
                 o.field_u64("total_drivers", drv_count as u64)?;
-                o.field_u64("uptime_ms", klib::time::now_millis())?;
+                o.field_u64("uptime_ms", klib::time::now_millis().unwrap_or(0))?;
                 o.end()
             })
             .expect("Vec-backed telemetry JSON serialization cannot fail");

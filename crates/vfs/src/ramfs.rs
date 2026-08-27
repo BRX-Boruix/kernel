@@ -73,7 +73,7 @@ fn reserve_with_watermark(
 
 /// 单调毫秒时间戳来源（S03：klib::time 为单调时间线，非 wall clock）。
 fn now_ms() -> u64 {
-    klib::time::now_millis()
+    klib::time::now_millis().unwrap_or(0)
 }
 
 /// RamFS 内部节点数据。

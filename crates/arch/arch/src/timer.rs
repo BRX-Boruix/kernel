@@ -15,17 +15,17 @@ pub type TimerCallback = fn(arg: usize);
 
 /// 定时器/时钟抽象接口（全静态方法，风格与 [`crate::Platform`] 一致）。
 pub trait Timer {
-    /// 当前单调时间（自时钟启动以来的纳秒数）。时钟未就绪时返回 0。
-    fn now_nanos() -> u64;
+    /// 当前单调时间（自时钟启动以来的纳秒数）。时钟未就绪时返回 `None`。
+    fn now_nanos() -> Option<u64>;
 
-    /// 当前单调时间（微秒）。
-    fn now_micros() -> u64 {
-        Self::now_nanos() / 1_000
+    /// 当前单调时间（微秒）。时钟未就绪时返回 `None`。
+    fn now_micros() -> Option<u64> {
+        Self::now_nanos().map(|n| n / 1_000)
     }
 
-    /// 当前单调时间（毫秒）。
-    fn now_millis() -> u64 {
-        Self::now_nanos() / 1_000_000
+    /// 当前单调时间（毫秒）。时钟未就绪时返回 `None`。
+    fn now_millis() -> Option<u64> {
+        Self::now_nanos().map(|n| n / 1_000_000)
     }
 
     /// 睡眠 `us` 微秒（时钟未就绪时立即返回）。

@@ -47,30 +47,29 @@ pub fn ticks() -> u64 {
 
 /// 当前单调时间（自时钟启动以来的纳秒数）。
 ///
-/// **S09**：时钟源未注入（[`clock_ready`] == false）时返回 0。此 0 是
-/// **未就绪哨兵**，不是"真实时间恰好为 0"——调用方在基于时间做逻辑
-/// 前必须先判 [`clock_ready`]，避免把"未就绪"当作正常时间使用。内核在
-/// LAPIC 定时器初始化（架构层 `lapic::init`）后注入时钟源，此路径在
-/// 生产启动中仅在极早期可达。
-pub fn now_nanos() -> u64 {
+/// **S09**：时钟源未注入（[`clock_ready`] == false）时返回 `None`——用
+/// `Option` 显式表达"未就绪"，而不是伪装成"真实时间恰好为 0"的哨兵值。
+/// 内核在 LAPIC 定时器初始化（架构层 `lapic::init`）后注入时钟源，此路径
+/// 在生产启动中仅在极早期可达；调用方应把 `None` 当作"时钟不可用"处理。
+pub fn now_nanos() -> Option<u64> {
     let f = TICK_FN.load(Ordering::Acquire);
     if f == 0 {
-        return 0;
+        return None;
     }
     let hz = TICK_HZ.load(Ordering::Relaxed);
     let t = unsafe { core::mem::transmute::<usize, TickFn>(f)() };
     // u128 中间运算防溢出（tick 可能达 1e18 量级）。
-    (t as u128 * 1_000_000_000 / hz as u128) as u64
+    Some((t as u128 * 1_000_000_000 / hz as u128) as u64)
 }
 
-/// 当前单调时间（微秒）。
-pub fn now_micros() -> u64 {
-    now_nanos() / 1_000
+/// 当前单调时间（微秒）。时钟未就绪返回 `None`。
+pub fn now_micros() -> Option<u64> {
+    now_nanos().map(|n| n / 1_000)
 }
 
-/// 当前单调时间（毫秒）。
-pub fn now_millis() -> u64 {
-    now_nanos() / 1_000_000
+/// 当前单调时间（毫秒）。时钟未就绪返回 `None`。
+pub fn now_millis() -> Option<u64> {
+    now_nanos().map(|n| n / 1_000_000)
 }
 
 /// 忙等睡眠 `ns` 纳秒。时钟未注入时立即返回（防早期死循环）。
@@ -82,8 +81,9 @@ pub fn sleep_nanos(ns: u64) {
     if !clock_ready() {
         return;
     }
-    let deadline = now_nanos().saturating_add(ns);
-    while now_nanos() < deadline {
+    // clock_ready() 已保证注入时钟源，now_nanos() 必为 Some。
+    let deadline = now_nanos().expect("clock_ready checked").saturating_add(ns);
+    while now_nanos().expect("clock_ready checked") < deadline {
         core::hint::spin_loop();
     }
 }
@@ -147,7 +147,8 @@ pub fn set_timeout(delay_ns: u64, callback: TimerCallback, arg: usize) -> Option
     if !clock_ready() {
         return None; // 无时钟源：永不调度，直接拒绝
     }
-    let deadline = now_nanos().saturating_add(delay_ns);
+    // clock_ready() 已保证注入时钟源。
+    let deadline = now_nanos().expect("clock_ready checked").saturating_add(delay_ns);
     let mut table = TIMER_TABLE.lock();
     let slot_index = table
         .slots
@@ -204,7 +205,8 @@ pub fn poll_timeouts() {
     if !clock_ready() {
         return;
     }
-    let now = now_nanos();
+    // clock_ready() 已保证注入时钟源。
+    let now = now_nanos().expect("clock_ready checked");
     // 收集到期槽（最多 MAX_TIMERS 个），按 deadline 升序排序后锁外执行回调。
     let mut due = [0usize; MAX_TIMERS]; // callback 指针
     let mut dl = [0u64; MAX_TIMERS];
@@ -317,14 +319,14 @@ mod tests {
         // 1 tick = 10ms (100Hz)
         set_clock_source(fake_tick, 100);
         FAKE_TICK.store(0, Ordering::Relaxed);
-        assert_eq!(now_nanos(), 0);
+        assert_eq!(now_nanos(), Some(0));
         FAKE_TICK.store(50, Ordering::Relaxed);
-        assert_eq!(now_nanos(), 500_000_000); // 50 * 10ms
-        assert_eq!(now_micros(), 500_000);
-        assert_eq!(now_millis(), 500);
+        assert_eq!(now_nanos(), Some(500_000_000)); // 50 * 10ms
+        assert_eq!(now_micros(), Some(500_000));
+        assert_eq!(now_millis(), Some(500));
         FAKE_TICK.store(1000, Ordering::Relaxed);
-        assert_eq!(now_nanos(), 10_000_000_000);
-        assert_eq!(now_millis(), 10_000);
+        assert_eq!(now_nanos(), Some(10_000_000_000));
+        assert_eq!(now_millis(), Some(10_000));
     }
 
     #[test]
@@ -333,9 +335,9 @@ mod tests {
         // 1 tick = 1us (1MHz)
         set_clock_source(fake_tick, 1_000_000);
         FAKE_TICK.store(250_000, Ordering::Relaxed);
-        assert_eq!(now_nanos(), 250_000_000); // 250ms
-        assert_eq!(now_micros(), 250_000);
-        assert_eq!(now_millis(), 250);
+        assert_eq!(now_nanos(), Some(250_000_000)); // 250ms
+        assert_eq!(now_micros(), Some(250_000));
+        assert_eq!(now_millis(), Some(250));
     }
 
     #[test]
@@ -475,10 +477,12 @@ mod tests {
     #[test]
     fn no_clock_source_is_safe() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // 未注入时钟源：所有操作退化为安全空转。
+        // 未注入时钟源：所有操作退化为安全空转，now_* 如实返回 None。
         TICK_FN.store(0, Ordering::SeqCst);
         assert!(!clock_ready());
-        assert_eq!(now_nanos(), 0);
+        assert_eq!(now_nanos(), None);
+        assert_eq!(now_micros(), None);
+        assert_eq!(now_millis(), None);
         assert!(set_timeout(10, cb_count, 0).is_none());
         poll_timeouts(); // 不 panic
         sleep_ms(1); // 立即返回，不 panic
