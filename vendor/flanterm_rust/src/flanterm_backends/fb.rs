@@ -803,10 +803,12 @@ fn draw_cursor(ctx: &mut FlantermContext) {
     unsafe {
         plot_char(fb, cols, rows, &c, fb.cursor_x, fb.cursor_y);
     }
-    if let Some(idx) = fb.map[i] {
-        fb.grid[i] = fb.queue[idx].c;
-        fb.map[i] = None;
-    }
+    // S20：不得在此吸收（清空）光标格的 pending 项。若光标正落在有待刷
+    // 新字符的格上，此处只画反转色光标，**保留** `map[i]=Some(idx)`，让
+    // 随后的 double_buffer_flush 循环画出该格的真实颜色。旧实现在此把
+    // `grid[i]=queue[idx].c` 并 `map[i]=None`，导致 flush 循环以
+    // `map.is_none()` 跳过该格——真实颜色永远不被绘制，屏幕残留反转
+    // 字符（`write("A\x1b[H")` 可复现）。
 }
 
 fn flanterm_fb_double_buffer_flush(ctx: &mut FlantermContext) {
@@ -1321,4 +1323,126 @@ pub unsafe fn flanterm_fb_init(
 
 pub fn flanterm_fb_set_flush_callback(ctx: &mut FlantermContext, flush_callback: FlushCallback) {
     ctx.backend.flush_callback = flush_callback;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个最小可绘制 FbBackend：实帧缓冲、实心字形（全 0xFF），
+    /// 使 `plot_char` 把整个字形格涂成 `fg` 色，便于直接断言像素。
+    fn test_backend(width: usize, height: usize) -> (FbBackend, Vec<u32>) {
+        let mut fb_buf = vec![0u32; width * height];
+        let fb_ptr = fb_buf.as_mut_ptr();
+        let font_bool = vec![0xFFu8; 8 * 16]; // 实心字形
+        let backend = FbBackend {
+            plot_mode: PlotMode::UnscaledNoCanvas,
+            flush_callback: None,
+            font_width: 8,
+            font_height: 16,
+            glyph_width: 8,
+            glyph_height: 16,
+            font_scale_x: 1,
+            font_scale_y: 1,
+            offset_x: 0,
+            offset_y: 0,
+            framebuffer: fb_ptr,
+            pitch: width * 4,
+            width,
+            height,
+            phys_height: height,
+            red_mask_size: 8,
+            red_mask_shift: 16,
+            green_mask_size: 8,
+            green_mask_shift: 8,
+            blue_mask_size: 8,
+            blue_mask_shift: 0,
+            rotation: FLANTERM_FB_ROTATE_0,
+            font_bits: Vec::new(),
+            font_bool,
+            ansi_colours: [0; 8],
+            ansi_bright_colours: [0; 8],
+            default_fg: 0x00aa_aaaa,
+            default_bg: 0x0000_0000,
+            default_fg_bright: 0x00ff_ffff,
+            default_bg_bright: 0x0055_5555,
+            canvas: None,
+            grid: vec![
+                FlantermFbChar {
+                    c: 0,
+                    fg: 0x00aa_aaaa,
+                    bg: 0x0000_0000,
+                };
+                (width / 8) * (height / 16)
+            ],
+            queue: Vec::new(),
+            queue_i: 0,
+            map: vec![None; (width / 8) * (height / 16)],
+            text_fg: 0x00aa_aaaa,
+            text_bg: 0xffff_ffff,
+            cursor_x: 0,
+            cursor_y: 0,
+            saved_state_text_fg: 0,
+            saved_state_text_bg: 0,
+            saved_state_cursor_x: 0,
+            saved_state_cursor_y: 0,
+            old_cursor_x: 0,
+            old_cursor_y: 0,
+        };
+        (backend, fb_buf)
+    }
+
+    /// 构造一个已启用光标的 FlantermContext（rows×cols 网格）。
+    fn test_ctx(width: usize, height: usize) -> (FlantermContext, Vec<u32>) {
+        let (backend, fb_buf) = test_backend(width, height);
+        let cols = width / 8;
+        let rows = height / 16;
+        let mut ctx = Box::new(flanterm_context_new(backend, rows, cols));
+        ctx.cursor_enabled = true;
+        ctx.autoflush = false;
+        (*ctx, fb_buf)
+    }
+
+    /// S20 回归：flush 不得吞掉光标格上的真实字符颜色。
+    ///
+    /// 复现 `write("A\x1b[H")`：在光标格 (0,0) 放入 pending 项（真实 fg=RED,
+    /// bg=BLUE），光标也停在 (0,0)。旧实现 `draw_cursor` 先执行：画出
+    /// **反转色**（fg=BLUE）并吸收该 pending 项（map 置 None），随后 flush
+    /// 循环因 `map[offset].is_none()` 跳过该格——真实颜色永远不被绘制，
+    /// 屏幕残留反转 'A'。修复后 flush 必须画出真实 fg=RED。
+    #[test]
+    fn flush_does_not_swallow_cursor_cell_real_color() {
+        let (mut ctx, fb_buf) = test_ctx(80, 160); // 10 列 × 10 行
+        let cols = ctx.cols;
+        let real = FlantermFbChar {
+            c: 0,
+            fg: 0x00ff_0000, // RED
+            bg: 0x0000_00ff, // BLUE
+        };
+        // 在光标格 (0,0) 放一个 pending 项，并把光标也放在 (0,0)。
+        ctx.backend.queue.push(FlantermFbQueueItem {
+            x: 0,
+            y: 0,
+            c: real,
+        });
+        ctx.backend.queue_i = 1;
+        ctx.backend.map[0] = Some(0);
+        ctx.backend.grid[0] = FlantermFbChar {
+            c: 0,
+            fg: 0,
+            bg: 0,
+        };
+        ctx.backend.cursor_x = 0;
+        ctx.backend.cursor_y = 0;
+
+        // 刷新：draw_cursor + flush 循环。
+        flanterm_fb_double_buffer_flush(&mut ctx);
+
+        // 首像素应已是真实 fg=RED（实心字形全涂 fg）。
+        let pixel = fb_buf[0];
+        assert_eq!(
+            pixel, 0x00ff_0000,
+            "S20: flush must draw the real cursor-cell color, not swallow it as reversed"
+        );
+    }
 }
