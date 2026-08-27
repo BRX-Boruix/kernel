@@ -292,6 +292,11 @@ pub fn flanterm_context_new<B: BackendOps>(
     rows: usize,
     cols: usize,
 ) -> FlantermCore<B> {
+    // S17: rows/cols 必须为正。rows==0 → scroll_bottom_margin-1 下溢 panic，
+    // cols==0 → ctx.cols-1 下溢。此处以 debug_assert 固化为构造期契约；
+    // fb 后端（flanterm_fb_init）已在上游对 rows/cols==0 返回 None，正常
+    // 调用不会触及此断言（release 下合法构造方仍须保证非零）。
+    debug_assert!(rows > 0 && cols > 0, "flanterm: rows and cols must be > 0");
     let mut ctx = FlantermCore {
         tab_size: 0,
         autoflush: false,

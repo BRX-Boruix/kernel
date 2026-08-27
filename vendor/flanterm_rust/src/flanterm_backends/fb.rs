@@ -1130,6 +1130,14 @@ pub unsafe fn flanterm_fb_init(
     let glyph_height = font_height * font_scale_y;
     let cols = (width - margin * 2) / glyph_width;
     let rows = (height - margin * 2) / glyph_height;
+
+    // S17: 小分辨率 / 大边距 framebuffer 会算出 rows==0 或 cols==0。空终端
+    // 构造后 `scroll_bottom_margin-1` / `cols-1` 立即下溢 panic（debug）或
+    // 回绕成巨大值（release）。此处如实拒绝（返回 None），绝不构造一个
+    // 必然在下游崩溃的空上下文。
+    if rows == 0 || cols == 0 {
+        return None;
+    }
     let offset_x = margin + ((width - margin * 2) % glyph_width) / 2;
     let offset_y = margin + ((height - margin * 2) % glyph_height) / 2;
 
@@ -1444,5 +1452,41 @@ mod tests {
             pixel, 0x00ff_0000,
             "S20: flush must draw the real cursor-cell color, not swallow it as reversed"
         );
+    }
+
+    /// S17 回归：小分辨率/大边距 framebuffer 会算出 rows==0 或 cols==0，
+    /// 构造出空终端后 `scroll_bottom_margin-1`/`cols-1` 下溢 panic。
+    /// `flanterm_fb_init` 必须在 rows/cols 非正时返回 None（拒绝构造），
+    /// 而非返回一个必然在下游下溢的空上下文。
+    #[test]
+    fn fb_init_rejects_zero_rows_or_cols() {
+        // 8×16 字形、margin=8：宽 16、高 32 → (16-16)/8=0 列、(32-16)/16=1 行。
+        // 至少有一维为 0，必须被拒绝。
+        let mut fb = [0u32; 16 * 32];
+        unsafe {
+            let r = flanterm_fb_init(
+                fb.as_mut_ptr(),
+                16,     // width
+                32,     // height
+                16 * 4, // pitch
+                8, 0, 8, 8, 8, 16, // masks
+                core::ptr::null_mut(), // canvas
+                core::ptr::null_mut(), // ansi_colours
+                core::ptr::null_mut(), // ansi_bright_colours
+                core::ptr::null_mut(), // default_bg
+                core::ptr::null_mut(), // default_fg
+                core::ptr::null_mut(), // default_bg_bright
+                core::ptr::null_mut(), // default_fg_bright
+                core::ptr::null_mut(), // font
+                8, 16, 1, // font w/h/spacing
+                1, 1, // scale
+                8,    // margin
+                FLANTERM_FB_ROTATE_0,
+            );
+            assert!(
+                r.is_none(),
+                "S17: fb_init must reject a framebuffer too small to hold any glyph"
+            );
+        }
     }
 }
