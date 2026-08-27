@@ -26,6 +26,11 @@ static TICK_HZ: AtomicU64 = AtomicU64::new(1);
 /// 注入时钟源：`tick_fn` 返回单调 tick 计数，`tick_hz` 为其频率（Hz）。
 ///
 /// 应在架构定时器初始化完成后调用一次。可重复调用以切换时钟源。
+///
+/// S21 前提（成文）：TICK_FN→TICK_HZ 双 store 无发布同步；读者 Acquire 读 fn
+/// 后 Relaxed 读 hz，切换时钟源期间理论上可读到"新 fn + 旧 hz"错配。前提是
+/// **时钟源只在启动早期单线程阶段注入/切换一次**，此后 TICK_FN/TICK_HZ 不再
+/// 被写，错配窗口不可达。多核热切换时钟源须引入版本号/同一原子双字段。
 pub fn set_clock_source(tick_fn: TickFn, tick_hz: u64) {
     TICK_FN.store(tick_fn as usize, Ordering::SeqCst);
     TICK_HZ.store(tick_hz.max(1), Ordering::SeqCst);
@@ -58,8 +63,11 @@ pub fn now_nanos() -> Option<u64> {
     }
     let hz = TICK_HZ.load(Ordering::Relaxed);
     let t = unsafe { core::mem::transmute::<usize, TickFn>(f)() };
-    // u128 中间运算防溢出（tick 可能达 1e18 量级）。
-    Some((t as u128 * 1_000_000_000 / hz as u128) as u64)
+    // u128 中间运算防乘法溢出（tick 可能达 1e18 量级）。
+    // S19：最终 u128→u64 若超位宽（hz 极小且 tick 极大时商可超 u64）不应静默
+    // 回绕，饱和到 u64::MAX 而非截断。真实 LAPIC 频率下不可达，但做饱和更诚实。
+    let ns = (t as u128 * 1_000_000_000 / hz as u128) as u128;
+    Some(if ns > u64::MAX as u128 { u64::MAX } else { ns as u64 })
 }
 
 /// 当前单调时间（微秒）。时钟未就绪返回 `None`。

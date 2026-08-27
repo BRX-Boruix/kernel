@@ -25,9 +25,10 @@ pub struct MpmcQueue<T: Copy, const N: usize> {
     buf: [UnsafeCell<MaybeUninit<T>>; N],
     /// 每个槽的序号（Vyukov 算法核心：随入队/出队轮次递增）。
     seq: [AtomicUsize; N],
-    /// 下一次入队位置（单调递增计数器，永不回绕）。
+    /// 下一次入队位置（绝对序号，按 usize 位宽回绕；与 `seq` 槽位的
+    /// `pos..pos+N` 区间判别配合，回绕安全——见 [`MpmcQueue::pop`]）。
     enqueue_pos: AtomicUsize,
-    /// 下一次出队位置（单调递增计数器，永不回绕）。
+    /// 下一次出队位置（同入队，回绕设计）。
     dequeue_pos: AtomicUsize,
 }
 
@@ -71,7 +72,7 @@ impl<T: Copy, const N: usize> MpmcQueue<T, N> {
         unsafe {
             (*self.buf[idx].get()).write(value);
         }
-        self.seq[idx].store(pos + 1, Ordering::Release);
+        self.seq[idx].store(pos.wrapping_add(1), Ordering::Release);
     }
 
     /// 非阻塞入队；满立即返回 `false`。
@@ -88,13 +89,13 @@ impl<T: Copy, const N: usize> MpmcQueue<T, N> {
             }
             if self
                 .enqueue_pos
-                .compare_exchange(pos, pos + 1, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange(pos, pos.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
                 unsafe {
                     (*self.buf[idx].get()).write(value);
                 }
-                self.seq[idx].store(pos + 1, Ordering::Release);
+                self.seq[idx].store(pos.wrapping_add(1), Ordering::Release);
                 return true;
             }
             // CAS 失败：其他生产者抢先，重试。
@@ -106,11 +107,11 @@ impl<T: Copy, const N: usize> MpmcQueue<T, N> {
         let mask = N - 1;
         let pos = self.dequeue_pos.fetch_add(1, Ordering::Acquire);
         let idx = pos & mask;
-        while self.seq[idx].load(Ordering::Acquire) != pos + 1 {
+        while self.seq[idx].load(Ordering::Acquire) != pos.wrapping_add(1) {
             core::hint::spin_loop();
         }
         let value = unsafe { (*self.buf[idx].get()).assume_init_read() };
-        self.seq[idx].store(pos + N, Ordering::Release);
+        self.seq[idx].store(pos.wrapping_add(N), Ordering::Release);
         value
     }
 
@@ -122,16 +123,16 @@ impl<T: Copy, const N: usize> MpmcQueue<T, N> {
         loop {
             let pos = self.dequeue_pos.load(Ordering::Acquire);
             let idx = pos & mask;
-            if self.seq[idx].load(Ordering::Acquire) != pos + 1 {
+            if self.seq[idx].load(Ordering::Acquire) != pos.wrapping_add(1) {
                 return None; // 该轮数据尚未发布（空）
             }
             if self
                 .dequeue_pos
-                .compare_exchange(pos, pos + 1, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange(pos, pos.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
                 let value = unsafe { (*self.buf[idx].get()).assume_init_read() };
-                self.seq[idx].store(pos + N, Ordering::Release);
+                self.seq[idx].store(pos.wrapping_add(N), Ordering::Release);
                 return Some(value);
             }
             // CAS 失败：其他消费者抢先，重试。

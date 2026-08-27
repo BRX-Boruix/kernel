@@ -60,7 +60,10 @@ impl<const N: usize> StackTarget<N> {
 impl<const N: usize> JsonTarget for StackTarget<N> {
     fn write_str(&mut self, s: &str) -> Result<(), ()> {
         let bytes = s.as_bytes();
-        if self.len + bytes.len() > N {
+        // S19：`self.len + bytes.len()` 相加可能溢出（bytes.len() 极大时 debug
+        // panic / release wrap 误判放行再越界 copy）。改为减法比较：self.len<=N
+        // 恒成立，`bytes.len() > N - self.len` 无溢出。
+        if bytes.len() > N - self.len {
             return Err(());
         }
         self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
@@ -267,6 +270,10 @@ impl<'a, T: JsonTarget> JsonObject<'a, T> {
     }
 
     /// 开启嵌套子对象 `"key":{`
+    ///
+    /// S20 失败语义：`f` 返回 Err 时 target 已被写入 `"key":{` 而未闭合
+    /// `}`——目标处于未闭合的半成品状态（部分 JSON 污染）。调用方失败后
+    /// 必须**丢弃/重建**整个目标，不得继续复用当前目标续写合法 JSON。
     pub fn sub_object<F>(&mut self, key: &str, f: F) -> Result<&mut Self, ()>
     where
         F: FnOnce(&mut JsonObject<'_, T>) -> Result<(), ()>,
@@ -283,6 +290,9 @@ impl<'a, T: JsonTarget> JsonObject<'a, T> {
     }
 
     /// 开启嵌套子数组 `"key":[`
+    ///
+    /// S20 失败语义：同 [`Self::sub_object`]——`f` 失败后 target 留下未闭合
+    /// 的 `[`，调用方须丢弃/重建目标。
     pub fn sub_array<F>(&mut self, key: &str, f: F) -> Result<&mut Self, ()>
     where
         F: FnOnce(&mut JsonArray<'_, T>) -> Result<(), ()>,
@@ -366,6 +376,8 @@ impl<'a, T: JsonTarget> JsonArray<'a, T> {
     }
 
     /// 开启子对象元素 `{`
+    ///
+    /// S20 失败语义：`f` 失败后已写入逗号与 `{`，目标未闭合，须丢弃/重建。
     pub fn push_object<F>(&mut self, f: F) -> Result<&mut Self, ()>
     where
         F: FnOnce(&mut JsonObject<'_, T>) -> Result<(), ()>,
@@ -382,6 +394,8 @@ impl<'a, T: JsonTarget> JsonArray<'a, T> {
     }
 
     /// 开启子数组元素 `[`
+    ///
+    /// S20 失败语义：同 [`Self::push_object`]——失败后目标未闭合，须丢弃/重建。
     pub fn push_array<F>(&mut self, f: F) -> Result<&mut Self, ()>
     where
         F: FnOnce(&mut JsonArray<'_, T>) -> Result<(), ()>,

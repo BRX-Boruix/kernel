@@ -56,9 +56,13 @@ pub type OutputFn = crate::console::SinkFn;
 /// 注册一个输出端（兼容旧名）。
 ///
 /// 语义由"单次注入"变为"注册到统一 console"，可多次调用注册多个输出端
-/// （例如先注册串口，再注册 framebuffer 终端）。表满时静默忽略。
-pub fn set_output(f: OutputFn) {
-    let _ = crate::console::register(f);
+/// （例如先注册串口，再注册 framebuffer 终端）。
+///
+/// S09：返回注册是否成功——表满时返回 `false`，调用方据此感知输出端未接入，
+/// 不再静默丢弃注册。
+#[must_use]
+pub fn set_output(f: OutputFn) -> bool {
+    crate::console::register(f)
 }
 
 /// 写字符串到统一 console（`\n` 的 `\r\n` 转换由各 sink 自行处理）。

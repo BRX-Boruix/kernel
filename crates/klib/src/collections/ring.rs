@@ -78,7 +78,9 @@ impl<T, const N: usize> RingBuffer<T, N> {
         unsafe {
             (*slot).write(value);
         }
-        self.head.store(head + 1, Ordering::Release);
+        // S19：head+1 用 wrapping_add——满判走 wrapping_sub（74 行），暗示
+        // 计数按 usize 回绕设计；普通加法在 head 接近 usize::MAX 时溢出。
+        self.head.store(head.wrapping_add(1), Ordering::Release);
         Ok(())
     }
 
@@ -91,7 +93,8 @@ impl<T, const N: usize> RingBuffer<T, N> {
         }
         let slot: *const MaybeUninit<T> = unsafe { self.buf.get_unchecked(tail & (N - 1)).get() };
         let v = unsafe { (*slot).assume_init_read() };
-        self.tail.store(tail + 1, Ordering::Release);
+        // S19：同 push——tail+1 用 wrapping_add 与回绕计数设计一致。
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
         Some(v)
     }
 

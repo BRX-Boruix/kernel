@@ -114,6 +114,13 @@ impl Xoshiro256 {
 /// 返回 `None` 表示当前无可用硬件熵——`collect_entropy` 跳过该轮。
 pub type EntropySource = fn() -> Option<u64>;
 
+// S04：熵源函数指针存 usize（`EntropyPool.source`）再 transmute 回，依赖
+// x86_64 上 fn 指针可无损装入 usize。编译期断言固化该假设——移植到非此
+// 布局的架构会编译失败而非运行期悬垂调用。
+const _: () = {
+    assert!(core::mem::size_of::<EntropySource>() == core::mem::size_of::<usize>());
+};
+
 /// 熵池：4 槽状态 + 轮转混合 + 计数器。加锁保护（中断安全）。
 struct EntropyPool {
     state: [u64; 4],

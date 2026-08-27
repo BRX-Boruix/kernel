@@ -18,6 +18,20 @@ use buddy_system_allocator::Heap;
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+/// OOM 后单次 alloc 的最大堆增长重试次数（S13：抽取散落魔法阈值）。
+///
+/// 单次增长基于 layout 所需字节取最小能装下的 order，通常一次即够；极端
+/// 情况（分配器内部碎片）下多试几次提高命中率。8 次之后仍失败即认定不可
+/// 满足，返回空指针。
+const MAX_GROW_RETRIES: u32 = 8;
+
+// S04：set_grow_allocator 用 AtomicUsize 存函数指针再 transmute 回——依赖
+// x86_64 上函数指针可无损装入 usize（same-size）。编译期固化该假设：若未来
+// 移植到 fn-pointer ≠ usize 的架构，此处编译失败而不是运行期悬垂。
+const _: () = {
+    assert!(core::mem::size_of::<fn(u32) -> Option<u64>>() == core::mem::size_of::<usize>());
+};
+
 // ---------- 增长逻辑（宿主 / 内核共用面） ----------
 
 /// 堆增长源：`fn(order: u32) -> Option<u64>`。
@@ -127,7 +141,7 @@ mod kernel_backend {
             // OOM：反复增长并重试，直到成功或确认无法再增长。
             // 单次增长基于 layout 所需字节取最小能装下的 order，通常一次即够；
             // 极端情况下（如分配器内部碎片）多试几次可提高命中率。
-            for _ in 0..8 {
+            for _ in 0..MAX_GROW_RETRIES {
                 if grow_heap(&mut heap, &layout) {
                     if let Ok(non_null) = heap.alloc(layout) {
                         return non_null.as_ptr();
@@ -175,6 +189,7 @@ mod tests {
     use super::{grow_heap, grow_order, set_grow_allocator, GROW_ALLOC};
     use buddy_system_allocator::Heap;
     use core::alloc::Layout;
+    use std::vec::Vec;
 
     /// 假增长源：按 order 发放一块 4KiB 对齐、2^order 页的**堆内存**
     /// （std 分配器），耗尽语义由注入方自行决定。
@@ -184,8 +199,11 @@ mod tests {
     /// 的侵入式链表首写即 AV。改由 std 堆发放：区域必然可写、每次发放
     /// 地址独立，与真实帧分配器的"新区域"语义一致。
     static LAST_ORDER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    // S18：记录 fake_grow 每次发放的 (指针, 布局) 以便测试结束统一释放，
+    // 修复原实现"只 alloc 从不 free"的逐测试内存泄漏。
+    static FAKE_ALLOCS: std::sync::Mutex<Vec<(usize, Layout)>> = std::sync::Mutex::new(Vec::new());
     fn fake_grow(order: u32) -> Option<u64> {
-        use std::alloc::{alloc, Layout};
+        use std::alloc::{alloc, dealloc};
         LAST_ORDER.store(order, core::sync::atomic::Ordering::SeqCst);
         let n = 1usize << order;
         // 故意超量请求触发 None（测试用 order 上限远小于 usize 位宽，安全）
@@ -194,7 +212,16 @@ mod tests {
         if ptr.is_null() {
             return None;
         }
+        FAKE_ALLOCS.lock().unwrap().push((ptr as usize, layout));
         Some(ptr as u64)
+    }
+
+    /// 释放 fake_grow 已发放的全部块（每个使用 `inject_fake` 的测试在结尾调用）。
+    fn free_fake_allocs() {
+        let mut list = FAKE_ALLOCS.lock().unwrap();
+        for (ptr, layout) in list.drain(..) {
+            unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
+        }
     }
 
     fn inject_fake() {
@@ -237,6 +264,7 @@ mod tests {
         assert_eq!(LAST_ORDER.load(core::sync::atomic::Ordering::SeqCst), 1);
         let p = heap.alloc(l).expect("grown heap must satisfy allocation");
         assert_eq!(p.as_ptr() as usize % 8, 0);
+        free_fake_allocs(); // S18：释放假增长块，防泄漏
     }
 
     #[test]
@@ -261,5 +289,6 @@ mod tests {
         // Err。内核现状依赖「增长由小分配触发、小类经级联必然满足」，
         // 大类连续需求依赖帧虚拟地址的对齐巧合。原则解（add_to_heap 前
         // 按请求 layout 选配对齐地址，或 buddy 上游改造）随 mm 立项评估。
+        free_fake_allocs(); // S18：释放假增长块，防泄漏
     }
 }

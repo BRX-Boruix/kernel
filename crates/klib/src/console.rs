@@ -18,6 +18,14 @@
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+// S04：sink 表把 `&'static dyn Console` 胖指针拆成 (data, vtable) 两个 usize
+// 原子槽，依赖 dyn trait 对象 = data+vtable 且各占一个 usize 的 ABI 内部结构。
+// Rust 未官方保证，此处编译期断言固化：若目标移植到非此布局的 ABI，编译失败
+// 而非运行期悬垂 vtable。
+const _: () = {
+    assert!(core::mem::size_of::<&'static dyn Console>() == 2 * core::mem::size_of::<usize>());
+};
+
 extern crate alloc;
 
 use alloc::string::String;

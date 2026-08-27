@@ -65,6 +65,10 @@ impl<T> RwLock<T> {
                 continue;
             }
             let readers = s & READER_MASK;
+            // S19：reader 计数字段低 32 位，readers==0xffff_ffff 时 +1 会进位
+            // 污染高位 pending 位。物理线程数远小不可达，但与 pending 位对称
+            // 加 debug_assert 防护——reader 溢出同样不能静默发生。
+            debug_assert!(readers < READER_MASK, "reader count saturated");
             if self
                 .state
                 .compare_exchange(s, readers + 1, Ordering::Acquire, Ordering::Relaxed)
