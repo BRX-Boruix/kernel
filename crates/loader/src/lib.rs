@@ -542,7 +542,13 @@ mod backend {
 
         let mut loaded = 0usize;
         // 已成功加载段的用户虚拟区间集合，供入口校验（LM3）。
+        // S18/S20：seg_ranges 随段数 push 无界增长（上限仅受 phnum=u16
+        // 的 65535 约束，最多 ~1MB），堆耗尽会 OOM abort。用 try_reserve
+        // 按 phnum 预分配，失败则**如实报错**而非中止内核。
         let mut seg_ranges: Vec<(u64, u64)> = Vec::new();
+        if seg_ranges.try_reserve(hdr.phnum).is_err() {
+            return Err(Error::OutOfMemory);
+        }
         for i in 0..hdr.phnum {
             // 表完整性由 parse_header 单点保证：phoff + phnum*PHDR_SIZE
             // <= elf.len()，故按表项偏移的读取不会越界。
