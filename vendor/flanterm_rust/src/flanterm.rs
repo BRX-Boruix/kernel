@@ -1729,3 +1729,136 @@ pub fn flanterm_set_callback<B: BackendOps>(
 ) {
     ctx.callback = callback;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// 记录型后端：记录 raw_putchar 输出与光标移动，其余方法为最小实现，
+    /// 使纯解析器状态机可被直接断言（S23：补齐状态机红-绿测试）。
+    #[derive(Default)]
+    struct RecordBackend {
+        out: Vec<u8>,
+        cursor_x: usize,
+        cursor_y: usize,
+    }
+
+    impl RecordBackend {
+        fn new(cols: usize, rows: usize) -> FlantermCore<Self> {
+            let mut ctx = flanterm_context_new(Self::default(), rows, cols);
+            ctx.autoflush = false;
+            ctx
+        }
+    }
+
+    impl BackendOps for RecordBackend {
+        fn raw_putchar(ctx: &mut FlantermCore<Self>, c: u8) {
+            ctx.backend.out.push(c);
+        }
+        fn clear(_ctx: &mut FlantermCore<Self>, _move_cursor: bool) {}
+        fn set_cursor_pos(ctx: &mut FlantermCore<Self>, x: usize, y: usize) {
+            ctx.backend.cursor_x = x;
+            ctx.backend.cursor_y = y;
+        }
+        fn get_cursor_pos(ctx: &mut FlantermCore<Self>, x: &mut usize, y: &mut usize) {
+            *x = ctx.backend.cursor_x;
+            *y = ctx.backend.cursor_y;
+        }
+        fn set_text_fg(_ctx: &mut FlantermCore<Self>, _fg: usize) {}
+        fn set_text_bg(_ctx: &mut FlantermCore<Self>, _bg: usize) {}
+        fn set_text_fg_bright(_ctx: &mut FlantermCore<Self>, _fg: usize) {}
+        fn set_text_bg_bright(_ctx: &mut FlantermCore<Self>, _bg: usize) {}
+        fn set_text_fg_rgb(_ctx: &mut FlantermCore<Self>, _fg: u32) {}
+        fn set_text_bg_rgb(_ctx: &mut FlantermCore<Self>, _bg: u32) {}
+        fn set_text_fg_default(_ctx: &mut FlantermCore<Self>) {}
+        fn set_text_bg_default(_ctx: &mut FlantermCore<Self>) {}
+        fn set_text_fg_default_bright(_ctx: &mut FlantermCore<Self>) {}
+        fn set_text_bg_default_bright(_ctx: &mut FlantermCore<Self>) {}
+        fn move_character(_ctx: &mut FlantermCore<Self>, _a: usize, _b: usize, _c: usize, _d: usize) {
+        }
+        fn scroll(_ctx: &mut FlantermCore<Self>) {}
+        fn revscroll(_ctx: &mut FlantermCore<Self>) {}
+        fn swap_palette(_ctx: &mut FlantermCore<Self>) {}
+        fn save_state(_ctx: &mut FlantermCore<Self>) {}
+        fn restore_state(_ctx: &mut FlantermCore<Self>) {}
+        fn double_buffer_flush(_ctx: &mut FlantermCore<Self>) {}
+        fn full_refresh(_ctx: &mut FlantermCore<Self>) {}
+    }
+
+    /// S31：空输入是安全 no-op，不 panic、不产生输出。
+    #[test]
+    fn empty_input_is_noop() {
+        let mut ctx = RecordBackend::new(80, 24);
+        flanterm_write(&mut ctx, b"");
+        assert!(ctx.backend.out.is_empty());
+    }
+
+    /// S31：被截断的 UTF-8 序列——多字节首字节后直接来非连续字节，
+    /// 解析器不得 panic，应输出替换符 U+FFFE（0xfe），后续字节按普通
+    /// 字符继续处理。
+    #[test]
+    fn truncated_utf8_does_not_panic() {
+        let mut ctx = RecordBackend::new(80, 24);
+        // 0xc3 是二字节首字节；跟一个非连续字节 'x' 触发 unicode_error 路径。
+        flanterm_write(&mut ctx, &[0xc3, b'x']);
+        // 替换符 + 普通字符 x，均如实输出。
+        assert_eq!(ctx.backend.out, vec![0xfe, b'x']);
+    }
+
+    /// S19/S31：超长数字 CSI 参数不得溢出——大量 '9' 应饱和到 u32::MAX，
+    /// 而非回绕成 0（SGR 被清 reset）。
+    #[test]
+    fn overlong_numeric_param_saturates_not_wraps() {
+        let mut ctx = RecordBackend::new(80, 24);
+        // "\x1b[" + 16 个 '9'（远超 u32::MAX 可容位数）+ "m"
+        let mut input = Vec::new();
+        input.push(0x1b);
+        input.push(b'[');
+        for _ in 0..16 {
+            input.push(b'9');
+        }
+        input.push(b'm');
+        flanterm_write(&mut ctx, &input);
+        // 不 panic；esc_values[0] 已饱和（修复后），不能为 0。
+        assert!(
+            ctx.esc_values[0] > 0,
+            "overlong CSI numeric param must saturate, not wrap to 0"
+        );
+        assert_eq!(
+            ctx.esc_values[0],
+            u32::MAX,
+            "esc_values[0] should saturate to u32::MAX on overflow"
+        );
+    }
+
+    /// S31：OSC 序列超长（>255 字节）不得越界写 osc_buf。
+    #[test]
+    fn overlong_osc_does_not_overflow_buffer() {
+        let mut ctx = RecordBackend::new(80, 24);
+        // "\x1b]" + 300 个 'A' + "\x07"（BEL 结束）。
+        let mut input = Vec::new();
+        input.push(0x1b);
+        input.push(b']');
+        for _ in 0..300 {
+            input.push(b'A');
+        }
+        input.push(0x07);
+        flanterm_write(&mut ctx, &input);
+        // osc_buf 不得越界；内容被 256 字节上限截断。
+        assert!(ctx.osc_buf_i <= 256, "osc_buf must be capped at its length");
+    }
+
+    /// S31：乱序 CSI——只发 "\x1b[" 后直接发一个终结字节 `z`（0x7a，
+    /// 在 0x40..0x7e 范围内），解析器不得 panic，未知命令被忽略且
+    /// control_sequence 状态正确复位。
+    #[test]
+    fn malformed_csi_does_not_panic() {
+        let mut ctx = RecordBackend::new(80, 24);
+        // "\x1b[" 后接 'z'（合法 final 字节但无对应命令）。
+        flanterm_write(&mut ctx, &[0x1b, b'[', b'z']);
+        // 不 panic；未知命令被静默忽略，CSI 状态应已复位。
+        assert!(!ctx.control_sequence, "CSI state must be reset after final byte");
+    }
+}
