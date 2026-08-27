@@ -631,6 +631,12 @@ fn sys_exec(frame: &mut InterruptFrame) -> u64 {
                         Ok(m) => m,
                         Err(e) => return pack_err(e),
                     };
+                    // S31：不得按 meta.size 无界分配内核堆整读——恶意/超大
+                    // 可执行文件会触发内核 OOM abort（自伤面）。用既有批量
+                    // IO 上限 MAX_SYSCALL_BUF_BYTES 约束；超限即拒绝装载。
+                    if meta.size > MAX_SYSCALL_BUF_BYTES {
+                        return pack_err(Error::ExecFormat);
+                    }
                     let mut buf = alloc::vec![0u8; meta.size as usize];
                     if let Err(e) = inode.read_at(0, &mut buf) {
                         return pack_err(e);
