@@ -184,23 +184,29 @@ pub fn parse_hpet(buf: &[u8]) -> Option<Hpet> {
     // 后两种均无 GAS。QEMU 布局的 offset 44 优先（其 offset 40-43 是
     // 保留/低地址字段恒 0），为 0 时回退旧式 offset 40。
     let mut base_addr: u64 = 0;
-    if buf.len() >= 76 && buf[52] == 0 {
-        // ACPI 3.0+：GAS 在 offset 52，地址在 offset 56。
-        base_addr = u64::from_le_bytes([
-            buf[56], buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63],
-        ]);
-    }
-    if base_addr == 0 && buf.len() >= 52 {
+    if buf.len() >= 76 {
+        if buf[52] == 0 {
+            // ACPI 3.0+：GAS address_space=SystemMemory，地址在 offset 56。
+            base_addr = u64::from_le_bytes([
+                buf[56], buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63],
+            ]);
+        }
+        // S07：ACPI 3.0+ 表（≥76 字节）且 address_space!=0 时，GAS 地址
+        // 不是 MMIO 基址，不可用。此时**不**回退到旧式 offset 44/40 裸地址
+        // 解析——那会把周期字段（counter_clock_period_fs）误读为基址，
+        // 输出伪造的非零基址（S07 高项）。如实返回 None，由上层降级。
+    } else if buf.len() >= 52 {
+        // 短表（<76 字节，QEMU 56 字节 / 旧式 HPET 1.0 60 字节）：
         // QEMU 布局：offset 44 起 8 字节裸基址。
         base_addr = u64::from_le_bytes([
             buf[44], buf[45], buf[46], buf[47], buf[48], buf[49], buf[50], buf[51],
         ]);
-    }
-    if base_addr == 0 {
-        // 旧式 HPET 1.0：offset 40 起 8 字节裸基址。
-        base_addr = u64::from_le_bytes([
-            buf[40], buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47],
-        ]);
+        if base_addr == 0 && buf.len() >= 60 {
+            // 旧式 HPET 1.0：offset 40 起 8 字节裸基址。
+            base_addr = u64::from_le_bytes([
+                buf[40], buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47],
+            ]);
+        }
     }
     let page_protect = if buf.len() >= 76 { buf[72] & 0x03 } else { 0 };
 
@@ -396,5 +402,28 @@ mod tests {
         buf[4..8].copy_from_slice(&60u32.to_le_bytes());
         buf[8] = 1;
         assert!(parse_hpet(&buf).is_none());
+    }
+
+    /// S07 回归：ACPI 3.0+ 表（≥76 字节）且 GAS address_space != 0 时，
+    /// parse_hpet 必须返回 None，不得把周期字段（offset 44..47）误读为
+    /// 伪造基址——旧实现在 address_space!=0 时跳过 GAS 分支后回退到
+    /// offset 44 裸地址，若 counter_clock_period_fs 非零则输出假基址。
+    #[test]
+    fn hpet_acpi3_nonzero_address_space_returns_none() {
+        let mut buf = [0u8; 76];
+        buf[0..4].copy_from_slice(b"HPET");
+        buf[4..8].copy_from_slice(&76u32.to_le_bytes());
+        buf[8] = 1;
+        // 周期字段 offset 44 设非零（修复前会被误读为基址裸地址）
+        buf[44..48].copy_from_slice(&69_841_192u32.to_le_bytes());
+        // GAS address_space = 1（SystemIO 等非 MMIO 类型）
+        buf[52] = 1;
+        // GAS 地址 offset 56 设 0（不可用）
+        buf[56..64].copy_from_slice(&0u64.to_le_bytes());
+
+        assert!(
+            parse_hpet(&buf).is_none(),
+            "S07: ACPI 3.0+ with address_space!=0 must return None, not fake base from period field"
+        );
     }
 }
