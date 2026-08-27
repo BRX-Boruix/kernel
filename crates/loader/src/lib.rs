@@ -502,7 +502,7 @@ mod backend {
     use arch::{PageFlags, PageSize, VirtAddr};
     use arch_x86_64::paging::X86PageTable;
     use klib::error::Error;
-    use mm::user_space::{USER_STACK_TOP, USER_TOP, UserAddressSpace};
+    use mm::user_space::{DEFAULT_STACK_SIZE, USER_STACK_TOP, USER_TOP, UserAddressSpace};
 
     const PT_LOAD: u32 = 1;
     const PF_X: u32 = 1;
@@ -513,7 +513,12 @@ mod backend {
     #[allow(dead_code)]
     const PF_R: u32 = 4;
 
-    const USER_STACK_PAGES: usize = 8;
+    /// S28/S17：栈尺寸单一来源取自 `mm::user_space::DEFAULT_STACK_SIZE`。
+    /// 此前本文件硬编码 `USER_STACK_PAGES=8`（32KiB），无视 mm 已单点定义
+    /// 的 4MiB 规范栈——重复声明小 128 倍且无理由，深递归用户栈极易溢出。
+    /// 改为按规范常量推导页数（4MiB / 4KiB = 1024 页）。
+    const USER_STACK_PAGES: usize =
+        (DEFAULT_STACK_SIZE as usize) / (PageSize::Size4K.bytes() as usize);
 
     /// 本加载器的映射页粒度（LM5：单一来源取自 arch 抽象层，编译期取值）。
     const PAGE_SIZE: u64 = PageSize::Size4K.bytes();
