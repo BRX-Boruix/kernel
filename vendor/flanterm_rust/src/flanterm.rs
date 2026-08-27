@@ -1,6 +1,11 @@
 use crate::generated::{Interval, COL256, COMBINING, WIDE};
 use crate::unicode_map::unicode_to_cp437;
 
+// S28：以下 FLANTERM_CB_* 数值常量在本 crate 内**无任何使用者**——回调走
+// Rust 类型化枚举 [`FlantermCallback`]，从不引用这些数值。它们是为兼容
+// C 版 flanterm 回调数值协议（callback type 标记）保留的导出常量，供依赖
+// C ABI 的外部接线方对齐。保留但标注：非本 crate 调用路径，勿误当作 Rust
+// 侧协议。公开 API 未开 missing_docs（全公开面缺 rustdoc）。
 pub const FLANTERM_CB_DEC: u64 = 10;
 pub const FLANTERM_CB_BELL: u64 = 20;
 pub const FLANTERM_CB_PRIVATE_ID: u64 = 30;
@@ -893,6 +898,9 @@ fn control_sequence_parse<B: BackendOps>(ctx: &mut FlantermCore<B>, c: u8) {
         // （429496730 > 429496729），随后 `*10 + digit` 即溢出。
         // 改用 saturating 算术，杜绝任何溢出路径（溢出后 saturate
         // 到 u32::MAX，终端仍可正确运作）。
+        // S09 语义：超长数字参数 saturate 到 u32::MAX——该值不在任何有效
+        // SGR/CSI 参数域内，下游处理按"不可识别参数"忽略，不产生伪装成
+        // 合法小值的截断数字。
         ctx.esc_values[ctx.esc_values_i] = ctx.esc_values[ctx.esc_values_i]
             .saturating_mul(10)
             .saturating_add((c - b'0') as u32);
@@ -948,6 +956,12 @@ fn control_sequence_parse<B: BackendOps>(ctx: &mut FlantermCore<B>, c: u8) {
     }
 
     let r = ctx.scroll_enabled;
+    // S28 语义（成文）：CSI 处理期间临时禁止滚动（r 存回滚前的值），因为
+    // 本分支内的 repeat-char(`b'b'`) 等路径会经 raw_putchar 触发 wrap 滚动，
+    // 但 CSI 自身的语义（光标定位/上下滚等）应独立于 scroll_enabled 判定。
+    // 已知不一致：fb 后端的 `\n` wrap 路径读 scroll_enabled（fb.rs wrap），
+    // 而核心 `\n` 滚动路径不读——同一公开标志两端语义不统一，属遗留行为
+    // 不在此改动；如需统一应把判定收敛到单一入口。
     ctx.scroll_enabled = false;
     let mut x = 0usize;
     let mut y = 0usize;

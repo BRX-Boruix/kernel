@@ -110,6 +110,9 @@ pub struct FbInfo {
 pub(crate) enum RejectReason {
     /// 地址为 0：无内存可写。
     NullAddress,
+    /// 地址未按 4 字节对齐：绘制路径以 `*mut u32` 寻址像素，未对齐指针
+    /// 解引用是 UB（S04：此前只校验 pitch 对齐而漏了 addr 本身）。
+    AddrUnaligned,
     /// 每像素位数不是 32：绘制路径按 `*mut u32` 寻址像素。
     BppNot32,
     /// 宽或高为 0：空面无法承载字符网格。
@@ -143,6 +146,11 @@ fn reject_reason(info: &FbInfo) -> Option<RejectReason> {
 
     if info.addr == 0 {
         return Some(RejectReason::NullAddress);
+    }
+    // S04：addr 本身须 4 字节对齐（与 PIXEL_BYTES 一致）——绘制路径
+    // `addr as *mut u32` 按 u32 寻址，未对齐指针解引用属 UB。
+    if info.addr % (PIXEL_BYTES as usize) != 0 {
+        return Some(RejectReason::AddrUnaligned);
     }
     if info.bpp != REQUIRED_BPP {
         return Some(RejectReason::BppNot32);
@@ -203,6 +211,12 @@ fn reject_reason(info: &FbInfo) -> Option<RejectReason> {
 /// （ADR-010：错误码可程序化处理，动态上下文走日志）；调用方据此诚实降级
 /// 为纯串口且**不得**注册本终端 sink（死 sink 即伪装全功能）。
 pub fn init(fb_info: &FbInfo) -> Result<(), Error> {
+    // S18：已初始化则拒绝重复 init——重复调用会 Box::leak 第二份 context 并
+    // 覆盖 TERMINAL_PTR（泄漏 + 指向被覆盖）。init 只应发生一次。
+    if TERMINAL_PTR.load(Ordering::Acquire) != 0 {
+        error!("[terminal] init called twice; ignoring (already initialized)");
+        return Err(Error::InvalidParam);
+    }
     // T3：unsafe 前提逐条具名校验，先于任何指针使用。
     if let Some(reason) = reject_reason(fb_info) {
         error!(
@@ -215,8 +229,15 @@ pub fn init(fb_info: &FbInfo) -> Result<(), Error> {
         "[terminal] init fb={:#x} {}x{} pitch={} bpp={}",
         fb_info.addr, fb_info.width, fb_info.height, fb_info.pitch, fb_info.bpp
     );
-    // SAFETY：以上校验保证 addr 非零、bpp=32、pitch 对齐且容得下全部像素行；
-    // 地址由 bootloader 完成页映射且生命周期覆盖整个内核运行期。
+    // SAFETY：以上校验保证 addr 非零、4 字节对齐、bpp=32、pitch 对齐且容得下
+    // 全部像素行；地址由 bootloader 完成页映射且生命周期覆盖整个内核运行期。
+    //
+    // S13：vendor 参数具名——0/0/0 = 内置位图字体自动选型（宽/高/间距 0 = 默认），
+    // 1/1 = 1x 缩放（不放大内置字体），0 = 零边距（无预留外边距），
+    // FLANTERM_FB_ROTATE_0 = 无旋转。
+    const FONT_W_H_SPACING_AUTO: usize = 0;
+    const SCALE_1X: usize = 1;
+    const ZERO_MARGIN: usize = 0;
     let ctx = unsafe {
         flanterm_rust::flanterm_fb_init(
             fb_info.addr as *mut u32,
@@ -237,12 +258,12 @@ pub fn init(fb_info: &FbInfo) -> Result<(), Error> {
             core::ptr::null_mut(),
             core::ptr::null_mut(),
             core::ptr::null_mut(),
-            0,
-            0,
-            0,
-            1,
-            1,
-            0,
+            FONT_W_H_SPACING_AUTO,
+            FONT_W_H_SPACING_AUTO,
+            FONT_W_H_SPACING_AUTO,
+            SCALE_1X,
+            SCALE_1X,
+            ZERO_MARGIN,
             flanterm_rust::FLANTERM_FB_ROTATE_0,
         )
     };

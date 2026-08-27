@@ -15,6 +15,22 @@ pub const FLANTERM_FB_ROTATE_270: i32 = 3;
 
 const FLANTERM_FB_FONT_GLYPHS: usize = 256;
 
+// S16：自动字体缩放的分辨率阈值（见 flanterm_fb_init 的自动缩放分支）。
+// 2.5K(2560×1440) 与 4K(5120×2880=2×2560 逻辑跨度) 为高分屏经验档。
+const SCALE2_MIN_WIDTH: usize = 1920 + 1920 / 3; // 2560
+const SCALE2_MIN_HEIGHT: usize = 1080 + 1080 / 3; // 1440
+const SCALE4_MIN_WIDTH: usize = 3840 + 3840 / 3; // 5120
+const SCALE4_MIN_HEIGHT: usize = 2160 + 2160 / 3; // 2880
+
+/// "透明/默认"颜色哨兵（S13：0xffff_ffff 散落 8+ 处，统一为具名常量）。
+///
+/// 已知冲突边界：在 16/8/8 大色深掩码 framebuffer 上，`convert_colour_fb`
+/// 可能把某合法默认色转成 0xffffffff，与哨兵撞值——canvas 模式下默认背景
+/// 会被误绘成画布像素。真彩色（8/8/8）下 `convert_colour_fb` 不会输出
+/// 0xffffffff（r/g/b 各 8 位拼不出全 1 的 alpha 通道位），冲突仅在 16 位色
+/// 深路径存在；属既有语义，记录于注释供后续统一。
+pub const FLANTERM_FB_TRANSPARENT: u32 = 0xffff_ffff;
+
 /// 一次性诊断标志：若在绘制时发现 `framebuffer` 指针为 0，置位。
 ///
 /// `framebuffer` 仅在 `flanterm_fb_init` 构造时写入一次，之后无任何代码清零；
@@ -161,11 +177,11 @@ fn flanterm_fb_swap_palette(ctx: &mut FlantermContext) {
     let tmp = fb.text_bg;
     fb.text_bg = fb.text_fg;
     fb.text_fg = tmp;
-    if fb.text_fg == 0xffff_ffff {
+    if fb.text_fg == FLANTERM_FB_TRANSPARENT {
         fb.text_fg = fb.default_bg;
     }
     if fb.text_bg == fb.default_bg {
-        fb.text_bg = 0xffff_ffff;
+        fb.text_bg = FLANTERM_FB_TRANSPARENT;
     }
 }
 
@@ -183,6 +199,13 @@ unsafe fn plot_char(
     // 上层经 fb_null_seen() 查询并向日志报告（term1 T2：只观测、不自愈）。
     if fb.framebuffer.is_null() {
         FB_NULL_SEEN.store(true, Ordering::Relaxed);
+        return;
+    }
+    // S19：在入口统一钳制 glyph 索引到内置字体表范围（256）——NoCanvas 变体
+    // 此前直接 `c.c as usize * font_height * font_width` 无界偏移 font_bool，
+    // Canvas 变体有 glyph_idx<256 防御而 NoCanvas 没有，防御不一致。统一到
+    // 入口后四路全部受保护；越界字符绘为空白（内联为全 0，等价跳过）。
+    if (c.c as usize) >= FLANTERM_FB_FONT_GLYPHS {
         return;
     }
     match fb.plot_mode {
@@ -261,12 +284,12 @@ unsafe fn plot_char_scaled_canvas(
         for fx in 0..fb.font_width {
             for i in 0..fb.font_scale_x {
                 let gx = fb.font_scale_x * fx + i;
-                let bg = if c.bg == 0xffff_ffff {
+                let bg = if c.bg == FLANTERM_FB_TRANSPARENT {
                     *canvas_line.add(gx)
                 } else {
                     c.bg
                 };
-                let fg = if c.fg == 0xffff_ffff {
+                let fg = if c.fg == FLANTERM_FB_TRANSPARENT {
                     *canvas_line.add(gx)
                 } else {
                     c.fg
@@ -296,12 +319,12 @@ unsafe fn plot_char_scaled_uncanvas(
     }
 
     let default_bg = fb.default_bg;
-    let bg = if c.bg == 0xffff_ffff {
+    let bg = if c.bg == FLANTERM_FB_TRANSPARENT {
         default_bg
     } else {
         c.bg
     };
-    let fg = if c.fg == 0xffff_ffff {
+    let fg = if c.fg == FLANTERM_FB_TRANSPARENT {
         fb.default_fg
     } else {
         c.fg
@@ -432,12 +455,12 @@ unsafe fn plot_char_unscaled_canvas(
         let canvas_line = canvas_ptr.add(x + (y + gy) * fb.width);
         let mut glyph_pointer = glyph.add(gy * fb.font_width);
         for fx in 0..fb.font_width {
-            let bg = if c.bg == 0xffff_ffff {
+            let bg = if c.bg == FLANTERM_FB_TRANSPARENT {
                 *canvas_line.add(fx)
             } else {
                 c.bg
             };
-            let fg = if c.fg == 0xffff_ffff {
+            let fg = if c.fg == FLANTERM_FB_TRANSPARENT {
                 *canvas_line.add(fx)
             } else {
                 c.fg
@@ -466,12 +489,12 @@ unsafe fn plot_char_unscaled_uncanvas(
     }
 
     let default_bg = fb.default_bg;
-    let bg = if c.bg == 0xffff_ffff {
+    let bg = if c.bg == FLANTERM_FB_TRANSPARENT {
         default_bg
     } else {
         c.bg
     };
-    let fg = if c.fg == 0xffff_ffff {
+    let fg = if c.fg == FLANTERM_FB_TRANSPARENT {
         fb.default_fg
     } else {
         c.fg
@@ -791,7 +814,7 @@ fn flanterm_fb_set_text_fg_default(ctx: &mut FlantermContext) {
 
 fn flanterm_fb_set_text_bg_default(ctx: &mut FlantermContext) {
     let fb = &mut ctx.backend;
-    fb.text_bg = 0xffff_ffff;
+    fb.text_bg = FLANTERM_FB_TRANSPARENT;
 }
 
 fn flanterm_fb_set_text_fg_default_bright(ctx: &mut FlantermContext) {
@@ -1125,11 +1148,17 @@ pub unsafe fn flanterm_fb_init(
     if font_scale_x == 0 || font_scale_y == 0 {
         font_scale_x = 1;
         font_scale_y = 1;
-        if width >= (1920 + 1920 / 3) && height >= (1080 + 1080 / 3) {
+        // S16：自动缩放阈值具名并注释来源——4K(3840×2160) 与 2.5K(2560×1440)
+        // 为常见高分屏档位，此阈值源自 C 版 flanterm 的既有行为（沿袭原语义，
+        // 未记录具体出处，属"高清屏放大以保可读性"的经验档）。分辨率达到
+        // 该档即放大，否则 1x。
+        // 0/非 0 混传语义：任一为 0 即视为"请求自动"，两轴都被重置为自动——
+        // 不单独尊重另一轴的手动值（既有行为，注释记录）。
+        if width >= SCALE2_MIN_WIDTH && height >= SCALE2_MIN_HEIGHT {
             font_scale_x = 2;
             font_scale_y = 2;
         }
-        if width >= (3840 + 3840 / 3) && height >= (2160 + 2160 / 3) {
+        if width >= SCALE4_MIN_WIDTH && height >= SCALE4_MIN_HEIGHT {
             font_scale_x = 4;
             font_scale_y = 4;
         }
@@ -1198,7 +1227,7 @@ pub unsafe fn flanterm_fb_init(
         queue_i: 0,
         map: Vec::new(),
         text_fg: 0,
-        text_bg: 0xffff_ffff,
+        text_bg: FLANTERM_FB_TRANSPARENT,
         cursor_x: 0,
         cursor_y: 0,
         saved_state_text_fg: 0,
@@ -1268,7 +1297,7 @@ pub unsafe fn flanterm_fb_init(
     }
 
     fb.text_fg = fb.default_fg;
-    fb.text_bg = 0xffff_ffff;
+    fb.text_bg = FLANTERM_FB_TRANSPARENT;
 
     if !font.is_null() {
         let font_bytes = font_height * FLANTERM_FB_FONT_GLYPHS;
@@ -1408,7 +1437,7 @@ mod tests {
             queue_i: 0,
             map: vec![None; (width / 8) * (height / 16)],
             text_fg: 0x00aa_aaaa,
-            text_bg: 0xffff_ffff,
+            text_bg: FLANTERM_FB_TRANSPARENT,
             cursor_x: 0,
             cursor_y: 0,
             saved_state_text_fg: 0,
