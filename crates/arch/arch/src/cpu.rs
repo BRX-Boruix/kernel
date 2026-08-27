@@ -5,7 +5,8 @@
 //! - `has_feature`：运行时特性探测（x86 走 CPUID，RISC-V 走 misa/isa
 //!   字符串，AArch64 走 ID 寄存器），实现方负责把探测结果缓存；
 //! - `rdrand64`/`rdseed64`/`entropy_u64`：硬件熵读取（供 `klib::random`
-//!   熵池混合），无硬件熵源的架构实现 `entropy_u64` 可混合自身噪声。
+//!   熵池混合），`entropy_u64` 返回 `Option<u64>`——`None` 表示无可用
+//!   硬件熵源（S09/S07：绝不返回确定性数据冒充硬件熵）。
 //!
 //! 探测结果建议在 `init()`（BSP 单线程阶段）缓存，后续查询走缓存，
 //! 避免反复执行慢指令（如 x86 CPUID/RDSEED）。
@@ -135,16 +136,14 @@ pub trait Cpu {
     /// 从硬件种子发生器读 64 位（`RDSEED`；指令不可用或失败时 `None`）。
     fn rdseed64() -> Option<u64>;
 
-    /// 尽力从硬件熵源取 64 位（rdseed 优先，其次 rdrand；均不可用返回 0）。
+    /// 尽力从硬件熵源取 64 位（rdseed 优先，其次 rdrand；均不可用返回 `None`）。
     ///
-    /// 熵池注入用此接口；无硬件熵源的架构可覆盖为混合自身噪声。
-    fn entropy_u64() -> u64 {
-        if let Some(v) = Self::rdseed64() {
-            return v;
-        }
-        if let Some(v) = Self::rdrand64() {
-            return v;
-        }
-        0
+    /// 熵池注入用此接口；无硬件熵源的架构应返回 `None`（S09/S07/S10：绝不
+    /// 以确定性数据冒充硬件熵——宁可无源，不注伪熵），而非返回 0 或时间戳垫底。
+    fn entropy_u64() -> Option<u64> {
+        // 默认实现：尝试 rdseed 和 rdrand；均不可用则如实表达无源。
+        // 架构可覆盖（如 x86-64 可混合时钟噪声作最差保底，但必须明确标注）
+        // 且不可用于密钥。
+        Self::rdseed64().or_else(|| Self::rdrand64())
     }
 }

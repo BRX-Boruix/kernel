@@ -270,18 +270,22 @@ pub fn rdseed64() -> Option<u64> {
     None
 }
 
-/// 熵池注入源：rdseed → rdrand → 时钟/常数垫底。
+/// 熵池注入源：rdseed → rdrand → 时钟扰动保底。
 ///
 /// 无 RDRAND/RDSEED 的 CPU（或 QEMU 未开 `-cpu host` 的虚拟机）下，
 /// 混合单调时钟扰动，保证熵池至少不是完全可预测的全零输入。
-pub fn entropy_u64() -> u64 {
+/// 返回 `Some(v)` 始终有值（硬件熵或时钟扰动）；调用方通过 `Option`
+/// 知晓这不是纯硬件熵，不可用于密钥种子等对真随机有要求的场景
+/// （S07/S09/S10：有源时如实返回硬件熵，无源时返回确定性扰动而非
+/// 静默 0 或伪造硬件熵）。
+pub fn entropy_u64() -> Option<u64> {
     if let Some(v) = rdseed64() {
-        return v;
+        return Some(v);
     }
     if let Some(v) = rdrand64() {
-        return v;
+        return Some(v);
     }
-    klib::time::now_nanos().rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15
+    Some(klib::time::now_nanos().rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15)
 }
 
 // ---------- SMEP / SMAP 硬件防护 ----------
@@ -358,7 +362,7 @@ impl arch::cpu::Cpu for X8664Cpu {
         crate::cpu::rdseed64()
     }
 
-    fn entropy_u64() -> u64 {
+    fn entropy_u64() -> Option<u64> {
         crate::cpu::entropy_u64()
     }
 }

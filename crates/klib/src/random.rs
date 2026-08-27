@@ -111,7 +111,8 @@ impl Xoshiro256 {
 // ---------- 熵池 ----------
 
 /// 熵源读取函数（由架构层注入，如 RDRAND/RDSEED 封装）。
-pub type EntropySource = fn() -> u64;
+/// 返回 `None` 表示当前无可用硬件熵——`collect_entropy` 跳过该轮。
+pub type EntropySource = fn() -> Option<u64>;
 
 /// 熵池：4 槽状态 + 轮转混合 + 计数器。加锁保护（中断安全）。
 struct EntropyPool {
@@ -189,8 +190,10 @@ pub fn collect_entropy(rounds: usize) -> usize {
             break;
         }
         let v = unsafe { core::mem::transmute::<usize, EntropySource>(f)() };
-        add_entropy(v);
-        got += 1;
+        if let Some(v) = v {
+            add_entropy(v);
+            got += 1;
+        }
     }
     got
 }
@@ -265,8 +268,8 @@ mod tests {
     /// 假熵源：确定性递增，便于验证 collect/seed 通路。
     static FAKE_ENTROPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    fn fake_source() -> u64 {
-        FAKE_ENTROPY.fetch_add(0x9E37_79B9_7F4A_7C15, std::sync::atomic::Ordering::Relaxed)
+    fn fake_source() -> Option<u64> {
+        Some(FAKE_ENTROPY.fetch_add(0x9E37_79B9_7F4A_7C15, std::sync::atomic::Ordering::Relaxed))
     }
 
     #[test]
