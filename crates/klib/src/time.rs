@@ -46,6 +46,12 @@ pub fn ticks() -> u64 {
 }
 
 /// 当前单调时间（自时钟启动以来的纳秒数）。
+///
+/// **S09**：时钟源未注入（[`clock_ready`] == false）时返回 0。此 0 是
+/// **未就绪哨兵**，不是"真实时间恰好为 0"——调用方在基于时间做逻辑
+/// 前必须先判 [`clock_ready`]，避免把"未就绪"当作正常时间使用。内核在
+/// LAPIC 定时器初始化（架构层 `lapic::init`）后注入时钟源，此路径在
+/// 生产启动中仅在极早期可达。
 pub fn now_nanos() -> u64 {
     let f = TICK_FN.load(Ordering::Acquire);
     if f == 0 {
@@ -67,7 +73,11 @@ pub fn now_millis() -> u64 {
     now_nanos() / 1_000_000
 }
 
-/// 忙等睡眠 `ns` 纳秒。时钟未注入时立即返回。
+/// 忙等睡眠 `ns` 纳秒。时钟未注入时立即返回（防早期死循环）。
+///
+/// **S09**：未就绪即返回会把"未就绪"伪装成"睡眠已完成"。调用方必须
+/// 保证时钟就绪（[`clock_ready`]）后才调用；本 no-op 仅作早期防死循环
+/// 兜底，不作为正常睡眠语义。
 pub fn sleep_nanos(ns: u64) {
     if !clock_ready() {
         return;
@@ -78,12 +88,12 @@ pub fn sleep_nanos(ns: u64) {
     }
 }
 
-/// 忙等睡眠 `us` 微秒。时钟未注入时立即返回。
+/// 忙等睡眠 `us` 微秒。时钟未注入时立即返回（防早期死循环）。
 pub fn sleep_us(us: u64) {
     sleep_nanos(us.saturating_mul(1_000));
 }
 
-/// 忙等睡眠 `ms` 毫秒。时钟未注入时立即返回。
+/// 忙等睡眠 `ms` 毫秒。时钟未注入时立即返回（防早期死循环）。
 pub fn sleep_ms(ms: u64) {
     sleep_nanos(ms.saturating_mul(1_000_000));
 }
@@ -132,6 +142,7 @@ static TIMER_TABLE: IrqSpinLock<TimerTable> = IrqSpinLock::new(TimerTable {
 ///
 /// 返回定时器 id（可用于 [`cancel_timeout`]）。表满时返回 `None`。
 /// 定时器由 [`poll_timeouts`] 驱动，须周期调用。
+#[must_use] // S18：忽略返回值会失去取消句柄。
 pub fn set_timeout(delay_ns: u64, callback: TimerCallback, arg: usize) -> Option<u64> {
     if !clock_ready() {
         return None; // 无时钟源：永不调度，直接拒绝
@@ -350,7 +361,7 @@ mod tests {
     fn timer_callback_receives_arg() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
-        set_timeout(10_000, cb_arg, 42); // 10us 后
+        let _ = set_timeout(10_000, cb_arg, 42); // 10us 后
 
         FAKE_TICK.store(11, Ordering::Relaxed);
         poll_timeouts();
@@ -363,7 +374,7 @@ mod tests {
         reset();
         for i in 0..5u8 {
             // 延迟 10us~50us（间隔 10us），到期顺序应满足 4,3,2,1,0。
-            set_timeout((5 - i as u64) * 10_000, cb_push, i as usize);
+            let _ = set_timeout((5 - i as u64) * 10_000, cb_push, i as usize);
         }
         FAKE_TICK.store(200, Ordering::Relaxed); // 200us，全部到期
         poll_timeouts();
