@@ -104,12 +104,16 @@ pub trait IoDevice: Send + Sync {
 }
 
 /// 字符设备（如串口、终端、控制台）。
+///
+/// S15：**显式 opt-in marker**——不允许 blanket impl。只有具体字符设备
+/// 才 `impl CharDevice`，否则一切 IoDevice（含块/网络）都被标记为字符，
+/// DeviceKind 分类语义被架空。各设备依据自身 `kind()` 归属，不依赖本 trait。
 pub trait CharDevice: IoDevice {}
-impl<T: IoDevice + ?Sized> CharDevice for T {}
 
 /// 输入设备（如键盘、鼠标）。
+///
+/// S15：显式 opt-in marker（同 [`CharDevice`]）。仅真实输入设备实现。
 pub trait InputDevice: CharDevice {}
-impl<T: CharDevice + ?Sized> InputDevice for T {}
 
 /// 块存储设备（如 ATA/IDE 硬盘、VirtIO-Blk、Ramdisk）。
 pub trait BlockDevice: IoDevice {

@@ -1,6 +1,6 @@
 //! Early 阶段：COM1 串口控制台驱动（Platform CharDevice）。
 
-use crate::device::{BusType, Device, DeviceInfo, DeviceKind, IoDevice};
+use crate::device::{BusType, CharDevice, Device, DeviceInfo, DeviceKind, IoDevice};
 use crate::driver::DriverStage;
 use crate::hub::DriverHub;
 use klib::error::Error;
@@ -44,6 +44,9 @@ impl IoDevice for SerialDevice {
         self.write(data)
     }
 }
+
+// S15：显式 opt-in——COM1 串口是字符设备。
+impl CharDevice for SerialDevice {}
 
 pub static SERIAL_DEV: SerialDevice = SerialDevice;
 

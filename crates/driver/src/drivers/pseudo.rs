@@ -1,6 +1,6 @@
 //! Core/Late 阶段：伪设备实现（/devices/null, /devices/zero）。
 
-use crate::device::{BusType, Device, DeviceInfo, DeviceKind, IoDevice};
+use crate::device::{BusType, CharDevice, Device, DeviceInfo, DeviceKind, IoDevice};
 use crate::driver::DriverStage;
 use crate::hub::DriverHub;
 use klib::error::Error;
@@ -31,6 +31,9 @@ impl IoDevice for NullDevice {
     }
 }
 
+// S15：显式 opt-in——/devices/null 是字符设备。
+impl CharDevice for NullDevice {}
+
 pub struct ZeroDevice;
 
 impl Device for ZeroDevice {
@@ -59,6 +62,9 @@ impl IoDevice for ZeroDevice {
         data.len()
     }
 }
+
+// S15：显式 opt-in——/devices/zero 是字符设备。
+impl CharDevice for ZeroDevice {}
 
 pub static NULL_DEV: NullDevice = NullDevice;
 pub static ZERO_DEV: ZeroDevice = ZeroDevice;

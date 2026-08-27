@@ -1,7 +1,7 @@
 //! 统一驱动生命周期抽象与四阶段调度定义（Driver / DriverStage / Bidding / Hotplug Detach）。
 
 use crate::device::DeviceInfo;
-use crate::hub::DriverHub;
+use crate::hub::{DriverHub, EXPLICIT_BIND_SCORE};
 
 /// 驱动四阶段确定性启动时序（ADR-008 核心哲学）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -41,7 +41,8 @@ pub trait Driver: Send + Sync {
     /// 路径；多候选降级回退目前只有测试构造场景。文档不得暗示生产环境
     /// 存在多档竞争生态。
     fn score_probe(&self, hub: &DriverHub, dev: &DeviceInfo) -> u8 {
-        if self.probe(hub, dev) { 50 } else { 0 }
+        // S13：默认通用探测分单一来源，与 hub 显式绑定档位共用同一常量。
+        if self.probe(hub, dev) { EXPLICIT_BIND_SCORE } else { 0 }
     }
 
     /// 候选胜出后的绑定确认。

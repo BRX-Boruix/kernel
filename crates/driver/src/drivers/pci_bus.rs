@@ -118,6 +118,19 @@ pub enum PciBar {
 
 /// 解析指定 PCI 设备的 6 个 BAR 配置空间（**破坏性探测，仅限扫描期调用**）。
 ///
+/// 从"写全 1 读回"的尺寸掩码换算 BAR 尺寸（2 的幂，`!(mask & keep)+1`）。
+///
+/// S19：掩码为 0 时 `!(0)+1` 在 debug 下溢出 panic、release 下回绕为 0——
+/// 得到非法尺寸而非显式错误。此处检测零掩码并返回 `None`（畸形配置），
+/// 由调用方落到 `PciBar::None` 而非计算回绕值。
+fn bar_size_from_mask(size_mask: u32, keep: u32) -> Option<u32> {
+    let mask = size_mask & keep;
+    if mask == 0 {
+        return None;
+    }
+    Some(!mask + 1)
+}
+
 /// 采用"写全 1 读回"规范手法测量 BAR 尺寸——对已由驱动接管的设备执行会
 /// 瞬时破坏其配置空间。本函数私有化（ADR-022 §4），唯一调用方是
 /// [`scan_pci_bus`] 的枚举路径；运行期消费一律走 [`cached_pci_bars`]。
@@ -144,9 +157,20 @@ fn inspect_pci_bars(bus: u8, device: u8, function: u8) -> [PciBar; 6] {
         if orig_val & 1 == 1 {
             // I/O Port BAR
             let port = (orig_val & 0xFFFC) as u16;
-            let size = !(size_mask & 0xFFFC) + 1;
-            bars[i] = PciBar::IoPort { port, size };
-            i += 1;
+            match bar_size_from_mask(size_mask, 0xFFFC) {
+                Some(size) => {
+                    bars[i] = PciBar::IoPort { port, size };
+                    i += 1;
+                }
+                None => {
+                    warn!(
+                        "[pci] malformed config: I/O BAR {:02x}:{:02x}.{} reports zero size mask; skipped",
+                        bus, device, function
+                    );
+                    bars[i] = PciBar::None;
+                    i += 1;
+                }
+            }
         } else {
             // MMIO BAR
             let bar_type = (orig_val >> 1) & 0x03;
@@ -172,25 +196,48 @@ fn inspect_pci_bars(bus: u8, device: u8, function: u8) -> [PciBar; 6] {
 
                 let full_addr = ((orig_high as u64) << 32) | ((orig_val & 0xFFFF_FFF0) as u64);
                 let full_mask = ((high_mask as u64) << 32) | ((size_mask & 0xFFFF_FFF0) as u64);
-                let size = !full_mask + 1;
-
-                bars[i] = PciBar::Mmio64 {
-                    addr: full_addr,
-                    size,
-                    prefetchable,
+                // S19：零掩码（畸形）→ 如实 None，避免 `!full_mask+1` 回绕成非法尺寸。
+                let size = if full_mask == 0 {
+                    warn!(
+                        "[pci] malformed config: 64-bit MMIO BAR {:02x}:{:02x}.{} reports zero size mask; skipped",
+                        bus, device, function
+                    );
+                    0
+                } else {
+                    !full_mask + 1
                 };
+                if size == 0 {
+                    bars[i] = PciBar::None;
+                } else {
+                    bars[i] = PciBar::Mmio64 {
+                        addr: full_addr,
+                        size,
+                        prefetchable,
+                    };
+                }
                 bars[i + 1] = PciBar::None;
                 i += 2;
             } else {
                 // 32-bit MMIO
                 let addr = orig_val & 0xFFFF_FFF0;
-                let size = !(size_mask & 0xFFFF_FFF0) + 1;
-                bars[i] = PciBar::Mmio32 {
-                    addr,
-                    size,
-                    prefetchable,
-                };
-                i += 1;
+                match bar_size_from_mask(size_mask, 0xFFFF_FFF0) {
+                    Some(size) => {
+                        bars[i] = PciBar::Mmio32 {
+                            addr,
+                            size,
+                            prefetchable,
+                        };
+                        i += 1;
+                    }
+                    None => {
+                        warn!(
+                            "[pci] malformed config: 32-bit MMIO BAR {:02x}:{:02x}.{} reports zero size mask; skipped",
+                            bus, device, function
+                        );
+                        bars[i] = PciBar::None;
+                        i += 1;
+                    }
+                }
             }
         }
     }
@@ -277,6 +324,10 @@ pub fn scan_pci_bus() -> usize {
                 let kind = kind_for_class(class_code);
                 // KM6：唯一注册名 = 类别描述 + PCI 位置（泄漏为 'static，
                 // 注册表条目本就终生存在）。
+                //
+                // S18：Box::leak 是有界常驻分配，上界 = 扫描超集
+                // bus(0..=8=9) × device(0..32) × function(≤8) = 至多 2304 个
+                // 常驻名字（每次内核生命周期内固定，无释放路径，量级可控）。
                 let base = name_for_device(class_code, subclass);
                 let name: &'static str = alloc::boxed::Box::leak(
                     alloc::format!("{base}-{bus:02x}-{device:02x}-{function}").into_boxed_str(),

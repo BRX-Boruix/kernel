@@ -18,7 +18,7 @@
 //!   真实映射（PCD 不可缓存）→ 返回用户 VA。无登记窗口的设备如实返回
 //!   `NotSupported`，绝不以匿名内存伪装映射成功。
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::hub::DriverHub;
 use klib::error::Error;
 use klib::info;
 use klib::warn;
@@ -47,7 +47,6 @@ impl UioDriverEntry {
     };
 }
 
-static UIO_COUNT: AtomicUsize = AtomicUsize::new(0);
 static UIO_DRIVERS: Mutex<[UioDriverEntry; MAX_UIO_DRIVERS]> =
     Mutex::new([UioDriverEntry::EMPTY; MAX_UIO_DRIVERS]);
 
@@ -147,6 +146,11 @@ pub fn uio_register_driver(pid: usize, dev_name: &str) -> Result<usize, Error> {
     if dev_name.is_empty() || dev_name.len() >= UIO_DEV_NAME_MAX {
         return Err(Error::InvalidParam);
     }
+    // S08：认领的设备必须在 DriverHub 真实注册，否则接受任意名即成"幽灵
+    // 设备"认领记录。表内不存在的名字如实 NotFound。
+    if !DriverHub::device_exists(dev_name) {
+        return Err(Error::NotFound);
+    }
     let mut list = UIO_DRIVERS.lock();
     if slot_of_live_claim(&list, dev_name).is_some() {
         return Err(Error::AlreadyExists);
@@ -162,7 +166,6 @@ pub fn uio_register_driver(pid: usize, dev_name: &str) -> Result<usize, Error> {
         claimed_len: dev_name.len(),
         is_alive: true,
     };
-    UIO_COUNT.fetch_add(1, Ordering::Relaxed);
     info!(
         "[uio] driver registered: pid={} claiming dev={}",
         pid, dev_name

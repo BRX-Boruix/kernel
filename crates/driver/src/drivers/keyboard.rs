@@ -5,7 +5,7 @@
 //! DriverHub 转发到同一扇门——多读者竞争自此是字符设备的标准语义，内核
 //! 内部不存在第二条绕过设备的隐藏通道。
 
-use crate::device::{BusType, Device, DeviceInfo, DeviceKind, IoDevice};
+use crate::device::{BusType, CharDevice, Device, DeviceInfo, DeviceKind, InputDevice, IoDevice};
 use crate::driver::DriverStage;
 use crate::hub::DriverHub;
 use klib::error::Error;
@@ -57,6 +57,10 @@ impl IoDevice for KeyboardDevice {
 }
 
 pub static KEYBOARD_DEV: KeyboardDevice = KeyboardDevice;
+
+// S15：显式 opt-in——PS/2 键盘是字符/输入设备（InputDevice: CharDevice）。
+impl CharDevice for KeyboardDevice {}
+impl InputDevice for KeyboardDevice {}
 
 pub fn init_keyboard(_hub: &DriverHub) {
     if let Err(e) = DriverHub::register_device_info(

@@ -286,7 +286,11 @@ impl IoDevice for AtaPioDevice {
         let is_hw = *self.is_hardware.lock();
         if !is_hw {
             let storage = FALLBACK_STORAGE.lock();
-            let off = offset as usize;
+            // S04：用 try_from 而非 as usize——as 在非 64 位目标上会截断 u64
+            // 偏移；try_from 失败如实返回 0，不静默截断。
+            let Ok(off) = usize::try_from(offset) else {
+                return 0;
+            };
             if off >= storage.len() {
                 return 0;
             }
@@ -329,7 +333,10 @@ impl IoDevice for AtaPioDevice {
         let is_hw = *self.is_hardware.lock();
         if !is_hw {
             let mut storage = FALLBACK_STORAGE.lock();
-            let off = offset as usize;
+            // S04：同 read_at——用 try_from 而非 as usize，防截断。
+            let Ok(off) = usize::try_from(offset) else {
+                return 0;
+            };
             if off >= storage.len() {
                 return 0;
             }

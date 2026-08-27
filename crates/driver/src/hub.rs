@@ -28,7 +28,9 @@ pub const MAX_DEVICES: usize = 64;
 /// 该路径的驱动在注册前已在自己的 init 中完成真实初始化与接管
 /// （ata_pio identify、键盘控制器就绪等），绑定关系先于竞标存在；
 /// 分数取标准类驱动档位（ADR-022 §1 的分数语义），不是仲裁产物。
-const EXPLICIT_BIND_SCORE: u8 = 50;
+/// S13：单一来源——`driver.rs` 的 `score_probe` 默认通用探测分也引用此值，
+/// 避免两处散落的 50 漂移。
+pub(crate) const EXPLICIT_BIND_SCORE: u8 = 50;
 
 #[derive(Clone, Copy)]
 pub struct DeviceEntry {
@@ -367,6 +369,15 @@ impl DriverHub {
     /// `0..device_count()` 与各 `*_at(index)` 访问器构成同一枚举契约。
     pub fn device_count() -> usize {
         DEVICE_COUNT.load(Acquire)
+    }
+
+    /// 指定名称的设备是否已注册（S08：供 UIO 认领等 name-based 入口校验
+    /// 设备真实存在，杜绝注册"幽灵设备名"）。
+    pub fn device_exists(name: &str) -> bool {
+        let list = DEVICES.lock();
+        list.iter()
+            .take(DEVICE_COUNT.load(Acquire))
+            .any(|e| e.as_ref().map(|entry| entry.info.name == name).unwrap_or(false))
     }
 
     /// 返回当前已注册的驱动总数（驱动表无移除通道，恒等于稠密长度）。
