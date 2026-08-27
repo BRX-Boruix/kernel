@@ -787,11 +787,25 @@ mod backend {
         // S20：同 load_segment，HHDM 前置先于任何资源获取。
         let off = hhdm_offset()?;
 
-        // 与段帧同一退款纪律（audit-r2 F1）：映射拒绝时当场全额归还，
-        // 见 load_segment 内同名注释。
-        let frames = collect_frames(USER_STACK_PAGES)?;
+        // 按需分页（M17 重构）：只预留整个 4MiB 栈区（demand_paging=true，
+        // 不分配物理帧），初始只实映射**栈顶 1 页**承载命令行 + 参数块。
+        // 栈向下增长越过首页时由用户态 #PF 经 handle_page_fault 逐页补帧，
+        // 不再一次预分配 1024 页物理帧（旧实现深递归场景预占帧过多）。
+        addr_space
+            .reserve_user(
+                VirtAddr::new(stack_bottom),
+                VirtAddr::new(stack_top),
+                PageSize::Size4K,
+                PageFlags::empty().writable(),
+            )
+            .map_err(|e| Error::from(e))?;
+
+        // 只分配并映射栈顶 1 页。与段帧同一退款纪律（audit-r2 F1）：
+        // map_user 拒绝时当场全额归还（此处单帧，refund 即可）。
+        let frames = collect_frames(1)?;
+        let top_page_va = stack_top - PAGE_SIZE as u64;
         if let Err(e) = addr_space.map_user(
-            VirtAddr::new(stack_bottom),
+            VirtAddr::new(top_page_va),
             VirtAddr::new(stack_top),
             PageSize::Size4K,
             PageFlags::empty().writable(),
@@ -802,7 +816,8 @@ mod backend {
         }
 
         unsafe {
-            let top = (frames[USER_STACK_PAGES - 1] + off + PAGE_SIZE) as *mut u8;
+            // 栈顶页的物理末端（帧起始 + HHDM 偏移 + 整页）。
+            let top = (frames[0] + off + PAGE_SIZE) as *mut u8;
 
             if !cmd.is_empty() {
                 let str_user = stack_top - STR_OFF as u64;
