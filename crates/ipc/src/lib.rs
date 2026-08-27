@@ -53,6 +53,12 @@ use klib::sync::irq::IrqSpinLock;
 /// 只影响单轮搬运的切块大小（ipc1 ID1 选择理由成文）。
 pub const PIPE_CAPACITY: usize = 4096;
 
+/// 单次用户范围校验的字节上限（S13：抽取散落魔法字面量）。与 syscall 层
+/// `MAX_SYSCALL_BUF_BYTES` 同值同源——64 MiB 是"一用户拷贝请求"的合理
+/// 有界上限，超过直接拒绝（B2 有界上限纪律），避免拷贝路径被任意大长度
+/// 撑爆。
+pub const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
+
 /// 单管道每方向等待者上限（ipc1 IM6）。
 ///
 /// 为什么是 64：远超单用户玩具内核同一管道上并发阻塞读者/写者的合理规模
@@ -153,7 +159,10 @@ pub fn shm_create(size: u64) -> Result<u64, Error> {
     // 受物理帧总量约束远早于宽度耗尽。
     let page_bytes = PageSize::Size4K.bytes();
     let npages = (size / page_bytes) as usize;
-    let mut frames: Vec<u64> = Vec::with_capacity(npages);
+    // S20：用 try_reserve 而非 with_capacity——后者 OOM 时全局 alloc error
+    // panic，前者如实返回错误走退款路径。
+    let mut frames: Vec<u64> = Vec::new();
+    frames.try_reserve(npages).map_err(|_| Error::OutOfMemory)?;
     // IM1：中途 OOM 时逆序归还已成功分配的帧——错误路径的资源释放义务
     // （S18）在 OOM 这种最需要回收的场景同样成立。
     for _ in 0..npages {
@@ -347,14 +356,17 @@ pub fn shm_unmap<PT: arch::PageTable>(
 /// `pipe_create() -> id`：新建一个空管道。
 pub fn pipe_create() -> Result<u64, Error> {
     let id = NEXT_PIPE.fetch_add(1, Ordering::Relaxed);
-    PIPE_TABLE.lock().insert(
-        id,
-        PipeObject {
-            buf: VecDeque::with_capacity(PIPE_CAPACITY),
-            read_waiters: Vec::new(),
-            write_waiters: Vec::new(),
-        },
-    );
+    // S20：先 try_reserve 管道缓冲容量，OOM 如实返回错误——with_capacity
+    // 在分配失败时会全局 alloc error panic。
+    let mut pipe = PipeObject {
+        buf: VecDeque::new(),
+        read_waiters: Vec::new(),
+        write_waiters: Vec::new(),
+    };
+    pipe.buf
+        .try_reserve(PIPE_CAPACITY)
+        .map_err(|_| Error::OutOfMemory)?;
+    PIPE_TABLE.lock().insert(id, pipe);
     klib::info!("[ipc] pipe id={} created", id);
     Ok(id)
 }
@@ -384,7 +396,7 @@ fn validate_user_range<PT: arch::PageTable>(
     len: usize,
     access: mm::user_space::UserAccess,
 ) -> Result<(), Error> {
-    const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
+    // S13：具名常量（见 MAX_COPY_BYTES），不再是散落魔法字面量。
     if len as u64 > MAX_COPY_BYTES {
         return Err(Error::InvalidParam);
     }

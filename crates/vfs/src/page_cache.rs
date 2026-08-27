@@ -204,7 +204,11 @@ impl PageCache {
         if buf.len() >= READ_BULK_THRESHOLD_BYTES {
             let mut total_read = 0usize;
             while total_read < buf.len() {
-                let cur = offset + total_read as u64;
+                // S19：offset+total_read 无保护相加；offset 接近 u64::MAX 时
+                // checked_add 失败即停止（越界读无意义），不静默回绕。
+                let Some(cur) = offset.checked_add(total_read as u64) else {
+                    break;
+                };
                 let huge_offset = (cur / HUGE_PAGE_SIZE as u64) * HUGE_PAGE_SIZE as u64;
                 let huge_inner_off = (cur % HUGE_PAGE_SIZE as u64) as usize;
                 let huge_key = (node_key(inode), huge_offset);
@@ -330,8 +334,12 @@ impl PageCache {
         let mut map_huge = self.pages_huge.write();
 
         let start_page = (offset / PAGE_SIZE as u64) * PAGE_SIZE as u64;
-        let end_page =
-            ((offset + len + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) * PAGE_SIZE as u64;
+        // S19：`offset + len + PAGE_SIZE - 1` 是 u64 无保护加法，offset/len 接近
+        // u64::MAX 会回绕成小值从而框错区间。saturating_add 保证不溢出（饱和到
+        // MAX 后除法仍落到最大页，语义安全）。
+        let end_page = ((offset.saturating_add(len).saturating_add(PAGE_SIZE as u64 - 1))
+            / PAGE_SIZE as u64)
+            * PAGE_SIZE as u64;
 
         // 元组序性质：`(nk, start)..(nk, end)` 恰好框住本节点该区间内
         // 全部键——首分量不同的键必然落在区间之外。
@@ -344,7 +352,9 @@ impl PageCache {
         }
 
         let huge_start = (offset / HUGE_PAGE_SIZE as u64) * HUGE_PAGE_SIZE as u64;
-        let huge_end = ((offset + len + HUGE_PAGE_SIZE as u64 - 1) / HUGE_PAGE_SIZE as u64)
+        // S19：同 4K 路径，saturating_add 防 u64 回绕。
+        let huge_end = ((offset.saturating_add(len).saturating_add(HUGE_PAGE_SIZE as u64 - 1))
+            / HUGE_PAGE_SIZE as u64)
             * HUGE_PAGE_SIZE as u64;
         let victims_huge: Vec<PageKey> = map_huge
             .range((nk, huge_start)..(nk, huge_end))
@@ -393,14 +403,14 @@ impl PageCache {
 
         let mut drop4k: Vec<PageKey> = Vec::new();
         let mut drop_huge: Vec<PageKey> = Vec::new();
-        for (access, level, nk, off, equiv) in candidates {
+        // S28：access 从不读取，取消绑定（原 `let _ = access;` 是无效死代码）。
+        for (_, level, nk, off, equiv) in candidates {
             if evicted >= target_free_count {
                 break;
             }
             // 复查 access_count：收集与删除之间无写入（全程持读锁快照 +
             // 删除持写锁，单线程语义下无竞态窗口；多核化时此处需要升级
             // 为写锁内重验——S21 显式标注，同审计 O1）。
-            let _ = access;
             if level == 0 {
                 drop4k.push((nk, off));
             } else {
@@ -428,10 +438,23 @@ impl PageCache {
 
     /// 获取缓存统计快照。
     pub fn stats(&self) -> PageCacheStats {
-        let total_4k: usize = self.pages_4k.read().len();
+        // S13：total_pages 统一按 page_equivalent() 实账（截断块按实际数据量
+        // 折算），与 evict 的计账口径一致——不再把截断 2MB 块虚记为满 512 页。
+        let total_pages: usize = self
+            .pages_4k
+            .read()
+            .values()
+            .map(|p| p.page_equivalent())
+            .sum::<usize>()
+            + self
+                .pages_huge
+                .read()
+                .values()
+                .map(|p| p.page_equivalent())
+                .sum::<usize>();
         let total_huge: usize = self.pages_huge.read().len();
         PageCacheStats {
-            total_pages: total_4k + total_huge * (HUGE_PAGE_SIZE / PAGE_SIZE),
+            total_pages,
             huge_pages: total_huge,
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),

@@ -27,6 +27,10 @@ use klib::json::{JsonWriter, VecTarget};
 use crate::dynamic::{DynamicDirNode, DynamicFileNode};
 use crate::inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
 
+/// 总线名"PCI"（S13：devfs 按总线名划分子树，字面量集中定义，避免散落漂移
+/// 静默漏设备；与 driver crate 的 `BusType::Pci` 语义对应，此处是字符串投影）。
+const BUS_PCI: &str = "PCI";
+
 /// 设备概要信息。
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
@@ -276,7 +280,7 @@ impl DevFS {
         // `{name}/bars` 子目录；查不到的设备返回错误 JSON，不回退到固定设备。
         let pci_dir = Arc::new(DynamicDirNode::new());
         for dev in provider.list_devices() {
-            if dev.bus == "PCI" {
+            if dev.bus == BUS_PCI {
                 let p_pci = provider.clone();
                 let dev_name = dev.name.clone();
                 let dev_dir = Arc::new(DynamicDirNode::new());

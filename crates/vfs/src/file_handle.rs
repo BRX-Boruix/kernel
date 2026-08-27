@@ -157,6 +157,11 @@ impl FileHandle {
             return Err(Error::PermissionDenied);
         }
         let cur = if self.flags.append {
+            // S21：append 的"读 size + 写"非原子——两个并发 append 可能读到
+            // 相同 size 相互覆盖，丢失 O_APPEND 追加原子性。成文假设：当前
+            // 内核单 CPU、同一文件的并发 append 不存在（VFS 层无对同句柄的
+            // 跨进程并发写语义）；未来引入多写者时须把 size 读取+写入纳入
+            // 同一把 content 锁。
             let size = self.inode.metadata()?.size;
             self.offset.store(size, Ordering::SeqCst);
             size
@@ -205,7 +210,9 @@ impl FileHandle {
             }
             SeekWhence::Current => {
                 if offset < 0 {
-                    let neg = (-offset) as u64;
+                    // S19：`-offset` 在 offset==i64::MIN 时溢出 panic；
+                    // unsigned_abs() 对全部负值安全。
+                    let neg = offset.unsigned_abs();
                     cur.checked_sub(neg).ok_or(Error::OutOfRange)?
                 } else {
                     cur.checked_add(offset as u64).ok_or(Error::OutOfRange)?
@@ -213,7 +220,7 @@ impl FileHandle {
             }
             SeekWhence::End => {
                 if offset < 0 {
-                    let neg = (-offset) as u64;
+                    let neg = offset.unsigned_abs();
                     meta.size.checked_sub(neg).ok_or(Error::OutOfRange)?
                 } else {
                     meta.size

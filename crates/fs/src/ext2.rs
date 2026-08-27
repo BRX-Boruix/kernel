@@ -66,6 +66,9 @@ pub enum Ext2Error {
     UnsupportedBlockSize,
     /// 目录项损坏（rec_len 越界或不满足最小长度、size 与结构矛盾等）。
     CorruptDirEntry,
+    /// 超级块结构性损坏（计数/几何/字段自相矛盾）。S13：超级块解析失败
+    /// 不应借用 CorruptDirEntry/BadInode 等子结构变体——语义误导排查方向。
+    CorruptSuperblock,
     /// 调用方缓冲小于一个完整块（fs1 FM4：内部契约设防，不再切片 panic）。
     BufferTooSmall,
 }
@@ -112,13 +115,13 @@ pub fn parse_superblock(sb: &[u8; 1024]) -> Result<Ext2Superblock, Ext2Error> {
     let blocks_count = le_u32(sb, 4);
     let inodes_count = le_u32(sb, 0);
     if blocks_count == 0 || inodes_count == 0 {
-        return Err(Ext2Error::CorruptDirEntry);
+        return Err(Ext2Error::CorruptSuperblock);
     }
     // EXT2 规范：first_data_block 为 1 当且仅当块大小 1024，否则为 0。
     let first_data_block = le_u32(sb, 20);
     let expect_fdb = if block_size == 1024 { 1 } else { 0 };
     if first_data_block != expect_fdb {
-        return Err(Ext2Error::CorruptDirEntry);
+        return Err(Ext2Error::CorruptSuperblock);
     }
     let inode_size = if le_u32(sb, 76) >= 1 {
         let s = le_u16(sb, 88);
@@ -127,7 +130,7 @@ pub fn parse_superblock(sb: &[u8; 1024]) -> Result<Ext2Superblock, Ext2Error> {
         // block_size 字节的 inode 数据。损坏超级块声明超大 inode_size 会让
         // 每次 read_inode 按该值分配内核堆（自伤面），此处必须在解析期拒绝。
         if s < 128 || s % 128 != 0 || s as u32 > block_size {
-            return Err(Ext2Error::BadInode);
+            return Err(Ext2Error::CorruptSuperblock);
         }
         s
     } else {
@@ -135,7 +138,7 @@ pub fn parse_superblock(sb: &[u8; 1024]) -> Result<Ext2Superblock, Ext2Error> {
     };
     let blocks_per_group = le_u32(sb, 32);
     if blocks_per_group == 0 {
-        return Err(Ext2Error::BadInode);
+        return Err(Ext2Error::CorruptSuperblock);
     }
     Ok(Ext2Superblock {
         blocks_count,
@@ -515,7 +518,9 @@ pub(crate) fn ext2_to_klib(e: Ext2Error) -> Error {
     match e {
         Ext2Error::BadMagic | Ext2Error::ShortRead => Error::Io,
         Ext2Error::BadInode | Ext2Error::BufferTooSmall => Error::InvalidParam,
-        Ext2Error::CorruptDirEntry | Ext2Error::BlockOutOfRange => Error::Corrupt,
+        Ext2Error::CorruptDirEntry
+        | Ext2Error::CorruptSuperblock
+        | Ext2Error::BlockOutOfRange => Error::Corrupt,
         Ext2Error::UnsupportedTripleIndirect
         | Ext2Error::UnsupportedFragmentSize
         | Ext2Error::UnsupportedBlockSize => Error::NotSupported,
@@ -1066,18 +1071,18 @@ mod tests {
         let sb = base_sectors as usize + 1024;
         img[sb + 20..sb + 24].copy_from_slice(&0u32.to_le_bytes());
         let got = Ext2Fs::open(Arc::new(MockByteDevice::new(img)), base_sectors);
-        assert!(matches!(got, Err(Ext2Error::CorruptDirEntry)), "fdb mismatch rejected");
+        assert!(matches!(got, Err(Ext2Error::CorruptSuperblock)), "fdb mismatch rejected");
         // blocks_count=0
         let (mut img, _, _) = build_image();
         img[sb + 4..sb + 8].copy_from_slice(&0u32.to_le_bytes());
         let got = Ext2Fs::open(Arc::new(MockByteDevice::new(img)), base_sectors);
-        assert!(matches!(got, Err(Ext2Error::CorruptDirEntry)), "zero blocks_count rejected");
+        assert!(matches!(got, Err(Ext2Error::CorruptSuperblock)), "zero blocks_count rejected");
         // inodes_count=0
         let (img, _, _) = build_image();
         let mut img = img;
         img[sb..sb + 4].copy_from_slice(&0u32.to_le_bytes());
         let got = Ext2Fs::open(Arc::new(MockByteDevice::new(img)), base_sectors);
-        assert!(matches!(got, Err(Ext2Error::CorruptDirEntry)), "zero inodes_count rejected");
+        assert!(matches!(got, Err(Ext2Error::CorruptSuperblock)), "zero inodes_count rejected");
     }
 
     /// S19/S31 回归：`s_inode_size` 声明超块大（inode 表单块放不下）必须被拒，
@@ -1095,8 +1100,8 @@ mod tests {
         img[sb + 88..sb + 90].copy_from_slice(&65535u16.to_le_bytes());
         let got = parse_superblock(&img[sb..sb + 1024].try_into().unwrap());
         assert!(
-            matches!(got, Err(Ext2Error::BadInode)),
-            "inode_size larger than block_size must be rejected as BadInode"
+            matches!(got, Err(Ext2Error::CorruptSuperblock)),
+            "inode_size larger than block_size must be rejected as CorruptSuperblock"
         );
     }
 
