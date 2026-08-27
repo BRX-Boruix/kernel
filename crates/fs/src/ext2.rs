@@ -122,7 +122,11 @@ pub fn parse_superblock(sb: &[u8; 1024]) -> Result<Ext2Superblock, Ext2Error> {
     }
     let inode_size = if le_u32(sb, 76) >= 1 {
         let s = le_u16(sb, 88);
-        if s < 128 {
+        // S19/S31：inode_size 必须 >=128（最小 inode 结构）且为 128 的倍数
+        //（EXT2 规范），并**不得超过块大小**——一个 inode 表块最多容纳
+        // block_size 字节的 inode 数据。损坏超级块声明超大 inode_size 会让
+        // 每次 read_inode 按该值分配内核堆（自伤面），此处必须在解析期拒绝。
+        if s < 128 || s % 128 != 0 || s as u32 > block_size {
             return Err(Ext2Error::BadInode);
         }
         s
@@ -1041,10 +1045,29 @@ mod tests {
         assert!(matches!(got, Err(Ext2Error::CorruptDirEntry)), "zero inodes_count rejected");
     }
 
+    /// S19/S31 回归：`s_inode_size` 声明超块大（inode 表单块放不下）必须被拒，
+    /// 否则每次 read_inode 都按该超大值分配内核堆（损坏镜像可令每次 inode
+    /// 读取分配 64KB，自伤面）。
+    #[test]
+    fn test_superblock_rejects_huge_inode_size() {
+        let base_sectors = PART_START_LBA * SECTOR;
+        // inode_size=65535（> 1K 块大小），结构上不可能——一个 inode 表块
+        // 最多容纳 block_size 字节的 inode 数据。
+        let (mut img, _, _) = build_image();
+        let sb = base_sectors as usize + 1024;
+        // s_rev_level(76)=1 使 parse 走 inode_size 读取分支；s_inode_size 在 88。
+        img[sb + 76..sb + 80].copy_from_slice(&1u32.to_le_bytes());
+        img[sb + 88..sb + 90].copy_from_slice(&65535u16.to_le_bytes());
+        let got = parse_superblock(&img[sb..sb + 1024].try_into().unwrap());
+        assert!(
+            matches!(got, Err(Ext2Error::BadInode)),
+            "inode_size larger than block_size must be rejected as BadInode"
+        );
+    }
+
     /// fs1 FM2/FD1：七个显式错误变体逐一有测试锁定。
     #[test]
-    fn test_error_branches_each_locked() {
-        let base = PART_START_LBA * SECTOR;
+    fn test_error_branches_each_locked() {        let base = PART_START_LBA * SECTOR;
         // FD1：log_block_size=3（8K 块）→ UnsupportedBlockSize（不再冒充片段问题）
         let (mut img, _, _) = build_image();
         let sb = base as usize + 1024;
