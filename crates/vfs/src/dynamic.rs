@@ -107,8 +107,8 @@ impl INode for DynamicFileNode {
     /// A5：文件判型零成本——**绝不调用 generator**（metadata 的 size 字段
     /// 才需要生成；类型判定进热路径，历史实现曾因此每次 resolve 全量
     /// 生成动态内容后丢弃）。
-    fn node_type(&self) -> INodeType {
-        INodeType::RegularFile
+    fn node_type(&self) -> Result<INodeType, Error> {
+        Ok(INodeType::RegularFile)
     }
 
     fn lookup(&self, _name: &str) -> Result<Arc<dyn INode>, Error> {
@@ -187,8 +187,8 @@ impl INode for DynamicDirNode {
     }
 
     /// A5：目录判型零成本（entries 长度都不必读）。
-    fn node_type(&self) -> INodeType {
-        INodeType::Directory
+    fn node_type(&self) -> Result<INodeType, Error> {
+        Ok(INodeType::Directory)
     }
 
     fn truncate(&self, _size: u64) -> Result<(), Error> {

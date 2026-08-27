@@ -575,7 +575,7 @@ mod tests {
         );
         // 正向链接解析不受影响
         let through = mt.resolve("/lnk/secret.txt", true).unwrap();
-        assert_eq!(through.node_type(), crate::inode::INodeType::RegularFile);
+        assert_eq!(through.node_type().unwrap(), crate::inode::INodeType::RegularFile);
     }
 
     /// vfs1 D8-②：相对符号链接目标中的 `..` 以**链接所在目录**为基准

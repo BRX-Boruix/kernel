@@ -220,12 +220,12 @@ impl INode for RamINode {
     }
 
     /// A5：按数据族判型，零锁零分配（读 meta 反而要拿 RwLock）。
-    fn node_type(&self) -> INodeType {
-        match &self.data {
+    fn node_type(&self) -> Result<INodeType, Error> {
+        Ok(match &self.data {
             RamNodeData::File { .. } => INodeType::RegularFile,
             RamNodeData::Directory { .. } => INodeType::Directory,
             RamNodeData::Symlink { .. } => INodeType::Symlink,
-        }
+        })
     }
 
     fn truncate(&self, size: u64) -> Result<(), Error> {

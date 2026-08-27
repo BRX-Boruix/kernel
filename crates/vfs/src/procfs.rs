@@ -71,8 +71,8 @@ impl INode for ProcRootNode {
     }
 
     /// A5：目录判型零成本。
-    fn node_type(&self) -> INodeType {
-        INodeType::Directory
+    fn node_type(&self) -> Result<INodeType, Error> {
+        Ok(INodeType::Directory)
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn INode>, Error> {

@@ -121,7 +121,7 @@ impl FileHandle {
     ///   如实上抛——旧 `unwrap_or(0)` 会把追加起点静默落回文件头，
     ///   第一次写入就覆盖既有内容。
     pub fn new(inode: Arc<dyn INode>, flags: OpenFlags) -> Result<Self, Error> {
-        if flags.directory && inode.node_type() != crate::inode::INodeType::Directory {
+        if flags.directory && inode.node_type()? != crate::inode::INodeType::Directory {
             return Err(Error::NotDirectory);
         }
         let initial_offset = if flags.append {

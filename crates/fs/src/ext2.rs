@@ -575,10 +575,10 @@ impl INode for Ext2Node {
     }
 
     /// A5（ADR-023 §4）：类型从缓存 mode 派生，零盘访问零分配——
-    /// metadata 的 Corrupt 语义在此退化为"未知模式按 RegularFile 兜底"，
-    /// 热路径判型不允许失败；完整校验仍由 metadata() 承担。
-    fn node_type(&self) -> INodeType {
-        node_type_of(self.inode.mode).unwrap_or(INodeType::RegularFile)
+    /// S09：node_type 如实上抛——未知 mode 不再静默兜底为 RegularFile
+    /// （伪数据），而是按 Corrupt 报告；完整校验仍由 metadata() 承担。
+    fn node_type(&self) -> Result<INodeType, Error> {
+        node_type_of(self.inode.mode).ok_or(Error::Corrupt)
     }
 
     /// 元数据：size/type/权限/时间全部来自盘上真值。

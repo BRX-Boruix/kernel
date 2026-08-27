@@ -162,10 +162,13 @@ pub trait INode: Send + Sync {
     /// 判定软链接，导致读一次 `/processes/N/status` 在解析阶段就把 JSON
     /// 完整生成一遍再丢弃。默认实现退回 [`Self::metadata`] 以兼容第三方
     /// 实现；本 crate 内全部实现必须提供零生成覆盖。
-    fn node_type(&self) -> INodeType {
-        self.metadata()
-            .map(|m| m.node_type)
-            .unwrap_or(INodeType::RegularFile)
+    ///
+    /// **S09**：返回 `Result`——默认实现 `metadata()` 失败时如实上抛，绝不
+    /// 静默兜底为 `RegularFile`（旧 `unwrap_or(RegularFile)` 把任意错误
+    /// 伪装成普通文件，属伪数据）。本 crate 内实现均零成本覆盖，热路径
+    /// 不可达此默认。
+    fn node_type(&self) -> Result<INodeType, Error> {
+        self.metadata().map(|m| m.node_type)
     }
 
     /// 截断/调整大小。

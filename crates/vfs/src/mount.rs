@@ -76,7 +76,7 @@ impl MountTable {
             return Err(Error::AlreadyExists);
         }
         let target = self.resolve(&norm, true)?;
-        if target.node_type() != INodeType::Directory {
+        if target.node_type()? != INodeType::Directory {
             return Err(Error::NotDirectory);
         }
         let mut mounts = self.mounts.write();
@@ -147,7 +147,7 @@ impl MountTable {
             // A5（ADR-023 §4）：廉价类型查询判定软链接——绝不在此触发
             // 动态内容全量生成（metadata 对 DynamicFileNode 意味着执行
             // generator，历史上让每次路径解析付出 O(内容生成) 代价）。
-            if next_node.node_type() == INodeType::Symlink {
+            if next_node.node_type()? == INodeType::Symlink {
                 if !is_last || follow_symlink {
                     let link_target = next_node.read_link()?;
                     // 如果是绝对路径，从根重算；否则拼接

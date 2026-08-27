@@ -169,8 +169,8 @@ impl INode for SerialDeviceNode {
     }
 
     /// A5：字符设备判型零成本。
-    fn node_type(&self) -> INodeType {
-        INodeType::CharacterDevice
+    fn node_type(&self) -> Result<INodeType, Error> {
+        Ok(INodeType::CharacterDevice)
     }
 
     /// M17（ADR-023 §6）：串口是字符流，截断语义不存在——成功码会掩盖

@@ -111,8 +111,8 @@ impl INode for StdinNode {
     }
 
     /// A5：字符设备判型零成本。
-    fn node_type(&self) -> INodeType {
-        INodeType::CharacterDevice
+    fn node_type(&self) -> Result<INodeType, Error> {
+        Ok(INodeType::CharacterDevice)
     }
 
     fn interactive_input(&self) -> bool {
@@ -150,8 +150,8 @@ impl INode for StdoutNode {
     }
 
     /// A5：字符设备判型零成本。
-    fn node_type(&self) -> INodeType {
-        INodeType::CharacterDevice
+    fn node_type(&self) -> Result<INodeType, Error> {
+        Ok(INodeType::CharacterDevice)
     }
 }
 
