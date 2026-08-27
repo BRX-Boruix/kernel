@@ -237,7 +237,20 @@ impl DriverHub {
                 // 2. 索引压缩移除（swap-remove，稠密不变量）
                 {
                     let mut devices = DEVICES.lock();
+                    // S21：TOCTOU 防护——detach 在锁外执行期间，其它线程可能
+                    // 已并发注册/拔除设备，`idx` 与快照计数可能已失效。移除前
+                    // 在锁内**复核**：idx 仍在计数范围内，且该槽位仍绑定同一
+                    // 名字（并发竞争时名字匹配失败即放弃，不误删他设备）。
                     let last = DEVICE_COUNT.load(Acquire) - 1;
+                    let still_ours = idx <= last
+                        && devices
+                            .get(idx)
+                            .and_then(|e| e.as_ref())
+                            .map(|e| e.info.name == name)
+                            .unwrap_or(false);
+                    if !still_ours {
+                        continue;
+                    }
                     if idx != last {
                         // 仅当被移除设备不是末位时才需尾条前移补位。若 idx == last，
                         // `devices[idx] = devices[last].take()` 是**自赋值**：先
@@ -297,6 +310,17 @@ impl DriverHub {
                 // 2. 重置绑定状态
                 {
                     let mut devices = DEVICES.lock();
+                    // S21：TOCTOU 防护——detach 在锁外执行后，复核该槽位仍
+                    // 绑定同一设备再重置，避免并发竞争下误改他设备条目。
+                    let still_ours = idx <= DEVICE_COUNT.load(Acquire)
+                        && devices
+                            .get(idx)
+                            .and_then(|e| e.as_ref())
+                            .map(|e| e.info.name == name)
+                            .unwrap_or(false);
+                    if !still_ours {
+                        continue;
+                    }
                     if let Some(entry) = devices.get_mut(idx).and_then(|e| e.as_mut()) {
                         entry.driver_name = None;
                         entry.driver_score = 0;
@@ -458,18 +482,26 @@ impl DriverHub {
     /// 触发指定生命周期阶段的所有驱动初始化。
     pub fn init_stage(stage: DriverStage) {
         Self::ensure_registered();
-        let count = DRIVER_COUNT.load(Acquire);
-        let list = DRIVERS.lock();
         let hub = DriverHub;
-        for entry in list.iter().take(count) {
-            if entry.stage == stage {
-                entry.init(&hub);
-                info!(
-                    "[driver_hub] init stage={:?} driver={}",
-                    stage,
-                    entry.name()
-                );
-            }
+        // S21：不得持 DRIVERS 锁调用 driver.init——driver 的 init 可能回调
+        // hub（注册设备/仲裁，取 DEVICES 甚至 DRIVERS 锁），持锁遍历时回调
+        // 即重入死锁。改为**锁内收集**到期的 init 函数与名字，**锁外**逐一调用。
+        let inits: alloc::vec::Vec<(fn(&DriverHub), &'static str)> = {
+            let count = DRIVER_COUNT.load(Acquire);
+            let list = DRIVERS.lock();
+            list.iter()
+                .take(count)
+                .filter(|e| e.stage == stage)
+                .map(|e| (e.init, e.name()))
+                .collect()
+        };
+        for (init_fn, name) in inits {
+            init_fn(&hub);
+            info!(
+                "[driver_hub] init stage={:?} driver={}",
+                stage,
+                name
+            );
         }
     }
 
