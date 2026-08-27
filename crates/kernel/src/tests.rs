@@ -1613,9 +1613,16 @@ pub fn test_ipc1_semantics() {
         Error::Busy,
         "destroy while mappings alive must be Busy"
     );
+    // 最后一次 unmap 归零引用时对象已被自动回收（ADR-019：last mapping
+    // released → 对象与帧一并释放）。此后 shm_destroy 如实 NotFound——
+    // 不存在"销毁已自动回收对象"路径。
     ipc::shm_on_mappings_released(&[did2]);
-    ipc::shm_destroy(did2).expect("destroy after unmap");
-    assert!(!ipc::debug_shm_exists(did2), "destroyed after unmap");
+    assert!(!ipc::debug_shm_exists(did2), "last unmap auto-reclaims object");
+    assert_eq!(
+        ipc::shm_destroy(did2).unwrap_err(),
+        Error::NotFound,
+        "destroy after auto-reclaim must be NotFound"
+    );
     info!("[test-ipc1] S18 shm_destroy lifecycle OK");
 
     info!("[test-ipc1] PASS");
