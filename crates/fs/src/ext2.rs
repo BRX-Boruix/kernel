@@ -366,15 +366,30 @@ impl Ext2Fs {
         Ok(done)
     }
 
-    /// 设备字节容量 = 超级块 blocks_count × 块大小（fs1 FA2 / 审计 R7-F1）。
+    /// 设备字节容量（fs1 FA2 / 审计 R7-F1 / S09-S20-S31）。
     ///
     /// 一切"盘上声明的字节数 → 内核分配量"的换算必须先过这道上界——
     /// 目录数据与符号链接目标同受此约束，单点实现防止政策执行面再次
     /// 出现遗漏（R7 正是 read_dir_raw 有帽而 read_link_target 无帽的
     /// 不一致被点名）。
+    ///
+    /// S09/S20/S31：上界**必须锚定真实设备容量** `dev.byte_len()`，不得
+    /// 只信超级块几何。超级块来自不可信镜像：恶意镜像把 `s_blocks_count`
+    /// 夸大即可让"目录/链接 size ≤ 设备容量"防线以虚高几何放行超真实
+    /// 容量的分配声明 → `alloc::vec![0u8; size]` 触发内核 OOM 自伤，与
+    /// "绝不以受信为名触发 OOM 自伤"矛盾。此处取几何与真实容量的较小者：
+    /// 真实介质总是真值上限（寻址不可越界），几何只是结构一致性约束。
+    ///
+    /// 退化策略：设备不报告容量（`byte_len() == None`，非可寻址流设备）
+    /// 时，退回超级块几何作为唯一可用的受信上限——此时介质无"真实末尾"
+    /// 可比，几何是唯一的事实来源，但绝不因此无限放大。
     fn device_byte_capacity(&self) -> u64 {
         let sb = self.superblock();
-        sb.blocks_count as u64 * sb.block_size as u64
+        let sb_cap = sb.blocks_count as u64 * sb.block_size as u64;
+        match self.inner.dev.byte_len() {
+            Some(real) => core::cmp::min(sb_cap, real),
+            None => sb_cap,
+        }
     }
 
     /// 遍历目录 inode 的全部目录项。
@@ -968,6 +983,38 @@ mod tests {
         let root = vfs::inode::FileSystem::root(&fs);
         let err = root.list_dir().unwrap_err();
         assert_eq!(err, Error::Corrupt, "oversized dir declaration must be rejected");
+    }
+
+    /// S09/S20/S31 回归（清单 high）：`device_byte_capacity()` 不得只信
+    /// 超级块几何——恶意镜像夸大 `s_blocks_count` 后，K7 防线"目录/符号
+    /// 链接 size ≤ 设备容量"会以虚高几何放行超真实设备容量的分配声明，
+    /// 触发内核 OOM 自伤。上限必须锚定真实设备容量 `dev.byte_len()`。
+    ///
+    /// 直接单测返回值：把 `s_blocks_count` 抬到 u32::MAX（几何 ≈4TB），
+    /// 真实 MockByteDevice 容量为 2MiB。修复前函数返回 4TB（红）；修复后
+    /// 返回 min(几何, 真实容量) = 2MiB（绿）。
+    #[test]
+    fn test_device_byte_capacity_anchored_to_real_device() {
+        let (img, _, _) = build_image(); // Img::new(4096) → 2MiB 设备
+        let mut bad = img;
+        let base = (PART_START_LBA * SECTOR) as usize;
+        let sb = base + 1024;
+        // 夸大 s_blocks_count → 几何 ≈4TB（恶意声明）
+        bad[sb + 4..sb + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let dev = Arc::new(MockByteDevice::new(bad));
+        let fs = Ext2Fs::open(dev, PART_START_LBA * SECTOR).expect("sb still valid");
+        // 真实设备容量：MockByteDevice::new(img) → data.len() == 2MiB
+        let real_cap = 4096u64 * SECTOR;
+        assert_ne!(
+            fs.device_byte_capacity(),
+            u32::MAX as u64 * 1024u64,
+            "S09/S20/S31: capacity must NOT trust sb geometry when it exceeds the real device"
+        );
+        assert_eq!(
+            fs.device_byte_capacity(),
+            real_cap,
+            "device_byte_capacity must be anchored to the real device byte length"
+        );
     }
 
     /// fs1 FA2：超级块结构性 sanity——first_data_block 与块大小矛盾、
