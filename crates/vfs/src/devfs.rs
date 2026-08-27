@@ -129,9 +129,13 @@ impl SerialDeviceNode {
                         let _ = obj.field_str("error", "no_serial_baudrate");
                     }
                 }
-                let _ = obj.field_u64("data_bits", 8);
-                let _ = obj.field_str("parity", "none");
-                let _ = obj.field_u64("stop_bits", 1);
+                // S10/S07：data_bits/parity/stop_bits 此前硬编码为
+                // `8/"none"/1`——伪装成真实设备配置（伪配置）。Provider
+                // 接口不提供这些线设置的读取，故不得编造；与 telemetry_json
+                // 同一诚实化策略，显式标 not_supported 而非伪值。
+                let _ = obj.field_str("data_bits", "not_supported");
+                let _ = obj.field_str("parity", "not_supported");
+                let _ = obj.field_str("stop_bits", "not_supported");
                 let _ = obj.end();
             }
             let mut bytes = target.into_bytes();

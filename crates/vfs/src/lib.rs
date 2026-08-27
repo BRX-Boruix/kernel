@@ -375,6 +375,15 @@ mod tests {
         let n8 = cfg_file.read_at(0, &mut buf).unwrap();
         let s8 = core::str::from_utf8(&buf[..n8]).unwrap();
         assert!(s8.contains(r#""baudrate":9600"#));
+        // S10/S07：data_bits/parity/stop_bits 无真实数据源，必须显式
+        // not_supported，绝不得编造 8/"none"/1 伪配置。
+        assert!(
+            s8.contains(r#""data_bits":"not_supported""#)
+                && s8.contains(r#""parity":"not_supported""#)
+                && s8.contains(r#""stop_bits":"not_supported""#),
+            "config must disclose unsupported line settings, not fake 8/none/1"
+        );
+        assert!(!s8.contains(r#""data_bits":8"#), "must not fabricate data_bits=8");
 
         // 显示器分辨率 mode JSON：必须逐字透传 Provider 真值（DevFS 层无
         // 自己的分辨率缺省值），写路径如实 NotSupported（模式切换未实现）。
