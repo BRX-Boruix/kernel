@@ -194,6 +194,33 @@ pub fn shm_create(size: u64) -> Result<u64, Error> {
     Ok(id)
 }
 
+/// `shm_destroy(id)`：销毁一个共享内存对象并释放其全部物理帧。
+///
+/// S18（生命周期）：创建的 shm 若从未映射（或已全部 unmap），refs 恒 0，
+/// 若无销毁 API，其分配的物理帧将永久不可回收（帧泄漏）。本 API 提供显式
+/// 销毁路径——对象仍有存活映射（refs>0）时拒绝（`Busy`），须先全部 unmap。
+///
+/// 与 `shm_create`/`shm_map`/`shm_unmap` 同持 `SHM_TABLE` 锁，无新增锁序。
+pub fn shm_destroy(id: u64) -> Result<(), Error> {
+    let mut table = SHM_TABLE.lock();
+    match table.get(&id) {
+        None => return Err(Error::NotFound),
+        Some(obj) if obj.refs > 0 => return Err(Error::Busy),
+        Some(_) => {}
+    }
+    if let Some(obj) = table.remove(&id) {
+        for p in obj.frames.iter().rev() {
+            mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(*p));
+        }
+        klib::info!(
+            "[ipc] shm_destroy id={} freed {} frames",
+            id,
+            obj.frames.len()
+        );
+    }
+    Ok(())
+}
+
 /// 把 `ids` 中每个映射条目计为一个新存活引用（ipc1 IA1 fork 继承路径；
 /// 由 kernel 适配层实现 mm 的 ShmMappingHooks 后在本 crate 落账）。
 pub fn shm_on_mappings_acquired(ids: &[u64]) {
@@ -275,12 +302,43 @@ pub fn shm_map<PT: arch::PageTable>(
 ///
 /// 按**映射条目**记账（ADR-019）：移除本空间的一条 `shm_maps` 条目并递减
 /// 一个引用；归零即回收。
+///
+/// **锁序（S21）**：与 [`shm_map`] 统一为 `SHM_TABLE → mm`——先持 SHM_TABLE，
+/// 再对地址空间做 unmap（取 mm 的 shm_maps 锁）。旧实现 `shm_unmap` 走
+/// `mm → SHM_TABLE` 反向序，与 `shm_map` 的 `SHM_TABLE → mm` 构成 SMP 锁反转
+/// 死锁点（单核掩盖）。注意地址空间销毁钩子（`ipc_init.rs` 的
+/// `on_mappings_released`）由 mm 驱动、以 `mm → SHM_TABLE` 序调用
+/// [`shm_on_mappings_released`]——该路径为进程销毁独有，与 syscall 触发的
+/// `shm_unmap` 互斥（同一地址空间不会同时销毁与 unmap），成文记录。
 pub fn shm_unmap<PT: arch::PageTable>(
     id: u64,
     addr_space: &mut mm::user_space::UserAddressSpace<PT>,
 ) -> Result<(), PT::Error> {
+    // 统一锁序：先 SHM_TABLE，后 mm。
+    let mut table = SHM_TABLE.lock();
     addr_space.unmap_shm(id)?;
-    shm_on_mappings_released(core::slice::from_ref(&id));
+    let dead = match table.get_mut(&id) {
+        Some(obj) => {
+            obj.refs = obj.refs.saturating_sub(1);
+            obj.refs == 0
+        }
+        None => {
+            klib::warn!("[ipc] shm_unmap: unknown shm id {}", id);
+            false
+        }
+    };
+    if dead {
+        if let Some(obj) = table.remove(&id) {
+            for p in obj.frames.iter().rev() {
+                mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(*p));
+            }
+            klib::info!(
+                "[ipc] last mapping of id={} gone, freed {} frames",
+                id,
+                obj.frames.len()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -531,16 +589,30 @@ pub fn pipe_read<PT: arch::PageTable>(
                     chunk,
                     mm::user_space::UserAccess::Write,
                 )?;
+                // S20/S09：不得在交付证明前消费共享缓冲。旧实现先 pop 进
+                // staging、再 drop 表锁、最后 copy_to_user——若拷贝在验证与
+                // 拷贝之间因页面换出触发故障，已消费的 pipe 字节即丢失。
+                // 修复：**锁内**先做不可故障的拷贝（validate_user_range 已
+                // 使目标页驻留，属"无内核态 #PF"契约路径），成功后才 pop
+                // 消费——数据交付与消费原子，杜绝"已消费但拷贝失败"丢失。
                 let mut staging = [0u8; PIPE_CAPACITY];
-                for b in staging.iter_mut().take(chunk) {
-                    *b = pipe.buf.pop_front().expect("avail checked");
+                for (out, src) in staging
+                    .iter_mut()
+                    .take(chunk)
+                    .zip(pipe.buf.iter().take(chunk))
+                {
+                    *out = *src;
+                }
+                unsafe {
+                    arch_x86_64::mmio::copy_to_user(dst, staging.as_ptr(), chunk)
+                };
+                // 拷贝成功（契约保证不 fault）后才消费缓冲。
+                for _ in 0..chunk {
+                    pipe.buf.pop_front();
                 }
                 // 先收集后唤醒（同 write），唤醒在表锁之外。
                 let writers = core::mem::take(&mut pipe.write_waiters);
                 drop(table);
-                unsafe {
-                    arch_x86_64::mmio::copy_to_user(dst, staging.as_ptr(), chunk)
-                };
                 for w in writers {
                     wake_proc(w);
                 }

@@ -1596,6 +1596,28 @@ pub fn test_ipc1_semantics() {
     );
     info!("[test-ipc1] IA1 entry-accounting lifecycle OK");
 
+    // S18：shm_destroy 提供"从未映射/已全 unmap 对象"的显式销毁路径，
+    // 否则其物理帧永久泄漏。refs>0（仍有存活映射）时拒绝为 Busy。
+    let did = ipc::shm_create(0x1000).expect("shm_create for destroy");
+    assert_eq!(ipc::debug_shm_refs(did), Some(0), "fresh object not mapped");
+    ipc::shm_destroy(did).expect("destroy unreferenced object frees frames");
+    assert!(
+        !ipc::debug_shm_exists(did),
+        "destroyed object must be gone"
+    );
+    // refs>0 时拒绝销毁。
+    let did2 = ipc::shm_create(0x1000).expect("shm_create for busy");
+    ipc::shm_on_mappings_acquired(&[did2]);
+    assert_eq!(
+        ipc::shm_destroy(did2).unwrap_err(),
+        Error::Busy,
+        "destroy while mappings alive must be Busy"
+    );
+    ipc::shm_on_mappings_released(&[did2]);
+    ipc::shm_destroy(did2).expect("destroy after unmap");
+    assert!(!ipc::debug_shm_exists(did2), "destroyed after unmap");
+    info!("[test-ipc1] S18 shm_destroy lifecycle OK");
+
     info!("[test-ipc1] PASS");
 }
 
