@@ -38,7 +38,11 @@ fn init_framebuffer(_hub: &DriverHub) {
     // term1 T3：init 失败即诚实降级为纯串口，且不注册屏幕 sink——
     // 注册死 sink 等于向 console 层伪装屏幕可用。
     if term::init(&info).is_ok() {
-        let _ = klib::console::register_console(&term::TERMINAL_CONSOLE);
+        // S18：注册失败（console 表满）必须显式记录，不再静默吞返回值——
+        // 否则屏幕 sink 悄悄不挂载，用户以为有屏幕实则无。
+        if !klib::console::register_console(&term::TERMINAL_CONSOLE) {
+            error!("[fb] console sink table full; framebuffer terminal not registered");
+        }
     }
     if let Err(e) = DriverHub::register_device_info(
         DeviceInfo {

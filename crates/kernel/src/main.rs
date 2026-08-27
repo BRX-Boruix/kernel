@@ -628,9 +628,13 @@ fn halt_other_cpus_via_ipi() {
 // 字节数（0 = 缓冲空，vfs::stdio::StdinNode 据此返回 WouldBlock）。
 //
 // DM5 单一消费点纪律（ADR-022 §8）：键盘队列唯一合法消费点是 DriverHub
-// 注册的 ps2-keyboard 设备 read。stdin 经 Hub 按名转发到同一扇门；设备
-// 缺席（框架未就绪等）走 KM8 同款可见回退——直连 arch pop + 一次告警，
-// 内核内部不存在第二条绕过设备的隐藏通道。
+// 注册的 ps2-keyboard 设备 read。stdin 经 Hub 按名转发到同一扇门。
+//
+// S14 显式降级策略：设备缺席（框架未就绪等）时回退直连 arch pop，且
+// 仅此一次告警。两条路径**互斥**——Hub 命中即 return，绝不落到回退，
+// 故不存在同一数据源被两条消费点并发排空的竞态；回退仅在 ps2-keyboard
+// 注册之前的早期阶段可达（届时 Hub 尚未登记该设备）。内核内部不存在
+// 第二条绕过设备的隐藏通道。
 fn stdin_source(buf: &mut [u8]) -> usize {
     use driver::drivers::keyboard::PS2_KEYBOARD_DEVICE_NAME;
 
@@ -695,6 +699,19 @@ pub fn read_binary_from_programs(name: &str) -> Option<alloc::vec::Vec<u8>> {
     let node = root.resolve(&path, true).ok()?;
     let size = node.metadata().ok()?.size as usize;
     if size == 0 {
+        return None;
+    }
+    // S31：按 metadata().size 无界分配内核堆——超大文件（含损坏元数据声称的
+    // 巨尺寸）会 OOM abort。显式上限与 sys_exec 的 MAX_SYSCALL_BUF_BYTES
+    // 同源（64 MiB），超限即拒绝加载，绝不无界分配。
+    const MAX_PROGRAM_BYTES: usize = 64 * 1024 * 1024;
+    if size > MAX_PROGRAM_BYTES {
+        klib::error!(
+            "[programs] {} exceeds max loadable size {} bytes (declared {}), rejected",
+            path,
+            MAX_PROGRAM_BYTES,
+            size
+        );
         return None;
     }
     let mut buf = alloc::vec![0u8; size];

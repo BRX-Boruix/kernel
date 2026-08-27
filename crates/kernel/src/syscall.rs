@@ -314,6 +314,14 @@ fn sys_readdir(frame: &mut InterruptFrame) -> u64 {
     let buf_ptr = frame.rsi;
     let max_bytes = frame.rdx as usize;
 
+    // S31：max_bytes 是用户可控上限，内核侧给读目录结果设独立上限——否则
+    // 用户可传巨大值迫使内核为 out String 分配任意大堆块。上限远大于现实
+    // 目录输出（单个目录项数十字节），仅防无界分配。
+    const MAX_READDIR_OUT_BYTES: usize = 1 * 1024 * 1024;
+    if max_bytes > MAX_READDIR_OUT_BYTES {
+        return pack_err(Error::InvalidParam);
+    }
+
     let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
         Err(e) => return pack_err(e),

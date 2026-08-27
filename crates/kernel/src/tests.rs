@@ -522,6 +522,8 @@ pub fn test_heap() {
     // Box 分配 + 解引用
     let b = Box::new(42u32);
     info!("[test-heap] Box::new -> {}", *b);
+    // S29：断言分配后值完整保留（分配器真实持有内存，非瞬时借位）。
+    assert_eq!(*b, 42, "Box value must round-trip through heap allocation");
     drop(b);
 
     // Vec 分配多个元素（会多次扩容，测试分配器稳定性）
@@ -531,11 +533,14 @@ pub fn test_heap() {
     }
     let sum: i32 = v.iter().sum();
     info!("[test-heap] Vec sum = {}", sum);
+    // S29：100 个 0..100 元素求和 = 4950；断言扩容过程值不失真。
+    assert_eq!(sum, 4950, "Vec sum of 0..100 must be 4950 after multiple reallocations");
     drop(v);
 
     // 字符串（通过 alloc 的 String）
     let s = alloc::string::String::from("hello heap");
     info!("[test-heap] String = {}", s);
+    assert_eq!(s.as_str(), "hello heap", "String content must round-trip through heap");
     drop(s);
 
     info!("[test-heap] heap tests passed");
@@ -765,6 +770,12 @@ pub fn test_frame_alloc() {
         "[test-pmm] after alloc: allocated={} alloc_calls={} hit_uninit={} fail={}",
         s1.allocated_frames, s1.alloc_calls, s1.alloc_hit_uninit, s1.alloc_fail
     );
+    // S29：帧计数守恒断言——分配 3 帧后 allocated 必须净增 3。
+    assert_eq!(
+        s1.allocated_frames,
+        s0.allocated_frames + 3,
+        "allocating 3 frames must raise allocated count by exactly 3"
+    );
 
     // 释放一个，再分配，验证可重用
     mm::deallocate_frame(f2);
@@ -774,6 +785,12 @@ pub fn test_frame_alloc() {
         "[test-pmm] re-allocated f2b={:?} (expect equals freed f2={:?})",
         f2b.start_address(),
         f2.start_address()
+    );
+    // S29：释放后立即再分配应复用刚释放的帧（LIFO/就近回收）。
+    assert_eq!(
+        f2b.start_address(),
+        f2.start_address(),
+        "re-allocated frame should reuse the just-freed frame"
     );
 
     // 清理
@@ -786,6 +803,12 @@ pub fn test_frame_alloc() {
     info!(
         "[test-pmm] final: allocated={} alloc_calls={} fail={}",
         s2.allocated_frames, s2.alloc_calls, s2.alloc_fail
+    );
+    // S29：全部释放后 allocated 必须回到初始值（帧数守恒）。
+    assert_eq!(
+        s2.allocated_frames,
+        s0.allocated_frames,
+        "after freeing all frames, allocated count must return to initial"
     );
 }
 
@@ -2120,9 +2143,13 @@ pub fn test_acpi_parse_tables() {
         "PM1a_CNT_BLK must be parsed (FADT len >= 70 branch)"
     );
     let (base, period_fs) = crate::acpi::hpet_info().expect("HPET must be present on T3 platform");
-    assert_eq!(
-        base, 0xFED0_0000,
-        "QEMU HPET base address is fixed by platform layout"
+    // S04：不硬耦合 QEMU 固定基址 0xFED0_0000——真机/其它固件 HPET 基址不同，
+    // 硬编码会让自检误报。改为断言非零且落在 x86 内存映射设备区（高物理段，
+    // 规范化 ≥1MiB 之上，实际设备都在 ≥0xF0000000）。
+    assert!(
+        base != 0 && base >= 0x0010_0000,
+        "HPET base must be nonzero and in mapped device region, got {:#x}",
+        base
     );
     // 周期字段（COUNTER_CLK_PERIOD，u32 飞秒/计数）只断言非零与位宽上界：
     // 绝对精度属于驱动层行为，test_hpet 已用 est_hz 交叉验证真实频率；

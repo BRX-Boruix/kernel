@@ -87,8 +87,11 @@ pub fn init() {
 
 /// 返回 HPET 物理基址与时钟周期（飞秒）；无 HPET 表时为 `None`。
 ///
-/// KM11：原 `(0, 0)` 元组哨兵改为 `Option`——"没有"是独立于取值域的状态，
-/// 用魔法零值表达会把合法基址 0（理论可映射）与缺失混为一谈。
+/// S09：注释与实现口径须一致——`Option` 是调用侧的独立取值域（"没有"与
+/// 任何基址区分），但底层 `HPET_BASE/HPET_PERIOD_FS` 原子静态仍以 0 作为
+/// "尚未设置"的内部哨兵：基址 0 在 HPET 上恒不可用（规范要求 MMIO 位于
+/// 系统保留高段，且 RSDT 解析到 0 即判缺失）。若未来需支持合法基址 0，
+/// 须改用显式 `Option<u64>` 状态而非 0 哨兵。
 pub fn hpet_info() -> Option<(u64, u64)> {
     let base = HPET_BASE.load(Ordering::Acquire);
     let period = HPET_PERIOD_FS.load(Ordering::Acquire);
