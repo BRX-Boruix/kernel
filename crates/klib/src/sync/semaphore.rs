@@ -68,8 +68,8 @@ impl Semaphore {
     /// 释放一个资源。
     pub fn release(&self) {
         // S19：release 无上限，count 无限累加会在 usize::MAX 溢出。用
-        // fetch_update 饱和到 usize::MAX，杜绝回绕成小计数。
-        let _ = self.count.fetch_update(Ordering::Release, Ordering::Relaxed, |c| {
+        // try_update（原 fetch_update）饱和到 usize::MAX，杜绝回绕成小计数。
+        let _ = self.count.try_update(Ordering::Release, Ordering::Relaxed, |c| {
             Some(c.saturating_add(1))
         });
     }
