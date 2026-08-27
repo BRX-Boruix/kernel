@@ -80,7 +80,9 @@ pub fn init_percpu_caches(cpu_count: usize) {
 
     // 计算所需连续帧数与可容纳的最小 order（2^order 个 4KB 帧）。
     // order 上限 MAX_ORDER-1：buddy 能分配的最大块（2^(MAX_ORDER-1) 帧）。
-    let bytes = count * size_of::<PerCpuCache>();
+    // S19：count*size_of 无保护乘法在极端 count 下可回绕——saturating_mul
+    // 保证字节数不归零（归零会让后续 div_ceil 得 0 帧、order 又退化为旧越界写）。
+    let bytes = count.saturating_mul(size_of::<PerCpuCache>());
     let need_frames = bytes.div_ceil(4096);
     let order = order_for_need_frames(need_frames);
 

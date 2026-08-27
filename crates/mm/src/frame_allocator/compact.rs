@@ -26,6 +26,14 @@ const MAILBOX_DONE: u32 = 1 << 31;
 /// 属主完成（DONE 置位）后读取计数并复位——无任何裸跨槽元数据访问。
 static MAILBOXES: [AtomicU32; 256] = [const { AtomicU32::new(MAILBOX_IDLE) }; 256];
 
+/// S21：每邮箱的**请求方互斥**——同一目标邮箱同一时刻只允许一个请求核驱动，
+/// 否则两个请求核对同一 mailbox 的 IDLE→PENDING→等待 DONE 流程会相互踩踏
+/// （一个核吸收另一个核的 DONE/超时复位），邮箱生命周期被误判。锁粒度按
+/// 邮箱索引，请求核在驱动某个邮箱全程持锁，与中断上下文（属主写 DONE）不冲突
+/// ——属主从不在请求方临界区内取该锁，锁序为 mailbox + requester 单向。
+static MAILBOX_REQUESTERS: [spin::Mutex<()>; 256] =
+    [const { spin::Mutex::new(()) }; 256];
+
 /// 跨核投递函数（MA1b 注入点）：`fn(目标槽位) -> bool`。由 kernel 层接线到
 /// arch 的 LAPIC ICI + 槽位反查表；mm 保持架构中立。返回 false = 投递失败。
 type RemoteDrain = fn(usize) -> bool;
@@ -147,7 +155,10 @@ impl LazyBuddyAllocator {
                 continue;
             }
             // 仅对已注册 LAPIC id 的槽位发起（未上线槽位无 IPI 目标）。
-            let mailbox = &MAILBOXES[slot & 0xFF];
+            let mi = slot & 0xFF;
+            let mailbox = &MAILBOXES[mi];
+            // S21：同一目标邮箱的请求方互斥（防多请求核踩踏同一邮箱）。
+            let _req_guard = MAILBOX_REQUESTERS[mi].lock();
             if mailbox.load(Ordering::Acquire) != MAILBOX_IDLE {
                 continue; // 上一次请求尚未被消费：该核正忙，跳过不排队
             }

@@ -10,6 +10,10 @@ use super::allocator_core::{MAX_ORDER, ORDER_4K};
 use super::reserve::ReserveLevel;
 use super::{LazyBuddyAllocator, current_cpu_id};
 
+/// 自动压缩节流的最小分配间隔（次）。S13：抽取散落魔法数字——高 order 分配
+/// 失败且距上次 compact 已过至少本间隔才触发压缩，避免频繁紧凑的抖动开销。
+pub const AUTO_COMPACT_MIN_INTERVAL: usize = 1024;
+
 impl LazyBuddyAllocator {
     /// Allocate a frame of order N（等价于 [`Self::allocate_with_level`] 的
     /// Regular 级别：既有行为，失败兜底取 Regular 紧急池）。
@@ -53,8 +57,7 @@ impl LazyBuddyAllocator {
         if order > ORDER_4K {
             let now = self.alloc_calls.load(Ordering::Relaxed);
             let last = self.compact_last_alloc_call.load(Ordering::Relaxed);
-            let min_interval = 1024;
-            if now.saturating_sub(last) >= min_interval {
+            if now.saturating_sub(last) >= AUTO_COMPACT_MIN_INTERVAL {
                 let max_order = self.max_free_order();
                 if max_order < order {
                     self.compact_last_alloc_call.store(now, Ordering::Relaxed);

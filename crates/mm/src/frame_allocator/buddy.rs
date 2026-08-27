@@ -142,6 +142,13 @@ impl LazyBuddyAllocator {
         }
     }
 
+    /// 从 uninit 区分配帧。
+    ///
+    /// S21 锁序（成文）：本函数**持 uninit 锁**调用 `carve_align_gap` →
+    /// `free_and_merge` → `push_to_global` → `lock_global_list`，形成
+    /// `uninit → global` 的嵌套锁序。当前全局无反向路径（global 持锁内不会
+    /// 再取 uninit），故无实测死锁；但锁序必须集中标注——未来任何"global 持
+    /// 锁后再取 uninit"的实现都必须先解除本约定，否则自锁死。
     pub(crate) fn alloc_from_uninit(&self, order: usize) -> Option<usize> {
         let size = 1 << order;
 

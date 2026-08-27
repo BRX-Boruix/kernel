@@ -474,8 +474,14 @@ where
         if area.size == PageSize::Size2M {
             let aligned = area.start.as_u64()
                 + ((vaddr - area.start.as_u64()) / area.size.bytes()) * area.size.bytes();
-            if let Some(frame) =
-                crate::frame_allocator::allocate_frames(crate::frame_allocator::ORDER_2M)
+            // S19：2M 大页直通只允许整块落在区域内——若 aligned 块跨出
+            // area.end，映射会越出预留边界。强制整块在 [start,end) 内才直通，
+            // 否则退化到下方 4K 逐页路径（该路径逐页校验 cur_v < end）。
+            let in_area = aligned >= area.start.as_u64()
+                && aligned.saturating_add(area.size.bytes()) <= area.end.as_u64();
+            if in_area
+                && let Some(frame) =
+                    crate::frame_allocator::allocate_frames(crate::frame_allocator::ORDER_2M)
             {
                 let phys = frame.start_paddr();
                 let page_virt = phys_to_virt(phys) as *mut u8;
@@ -1206,7 +1212,10 @@ where
     ///
     /// 返回栈顶虚拟地址（高地址端）。栈区起点 = 栈顶 - 栈大小。
     pub fn setup_stack(&mut self, size: u64) -> Result<u64, PT::Error> {
-        let size = align_up(size, 4096);
+        // S19：size 是外部（可能用户可控）参数——用 align_up_checked 防
+        // `size+4095` 在 size 接近 u64::MAX 时回绕成小值、算出错误栈区间。
+        // 溢出如实译 OutOfRange，绝不静默绕过大栈限制。
+        let size = align_up_checked(size, 4096).ok_or(Error::OutOfRange)?;
         let top = USER_STACK_TOP;
         let bottom = top - size;
         if bottom < USER_BASE {

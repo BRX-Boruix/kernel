@@ -46,7 +46,12 @@ impl PerCpuCacheSet {
         F: FnOnce(&mut PerCpuCache) -> R,
     {
         let caches = self.caches.get().expect("per-CPU caches not initialized");
-        let cpu = cpu % caches.len(); // 防御性取模
+        // S19：cpu 越界是调用方 bug——防御性取模会把越界 cpu 静默映射到合法槽位，
+        // 掩盖 bug 且让两个 CPU 共享同槽（数据竞争）；caches.len()==0 时 %0 还会
+        // panic。改显式越界 panic（不可恢复的调用方缺陷），不静默错位。
+        if cpu >= caches.len() {
+            panic!("per-CPU slot out of range: {} >= {}", cpu, caches.len());
+        }
         unsafe { f(&mut *(caches.as_ptr().add(cpu) as *mut PerCpuCache)) }
     }
 }

@@ -78,6 +78,14 @@ impl LazyBuddyAllocator {
         None
     }
 
+    /// 把一个 4K 帧放入应急 reserve 池。
+    ///
+    /// S18 池生命周期（成文）：reserve 池帧以 `FrameState::Allocated` 标记并
+    /// 挂在 `reserve_list` 上，**仅**通过 `pop_from_pool` 出池复用（紧急分配
+    /// 路径），或池满时经 [`Self::free_and_merge`] 回收到全局 buddy 合并。
+    /// 出池帧与全局 buddy 正常交互；**不得**对仍在池中的帧重复调用
+    /// `reserve_push` 或与外部 allocator 交换（双重分配/账目不一致）。池上限
+    /// `RESERVE_CAP` 决定常驻应急帧上界，超限帧即回收到 buddy。
     pub(crate) fn reserve_push(&self, pfn: usize) {
         let mut list = self.reserve_list.lock();
         // 把"容量判断"与"入池"收敛到同一临界区内：多 CPU 并发释放时，
