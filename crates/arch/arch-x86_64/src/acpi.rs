@@ -45,9 +45,23 @@ pub fn init() -> Option<AcpiInfo> {
     let resp = RSDP_REQUEST.get_response().get()?;
     let rsdp_ptr = resp.address.as_ptr()? as *const u8;
 
-    // 读取 RSDP 前 36 字节（ACPI 2.0 布局）。
-    // SAFETY: limine 保证 RSDP 可访问，长度 ≥ 36（revision 2）或 ≥ 20。
-    let rsdp_bytes = unsafe { core::slice::from_raw_parts(rsdp_ptr, 36) };
+    // S31/S19：不得无条件读 36 字节。ACPI 1.0 RSDP 仅 20 字节；ACPI 2.0+
+    // 为 36 字节（或按 offset20 的 length 字段更长）。分两阶段读取：
+    //   1) 先读 20 字节（两种版本的最小公共布局），从 offset15 取 revision；
+    //   2) 若 revision >= 2，从 offset20 取 length 字段并按该值读取完整 RSDP。
+    // 否则保持 20 字节 ACPI 1.0 布局。
+    // SAFETY: limine 保证 RSDP 物理页已映射且长度至少 20 字节。
+    let base20 = unsafe { core::slice::from_raw_parts(rsdp_ptr, 20) };
+    let rev = base20[15];
+    let total_len = if rev >= 2 {
+        // 读取 length 字段（offset 20，u32 LE）。ACPI 2.0+ RSDP 长度恒 >= 36。
+        let len_slice = unsafe { core::slice::from_raw_parts(rsdp_ptr.add(20), 4) };
+        let len = u32::from_le_bytes([len_slice[0], len_slice[1], len_slice[2], len_slice[3]]) as usize;
+        len.max(36)
+    } else {
+        20
+    };
+    let rsdp_bytes = unsafe { core::slice::from_raw_parts(rsdp_ptr, total_len) };
     let rsdp = parse_rsdp(rsdp_bytes)?;
     klib::info!(
         "[acpi] RSDP rev={} rsdt={:#x} xsdt={:#x}",
