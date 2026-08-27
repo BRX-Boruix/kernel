@@ -86,7 +86,15 @@ impl PhysFrame {
     }
 
     /// 从物理地址构造页帧，要求已按 4KB 对齐（否则 panic）。
+    ///
+    /// S07 成文：doc 声称"否则 panic"，但实现不校验即破坏核心不变式
+    /// '始终 4KB 对齐'。加入 `debug_assert` 使未对齐构造在调试构建中
+    /// 被拦截，确保不变式不被静默违反。
     pub const fn from_aligned(addr: PhysAddr) -> Self {
+        debug_assert!(
+            addr.as_u64() & 0xFFF == 0,
+            "PhysFrame::from_aligned requires 4KB-aligned address"
+        );
         Self { start: addr }
     }
 }
