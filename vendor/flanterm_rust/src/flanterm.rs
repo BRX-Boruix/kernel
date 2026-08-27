@@ -164,119 +164,113 @@ pub struct FlantermCore<B: BackendOps> {
 
 impl<B: BackendOps> FlantermCore<B> {
     #[inline(always)]
-    fn with_backend<R>(&mut self, f: impl FnOnce(&mut B, &mut FlantermCore<B>) -> R) -> R {
-        let self_ptr = self as *mut FlantermCore<B>;
-        unsafe { f(&mut (*self_ptr).backend, &mut *self_ptr) }
-    }
-
-    #[inline(always)]
     fn raw_putchar(&mut self, c: u8) {
-        self.with_backend(|_, ctx| B::raw_putchar(ctx, c));
+        B::raw_putchar(self, c);
     }
 
     #[inline(always)]
     fn clear(&mut self, move_cursor: bool) {
-        self.with_backend(|_, ctx| B::clear(ctx, move_cursor));
+        B::clear(self, move_cursor);
     }
 
     #[inline(always)]
     fn set_cursor_pos(&mut self, x: usize, y: usize) {
-        self.with_backend(|_, ctx| B::set_cursor_pos(ctx, x, y));
+        B::set_cursor_pos(self, x, y);
     }
 
     #[inline(always)]
     fn get_cursor_pos(&mut self, x: &mut usize, y: &mut usize) {
-        self.with_backend(|_, ctx| B::get_cursor_pos(ctx, x, y));
+        B::get_cursor_pos(self, x, y);
     }
 
     #[inline(always)]
     fn set_text_fg(&mut self, fg: usize) {
-        self.with_backend(|_, ctx| B::set_text_fg(ctx, fg));
+        B::set_text_fg(self, fg);
     }
 
     #[inline(always)]
     fn set_text_bg(&mut self, bg: usize) {
-        self.with_backend(|_, ctx| B::set_text_bg(ctx, bg));
+        B::set_text_bg(self, bg);
     }
 
     #[inline(always)]
     fn set_text_fg_bright(&mut self, fg: usize) {
-        self.with_backend(|_, ctx| B::set_text_fg_bright(ctx, fg));
+        B::set_text_fg_bright(self, fg);
     }
 
     #[inline(always)]
     fn set_text_bg_bright(&mut self, bg: usize) {
-        self.with_backend(|_, ctx| B::set_text_bg_bright(ctx, bg));
+        B::set_text_bg_bright(self, bg);
     }
 
     #[inline(always)]
     fn set_text_fg_rgb(&mut self, fg: u32) {
-        self.with_backend(|_, ctx| B::set_text_fg_rgb(ctx, fg));
+        B::set_text_fg_rgb(self, fg);
     }
 
     #[inline(always)]
     fn set_text_bg_rgb(&mut self, bg: u32) {
-        self.with_backend(|_, ctx| B::set_text_bg_rgb(ctx, bg));
+        B::set_text_bg_rgb(self, bg);
     }
 
     #[inline(always)]
     fn set_text_fg_default(&mut self) {
-        self.with_backend(|_, ctx| B::set_text_fg_default(ctx));
+        B::set_text_fg_default(self);
     }
 
     #[inline(always)]
     fn set_text_bg_default(&mut self) {
-        self.with_backend(|_, ctx| B::set_text_bg_default(ctx));
+        B::set_text_bg_default(self);
     }
 
     #[inline(always)]
     fn set_text_fg_default_bright(&mut self) {
-        self.with_backend(|_, ctx| B::set_text_fg_default_bright(ctx));
+        B::set_text_fg_default_bright(self);
     }
 
     #[inline(always)]
     fn set_text_bg_default_bright(&mut self) {
-        self.with_backend(|_, ctx| B::set_text_bg_default_bright(ctx));
+        B::set_text_bg_default_bright(self);
     }
 
     #[inline(always)]
     fn move_character(&mut self, new_x: usize, new_y: usize, old_x: usize, old_y: usize) {
-        self.with_backend(|_, ctx| B::move_character(ctx, new_x, new_y, old_x, old_y));
+        B::move_character(self, new_x, new_y, old_x, old_y);
     }
 
     #[inline(always)]
     fn scroll(&mut self) {
-        self.with_backend(|_, ctx| B::scroll(ctx));
+        B::scroll(self);
     }
 
     #[inline(always)]
     fn revscroll(&mut self) {
-        self.with_backend(|_, ctx| B::revscroll(ctx));
+        B::revscroll(self);
     }
 
     #[inline(always)]
     fn swap_palette(&mut self) {
-        self.with_backend(|_, ctx| B::swap_palette(ctx));
+        B::swap_palette(self);
     }
 
     #[inline(always)]
     fn save_state(&mut self) {
-        self.with_backend(|_, ctx| B::save_state(ctx));
+        B::save_state(self);
     }
 
     #[inline(always)]
     fn restore_state(&mut self) {
-        self.with_backend(|_, ctx| B::restore_state(ctx));
+        B::restore_state(self);
     }
 
     #[inline(always)]
     fn double_buffer_flush(&mut self) {
-        self.with_backend(|_, ctx| B::double_buffer_flush(ctx));
+        B::double_buffer_flush(self);
     }
 
     #[inline(always)]
     fn full_refresh(&mut self) {
-        self.with_backend(|_, ctx| B::full_refresh(ctx));
+        B::full_refresh(self);
     }
 
     #[inline(always)]
