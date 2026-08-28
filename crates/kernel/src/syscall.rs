@@ -130,7 +130,9 @@ pub const ENTRY_KIND_SOCKET: u64 = 6;
 
 // ---------- 5. DEVICE Domain (0x50, UIO Sandboxing) ----------
 pub const SYS_DRIVER_REGISTER: u32 = nr(domain::DEVICE, op::CREATE); // 0x51
+pub const SYS_DRIVER_QUERY: u32 = nr(domain::DEVICE, op::READ); // 0x52
 pub const SYS_DRIVER_CLAIM: u32 = nr(domain::DEVICE, op::WRITE); // 0x53
+pub const SYS_DRIVER_UNREGISTER: u32 = nr(domain::DEVICE, op::DELETE); // 0x54
 
 // ---------- ABI 打包（成功 / 错误） ----------
 
@@ -1209,6 +1211,116 @@ fn sys_driver_claim(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
+/// `driver_query(dev_name_ptr, out_json_ptr, cap) -> len` (ADR-014 0x52)
+///
+/// 查询设备绑定状态（READ）：输出紧凑 JSON 到用户缓冲。
+/// - 设备不存在 → `{"error":"not_found","device":"<name>"}`；
+/// - 已真实接管（驱动绑定 + controls_hardware）→
+///   `{"device":"<name>","binding":"driver:<name>","uio_claimed":<bool>}`；
+/// - 竞标胜出未接管（candidate-only）→
+///   `{"device":"<name>","binding":"candidate:<name>(unimplemented)","uio_claimed":<bool>}`。
+/// `uio_claimed` 如实反映该设备是否已被用户态驱动（UIO）活跃认领。放不下
+/// 完整 JSON 时按 `InvalidParam` 拒绝（宁缺毋假，不截断交付半截 JSON）。
+fn sys_driver_query(frame: &mut SyscallFrame) -> u64 {
+    let name_ptr = frame.a1;
+    let out_ptr = frame.a2;
+    let cap = frame.a3 as usize;
+
+    const MAX_QUERY_OUT_BYTES: usize = 512;
+    if cap > MAX_QUERY_OUT_BYTES {
+        return pack_err(Error::InvalidParam);
+    }
+
+    // 拷贝设备名（NUL 结尾，上限 UIO 名长 32）。
+    let name = match copy_path_from_user(name_ptr, driver::uio::UIO_DEV_NAME_MAX) {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    if name.is_empty() {
+        return pack_err(Error::InvalidParam);
+    }
+
+    let mut target = klib::json::VecTarget::new();
+    let mut writer = klib::json::JsonWriter::new(&mut target);
+    // 枚举 DriverHub 找设备并判定绑定态。
+    let mut found = false;
+    let count = driver::DriverHub::device_count();
+    for i in 0..count {
+        let Some(info) = driver::DriverHub::device_info_at(i) else {
+            continue;
+        };
+        if info.name != name.as_str() {
+            continue;
+        }
+        found = true;
+        let claimed = driver::uio_is_device_claimed(&name);
+        let binding = if driver::DriverHub::device_driver_is_candidate(i) {
+            alloc::format!("candidate:{}(unimplemented)", info.name)
+        } else if let Some(d) = driver::DriverHub::device_driver_at(i) {
+            alloc::format!("driver:{}", d)
+        } else {
+            alloc::string::String::from("unbound")
+        };
+        writer
+            .start_object()
+            .and_then(|mut o| {
+                o.field_str("device", &name)?;
+                o.field_str("binding", &binding)?;
+                o.field_bool("uio_claimed", claimed)?;
+                o.end()
+            })
+            .expect("Vec-backed query JSON cannot fail");
+        break;
+    }
+    if !found {
+        writer
+            .start_object()
+            .and_then(|mut o| {
+                o.field_str("error", "not_found")?;
+                o.field_str("device", &name)?;
+                o.end()
+            })
+            .expect("Vec-backed query JSON cannot fail");
+    }
+    let bytes = target.as_bytes();
+    let n = bytes.len();
+    if n == 0 || n > cap {
+        return pack_err(Error::InvalidParam);
+    }
+    if let Err(e) = validate_user_range(out_ptr, n as u64, UserAccess::Write) {
+        return pack_err(e);
+    }
+    unsafe {
+        arch_x86_64::mmio::copy_to_user(out_ptr, bytes.as_ptr(), n);
+    }
+    pack_ok(n as u64)
+}
+
+/// `driver_unregister(slot) -> 0` (ADR-014 0x54)
+///
+/// 注销驱动（DELETE）：以 `uio_id` 释放注册槽位并解绑其设备。与 claim 同源
+/// 授权——调用者必须就是注册者本人（他人 id 报 `PermissionDenied`，不存在的
+/// id 报 `NotFound`）。
+fn sys_driver_unregister(frame: &mut SyscallFrame) -> u64 {
+    let uio_id = frame.a1 as usize;
+    let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+    match driver::uio_unregister_driver(uio_id, pid) {
+        Ok(()) => {
+            klib::info!("[uio] driver_unregister({}) released slot", uio_id);
+            pack_ok(0)
+        }
+        Err(e) => {
+            klib::info!(
+                "[uio] driver_unregister({}) denied for pid={}: {:?}",
+                uio_id,
+                pid,
+                e
+            );
+            pack_err(e)
+        }
+    }
+}
+
 // ---------- 分发 ----------
 
 /// 分发结果：`Done(v)` = 正常返回值（写入 `frame.result`，架构层写回 rax 带
@@ -1261,7 +1373,9 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
 
         // DEVICE Domain (0x50)
         SYS_DRIVER_REGISTER => done(sys_driver_register(frame)),
+        SYS_DRIVER_QUERY => done(sys_driver_query(frame)),
         SYS_DRIVER_CLAIM => done(sys_driver_claim(frame)),
+        SYS_DRIVER_UNREGISTER => done(sys_driver_unregister(frame)),
 
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);

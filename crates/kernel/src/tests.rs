@@ -4181,6 +4181,230 @@ pub fn test_syscall_entry_create_kind() {
     info!("[test-syscall-entry-create-kind] PASS");
 }
 
+/// ADR-014 补全 DRIVER 域 0x52/0x54：driver_query 绑定状态 JSON + driver_unregister。
+///
+/// 覆盖：
+/// 1. `driver_register`（0x51）注册真实设备 → 返回 uio_id。
+/// 2. `driver_query`（0x52）→ 输出绑定 JSON：`driver:<name>` 且 `uio_claimed:true`。
+/// 3. `driver_unregister`（0x54）→ 释放槽位，返回 0。
+/// 4. `driver_query` 复查 → `uio_claimed:false`（槽位已释放）。
+/// 5. 查询不存在的设备 → `{"error":"not_found",...}`。
+/// 6. 注销不存在的槽位 → NotFound。
+pub fn test_syscall_driver_query_unregister() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::Process;
+
+    info!("[test-syscall-driver-query] === ADR-014: DRIVER 0x52/0x54 ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4: 0,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
+        }
+    }
+
+    // 找一个真实注册的设备名（framebuffer 在引导期恒注册，属 Display）。
+    let dev_name = (0..driver::DriverHub::device_count())
+        .find_map(|i| {
+            driver::DriverHub::device_info_at(i)
+                .filter(|d| d.name == "framebuffer")
+                .map(|d| d.name)
+        })
+        .expect("framebuffer device must be registered");
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x3000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
+    let base = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        for pg in 0..3u64 {
+            p.addr_space_mut().handle_page_fault(
+                base + pg * 0x1000,
+                arch_x86_64::paging::PageFaultCode::new(0),
+            );
+        }
+    }
+    // 第 0 页：设备名（NUL 结尾）；第 1 页：query 输出缓冲；第 2 页：备用名。
+    let name_bytes = {
+        let mut b = [0u8; 64];
+        let n = core::cmp::min(dev_name.len(), 63);
+        b[..n].copy_from_slice(&dev_name.as_bytes()[..n]);
+        b[n] = 0;
+        b
+    };
+    let ghost_name = b"ghost-device-xyz\0";
+    unsafe {
+        let pa0 = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), (pa0 + off) as *mut u8, name_bytes.len());
+        let pa2 = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base + 0x2000))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(ghost_name.as_ptr(), (pa2 + off) as *mut u8, ghost_name.len());
+    }
+
+    // 1. driver_register(0x51) → uio_id。
+    let mut reg = frame(
+        crate::syscall::SYS_DRIVER_REGISTER,
+        base,
+        dev_name.len() as u64,
+        0,
+    );
+    assert!(crate::syscall::syscall_entry(&mut reg));
+    assert!(
+        reg.result < 0x8000_0000_0000_0000,
+        "driver_register must succeed"
+    );
+    let uio_id = reg.result as usize;
+
+    // 2. driver_query(0x52) → 绑定 JSON 到第 1 页。
+    let mut q = frame(
+        crate::syscall::SYS_DRIVER_QUERY,
+        base,
+        base + 0x1000,
+        256,
+    );
+    assert!(crate::syscall::syscall_entry(&mut q));
+    assert!(q.result < 0x8000_0000_0000_0000, "driver_query must succeed");
+    let qlen = q.result as usize;
+    assert!(qlen > 0 && qlen <= 256, "query output length sane");
+    let mut qbuf = [0u8; 256];
+    unsafe {
+        let pa1 = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base + 0x1000))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping((pa1 + off) as *const u8, qbuf.as_mut_ptr(), qlen);
+    }
+    let qs = core::str::from_utf8(&qbuf[..qlen]).expect("query JSON is UTF-8");
+    assert!(
+        qs.contains(dev_name) && qs.contains("driver:framebuffer"),
+        "query must report driver binding, got: {}",
+        qs
+    );
+    assert!(
+        qs.contains(r#""uio_claimed":true"#),
+        "query must report uio_claimed:true after register, got: {}",
+        qs
+    );
+    info!("[test-syscall-driver-query] query after register: {}", qs);
+
+    // 3. driver_unregister(0x54) → 释放槽位。
+    let mut unreg = frame(crate::syscall::SYS_DRIVER_UNREGISTER, uio_id as u64, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut unreg));
+    assert!(
+        unreg.result < 0x8000_0000_0000_0000,
+        "driver_unregister must succeed"
+    );
+
+    // 4. driver_query 复查 → uio_claimed:false。
+    let mut q2 = frame(
+        crate::syscall::SYS_DRIVER_QUERY,
+        base,
+        base + 0x1000,
+        256,
+    );
+    assert!(crate::syscall::syscall_entry(&mut q2));
+    assert!(q2.result < 0x8000_0000_0000_0000, "driver_query #2 must succeed");
+    let q2len = q2.result as usize;
+    let mut q2buf = [0u8; 256];
+    unsafe {
+        let pa1 = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base + 0x1000))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping((pa1 + off) as *const u8, q2buf.as_mut_ptr(), q2len);
+    }
+    let q2s = core::str::from_utf8(&q2buf[..q2len]).expect("query #2 JSON is UTF-8");
+    assert!(
+        q2s.contains(r#""uio_claimed":false"#),
+        "query must report uio_claimed:false after unregister, got: {}",
+        q2s
+    );
+    info!("[test-syscall-driver-query] query after unregister: {}", q2s);
+
+    // 5. 查询不存在的设备 → not_found。
+    let mut qn = frame(
+        crate::syscall::SYS_DRIVER_QUERY,
+        base + 0x2000,
+        base + 0x1000,
+        256,
+    );
+    assert!(crate::syscall::syscall_entry(&mut qn));
+    assert!(qn.result < 0x8000_0000_0000_0000, "query ghost must succeed");
+    let qnlen = qn.result as usize;
+    let mut qnbuf = [0u8; 256];
+    unsafe {
+        let pa1 = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base + 0x1000))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping((pa1 + off) as *const u8, qnbuf.as_mut_ptr(), qnlen);
+    }
+    let qns = core::str::from_utf8(&qnbuf[..qnlen]).expect("ghost query JSON is UTF-8");
+    assert!(
+        qns.contains(r#""error":"not_found""#),
+        "ghost device must report not_found, got: {}",
+        qns
+    );
+    info!("[test-syscall-driver-query] ghost query: {}", qns);
+
+    // 6. 注销不存在的槽位 → NotFound。
+    let mut unreg2 = frame(
+        crate::syscall::SYS_DRIVER_UNREGISTER,
+        (uio_id + 100) as u64,
+        0,
+        0,
+    );
+    assert!(crate::syscall::syscall_entry(&mut unreg2));
+    assert_eq!(
+        unreg2.result,
+        (-(klib::error::Error::NotFound.to_errno() as i64)) as u64,
+        "unregister of nonexistent slot must be NotFound"
+    );
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-syscall-driver-query] PASS");
+}
+
 /// B14/B21：SYS_MEMORY_QUERY 全链路覆盖 + stdin Busy→EAGAIN 语义锁定。
 ///
 /// - **B14**：已映射页查询返回 PRESENT|USER|WRITABLE 位图；未触碰 demand

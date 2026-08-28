@@ -227,3 +227,30 @@ pub fn uio_is_device_claimed(dev_name: &str) -> bool {
     let list = UIO_DRIVERS.lock();
     slot_of_live_claim(&list, dev_name).is_some()
 }
+
+/// 注销驱动（UIO Unregister，ADR-014 0x54）：释放注册槽位并解绑其设备。
+///
+/// 与 [`uio_claim_device`] 同源授权：以 `uio_id` 精确定位记录并校验调用者
+/// 归属——不存在的 id 报 [`Error::NotFound`]，他人 id 报
+/// [`Error::PermissionDenied`]。注销后槽位 `is_alive=false`，该设备名恢复
+/// 可注册状态（`slot_of_live_claim` 不再命中）。
+pub fn uio_unregister_driver(uio_id: usize, caller_pid: usize) -> Result<(), Error> {
+    let mut list = UIO_DRIVERS.lock();
+    let Some(entry) = list.get_mut(uio_id) else {
+        return Err(Error::NotFound);
+    };
+    if !entry.is_alive {
+        return Err(Error::NotFound);
+    }
+    if entry.pid != caller_pid {
+        return Err(Error::PermissionDenied);
+    }
+    let dev_str = core::str::from_utf8(&entry.claimed_device[..entry.claimed_len])
+        .unwrap_or("unknown");
+    entry.is_alive = false;
+    info!(
+        "[uio] driver unregistered: pid={} uio_id={} released dev={}",
+        caller_pid, uio_id, dev_str
+    );
+    Ok(())
+}
