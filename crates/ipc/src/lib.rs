@@ -126,6 +126,13 @@ struct PipeObject {
     buf: VecDeque<u8>,
     read_waiters: Vec<usize>,
     write_waiters: Vec<usize>,
+    /// 打开该管道的 fd 端引用计数（ADR-014 FLAG_PIPE 成对句柄）。
+    ///
+    /// 一个管道可被多个 fd 引用（一次 FLAG_PIPE 创建一对读写端，两端均指向
+    /// 同一 id）。`refs` 记的是"仍持有的 fd 端"总数：归零才销毁对象并唤醒
+    /// 全部残留等待者。`pipe_create` 建表时 `refs=0`，每分配一个 fd 端经
+    /// [`pipe_ref_inc`] 增记，关闭一个 fd 端经 [`pipe_ref_dec`] 减记。
+    refs: usize,
 }
 
 static SHM_TABLE: IrqSpinLock<BTreeMap<u64, ShmObject>> = IrqSpinLock::new(BTreeMap::new());
@@ -362,6 +369,7 @@ pub fn pipe_create() -> Result<u64, Error> {
         buf: VecDeque::new(),
         read_waiters: Vec::new(),
         write_waiters: Vec::new(),
+        refs: 0,
     };
     pipe.buf
         .try_reserve(PIPE_CAPACITY)
@@ -369,6 +377,51 @@ pub fn pipe_create() -> Result<u64, Error> {
     PIPE_TABLE.lock().insert(id, pipe);
     klib::info!("[ipc] pipe id={} created", id);
     Ok(id)
+}
+
+/// 管道 `id` 的一个 fd 端引用（ADR-014 FLAG_PIPE 分配 fd 端时调用）。
+///
+/// 增加 `refs`。若 `id` 不存在返回 `NotFound`（宁缺毋假：未建引用绝不
+/// 伪造成功）。调用方在 fd 分配失败需回滚时应配对的 [`pipe_ref_dec`]。
+pub fn pipe_ref_inc(id: u64) -> Result<(), Error> {
+    let mut table = PIPE_TABLE.lock();
+    let Some(pipe) = table.get_mut(&id) else {
+        return Err(Error::NotFound);
+    };
+    // S19：refs 是 fd 端计数，最多同进程 fd 表上限量级；checked_add 防
+    // 极端路径回绕（2^64 个 fd 端不可达，防御性）——回绕即资源上限，ENOSPC。
+    let new = pipe.refs.checked_add(1).ok_or(Error::NoSpace)?;
+    pipe.refs = new;
+    Ok(())
+}
+
+/// 释放管道 `id` 的一个 fd 端引用（关闭 fd 端时调用）。
+///
+/// 递减 `refs`；归零即销毁管道并唤醒全部残留读写等待者（同 [`pipe_close`]）。
+/// 若 `id` 不存在返回 `NotFound`。`refs` 已为 0 时如实返回 `NotFound`——
+/// 绝不静默减出下溢。
+pub fn pipe_ref_dec(id: u64) -> Result<(), Error> {
+    let wake: Vec<usize> = {
+        let mut table = PIPE_TABLE.lock();
+        let Some(pipe) = table.get_mut(&id) else {
+            return Err(Error::NotFound);
+        };
+        if pipe.refs == 0 {
+            return Err(Error::NotFound);
+        }
+        pipe.refs -= 1;
+        if pipe.refs > 0 {
+            return Ok(());
+        }
+        let (rw, ww) = (core::mem::take(&mut pipe.read_waiters), core::mem::take(&mut pipe.write_waiters));
+        table.remove(&id);
+        rw.into_iter().chain(ww).collect()
+    };
+    for pid in wake {
+        wake_proc(pid);
+    }
+    klib::info!("[ipc] pipe id={} refcount-destroyed", id);
+    Ok(())
 }
 
 fn current_pid() -> usize {

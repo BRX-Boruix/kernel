@@ -456,6 +456,9 @@ unsafe fn kmain_body() -> ! {
     // ADR-014 SYS_ENTRY_UPDATE (0x43)：move/rename 节点。
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_entry_update();
+    // ADR-014 SYS_STREAM_CREATE FLAG_PIPE (0x11)：匿名管道端。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_syscall_pipe();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m63();
     #[cfg(feature = "kernel-tests")]

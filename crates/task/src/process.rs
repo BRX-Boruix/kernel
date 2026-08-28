@@ -153,8 +153,9 @@ pub struct Process<PT: PageTable> {
     entry_rip: u64,
     /// 用户栈顶 RSP。
     user_stack_top: u64,
-    /// 文件描述符表（FD Table，M6.2）。
-    fd_table: Vec<Option<vfs::file_handle::FileHandle>>,
+    /// 文件描述符表（FD Table，M6.2）。槽位可持有文件句柄或匿名管道端
+    /// （ADR-014 §4.1 FLAG_PIPE）。
+    fd_table: Vec<Option<vfs::file_handle::OpenHandle>>,
 }
 
 impl<PT: PageTable> Process<PT> {
@@ -174,9 +175,9 @@ impl<PT: PageTable> Process<PT> {
         // "保留 0/1/2"从跨 crate 心照不宣变为结构事实。close 保护仍是
         // syscall 层显式策略：无 dup/redirect 机制前关闭标准流不可恢复。
         let fd_table = alloc::vec![
-            Some(vfs::stdio::stdin_handle()),
-            Some(vfs::stdio::stdout_handle()),
-            Some(vfs::stdio::stderr_handle()),
+            Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stdin_handle())),
+            Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stdout_handle())),
+            Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stderr_handle())),
         ];
         Process {
             pid,
@@ -205,7 +206,7 @@ impl<PT: PageTable> Process<PT> {
     /// [`Error::NoSpace`]，绝不无界增长；已关闭槽位的复用不受上限挤压。
     pub fn alloc_fd(
         &mut self,
-        handle: vfs::file_handle::FileHandle,
+        handle: vfs::file_handle::OpenHandle,
     ) -> Result<usize, klib::error::Error> {
         for (fd, slot) in self.fd_table.iter_mut().enumerate() {
             if slot.is_none() {
@@ -222,12 +223,12 @@ impl<PT: PageTable> Process<PT> {
     }
 
     /// 获取指定 fd 句柄的只读引用。
-    pub fn get_fd(&self, fd: usize) -> Option<&vfs::file_handle::FileHandle> {
+    pub fn get_fd(&self, fd: usize) -> Option<&vfs::file_handle::OpenHandle> {
         self.fd_table.get(fd)?.as_ref()
     }
 
     /// 关闭并移除指定 fd 句柄。
-    pub fn close_fd(&mut self, fd: usize) -> Option<vfs::file_handle::FileHandle> {
+    pub fn close_fd(&mut self, fd: usize) -> Option<vfs::file_handle::OpenHandle> {
         if fd < self.fd_table.len() {
             self.fd_table[fd].take()
         } else {

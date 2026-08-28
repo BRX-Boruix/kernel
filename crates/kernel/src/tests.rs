@@ -2910,19 +2910,29 @@ pub fn test_vfs_m62() {
 
     let handle1 = FileHandle::new(file.clone(), OpenFlags::READ_WRITE)
         .expect("ramfs handle metadata is infallible");
-    let fd1 = proc.alloc_fd(handle1).expect("alloc fd 3");
+    let fd1 = proc
+        .alloc_fd(vfs::file_handle::OpenHandle::File(handle1))
+        .expect("alloc fd 3");
     assert_eq!(fd1, 3, "first user fd must be 3");
 
     let handle2 = FileHandle::new(file.clone(), OpenFlags::READ_ONLY)
         .expect("ramfs handle metadata is infallible");
-    let fd2 = proc.alloc_fd(handle2).expect("alloc fd 4");
+    let fd2 = proc
+        .alloc_fd(vfs::file_handle::OpenHandle::File(handle2))
+        .expect("alloc fd 4");
     assert_eq!(fd2, 4, "second user fd must be 4");
 
     // 句柄隔离验证
-    let h1 = proc.get_fd(fd1).expect("get fd 3");
+    let h1 = match proc.get_fd(fd1).expect("get fd 3") {
+        vfs::file_handle::OpenHandle::File(f) => f,
+        vfs::file_handle::OpenHandle::Pipe { .. } => unreachable!(),
+    };
     assert_eq!(h1.write(b"FD table OK").unwrap(), 11);
 
-    let h2 = proc.get_fd(fd2).expect("get fd 4");
+    let h2 = match proc.get_fd(fd2).expect("get fd 4") {
+        vfs::file_handle::OpenHandle::File(f) => f,
+        vfs::file_handle::OpenHandle::Pipe { .. } => unreachable!(),
+    };
     let mut buf = [0u8; 11];
     assert_eq!(h2.read(&mut buf).unwrap(), 11);
     assert_eq!(&buf, b"FD table OK");
@@ -2933,7 +2943,9 @@ pub fn test_vfs_m62() {
 
     let handle3 = FileHandle::new(file.clone(), OpenFlags::READ_WRITE)
         .expect("ramfs handle metadata is infallible");
-    let fd3 = proc.alloc_fd(handle3).expect("realloc fd 3");
+    let fd3 = proc
+        .alloc_fd(vfs::file_handle::OpenHandle::File(handle3))
+        .expect("realloc fd 3");
     assert_eq!(fd3, 3, "slot 3 must be reused after close");
 
     info!("[test-vfs-m62] PASS");
@@ -3613,6 +3625,237 @@ pub fn test_syscall_entry_update() {
     info!("[test-syscall-entry-update] PASS");
 }
 
+/// ADR-014 SYS_STREAM_CREATE FLAG_PIPE (0x11)：匿名管道端端到端。
+///
+/// 覆盖：
+/// 1. FLAG_PIPE + 空路径 → 返回打包 `(read_fd<<32)|write_fd`，两 fd 均合法。
+/// 2. 写 write_fd → 读 read_fd → 内容一致（经 ipc::pipe_* 路由）。
+/// 3. 管道不可定位：非顺序哨兵偏移 → IllegalSeek（ESPIPE）。
+/// 4. FLAG_PIPE + 非空路径 → InvalidParam（宁缺毋假，不静默忽略路径）。
+/// 5. 关闭两 fd → 管道 refcount 归零销毁，后续读写 → NotFound。
+/// 6. 无效 fd 读 → InvalidParam。
+pub fn test_syscall_pipe() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use arch_x86_64::interrupts::InterruptFrame;
+    use task::Process;
+
+    info!("[test-syscall-pipe] === ADR-014: SYS_STREAM_CREATE FLAG_PIPE ===");
+
+    // 纯 Done 路径（mmap/create 等）不读 arch_frame，填 0。
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
+        }
+    }
+    // 管道读写/关闭路径经 sys_read/sys_write 调 arch_frame(frame) 取真实
+    // InterruptFrame（阻塞切换用）；本测试写入量 ≤ PIPE_CAPACITY 不触发阻塞，
+    // 但 arch_frame 仍被创建引用——必须指向真实帧，否则 UB。这里就地分配。
+    let mut ifr = InterruptFrame {
+        rax: 0,
+        rbx: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        rbp: 0,
+        r8: 0,
+        r9: 0,
+        r10: 0,
+        r11: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        vector: 0,
+        error_code: 0,
+        rip: 0,
+        cs: 0,
+        rflags: 0,
+        rsp: 0,
+        ss: 0,
+    };
+    let mut pipe_frame = |nr: u32, a1: u64, a2: u64, a3: u64, a4: u64| SyscallFrame {
+        nr: nr as u64,
+        a1,
+        a2,
+        a3,
+        a4,
+        a5: 0,
+        result: 0,
+        switched: false,
+        arch_frame: (&mut ifr as *mut InterruptFrame) as usize,
+    };
+    // FLAG_PIPE = bit 6（vfs::file_handle::OpenFlags::pipe）。
+    const FLAG_PIPE: u32 = 1 << 6;
+    const STREAM_OFFSET_CURRENT: u64 = u64::MAX;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+
+    // 映射两页并驻留：路径串区（buf）与数据缓冲（buf2）。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
+    let base = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space_mut()
+            .handle_page_fault(base, arch_x86_64::paging::PageFaultCode::new(0));
+        p.addr_space_mut().handle_page_fault(
+            base + 0x1000,
+            arch_x86_64::paging::PageFaultCode::new(0),
+        );
+    }
+    // 写入数据串到 buf（数据缓冲）与一个非空路径串到 buf2（负例用）。
+    let data_s = b"hello pipe\0";
+    let nonempty_s = b"/scratch/x\0";
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(data_s.as_ptr(), (pa + off) as *mut u8, data_s.len());
+        let pa2 = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base + 0x1000))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(nonempty_s.as_ptr(), (pa2 + off) as *mut u8, nonempty_s.len());
+    }
+    let data_ptr = base;
+    let nonempty_ptr = base + 0x1000;
+
+    // 1. FLAG_PIPE + 空路径：path_ptr 指向空串（首字节 0）。
+    let empty_ptr = base + 0x200; // 该页零填充 → 空串
+    let mut create = frame(
+        crate::syscall::SYS_STREAM_CREATE,
+        empty_ptr,
+        FLAG_PIPE as u64,
+        0,
+        0,
+    );
+    assert!(crate::syscall::syscall_entry(&mut create));
+    assert!(
+        create.result < 0x8000_0000_0000_0000,
+        "pipe create must succeed"
+    );
+    let read_fd = (create.result & 0xFFFF_FFFF) as usize;
+    let write_fd = (create.result >> 32) as usize;
+    assert!(read_fd >= 3 && write_fd >= 3, "pipe fds must be user fds");
+
+    // 2. 写 write_fd → 读 read_fd → 内容一致。
+    let mut w = pipe_frame(
+        crate::syscall::SYS_STREAM_WRITE,
+        write_fd as u64,
+        data_ptr,
+        5,
+        STREAM_OFFSET_CURRENT,
+    );
+    assert!(crate::syscall::syscall_entry(&mut w));
+    assert_eq!(w.result, 5, "pipe write must deliver 5 bytes");
+
+    let mut r = pipe_frame(
+        crate::syscall::SYS_STREAM_READ,
+        read_fd as u64,
+        data_ptr,
+        5,
+        STREAM_OFFSET_CURRENT,
+    );
+    assert!(crate::syscall::syscall_entry(&mut r));
+    assert_eq!(r.result, 5, "pipe read must return 5 bytes");
+    let mut back = [0u8; 5];
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(data_ptr))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping((pa + off) as *const u8, back.as_mut_ptr(), 5);
+    }
+    assert_eq!(&back, b"hello", "pipe content preserved");
+
+    // 3. 管道不可定位：非顺序哨兵偏移 → ESPIPE。
+    let mut bad_off = pipe_frame(
+        crate::syscall::SYS_STREAM_WRITE,
+        write_fd as u64,
+        data_ptr,
+        5,
+        0, // 定位写，非法
+    );
+    assert!(crate::syscall::syscall_entry(&mut bad_off));
+    assert_eq!(
+        bad_off.result,
+        (-(klib::error::Error::IllegalSeek.to_errno() as i64)) as u64,
+        "positioned pipe write must be ESPIPE"
+    );
+
+    // 4. FLAG_PIPE + 非空路径 → InvalidParam。
+    let mut bad_path = frame(
+        crate::syscall::SYS_STREAM_CREATE,
+        nonempty_ptr,
+        FLAG_PIPE as u64,
+        0,
+        0,
+    );
+    assert!(crate::syscall::syscall_entry(&mut bad_path));
+    assert_eq!(
+        bad_path.result,
+        (-(klib::error::Error::InvalidParam.to_errno() as i64)) as u64,
+        "FLAG_PIPE with non-empty path must be InvalidParam"
+    );
+
+    // 5. 关闭两 fd → refcount 归零销毁 → 后续读 NotFound。
+    let mut c1 = pipe_frame(crate::syscall::SYS_STREAM_CLOSE, write_fd as u64, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut c1));
+    assert!(c1.result < 0x8000_0000_0000_0000, "close write end");
+    let mut c2 = pipe_frame(crate::syscall::SYS_STREAM_CLOSE, read_fd as u64, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut c2));
+    assert!(c2.result < 0x8000_0000_0000_0000, "close read end");
+    // 管道已销毁：对已关闭 fd 读 → InvalidParam（fd 表已移除）。
+    let mut ghost = pipe_frame(
+        crate::syscall::SYS_STREAM_READ,
+        read_fd as u64,
+        data_ptr,
+        1,
+        STREAM_OFFSET_CURRENT,
+    );
+    assert!(crate::syscall::syscall_entry(&mut ghost));
+    assert_eq!(
+        ghost.result,
+        (-(klib::error::Error::InvalidParam.to_errno() as i64)) as u64,
+        "read on closed fd must be InvalidParam"
+    );
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-syscall-pipe] PASS");
+}
+
 /// B14/B21：SYS_MEMORY_QUERY 全链路覆盖 + stdin Busy→EAGAIN 语义锁定。
 ///
 /// - **B14**：已映射页查询返回 PRESENT|USER|WRITABLE 位图；未触碰 demand
@@ -3749,7 +3992,9 @@ pub fn test_syscall_memquery_and_stdin_busy() {
         let mut refused: Option<klib::error::Error> = None;
         let mut granted = 0usize;
         while granted <= Process::<X86PageTable>::MAX_FDS {
-            match p.alloc_fd(vfs::stdio::stdout_handle()) {
+            match p.alloc_fd(vfs::file_handle::OpenHandle::File(
+                vfs::stdio::stdout_handle(),
+            )) {
                 Ok(_) => granted += 1,
                 Err(e) => {
                     refused = Some(e);

@@ -15,6 +15,9 @@ pub struct OpenFlags {
     pub truncate: bool,
     pub append: bool,
     pub directory: bool,
+    /// FLAG_PIPE（ADR-014 §4.1）：配合空路径，经 `SYS_STREAM_CREATE` 分配
+    /// 一对匿名管道流句柄，而非打开文件节点。
+    pub pipe: bool,
 }
 
 impl OpenFlags {
@@ -25,6 +28,7 @@ impl OpenFlags {
         truncate: false,
         append: false,
         directory: false,
+        pipe: false,
     };
 
     pub const WRITE_ONLY: Self = Self {
@@ -34,6 +38,7 @@ impl OpenFlags {
         truncate: false,
         append: false,
         directory: false,
+        pipe: false,
     };
 
     pub const READ_WRITE: Self = Self {
@@ -43,6 +48,7 @@ impl OpenFlags {
         truncate: false,
         append: false,
         directory: false,
+        pipe: false,
     };
 
     pub const CREATE_OR_TRUNCATE: Self = Self {
@@ -52,6 +58,7 @@ impl OpenFlags {
         truncate: true,
         append: false,
         directory: false,
+        pipe: false,
     };
 
     /// 追加写（O_APPEND 语义）：每次 write 的落点锚定当前真实大小。
@@ -62,6 +69,7 @@ impl OpenFlags {
         truncate: false,
         append: true,
         directory: false,
+        pipe: false,
     };
 
     pub const fn to_bits(self) -> u32 {
@@ -84,6 +92,9 @@ impl OpenFlags {
         if self.directory {
             bits |= 1 << 5;
         }
+        if self.pipe {
+            bits |= 1 << 6;
+        }
         bits
     }
 
@@ -101,6 +112,7 @@ impl OpenFlags {
             truncate: (bits & (1 << 3)) != 0,
             append: (bits & (1 << 4)) != 0,
             directory: (bits & (1 << 5)) != 0,
+            pipe: (bits & (1 << 6)) != 0,
         }
     }
 }
@@ -110,6 +122,20 @@ pub struct FileHandle {
     pub inode: Arc<dyn INode>,
     pub offset: AtomicU64,
     pub flags: OpenFlags,
+}
+
+/// 进程 fd 表槽位可持有的句柄种类（ADR-014 §4.1）。
+///
+/// 当前为「文件句柄」与「匿名管道端」。管道端不持有 INode——读写经
+/// `ipc::pipe_read/pipe_write` 直接路由到 ipc crate 的环形缓冲（阻塞/等待
+/// 语义属 ipc 层，见 `kernel/crates/ipc`），故 fd 表不再假设每个槽位都是
+/// 文件节点句柄。
+pub enum OpenHandle {
+    /// 普通文件/设备/流节点句柄（原有语义）。
+    File(FileHandle),
+    /// 匿名管道端：`id` 为 ipc 管道表主键。同一管道可被多个 fd 引用
+    /// （FLAG_PIPE 一次创建一对读写端），引用计数在 ipc 层维护。
+    Pipe { id: u64 },
 }
 
 impl FileHandle {

@@ -222,6 +222,11 @@ fn copy_path_from_user(path_ptr: u64, max_len: usize) -> Result<alloc::string::S
 }
 
 /// `open(path_ptr, flags_bits, perm_bits)`：打开或创建文件，返回 fd。
+///
+/// ADR-014 §4.1 FLAG_PIPE：当 `flags` 含 `pipe` 位且 `path_ptr` 指向空串
+/// （仅根路径 `/` 或空串）时，本 syscall 改为分配一对匿名管道端，返回值
+/// 为 `(read_fd << 32) | write_fd` 打包（两 fd 均 < 2^32，bit63 恒 0 即成功）。
+/// 两 fd 均引用同一 ipc 管道（环形缓冲），读写经 `ipc::pipe_*` 路由。
 fn sys_open(frame: &mut SyscallFrame) -> u64 {
     let path_ptr = frame.a1;
     let flags_bits = frame.a2 as u32;
@@ -234,6 +239,12 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
 
     let flags = vfs::file_handle::OpenFlags::from_bits(flags_bits);
     let perm = vfs::inode::Permissions::from_bits(perm_bits);
+
+    // ADR-014 FLAG_PIPE：匿名管道，不落文件系统。路径须为空（"" 或 "/"）。
+    if flags.pipe {
+        return sys_open_pipe(path, frame);
+    }
+
     let root = crate::vfs_init::root();
 
     let inode = match root.resolve(&path, true) {
@@ -269,10 +280,62 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
         return pack_err(Error::NotFound);
     };
     // KA7：fd 表满（每进程上限）如实 ENOSPC，绝不无界吃内核堆。
-    match proc.alloc_fd(handle) {
+    match proc.alloc_fd(vfs::file_handle::OpenHandle::File(handle)) {
         Ok(fd) => pack_ok(fd as u64),
         Err(e) => pack_err(e),
     }
+}
+
+/// FLAG_PIPE：创建一对匿名管道端并各分配一个 fd。
+///
+/// 路径必须是空串 `""` 或根路径 `"/"`（宁缺毋假：带真实路径的 FLAG_PIPE
+/// 返回 `InvalidParam`，绝不静默忽略路径）。返回 `(read_fd << 32) | write_fd`。
+fn sys_open_pipe(path: alloc::string::String, _frame: &mut SyscallFrame) -> u64 {
+    if path != "/" && !path.is_empty() {
+        return pack_err(Error::InvalidParam);
+    }
+    // 建管道（refs=0），随后为两个 fd 端各增记一次引用。
+    let id = match ipc::pipe_create() {
+        Ok(i) => i,
+        Err(e) => return pack_err(e),
+    };
+    let inc = |id: u64| ipc::pipe_ref_inc(id);
+    let dec = |id: u64| {
+        let _ = ipc::pipe_ref_dec(id);
+    };
+    if inc(id).is_err() {
+        // 理论不可达（刚创建必在表内），防御性清理。
+        let _ = ipc::pipe_close(id);
+        return pack_err(Error::NotFound);
+    }
+    let Some(proc) = current_proc_mut() else {
+        dec(id);
+        return pack_err(Error::NotFound);
+    };
+    // 分配两个 fd 端。第二个失败需回滚：释放第一个 fd 槽 + 递减引用。
+    let read_fd = match proc.alloc_fd(vfs::file_handle::OpenHandle::Pipe { id }) {
+        Ok(fd) => fd,
+        Err(e) => {
+            dec(id);
+            return pack_err(e);
+        }
+    };
+    if inc(id).is_err() {
+        proc.close_fd(read_fd);
+        dec(id);
+        return pack_err(Error::NotFound);
+    }
+    let write_fd = match proc.alloc_fd(vfs::file_handle::OpenHandle::Pipe { id }) {
+        Ok(fd) => fd,
+        Err(e) => {
+            proc.close_fd(read_fd);
+            dec(id);
+            return pack_err(e);
+        }
+    };
+    // 打包：read_fd 低 32 位，write_fd 高 32 位。fd < 2^32，bit63 恒 0 → 成功。
+    let packed = (read_fd as u64) | ((write_fd as u64) << 32);
+    pack_ok(packed)
 }
 
 /// `close(fd)`：关闭用户分配的文件描述符。
@@ -287,10 +350,16 @@ fn sys_close(frame: &mut SyscallFrame) -> u64 {
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
-    if proc.close_fd(fd).is_some() {
-        pack_ok(0)
-    } else {
-        pack_err(Error::NotFound)
+    match proc.close_fd(fd) {
+        Some(vfs::file_handle::OpenHandle::Pipe { id }) => {
+            // 释放管道端引用；归零即销毁（ipc::pipe_ref_dec 语义）。
+            match ipc::pipe_ref_dec(id) {
+                Ok(()) => pack_ok(0),
+                Err(_) => pack_err(Error::NotFound),
+            }
+        }
+        Some(vfs::file_handle::OpenHandle::File(_)) => pack_ok(0),
+        None => pack_err(Error::NotFound),
     }
 }
 
@@ -444,15 +513,38 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
         return pack_ok(0);
     }
 
-    // KM1：无 fd 号特判——1/2 与普通句柄走同一条路，stdout/stderr 节点在
-    // write_at 内直发字节（K5 完全体：串口 sink 字节透明，文本 sink 自行
-    // lossy），syscall 层零转换。
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
-    let Some(handle) = proc.get_fd(fd as usize) else {
-        return pack_err(Error::InvalidParam);
+
+    // ADR-014 FLAG_PIPE：管道端直接经 ipc::pipe_write 路由（环形缓冲 +
+    // 内部阻塞/唤醒）。管道不可定位，非顺序写哨兵如实 ESPIPE。
+    let pipe_id = match proc.get_fd(fd as usize) {
+        Some(vfs::file_handle::OpenHandle::Pipe { id }) => Some(*id),
+        Some(vfs::file_handle::OpenHandle::File(_)) => None,
+        None => return pack_err(Error::InvalidParam),
     };
+    if let Some(id) = pipe_id {
+        if offset != STREAM_OFFSET_CURRENT {
+            return pack_err(Error::IllegalSeek);
+        }
+        // pipe_write 内部可能阻塞切走并等待唤醒后继续；进程回归后本帧即
+        // 当前进程现场（见 sys_read 阻塞契约），完成后可安全回写 result。
+        let space = proc.addr_space();
+        return match ipc::pipe_write(arch_frame(frame), id, space, buf, len) {
+            Ok(n) => pack_ok(n),
+            Err(e) => pack_err(e),
+        };
+    }
+    let handle = match proc.get_fd(fd as usize) {
+        Some(vfs::file_handle::OpenHandle::File(h)) => h,
+        Some(vfs::file_handle::OpenHandle::Pipe { .. }) => unreachable!("handled above"),
+        None => return pack_err(Error::InvalidParam),
+    };
+
+    // KM1：无 fd 号特判——1/2 与普通句柄走同一条路，stdout/stderr 节点在
+    // write_at 内直发字节（K5 完全体：串口 sink 字节透明，文本 sink 自行
+    // lossy），syscall 层零转换。
     // KM17：字符流不可定位。可定位性来自节点真值（is_seekable），不再依赖
     // fd 号魔法数字；除顺序写哨兵外的任何偏移以 ESPIPE 如实拒绝。
     if !handle.inode.is_seekable() && offset != STREAM_OFFSET_CURRENT {
@@ -544,14 +636,35 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
         return done(pack_ok(0));
     }
 
-    // KM1：无 fd 号特判——0 与普通句柄走同一条路。stdin 节点空读返回
-    // WouldBlock，下方按节点真值（interactive_input）翻译为阻塞切换。
     let Some(proc) = current_proc_mut() else {
         return done(pack_err(Error::NotFound));
     };
-    let Some(handle) = proc.get_fd(fd as usize) else {
-        return done(pack_err(Error::InvalidParam));
+
+    // ADR-014 FLAG_PIPE：管道端直接经 ipc::pipe_read 路由。管道不可定位，
+    // 非顺序读哨兵如实 ESPIPE。pipe_read 内部阻塞/唤醒（进程回归后本帧即
+    // 当前进程现场），完成后可安全回写 result。
+    let pipe_id = match proc.get_fd(fd as usize) {
+        Some(vfs::file_handle::OpenHandle::Pipe { id }) => Some(*id),
+        Some(vfs::file_handle::OpenHandle::File(_)) => None,
+        None => return done(pack_err(Error::InvalidParam)),
     };
+    if let Some(id) = pipe_id {
+        if offset != STREAM_OFFSET_CURRENT {
+            return done(pack_err(Error::IllegalSeek));
+        }
+        let space = proc.addr_space();
+        return match ipc::pipe_read(arch_frame(frame), id, space, buf, len) {
+            Ok(n) => done(pack_ok(n)),
+            Err(e) => done(pack_err(e)),
+        };
+    }
+    let handle = match proc.get_fd(fd as usize) {
+        Some(vfs::file_handle::OpenHandle::File(h)) => h,
+        Some(vfs::file_handle::OpenHandle::Pipe { .. }) => unreachable!("handled above"),
+        None => return done(pack_err(Error::InvalidParam)),
+    };
+    // KM1：无 fd 号特判——0 与普通句柄走同一条路。stdin 节点空读返回
+    // WouldBlock，下方按节点真值（interactive_input）翻译为阻塞切换。
     // KM17：字符流不可定位，可定位性来自节点真值。
     if !handle.inode.is_seekable() && offset != STREAM_OFFSET_CURRENT {
         return done(pack_err(Error::IllegalSeek));

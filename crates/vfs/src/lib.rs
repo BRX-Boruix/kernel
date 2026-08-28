@@ -26,6 +26,9 @@ pub use dynamic::{DynamicDirNode, DynamicFileNode};
 pub use file_handle::{
     FileHandle, OpenFlags,
 };
+// 匿名管道端（ADR-014 §4.1 FLAG_PIPE）也随根再导出，供 task/进程 fd 表与
+// syscall 层拼写。
+pub use file_handle::OpenHandle;
 // M12（ADR-023 §5）：SeekWhence 是句柄 seek 契约的公共枚举，随 crate
 // 根再导出——调用方不应被要求钻进 file_handle 模块路径才能拼写类型。
 pub use file_handle::SeekWhence;
