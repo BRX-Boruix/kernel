@@ -102,6 +102,27 @@ pub trait DeviceInfoProvider: Send + Sync {
     fn disk_partitions_json(&self, name: &str) -> String {
         alloc::format!(r#"{{"error":"no_disk_partitions","device":"{}"}}"#, name)
     }
+
+    /// 单块设备真实 MBR 分区 id 枚举（ADR-012 §4 逐分区投影
+    /// `/devices/disks/{name}/partitions/{part_id}`）。id 形如 `partition-1`、
+    /// `partition-2`（1-based 真实 MBR 槽位序）。签名/解析失败或无分区返回空。
+    /// 默认空，由内核 provider 覆写。
+    fn list_disk_partition_ids(&self, name: &str) -> alloc::vec::Vec<alloc::string::String> {
+        let _ = name;
+        alloc::vec::Vec::new()
+    }
+
+    /// 单块设备单个真实分区信息 JSON（ADR-012 §4 逐分区投影
+    /// `/devices/disks/{name}/partitions/{part_id}/info`）。输出真实
+    /// `start_lba`/`sector_count`/`type`/`bootable`；id 不在分区表内或设备
+    /// 不可读须显式报错，绝不编造。默认显式 not_supported，由内核 provider 覆写。
+    fn disk_partition_info_json(&self, name: &str, part_id: &str) -> String {
+        alloc::format!(
+            r#"{{"error":"no_disk_partition","device":"{}","part":"{}"}}"#,
+            name,
+            part_id
+        )
+    }
 }
 
 /// 串口主数据流与属性子目录复合节点。
@@ -376,7 +397,28 @@ impl DevFS {
             }));
             let disk_dir = Arc::new(DynamicDirNode::new());
             disk_dir.add_child("info", info_node);
-            disk_dir.add_child("partitions", parts_node);
+
+            // 逐分区投影（ADR-012 §4）：partitions/ 为目录，既保留原
+            // `partitions` JSON 文件（数组真值），又为每个真实 MBR 分区建
+            // `partition-{n}/info` 独立路径节点。无分区/解析失败则仅剩 JSON 文件。
+            let partitions_dir = Arc::new(DynamicDirNode::new());
+            partitions_dir.add_child("partitions", parts_node);
+            for part_id in provider.list_disk_partition_ids(&disk_name) {
+                let p_part = provider.clone();
+                let n_disk = disk_name.clone();
+                let n_part = part_id.clone();
+                let part_info_node = Arc::new(DynamicFileNode::read_only(move || {
+                    let mut json = p_part
+                        .disk_partition_info_json(&n_disk, &n_part)
+                        .into_bytes();
+                    json.push(b'\n');
+                    json
+                }));
+                let part_dir = Arc::new(DynamicDirNode::new());
+                part_dir.add_child("info", part_info_node);
+                partitions_dir.add_child(&part_id, part_dir);
+            }
+            disk_dir.add_child("partitions", partitions_dir);
             disks_dir.add_child(&disk_name, disk_dir);
         }
         root.add_child("disks", disks_dir);

@@ -4992,7 +4992,10 @@ pub fn test_vfs_m63() {
                 );
                 // partitions 对无 IO 设备同样应是诚实错误。
                 let parts_node = root
-                    .resolve(&alloc::format!("/devices/disks/{}/partitions", name), true)
+                    .resolve(
+                        &alloc::format!("/devices/disks/{}/partitions/partitions", name),
+                        true,
+                    )
                     .expect(&alloc::format!("resolve /devices/disks/{}/partitions", name));
                 let pn = parts_node.read_at(0, &mut buf).expect("read disk partitions");
                 let ps = core::str::from_utf8(&buf[..pn]).expect("utf8 disk partitions");
@@ -5036,17 +5039,59 @@ pub fn test_vfs_m63() {
                 info.volatile,
                 s.trim()
             );
-            // partitions：数组（真实 MBR）或显式错误对象，二者都诚实。
-            let parts_node = root
+            // partitions 目录：含 JSON 数组真值 + 逐分区投影 partition-{n}/info。
+            let parts_dir = root
                 .resolve(&alloc::format!("/devices/disks/{}/partitions", name), true)
                 .expect(&alloc::format!("resolve /devices/disks/{}/partitions", name));
-            let pn = parts_node.read_at(0, &mut buf).expect("read disk partitions");
-            let ps = core::str::from_utf8(&buf[..pn]).expect("utf8 disk partitions");
+            let parts_entries = parts_dir.list_dir().expect("list disk partitions dir");
+            let parts_json = root
+                .resolve(
+                    &alloc::format!("/devices/disks/{}/partitions/partitions", name),
+                    true,
+                )
+                .expect(&alloc::format!("resolve partitions JSON"));
+            let pn = parts_json.read_at(0, &mut buf).expect("read disk partitions");
+            let ps = alloc::string::String::from(
+                core::str::from_utf8(&buf[..pn]).expect("utf8 disk partitions"),
+            );
             assert!(
                 ps.starts_with('[') || ps.contains(r#""error""#),
                 "disk partitions must be a real array or honest error, got: {}",
                 ps.trim()
             );
+            // 若存在真实分区 JSON，则逐分区投影 partition-{n}/info 必须存在
+            // 且携带真实 start_lba/sector_count。
+            if ps.starts_with('[') && ps != "[]" {
+                let part_id = "partition-1";
+                assert!(
+                    parts_entries.iter().any(|e| e.name == part_id),
+                    "real partitions require a '{}' path node",
+                    part_id
+                );
+                let part_info = root
+                    .resolve(
+                        &alloc::format!(
+                            "/devices/disks/{}/partitions/{}/info",
+                            name,
+                            part_id
+                        ),
+                        true,
+                    )
+                    .expect(&alloc::format!("resolve {}/info", part_id));
+                let pi = part_info.read_at(0, &mut buf).expect("read partition info");
+                let pis = core::str::from_utf8(&buf[..pi]).expect("utf8 partition info");
+                assert!(
+                    pis.contains(r#""start_lba""#) && pis.contains(r#""sector_count""#),
+                    "partition info must expose real start_lba/sector_count, got: {}",
+                    pis.trim()
+                );
+                info!(
+                    "[test-vfs-m63] /devices/disks/{}/partitions/{}/info: {}",
+                    name,
+                    part_id,
+                    pis.trim()
+                );
+            }
             info!(
                 "[test-vfs-m63] /devices/disks/{}/info: {} | partitions: {}",
                 name,

@@ -567,51 +567,80 @@ impl DeviceInfoProvider for KernelDeviceProvider {
     }
 
     fn disk_partitions_json(&self, name: &str) -> String {
-        let count = driver::DriverHub::device_count();
-        for i in 0..count {
-            let Some(info) = driver::DriverHub::device_info_at(i) else {
-                continue;
-            };
-            if info.name != name || info.kind != driver::DeviceKind::Block {
-                continue;
-            }
-            let Some(ops) = driver::DriverHub::device_at(i) else {
-                return disk_error_json("no_io_ops", name);
-            };
-            let Some(io) = ops.as_io() else {
-                return disk_error_json("no_io_ops", name);
-            };
-            // 真实读 LBA0；短读/签名不符 → 显式报错，绝不编造分区表。
-            let mut sector = [0u8; 512];
-            if io.read_at(0, &mut sector) < 512 {
-                return disk_error_json("lba0_short_read", name);
-            }
-            let mbr = match fs::mbr::parse_mbr(&sector) {
-                Ok(m) => m,
-                Err(_) => return disk_error_json("no_mbr", name),
-            };
-            let mut target = klib::json::VecTarget::new();
-            let mut writer = klib::json::JsonWriter::new(&mut target);
-            if let Ok(mut arr) = writer.start_array() {
-                for p in mbr.partitions.iter().copied() {
-                    if p.is_empty() {
-                        continue;
-                    }
-                    let _ = arr.push_object(|obj| {
-                        let _ = obj.field_u64("start_lba", p.start_lba as u64);
-                        let _ = obj.field_u64("sector_count", p.sector_count as u64);
-                        let _ = obj.field_str("type", &alloc::format!("{:#04x}", p.part_type));
-                        let _ = obj.field_bool("bootable", p.boot_flag == 0x80);
-                        Ok(())
-                    });
+        let mbr = match read_disk_mbr(name) {
+            Ok(m) => m,
+            Err(code) => return disk_error_json(code, name),
+        };
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        if let Ok(mut arr) = writer.start_array() {
+            for p in mbr.partitions.iter().copied() {
+                if p.is_empty() {
+                    continue;
                 }
-                let _ = arr.end();
+                let _ = arr.push_object(|obj| {
+                    let _ = obj.field_u64("start_lba", p.start_lba as u64);
+                    let _ = obj.field_u64("sector_count", p.sector_count as u64);
+                    let _ = obj.field_str("type", &alloc::format!("{:#04x}", p.part_type));
+                    let _ = obj.field_bool("bootable", p.boot_flag == 0x80);
+                    Ok(())
+                });
             }
-            return target
-                .into_string()
-                .expect("disk partitions JSON serialization is ASCII-safe");
+            let _ = arr.end();
         }
-        disk_error_json("not_found", name)
+        target
+            .into_string()
+            .expect("disk partitions JSON serialization is ASCII-safe")
+    }
+
+    fn list_disk_partition_ids(&self, name: &str) -> alloc::vec::Vec<alloc::string::String> {
+        let mbr = match read_disk_mbr(name) {
+            Ok(m) => m,
+            Err(_) => return alloc::vec::Vec::new(),
+        };
+        // 1-based 真实 MBR 槽位序：`partition-1`、`partition-2`（ADR-012 §4）。
+        mbr.partitions
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.is_empty())
+            .map(|(i, _)| alloc::format!("partition-{}", i + 1))
+            .collect()
+    }
+
+    fn disk_partition_info_json(&self, name: &str, part_id: &str) -> String {
+        let mbr = match read_disk_mbr(name) {
+            Ok(m) => m,
+            Err(code) => return disk_error_json(code, name),
+        };
+        // 解析 `partition-{n}`：1-based 真实槽位。
+        let idx = match part_id.strip_prefix("partition-") {
+            Some(rest) => match rest.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= mbr.partitions.len() => n - 1,
+                _ => return disk_error_json("not_found", name),
+            },
+            None => return disk_error_json("not_found", name),
+        };
+        let p = match mbr.partitions.get(idx) {
+            Some(p) if !p.is_empty() => *p,
+            _ => return disk_error_json("not_found", name),
+        };
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        writer
+            .start_object()
+            .and_then(|mut o| {
+                o.field_str("device", name)?;
+                o.field_str("part", part_id)?;
+                o.field_u64("start_lba", p.start_lba as u64)?;
+                o.field_u64("sector_count", p.sector_count as u64)?;
+                o.field_str("type", &alloc::format!("{:#04x}", p.part_type))?;
+                o.field_bool("bootable", p.boot_flag == 0x80)?;
+                o.end()
+            })
+            .expect("Vec-backed partition info JSON serialization cannot fail");
+        target
+            .into_string()
+            .expect("partition info JSON keys and device names are UTF-8")
     }
 }
 
@@ -631,6 +660,34 @@ fn disk_error_json(code: &str, name: &str) -> String {
     target
         .into_string()
         .expect("disk error JSON keys and device names are UTF-8")
+}
+
+/// 读块设备 LBA0 并解析真实 MBR（ADR-012 §4 逐分区投影共享半）。
+///
+/// 出错时返回错误码字符串（`no_io_ops`/`lba0_short_read`/`no_mbr`/`not_found`），
+/// 绝不回退到编造分区表（S09 宁缺毋假）。
+fn read_disk_mbr(name: &str) -> Result<fs::mbr::Mbr, &'static str> {
+    let count = driver::DriverHub::device_count();
+    for i in 0..count {
+        let Some(info) = driver::DriverHub::device_info_at(i) else {
+            continue;
+        };
+        if info.name != name || info.kind != driver::DeviceKind::Block {
+            continue;
+        }
+        let Some(ops) = driver::DriverHub::device_at(i) else {
+            return Err("no_io_ops");
+        };
+        let Some(io) = ops.as_io() else {
+            return Err("no_io_ops");
+        };
+        let mut sector = [0u8; 512];
+        if io.read_at(0, &mut sector) < 512 {
+            return Err("lba0_short_read");
+        }
+        return fs::mbr::parse_mbr(&sector).map_err(|_| "no_mbr");
+    }
+    Err("not_found")
 }
 
 /// 初始化根文件系统并构建默认 RESTful 目录骨架与特殊文件系统挂载（ADR-005 / ADR-011 / ADR-012 / ADR-013）。
