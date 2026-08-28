@@ -19,6 +19,8 @@ mod vfs_init;
 #[cfg(feature = "kernel-tests")]
 mod tests;
 
+use arch::interrupt::InterruptController;
+use arch::syscall::SyscallEntry;
 use arch::Platform;
 use core::sync::atomic::{AtomicBool, Ordering};
 use klib::{error, info, warn};
@@ -144,7 +146,9 @@ unsafe fn kmain_body() -> ! {
         panic_cpu_id,
         term::write_str as fn(&str),
     );
-    panic::set_panic_quiesce(arch_x86_64::interrupts::disable);
+    panic::set_panic_quiesce(
+        <arch_x86_64::interrupt::X86InterruptController as InterruptController>::disable,
+    );
     // 显示前置要素（堆分配器 + Limine framebuffer + 驱动框架）均已就绪：
     // 立即启动 framebuffer 终端，比任何 test 都靠前，方便屏幕实时看日志。
     init_display();
@@ -269,7 +273,7 @@ unsafe fn kmain_body() -> ! {
     // 初始化 Local APIC 定时器（Limine 已启用 LAPIC，硬件中断走 APIC）
     info!("[kmain] enabling interrupts (LAPIC timer ~100Hz)");
     arch_x86_64::lapic::init();
-    arch_x86_64::interrupts::enable();
+    <arch_x86_64::interrupt::X86InterruptController as InterruptController>::enable();
 
     // 短暂等待验证时钟中断确实触发
     #[cfg(feature = "kernel-tests")]
@@ -315,6 +319,11 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_pmm_bench();
 
+    // T7 / ADR-007：验证 arch::InterruptController trait 与底层 IRQ 表/中断
+    // 开关联动（同一份状态，不重复实现）。依赖中断已使能。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_arch_interrupt_controller_trait();
+
     // T7：验证通用 IRQ 注册/分配（共享中断）：IRQ0 上已有 LAPIC 定时器 handler，
     // 再注册观察者共享同一 IRQ，验证多 handler 分发互不干扰。依赖 tick 运行。
     #[cfg(feature = "kernel-tests")]
@@ -335,9 +344,10 @@ unsafe fn kmain_body() -> ! {
     tests::test_spawn_user_fault();
 
     // M4.1：注册 syscall 软中断入口（用户态 `int 0x80` → 内核 syscall 分发）。
-    // 用 spin::Once 单次注册；M3.3 测试不触发 syscall，注册无副作用。
+    // 经 ADR-007 的 `arch::SyscallEntry` 抽象接入：x86-64 层把 `int 0x80`
+    // 的 `InterruptFrame` 翻译成可移植 `SyscallFrame` 后调用本入口。
     // 与 `mod syscall` 同步 gate：生产构建（无 kernel-tests）不编译 syscall 机制。
-    arch_x86_64::interrupts::register_soft_interrupt_handler(syscall::syscall_entry);
+    <arch_x86_64::syscall::X86SyscallEntry as SyscallEntry>::register(syscall::syscall_entry);
 
     // M4.1 syscall 验收：用户代码经 `int 0x80` 调用 write/exit 等（停机验收，
     // 不返回主流程），故单独用 kernel-test-m41 feature 门控。

@@ -1923,6 +1923,57 @@ extern "C" fn shared_irq_observer(_irq: u8) -> bool {
     false
 }
 
+/// T7 / ADR-007：验证 `arch::InterruptController` trait（`X86InterruptController`）
+/// 与底层 `arch_x86_64::interrupts` 的**同一份**外部 IRQ 表 / 中断开关状态联动，
+/// 而非在 trait 层另起一份状态（S28：不重复实现、不造假）。
+///
+/// - trait `interrupts_enabled` 必须与底层直调返回一致；
+/// - trait `register_irq`/`unregister_irq` 必须增减同一条 IRQ 的 `irq_handler_count`。
+///
+/// 使用未被任何设备占用的 IRQ 15 临时槽，测试结束即注销，零残留。
+extern "C" fn trait_irq_probe(_irq: u8) -> bool {
+    false
+}
+
+pub fn test_arch_interrupt_controller_trait() {
+    use arch::interrupt::InterruptController;
+    use arch_x86_64::interrupt::X86InterruptController;
+    use arch_x86_64::interrupts::{irq_handler_count, interrupts_enabled};
+
+    info!("[irq] === ADR-007: InterruptController trait ===");
+
+    // 1. 中断开关状态：trait 与底层直调必须一致。
+    assert_eq!(
+        <X86InterruptController as InterruptController>::interrupts_enabled(),
+        interrupts_enabled(),
+        "trait interrupts_enabled must mirror arch-x86_64 state"
+    );
+
+    // 2. IRQ 注册/注销：trait 操作同一张表。
+    const SPARE_IRQ: u8 = 15;
+    let before = irq_handler_count(SPARE_IRQ);
+    assert!(
+        <X86InterruptController as InterruptController>::register_irq(SPARE_IRQ, trait_irq_probe),
+        "trait register_irq must succeed on spare IRQ"
+    );
+    assert_eq!(
+        irq_handler_count(SPARE_IRQ),
+        before + 1,
+        "trait register must land in the shared IRQ table"
+    );
+    assert!(
+        <X86InterruptController as InterruptController>::unregister_irq(SPARE_IRQ, trait_irq_probe),
+        "trait unregister_irq must succeed"
+    );
+    assert_eq!(
+        irq_handler_count(SPARE_IRQ),
+        before,
+        "trait unregister must remove from the shared IRQ table"
+    );
+
+    info!("[irq] InterruptController trait PASS");
+}
+
 /// T7：验证通用 IRQ 注册/分配（共享中断）。
 ///
 /// 验证方法（让共享 handler 真正被分发）：
@@ -2812,7 +2863,7 @@ pub fn test_vfs_m62() {
 /// - 零长度、非页对齐地址、跨用户上界与整数溢出参数（EINVAL）。
 pub fn test_syscall_munmap() {
     use alloc::boxed::Box;
-    use arch_x86_64::interrupts::InterruptFrame;
+    use arch::syscall::SyscallFrame;
     use klib::error::Error;
     use task::Process;
 
@@ -2825,30 +2876,18 @@ pub fn test_syscall_munmap() {
     // 中断可用）。
     let irq_flags = arch_x86_64::interrupts::irq_save();
 
-    fn frame(nr: u32, addr: u64, size: u64) -> InterruptFrame {
-        InterruptFrame {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rbp: 0,
-            rdi: addr,
-            rsi: size,
-            rdx: 0,
-            rcx: 0,
-            rbx: 0,
-            rax: nr as u64,
-            vector: 0,
-            error_code: 0,
-            rip: 0,
-            cs: 0,
-            rflags: 0,
-            rsp: 0,
-            ss: 0,
+    // munmap 为纯 Done 路径（不切换现场），arch_frame 填 0。
+    fn frame(nr: u32, addr: u64, size: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1: addr,
+            a2: size,
+            a3: 0,
+            a4: 0,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
         }
     }
 
@@ -2860,7 +2899,7 @@ pub fn test_syscall_munmap() {
 
     let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0);
     assert!(crate::syscall::syscall_entry(&mut map));
-    let mapped = map.rax;
+    let mapped = map.result;
     assert!(
         mapped >= mm::user_space::USER_BASE && mapped < mm::user_space::USER_TOP,
         "mmap must return a user address"
@@ -2884,7 +2923,7 @@ pub fn test_syscall_munmap() {
 
     let mut unmap_first = frame(crate::syscall::SYS_MEMORY_UNMAP, mapped, 0x1000);
     assert!(crate::syscall::syscall_entry(&mut unmap_first));
-    assert_eq!(unmap_first.rax, 0, "first partial munmap must succeed");
+    assert_eq!(unmap_first.result, 0, "first partial munmap must succeed");
     let proc = task::current_proc_mut().expect("test process retained");
     assert!(
         proc.addr_space_mut()
@@ -2906,18 +2945,18 @@ pub fn test_syscall_munmap() {
     let expected_not_found = (-(Error::NotFound.to_errno() as i64)) as u64;
     let mut repeat = frame(crate::syscall::SYS_MEMORY_UNMAP, mapped, 0x1000);
     assert!(crate::syscall::syscall_entry(&mut repeat));
-    assert_eq!(repeat.rax, expected_not_found, "repeat munmap must fail");
+    assert_eq!(repeat.result, expected_not_found, "repeat munmap must fail");
 
     let mut unmap_second = frame(crate::syscall::SYS_MEMORY_UNMAP, mapped + 0x1000, 0x1000);
     assert!(crate::syscall::syscall_entry(&mut unmap_second));
-    assert_eq!(unmap_second.rax, 0, "second partial munmap must succeed");
+    assert_eq!(unmap_second.result, 0, "second partial munmap must succeed");
 
     // `brk` 区域也是按需分页，但生命周期归堆管理：munmap 绝不能越权删除它。
     let heap_end = mm::user_space::USER_HEAP_BASE + 0x1000;
     let mut grow_heap = frame(crate::syscall::SYS_MEMORY_GROW, heap_end, 0);
     assert!(crate::syscall::syscall_entry(&mut grow_heap));
     assert_eq!(
-        grow_heap.rax, heap_end,
+        grow_heap.result, heap_end,
         "brk must establish heap reservation"
     );
     let mut unmap_heap = frame(
@@ -2927,7 +2966,7 @@ pub fn test_syscall_munmap() {
     );
     assert!(crate::syscall::syscall_entry(&mut unmap_heap));
     assert_eq!(
-        unmap_heap.rax, expected_not_found,
+        unmap_heap.result, expected_not_found,
         "munmap must reject non-anonymous heap regions"
     );
 
@@ -2944,7 +2983,7 @@ pub fn test_syscall_munmap() {
     ] {
         let mut invalid = frame(crate::syscall::SYS_MEMORY_UNMAP, addr, size);
         assert!(crate::syscall::syscall_entry(&mut invalid));
-        assert_eq!(invalid.rax, expected_invalid, "munmap {label} must reject");
+        assert_eq!(invalid.result, expected_invalid, "munmap {label} must reject");
     }
 
     task::clear_current_proc();
@@ -2968,37 +3007,25 @@ pub fn test_syscall_munmap() {
 /// 6. **K8**：O_TRUNC 无写位 → EINVAL 且文件内容原样保留；带写位截断成功。
 pub fn test_syscall_usercopy_faults() {
     use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
     use arch::PageSize;
-    use arch_x86_64::interrupts::InterruptFrame;
     use klib::error::Error;
     use task::Process;
 
     info!("[test-syscall-usercopy] === AR1/K7/K8: user-buffer pre-validation ===");
 
-    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> InterruptFrame {
-        InterruptFrame {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rbp: 0,
-            rdi: a1,
-            rsi: a2,
-            rdx: a3,
-            rcx: 0,
-            rbx: 0,
-            rax: nr as u64,
-            vector: 0,
-            error_code: 0,
-            rip: 0,
-            cs: 0,
-            rflags: 0,
-            rsp: 0,
-            ss: 0,
+    // 本测试全为纯 Done 路径（不切换现场），arch_frame 填 0。
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4: 0,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
         }
     }
 
@@ -3027,7 +3054,7 @@ pub fn test_syscall_usercopy_faults() {
     // 两页按需分页 mmap 区（未触碰，无 PTE）：page A 探针源，page B 放路径串。
     let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0);
     assert!(crate::syscall::syscall_entry(&mut map));
-    let page_a = map.rax;
+    let page_a = map.result;
     let page_b = page_a + 0x1000;
 
     let efault = (-(Error::BadAddress.to_errno() as i64)) as u64;
@@ -3037,10 +3064,10 @@ pub fn test_syscall_usercopy_faults() {
     // ---- 1. 未触碰页作 write 源 → EFAULT（修复前：内核态 #PF 停机）----
     info!("[test-syscall-usercopy] probing write from untouched demand page...");
     let mut w = frame(crate::syscall::SYS_STREAM_WRITE, 1, page_a, 16);
-    w.r10 = u64::MAX; // STREAM_OFFSET_CURRENT
+    w.a4 = u64::MAX; // STREAM_OFFSET_CURRENT
     assert!(crate::syscall::syscall_entry(&mut w));
     assert_eq!(
-        w.rax, efault,
+        w.result, efault,
         "untouched demand page as write source must return EFAULT"
     );
 
@@ -3067,9 +3094,9 @@ pub fn test_syscall_usercopy_faults() {
         );
     }
     let mut w_ok = frame(crate::syscall::SYS_STREAM_WRITE, 1, page_a, 8);
-    w_ok.r10 = u64::MAX;
+    w_ok.a4 = u64::MAX;
     assert!(crate::syscall::syscall_entry(&mut w_ok));
-    assert_eq!(w_ok.rax, 8, "resident buffer must be writable out");
+    assert_eq!(w_ok.result, 8, "resident buffer must be writable out");
 
     // 经 HHDM 把路径串写进 page B（内核半区别名，SMAP 不适用；既有测试同法）。
     let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
@@ -3101,9 +3128,9 @@ pub fn test_syscall_usercopy_faults() {
         mm::user_space::USER_TOP - 4,
         8,
     );
-    w_win.r10 = u64::MAX;
+    w_win.a4 = u64::MAX;
     assert!(crate::syscall::syscall_entry(&mut w_win));
-    assert_eq!(w_win.rax, out_of_range, "window-crossing range must reject");
+    assert_eq!(w_win.result, out_of_range, "window-crossing range must reject");
 
     // ---- 4. 只读页作 readdir 输出目标（写意图）→ EFAULT ----
     const RO_ADDR: u64 = 0x0000_0000_5000_0000; // 堆基址之下的空闲用户区
@@ -3128,7 +3155,7 @@ pub fn test_syscall_usercopy_faults() {
     );
     assert!(crate::syscall::syscall_entry(&mut rd_ro));
     assert_eq!(
-        rd_ro.rax, efault,
+        rd_ro.result, efault,
         "read-only page must reject kernel-side copy_to_user (write intent)"
     );
 
@@ -3136,16 +3163,16 @@ pub fn test_syscall_usercopy_faults() {
     let mut rd_ok = frame(crate::syscall::SYS_ENTRY_READ, page_b + 64, page_a, 256);
     assert!(crate::syscall::syscall_entry(&mut rd_ok));
     assert!(
-        rd_ok.rax != out_of_range && rd_ok.rax != efault && rd_ok.rax != 0,
+        rd_ok.result != out_of_range && rd_ok.result != efault && rd_ok.result != 0,
         "readdir into writable resident page must succeed"
     );
 
     // ---- 5. 长度越过已映射边界 → EFAULT（分块逐段校验）----
     let mut w_over = frame(crate::syscall::SYS_STREAM_WRITE, 1, page_a, 0x3000);
-    w_over.r10 = u64::MAX;
+    w_over.a4 = u64::MAX;
     assert!(crate::syscall::syscall_entry(&mut w_over));
     assert_eq!(
-        w_over.rax, efault,
+        w_over.result, efault,
         "length past the last mapped page must EFAULT"
     );
 
@@ -3159,7 +3186,7 @@ pub fn test_syscall_usercopy_faults() {
     );
     assert!(crate::syscall::syscall_entry(&mut o_bad));
     assert_eq!(
-        o_bad.rax, einval,
+        o_bad.result, einval,
         "O_TRUNC without write access must be rejected, not silently ignored"
     );
     // 文件内容原样保留（此前 test_vfs_m61 写入过 JSON，size > 0）。
@@ -3174,7 +3201,7 @@ pub fn test_syscall_usercopy_faults() {
     let mut o_trunc = frame(crate::syscall::SYS_STREAM_CREATE, page_b, write_trunc, 0);
     assert!(crate::syscall::syscall_entry(&mut o_trunc));
     assert!(
-        o_trunc.rax < 0x8000_0000_0000_0000,
+        o_trunc.result < 0x8000_0000_0000_0000,
         "O_TRUNC|WRITE must open successfully"
     );
     {
@@ -3204,35 +3231,23 @@ pub fn test_syscall_usercopy_faults() {
 /// fpos / 校验回绕。本测试写满 2MiB+16 到 RAMFS 文件，断言返回全长。
 pub fn test_syscall_seq_large_io() {
     use alloc::boxed::Box;
-    use arch_x86_64::interrupts::InterruptFrame;
+    use arch::syscall::SyscallFrame;
     use task::Process;
 
     info!("[test-syscall-seq-large] === S19: sequential IO > chunk must not truncate ===");
 
-    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> InterruptFrame {
-        InterruptFrame {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rbp: 0,
-            rdi: a1,
-            rsi: a2,
-            rdx: a3,
-            rcx: 0,
-            rbx: 0,
-            rax: nr as u64,
-            vector: 0,
-            error_code: 0,
-            rip: 0,
-            cs: 0,
-            rflags: 0,
-            rsp: 0,
-            ss: 0,
+    // 本测试全为纯 Done 路径（不切换现场），arch_frame 填 0。
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4: 0,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
         }
     }
 
@@ -3256,10 +3271,10 @@ pub fn test_syscall_seq_large_io() {
     let mut map = frame(crate::syscall::SYS_MEMORY_MAP, WRITE_LEN, 0, 0);
     assert!(crate::syscall::syscall_entry(&mut map));
     assert!(
-        map.rax < 0x8000_0000_0000_0000,
+        map.result < 0x8000_0000_0000_0000,
         "mmap must succeed (not an error)"
     );
-    let buf = map.rax;
+    let buf = map.result;
     {
         let p = task::current_proc_mut().expect("test proc");
         let mut a = buf;
@@ -3292,18 +3307,18 @@ pub fn test_syscall_seq_large_io() {
     );
     assert!(crate::syscall::syscall_entry(&mut o));
     assert!(
-        o.rax < 0x8000_0000_0000_0000,
+        o.result < 0x8000_0000_0000_0000,
         "open/create must succeed"
     );
-    let fd = o.rax;
+    let fd = o.result;
 
     // 顺序写 1MiB+16：修复前第二块 fpos 回绕 → 只交付 1MiB（红），
     // 修复后必须交付全长。
     let mut w = frame(crate::syscall::SYS_STREAM_WRITE, fd, buf, WRITE_LEN);
-    w.r10 = u64::MAX; // STREAM_OFFSET_CURRENT
+    w.a4 = u64::MAX; // STREAM_OFFSET_CURRENT
     assert!(crate::syscall::syscall_entry(&mut w));
     assert_eq!(
-        w.rax, WRITE_LEN,
+        w.result, WRITE_LEN,
         "sequential write >1MiB must deliver full length (S19: no truncation)"
     );
 
@@ -3312,7 +3327,7 @@ pub fn test_syscall_seq_large_io() {
     {
         let mut c = frame(crate::syscall::SYS_STREAM_CLOSE, fd, 0, 0);
         assert!(crate::syscall::syscall_entry(&mut c));
-        assert!(c.rax < 0x8000_0000_0000_0000, "close fd must succeed");
+        assert!(c.result < 0x8000_0000_0000_0000, "close fd must succeed");
     }
     {
         let root = crate::vfs_init::root();
@@ -3337,35 +3352,23 @@ pub fn test_syscall_seq_large_io() {
 ///   而不是顶掉唯一等待者（KM15）——此前该分支零测试佐证。
 pub fn test_syscall_memquery_and_stdin_busy() {
     use alloc::boxed::Box;
-    use arch_x86_64::interrupts::InterruptFrame;
+    use arch::syscall::SyscallFrame;
     use task::Process;
 
     info!("[test-syscall-mq-busy] === B14/B21: memory_query coverage + stdin Busy semantics ===");
 
-    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> InterruptFrame {
-        InterruptFrame {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rbp: 0,
-            rdi: a1,
-            rsi: a2,
-            rdx: a3,
-            rcx: 0,
-            rbx: 0,
-            rax: nr as u64,
-            vector: 0,
-            error_code: 0,
-            rip: 0,
-            cs: 0,
-            rflags: 0,
-            rsp: 0,
-            ss: 0,
+    // 本测试除 stdin 阻塞分支（arch_frame 填 0，不切换）外全为 Done 路径。
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4: 0,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
         }
     }
 
@@ -3384,7 +3387,7 @@ pub fn test_syscall_memquery_and_stdin_busy() {
     // 两页 demand 区；显式补页 page_a（fault-ahead 会连带 page_b）。
     let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0);
     assert!(crate::syscall::syscall_entry(&mut map));
-    let page_a = map.rax;
+    let page_a = map.result;
     {
         let p = task::current_proc_mut().expect("test proc");
         assert!(p.addr_space_mut().handle_page_fault(
@@ -3399,7 +3402,7 @@ pub fn test_syscall_memquery_and_stdin_busy() {
     const MEMQ_WRITABLE: u64 = 1 << 2;
     let mut q1 = frame(crate::syscall::SYS_MEMORY_QUERY, page_a, page_a, 0);
     assert!(crate::syscall::syscall_entry(&mut q1));
-    assert_eq!(q1.rax, 0, "memory_query success must pack_ok(0)");
+    assert_eq!(q1.result, 0, "memory_query success must pack_ok(0)");
     let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
     let pa_phys = {
         let p = task::current_proc_mut().expect("test proc");
@@ -3417,7 +3420,7 @@ pub fn test_syscall_memquery_and_stdin_busy() {
     let far_addr: u64 = 0x0000_5000_0000_0000; // 用户半区高位，无任何区域声明
     let mut q2 = frame(crate::syscall::SYS_MEMORY_QUERY, far_addr, page_a, 0);
     assert!(crate::syscall::syscall_entry(&mut q2));
-    assert_eq!(q2.rax, 0);
+    assert_eq!(q2.result, 0);
     let bits2 = unsafe { core::ptr::read_volatile((pa_phys + off) as *const u64) };
     assert_eq!(bits2, 0, "unmapped address must report not-present");
     let still_absent = {
@@ -3430,7 +3433,7 @@ pub fn test_syscall_memquery_and_stdin_busy() {
     let efault = (-(klib::error::Error::BadAddress.to_errno() as i64)) as u64;
     let mut q3 = frame(crate::syscall::SYS_MEMORY_QUERY, page_a, far_addr, 0);
     assert!(crate::syscall::syscall_entry(&mut q3));
-    assert_eq!(q3.rax, efault, "invalid out_ptr must be EFAULT");
+    assert_eq!(q3.result, efault, "invalid out_ptr must be EFAULT");
 
     // ---- B21：KBD_WAITER 被占 → 第二个 stdin 读者 EAGAIN ----
     assert!(
@@ -3442,11 +3445,30 @@ pub fn test_syscall_memquery_and_stdin_busy() {
     // 读缓冲用 page_a（已驻留；Busy 分支在缓冲校验之后、读之前返回）。
     // stdin 不可定位：offset 必须为顺序读哨兵 STREAM_OFFSET_CURRENT，否则
     // 在 WouldBlock 之前就被 ESPIPE 拒绝。
-    let mut rd = frame(crate::syscall::SYS_STREAM_READ, 0, page_a, 16);
-    rd.r10 = u64::MAX;
+    //
+    // stdin read 可能触达 `block_for_kbd`（本次因 KBD_WAITER 被占走 Busy
+    // 分支，但 syscall 分发无条件经 `arch_frame` 取回底层中断帧）——故
+    // arch_frame 必须指向真实存在的 `InterruptFrame`，不得为 0（S09：不伪造、
+    // 不空指针）。
+    let mut rd_arch = arch_x86_64::interrupts::InterruptFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+        vector: 0, error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+    let mut rd = SyscallFrame {
+        nr: crate::syscall::SYS_STREAM_READ as u64,
+        a1: 0,
+        a2: page_a,
+        a3: 16,
+        a4: u64::MAX, // STREAM_OFFSET_CURRENT
+        a5: 0,
+        result: 0,
+        switched: false,
+        arch_frame: &mut rd_arch as *mut _ as usize,
+    };
     assert!(crate::syscall::syscall_entry(&mut rd));
     assert_eq!(
-        rd.rax, eagain,
+        rd.result, eagain,
         "second concurrent stdin reader must get EAGAIN (KM15)"
     );
     task::scheduler::debug_release_kbd_waiter();
@@ -3483,38 +3505,26 @@ pub fn test_syscall_memquery_and_stdin_busy() {
 }
 
 pub fn test_syscall_std_stream_close() {
-    use arch_x86_64::interrupts::InterruptFrame;
+    use arch::syscall::SyscallFrame;
     use klib::error::Error;
 
     info!("[test-syscall-close] === DMYGH #10: reject closing stdio ===");
     let expected = (-(Error::NotSupported.to_errno() as i64)) as u64;
     for fd in [0u64, 1, 2] {
-        let mut frame = InterruptFrame {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rbp: 0,
-            rdi: fd,
-            rsi: 0,
-            rdx: 0,
-            rcx: 0,
-            rbx: 0,
-            rax: crate::syscall::SYS_STREAM_CLOSE as u64,
-            vector: 0,
-            error_code: 0,
-            rip: 0,
-            cs: 0,
-            rflags: 0,
-            rsp: 0,
-            ss: 0,
+        // close 为纯 Done 路径，arch_frame 填 0。
+        let mut frame = SyscallFrame {
+            nr: crate::syscall::SYS_STREAM_CLOSE as u64,
+            a1: fd,
+            a2: 0,
+            a3: 0,
+            a4: 0,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
         };
         assert!(crate::syscall::syscall_entry(&mut frame));
-        assert_eq!(frame.rax, expected, "close({fd}) must return ENOTSUP");
+        assert_eq!(frame.result, expected, "close({fd}) must return ENOTSUP");
     }
     info!("[test-syscall-close] PASS");
 }

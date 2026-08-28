@@ -12,6 +12,7 @@ pub mod fpu;
 pub mod gdt;
 pub mod hpet;
 pub mod imcr;
+pub mod interrupt;
 pub mod interrupts;
 pub mod keyboard;
 pub mod lapic;
@@ -22,6 +23,7 @@ pub mod port;
 pub mod rtc;
 pub mod serial;
 pub mod smp;
+pub mod syscall;
 pub mod task;
 pub mod timer;
 

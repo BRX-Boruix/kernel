@@ -14,7 +14,9 @@ pub mod acpi;
 pub mod addr;
 pub mod cpu;
 pub mod hhdm;
+pub mod interrupt;
 pub mod paging;
+pub mod syscall;
 pub mod task;
 pub mod timer;
 
@@ -22,7 +24,9 @@ pub use acpi::{Rsdp, SdtHeader};
 pub use addr::{PhysAddr, PhysFrame, VirtAddr};
 pub use cpu::{Cpu, CpuFeature};
 pub use hhdm::{PHYS_OFFSET, phys_to_virt, virt_to_phys};
+pub use interrupt::{InterruptController, IrqHandler};
 pub use paging::{ActivePageTable, PageFaultCode, PageFlags, PageSize, PageTable};
+pub use syscall::{SyscallEntry, SyscallEntryFn, SyscallFrame};
 pub use task::{TaskContext, switch_to};
 pub use timer::{Timer, TimerCallback};
 

@@ -13,6 +13,7 @@
 //! 设计哲学（RESTful 资源观 + Rust 风格错误）：所有资源共享同一套 CRUD
 //! 操作码（CREATE/READ/WRITE/CLOSE/CONTROL/QUERY），新资源只需新开域块。
 
+use arch::syscall::SyscallFrame;
 use arch::PageFlags;
 use arch_x86_64::interrupts::InterruptFrame;
 use klib::error::Error;
@@ -42,6 +43,21 @@ const SYSCALL_COPY_CHUNK_BYTES: u64 = 1024 * 1024;
 /// - 与 PATH_PARAM_MAX 旧名的关系：更名以表达"用户输入上限"语义，
 ///   内核内部路径不受此约束。
 const MAX_USER_PATH_BYTES: usize = 4096;
+
+/// 从可移植 `SyscallFrame` 取回底层架构中断帧（Switched 路径专用）。
+///
+/// `arch_frame` 由架构层（`arch-x86_64::syscall`）填充为真实
+/// `&mut InterruptFrame` 的地址。阻塞/让出 syscall（read 阻塞、waitpid、
+/// exit、kill 自杀）需要它来**整体替换**现场为下一进程的保存帧（调度器
+/// 语义，见 `task` crate）；此访问是架构耦合的边界，仅切换路径使用，
+/// 非切换路径不读 `arch_frame`。
+///
+/// S21：`arch_frame` 指向的 `InterruptFrame` 由架构层保证有效（当前软中断
+/// 现场），且本分发入口是唯一持有者；`task::*` 切换原语在读改写现场时
+/// 持有调度器锁。非切换路径不得调用本函数。
+fn arch_frame<'a>(frame: &'a mut SyscallFrame) -> &'a mut InterruptFrame {
+    unsafe { &mut *(frame.arch_frame as *mut InterruptFrame) }
+}
 
 // ---------- syscall 号（域 + 操作二维编码） ----------
 
@@ -206,10 +222,10 @@ fn copy_path_from_user(path_ptr: u64, max_len: usize) -> Result<alloc::string::S
 }
 
 /// `open(path_ptr, flags_bits, perm_bits)`：打开或创建文件，返回 fd。
-fn sys_open(frame: &mut InterruptFrame) -> u64 {
-    let path_ptr = frame.rdi;
-    let flags_bits = frame.rsi as u32;
-    let perm_bits = frame.rdx as u32;
+fn sys_open(frame: &mut SyscallFrame) -> u64 {
+    let path_ptr = frame.a1;
+    let flags_bits = frame.a2 as u32;
+    let perm_bits = frame.a3 as u32;
 
     let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
@@ -263,8 +279,8 @@ fn sys_open(frame: &mut InterruptFrame) -> u64 {
 ///
 /// fd 0/1/2 是进程的保留标准流，不是可关闭的用户句柄；拒绝该操作并返回
 /// `Error::NotSupported`（ENOTSUP），绝不以成功码掩盖未发生的状态变化。
-fn sys_close(frame: &mut InterruptFrame) -> u64 {
-    let fd = frame.rdi as usize;
+fn sys_close(frame: &mut SyscallFrame) -> u64 {
+    let fd = frame.a1 as usize;
     if fd < 3 {
         return pack_err(Error::NotSupported);
     }
@@ -279,9 +295,9 @@ fn sys_close(frame: &mut InterruptFrame) -> u64 {
 }
 
 /// `mkdir(path_ptr, perm_bits)`：创建目录。
-fn sys_mkdir(frame: &mut InterruptFrame) -> u64 {
-    let path_ptr = frame.rdi;
-    let perm_bits = frame.rsi as u32;
+fn sys_mkdir(frame: &mut SyscallFrame) -> u64 {
+    let path_ptr = frame.a1;
+    let perm_bits = frame.a2 as u32;
     let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
@@ -295,8 +311,8 @@ fn sys_mkdir(frame: &mut InterruptFrame) -> u64 {
 }
 
 /// `unlink(path_ptr)`：删除文件或空目录。
-fn sys_unlink(frame: &mut InterruptFrame) -> u64 {
-    let path_ptr = frame.rdi;
+fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
+    let path_ptr = frame.a1;
     let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
@@ -309,10 +325,10 @@ fn sys_unlink(frame: &mut InterruptFrame) -> u64 {
 }
 
 /// `readdir(path_ptr, buf_ptr, max_bytes)`：获取目录项列表（以 JSON 结构或固定格式写入用户缓冲）。
-fn sys_readdir(frame: &mut InterruptFrame) -> u64 {
-    let path_ptr = frame.rdi;
-    let buf_ptr = frame.rsi;
-    let max_bytes = frame.rdx as usize;
+fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
+    let path_ptr = frame.a1;
+    let buf_ptr = frame.a2;
+    let max_bytes = frame.a3 as usize;
 
     // S31：max_bytes 是用户可控上限，内核侧给读目录结果设独立上限——否则
     // 用户可传巨大值迫使内核为 out String 分配任意大堆块。上限远大于现实
@@ -391,11 +407,11 @@ fn sys_readdir(frame: &mut InterruptFrame) -> u64 {
 ///
 /// ABI 约定：仅 [`STREAM_OFFSET_CURRENT`] 表示顺序写；`offset=0` 以及任意其他
 /// 偏移均为定位写（`pwrite`），不会推进句柄当前位置。
-fn sys_write(frame: &mut InterruptFrame) -> u64 {
-    let fd = frame.rdi;
-    let buf = frame.rsi;
-    let len = frame.rdx;
-    let offset = frame.r10;
+fn sys_write(frame: &mut SyscallFrame) -> u64 {
+    let fd = frame.a1;
+    let buf = frame.a2;
+    let len = frame.a3;
+    let offset = frame.a4;
 
     if len == 0 {
         return pack_ok(0);
@@ -492,11 +508,11 @@ fn sys_write(frame: &mut InterruptFrame) -> u64 {
 /// 返回 [`DispatchResult`]：stdin 阻塞路径会把 `*frame` 整体切换为下一进程
 /// 现场（K1a），此时入口不得再写 rax——返回值语义由 [`DispatchResult`]
 /// 显式表达，杜绝 bool 被调用方无视。
-fn sys_read(frame: &mut InterruptFrame) -> DispatchResult {
-    let fd = frame.rdi;
-    let buf = frame.rsi;
-    let len = frame.rdx;
-    let offset = frame.r10;
+fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
+    let fd = frame.a1;
+    let buf = frame.a2;
+    let len = frame.a3;
+    let offset = frame.a4;
     if len == 0 {
         return done(pack_ok(0));
     }
@@ -574,7 +590,7 @@ fn sys_read(frame: &mut InterruptFrame) -> DispatchResult {
                 // EAGAIN 而不是把对方顶掉（KM15）；Switched = 帧已整体切换，
                 // 禁止再写 rax（K1a）。唤醒后用户 read 重试取字符。
                 if total == 0 && e == Error::WouldBlock && handle.inode.interactive_input() {
-                    return match task::block_for_kbd(frame) {
+                    return match task::block_for_kbd(arch_frame(frame)) {
                         task::scheduler::BlockKbdOutcome::Switched => DispatchResult::Switched,
                         task::scheduler::BlockKbdOutcome::Busy => done(pack_err(Error::WouldBlock)),
                     };
@@ -603,10 +619,10 @@ fn sys_read(frame: &mut InterruptFrame) -> DispatchResult {
 /// KD8：同步删除无名魔数边界 `arg1 < 16`——内建索引实际只有 {0,1} 两项，
 /// 2..15 恒失败；现在除两个命名内建索引外一切值都按其 ABI 本义（路径指针）
 /// 处理，野指针由 copy_path_from_user 预校验如实拒绝。
-fn sys_exec(frame: &mut InterruptFrame) -> u64 {
-    let arg1 = frame.rdi;
-    let arg_ptr = frame.rsi;
-    let arg_len = frame.rdx;
+fn sys_exec(frame: &mut SyscallFrame) -> u64 {
+    let arg1 = frame.a1;
+    let arg_ptr = frame.a2;
+    let arg_len = frame.a3;
 
     let root = crate::vfs_init::root();
 
@@ -740,8 +756,8 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
 }
 
 /// `mmap(size)`：在当前进程用户空间预留一段按需分页区，返回起始地址。
-fn sys_mmap(frame: &mut InterruptFrame) -> u64 {
-    let size = frame.rdi;
+fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
+    let size = frame.a1;
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
@@ -756,9 +772,9 @@ fn sys_mmap(frame: &mut InterruptFrame) -> u64 {
 ///
 /// ABI 使用 `rdi=addr`、`rsi=size`。地址与长度必须均为 4KiB 粒度，且整个范围
 /// 必须属于单个匿名 mmap 区域；否则返回明确错误，绝不把无操作伪装成成功。
-fn sys_munmap(frame: &mut InterruptFrame) -> u64 {
-    let addr = frame.rdi;
-    let size = frame.rsi;
+fn sys_munmap(frame: &mut SyscallFrame) -> u64 {
+    let addr = frame.a1;
+    let size = frame.a2;
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
@@ -779,7 +795,7 @@ fn sys_munmap(frame: &mut InterruptFrame) -> u64 {
 ///
 /// 位值与 libsys `nr::MEMQ_*` 双侧定义、注释互指（同 STREAM_OFFSET_CURRENT
 /// 模式：内核不依赖用户态 crate）。
-fn sys_memory_query(frame: &mut InterruptFrame) -> u64 {
+fn sys_memory_query(frame: &mut SyscallFrame) -> u64 {
     /// 查询结果位图：页表项 present。
     const MEMQ_PRESENT: u64 = 1 << 0;
     /// 查询结果位图：用户态可访问。
@@ -789,8 +805,8 @@ fn sys_memory_query(frame: &mut InterruptFrame) -> u64 {
     /// out_ptr 指向的位图字节数（u64）。
     const OUT_LEN: u64 = 8;
 
-    let addr = frame.rdi;
-    let out_ptr = frame.rsi;
+    let addr = frame.a1;
+    let out_ptr = frame.a2;
 
     if let Err(e) = validate_user_range(out_ptr, OUT_LEN, UserAccess::Write) {
         return pack_err(e);
@@ -818,8 +834,8 @@ fn sys_memory_query(frame: &mut InterruptFrame) -> u64 {
 }
 
 /// `brk(new)`：调整当前进程堆断点（0 = 仅查询）。
-fn sys_brk(frame: &mut InterruptFrame) -> u64 {
-    let new = frame.rdi;
+fn sys_brk(frame: &mut SyscallFrame) -> u64 {
+    let new = frame.a1;
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
@@ -838,16 +854,16 @@ fn sys_brk(frame: &mut InterruptFrame) -> u64 {
 ///   进程保存帧 rax 并唤醒，iretq 后用户态直接拿到；入口禁止回写占位值。
 ///   目标非亲生/不存在/已收尸 → `NotFound`（errno 2，klib 错误表无 ECHILD
 ///   的最近语义）；无其他就绪进程可切时拒绝阻塞 → `WouldBlock`。
-fn sys_task_wait(frame: &mut InterruptFrame) -> DispatchResult {
-    let target_pid = frame.rdi as usize;
-    let timeout_ns = frame.rsi;
+fn sys_task_wait(frame: &mut SyscallFrame) -> DispatchResult {
+    let target_pid = frame.a1 as usize;
+    let timeout_ns = frame.a2;
 
     if target_pid == 0 && timeout_ns == 0 {
         // K1b/KA6：yield_now 返回 Switched 时 `*frame` 已被整体替换为下一进程
         // 保存帧（yield 返回值 0 由调度器写入被保存帧，scheduler.rs），此处若再以
         // Done(0) 收尾会把 rax=0 写穿目标进程现场。枚举强制穷尽匹配，漏翻
         // 编译期即不可能；NotSwitched 才是普通的 Done(0)。
-        match task::yield_now(frame) {
+        match task::yield_now(arch_frame(frame)) {
             task::SwitchOutcome::Switched => return DispatchResult::Switched,
             task::SwitchOutcome::NotSwitched => return done(pack_ok(0)),
         }
@@ -858,7 +874,7 @@ fn sys_task_wait(frame: &mut InterruptFrame) -> DispatchResult {
         return done(pack_ok(0));
     }
 
-    match task::waitpid(target_pid, frame) {
+    match task::waitpid(target_pid, arch_frame(frame)) {
         Ok(task::Waited::Code(code)) => done(pack_ok(code)),
         Ok(task::Waited::Blocked) => DispatchResult::Switched,
         Err(e) => done(pack_err(e)),
@@ -872,11 +888,11 @@ fn sys_task_wait(frame: &mut InterruptFrame) -> DispatchResult {
 /// 就绪进程，改写 `frame` 为下一个就绪进程的保存帧；返回后 `syscall_entry`
 /// 的 iretq 进入目标进程。若所有进程都退出则 idle halt 等待。返回值为填充
 /// 占位（当前进程已死，实际由 iretq 接管）。
-fn sys_exit(frame: &mut InterruptFrame) -> u64 {
-    let code = frame.rdi;
+fn sys_exit(frame: &mut SyscallFrame) -> u64 {
+    let code = frame.a1;
     let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
     klib::info!("[syscall] process {} exit(code={})", pid, code);
-    task::exit_current(frame, code);
+    task::exit_current(arch_frame(frame), code);
     0
 }
 
@@ -884,12 +900,12 @@ fn sys_exit(frame: &mut InterruptFrame) -> u64 {
 ///
 /// **自杀必须返回 [`DispatchResult::Switched`] 而非 `Done`**（S26 回归）：
 /// `exit_current` 会把 `*frame` 整体改写为下一进程的保存帧并切走；若此处
-/// 返回 `Done(0)`，`syscall_entry` 会用 `frame.rax = 0` 覆盖**下一进程**的
-/// 现场（把自杀进程的返回值写进别人家）。与 `sys_exit` 同纪律：切换发生后
-/// 返回值语义交由调度接管。
-fn sys_kill(frame: &mut InterruptFrame) -> DispatchResult {
-    let target = frame.rdi as usize;
-    let sig = frame.rsi as u32;
+/// 返回 `Done(0)`，`syscall_entry` 会置 `result=0`，架构层把 0 写回 `rax`
+/// 覆盖**下一进程**的现场（把自杀进程的返回值写进别人家）。与 `sys_exit`
+/// 同纪律：切换发生后返回值语义交由调度接管。
+fn sys_kill(frame: &mut SyscallFrame) -> DispatchResult {
+    let target = frame.a1 as usize;
+    let sig = frame.a2 as u32;
     // 自杀判定：target 即当前进程且是真实信号（非探活 sig=0）。init 自杀
     // 由 kill_pid 的 PID1 防护拒绝（此处不自行 exit，避免绕过防护）。
     let is_suicide = {
@@ -897,19 +913,19 @@ fn sys_kill(frame: &mut InterruptFrame) -> DispatchResult {
         cur == Some(target) && sig != 0 && target != task::init_pid()
     };
     if is_suicide {
-        task::exit_current(frame, sig as u64);
+        task::exit_current(arch_frame(frame), sig as u64);
         return DispatchResult::Switched;
     }
-    match task::kill_pid(target, sig, frame) {
+    match task::kill_pid(target, sig, arch_frame(frame)) {
         Ok(_) => done(pack_ok(0)),
         Err(e) => done(pack_err(e)),
     }
 }
 
 /// `driver_register(name_ptr, len) -> uio_id` (M11.1)
-fn sys_driver_register(frame: &mut InterruptFrame) -> u64 {
-    let name_ptr = frame.rdi as *const u8;
-    let len = frame.rsi as usize;
+fn sys_driver_register(frame: &mut SyscallFrame) -> u64 {
+    let name_ptr = frame.a1 as *const u8;
+    let len = frame.a2 as usize;
     if len == 0 || len > 32 {
         return pack_err(Error::InvalidParam);
     }
@@ -943,10 +959,10 @@ fn sys_driver_register(frame: &mut InterruptFrame) -> u64 {
 ///    页真实映射进当前进程地址空间，返回用户虚拟地址。
 /// 设备未发布窗口（如无 MMIO BAR 的设备）→ NotSupported；窗口映射失败按
 /// mm 错误如实上抛。绝不以匿名内存伪装映射成功。
-fn sys_driver_claim(frame: &mut InterruptFrame) -> u64 {
-    let uio_id = frame.rdi as usize;
-    let _mmio_base = frame.rsi;
-    let _size = frame.rdx;
+fn sys_driver_claim(frame: &mut SyscallFrame) -> u64 {
+    let uio_id = frame.a1 as usize;
+    let _mmio_base = frame.a2;
+    let _size = frame.a3;
     let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
     // 授权半程：id 存在性 + 归属校验。
     if let Err(e) = driver::uio_claim_device(uio_id, pid) {
@@ -991,11 +1007,11 @@ fn sys_driver_claim(frame: &mut InterruptFrame) -> u64 {
 
 // ---------- 分发 ----------
 
-/// 分发结果：`Done(v)` = 正常返回值（写回 `frame.rax` 带回调用进程）；
-/// `Switched` = 处理器已把 `*frame` **整体替换**为下一进程的保存帧并切换
-/// （waitpid 阻塞 / exit 切换）。此时 `frame.rax` 属于目标进程语义
-/// （如 waitpid 交付的退出码），入口**必须禁止**再写返回值——否则会用
-/// 占位值覆盖交付结果/目标进程现场。
+/// 分发结果：`Done(v)` = 正常返回值（写入 `frame.result`，架构层写回 rax 带
+/// 回调用进程）；`Switched` = 调度器已把真实中断帧**整体替换**为下一进程的
+/// 保存帧并切换（waitpid 阻塞 / exit 切换）。此时目标进程 rax 由调度语义
+/// 交付（如 waitpid 交付的退出码），入口**必须禁止**再写返回值——否则会用
+/// 占位值覆盖交付结果/目标进程现场（置 `frame.switched`，架构层不写回）。
 enum DispatchResult {
     Done(u64),
     Switched,
@@ -1007,7 +1023,7 @@ fn done(v: u64) -> DispatchResult {
 }
 
 /// 按系统调用号分发到具体实现。
-fn dispatch(nr: u64, frame: &mut InterruptFrame) -> DispatchResult {
+fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
     match nr as u32 {
         // STREAM Domain (0x10)
         SYS_STREAM_CREATE => done(sys_open(frame)),
@@ -1051,34 +1067,38 @@ fn dispatch(nr: u64, frame: &mut InterruptFrame) -> DispatchResult {
 
 // ---------- 软中断入口 ----------
 
-/// `int 0x80` 软中断处理回调（注册为 `register_soft_interrupt_handler`）。
+/// `int 0x80` 软中断处理回调（注册为 `arch::SyscallEntry::register`）。
 ///
-/// 从 `InterruptFrame` 读 `rax`（系统调用号）与参数寄存器，分发执行：
-/// - [`DispatchResult::Done`]：把结果写回 `frame.rax`，iretq 带回调用进程；
-/// - [`DispatchResult::Switched`]：`*frame` 已是下一进程保存帧，其 rax 由
-///   调度语义负责（如 waitpid 交付的子进程退出码），不得覆盖。
+/// 从 `SyscallFrame` 读 `nr`（系统调用号）与参数寄存器，分发执行：
+/// - [`DispatchResult::Done`]：把结果写入 `frame.result`，架构层写回 rax，
+///   iretq 带回调用进程；
+/// - [`DispatchResult::Switched`]：调度器已把真实中断帧**整体替换**为下一
+///   进程的保存帧，其 rax 由调度语义负责（如 waitpid 交付的子进程退出码），
+///   故置 `frame.switched`，架构层**不得**把 result 写回。
 ///
 /// 返回 `true` 让 `iretq` 把（可能的）新现场带回目标用户态。
-pub extern "C" fn syscall_entry(frame: &mut InterruptFrame) -> bool {
-    let nr = frame.rax;
+pub extern "C" fn syscall_entry(frame: &mut SyscallFrame) -> bool {
+    let nr = frame.nr;
     // 进入/返回 trace 仅在自检构建开启（避免每条 syscall 生产刷屏）。
     #[cfg(feature = "kernel-tests")]
     klib::info!(
         "[syscall] nr={:#x} a1={:#x} a2={:#x} a3={:#x}",
         nr,
-        frame.rdi,
-        frame.rsi,
-        frame.rdx
+        frame.a1,
+        frame.a2,
+        frame.a3
     );
     match dispatch(nr, frame) {
         DispatchResult::Done(ret) => {
             #[cfg(feature = "kernel-tests")]
             klib::info!("[syscall] nr={:#x} -> {:#x}", nr, ret);
-            frame.rax = ret;
+            frame.result = ret;
         }
         DispatchResult::Switched => {
             #[cfg(feature = "kernel-tests")]
             klib::info!("[syscall] nr={:#x} -> <switched>", nr);
+            // 现场已整体切换为下一进程，架构层不得回写 result。
+            frame.switched = true;
         }
     }
     true
