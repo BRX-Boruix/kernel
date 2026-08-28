@@ -2678,6 +2678,96 @@ pub fn test_vfs_m61() {
     info!("[test-vfs-m61] PASS");
 }
 
+/// ADR-012 §3.2.1：卷重名冲突自动自增后缀（卷重名消解）。
+///
+/// 覆盖：
+/// 1. 首个同名卷挂载为 `/volumes/data`。
+/// 2. 第二个同名卷自动递增为 `/volumes/data-2`，第三个为 `/volumes/data-3`。
+/// 3. 各卷内容互相隔离（写入 data 不污染 data-2）。
+/// 4. 卸载 `/volumes/data` 后再次挂载同名卷，复用空闲的 `/volumes/data`（不跳到 data-4）。
+/// 5. 挂载目标目录不存在时自动创建。
+pub fn test_vfs_volume_collision() {
+    use crate::vfs_init;
+    use alloc::sync::Arc;
+    use vfs::inode::{INodeType, Permissions};
+    use vfs::ramfs::RamFS;
+
+    info!("[test-vfs-volume-collision] === ADR-012-6: volume name collision auto-increment ===");
+
+    let root = vfs_init::root();
+    // 卷命名空间必须已存在（vfs_init 骨架）。
+    root.resolve("/volumes", true)
+        .expect("/volumes must exist");
+    // 清理：确保本测试不因先前残留同名挂载而误判。
+    for p in ["/volumes/data", "/volumes/data-2", "/volumes/data-3"] {
+        let _ = root.unmount(p);
+    }
+
+    // 1. 首个 data 卷 → /volumes/data
+    let fs1 = Arc::new(RamFS::new());
+    let m1 = root
+        .mount_volume("data", fs1.clone())
+        .expect("mount first data volume");
+    assert_eq!(m1.as_str(), "/volumes/data", "first volume keeps base name");
+
+    // 2. 第二个同名 data 卷 → /volumes/data-2，第三个 → /volumes/data-3
+    let fs2 = Arc::new(RamFS::new());
+    let m2 = root
+        .mount_volume("data", fs2.clone())
+        .expect("mount second data volume");
+    assert_eq!(m2.as_str(), "/volumes/data-2", "second colliding volume auto-increments");
+    let fs3 = Arc::new(RamFS::new());
+    let m3 = root
+        .mount_volume("data", fs3.clone())
+        .expect("mount third data volume");
+    assert_eq!(m3.as_str(), "/volumes/data-3", "third colliding volume auto-increments");
+
+    // 3. 各卷内容互相隔离：写入 data 不污染 data-2/data-3。
+    root.create_file("/volumes/data/first.rs", Permissions::all())
+        .expect("create in data");
+    root.create_file("/volumes/data-2/second.rs", Permissions::all())
+        .expect("create in data-2");
+    root.create_file("/volumes/data-3/third.rs", Permissions::all())
+        .expect("create in data-3");
+    for (path, absent) in [
+        ("/volumes/data/first.rs", "second.rs"),
+        ("/volumes/data-2/second.rs", "first.rs"),
+        ("/volumes/data-3/third.rs", "second.rs"),
+    ] {
+        let node = root
+            .resolve(path, true)
+            .expect("resolve volume file");
+        assert_eq!(
+            node.metadata().expect("meta").node_type,
+            INodeType::RegularFile
+        );
+        // 反向：其它卷的标记文件不应出现在本卷（隔离性）。
+        let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap();
+        assert!(
+            root.resolve(&alloc::format!("{}/{}", parent, absent), true).is_err(),
+            "volume isolation: {absent} must not exist under {parent}"
+        );
+    }
+
+    // 4. 卸载 /volumes/data 后重新挂载同名卷，复用空闲 /volumes/data（不跳到 data-4）。
+    root.unmount("/volumes/data").expect("unmount data");
+    let m4 = root
+        .mount_volume("data", fs1.clone())
+        .expect("re-mount data");
+    assert_eq!(
+        m4.as_str(),
+        "/volumes/data",
+        "freed base name is reused, not data-4"
+    );
+
+    // 5. 清理：卸载全部本测试卷挂载点，避免污染后续测试。
+    for p in ["/volumes/data", "/volumes/data-2", "/volumes/data-3"] {
+        let _ = root.unmount(p);
+    }
+
+    info!("[test-vfs-volume-collision] PASS");
+}
+
 /// 词法规范 v2（ADR-005）命名 linter：把目录命名的词法契约变成可执行测试。
 ///
 /// 规则：

@@ -87,6 +87,77 @@ impl MountTable {
         Ok(())
     }
 
+    /// 按卷名挂载文件系统到 `/volumes/{name}`，同名卷自动自增后缀（ADR-012 §3.2.1）。
+    ///
+    /// 卷重名消解语义：首个挂载为 `/volumes/{name}`；若该路径已是**活动挂载点**
+    /// （已被某个同名卷占用），依次尝试 `/volumes/{name}-2`、`{name}-3`……直到
+    /// 找到空闲目标，挂载后返回最终绝对路径。挂载目标目录不存在时先创建。
+    ///
+    /// ## 冲突判定（S21 锁序 + TOCTOU 审计）
+    ///
+    /// 占用判定的标准是 `mounts` 表中是否已有该路径键（卷挂载后即在表中登记），
+    /// 而非 `/volumes` 下普通目录是否存在——`/volumes` 是卷专用命名空间，每个
+    /// 子项都应是挂载点；同名冲突 = 目标键已被占。
+    ///
+    /// 锁序（S21）：本方法**不**持 `mounts` 写锁调用 `mkdir`/`resolve`——那会
+    /// 在持写锁时取读锁（自锁死，spin RwLock 不可重入）。目录创建在占位检查
+    /// 之外完成；写锁内只做 `contains_key` 复查与插入（与 [`Self::mount`] 的
+    /// 既有 TOCTOU 界面一致）。极端并发下若目标在检查后被抢先挂载，
+    /// `Self::mount` 因写锁内 `contains_key` 复查返回 `AlreadyExists`，本方法
+    /// 捕捉后继续递增——绝不挂错路径（BORUIX 卷挂载为启动期顺序操作，此窗口
+    /// 单线程下不存在）。
+    pub fn mount_volume(&self, name: &str, fs: Arc<dyn FileSystem>) -> Result<String, Error> {
+        validate_name(name)?;
+        // 卷命名空间须存在（A6：父链可解析）。
+        self.resolve("/volumes", true)?;
+        let base = alloc::format!("/volumes/{}", name);
+        // 创建首个候选挂载点目录（占用时多建几个空目录无害，最终以 mounts 键为准）。
+        if let Err(e) = self.mkdir(&base, Permissions::all()) {
+            match e {
+                // 目录已存在（普通目录或占用前已建）——允许。
+                Error::AlreadyExists => {}
+                // 已存在但非目录：无法作为挂载点。
+                Error::NotDirectory => return Err(Error::NotDirectory),
+                other => return Err(other),
+            }
+        }
+        // 自增寻找空闲挂载目标：以 mounts 表中是否已登记该路径键为占用判定。
+        // `mount` 内部写锁复查 contains_key（TOCTOU 防线）；极端并发下若目标被
+        // 抢先挂载返回 AlreadyExists，则继续递增重试——绝不挂错路径（BORUIX
+        // 卷挂载为启动期顺序操作，该窗口单线程下不可达，循环仅为 S39 严谨兜底）。
+        let mut candidate = base.clone();
+        let mut suffix = 2usize;
+        loop {
+            let canon = Path::canonicalize(&candidate);
+            if self.mounts.read().contains_key(&canon) {
+                candidate = alloc::format!("{}-{}", base, suffix);
+                suffix += 1;
+                continue;
+            }
+            // 目标挂载点目录须存在且为目录（A6）。候选可能因自增而尚未创建。
+            match self.resolve(&candidate, true) {
+                Ok(node) => {
+                    if node.node_type()? != INodeType::Directory {
+                        return Err(Error::NotDirectory);
+                    }
+                }
+                Err(Error::NotFound) => {
+                    self.mkdir(&candidate, Permissions::all())?;
+                }
+                Err(e) => return Err(e),
+            }
+            match self.mount(&candidate, fs.clone()) {
+                Ok(()) => return Ok(candidate),
+                Err(Error::AlreadyExists) => {
+                    // 并发窗口被抢先：递增重试（单线程启动期不可达）。
+                    candidate = alloc::format!("{}-{}", base, suffix);
+                    suffix += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// 卸载挂载点。
     pub fn unmount(&self, target_path: &str) -> Result<(), Error> {
         let norm = Path::canonicalize(target_path);

@@ -436,6 +436,9 @@ unsafe fn kmain_body() -> ! {
     // 运行 M6.1 / M6.2 / M6.3 / M6.4 / M6.5 VFS 自检测试（在 kernel-tests feature 启用时）。
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m61();
+    // ADR-012 §3.2.1：卷重名冲突自动自增后缀（卷重名消解）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_vfs_volume_collision();
     // 词法规范 v2（ADR-005）命名 linter：根命名空间词表契约。
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_lexicon();
