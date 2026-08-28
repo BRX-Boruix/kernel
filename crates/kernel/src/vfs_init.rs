@@ -489,6 +489,148 @@ impl DeviceInfoProvider for KernelDeviceProvider {
             .into_string()
             .expect("pci bars JSON serialization is ASCII-safe")
     }
+
+    // ---- ADR-005/012 /devices/disks 块设备子树 ----
+
+    fn list_disk_names(&self) -> alloc::vec::Vec<alloc::string::String> {
+        let mut names = alloc::vec::Vec::new();
+        let count = driver::DriverHub::device_count();
+        for i in 0..count {
+            if let Some(info) = driver::DriverHub::device_info_at(i) {
+                if info.kind == driver::DeviceKind::Block {
+                    names.push(alloc::string::String::from(info.name));
+                }
+            }
+        }
+        names
+    }
+
+    fn disk_info_json(&self, name: &str) -> String {
+        let count = driver::DriverHub::device_count();
+        for i in 0..count {
+            let Some(info) = driver::DriverHub::device_info_at(i) else {
+                continue;
+            };
+            if info.name != name || info.kind != driver::DeviceKind::Block {
+                continue;
+            }
+            // 容量必须来自真实 `as_io().size()`；无 IO 操作集或 size 缺席时
+            // 显式报 no_capacity，绝不编造容量（S09 宁缺毋假）。
+            let Some(ops) = driver::DriverHub::device_at(i) else {
+                return disk_error_json("no_io_ops", name);
+            };
+            let Some(io) = ops.as_io() else {
+                return disk_error_json("no_io_ops", name);
+            };
+            let capacity = io.size();
+            let bus_str = match info.bus {
+                driver::BusType::Pci => "PCI",
+                driver::BusType::Platform => "Platform",
+                driver::BusType::Virtual => "Virtual",
+                driver::BusType::Unknown => "Unknown",
+            };
+            let driver = match driver::DriverHub::device_driver_at(i) {
+                Some(d) => {
+                    if driver::DriverHub::device_driver_is_candidate(i) {
+                        alloc::format!("candidate:{}(unimplemented)", d)
+                    } else {
+                        alloc::string::String::from(d)
+                    }
+                }
+                None => alloc::string::String::from("unbound"),
+            };
+            let mut target = klib::json::VecTarget::new();
+            let mut writer = klib::json::JsonWriter::new(&mut target);
+            writer
+                .start_object()
+                .and_then(|mut o| {
+                    o.field_str("name", name)?;
+                    o.field_str("bus", bus_str)?;
+                    o.field_str("driver", &driver)?;
+                    o.field_bool("volatile", info.volatile)?;
+                    match capacity {
+                        Some(c) => {
+                            let _ = o.field_u64("capacity_bytes", c)?;
+                        }
+                        None => {
+                            let _ = o.field_null("capacity_bytes")?;
+                        }
+                    }
+                    o.end()
+                })
+                .expect("Vec-backed disk info JSON serialization cannot fail");
+            return target
+                .into_string()
+                .expect("disk info JSON keys and device names are UTF-8");
+        }
+        disk_error_json("not_found", name)
+    }
+
+    fn disk_partitions_json(&self, name: &str) -> String {
+        let count = driver::DriverHub::device_count();
+        for i in 0..count {
+            let Some(info) = driver::DriverHub::device_info_at(i) else {
+                continue;
+            };
+            if info.name != name || info.kind != driver::DeviceKind::Block {
+                continue;
+            }
+            let Some(ops) = driver::DriverHub::device_at(i) else {
+                return disk_error_json("no_io_ops", name);
+            };
+            let Some(io) = ops.as_io() else {
+                return disk_error_json("no_io_ops", name);
+            };
+            // 真实读 LBA0；短读/签名不符 → 显式报错，绝不编造分区表。
+            let mut sector = [0u8; 512];
+            if io.read_at(0, &mut sector) < 512 {
+                return disk_error_json("lba0_short_read", name);
+            }
+            let mbr = match fs::mbr::parse_mbr(&sector) {
+                Ok(m) => m,
+                Err(_) => return disk_error_json("no_mbr", name),
+            };
+            let mut target = klib::json::VecTarget::new();
+            let mut writer = klib::json::JsonWriter::new(&mut target);
+            if let Ok(mut arr) = writer.start_array() {
+                for p in mbr.partitions.iter().copied() {
+                    if p.is_empty() {
+                        continue;
+                    }
+                    let _ = arr.push_object(|obj| {
+                        let _ = obj.field_u64("start_lba", p.start_lba as u64);
+                        let _ = obj.field_u64("sector_count", p.sector_count as u64);
+                        let _ = obj.field_str("type", &alloc::format!("{:#04x}", p.part_type));
+                        let _ = obj.field_bool("bootable", p.boot_flag == 0x80);
+                        Ok(())
+                    });
+                }
+                let _ = arr.end();
+            }
+            return target
+                .into_string()
+                .expect("disk partitions JSON serialization is ASCII-safe");
+        }
+        disk_error_json("not_found", name)
+    }
+}
+
+/// 统一磁盘错误对象 `{"error":<code>,"device":<name>}`（ADR-012 §4 诚实化：
+/// 任何无真实数据源的字段显式报错，绝不编造）。
+fn disk_error_json(code: &str, name: &str) -> String {
+    let mut target = klib::json::VecTarget::new();
+    let mut writer = klib::json::JsonWriter::new(&mut target);
+    writer
+        .start_object()
+        .and_then(|mut o| {
+            o.field_str("error", code)?;
+            o.field_str("device", name)?;
+            o.end()
+        })
+        .expect("Vec-backed disk error JSON serialization cannot fail");
+    target
+        .into_string()
+        .expect("disk error JSON keys and device names are UTF-8")
 }
 
 /// 初始化根文件系统并构建默认 RESTful 目录骨架与特殊文件系统挂载（ADR-005 / ADR-011 / ADR-012 / ADR-013）。

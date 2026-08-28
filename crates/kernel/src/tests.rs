@@ -4940,6 +4940,131 @@ pub fn test_vfs_m63() {
         info!("[test-vfs-m63] framebuffer DisplayDevice registered with real geometry OK");
     }
 
+    // ADR-005/012：/devices/disks 块设备子树。对 DriverHub 中每个 Block 设备，
+    // 断言 /devices/disks/{name}/info 暴露真实容量/易失性/驱动绑定，且
+    // /devices/disks/{name}/partitions 为真实 MBR 分区数组或显式诚实错误。
+    // 注意：PCI IDE 等"块类候选但未绑定 IO 驱动"的设备（如
+    // pci-ide-storage-*）**诚实返回** {"error":"no_io_ops",...}——无驱动即无
+    // 真实容量来源，宁缺毋假；测试须同时接受"真实磁盘"与"诚实错误"两种形态，
+    // 并断言至少有一个真实磁盘（携带 capacity_bytes）。
+    {
+        let disks_dir = root
+            .resolve("/devices/disks", true)
+            .expect("resolve /devices/disks");
+        let entries = disks_dir.list_dir().expect("list /devices/disks");
+        let count = driver::DriverHub::device_count();
+        let mut block_found = false;
+        let mut real_disk_found = false;
+        for i in 0..count {
+            let Some(info) = driver::DriverHub::device_info_at(i) else {
+                continue;
+            };
+            if info.kind != driver::DeviceKind::Block {
+                continue;
+            }
+            block_found = true;
+            let name = info.name;
+            assert!(
+                entries.iter().any(|e| e.name == name),
+                "/devices/disks must contain block device '{}'",
+                name
+            );
+            let info_node = root
+                .resolve(&alloc::format!("/devices/disks/{}/info", name), true)
+                .expect(&alloc::format!("resolve /devices/disks/{}/info", name));
+            let n = info_node.read_at(0, &mut buf).expect("read disk info");
+            let s = alloc::string::String::from(
+                core::str::from_utf8(&buf[..n]).expect("utf8 disk info"),
+            );
+
+            // 未绑定 IO 驱动的块类候选：如实返回错误对象，容量缺席是事实，
+            // 不是测试失败。
+            if s.contains(r#""error""#) {
+                assert!(
+                    s.contains(&alloc::format!(r#""device":"{}""#, name)),
+                    "disk error must name the device, got: {}",
+                    s.trim()
+                );
+                info!(
+                    "[test-vfs-m63] /devices/disks/{}/info (honest unbound): {}",
+                    name,
+                    s.trim()
+                );
+                // partitions 对无 IO 设备同样应是诚实错误。
+                let parts_node = root
+                    .resolve(&alloc::format!("/devices/disks/{}/partitions", name), true)
+                    .expect(&alloc::format!("resolve /devices/disks/{}/partitions", name));
+                let pn = parts_node.read_at(0, &mut buf).expect("read disk partitions");
+                let ps = core::str::from_utf8(&buf[..pn]).expect("utf8 disk partitions");
+                assert!(
+                    ps.contains(r#""error""#),
+                    "unbound disk partitions must be honest error, got: {}",
+                    ps.trim()
+                );
+                continue;
+            }
+
+            // 真实绑定的磁盘：必须暴露真实名称、容量、易失性。
+            real_disk_found = true;
+            assert!(
+                s.contains(&alloc::format!(r#""name":"{}""#, name)),
+                "disk info must name '{}', got: {}",
+                name,
+                s.trim()
+            );
+            // 容量必须与真实 as_io().size() 一致（不编造）。
+            let expected_cap = driver::DriverHub::device_at(i)
+                .and_then(|d| d.as_io())
+                .and_then(|io| io.size());
+            match expected_cap {
+                Some(cap) => assert!(
+                    s.contains(&alloc::format!(r#""capacity_bytes":{}"#, cap)),
+                    "disk info must expose real capacity {}, got: {}",
+                    cap,
+                    s.trim()
+                ),
+                None => assert!(
+                    s.contains(r#""capacity_bytes":null"#),
+                    "no capacity source must project null, got: {}",
+                    s.trim()
+                ),
+            }
+            // 易失性必须逐设备披露。
+            assert!(
+                s.contains(&alloc::format!(r#""volatile":{}"#, info.volatile)),
+                "disk info must disclose volatile={}, got: {}",
+                info.volatile,
+                s.trim()
+            );
+            // partitions：数组（真实 MBR）或显式错误对象，二者都诚实。
+            let parts_node = root
+                .resolve(&alloc::format!("/devices/disks/{}/partitions", name), true)
+                .expect(&alloc::format!("resolve /devices/disks/{}/partitions", name));
+            let pn = parts_node.read_at(0, &mut buf).expect("read disk partitions");
+            let ps = core::str::from_utf8(&buf[..pn]).expect("utf8 disk partitions");
+            assert!(
+                ps.starts_with('[') || ps.contains(r#""error""#),
+                "disk partitions must be a real array or honest error, got: {}",
+                ps.trim()
+            );
+            info!(
+                "[test-vfs-m63] /devices/disks/{}/info: {} | partitions: {}",
+                name,
+                s.trim(),
+                ps.trim()
+            );
+        }
+        assert!(
+            block_found,
+            "selftest expects at least one Block device in DriverHub for /devices/disks"
+        );
+        assert!(
+            real_disk_found,
+            "selftest expects at least one real (IO-bound) disk with capacity in /devices/disks"
+        );
+        info!("[test-vfs-m63] /devices/disks subtree verified");
+    }
+
     info!("[test-vfs-m63] PASS");
 }
 
