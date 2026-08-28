@@ -112,6 +112,22 @@ pub const SYS_ENTRY_READ: u32 = nr(domain::VFS, op::READ); // 0x42
 pub const SYS_ENTRY_UPDATE: u32 = nr(domain::VFS, op::WRITE); // 0x43
 pub const SYS_ENTRY_DELETE: u32 = nr(domain::VFS, op::DELETE); // 0x44
 
+// ---------- SYS_ENTRY_CREATE kind 编码（ADR-014 §4.4，与 INodeType 对齐）----------
+/// 创建普通文件（kind=REG/FILE）。
+pub const ENTRY_KIND_FILE: u64 = 1;
+/// 创建目录（kind=DIR/DIRECTORY）。
+pub const ENTRY_KIND_DIRECTORY: u64 = 0;
+/// 创建符号链接（kind=LINK/SYMLINK）。
+pub const ENTRY_KIND_SYMLINK: u64 = 2;
+/// 创建命名管道（kind=FIFO）。
+pub const ENTRY_KIND_FIFO: u64 = 3;
+/// 创建字符设备节点（kind=CHRDEV）。
+pub const ENTRY_KIND_CHARDEV: u64 = 4;
+/// 创建块设备节点（kind=BLKDEV）。
+pub const ENTRY_KIND_BLOCKDEV: u64 = 5;
+/// 创建套接字节点（kind=SOCK）。
+pub const ENTRY_KIND_SOCKET: u64 = 6;
+
 // ---------- 5. DEVICE Domain (0x50, UIO Sandboxing) ----------
 pub const SYS_DRIVER_REGISTER: u32 = nr(domain::DEVICE, op::CREATE); // 0x51
 pub const SYS_DRIVER_CLAIM: u32 = nr(domain::DEVICE, op::WRITE); // 0x53
@@ -363,19 +379,38 @@ fn sys_close(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
-/// `mkdir(path_ptr, perm_bits)`：创建目录。
-fn sys_mkdir(frame: &mut SyscallFrame) -> u64 {
+/// `entry_create(path_ptr, kind, perm)`：创建目录或特殊节点（ADR-014 §4.4 0x41）。
+///
+/// 参数：`a1=path_ptr`、`a2=kind`（[`ENTRY_KIND_*`]）、`a3=perm`。`kind` 决定
+/// 待建节点类型——不再无条件当目录创建。当前 VFS 实际支持创建目录（`mkdir`）
+/// 与普通文件（`create_file`）；其余 kind（symlink/fifo/chardev/blkdev/socket）
+/// 尚无可落地路径，**如实返回 `NotSupported`**（S09 宁缺毋假），绝不把特殊
+/// 节点静默当成目录创建造成伪成功。未知 kind 返回 `InvalidParam`。
+fn sys_entry_create(frame: &mut SyscallFrame) -> u64 {
     let path_ptr = frame.a1;
-    let perm_bits = frame.a2 as u32;
+    let kind = frame.a2;
+    let perm_bits = frame.a3 as u32;
     let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
     };
     let perm = vfs::inode::Permissions::from_bits(perm_bits);
     let root = crate::vfs_init::root();
-    match root.mkdir(&path, perm) {
-        Ok(_) => pack_ok(0),
-        Err(e) => pack_err(e),
+    match kind {
+        crate::syscall::ENTRY_KIND_DIRECTORY => match root.mkdir(&path, perm) {
+            Ok(_) => pack_ok(0),
+            Err(e) => pack_err(e),
+        },
+        crate::syscall::ENTRY_KIND_FILE => match root.create_file(&path, perm) {
+            Ok(_) => pack_ok(0),
+            Err(e) => pack_err(e),
+        },
+        crate::syscall::ENTRY_KIND_SYMLINK
+        | crate::syscall::ENTRY_KIND_FIFO
+        | crate::syscall::ENTRY_KIND_CHARDEV
+        | crate::syscall::ENTRY_KIND_BLOCKDEV
+        | crate::syscall::ENTRY_KIND_SOCKET => pack_err(Error::NotSupported),
+        _ => pack_err(Error::InvalidParam),
     }
 }
 
@@ -1219,7 +1254,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         }
 
         // VFS Domain (0x40)
-        SYS_ENTRY_CREATE => done(sys_mkdir(frame)),
+        SYS_ENTRY_CREATE => done(sys_entry_create(frame)),
         SYS_ENTRY_READ => done(sys_readdir(frame)),
         SYS_ENTRY_UPDATE => done(sys_entry_update(frame)),
         SYS_ENTRY_DELETE => done(sys_unlink(frame)),

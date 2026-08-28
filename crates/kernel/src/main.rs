@@ -462,6 +462,9 @@ unsafe fn kmain_body() -> ! {
     // ADR-014 SYS_ENTRY_READ (0x42)：标准紧凑 JSON 输出。
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_entry_read_json();
+    // ADR-014 SYS_ENTRY_CREATE (0x41)：kind 参数解析。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_syscall_entry_create_kind();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m63();
     #[cfg(feature = "kernel-tests")]

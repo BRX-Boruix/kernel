@@ -4023,6 +4023,164 @@ pub fn test_syscall_entry_read_json() {
     info!("[test-syscall-entry-read-json] PASS");
 }
 
+/// ADR-014 SYS_ENTRY_CREATE (0x41)：kind 参数解析（目录/文件/特殊节点/未知）。
+///
+/// 覆盖：
+/// 1. `kind=DIRECTORY` 建目录成功，`list_dir` 可见。
+/// 2. `kind=FILE` 建普通文件成功，`list_dir` 可见。
+/// 3. `kind=FIFO/CHRDEV/SOCK` 等特殊节点 → NotSupported（S09 宁缺毋假，
+///    不静默当目录创建）。
+/// 4. 未知 kind → InvalidParam。
+pub fn test_syscall_entry_create_kind() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use crate::vfs_init;
+    use task::Process;
+
+    info!("[test-syscall-entry-create-kind] === ADR-014: SYS_ENTRY_CREATE kind ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4: 0,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
+        }
+    }
+    use crate::syscall::{
+        ENTRY_KIND_CHARDEV, ENTRY_KIND_DIRECTORY, ENTRY_KIND_FILE, ENTRY_KIND_FIFO,
+        ENTRY_KIND_SYMLINK,
+    };
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x3000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
+    let base = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        for pg in 0..3u64 {
+            p.addr_space_mut().handle_page_fault(
+                base + pg * 0x1000,
+                arch_x86_64::paging::PageFaultCode::new(0),
+            );
+        }
+    }
+    // 三个路径串：dir / file / (路径复用)。写到前两页。
+    let dir_s = b"/scratch/kind_dir\0";
+    let file_s = b"/scratch/kind_file.txt\0";
+    let special_s = b"/scratch/kind_fifo\0";
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(dir_s.as_ptr(), (pa + off) as *mut u8, dir_s.len());
+        let pa1 = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base + 0x1000))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(file_s.as_ptr(), (pa1 + off) as *mut u8, file_s.len());
+        let pa2 = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base + 0x2000))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(special_s.as_ptr(), (pa2 + off) as *mut u8, special_s.len());
+    }
+
+    // 1. kind=DIRECTORY 建目录。
+    let mut mkdir = frame(
+        crate::syscall::SYS_ENTRY_CREATE,
+        base,
+        ENTRY_KIND_DIRECTORY,
+        0o755,
+    );
+    assert!(crate::syscall::syscall_entry(&mut mkdir));
+    assert!(
+        mkdir.result < 0x8000_0000_0000_0000,
+        "mkdir with kind=DIRECTORY must succeed"
+    );
+
+    // 2. kind=FILE 建普通文件。
+    let mut touch = frame(
+        crate::syscall::SYS_ENTRY_CREATE,
+        base + 0x1000,
+        ENTRY_KIND_FILE,
+        0o644,
+    );
+    assert!(crate::syscall::syscall_entry(&mut touch));
+    assert!(
+        touch.result < 0x8000_0000_0000_0000,
+        "create file with kind=FILE must succeed"
+    );
+
+    // 校验：list_dir 确实含 dir 与 file 两个节点。
+    let root = vfs_init::root();
+    let scratch = root.resolve("/scratch", true).expect("resolve /scratch");
+    let entries = scratch.list_dir().expect("list /scratch");
+    let names: alloc::vec::Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"kind_dir") && names.contains(&"kind_file.txt"),
+        "both created nodes must appear in list_dir (got {:?})",
+        names
+    );
+
+    // 3. 特殊节点 kind → NotSupported（宁缺毋假，不静默当目录创建）。
+    for bad_kind in [ENTRY_KIND_SYMLINK, ENTRY_KIND_FIFO, ENTRY_KIND_CHARDEV] {
+        let mut spec = frame(
+            crate::syscall::SYS_ENTRY_CREATE,
+            base + 0x2000,
+            bad_kind,
+            0o600,
+        );
+        assert!(crate::syscall::syscall_entry(&mut spec));
+        assert_eq!(
+            spec.result,
+            (-(klib::error::Error::NotSupported.to_errno() as i64)) as u64,
+            "special-node kind={} must be NotSupported",
+            bad_kind
+        );
+    }
+
+    // 4. 未知 kind → InvalidParam。
+    let mut unknown = frame(crate::syscall::SYS_ENTRY_CREATE, base, 999, 0);
+    assert!(crate::syscall::syscall_entry(&mut unknown));
+    assert_eq!(
+        unknown.result,
+        (-(klib::error::Error::InvalidParam.to_errno() as i64)) as u64,
+        "unknown kind must be InvalidParam"
+    );
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-syscall-entry-create-kind] PASS");
+}
+
 /// B14/B21：SYS_MEMORY_QUERY 全链路覆盖 + stdin Busy→EAGAIN 语义锁定。
 ///
 /// - **B14**：已映射页查询返回 PRESENT|USER|WRITABLE 位图；未触碰 demand
