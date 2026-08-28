@@ -19,6 +19,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use klib::error::Error;
 use spin::RwLock;
 
@@ -27,6 +28,10 @@ use crate::path::Path;
 
 /// 最大符号链接跳转深度（防死循环）。
 pub const MAX_SYMLINK_DEPTH: usize = 64;
+
+/// 未命名卷自动降级的短标识序号源（ADR-012 §3.2.2）：无硬件提示时生成
+/// 确定性 `storage-{seq}`，seq 单调递增，结合同名自增消解保证唯一。
+static UNNAMED_SEQ: AtomicUsize = AtomicUsize::new(1);
 
 /// 校验路径末段文件名（ADR-023 §2）：非空、不含 `/`、不含 C0 控制字符与 DEL。
 fn validate_name(name: &str) -> Result<(), Error> {
@@ -124,9 +129,45 @@ impl MountTable {
     /// 单线程下不存在）。
     pub fn mount_volume(&self, name: &str, fs: Arc<dyn FileSystem>) -> Result<String, Error> {
         validate_name(name)?;
+        let base = alloc::format!("/volumes/{}", name);
+        self.mount_named(base, fs)
+    }
+
+    /// 按未命名卷自动降级路径挂载（ADR-012 §3.2.2 未命名卷自动降级）。
+    ///
+    /// 无卷标分区不具友好名，须自动使用**短 UUID 或硬件识别名**挂载，避免
+    /// 退化为空名/乱名。本方法接收调用方从设备/分区识别出的硬件标识作为
+    /// 提示（如 `disk-2-part1`）；若未提供（`None` 或空/非法），则生成一个
+    /// 单调递增的短标识 `storage-{seq}`。生成是**确定性**的，不伪造硬件
+    /// 身份（S09：无 UUID 源时绝不以假 UUID 冒充）。
+    ///
+    /// 落到 `/volumes/{base}` 后仍走同名自增消解（与 [`Self::mount_volume`]
+    /// 同源），返回最终绝对路径。
+    pub fn mount_unnamed_volume(
+        &self,
+        hint: Option<&str>,
+        fs: Arc<dyn FileSystem>,
+    ) -> Result<String, Error> {
         // 卷命名空间须存在（A6：父链可解析）。
         self.resolve("/volumes", true)?;
-        let base = alloc::format!("/volumes/{}", name);
+        let base = match hint {
+            // 硬件识别名：合法则直接采用。
+            Some(h) if !h.is_empty() && validate_name(h).is_ok() => {
+                alloc::format!("/volumes/{}", h)
+            }
+            // 无/非法提示：生成确定性短标识 storage-{seq}（seq 单调递增）。
+            _ => {
+                let seq = UNNAMED_SEQ.fetch_add(1, Ordering::Relaxed);
+                alloc::format!("/volumes/storage-{:x}", seq)
+            }
+        };
+        self.mount_named(base, fs)
+    }
+
+    /// 卷挂载核心：以 `/volumes/` 下 base 为候选，同名自增消解后挂载返回
+    /// 最终绝对路径（ADR-012 §3.2.1）。base 已含 `/volumes/` 前缀且未段经
+    /// [`validate_name`] 校验，故不再重复校验。
+    fn mount_named(&self, base: String, fs: Arc<dyn FileSystem>) -> Result<String, Error> {
         // 创建首个候选挂载点目录（占用时多建几个空目录无害，最终以 mounts 键为准）。
         if let Err(e) = self.mkdir(&base, Permissions::all()) {
             match e {

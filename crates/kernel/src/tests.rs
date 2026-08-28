@@ -2760,8 +2760,60 @@ pub fn test_vfs_volume_collision() {
         "freed base name is reused, not data-4"
     );
 
-    // 5. 清理：卸载全部本测试卷挂载点，避免污染后续测试。
+    // 5. 未命名卷自动降级（ADR-012 §3.2.2）：无硬件提示生成 storage-{seq}，
+    //    有硬件提示则采用（disk-2-part1），均经同名自增消解保证唯一。
+    let fs4 = Arc::new(RamFS::new());
+    let um1 = root
+        .mount_unnamed_volume(None, fs4.clone())
+        .expect("mount unnamed volume with no hint");
+    assert!(
+        um1.starts_with("/volumes/storage-"),
+        "no-hint unnamed volume must fall back to storage-{{seq}}, got: {}",
+        um1
+    );
+    let fs5 = Arc::new(RamFS::new());
+    let um2 = root
+        .mount_unnamed_volume(None, fs5.clone())
+        .expect("mount second unnamed volume with no hint");
+    assert_ne!(
+        um1, um2,
+        "two no-hint unnamed volumes must get distinct paths: {} vs {}",
+        um1, um2
+    );
+    let fs6 = Arc::new(RamFS::new());
+    let um3 = root
+        .mount_unnamed_volume(Some("disk-2-part1"), fs6.clone())
+        .expect("mount unnamed volume with hardware hint");
+    assert_eq!(
+        um3.as_str(),
+        "/volumes/disk-2-part1",
+        "hinted unnamed volume keeps hardware identifier"
+    );
+    // 非法/空硬件提示须回退到 storage-{seq}，绝不采用乱名。
+    let fs7 = Arc::new(RamFS::new());
+    let um4 = root
+        .mount_unnamed_volume(Some("bad/name"), fs7.clone())
+        .expect("mount unnamed volume with invalid hint falls back");
+    assert!(
+        um4.starts_with("/volumes/storage-"),
+        "invalid hint must fall back to storage-{{seq}}, got: {}",
+        um4
+    );
+    info!(
+        "[test-vfs-volume-collision] unnamed fallback: {} {} {} {}",
+        um1, um2, um3, um4
+    );
+    // 未命名卷内容隔离且路径真实可解析。
+    root.create_file("/volumes/disk-2-part1/blob.bin", Permissions::all())
+        .expect("create file in hinted unnamed volume");
+    root.resolve("/volumes/disk-2-part1/blob.bin", true)
+        .expect("hinted unnamed volume path must resolve");
+
+    // 6. 清理：卸载全部本测试卷挂载点，避免污染后续测试。
     for p in ["/volumes/data", "/volumes/data-2", "/volumes/data-3"] {
+        let _ = root.unmount(p);
+    }
+    for p in [um1.as_str(), um2.as_str(), um3.as_str(), um4.as_str()] {
         let _ = root.unmount(p);
     }
 
