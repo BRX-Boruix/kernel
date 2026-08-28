@@ -1208,6 +1208,12 @@ where
         self.shm_maps.lock().len()
     }
 
+    /// 共享内存映射条目快照（ADR-014 共享语义：`sys_munmap` 按 vaddr 反查
+    /// 命中对象 id，走 `ipc::shm_unmap`）。只读拷贝，不持有内部锁返回。
+    pub fn shm_maps(&self) -> alloc::vec::Vec<ShmMap> {
+        self.shm_maps.lock().clone()
+    }
+
     /// 在固定栈顶下方预留用户栈区（向下增长，按需分页）。
     ///
     /// 返回栈顶虚拟地址（高地址端）。栈区起点 = 栈顶 - 栈大小。

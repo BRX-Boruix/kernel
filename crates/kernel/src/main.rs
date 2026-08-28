@@ -468,6 +468,9 @@ unsafe fn kmain_body() -> ! {
     // ADR-014 DRIVER 域补全：0x52 driver_query + 0x54 driver_unregister。
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_driver_query_unregister();
+    // ADR-014 §4.2 MEMORY_MAP 共享语义。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_syscall_memory_map_shared();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m63();
     #[cfg(feature = "kernel-tests")]

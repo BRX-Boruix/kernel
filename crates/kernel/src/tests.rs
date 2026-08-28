@@ -4405,6 +4405,120 @@ pub fn test_syscall_driver_query_unregister() {
     info!("[test-syscall-driver-query] PASS");
 }
 
+/// ADR-014 §4.2 MEMORY_MAP 共享语义：`shared_id` 映射共享对象 + `MEM_MAP_SHARED`
+/// 建共享 + `munmap` 解共享。
+///
+/// 覆盖：
+/// 1. `ipc::shm_create` 建对象 → `SYS_MEMORY_MAP(size,0,id)` 映射返回 vaddr。
+/// 2. 写入/读回映射帧（真实共享物理帧，非匿名伪装）。
+/// 3. `SYS_MEMORY_UNMAP(vaddr,size)` 命中共享映射 → `ipc::shm_unmap`，对象引用归零。
+/// 4. `SYS_MEMORY_MAP(size,MEM_MAP_SHARED,0)` 建+映射新对象 → vaddr 有效。
+/// 5. 映射不存在 id → NotFound。
+pub fn test_syscall_memory_map_shared() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::Process;
+
+    info!("[test-syscall-mmap-shared] === ADR-014: MEMORY_MAP shared semantics ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4: 0,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
+        }
+    }
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+
+    // 1. 建共享对象 + 经 syscall 映射。
+    let sid = ipc::shm_create(0x1000).expect("shm_create");
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, sid);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "shm map must succeed");
+    let vaddr = map.result;
+    assert_ne!(vaddr, 0, "shared map must return nonzero vaddr");
+
+    // 2. 写/读真实共享帧（经页表 translate 到物理帧，HHDM 写）。
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(vaddr))
+            .expect("shared mapping must be resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(b"SHARED_MEM\0".as_ptr(), (pa + off) as *mut u8, 11);
+    }
+    let mut rd = [0u8; 11];
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(vaddr))
+            .expect("shared mapping resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping((pa + off) as *const u8, rd.as_mut_ptr(), 11);
+    }
+    assert_eq!(&rd, b"SHARED_MEM\0", "shared frame content roundtrip");
+    info!("[test-syscall-mmap-shared] shared map + write/read OK vaddr={:#x}", vaddr);
+
+    // 3. munmap 命中共享 → 解除映射，对象引用归零。
+    assert_eq!(ipc::debug_shm_exists(sid), true, "object must be live");
+    let mut unmap = frame(crate::syscall::SYS_MEMORY_UNMAP, vaddr, 0x1000, 0);
+    assert!(crate::syscall::syscall_entry(&mut unmap));
+    assert!(unmap.result < 0x8000_0000_0000_0000, "shared munmap must succeed");
+    assert_eq!(ipc::debug_shm_exists(sid), false, "last unmap must free object");
+    info!("[test-syscall-mmap-shared] shared munmap released object OK");
+
+    // 4. MEM_MAP_SHARED 建+映射新对象。
+    let mut create = frame(
+        crate::syscall::SYS_MEMORY_MAP,
+        0x1000,
+        crate::syscall::MEM_MAP_SHARED,
+        0,
+    );
+    assert!(crate::syscall::syscall_entry(&mut create));
+    assert!(
+        create.result < 0x8000_0000_0000_0000,
+        "MEM_MAP_SHARED create+map must succeed"
+    );
+    assert_ne!(create.result, 0, "shared-create must return nonzero vaddr");
+    info!("[test-syscall-mmap-shared] MEM_MAP_SHARED create+map OK vaddr={:#x}", create.result);
+
+    // 5. 映射不存在 id → NotFound。
+    let mut bad = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0xDEAD_BEEF);
+    assert!(crate::syscall::syscall_entry(&mut bad));
+    assert_eq!(
+        bad.result,
+        (-(klib::error::Error::NotFound.to_errno() as i64)) as u64,
+        "map nonexistent shared_id must be NotFound"
+    );
+    info!("[test-syscall-mmap-shared] map nonexistent id -> NotFound OK");
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-syscall-mmap-shared] PASS");
+}
+
 /// B14/B21：SYS_MEMORY_QUERY 全链路覆盖 + stdin Busy→EAGAIN 语义锁定。
 ///
 /// - **B14**：已映射页查询返回 PRESENT|USER|WRITABLE 位图；未触碰 demand

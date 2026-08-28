@@ -96,6 +96,10 @@ const STREAM_OFFSET_CURRENT: u64 = u64::MAX;
 
 // ---------- 2. MEMORY Domain (0x20) ----------
 pub const SYS_MEMORY_MAP: u32 = nr(domain::MEMORY, op::CREATE); // 0x21
+
+/// SYS_MEMORY_MAP `flags` 位：新建共享内存对象并映射（ADR-014 §4.2，旧
+/// SYS_SHM_CREATE 合并路径；`shared_id` 参数置 0 走本路径）。
+pub const MEM_MAP_SHARED: u64 = 1 << 0;
 pub const SYS_MEMORY_QUERY: u32 = nr(domain::MEMORY, op::READ); // 0x22
 pub const SYS_MEMORY_GROW: u32 = nr(domain::MEMORY, op::WRITE); // 0x23
 pub const SYS_MEMORY_UNMAP: u32 = nr(domain::MEMORY, op::DELETE); // 0x24
@@ -964,26 +968,77 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
 /// `mmap(size)`：在当前进程用户空间预留一段按需分页区，返回起始地址。
 fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
     let size = frame.a1;
+    let flags = frame.a2;
+    let shared_id = frame.a3;
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
-    let flags = PageFlags::empty().writable().user();
-    match proc.addr_space_mut().mmap_user(size, flags) {
+    // ADR-014 §4.2 共享语义：`shared_id != 0` 映射指定共享内存对象（旧
+    // SYS_SHM_MAP 合并）；`flags & MEM_MAP_SHARED` 新建共享对象并映射（旧
+    // SYS_SHM_CREATE 合并）。二者返回起始虚拟地址。均经 `ipc::shm_*` 路径，
+    // 不再把 shared_id 静默忽略成匿名映射。
+    if shared_id != 0 {
+        let addr_space = proc.addr_space_mut();
+        return match ipc::shm_map::<arch_x86_64::paging::X86PageTable>(shared_id, addr_space) {
+            Ok(vaddr) => pack_ok(vaddr),
+            Err(e) => {
+                klib::info!("[mmap] shm_map id={} failed: {:?}", shared_id, e);
+                pack_err(Error::NotFound)
+            }
+        };
+    }
+    if flags & MEM_MAP_SHARED != 0 {
+        // 新建共享对象并映射（旧 SHM_CREATE 合并路径）。对象 id 由 QUERY 按
+        // 地址反查（同 MEM_MAP_SHARED 语义）；此处只负责建+映射。
+        let new_id = match ipc::shm_create(size) {
+            Ok(id) => id,
+            Err(e) => return pack_err(e),
+        };
+        let addr_space = proc.addr_space_mut();
+        return match ipc::shm_map::<arch_x86_64::paging::X86PageTable>(new_id, addr_space) {
+            Ok(vaddr) => pack_ok(vaddr),
+            Err(e) => {
+                // 映射失败则销毁刚建的对象，避免悬挂（诚实回滚）。
+                let _ = ipc::shm_destroy(new_id);
+                klib::info!("[mmap] shm_create+map failed: {:?}", e);
+                pack_err(Error::NoSpace)
+            }
+        };
+    }
+    let pf = PageFlags::empty().writable().user();
+    match proc.addr_space_mut().mmap_user(size, pf) {
         Ok(addr) => pack_ok(addr),
         Err(e) => pack_err(e),
     }
 }
 
-/// `munmap(addr, size)`：释放当前进程的一段匿名 mmap 地址区间。
+/// `munmap(addr, size)`：释放当前进程的一段 mmap 地址区间（匿名或共享）。
 ///
-/// ABI 使用 `rdi=addr`、`rsi=size`。地址与长度必须均为 4KiB 粒度，且整个范围
-/// 必须属于单个匿名 mmap 区域；否则返回明确错误，绝不把无操作伪装成成功。
+/// ABI 使用 `rdi=addr`、`rsi=size`。地址必须 4KiB 粒度。若 `addr` 命中本进程
+/// 已映射的共享内存对象（ADR-014 共享语义），则走 `ipc::shm_unmap` 解除该
+/// 对象映射（引用归零即回收帧）；否则走匿名 `munmap_anonymous`。
 fn sys_munmap(frame: &mut SyscallFrame) -> u64 {
     let addr = frame.a1;
     let size = frame.a2;
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
+    // 共享优先：查本进程 shm_maps 是否有以 `addr` 起始的对象映射。
+    let shared_id = proc
+        .addr_space()
+        .shm_maps()
+        .iter()
+        .find(|m| m.vaddr == addr)
+        .map(|m| m.id);
+    if let Some(id) = shared_id {
+        return match ipc::shm_unmap::<arch_x86_64::paging::X86PageTable>(id, proc.addr_space_mut()) {
+            Ok(_) => {
+                klib::info!("[munmap] shm_unmap id={} at {:#x}", id, addr);
+                pack_ok(0)
+            }
+            Err(e) => pack_err(Error::NotFound),
+        };
+    }
     match proc.addr_space_mut().munmap_anonymous(addr, size) {
         Ok(()) => pack_ok(0),
         Err(e) => pack_err(e),
