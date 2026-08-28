@@ -3856,6 +3856,173 @@ pub fn test_syscall_pipe() {
     info!("[test-syscall-pipe] PASS");
 }
 
+/// ADR-014 SYS_ENTRY_READ (0x42)：标准紧凑 JSON 数组输出（ADR-013 对象视图）。
+///
+/// 覆盖：
+/// 1. 目录 readdir 输出为 `[{"name":..,"type":..,"size":..},...]` 合法 JSON。
+/// 2. 含引号/反斜杠的文件名被正确转义（S09 宁缺毋假，不破坏成帧）。
+/// 3. 子目录 type="dir"、文件 type="file"。
+/// 4. 过小缓冲触发整条省略（仍返回完整数组），空目录返回 `[]`。
+pub fn test_syscall_entry_read_json() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use crate::vfs_init;
+    use task::Process;
+    use vfs::inode::Permissions;
+
+    info!("[test-syscall-entry-read-json] === ADR-014: SYS_ENTRY_READ JSON ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4: 0,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
+        }
+    }
+
+    let root = vfs_init::root();
+    root.mkdir("/json_rd", Permissions::read_write())
+        .expect("mkdir json_rd");
+    root.create_file("/json_rd/alpha.txt", Permissions::read_write())
+        .expect("create alpha");
+    root.mkdir("/json_rd/sub", Permissions::read_write())
+        .expect("mkdir sub");
+    // 含引号与反斜杠的恶意文件名，验证转义。
+    root.create_file("/json_rd/we\"ird\\n.txt", Permissions::read_write())
+        .expect("create quoted filename");
+    root.mkdir("/json_rd_empty", Permissions::read_write())
+        .expect("mkdir empty dir");
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x4000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
+    let base = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space_mut()
+            .handle_page_fault(base, arch_x86_64::paging::PageFaultCode::new(0));
+        p.addr_space_mut().handle_page_fault(
+            base + 0x1000,
+            arch_x86_64::paging::PageFaultCode::new(0),
+        );
+        p.addr_space_mut().handle_page_fault(
+            base + 0x2000,
+            arch_x86_64::paging::PageFaultCode::new(0),
+        );
+        p.addr_space_mut().handle_page_fault(
+            base + 0x3000,
+            arch_x86_64::paging::PageFaultCode::new(0),
+        );
+    }
+    let path_s = b"/json_rd\0";
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(path_s.as_ptr(), (pa + off) as *mut u8, path_s.len());
+    }
+    let path_ptr = base;
+    let out_ptr = base + 0x1000;
+
+    // 1. 大缓冲 readdir → 合法 JSON 数组。
+    let mut rd = frame(crate::syscall::SYS_ENTRY_READ, path_ptr, out_ptr, 512);
+    assert!(crate::syscall::syscall_entry(&mut rd));
+    assert!(
+        rd.result < 0x8000_0000_0000_0000,
+        "readdir must succeed"
+    );
+    let n = rd.result as usize;
+    assert!(n >= 2, "JSON array must be non-trivial");
+    let mut json_buf = alloc::vec::Vec::new();
+    json_buf.resize(n, 0u8);
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(out_ptr))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping((pa + off) as *const u8, json_buf.as_mut_ptr(), n);
+    }
+    let json = core::str::from_utf8(&json_buf).expect("JSON output must be valid UTF-8");
+    info!("[test-syscall-entry-read-json] json={}", json);
+    // 成帧断言：以 [ 开头 ] 结尾；含 name/type/size 字段；引号/反斜杠已转义。
+    assert!(json.starts_with('[') && json.ends_with(']'), "array framing");
+    assert!(json.contains("\"name\""), "name field");
+    assert!(json.contains("\"type\""), "type field");
+    assert!(json.contains("\"size\""), "size field");
+    assert!(json.contains("\"type\":\"dir\""), "sub dir type");
+    assert!(json.contains("\"type\":\"file\""), "file type");
+    assert!(json.contains("\\\"") || !json.contains("we\""), "quote escaped");
+    assert!(json.contains("\\\\"), "backslash escaped");
+    assert!(!json.contains("we\"ird"), "raw quote must be escaped");
+    // 每出现 type 字段，必须是合法 `"type":"..."` 而非裸 `type:`。
+    assert!(!json.contains("name:type"), "must not be legacy name:type format");
+
+    // 3. 空目录 → `[]`。（/json_rd_empty 已在上方创建；空输出写入干净的
+    //    第 4 页 base+0x3000，避免与首个 readdir 输出页重叠产生误读。）
+    let empty_path_s = b"/json_rd_empty\0";
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base + 0x2000))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(empty_path_s.as_ptr(), (pa + off) as *mut u8, empty_path_s.len());
+    }
+    let mut rd_empty = frame(
+        crate::syscall::SYS_ENTRY_READ,
+        base + 0x2000,
+        base + 0x3000,
+        128,
+    );
+    assert!(crate::syscall::syscall_entry(&mut rd_empty));
+    assert!(rd_empty.result < 0x8000_0000_0000_0000, "empty readdir ok");
+    let ne = rd_empty.result as usize;
+    let mut empty_buf = alloc::vec::Vec::new();
+    empty_buf.resize(ne, 0u8);
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(base + 0x3000))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping((pa + off) as *const u8, empty_buf.as_mut_ptr(), ne);
+    }
+    let empty_json = core::str::from_utf8(&empty_buf).expect("empty JSON valid");
+    assert_eq!(empty_json, "[]", "empty dir must serialize to []");
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-syscall-entry-read-json] PASS");
+}
+
 /// B14/B21：SYS_MEMORY_QUERY 全链路覆盖 + stdin Busy→EAGAIN 语义锁定。
 ///
 /// - **B14**：已映射页查询返回 PRESENT|USER|WRITABLE 位图；未触碰 demand

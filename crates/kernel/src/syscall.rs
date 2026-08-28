@@ -450,11 +450,13 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
         Err(e) => return pack_err(e),
     };
 
-    // 格式化为换行分隔的名字与大小列表。
-    // 格式：`name:type:size\n`。KM5：只交付**完整行**——放不下整条的尾部
-    // 条目整体省略，绝不把半行 `name:type:` 交给调用方破坏协议成帧；返回
+    // 标准紧凑 JSON 数组输出（ADR-014 §4.1 / ADR-013 对象视图一致约定）：
+    //   [{"name":"...","type":"file","size":123}, ...]
+    // 经 klib::json 的 JsonWriter 逐字段转义（S09 宁缺毋假：名字含引号/反斜杠
+    // 等控制符均正确转义，绝不裸拼破坏成帧）。KM5：只交付**完整数组**——放
+    // 不下整条时尾部条目整体省略，绝不把半截 `{"name":"...` 交给调用方；返回
     // 字节数 < 完整列表长度即表示还有剩余条目（分页语义，成文）。
-    /// readdir 单条记录的类型标签（协议字段）。
+    /// readdir 单条记录的类型标签（JSON `type` 字段值，ADR-013 约定）。
     const fn type_tag(t: vfs::inode::INodeType) -> &'static str {
         match t {
             vfs::inode::INodeType::Directory => "dir",
@@ -466,28 +468,55 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
             vfs::inode::INodeType::Socket => "sock",
         }
     }
-    let mut out = alloc::string::String::new();
+
+    // 先在内存 VecTarget 构建完整 JSON 数组（总长受 max_bytes 约束，防无界
+    // 分配），再整块校验并拷入用户缓冲。VecTarget::write_str 无分配错误路径，
+    // JsonWriter 的 Result 恒 Ok，.expect 保守可行。
+    let mut target = klib::json::VecTarget::new();
+    let mut writer = klib::json::JsonWriter::new(&mut target);
+    let mut array = writer.start_array().expect("Vec-backed JSON cannot fail");
+    // 已写数组字节数（不含进行中的元素）；array 持有 target 可变借用，故用
+    // 计数变量而非 target.as_bytes() 量长。
+    let mut written = 0usize;
+    let mut first = true;
     for e in &entries {
-        use core::fmt::Write;
-        let mut line = alloc::string::String::new();
-        if write!(line, "{}:{}:{}\n", e.name, type_tag(e.node_type), e.size).is_err() {
-            // String 写入不可能失败（alloc::fmt 无分配错误路径），保守跳过。
-            continue;
+        // 单条记录 JSON 化到临时 target 再量长：放不下则整条省略（含其前导
+        // 逗号），保证主数组永不含未闭合/半截对象。
+        let mut item = klib::json::VecTarget::new();
+        let mut iw = klib::json::JsonWriter::new(&mut item);
+        let mut obj = iw.start_object().expect("Vec-backed JSON cannot fail");
+        obj.field_str("name", e.name.as_str())
+            .expect("Vec-backed JSON cannot fail")
+            .field_str("type", type_tag(e.node_type))
+            .expect("Vec-backed JSON cannot fail")
+            .field_u64("size", e.size)
+            .expect("Vec-backed JSON cannot fail");
+        let _ = obj.end();
+        let item_bytes = item.as_bytes();
+        // item 仅由 JsonWriter 生成，恒为合法 UTF-8（field_str 按 char 转义）。
+        let item_str = match core::str::from_utf8(item_bytes) {
+            Ok(s) => s,
+            Err(_) => continue, // 保守：非法 UTF-8 则跳过该条（理论不可达）
+        };
+        // 估算加入本条后的总长：非首条多一个前导逗号。
+        let add = item_bytes.len() + if first { 0 } else { 1 };
+        if written + add + 1 > max_bytes {
+            break; // 放不下本条，整体省略剩余条目
         }
-        if out.len() + line.len() > max_bytes {
+        if array.push_raw(item_str).is_err() {
             break;
         }
-        out.push_str(&line);
+        written += add;
+        first = false;
     }
-    // 审计 B10：缓冲连**第一条**都放不下时返回 0 会与 EOF/空目录不可区分
-    // ——大目录静默丢条目。按 POSIX getdents 惯例以 EINVAL 如实拒绝：调用
-    // 方加大缓冲重试即可；只有 entries 为空（真 EOF）才返回 0。
-    if out.is_empty() && !entries.is_empty() {
+    let _ = array.end();
+    let bytes = target.as_bytes();
+    let n = bytes.len();
+    // B10：缓冲连 `[]` 都放不下（max_bytes<2）时返回 0 会与 EOF/空目录不可
+    // 区分。按 POSIX getdents 惯例以 EINVAL 如实拒绝；entries 为空才返回 0。
+    if n == 0 && !entries.is_empty() {
         return pack_err(Error::InvalidParam);
     }
-
-    let bytes = out.as_bytes();
-    let n = bytes.len();
     if n > 0 {
         if let Err(e) = validate_user_range(buf_ptr, n as u64, UserAccess::Write) {
             return pack_err(e);
