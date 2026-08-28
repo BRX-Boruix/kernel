@@ -4,7 +4,8 @@
 //! 与 ADR-013（JSON 第一公民）：
 //! - `/`：根内存文件系统（RamFS）
 //! - `/processes`：挂载 ProcFS（动态只读 JSON 状态节点）
-//! - `/system`：挂载 SysFS（CPU、内存、内核信息 JSON）
+//! - `/system`：真实可写 RamFS 域目录（ADR-012 swapfile 归属），`/system/info`
+//!   挂载 SysFS（CPU、内存、内核信息 JSON）
 //! - `/devices`：挂载 DevFS（串口主数据通道、属性子文件、设备列表 JSON）
 
 use alloc::format;
@@ -734,8 +735,16 @@ pub fn init() {
         .mount("/processes", procfs)
         .expect("mount procfs");
 
+    // `/system` 保持为真实可写 RamFS 域目录（ADR-012 §3 #3：可容纳 swapfile 等
+    // 运行时文件）；SysFS 只读 JSON 视图挂载到子目录 `/system/info/`，避免
+    // 虚视图遮蔽真实存储归属。
+    mount_table
+        .mkdir("/system/info", Permissions::all())
+        .expect("mkdir /system/info");
     let sysfs = Arc::new(SysFS::new(Arc::new(KernelSystemProvider)));
-    mount_table.mount("/system", sysfs).expect("mount sysfs");
+    mount_table
+        .mount("/system/info", sysfs)
+        .expect("mount sysfs at /system/info");
 
     let devfs = Arc::new(DevFS::new(Arc::new(KernelDeviceProvider)));
     mount_table.mount("/devices", devfs).expect("mount devfs");

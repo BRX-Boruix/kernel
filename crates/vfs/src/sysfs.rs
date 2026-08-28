@@ -1,9 +1,13 @@
-//! SysFS 系统信息虚拟文件系统（挂载于 `/system`）。
+//! SysFS 系统信息虚拟文件系统（挂载于 `/system/info`，只读 JSON 视图）。
 //!
 //! 遵循 ADR-005（RESTful 资源观）与 ADR-013（JSON 第一公民）：
-//! - `/system/cpu`：CPU 架构、核心数、频率及特性列表 JSON；
-//! - `/system/memory`：LazyBuddy 内存容量、已分配、空闲及紧急预留池状态 JSON；
-//! - `/system/kernel`：内核版本、启动时间及构建元数据 JSON。
+//! - `/system/info/cpu`：CPU 架构、核心数、频率及特性列表 JSON；
+//! - `/system/info/memory`：LazyBuddy 内存容量、已分配、空闲及紧急预留池状态 JSON；
+//! - `/system/info/kernel`：内核版本、启动时间及构建元数据 JSON。
+//!
+//! `/system` 本身是真实可写 RamFS 域目录（ADR-012 swapfile 归属），SysFS 只读
+//! 视图挂载在其 `info` 子目录下，避免虚视图遮蔽真实存储。本 FS 为纯只读投影，
+//! 不承载任何写文件。
 
 use alloc::string::String;
 use alloc::sync::Arc;

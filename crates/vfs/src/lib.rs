@@ -296,6 +296,7 @@ mod tests {
 
         mount_table.mkdir("/processes", Permissions::all()).unwrap();
         mount_table.mkdir("/system", Permissions::all()).unwrap();
+        mount_table.mkdir("/system/info", Permissions::all()).unwrap();
         mount_table.mkdir("/devices", Permissions::all()).unwrap();
 
         // 1. ProcFS 挂载与 JSON 读取
@@ -317,19 +318,27 @@ mod tests {
         assert!(s2.contains(r#""pid":1"#));
         assert!(s2.contains(r#""state":"Running""#));
 
-        // 2. SysFS 挂载与 JSON 读取
+        // 2. SysFS 挂载与 JSON 读取（/system/info）
         let sysfs = Arc::new(SysFS::new(Arc::new(MockSystemProvider)));
-        mount_table.mount("/system", sysfs).unwrap();
+        mount_table.mount("/system/info", sysfs).unwrap();
 
-        let cpu_file = mount_table.resolve("/system/cpu", true).unwrap();
+        let cpu_file = mount_table.resolve("/system/info/cpu", true).unwrap();
         let n3 = cpu_file.read_at(0, &mut buf).unwrap();
         let s3 = core::str::from_utf8(&buf[..n3]).unwrap();
         assert!(s3.contains(r#""arch":"x86_64""#));
 
-        let mem_file = mount_table.resolve("/system/memory", true).unwrap();
+        let mem_file = mount_table.resolve("/system/info/memory", true).unwrap();
         let n4 = mem_file.read_at(0, &mut buf).unwrap();
         let s4 = core::str::from_utf8(&buf[..n4]).unwrap();
         assert!(s4.contains(r#""capacity_bytes":134217728"#));
+
+        // /system 本体仍是真实可写 RamFS：可容纳 swapfile 等运行时文件。
+        mount_table
+            .create_file("/system/swapfile", Permissions::read_write())
+            .unwrap();
+        let _swap = mount_table.resolve("/system/swapfile", true).unwrap();
+        // SysFS 只读视图不应遮蔽 /system 的可写性：swapfile 存在而 info 视图同在。
+        mount_table.resolve("/system/info/cpu", true).unwrap();
 
         // 3. DevFS 挂载与属性子文件
         let devfs = Arc::new(DevFS::new(Arc::new(MockDeviceProvider {

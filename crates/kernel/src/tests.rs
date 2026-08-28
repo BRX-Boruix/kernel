@@ -4761,6 +4761,7 @@ pub fn test_syscall_std_stream_close() {
 /// M6.3：验证特殊文件系统（ProcFS / SysFS / DevFS）与 JSON 第一公民。
 pub fn test_vfs_m63() {
     use crate::vfs_init;
+    use vfs::inode::Permissions;
 
     info!("[test-vfs-m63] === M6.3: ProcFS, SysFS, DevFS JSON First-Citizen Selftest ===");
 
@@ -4786,12 +4787,12 @@ pub fn test_vfs_m63() {
     );
     info!("[test-vfs-m63] /processes/list JSON output: {}", s1.trim());
 
-    // 2. SysFS 验证 (/system/cpu, /system/memory, /system/kernel)
+    // 2. SysFS 验证 (/system/info/cpu, /system/info/memory, /system/info/kernel)
     let cpu_node = root
-        .resolve("/system/cpu", true)
-        .expect("resolve /system/cpu");
-    let n2 = cpu_node.read_at(0, &mut buf).expect("read /system/cpu");
-    let s2 = core::str::from_utf8(&buf[..n2]).expect("utf8 /system/cpu");
+        .resolve("/system/info/cpu", true)
+        .expect("resolve /system/info/cpu");
+    let n2 = cpu_node.read_at(0, &mut buf).expect("read /system/info/cpu");
+    let s2 = core::str::from_utf8(&buf[..n2]).expect("utf8 /system/info/cpu");
     assert!(
         s2.contains(r#""arch":""#),
         "cpu json must contain arch field"
@@ -4820,31 +4821,42 @@ pub fn test_vfs_m63() {
             feature.name()
         );
     }
-    info!("[test-vfs-m63] /system/cpu: {}", s2.trim());
+    info!("[test-vfs-m63] /system/info/cpu: {}", s2.trim());
 
     let mem_node = root
-        .resolve("/system/memory", true)
-        .expect("resolve /system/memory");
-    let n3 = mem_node.read_at(0, &mut buf).expect("read /system/memory");
-    let s3 = core::str::from_utf8(&buf[..n3]).expect("utf8 /system/memory");
+        .resolve("/system/info/memory", true)
+        .expect("resolve /system/info/memory");
+    let n3 = mem_node.read_at(0, &mut buf).expect("read /system/info/memory");
+    let s3 = core::str::from_utf8(&buf[..n3]).expect("utf8 /system/info/memory");
     assert!(
         s3.contains(r#""capacity_bytes":"#),
         "mem json must contain capacity_bytes"
     );
-    info!("[test-vfs-m63] /system/memory: {}", s3.trim());
+    info!("[test-vfs-m63] /system/info/memory: {}", s3.trim());
 
     let kernel_node = root
-        .resolve("/system/kernel", true)
-        .expect("resolve /system/kernel");
+        .resolve("/system/info/kernel", true)
+        .expect("resolve /system/info/kernel");
     let n4 = kernel_node
         .read_at(0, &mut buf)
-        .expect("read /system/kernel");
-    let s4 = core::str::from_utf8(&buf[..n4]).expect("utf8 /system/kernel");
+        .expect("read /system/info/kernel");
+    let s4 = core::str::from_utf8(&buf[..n4]).expect("utf8 /system/info/kernel");
     assert!(
         s4.contains(r#""name":"BORUIX""#),
         "kernel json must contain name BORUIX"
     );
-    info!("[test-vfs-m63] /system/kernel: {}", s4.trim());
+    info!("[test-vfs-m63] /system/info/kernel: {}", s4.trim());
+
+    // 2b. /system 本体为真实可写 RamFS 域目录（ADR-012 §3 #3：swapfile 归属）：
+    //     SysFS 只读视图迁移到 /system/info 后，/system 可写、info 只读共存。
+    root.create_file("/system/swapfile", Permissions::all())
+        .expect("create /system/swapfile in writable /system");
+    let swap_node = root.resolve("/system/swapfile", true).expect("resolve swapfile");
+    let _ = swap_node;
+    // info 视图未受影响。
+    root.resolve("/system/info/cpu", true)
+        .expect("/system/info/cpu still resolvable after writing /system/swapfile");
+    info!("[test-vfs-m63] /system is writable (created /system/swapfile)");
 
     // 3. DevFS 验证 (/devices/list, /devices/serial-com1/baudrate, /devices/displays/primary/mode)
     let dev_list = root
