@@ -209,7 +209,9 @@ impl DeviceInfoProvider for KernelDeviceProvider {
             if let Some(info) = driver::DriverHub::device_info_at(i) {
                 if info.name == COM1_DEVICE_NAME {
                     if let Some(ops) = driver::DriverHub::device_at(i) {
-                        return Ok(ops.read(buf));
+                        if let Some(io) = ops.as_io() {
+                            return Ok(io.read(buf));
+                        }
                     }
                 }
             }
@@ -238,7 +240,9 @@ impl DeviceInfoProvider for KernelDeviceProvider {
             if let Some(info) = driver::DriverHub::device_info_at(i) {
                 if info.name == COM1_DEVICE_NAME {
                     if let Some(ops) = driver::DriverHub::device_at(i) {
-                        return Ok(ops.write(buf));
+                        if let Some(io) = ops.as_io() {
+                            return Ok(io.write(buf));
+                        }
                     }
                 }
             }
@@ -600,7 +604,7 @@ fn populate_builtin_programs(mount_table: &Arc<vfs::mount::MountTable>) {
 }
 
 /// drv 块设备 → fs::ByteDevice 桥接（只读路径足够；EXT2 驱动本身只读）。
-struct DrvByteBridge(&'static dyn driver::DeviceOps);
+struct DrvByteBridge(&'static dyn driver::Device);
 
 impl fs::ByteDevice for DrvByteBridge {
     fn read_bytes(&self, offset: u64, out: &mut [u8]) -> usize {

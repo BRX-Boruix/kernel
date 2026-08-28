@@ -138,6 +138,39 @@ pub trait NetDevice: IoDevice {
     }
 }
 
+/// 显示设备（Framebuffer 线性显存、分辨率与刷新率配置，ADR-008 哲学三）。
+///
+/// 显示设备**不是**字节流通道：它不实现 `IoDevice`，而是以 [`Device`] 身份
+/// 注册进 DriverHub（`DeviceEntry.dev` 现承载 `&dyn Device`），经
+/// [`Device::as_display`] 观测。刷新率若无真值来源则返回 `None`（宁缺毋假，
+/// 禁止编造 60Hz 之类的缺省）。
+pub trait DisplayDevice: Device + Send + Sync {
+    /// Framebuffer 线性显存起始地址（字节）。缺省 `None` = 无显存可映射。
+    fn framebuffer_address(&self) -> Option<u64> {
+        None
+    }
+    /// 显存总大小（字节）。
+    fn framebuffer_size(&self) -> Option<u64> {
+        None
+    }
+    /// 分辨率 `(width, height)`（像素）。
+    fn resolution(&self) -> Option<(u32, u32)> {
+        None
+    }
+    /// 每行字节数（pitch）。
+    fn pitch(&self) -> Option<u32> {
+        None
+    }
+    /// 每像素位数（bpp）。
+    fn bits_per_pixel(&self) -> Option<u32> {
+        None
+    }
+    /// 刷新率（Hz）。无真实披露来源时缺省 `None`。
+    fn refresh_hz(&self) -> Option<u32> {
+        None
+    }
+}
+
 /// 设备种类分类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceKind {
@@ -202,6 +235,11 @@ pub trait Device: Send + Sync {
         None
     }
     fn as_block(&self) -> Option<&dyn BlockDevice> {
+        None
+    }
+    /// 显示设备能力（ADR-008 哲学三）：Framebuffer 线性显存、分辨率与刷新率
+    /// 配置。非显示设备保持缺省 `None`；显示设备实现 [`DisplayDevice`]。
+    fn as_display(&self) -> Option<&dyn DisplayDevice> {
         None
     }
 }

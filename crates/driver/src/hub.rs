@@ -16,7 +16,7 @@ use klib::error::Error;
 use klib::{info, warn};
 use spin::Mutex;
 
-use crate::device::{BusType, DeviceInfo, DeviceOps};
+use crate::device::{BusType, Device, DeviceInfo};
 use crate::driver::{Driver, DriverEntry, DriverStage};
 use crate::event::{DeviceEvent, publish_event};
 
@@ -35,7 +35,10 @@ pub(crate) const EXPLICIT_BIND_SCORE: u8 = 50;
 #[derive(Clone, Copy)]
 pub struct DeviceEntry {
     pub info: DeviceInfo,
-    pub dev: Option<&'static dyn DeviceOps>,
+    /// 设备实例。`&'static dyn Device` 容纳所有分类：IO 设备实现
+    /// `DeviceOps`（=Device+IoDevice），显示等非 IO 设备仅实现 [`Device`]
+    /// 并经 [`Device::as_display`] 观测。
+    pub dev: Option<&'static dyn Device>,
     /// 绑定记录：竞标胜出的候选名，或注册时显式声明的接管驱动名。
     pub driver_name: Option<&'static str>,
     pub driver_score: u8,
@@ -150,7 +153,7 @@ impl DriverHub {
     /// 表满返回 [`Error::NoSpace`]（DM1）。
     pub fn register_device_info(
         info: DeviceInfo,
-        dev: Option<&'static dyn DeviceOps>,
+        dev: Option<&'static dyn Device>,
         driver_name: Option<&'static str>,
     ) -> Result<(), Error> {
         let mut list = DEVICES.lock();
@@ -406,8 +409,8 @@ impl DriverHub {
         list.get(index).and_then(|e| e.as_ref()).is_some()
     }
 
-    /// 获取指定索引的设备操作集。
-    pub fn device_at(index: usize) -> Option<&'static dyn DeviceOps> {
+    /// 获取指定索引的设备实例。
+    pub fn device_at(index: usize) -> Option<&'static dyn Device> {
         if index >= DEVICE_COUNT.load(Acquire) {
             return None;
         }

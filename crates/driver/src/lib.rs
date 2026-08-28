@@ -26,8 +26,8 @@ pub use drivers::pci_bus as pci;
 pub use drivers::pci_classes as pci_drivers;
 
 pub use device::{
-    BlockDevice, BusType, CharDevice, Device, DeviceInfo, DeviceKind, DeviceOps, InputDevice,
-    IoDevice, IoStats, NetDevice, sectors_touched,
+    BlockDevice, BusType, CharDevice, Device, DeviceInfo, DeviceKind, DeviceOps, DisplayDevice,
+    InputDevice, IoDevice, IoStats, NetDevice, sectors_touched,
 };
 pub use driver::{Driver, DriverEntry, DriverStage};
 pub use event::{

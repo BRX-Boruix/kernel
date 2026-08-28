@@ -9,6 +9,64 @@ use klib::{error, info};
 /// Limine framebuffer 指针。
 static FRAMEBUFFER_PTR: AtomicUsize = AtomicUsize::new(0);
 
+/// Framebuffer 显示设备实例（ADR-008 哲学三 `DisplayDevice`）。
+///
+/// 以 `&'static dyn Device` 注册进 DriverHub（**不是** IO 设备，不实现
+/// `IoDevice`——显示能力不冒充字节流通道）。真实几何与显存地址直读 Limine
+/// framebuffer 描述符（`FRAMEBUFFER_PTR`）。刷新率 Limine 不披露，
+/// `refresh_hz()` 返回 `None`（宁缺毋假，禁止编造 60Hz）。
+struct FramebufferDisplay;
+
+/// 读取 Limine framebuffer 描述符引用（指针为 0 时返回 None）。
+fn framebuffer_desc() -> Option<&'static limine::Framebuffer> {
+    let p = FRAMEBUFFER_PTR.load(Ordering::Acquire);
+    if p == 0 {
+        return None;
+    }
+    // SAFETY：指针来自 init_display 阶段注册的 Limine framebuffer 描述符，
+    // bootloader 保证其生命周期覆盖整个内核运行期；此处只读整型/地址字段。
+    Some(unsafe { &*(p as *const limine::Framebuffer) })
+}
+
+impl driver::Device for FramebufferDisplay {
+    fn name(&self) -> &'static str {
+        "framebuffer"
+    }
+    fn kind(&self) -> driver::DeviceKind {
+        driver::DeviceKind::Display
+    }
+    fn as_display(&self) -> Option<&dyn driver::DisplayDevice> {
+        Some(self)
+    }
+}
+
+impl driver::DisplayDevice for FramebufferDisplay {
+    fn framebuffer_address(&self) -> Option<u64> {
+        let fb = framebuffer_desc()?;
+        fb.address.as_ptr().map(|a| a as u64)
+    }
+    fn framebuffer_size(&self) -> Option<u64> {
+        let fb = framebuffer_desc()?;
+        Some(fb.pitch as u64 * fb.height as u64)
+    }
+    fn resolution(&self) -> Option<(u32, u32)> {
+        let fb = framebuffer_desc()?;
+        Some((fb.width as u32, fb.height as u32))
+    }
+    fn pitch(&self) -> Option<u32> {
+        let fb = framebuffer_desc()?;
+        Some(fb.pitch as u32)
+    }
+    fn bits_per_pixel(&self) -> Option<u32> {
+        let fb = framebuffer_desc()?;
+        Some(fb.bpp as u32)
+    }
+    fn refresh_hz(&self) -> Option<u32> {
+        // Limine 不披露刷新率 → 宁缺毋假不返回。
+        None
+    }
+}
+
 fn init_framebuffer(_hub: &DriverHub) {
     let p = FRAMEBUFFER_PTR.load(Ordering::Acquire);
     if p == 0 {
@@ -58,9 +116,9 @@ fn init_framebuffer(_hub: &DriverHub) {
             // C15.1：帧缓冲是易失显示面，内容不持久。
             volatile: true,
         },
-        // KM7：无 I/O 操作集 → dev=None。显示能力不冒充字节流通道；
-        // 驱动名绑定保留（framebuffer 驱动负责终端初始化，与 IO 无关）。
-        None,
+        // KM7/ADR-008：注册真实 DisplayDevice 实例——显示能力经 `as_display()`
+        // 观测，不冒充字节流通道（`as_io()` 恒 None）。
+        Some(&FramebufferDisplay as &'static dyn driver::Device),
         Some("framebuffer"),
     ) {
         // DM1（ADR-022 §5）：注册失败必须可见，静默丢设备不复存在。

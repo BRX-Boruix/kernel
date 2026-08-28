@@ -4548,6 +4548,60 @@ pub fn test_vfs_m63() {
         s7.trim()
     );
 
+    // ADR-008 哲学三：framebuffer 注册为真实 DisplayDevice 实例，经
+    // `device_at(i).as_display()` 可观测——显示能力不冒充字节流通道
+    // （as_io 恒 None），几何与显存地址直读 Limine 真值。
+    {
+        let count = driver::DriverHub::device_count();
+        let mut found_display = false;
+        for i in 0..count {
+            if let Some(info) = driver::DriverHub::device_info_at(i) {
+                if info.name == "framebuffer" && info.kind == driver::DeviceKind::Display {
+                    let dev = driver::DriverHub::device_at(i)
+                        .expect("registered framebuffer device must have an instance");
+                    assert!(
+                        dev.as_io().is_none(),
+                        "display device must NOT expose a byte-stream io channel"
+                    );
+                    let disp = dev
+                        .as_display()
+                        .expect("framebuffer device must expose DisplayDevice capability");
+                    let res = disp
+                        .resolution()
+                        .expect("framebuffer resolution must be present");
+                    assert_eq!(
+                        res,
+                        (w as u32, h as u32),
+                        "DisplayDevice resolution must match Limine geometry"
+                    );
+                    assert_eq!(
+                        disp.bits_per_pixel(),
+                        Some(bpp as u32),
+                        "DisplayDevice bpp must match Limine geometry"
+                    );
+                    assert!(
+                        disp.framebuffer_address().is_some(),
+                        "framebuffer linear memory address must be present"
+                    );
+                    assert!(
+                        disp.framebuffer_size().is_some(),
+                        "framebuffer linear memory size must be present"
+                    );
+                    assert!(
+                        disp.refresh_hz().is_none(),
+                        "refresh_hz has no disclosure source; must stay None"
+                    );
+                    found_display = true;
+                }
+            }
+        }
+        assert!(
+            found_display,
+            "framebuffer DisplayDevice instance must be registered in DriverHub"
+        );
+        info!("[test-vfs-m63] framebuffer DisplayDevice registered with real geometry OK");
+    }
+
     info!("[test-vfs-m63] PASS");
 }
 
@@ -4742,7 +4796,10 @@ pub fn test_driver_hub_m72() {
                 found_cmos = true;
                 if let Some(ops) = DriverHub::device_at(i) {
                     let mut buf = [0u8; 32];
-                    let n = ops.read(&mut buf);
+                    let n = ops
+                        .as_io()
+                        .expect("cmos-rtc exposes io ops")
+                        .read(&mut buf);
                     assert!(n > 0, "cmos read must return timestamp");
                     let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
                     info!("[test-driver-hub-m72] CMOS RTC timestamp: {}", s.trim());
@@ -4758,16 +4815,17 @@ pub fn test_driver_hub_m72() {
             if info.name == "zero" {
                 if let Some(ops) = DriverHub::device_at(i) {
                     let mut buf = [0xFFu8; 16];
-                    let n = ops.read(&mut buf);
+                    let n = ops.as_io().expect("zero is io").read(&mut buf);
                     assert_eq!(n, 16);
                     assert_eq!(buf, [0u8; 16], "zero device must fill zeroes");
                 }
             } else if info.name == "null" {
                 if let Some(ops) = DriverHub::device_at(i) {
+                    let io = ops.as_io().expect("null is io");
                     let mut buf = [0x55u8; 16];
-                    let n = ops.read(&mut buf);
+                    let n = io.read(&mut buf);
                     assert_eq!(n, 0, "null device read must return 0");
-                    let wn = ops.write(b"discard");
+                    let wn = io.write(b"discard");
                     assert_eq!(wn, 7, "null device write must accept all");
                 }
             }
@@ -4838,14 +4896,14 @@ pub fn test_driver_hub_m72() {
                     let ar0 = ata_stats.sectors_read();
                     // C13.1 排雷：LBA0 是 MBR 保留区，块设备读写自检使用盘中部
                     // scratch 扇区（避开 MBR/FS 元数据区与末端边界）。
-                    let size = dev.size().expect("ata size known");
+                    let size = ata_io.size().expect("ata size known");
                     let scratch_off = (size / 2) / 512 * 512;
                     let mut test_buf = [0u8; 512];
                     test_buf[0..4].copy_from_slice(b"BRX!");
-                    let written = dev.write_at(scratch_off, &test_buf);
+                    let written = ata_io.write_at(scratch_off, &test_buf);
                     assert_eq!(written, 512, "ata write_at scratch sector");
                     let mut read_buf = [0u8; 512];
-                    let read_n = dev.read_at(scratch_off, &mut read_buf);
+                    let read_n = ata_io.read_at(scratch_off, &mut read_buf);
                     assert_eq!(read_n, 512, "ata read_at scratch sector");
                     assert_eq!(&read_buf[0..4], b"BRX!", "ata scratch sector content match");
                     assert_eq!(
@@ -4872,10 +4930,11 @@ pub fn test_driver_hub_m72() {
                 );
                 if let Some(dev) = DriverHub::device_at(i) {
                     assert_eq!(dev.kind(), driver::DeviceKind::Block);
-                    let written = dev.write_at(1024, b"RAMDISK_BORUIX_VOLUME");
+                    let rd_io = dev.as_io().expect("ramdisk exposes io ops");
+                    let written = rd_io.write_at(1024, b"RAMDISK_BORUIX_VOLUME");
                     assert_eq!(written, 21);
                     let mut r_buf = [0u8; 21];
-                    let read_n = dev.read_at(1024, &mut r_buf);
+                    let read_n = rd_io.read_at(1024, &mut r_buf);
                     assert_eq!(read_n, 21);
                     assert_eq!(&r_buf, b"RAMDISK_BORUIX_VOLUME");
 
@@ -4883,41 +4942,40 @@ pub fn test_driver_hub_m72() {
                     // 禁止把 3 字节静默截断成尾部 2 字节写入。
                     const RAMDISK_STATIC_CAPACITY: u64 = 64 * 1024;
                     assert_eq!(
-                        dev.size(),
+                        rd_io.size(),
                         Some(RAMDISK_STATIC_CAPACITY),
                         "ramdisk must report its actual writable storage capacity"
                     );
                     let tail_offset = RAMDISK_STATIC_CAPACITY - 2;
-                    assert_eq!(dev.write_at(tail_offset, b"OK"), 2);
+                    assert_eq!(rd_io.write_at(tail_offset, b"OK"), 2);
                     assert_eq!(
-                        dev.write_at_checked(tail_offset, b"BAD"),
+                        rd_io.write_at_checked(tail_offset, b"BAD"),
                         Err(klib::error::Error::OutOfRange),
                         "ramdisk must return an explicit range error instead of truncating"
                     );
                     assert_eq!(
-                        dev.write_at(tail_offset, b"BAD"),
+                        rd_io.write_at(tail_offset, b"BAD"),
                         0,
                         "legacy write_at compatibility path must not partially write"
                     );
                     let mut tail = [0u8; 2];
-                    assert_eq!(dev.read_at(tail_offset, &mut tail), 2);
+                    assert_eq!(rd_io.read_at(tail_offset, &mut tail), 2);
                     assert_eq!(&tail, b"OK", "rejected write must not alter tail bytes");
                     info!("[test-driver-hub-m72] Ramdisk capacity and boundary-write honesty OK");
 
                     // DMYGH C16.1：真实 I/O 计数——对齐整扇区、部分扇区、失败写三类。
-                    let rd_io = dev.as_io().expect("ramdisk exposes io ops");
                     let rd_stats = rd_io.io_stats().expect("ramdisk must expose real io stats");
                     let w_base = rd_stats.sectors_written();
                     let r_base = rd_stats.sectors_read();
                     let two_sectors = [0xA7u8; 1024];
-                    assert_eq!(dev.write_at(8192, &two_sectors), 1024);
+                    assert_eq!(rd_io.write_at(8192, &two_sectors), 1024);
                     assert_eq!(
                         rd_stats.sectors_written(),
                         w_base + 2,
                         "aligned 2-sector write must count exactly 2"
                     );
                     let mut back = [0u8; 1024];
-                    assert_eq!(dev.read_at(8192, &mut back), 1024);
+                    assert_eq!(rd_io.read_at(8192, &mut back), 1024);
                     assert_eq!(&back[..4], &two_sectors[..4], "read-back content match");
                     assert_eq!(
                         rd_stats.sectors_read(),
@@ -4925,7 +4983,7 @@ pub fn test_driver_hub_m72() {
                         "aligned 2-sector read must count exactly 2"
                     );
                     // 单扇区内部分写：触碰恰好 1 个逻辑扇区
-                    assert_eq!(dev.write_at(4096 + 100, b"PARTIAL"), 7);
+                    assert_eq!(rd_io.write_at(4096 + 100, b"PARTIAL"), 7);
                     assert_eq!(
                         rd_stats.sectors_written(),
                         w_base + 3,
@@ -4933,7 +4991,7 @@ pub fn test_driver_hub_m72() {
                     );
                     // 失败/被拒绝的写绝不计数
                     assert_eq!(
-                        dev.write_at_checked(tail_offset, b"BAD"),
+                        rd_io.write_at_checked(tail_offset, b"BAD"),
                         Err(klib::error::Error::OutOfRange)
                     );
                     assert_eq!(
@@ -5341,7 +5399,8 @@ pub fn test_ata_tail_probe() {
     let Some(dev) = driver::DriverHub::device_at(idx) else {
         return;
     };
-    let total = dev.size().expect("ata size known") / 512;
+    let io = dev.as_io().expect("ata exposes io ops");
+    let total = io.size().expect("ata size known") / 512;
     info!(
         "[test-ata-tail-probe] total_sectors={} probing mid + last three",
         total
@@ -5356,9 +5415,9 @@ pub fn test_ata_tail_probe() {
         let mut wbuf = [0u8; 512];
         let marker = (lba as u32) | 0x5A000000;
         wbuf[0..4].copy_from_slice(&marker.to_le_bytes());
-        let wn = dev.write_at(off, &wbuf);
+        let wn = io.write_at(off, &wbuf);
         let mut rbuf = [0u8; 512];
-        let rn = dev.read_at(off, &mut rbuf);
+        let rn = io.read_at(off, &mut rbuf);
         let ok = rn == 512 && rbuf[0..4] == wbuf[0..4];
         info!(
             "[test-ata-tail-probe] lba={} ({}) write={} read={} match={}",
@@ -6886,7 +6945,8 @@ pub fn test_drv1_remediation() {
     match ata_idx {
         Some(idx) => {
             let dev = driver::DriverHub::device_at(idx).expect("ata0 exposes ops");
-            if let Some(size) = dev.size() {
+            let io = dev.as_io().expect("ata0 exposes io ops");
+            if let Some(size) = io.size() {
                 assert!(
                     size / 512 <= LBA28_MAX_SECTORS,
                     "hardware ata0 capacity must stay within the LBA28 domain (guard postcondition)"

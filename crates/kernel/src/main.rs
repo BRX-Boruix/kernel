@@ -668,7 +668,9 @@ fn stdin_source(buf: &mut [u8]) -> usize {
         if let Some(info) = driver::DriverHub::device_info_at(i) {
             if info.name == PS2_KEYBOARD_DEVICE_NAME {
                 if let Some(ops) = driver::DriverHub::device_at(i) {
-                    return ops.read(buf);
+                    if let Some(io) = ops.as_io() {
+                        return io.read(buf);
+                    }
                 }
             }
         }
