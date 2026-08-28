@@ -41,6 +41,21 @@ fn validate_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// M1 绝对路径契约（ADR-027 §3 第 26 条 / vfs1 R5）：公共操作只接受绝对路径。
+///
+/// 相对路径（不以 `/` 开头）显式 [`Error::InvalidParam`]，绝不静默当作绝对路径
+/// 解析——`canonicalize` 对相对输入会保留前导 `..`（`"../x"` 保持 `"../x"`），
+/// 若被当绝对路径解析会伪造位置。`create_file/mkdir/unlink/symlink` 经
+/// `split_entry` 已拒绝相对路径；此处统一 `mount/unmount/resolve` 的入口，
+/// 使全表公共操作绝对路径契约一致（与模块头声称相符）。
+fn require_absolute(path_str: &str) -> Result<(), Error> {
+    if path_str.starts_with('/') {
+        Ok(())
+    } else {
+        Err(Error::InvalidParam)
+    }
+}
+
 /// 全局挂载表。
 pub struct MountTable {
     root_fs: Arc<dyn FileSystem>,
@@ -71,6 +86,7 @@ impl MountTable {
     /// （父链不存在），或遮蔽一个普通文件。校验在读锁下完成后再取写锁
     /// 插入（单线程启动期 + 写锁内 contains_key 复查，TOCTOU 面为零）。
     pub fn mount(&self, target_path: &str, fs: Arc<dyn FileSystem>) -> Result<(), Error> {
+        require_absolute(target_path)?;
         let norm = Path::canonicalize(target_path);
         if norm == "/" {
             return Err(Error::AlreadyExists);
@@ -160,6 +176,7 @@ impl MountTable {
 
     /// 卸载挂载点。
     pub fn unmount(&self, target_path: &str) -> Result<(), Error> {
+        require_absolute(target_path)?;
         let norm = Path::canonicalize(target_path);
         let mut mounts = self.mounts.write();
         if mounts.remove(&norm).is_some() {
@@ -170,7 +187,11 @@ impl MountTable {
     }
 
     /// 核心路径解析：从根开始逐级解析路径并处理挂载点与软链接。
+    ///
+    /// M1：只接受绝对路径；相对路径显式 [`Error::InvalidParam`]。软链接目标解析
+    /// 产生的内部递归路径恒为绝对（链接目标绝对化或与父路径拼接），不重复检查。
     pub fn resolve(&self, path_str: &str, follow_symlink: bool) -> Result<Arc<dyn INode>, Error> {
+        require_absolute(path_str)?;
         self.resolve_internal(path_str, follow_symlink, 0)
     }
 
@@ -303,6 +324,31 @@ impl MountTable {
         }
         let parent_node = self.resolve(&parent_path, true)?;
         parent_node.unlink(&name)
+    }
+
+    /// 重命名/移动节点（ADR-014 SYS_ENTRY_UPDATE 0x43 / vfs1 M1）。
+    ///
+    /// 把 `old_path` 改名到 `new_path`。当前实现为**同目录重命名**：
+    /// 两个路径的父目录须为同一个（跨目录/跨文件系统移动返回
+    /// [`Error::NotSupported`]，宁缺毋假，见 `INode::rename` 约定）。
+    ///
+    /// 前置校验（S31/M1）：两路径均须绝对；`old_path` 与 `new_path` 的末段
+    /// 名字均须合法（`validate_name`）；源项存在、目标项不冲突（由底层
+    /// `INode::rename` 保证 NotFound/AlreadyExists）。挂载点本身的目录项不参与
+    /// 本操作（目标若命中挂载点键，交由调用方语义；此处直接委托目录节点）。
+    pub fn rename(&self, old_path: &str, new_path: &str) -> Result<(), Error> {
+        require_absolute(old_path)?;
+        require_absolute(new_path)?;
+        let (old_parent, old_name) = Self::split_entry(old_path)?;
+        validate_name(&old_name)?;
+        let (new_parent, new_name) = Self::split_entry(new_path)?;
+        validate_name(&new_name)?;
+        // 同目录前提：跨目录/跨 FS 移动非本原语范围，如实 NotSupported。
+        if old_parent != new_parent {
+            return Err(Error::NotSupported);
+        }
+        let parent_node = self.resolve(&old_parent, true)?;
+        parent_node.rename(&old_name, &new_name)
     }
 
     /// 创建软链接。

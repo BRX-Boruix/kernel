@@ -704,6 +704,13 @@ mod tests {
             mt.symlink("x", "rel-link").err(),
             Some(Error::InvalidParam)
         );
+        // M1：mount/unmount/resolve 同样拒绝相对路径（审计 L500 修复点）。
+        assert_eq!(
+            mt.mount("rel/mnt", Arc::new(RamFS::new())).err(),
+            Some(Error::InvalidParam)
+        );
+        assert_eq!(mt.unmount("rel/mnt").err(), Some(Error::InvalidParam));
+        assert_eq!(mt.resolve("rel/path", true).err(), Some(Error::InvalidParam));
     }
 
     /// vfs1 A6：mount 目标必须存在且为目录。
@@ -725,6 +732,44 @@ mod tests {
         // 合法目录成功
         mt.mkdir("/ok", Permissions::read_write()).unwrap();
         assert!(mt.mount("/ok", Arc::new(RamFS::new())).is_ok());
+    }
+
+    /// ADR-014 SYS_ENTRY_UPDATE (0x43)：同目录重命名语义。
+    #[test]
+    fn test_rename_same_dir_semantics() {
+        let root_fs = Arc::new(RamFS::new());
+        let mt = MountTable::new(root_fs.clone());
+        mt.create_file("/a.txt", Permissions::read_write()).unwrap();
+        // 同目录重命名成功，内容保 inode 身份（读写经旧名关闭后新名可达）。
+        mt.rename("/a.txt", "/b.txt").expect("rename within dir");
+        assert!(mt.resolve("/a.txt", true).is_err(), "old name gone");
+        assert_eq!(
+            mt.create_file("/b.txt", Permissions::read_write()).err(),
+            Some(Error::AlreadyExists)
+        );
+        assert!(mt.resolve("/b.txt", true).is_ok(), "new name reachable");
+        // 源不存在 → NotFound。
+        assert_eq!(
+            mt.rename("/ghost", "/c.txt").err(),
+            Some(Error::NotFound)
+        );
+        // 目标已存在 → AlreadyExists（绝不静默覆盖）。
+        mt.create_file("/d.txt", Permissions::read_write()).unwrap();
+        assert_eq!(
+            mt.rename("/b.txt", "/d.txt").err(),
+            Some(Error::AlreadyExists)
+        );
+        // 相对路径 → InvalidParam（M1）。
+        assert_eq!(mt.rename("b.txt", "/e.txt").err(), Some(Error::InvalidParam));
+        assert_eq!(mt.rename("/b.txt", "e.txt").err(), Some(Error::InvalidParam));
+        // 跨目录 → NotSupported（宁缺毋假，跨 FS 移动未实现）。
+        mt.mkdir("/dir1", Permissions::read_write()).unwrap();
+        mt.mkdir("/dir2", Permissions::read_write()).unwrap();
+        mt.create_file("/dir1/x.txt", Permissions::read_write()).unwrap();
+        assert_eq!(
+            mt.rename("/dir1/x.txt", "/dir2/x.txt").err(),
+            Some(Error::NotSupported)
+        );
     }
 
     /// vfs1 A7：活动挂载点及其祖先目录不可 unlink；卸载后恢复可删。
