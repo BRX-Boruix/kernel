@@ -324,6 +324,33 @@ fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
+/// `entry_update(path_ptr, new_path_ptr, flags)`：重命名/移动节点（ADR-014 0x43）。
+///
+/// 当前实现为**同目录重命名**：源与目标须在同一父目录（跨目录移动如实
+/// `NotSupported`，宁缺毋假）。`flags` 保留（当前仅 0 接受，非 0 返回
+/// `InvalidParam`）——ADR-014 允许其表达"更新元数据"等扩展，未实现前不静默忽略。
+fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
+    let old_path_ptr = frame.a1;
+    let new_path_ptr = frame.a2;
+    let flags = frame.a3;
+    if flags != 0 {
+        return pack_err(Error::InvalidParam);
+    }
+    let old_path = match copy_path_from_user(old_path_ptr, MAX_USER_PATH_BYTES) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    let new_path = match copy_path_from_user(new_path_ptr, MAX_USER_PATH_BYTES) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    let root = crate::vfs_init::root();
+    match root.rename(&old_path, &new_path) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
 /// `readdir(path_ptr, buf_ptr, max_bytes)`：获取目录项列表（以 JSON 结构或固定格式写入用户缓冲）。
 fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
     let path_ptr = frame.a1;
@@ -1052,6 +1079,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         // VFS Domain (0x40)
         SYS_ENTRY_CREATE => done(sys_mkdir(frame)),
         SYS_ENTRY_READ => done(sys_readdir(frame)),
+        SYS_ENTRY_UPDATE => done(sys_entry_update(frame)),
         SYS_ENTRY_DELETE => done(sys_unlink(frame)),
 
         // DEVICE Domain (0x50)

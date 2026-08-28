@@ -453,6 +453,9 @@ unsafe fn kmain_body() -> ! {
     // S19：顺序读写超过单块上限不得截断（>1MiB 顺序 write 回绕短交付回归）。
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_seq_large_io();
+    // ADR-014 SYS_ENTRY_UPDATE (0x43)：move/rename 节点。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_syscall_entry_update();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m63();
     #[cfg(feature = "kernel-tests")]

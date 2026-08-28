@@ -198,6 +198,21 @@ pub trait INode: Send + Sync {
         Err(Error::NotDirectory)
     }
 
+    /// 在**同一目录内**重命名子项（ADR-014 SYS_ENTRY_UPDATE 0x43 的原语）。
+    ///
+    /// 把子项 `old_name` 改名/移动到本目录内的 `new_name`：不动内容、只改目录
+    /// 项键（保 inode 身份）。约定：
+    /// - `old_name` 不存在 → [`Error::NotFound`]；
+    /// - `new_name` 已存在 → [`Error::AlreadyExists`]（不静默覆盖）；
+    /// - 调用方（`MountTable::rename`）已先校验名字合法与同目录前提。
+    ///
+    /// 默认实现返回 [`Error::NotSupported`]——跨目录/跨文件系统移动不在本原语
+    /// 语义内（调用方返回 NotSupported，宁缺毋假）。本 crate 内 RamFS 提供实现；
+    /// 其余 FS（devfs/procfs/sysfs）如实 NotSupported。
+    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), Error> {
+        Err(Error::NotSupported)
+    }
+
     /// 列出所有子目录项。
     fn list_dir(&self) -> Result<Vec<DirEntry>, Error> {
         Err(Error::NotDirectory)

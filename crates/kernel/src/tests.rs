@@ -3434,6 +3434,185 @@ pub fn test_syscall_seq_large_io() {
     info!("[test-syscall-seq-large] PASS");
 }
 
+/// ADR-014 SYS_ENTRY_UPDATE (0x43)：move/rename 节点。
+///
+/// 覆盖：
+/// 1. 同目录重命名成功：源消失、目标可达（内容保 inode 身份）。
+/// 2. 源不存在 → NotFound。
+/// 3. 目标已存在 → AlreadyExists（绝不静默覆盖）。
+/// 4. 跨目录 → NotSupported（宁缺毋假）。
+/// 5. 相对路径（M1）→ InvalidParam；flags 非 0 → InvalidParam。
+pub fn test_syscall_entry_update() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::Process;
+
+    info!("[test-syscall-entry-update] === ADR-014: SYS_ENTRY_UPDATE (0x43) rename ===");
+
+    // 纯 Done 路径（不切换现场），arch_frame 填 0。
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4: 0,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
+        }
+    }
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+
+    // 映射一页并驻留，写入两条路径串（old/new）。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
+    let buf = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space_mut()
+            .handle_page_fault(buf, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let old_s = b"/scratch/entry_old.txt\0";
+    let new_s = b"/scratch/entry_new.txt\0";
+    let rel_s = b"relative.txt\0";
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(buf))
+            .expect("buffer resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(old_s.as_ptr(), (pa + off) as *mut u8, old_s.len());
+        core::ptr::copy_nonoverlapping(
+            new_s.as_ptr(),
+            (pa + off + 0x40) as *mut u8,
+            new_s.len(),
+        );
+        core::ptr::copy_nonoverlapping(rel_s.as_ptr(), (pa + off + 0x80) as *mut u8, rel_s.len());
+    }
+    let old_ptr = buf;
+    let new_ptr = buf + 0x40;
+    let rel_ptr = buf + 0x80;
+
+    // 创建源文件。
+    let mut create = frame(crate::syscall::SYS_ENTRY_CREATE, old_ptr, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut create));
+    assert!(create.result < 0x8000_0000_0000_0000, "mkdir /scratch/entry_old.txt");
+
+    // 1. 同目录重命名成功。
+    let mut upd = frame(crate::syscall::SYS_ENTRY_UPDATE, old_ptr, new_ptr, 0);
+    assert!(crate::syscall::syscall_entry(&mut upd));
+    assert!(upd.result < 0x8000_0000_0000_0000, "rename must succeed");
+    {
+        let root = crate::vfs_init::root();
+        assert!(root.resolve("/scratch/entry_old.txt", true).is_err(), "old gone");
+        assert!(root.resolve("/scratch/entry_new.txt", true).is_ok(), "new reachable");
+    }
+
+    // 2. 源不存在 → NotFound。
+    let mut nf = frame(crate::syscall::SYS_ENTRY_UPDATE, old_ptr, new_ptr, 0);
+    assert!(crate::syscall::syscall_entry(&mut nf));
+    assert_eq!(
+        nf.result,
+        (-(klib::error::Error::NotFound.to_errno() as i64)) as u64,
+        "renaming a missing source must be NotFound"
+    );
+
+    // 3. 目标已存在 → AlreadyExists（先创建新目标同名文件）。
+    {
+        let root = crate::vfs_init::root();
+        root.create_file("/scratch/entry_conflict.txt", vfs::inode::Permissions::all())
+            .expect("create conflict target");
+    }
+    let mut ae = frame(crate::syscall::SYS_ENTRY_UPDATE, new_ptr, buf + 0xC0, 0);
+    let conflict_s = b"/scratch/entry_conflict.txt\0";
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(buf))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(
+            conflict_s.as_ptr(),
+            (pa + off + 0xC0) as *mut u8,
+            conflict_s.len(),
+        );
+    }
+    assert!(crate::syscall::syscall_entry(&mut ae));
+    assert_eq!(
+        ae.result,
+        (-(klib::error::Error::AlreadyExists.to_errno() as i64)) as u64,
+        "renaming onto an existing name must be AlreadyExists"
+    );
+
+    // 4. 跨目录 → NotSupported。
+    {
+        let root = crate::vfs_init::root();
+        root.mkdir("/scratch/other", vfs::inode::Permissions::all())
+            .expect("mkdir other dir");
+    }
+    let other_s = b"/scratch/other/entry_new.txt\0";
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(buf))
+            .expect("resident")
+            .as_u64();
+        core::ptr::copy_nonoverlapping(
+            other_s.as_ptr(),
+            (pa + off + 0x100) as *mut u8,
+            other_s.len(),
+        );
+    }
+    let mut cross = frame(crate::syscall::SYS_ENTRY_UPDATE, new_ptr, buf + 0x100, 0);
+    assert!(crate::syscall::syscall_entry(&mut cross));
+    assert_eq!(
+        cross.result,
+        (-(klib::error::Error::NotSupported.to_errno() as i64)) as u64,
+        "cross-directory move must be NotSupported (honest absence)"
+    );
+
+    // 5a. 相对路径 → InvalidParam（M1）。
+    let mut rel = frame(crate::syscall::SYS_ENTRY_UPDATE, rel_ptr, new_ptr, 0);
+    assert!(crate::syscall::syscall_entry(&mut rel));
+    assert_eq!(
+        rel.result,
+        (-(klib::error::Error::InvalidParam.to_errno() as i64)) as u64,
+        "relative source path must be InvalidParam"
+    );
+    // 5b. flags 非 0 → InvalidParam（未实现扩展不静默忽略）。
+    let mut fl = frame(crate::syscall::SYS_ENTRY_UPDATE, new_ptr, buf + 0x40, 0x1);
+    assert!(crate::syscall::syscall_entry(&mut fl));
+    assert_eq!(
+        fl.result,
+        (-(klib::error::Error::InvalidParam.to_errno() as i64)) as u64,
+        "non-zero flags must be InvalidParam"
+    );
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-syscall-entry-update] PASS");
+}
+
 /// B14/B21：SYS_MEMORY_QUERY 全链路覆盖 + stdin Busy→EAGAIN 语义锁定。
 ///
 /// - **B14**：已映射页查询返回 PRESENT|USER|WRITABLE 位图；未触碰 demand

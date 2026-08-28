@@ -329,6 +329,33 @@ impl INode for RamINode {
         }
     }
 
+    /// 同目录内重命名子项（ADR-014 SYS_ENTRY_UPDATE 0x43 原语）：只改目录项键、
+    /// 不动内容与 inode 身份。`old_name` 缺失 → NotFound；`new_name` 已占 → 
+    /// AlreadyExists（绝不静默覆盖）。
+    fn rename(&self, old_name: &str, new_name: &str) -> Result<(), Error> {
+        match &self.data {
+            RamNodeData::Directory { children } => {
+                let mut c = children.write();
+                if !c.contains_key(old_name) {
+                    return Err(Error::NotFound);
+                }
+                if c.contains_key(new_name) {
+                    return Err(Error::AlreadyExists);
+                }
+                // 弹出旧键，以新键插回（保 Arc 身份，内容零拷贝）。
+                if let Some(node) = c.remove(old_name) {
+                    c.insert(new_name.to_string(), node);
+                    drop(c);
+                    self.touch_dir_meta();
+                    Ok(())
+                } else {
+                    Err(Error::NotFound)
+                }
+            }
+            _ => Err(Error::NotDirectory),
+        }
+    }
+
     fn list_dir(&self) -> Result<Vec<DirEntry>, Error> {
         match &self.data {
             RamNodeData::Directory { children } => {
