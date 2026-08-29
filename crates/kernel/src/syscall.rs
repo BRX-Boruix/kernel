@@ -69,6 +69,8 @@ pub mod domain {
     pub const TASK: u32 = 0x30;
     pub const VFS: u32 = 0x40;
     pub const DEVICE: u32 = 0x50;
+    /// VOLUME 域（ADR-030 §决策6）：卷管理能力（挂/列/更/格/卸）。
+    pub const VOLUME: u32 = 0x60;
 }
 
 pub mod op {
@@ -76,6 +78,10 @@ pub mod op {
     pub const READ: u32 = 0x02;
     pub const WRITE: u32 = 0x03;
     pub const DELETE: u32 = 0x04;
+    /// VOLUME 域扩展动词：格式化卷。独立于 4 通用动词，不复用 DELETE 的 0x04。
+    pub const FORMAT: u32 = 0x05;
+    /// VOLUME 域扩展动词：卸载卷。
+    pub const UNMOUNT: u32 = 0x06;
 }
 
 const fn nr(d: u32, o: u32) -> u32 {
@@ -145,6 +151,13 @@ pub const SYS_DRIVER_REGISTER: u32 = nr(domain::DEVICE, op::CREATE); // 0x51
 pub const SYS_DRIVER_QUERY: u32 = nr(domain::DEVICE, op::READ); // 0x52
 pub const SYS_DRIVER_CLAIM: u32 = nr(domain::DEVICE, op::WRITE); // 0x53
 pub const SYS_DRIVER_UNREGISTER: u32 = nr(domain::DEVICE, op::DELETE); // 0x54
+
+// ---------- 6. VOLUME Domain (0x60, ADR-030) ----------
+pub const SYS_VOLUME_MOUNT: u32 = nr(domain::VOLUME, op::CREATE); // 0x61
+pub const SYS_VOLUME_LIST: u32 = nr(domain::VOLUME, op::READ); // 0x62
+pub const SYS_VOLUME_UPDATE: u32 = nr(domain::VOLUME, op::WRITE); // 0x63
+pub const SYS_VOLUME_FORMAT: u32 = nr(domain::VOLUME, op::FORMAT); // 0x65
+pub const SYS_VOLUME_UNMOUNT: u32 = nr(domain::VOLUME, op::UNMOUNT); // 0x66
 
 // ---------- ABI 打包（成功 / 错误） ----------
 
@@ -961,16 +974,16 @@ fn sys_exec(frame: &mut SyscallFrame) -> u64 {
     // 1. 获取 ELF 字节数据
     let elf_data: alloc::vec::Vec<u8> = match arg1 {
         BUILTIN_INDEX_INIT | BUILTIN_INDEX_SHELL => {
-            // 内建索引走统一双源读取（ADR-017 + read_binary_dual_source）：
-            // 外部盘遮蔽 /programs 时盘上文件优先；盘中缺失则文件级回退到
-            // 内置 liveCD payload。与 KM3 无冲突——两源是不同数据载体
-            // （VFS/磁盘 vs 内核静态），非同路重复尝试（见 main.rs 该函数注）。
-            let (name, builtin) = if arg1 == BUILTIN_INDEX_INIT {
-                ("init.elf", crate::binaries_payload::INIT_ELF)
+            // 内建索引走统一单源读取（ADR-028）：`/programs` 只由内置
+            // liveCD payload 填充，外部盘不再遮蔽（盘优先双源已废除）。
+            // 与 KM3 无冲突——这里删去的是 read_binary_dual_source 的
+            // 磁盘优先回退分支，单源即 /programs。
+            let name = if arg1 == BUILTIN_INDEX_INIT {
+                "init.elf"
             } else {
-                ("shell.elf", crate::binaries_payload::SHELL_ELF)
+                "shell.elf"
             };
-            match crate::read_binary_dual_source(name, builtin) {
+            match crate::read_binary_from_programs(name) {
                 Some(v) => v,
                 None => return pack_err(Error::NotFound),
             }
@@ -1562,6 +1575,140 @@ fn sys_driver_unregister(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
+// ---------- VOLUME Domain (0x60, ADR-030) ----------
+
+/// `volume_mount(dev_name_ptr) -> 0`（M4.2，0x61）。
+///
+/// 按块设备名把其首分区的 EXT2 挂载到 `/volumes/{label}`（复用 M1.2 链路），
+/// 卷标命名/冲突消解由 [`MountTable::mount_volume`] 承担。成功返回 0；
+/// 失败如实上抛（NotFound/Corrupt/NotSupported/ReadOnly），绝不伪挂成功。
+fn sys_volume_mount(frame: &mut SyscallFrame) -> u64 {
+    let dev_name_ptr = frame.a1;
+    let dev_name = match copy_path_from_user(dev_name_ptr, MAX_USER_PATH_BYTES) {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    if dev_name.is_empty() {
+        return pack_err(Error::InvalidParam);
+    }
+    match crate::vfs_init::mount_device_volume(&dev_name) {
+        Ok(final_path) => {
+            klib::info!("[volume] mounted '{}' at {}", dev_name, final_path);
+            pack_ok(0)
+        }
+        Err(e) => {
+            klib::info!("[volume] mount '{}' failed: {:?}", dev_name, e);
+            pack_err(e)
+        }
+    }
+}
+
+/// `volume_list(buf_ptr, cap) -> len`（M4.2，0x62）。
+///
+/// 返回 `/volumes` 下已挂载卷的 JSON 数组（每项 `{"path":...}`）。挂载点
+/// 枚举直接读 VFS 的 `/volumes` 目录项（真实挂载点，S09：绝不从无数据源
+/// 处编造卷）。写出长度返回给用户；`cap` 超过内部上限（512）→ `InvalidParam`，
+/// 实际写出字节数 0 或超 cap → `NoSpace`。
+fn sys_volume_list(frame: &mut SyscallFrame) -> u64 {
+    const MAX_VOLUME_LIST_BYTES: usize = 512;
+    let out_ptr = frame.a1;
+    let cap = frame.a2 as usize;
+    if cap > MAX_VOLUME_LIST_BYTES {
+        return pack_err(Error::InvalidParam);
+    }
+    let root = crate::vfs_init::root();
+    // 读 /volumes 目录项（真实挂载点）。
+    let volumes_node = match root.resolve("/volumes", true) {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    let entries = match volumes_node.list_dir() {
+        Ok(e) => e,
+        Err(e) => return pack_err(e),
+    };
+    let mut target = klib::json::VecTarget::new();
+    let mut writer = klib::json::JsonWriter::new(&mut target);
+    writer
+        .start_array()
+        .and_then(|mut arr| {
+            for entry in entries {
+                let path = alloc::format!("/volumes/{}", entry.name);
+                arr.push_object(|o| {
+                    o.field_str("path", &path)?;
+                    Ok(())
+                })?;
+            }
+            arr.end()
+        })
+        .expect("Vec-backed volume JSON cannot fail");
+    let bytes = target.as_bytes();
+    let n = bytes.len();
+    if n == 0 || n > cap {
+        return pack_err(Error::NoSpace);
+    }
+    if let Err(e) = validate_user_range(out_ptr, n as u64, UserAccess::Write) {
+        return pack_err(e);
+    }
+    unsafe {
+        arch_x86_64::mmio::copy_to_user(out_ptr, bytes.as_ptr(), n);
+    }
+    pack_ok(n as u64)
+}
+
+/// `volume_update(path_ptr, new_path_ptr, flags) -> 0`（M4.2，0x63）。
+///
+/// 卷属性管理：重命名挂载点。内核当前 `MountTable` 无"挂载点改名"原子接口
+/// （rename 只作用于普通节点，挂载点改名会改变 mounts 表键），故本实现
+/// 如实返回 [`Error::NotSupported`]——宁缺毋假，不伪做"卸载旧 + 挂新"的
+/// 破坏性近似。`flags` 当前仅 0 接受。
+fn sys_volume_update(frame: &mut SyscallFrame) -> u64 {
+    let _path_ptr = frame.a1;
+    let _new_path_ptr = frame.a2;
+    let flags = frame.a3;
+    if flags != 0 {
+        return pack_err(Error::InvalidParam);
+    }
+    // 挂载点改名需 MountTable 的原子 mount-rename 接口（P2），未实现前如实拒绝。
+    pack_err(Error::NotSupported)
+}
+
+/// `volume_format(dev_name_ptr, label_ptr) -> 0`（M4.2，0x65）。
+///
+/// 格式化卷 = 在块设备上新建 EXT2 文件系统（mkfs：superblock/位图/GDT/根
+/// 目录初值）。M3 交付的是"在**既有** EXT2 上分配/释放/写"的最小可写支集，
+/// 并不含 mkfs 建文件系统例程——那是独立里程碑（P2）。故如实返回
+/// [`Error::NotSupported`]，绝不伪造"已格式化"的伪成功（S09）。
+fn sys_volume_format(frame: &mut SyscallFrame) -> u64 {
+    let _dev_name_ptr = frame.a1;
+    let _label_ptr = frame.a2;
+    // mkfs 例程未实现（M3 只含既有 fs 的写支集，不含建 fs）。
+    pack_err(Error::NotSupported)
+}
+
+/// `volume_unmount(path_ptr) -> 0`（M4.2，0x66）。
+///
+/// 卸载指定挂载点（`MountTable::unmount`）。路径须为 `/volumes/...` 绝对路径，
+/// 由用户提供并规范化；不存在的挂载点如实 `NotFound`。
+fn sys_volume_unmount(frame: &mut SyscallFrame) -> u64 {
+    let path_ptr = frame.a1;
+    let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    let path = match absolute_path(&path) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
+    let root = crate::vfs_init::root();
+    match root.unmount(&path) {
+        Ok(()) => {
+            klib::info!("[volume] unmounted {}", path);
+            pack_ok(0)
+        }
+        Err(e) => pack_err(e),
+    }
+}
+
 // ---------- 分发 ----------
 
 /// 分发结果：`Done(v)` = 正常返回值（写入 `frame.result`，架构层写回 rax 带
@@ -1619,6 +1766,13 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_DRIVER_QUERY => done(sys_driver_query(frame)),
         SYS_DRIVER_CLAIM => done(sys_driver_claim(frame)),
         SYS_DRIVER_UNREGISTER => done(sys_driver_unregister(frame)),
+
+        // VOLUME Domain (0x60, ADR-030)
+        SYS_VOLUME_MOUNT => done(sys_volume_mount(frame)),
+        SYS_VOLUME_LIST => done(sys_volume_list(frame)),
+        SYS_VOLUME_UPDATE => done(sys_volume_update(frame)),
+        SYS_VOLUME_FORMAT => done(sys_volume_format(frame)),
+        SYS_VOLUME_UNMOUNT => done(sys_volume_unmount(frame)),
 
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);

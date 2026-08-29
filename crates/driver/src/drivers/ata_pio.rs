@@ -1,13 +1,21 @@
 //! ATA / IDE PIO 模式硬盘驱动（BlockDevice）。
 //!
-//! 实现 Primary/Secondary 通道 **LBA28** 扇区读写与 Identify 设备识别
-//! （命令字 `0x20`/`0x30`，28 位寻址域）。LBA48（`0x24`/`0x34` 双寄存器
-//! 命令序列）**未实现**，文档与实现就此对齐（drv1 DA2：宣称未实现的能力
-//! 与静默回卷同样致命——前者可见，后者腐蚀数据）。
+//! 实现 Primary/Secondary 通道 × Master/Slave 四设备 **LBA28** 扇区读写与
+//! Identify 设备识别（命令字 `0x20`/`0x30`，28 位寻址域）。LBA48
+//! （`0x24`/`0x34` 双寄存器命令序列）**未实现**，文档与实现就此对齐
+//! （drv1 DA2：宣称未实现的能力与静默回卷同样致命——前者可见，后者腐蚀数据）。
 //!
 //! 超域守卫：identify 报告的容量超过 [`LBA28_MAX_SECTORS`] 时拒绝硬件模式
 //! （ADR-022 §3），杜绝高位偏移被截断到低位 LBA 的静默数据损坏。
 //! 当无真实硬件或 QEMU 纯 CD-ROM 启动时，提供 64KB 快速扇区内存模拟回退。
+//!
+//! ## 多盘支持（M0.4，ADR-030 §决策5）
+//!
+//! 本驱动探测 Primary/Secondary 两个通道各 Master/Slave 两个驱动位，共四个
+//! 设备槽：`ata0`（Primary Master）、`ata1`（Primary Slave）、`ata2`
+//! （Secondary Master）、`ata3`（Secondary Slave）。每块识别到的真实 ATA 盘
+//! 分别登记 `DriverHub`，使"系统盘 + 卷盘"可同时存在（ADR-029 两块盘场景）。
+//! ATAPI 包设备（CD-ROM）如实跳过（不伪造 RAM 盘）。
 
 use crate::device::{
     sectors_touched, BlockDevice, BusType, Device, DeviceInfo, DeviceKind, IoDevice, IoStats,
@@ -18,15 +26,21 @@ use arch_x86_64::port::{inb, inw, outb, outw};
 use klib::{error::Error, info};
 use spin::Mutex;
 
-const ATA_DATA: u16 = 0x1F0;
-const ATA_FEATURES: u16 = 0x1F1;
-const ATA_SECTOR_COUNT: u16 = 0x1F2;
-const ATA_LBA_LOW: u16 = 0x1F3;
-const ATA_LBA_MID: u16 = 0x1F4;
-const ATA_LBA_HIGH: u16 = 0x1F5;
-const ATA_DRIVE: u16 = 0x1F6;
-const ATA_STATUS: u16 = 0x1F7;
-const ATA_COMMAND: u16 = 0x1F7;
+/// Primary 通道寄存器基址（0x1F0 系列）。
+const ATA_PRIMARY_BASE: u16 = 0x1F0;
+/// Secondary 通道寄存器基址（0x170 系列，M0.4）。
+const ATA_SECONDARY_BASE: u16 = 0x170;
+
+/// 通道内寄存器偏移（Primary 与 Secondary 同构，仅基址不同）。
+const REG_DATA: u16 = 0x00; // 16 位数据口
+const REG_FEATURES: u16 = 0x01;
+const REG_SECTOR_COUNT: u16 = 0x02;
+const REG_LBA_LOW: u16 = 0x03;
+const REG_LBA_MID: u16 = 0x04;
+const REG_LBA_HIGH: u16 = 0x05;
+const REG_DRIVE: u16 = 0x06;
+const REG_STATUS: u16 = 0x07;
+const REG_COMMAND: u16 = 0x07;
 
 const ATA_SR_BSY: u8 = 0x80;
 const ATA_SR_DRQ: u8 = 0x08;
@@ -58,7 +72,7 @@ pub enum AtaIdentify {
     Ata(u64),
     /// ATAPI 包设备（CD-ROM 等）：本驱动只做 LBA28 块读写，不支持包设备。
     AtapiPacket,
-    /// 主驱动位上没有可识别设备。
+    /// 该驱动位上没有可识别设备。
     Absent,
 }
 
@@ -68,15 +82,29 @@ fn io_delay() {
     outb(0x80, 0);
 }
 
-fn status_read() -> u8 {
-    inb(ATA_STATUS)
+/// 读通道状态寄存器。
+#[inline]
+fn status_read(channel: u16) -> u8 {
+    inb(channel + REG_STATUS)
 }
 
-fn wait_not_busy() -> bool {
+/// 读通道数据口 16 位字。
+#[inline]
+fn data_read(channel: u16) -> u16 {
+    inw(channel + REG_DATA)
+}
+
+/// 写通道数据口 16 位字。
+#[inline]
+fn data_write(channel: u16, word: u16) {
+    outw(channel + REG_DATA, word);
+}
+
+fn wait_not_busy(channel: u16) -> bool {
     // 预算依据：每次轮询是一次 VM exit 级 inb；QEMU 对冷文件首次回写
     // （新建镜像首启）可能超过 1 万次窗口，20 万次给出数百毫秒上限。
     for _ in 0..200_000 {
-        let s = status_read();
+        let s = status_read(channel);
         if s == 0xFF {
             return false;
         }
@@ -87,13 +115,13 @@ fn wait_not_busy() -> bool {
     false
 }
 
-fn wait_drq() -> bool {
+fn wait_drq(channel: u16) -> bool {
     // 预算依据（drv1 DD2）：与 [`wait_not_busy`] 同一 VM-exit 级论证——
     // 每次轮询是一次 VM exit 级 inb，QEMU 对冷文件首次回写可能超过 1 万次
     // 窗口，20 万次给出数百毫秒上限。ERR/DF 早退分支保证真实故障路径的
     // 成本不受预算放宽影响，放宽只作用于"慢但健康"的数据相位等待。
     for _ in 0..200_000 {
-        let s = status_read();
+        let s = status_read(channel);
         if s == 0xFF {
             return false;
         }
@@ -107,54 +135,60 @@ fn wait_drq() -> bool {
     false
 }
 
-fn select_drive_lba(lba: u64) {
-    // 高 4 位口承载 LBA28 的 bits[27:24]——寻址域就此封顶于 28 位，
-    // 超域容量由 init_ata 的 LBA28_MAX_SECTORS 守卫拒绝，不在此静默截断。
-    let drive = 0xE0u8 | (((lba >> 24) & 0x0F) as u8);
-    outb(ATA_DRIVE, drive);
+/// 选择通道上的驱动位并锁存 LBA 高位。
+///
+/// 驱动/磁头寄存器：bit6=LBA 模式（恒 1）、bit4=DEV（0=Master, 1=Slave）、
+/// bit[3:0]=LBA bits[27:24]。寻址域就此封顶于 28 位，超域容量由 init_ata
+/// 的 [`LBA28_MAX_SECTORS`] 守卫拒绝，不在此静默截断。
+fn select_drive_lba(channel: u16, lba: u64, slave: bool) {
+    let dev = if slave { 0x10 } else { 0x00 };
+    let drive = 0xE0u8 | dev | (((lba >> 24) & 0x0F) as u8);
+    outb(channel + REG_DRIVE, drive);
     io_delay();
 }
 
-fn set_lba_regs(lba: u64, count: u8) {
-    outb(ATA_FEATURES, 0);
-    outb(ATA_SECTOR_COUNT, count);
-    outb(ATA_LBA_LOW, (lba & 0xFF) as u8);
-    outb(ATA_LBA_MID, ((lba >> 8) & 0xFF) as u8);
-    outb(ATA_LBA_HIGH, ((lba >> 16) & 0xFF) as u8);
+fn set_lba_regs(channel: u16, lba: u64, count: u8) {
+    outb(channel + REG_FEATURES, 0);
+    outb(channel + REG_SECTOR_COUNT, count);
+    outb(channel + REG_LBA_LOW, (lba & 0xFF) as u8);
+    outb(channel + REG_LBA_MID, ((lba >> 8) & 0xFF) as u8);
+    outb(channel + REG_LBA_HIGH, ((lba >> 16) & 0xFF) as u8);
 }
 
-/// 识别 Primary Master 上的设备（drv1 DA2/DD3）。
+/// 识别指定通道上指定驱动位的设备（drv1 DA2/DD3，M0.4 四设备探测）。
 ///
 /// - `status == 0` → [`AtaIdentify::Absent`]；
 /// - IDENTIFY 完成 → 读容量：LBA28 字（word 60/61）为唯一权威
 ///   （本驱动 LBA28-only，不采信 LBA48 字段——宣称读取却无法寻址等于埋雷）；
 /// - 命令失败且 LBA Mid/High 呈 ATAPI 签名（0x14/0xEB）→
 ///   [`AtaIdentify::AtapiPacket`]，把包设备从"无设备"中显式区分。
-pub fn identify_ata() -> AtaIdentify {
-    if !wait_not_busy() {
+pub fn identify_ata(channel: u16, slave: bool) -> AtaIdentify {
+    if !wait_not_busy(channel) {
         return AtaIdentify::Absent;
     }
-    select_drive_lba(0);
-    outb(ATA_SECTOR_COUNT, 0);
-    outb(ATA_LBA_LOW, 0);
-    outb(ATA_LBA_MID, 0);
-    outb(ATA_LBA_HIGH, 0);
-    outb(ATA_COMMAND, ATA_CMD_IDENTIFY);
+    select_drive_lba(channel, 0, slave);
+    outb(channel + REG_SECTOR_COUNT, 0);
+    outb(channel + REG_LBA_LOW, 0);
+    outb(channel + REG_LBA_MID, 0);
+    outb(channel + REG_LBA_HIGH, 0);
+    outb(channel + REG_COMMAND, ATA_CMD_IDENTIFY);
 
-    let status = status_read();
+    let status = status_read(channel);
     if status == 0 {
         return AtaIdentify::Absent;
     }
-    if !wait_drq() {
+    if !wait_drq(channel) {
         // 命令失败：读签名口区分 ATAPI 包设备与真缺席（规范定义，
         // IDENTIFY DEVICE 对包设备报错后签名口保持 0x14/0xEB）。
-        let mid = inb(ATA_LBA_MID);
-        let high = inb(ATA_LBA_HIGH);
+        let mid = inb(channel + REG_LBA_MID);
+        let high = inb(channel + REG_LBA_HIGH);
         if mid == ATAPI_SIG_LBA_MID && high == ATAPI_SIG_LBA_HIGH {
             return AtaIdentify::AtapiPacket;
         }
         klib::error!(
-            "[ata_pio] identify failed: status={:#04x} sig_mid={:#04x} sig_high={:#04x}",
+            "[ata_pio] identify failed (ch={:#x} slave={}): status={:#04x} sig_mid={:#04x} sig_high={:#04x}",
+            channel,
+            slave,
             status,
             mid,
             high
@@ -163,7 +197,7 @@ pub fn identify_ata() -> AtaIdentify {
     }
     let mut data = [0u16; 256];
     for word in data.iter_mut() {
-        *word = inw(ATA_DATA);
+        *word = data_read(channel);
     }
     let lba28 = ((data[60] as u32) | ((data[61] as u32) << 16)) as u64;
     if lba28 > 0 {
@@ -175,9 +209,9 @@ pub fn identify_ata() -> AtaIdentify {
     }
 }
 
-fn ata_read_sector(lba: u64, out: &mut [u8; 512]) -> bool {
+fn ata_read_sector(channel: u16, slave: bool, lba: u64, out: &mut [u8; 512]) -> bool {
     for attempt in 0..3 {
-        if !wait_not_busy() {
+        if !wait_not_busy(channel) {
             klib::error!(
                 "[ata_pio] read lba={} attempt={} failed: device stuck BSY (10k polls)",
                 lba,
@@ -185,11 +219,11 @@ fn ata_read_sector(lba: u64, out: &mut [u8; 512]) -> bool {
             );
             continue;
         }
-        select_drive_lba(lba);
-        set_lba_regs(lba, 1);
-        outb(ATA_COMMAND, ATA_CMD_READ_SECTORS);
-        let st = status_read();
-        let drq_ok = wait_drq();
+        select_drive_lba(channel, lba, slave);
+        set_lba_regs(channel, lba, 1);
+        outb(channel + REG_COMMAND, ATA_CMD_READ_SECTORS);
+        let st = status_read(channel);
+        let drq_ok = wait_drq(channel);
         if st == 0xFF || (st & ATA_SR_ERR) != 0 || (st & ATA_SR_DF) != 0 || !drq_ok {
             // 失败诊断：status 原值 + 各标志位拆解（ERR=0x01 DF=0x20 DRQ=0x08）。
             klib::error!(
@@ -204,7 +238,7 @@ fn ata_read_sector(lba: u64, out: &mut [u8; 512]) -> bool {
             continue;
         }
         for i in 0..256 {
-            let word = inw(ATA_DATA);
+            let word = data_read(channel);
             out[i * 2] = (word & 0xFF) as u8;
             out[i * 2 + 1] = (word >> 8) as u8;
         }
@@ -213,33 +247,33 @@ fn ata_read_sector(lba: u64, out: &mut [u8; 512]) -> bool {
     false
 }
 
-fn ata_write_sector(lba: u64, data: &[u8; 512]) -> bool {
+fn ata_write_sector(channel: u16, slave: bool, lba: u64, data: &[u8; 512]) -> bool {
     for _ in 0..3 {
-        if !wait_not_busy() {
+        if !wait_not_busy(channel) {
             continue;
         }
-        select_drive_lba(lba);
-        set_lba_regs(lba, 1);
-        outb(ATA_COMMAND, ATA_CMD_WRITE_SECTORS);
-        if !wait_drq() {
+        select_drive_lba(channel, lba, slave);
+        set_lba_regs(channel, lba, 1);
+        outb(channel + REG_COMMAND, ATA_CMD_WRITE_SECTORS);
+        if !wait_drq(channel) {
             continue;
         }
         for i in 0..256 {
             let word = (data[i * 2] as u16) | ((data[i * 2 + 1] as u16) << 8);
-            outw(ATA_DATA, word);
+            data_write(channel, word);
         }
         // 完成等待：最后一个数据字写出后，设备置 BSY 把缓冲落盘
         // （QEMU 经异步下半区提交宿主文件）。必须等到命令真正结束再返回，
-        // 否则紧随其后的读命令会在 BSY 上撞车——这正是“末端 LBA 读返回 0”
+        // 否则紧随其后的读命令会在 BSY 上撞车——这正是"末端 LBA 读返回 0"
         // 的真实根因：与 LBA 位置无关，任何写后立即读都可能触发。
-        if !wait_not_busy() {
+        if !wait_not_busy(channel) {
             klib::error!(
                 "[ata_pio] write lba={} failed: device stuck BSY after data phase",
                 lba
             );
             continue;
         }
-        let st = status_read();
+        let st = status_read(channel);
         if (st & ATA_SR_ERR) == 0 && (st & ATA_SR_DF) == 0 {
             return true;
         }
@@ -256,6 +290,12 @@ fn ata_write_sector(lba: u64, data: &[u8; 512]) -> bool {
 
 pub struct AtaPioDevice {
     pub name: &'static str,
+    /// 通道寄存器基址（Primary 0x1F0 / Secondary 0x170）。
+    pub channel: u16,
+    /// 驱动位：false=Master, true=Slave。
+    pub slave: bool,
+    /// 硬件 I/O 位置（登记用）：0x1F0/0x1F0/0x170/0x170。
+    pub location: u32,
     pub sectors: Mutex<u64>,
     pub is_hardware: Mutex<bool>,
     /// 真实 I/O 计数（C16.1）：硬件路径按成功 sector 命令计数，
@@ -314,7 +354,7 @@ impl IoDevice for AtaPioDevice {
         let mut buf = [0u8; 512];
         let mut remaining = out.len();
         while remaining > 0 && lba < total_sectors {
-            if !ata_read_sector(lba, &mut buf) {
+            if !ata_read_sector(self.channel, self.slave, lba, &mut buf) {
                 break;
             }
             // C16.1：每条成功 sector 读命令计 1。
@@ -363,18 +403,18 @@ impl IoDevice for AtaPioDevice {
             let take = core::cmp::min(remaining, 512 - sector_off);
             if sector_off != 0 || take < 512 {
                 // 部分扇区写：真实的读-改-写序列，两条命令各计其账。
-                if !ata_read_sector(lba, &mut buf) {
+                if !ata_read_sector(self.channel, self.slave, lba, &mut buf) {
                     break;
                 }
                 self.stats.record_read(1);
                 buf[sector_off..sector_off + take].copy_from_slice(&data[done..done + take]);
-                if !ata_write_sector(lba, &buf) {
+                if !ata_write_sector(self.channel, self.slave, lba, &buf) {
                     break;
                 }
                 self.stats.record_write(1);
             } else {
                 buf.copy_from_slice(&data[done..done + 512]);
-                if !ata_write_sector(lba, &buf) {
+                if !ata_write_sector(self.channel, self.slave, lba, &buf) {
                     break;
                 }
                 self.stats.record_write(1);
@@ -407,9 +447,40 @@ impl BlockDevice for AtaPioDevice {
     }
 }
 
-/// identify 成功时的真实硬件盘身份：背后是可持久化介质（-hda 镜像/真机硬盘）。
+/// identify 成功时的真实硬件盘身份（M0.4 四设备）：
+/// 背后是可持久化介质（-hda/-hdb 镜像/真机硬盘）。
 pub static ATA_PRIMARY_MASTER: AtaPioDevice = AtaPioDevice {
     name: "ata0",
+    channel: ATA_PRIMARY_BASE,
+    slave: false,
+    location: ATA_PRIMARY_BASE as u32,
+    sectors: Mutex::new(0),
+    is_hardware: Mutex::new(false),
+    stats: IoStats::new(),
+};
+pub static ATA_PRIMARY_SLAVE: AtaPioDevice = AtaPioDevice {
+    name: "ata1",
+    channel: ATA_PRIMARY_BASE,
+    slave: true,
+    location: ATA_PRIMARY_BASE as u32,
+    sectors: Mutex::new(0),
+    is_hardware: Mutex::new(false),
+    stats: IoStats::new(),
+};
+pub static ATA_SECONDARY_MASTER: AtaPioDevice = AtaPioDevice {
+    name: "ata2",
+    channel: ATA_SECONDARY_BASE,
+    slave: false,
+    location: ATA_SECONDARY_BASE as u32,
+    sectors: Mutex::new(0),
+    is_hardware: Mutex::new(false),
+    stats: IoStats::new(),
+};
+pub static ATA_SECONDARY_SLAVE: AtaPioDevice = AtaPioDevice {
+    name: "ata3",
+    channel: ATA_SECONDARY_BASE,
+    slave: true,
+    location: ATA_SECONDARY_BASE as u32,
     sectors: Mutex::new(0),
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
@@ -419,6 +490,9 @@ pub static ATA_PRIMARY_MASTER: AtaPioDevice = AtaPioDevice {
 /// 独立注册名 + 易失披露，杜绝以 "ata0" 名义伪装持久硬盘。
 static ATA_RAM_FALLBACK: AtaPioDevice = AtaPioDevice {
     name: "ata0-ramfallback",
+    channel: ATA_PRIMARY_BASE,
+    slave: false,
+    location: ATA_PRIMARY_BASE as u32,
     sectors: Mutex::new(0),
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
@@ -427,67 +501,81 @@ static ATA_RAM_FALLBACK: AtaPioDevice = AtaPioDevice {
 /// 回退盘容量：128 扇区 × 512B = 64KiB。
 const FALLBACK_SECTOR_COUNT: u64 = 128;
 
+/// 四设备探测槽位表（M0.4）：(设备静态, 通道基址, 驱动位, 显示名)。
+const DEVICE_SLOTS: [(&AtaPioDevice, u16, bool); 4] = [
+    (&ATA_PRIMARY_MASTER, ATA_PRIMARY_BASE, false),
+    (&ATA_PRIMARY_SLAVE, ATA_PRIMARY_BASE, true),
+    (&ATA_SECONDARY_MASTER, ATA_SECONDARY_BASE, false),
+    (&ATA_SECONDARY_SLAVE, ATA_SECONDARY_BASE, true),
+];
+
 pub fn init_ata(_hub: &DriverHub) {
     // 身份在 init 时一次性判定并写入注册表，运行期不再变更（无影子状态）。
     // ADR-022 §3：Ata 超域容量拒绝硬件模式（不钳制——钳制是对介质容量的
     // 说谎）；AtapiPacket 不落回退盘（硬件存在而伪造 RAM 盘会掩盖可支持的
-    // 未来目标）；Absent 维持 DMYGH #15 披露式回退政策。
-    let registration: Option<(&'static AtaPioDevice, &'static str, bool)> = match identify_ata() {
-        AtaIdentify::Ata(sec) if sec <= LBA28_MAX_SECTORS => {
-            *ATA_PRIMARY_MASTER.sectors.lock() = sec;
-            *ATA_PRIMARY_MASTER.is_hardware.lock() = true;
-            info!(
-                "[ata_pio] ATA Primary Master hardware identified: {} sectors ({} MB), LBA28 domain",
-                sec,
-                (sec * 512) / (1024 * 1024)
-            );
-            Some((&ATA_PRIMARY_MASTER, "ata0", false))
-        }
-        AtaIdentify::Ata(sec) => {
-            klib::error!(
-                "[ata_pio] refusing unsafe hardware access: disk capacity {} sectors exceeds LBA28 addressing limit {} (offsets would silently wrap and corrupt data)",
-                sec,
-                LBA28_MAX_SECTORS
-            );
-            *ATA_RAM_FALLBACK.sectors.lock() = FALLBACK_SECTOR_COUNT;
-            *ATA_RAM_FALLBACK.is_hardware.lock() = false;
-            info!(
-                "[ata_pio] falling back to NON-PERSISTENT RAM storage '{}' ({} KiB) - all data is lost on reboot",
-                ATA_RAM_FALLBACK.name,
-                (FALLBACK_SECTOR_COUNT * 512) / 1024
-            );
-            Some((&ATA_RAM_FALLBACK, "ata0-ramfallback", true))
-        }
-        AtaIdentify::AtapiPacket => {
-            info!(
-                "[ata_pio] ATAPI packet device detected on Primary Master; LBA28 PIO block driver does not support packet devices - no block device registered"
-            );
-            None
-        }
-        AtaIdentify::Absent => {
-            // DMYGH #15：identify 失败时如实登记为非持久内存回退盘，
-            // 日志保留 fallback 说明，设备列表同步携带 volatile=true。
-            *ATA_RAM_FALLBACK.sectors.lock() = FALLBACK_SECTOR_COUNT;
-            *ATA_RAM_FALLBACK.is_hardware.lock() = false;
-            info!(
-                "[ata_pio] ATA identify failed; fallback to NON-PERSISTENT RAM storage '{}' ({} KiB) - all data is lost on reboot",
-                ATA_RAM_FALLBACK.name,
-                (FALLBACK_SECTOR_COUNT * 512) / 1024
-            );
-            Some((&ATA_RAM_FALLBACK, "ata0-ramfallback", true))
-        }
-    };
+    // 未来目标）；Absent 维持 DMYGH #15 披露式回退政策（仅当四设备全缺席时
+    // 才落 RAM 回退，且只回退一块）。
+    let mut found_hardware = false;
 
-    let Some((dev, dev_name, volatile)) = registration else {
+    for (dev, channel, slave) in DEVICE_SLOTS {
+        match identify_ata(channel, slave) {
+            AtaIdentify::Ata(sec) if sec <= LBA28_MAX_SECTORS => {
+                *dev.sectors.lock() = sec;
+                *dev.is_hardware.lock() = true;
+                info!(
+                    "[ata_pio] ATA {} hardware identified: {} sectors ({} MB), LBA28 domain",
+                    dev.name,
+                    sec,
+                    (sec * 512) / (1024 * 1024)
+                );
+                register_device(dev, dev.name, false);
+                found_hardware = true;
+            }
+            AtaIdentify::Ata(sec) => {
+                klib::error!(
+                    "[ata_pio] refusing unsafe hardware access on '{}': disk capacity {} sectors exceeds LBA28 addressing limit {} (offsets would silently wrap and corrupt data)",
+                    dev.name,
+                    sec,
+                    LBA28_MAX_SECTORS
+                );
+                // 超域盘不可用，也不伪造回退；继续考察其余槽位。
+            }
+            AtaIdentify::AtapiPacket => {
+                info!(
+                    "[ata_pio] ATAPI packet device detected on '{}'; LBA28 PIO block driver does not support packet devices - no block device registered",
+                    dev.name
+                );
+            }
+            AtaIdentify::Absent => {
+                // 该槽位无设备；不登记、不伪造。四槽全缺席时最后统一落回退。
+            }
+        }
+    }
+
+    if found_hardware {
         return;
-    };
+    }
 
+    // DMYGH #15：四设备全缺席（纯 CD-ROM 或无盘）时如实登记非持久内存
+    // 回退盘，日志保留 fallback 说明，设备列表同步携带 volatile=true。
+    *ATA_RAM_FALLBACK.sectors.lock() = FALLBACK_SECTOR_COUNT;
+    *ATA_RAM_FALLBACK.is_hardware.lock() = false;
+    info!(
+        "[ata_pio] no ATA hardware found; fallback to NON-PERSISTENT RAM storage '{}' ({} KiB) - all data is lost on reboot",
+        ATA_RAM_FALLBACK.name,
+        (FALLBACK_SECTOR_COUNT * 512) / 1024
+    );
+    register_device(&ATA_RAM_FALLBACK, ATA_RAM_FALLBACK.name, true);
+}
+
+/// 登记一块盘到 DriverHub（volatile 语义直通，无影子状态）。
+fn register_device(dev: &'static AtaPioDevice, name: &'static str, volatile: bool) {
     if let Err(e) = DriverHub::register_device_info(
         DeviceInfo {
-            name: dev_name,
+            name,
             kind: DeviceKind::Block,
             bus: BusType::Platform,
-            location: 0x1F0,
+            location: dev.location,
             vendor_id: 0,
             device_id: 0,
             class_code: 0x01,

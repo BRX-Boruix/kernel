@@ -4,10 +4,14 @@
 //! 由 [`crate::mbr`] 解析得出），分区内 1024B 块、超级块 @分区偏移 1024、
 //! 组描述符 @first_data_block+1 块、inode 表由组描述符指向。
 //!
-//! 只读边界：本模块不提供任何写路径；VFS 节点的 writable 恒为 false，全部
-//! 写族方法如实返回 [`Error::ReadOnly`]（EROFS）而非 trait 默认的
-//! NotDirectory/NotSupported 谎言（fs1 FA3a）。稀疏块（块指针 0）按全零
-//! 读出——这是 EXT2 的真实语义而非伪造。
+//! 只读边界（fs1 整改后形态 → M3 可写）：本模块自 M3 起提供**最小可写
+//! 支集**（块/inode 分配释放、位图更新、目录项增删、superblock/GDT 记账、
+//! 直块 + 一级/二级间接块、文件数据写、truncate），写路径经页缓存写穿一致性
+//! 落盘（本内核无页缓存写回期，写即落盘）。读侧亦支持一级/二级间接
+//! 寻址；仅三重间接仍显式拒绝（当前镜像与工作负载不需要，写侧 blocks[14]
+//! 不分配，读侧遇三重间接文件如实报错）。VFS 节点 writable 恒为 true，写族方法
+//! 如实返回 [`Error::ReadOnly`] 仅当底层 `ByteDevice::write_bytes` 不可写
+//! （返回 0）时由短写映射为 IO 错误。
 //!
 //! ## 镜像元数据信任边界（fs1 FA2 / ADR-021）
 //!
@@ -83,6 +87,78 @@ pub struct Ext2Superblock {
     pub inode_size: u16,
     pub first_data_block: u32,
     pub block_size: u32,
+    /// 卷标 `s_volume_name`（@120，16 字节，未用空间以 NUL 填充）。
+    ///
+    /// 用于 `/volumes/{label}` 命名（ADR-028 §决策2 / ADR-029 §决策1）。
+    /// 卷标是镜像创建者声明的友好名，可能全零（无卷标）或任意字节；
+    /// 见 [`Ext2Superblock::volume_name_str`] 的截断/合法性策略。
+    pub volume_name: [u8; 16],
+    /// 文件系统 UUID `s_uuid`（@104，16 字节，EXT2 rev1 起存在）。
+    ///
+    /// 用于 boot 来源判定的 FS UUID 比对（ADR-029 §决策3）。镜像创建者
+    /// 可填任意 16 字节；全零表示"未声明 UUID"，比对时须视为无 UUID
+    /// 而非一个等于零的 UUID（S09 宁缺毋假）。
+    pub uuid: [u8; 16],
+    /// `s_free_blocks_count`（@12）：全卷空闲块计数（M3 写路径记账锚点）。
+    pub free_blocks_count: u32,
+    /// `s_free_inodes_count`（@16）：全卷空闲 inode 计数（M3 写路径记账锚点）。
+    pub free_inodes_count: u32,
+}
+
+impl Ext2Superblock {
+    /// 卷标字符串访问器：截断到首个 NUL，无卷标（首字节即 0 或全零）返回空串。
+    ///
+    /// 卷标合法性策略（S02/S09）：卷标是镜像创建者声明的友好名，可能
+    /// 含任意字节。返回 [`Option`] 而非直接 `&str`——非 UTF-8 的卷标不能
+    /// 用 lossy 替换（那会篡改展示名），如实返回 `None` 让调用方走无卷标
+    /// 降级命名（`storage-{ShortUUID}`，ADR-030 §决策2）。
+    pub fn volume_name_str(&self) -> Option<&str> {
+        let end = self
+            .volume_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.volume_name.len());
+        if end == 0 {
+            return Some("");
+        }
+        core::str::from_utf8(&self.volume_name[..end]).ok()
+    }
+
+    /// FS UUID 是否未声明（全零）。
+    ///
+    /// 用于 boot 来源比对：全零 UUID 是"无 UUID"而非"UUID 为零值"，
+    /// 与任何真实 boot UUID 都不应命中（S09 宁缺毋假）。
+    pub fn uuid_is_zero(&self) -> bool {
+        self.uuid.iter().all(|&b| b == 0)
+    }
+}
+
+/// EXT2 目录项文件名最大长度（规范硬约束：`name_len` 字段仅 1 字节）。
+const EXT2_NAME_LEN_MAX: usize = 255;
+
+/// 校验一个 EXT2 目录项组件名（写入侧统一入口）。
+///
+/// 对齐 VFS 层 `MountTable::validate_name`（mount.rs）的合法字符集合，并叠加
+/// EXT2 自身的 `name_len` 1 字节上限。三处规则归一，消除"读侧任意非 NUL、
+/// 写侧只拒 `/`、VFS 额外拒控制字符"的三套不一致：
+/// - 非空；
+/// - 长度 ≤ 255（`name_len` u8 上限，超长显式拒绝，杜绝 `as u8` 静默截断）；
+/// - 不含 `/`（路径分隔符，单组件名不允许）；
+/// - 不含控制字符 `<0x20` 与 `0x7F`（与 VFS `validate_name` 同规则）。
+///
+/// 违反返回 [`Ext2Error::CorruptDirEntry`]，调用方再按需映射（S04：显式拒绝
+/// 而非静默截断字节）。
+fn validate_component_name(name: &str) -> Result<(), Ext2Error> {
+    let b = name.as_bytes();
+    if b.is_empty() || b.len() > EXT2_NAME_LEN_MAX {
+        return Err(Ext2Error::CorruptDirEntry);
+    }
+    for &byte in b {
+        if byte == b'/' || byte <= 0x1F || byte == 0x7F {
+            return Err(Ext2Error::CorruptDirEntry);
+        }
+    }
+    Ok(())
 }
 
 fn le_u16(b: &[u8], off: usize) -> u16 {
@@ -140,6 +216,13 @@ pub fn parse_superblock(sb: &[u8; 1024]) -> Result<Ext2Superblock, Ext2Error> {
     if blocks_per_group == 0 {
         return Err(Ext2Error::CorruptSuperblock);
     }
+    // 卷标 @120、FS UUID @104：均 16 字节原始字段（EXT2 规范）。
+    // 不在此做 UTF-8 校验——卷标可能任意字节，合法性判定交给消费方
+    // （volume_name_str），解析层只负责忠实取出盘上真值。
+    let mut volume_name = [0u8; 16];
+    volume_name.copy_from_slice(&sb[120..136]);
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&sb[104..120]);
     Ok(Ext2Superblock {
         blocks_count,
         inodes_count,
@@ -148,6 +231,10 @@ pub fn parse_superblock(sb: &[u8; 1024]) -> Result<Ext2Superblock, Ext2Error> {
         inode_size,
         first_data_block,
         block_size,
+        volume_name,
+        uuid,
+        free_blocks_count: le_u32(sb, 12),
+        free_inodes_count: le_u32(sb, 16),
     })
 }
 
@@ -202,6 +289,16 @@ pub struct Ext2Fs {
     inner: Arc<Ext2Inner>,
 }
 
+/// 组描述符（M3 写路径需要位图块号与组级空闲计数）。
+#[derive(Debug, Clone, Copy)]
+struct GroupDesc {
+    block_bitmap: u32,
+    inode_bitmap: u32,
+    inode_table: u32,
+    free_blocks: u32,
+    free_inodes: u32,
+}
+
 struct Ext2Inner {
     dev: Arc<dyn ByteDevice>,
     /// 分区起始字节地址 = 分区起始 LBA × 512。
@@ -231,6 +328,70 @@ impl Ext2Fs {
         &self.inner.sb
     }
 
+    /// 读取一个完整块到新分配的 Vec（M3 写路径便捷原语，与 `read_block`
+    /// 同界：block 越界 / 短读如实报错，缓冲恒为整块）。
+    fn read_block_buf(&self, block: u32) -> Result<alloc::vec::Vec<u8>, Ext2Error> {
+        let bs = self.superblock().block_size as usize;
+        let mut buf = alloc::vec![0u8; bs];
+        self.read_block(block, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// 计算 inode 的 EXT2 规范 `i_blocks`（512 字节扇区计数）。
+    ///
+    /// 规范定义 `i_blocks` 为文件占用的全部 512B 扇区数，**含间接指针表块
+    /// 自身**——旧实现 `size.div_ceil(512)` 只按数据字节推算，把间接块占用
+    /// 漏记（偏小）。本函数按块映射结构逐级清点：直块 + 一级间接表（含其
+    /// 数据指针）+ 二级间接表（含各级 L1 表及其数据指针），再乘以每块扇区数。
+    /// 数据块按映射中的非零指针计（稀疏区不计）。三重间接区（blocks[14]）
+    /// 不建模，若出现按真实占用量清点到 blocks[14] 本身仍照常计入其表块。
+    fn count_sectors(&self, inode: &Inode) -> Result<u32, Ext2Error> {
+        let bs = self.superblock().block_size as usize;
+        let per_block = bs / 4;
+        let sectors_per_block = (bs / 512) as u32;
+        let mut blocks = 0u32;
+        // 直块：非零即计。
+        for &b in &inode.blocks[..12] {
+            if b != 0 {
+                blocks += 1;
+            }
+        }
+        // 一级间接表（blocks[12]）：表块 1 + 非零数据指针。
+        if inode.blocks[12] != 0 {
+            blocks += 1;
+            let l1 = self.read_block_buf(inode.blocks[12])?;
+            for i in 0..per_block {
+                if le_u32(&l1, i * 4) != 0 {
+                    blocks += 1;
+                }
+            }
+        }
+        // 二级间接表（blocks[13]）：表块 1 + 各非零 L1 表块 + 各 L1 内非零数据指针。
+        if inode.blocks[13] != 0 {
+            blocks += 1;
+            let dbl = self.read_block_buf(inode.blocks[13])?;
+            for i in 0..per_block {
+                let l1_ptr = le_u32(&dbl, i * 4);
+                if l1_ptr == 0 {
+                    continue;
+                }
+                blocks += 1; // L1 表块
+                let l1 = self.read_block_buf(l1_ptr)?;
+                for j in 0..per_block {
+                    if le_u32(&l1, j * 4) != 0 {
+                        blocks += 1;
+                    }
+                }
+            }
+        }
+        // 三重间接表（blocks[14]）：本驱动不建模数据分配，但表块本身若存在
+        // （外部工具写入）按真实占用量计入。
+        if inode.blocks[14] != 0 {
+            blocks += 1;
+        }
+        Ok(blocks * sectors_per_block)
+    }
+
     /// 读取一个完整块。
     ///
     /// fs1 FM4：`out` 必须能容纳整个块——不足时显式返回
@@ -253,11 +414,11 @@ impl Ext2Fs {
     }
 
     /// 读组描述符（GDT 位于 first_data_block + 1 块起，每项 32 字节）：
-    /// 返回 (块位图块号, inode 位图块号, inode 表块号)。
+    /// 返回 (块位图块号, inode 位图块号, inode 表块号, 空闲块计数, 空闲 inode 计数)。
     ///
     /// fs1 FM4 附带：直接按 32 字节定长栈缓冲读取，不再整块分配堆内存
-    /// 只为取前 32 字节。
-    fn read_group_desc(&self, group: u32) -> Result<(u32, u32, u32), Ext2Error> {
+    /// 只为取前 32 字节。空闲计数 @12/@16 为 M3 写路径的组级记账锚点。
+    fn read_group_desc(&self, group: u32) -> Result<GroupDesc, Ext2Error> {
         let sb = self.superblock();
         let gdt_block = (sb.first_data_block + 1) as u64;
         let mut buf = [0u8; 32];
@@ -267,7 +428,13 @@ impl Ext2Fs {
         if n < 32 {
             return Err(Ext2Error::ShortRead);
         }
-        Ok((le_u32(&buf, 0), le_u32(&buf, 4), le_u32(&buf, 8)))
+        Ok(GroupDesc {
+            block_bitmap: le_u32(&buf, 0),
+            inode_bitmap: le_u32(&buf, 4),
+            inode_table: le_u32(&buf, 8),
+            free_blocks: le_u16(&buf, 12) as u32,
+            free_inodes: le_u16(&buf, 14) as u32,
+        })
     }
 
     /// 按 inode 号读取 inode 结构。
@@ -278,7 +445,8 @@ impl Ext2Fs {
         }
         let group = (ino - 1) / sb.inodes_per_group;
         let idx = (ino - 1) % sb.inodes_per_group;
-        let (_, _, inode_table) = self.read_group_desc(group)?;
+        let gd = self.read_group_desc(group)?;
+        let inode_table = gd.inode_table;
         let bs = sb.block_size as u64;
         let abs = self.inner.part_start_byte
             + inode_table as u64 * bs
@@ -508,6 +676,852 @@ impl Ext2Fs {
         }
         Err(Error::NotFound)
     }
+
+    // ---- M3 写路径（EXT2 最小可写支集，disk.md P1-6） ----
+    //
+    // 只读挂载已废除：本模块现提供最小可写支集——块/inode 分配释放、位图
+    // 更新、目录项增删、superblock/GDT 记账、直块 + 一级间接块分配、文件
+    // 数据写、truncate。所有写都经 [`ByteDevice::write_bytes`] 落盘（M0.2
+    // 桥接），写穿无延迟（本内核无页缓存写回期，PageCache 语义见 ADR-026）。
+    // 双重间接/三重间接仍显式拒绝（当前镜像与工作负载不需要，见只读注释）。
+
+    /// 写入一个完整块（M3 地基：与 [`Self::read_block`] 对称的写原语）。
+    ///
+    /// `data` 必须恰为块大小；不足/超长都显式拒绝（不静默截断或越界），
+    /// 短写（设备返回少于块大小）如实报 `ShortRead`——绝不把部分写伪装成
+    /// 成功（S09）。
+    fn write_block(&self, block: u32, data: &[u8]) -> Result<(), Ext2Error> {
+        let sb = self.superblock();
+        if block >= sb.blocks_count {
+            return Err(Ext2Error::BlockOutOfRange);
+        }
+        let bs = sb.block_size as usize;
+        if data.len() != bs {
+            return Err(Ext2Error::BufferTooSmall);
+        }
+        let off = self.inner.part_start_byte + block as u64 * bs as u64;
+        let n = self.inner.dev.write_bytes(off, data);
+        if n < bs {
+            return Err(Ext2Error::ShortRead);
+        }
+        Ok(())
+    }
+
+    /// 块号 → 所属组号。
+    #[inline]
+    fn block_group(&self, block: u32) -> u32 {
+        block / self.superblock().blocks_per_group
+    }
+
+    /// inode 号 → 所属组号。
+    #[inline]
+    fn inode_group(&self, ino: u32) -> u32 {
+        (ino - 1) / self.superblock().inodes_per_group
+    }
+
+    /// 读整块位图（块位图或 inode 位图）。
+    fn read_bitmap(&self, bitmap_block: u32) -> Result<alloc::vec::Vec<u8>, Ext2Error> {
+        let bs = self.superblock().block_size as usize;
+        let mut buf = alloc::vec![0u8; bs];
+        self.read_block(bitmap_block, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// 在位图中置位（置 1 = 占用）。
+    fn bitmap_set(&self, bitmap_block: u32, bit: u32) -> Result<(), Ext2Error> {
+        let mut map = self.read_bitmap(bitmap_block)?;
+        let byte = (bit / 8) as usize;
+        if byte >= map.len() {
+            return Err(Ext2Error::BlockOutOfRange);
+        }
+        map[byte] |= 1 << (bit % 8);
+        self.write_block(bitmap_block, &map)
+    }
+
+    /// 在位图中清零（清 0 = 空闲）。
+    fn bitmap_clear(&self, bitmap_block: u32, bit: u32) -> Result<(), Ext2Error> {
+        let mut map = self.read_bitmap(bitmap_block)?;
+        let byte = (bit / 8) as usize;
+        if byte >= map.len() {
+            return Err(Ext2Error::BlockOutOfRange);
+        }
+        map[byte] &= !(1 << (bit % 8));
+        self.write_block(bitmap_block, &map)
+    }
+
+    /// 分配一个空闲块：跨组扫描，组内位图中找 0 位，置位并更新组/全局空闲计数。
+    fn alloc_block(&self) -> Result<u32, Ext2Error> {
+        let sb = self.superblock();
+        // 读盘上实时空闲计数（快照 `sb.free_blocks_count` 不随写更新，S31）。
+        if self.live_free_blocks()? == 0 {
+            return Err(Ext2Error::BlockOutOfRange); // 卷满：显式无空闲块
+        }
+        let group_count = sb.blocks_count.div_ceil(sb.blocks_per_group);
+        for group in 0..group_count {
+            let gd = self.read_group_desc(group)?;
+            let map = self.read_bitmap(gd.block_bitmap)?;
+            // 组内位范围：该组覆盖的块号区间。
+            let group_start = group * sb.blocks_per_group;
+            let group_end = core::cmp::min(group_start + sb.blocks_per_group, sb.blocks_count);
+            let bits = (group_end - group_start) as usize;
+            for idx in 0..bits {
+                let byte = idx / 8;
+                if byte >= map.len() {
+                    break;
+                }
+                if map[byte] & (1 << (idx % 8)) == 0 {
+                    // 找到空闲位：置位并记账。
+                    let block = group_start + idx as u32;
+                    self.bitmap_set(gd.block_bitmap, idx as u32)?;
+                    self.adjust_group_free_blocks(group, -1)?;
+                    self.adjust_superblock_free_blocks(-1)?;
+                    // S06/S18：新分配块清零——`free_block` 只清位图位不清数据，
+                    // 块内容保留被删文件的残留。若此处不置零，间接表块首次使用
+                    // 会读入陈旧指针（N1），文件增长后未写区会读出残留数据（N2）。
+                    // 统一在此清零，任何经 alloc_block 的块都是干净的。
+                    let bs = sb.block_size as usize;
+                    let zero = alloc::vec![0u8; bs];
+                    self.write_block(block, &zero)?;
+                    return Ok(block);
+                }
+            }
+        }
+        Err(Ext2Error::BlockOutOfRange)
+    }
+
+    /// 释放一个块：清零位图位并更新组/全局空闲计数。
+    fn free_block(&self, block: u32) -> Result<(), Ext2Error> {
+        let sb = self.superblock();
+        if block == 0 || block >= sb.blocks_count {
+            return Err(Ext2Error::BlockOutOfRange);
+        }
+        let group = self.block_group(block);
+        let gd = self.read_group_desc(group)?;
+        let bit = block - group * sb.blocks_per_group;
+        self.bitmap_clear(gd.block_bitmap, bit)?;
+        self.adjust_group_free_blocks(group, 1)?;
+        self.adjust_superblock_free_blocks(1)?;
+        Ok(())
+    }
+
+    /// 分配一个空闲 inode：置位 inode 位图 + 记账，返回 inode 号（1-based）。
+    fn alloc_inode(&self) -> Result<u32, Ext2Error> {
+        let sb = self.superblock();
+        // 读盘上实时空闲 inode 计数（快照 `sb.free_inodes_count` 不随写更新）。
+        if self.live_free_inodes()? == 0 {
+            return Err(Ext2Error::BadInode); // inode 耗尽
+        }
+        let group_count = sb.inodes_count.div_ceil(sb.inodes_per_group);
+        for group in 0..group_count {
+            let gd = self.read_group_desc(group)?;
+            let map = self.read_bitmap(gd.inode_bitmap)?;
+            let group_start = group * sb.inodes_per_group;
+            let group_end = core::cmp::min(group_start + sb.inodes_per_group, sb.inodes_count);
+            let bits = (group_end - group_start) as usize;
+            for idx in 0..bits {
+                let byte = idx / 8;
+                if byte >= map.len() {
+                    break;
+                }
+                if map[byte] & (1 << (idx % 8)) == 0 {
+                    self.bitmap_set(gd.inode_bitmap, idx as u32)?;
+                    self.adjust_group_free_inodes(group, -1)?;
+                    self.adjust_superblock_free_inodes(-1)?;
+                    // inode 号 = 组内偏移 + 1（inode 号从 1 起）。
+                    return Ok(group_start + idx as u32 + 1);
+                }
+            }
+        }
+        Err(Ext2Error::BadInode)
+    }
+
+    /// 释放一个 inode：清零位图位 + 记账。
+    fn free_inode(&self, ino: u32) -> Result<(), Ext2Error> {
+        let sb = self.superblock();
+        if ino == 0 || ino > sb.inodes_count {
+            return Err(Ext2Error::BadInode);
+        }
+        let group = self.inode_group(ino);
+        let gd = self.read_group_desc(group)?;
+        let bit = (ino - 1) - group * sb.inodes_per_group;
+        self.bitmap_clear(gd.inode_bitmap, bit)?;
+        self.adjust_group_free_inodes(group, 1)?;
+        self.adjust_superblock_free_inodes(1)?;
+        Ok(())
+    }
+
+    /// 组级空闲块计数增减（GDT @12）。
+    fn adjust_group_free_blocks(&self, group: u32, delta: i32) -> Result<(), Ext2Error> {
+        let gd = self.read_group_desc(group)?;
+        let updated = gd.free_blocks as i32 + delta;
+        if updated < 0 {
+            return Err(Ext2Error::CorruptSuperblock);
+        }
+        let sb = self.superblock();
+        let gdt_block = (sb.first_data_block + 1) as u64;
+        let off_abs =
+            self.inner.part_start_byte + gdt_block * sb.block_size as u64 + group as u64 * 32;
+        self.inner.dev.write_bytes(off_abs + 12, &(updated as u16).to_le_bytes());
+        Ok(())
+    }
+
+    /// 组级空闲 inode 计数增减（GDT @14）。
+    fn adjust_group_free_inodes(&self, group: u32, delta: i32) -> Result<(), Ext2Error> {
+        let gd = self.read_group_desc(group)?;
+        let updated = gd.free_inodes as i32 + delta;
+        if updated < 0 {
+            return Err(Ext2Error::CorruptSuperblock);
+        }
+        let sb = self.superblock();
+        let gdt_block = (sb.first_data_block + 1) as u64;
+        let off_abs =
+            self.inner.part_start_byte + gdt_block * sb.block_size as u64 + group as u64 * 32;
+        self.inner.dev.write_bytes(off_abs + 14, &(updated as u16).to_le_bytes());
+        Ok(())
+    }
+
+    /// 全局空闲块计数增减（superblock @12）。
+    fn adjust_superblock_free_blocks(&self, delta: i32) -> Result<(), Ext2Error> {
+        let sb_off = self.inner.part_start_byte + 1024;
+        let mut buf = [0u8; 4];
+        if self.inner.dev.read_bytes(sb_off + 12, &mut buf) < 4 {
+            return Err(Ext2Error::ShortRead);
+        }
+        let cur = le_u32(&buf, 0) as i64;
+        let updated = cur + delta as i64;
+        if updated < 0 {
+            return Err(Ext2Error::CorruptSuperblock);
+        }
+        self.inner.dev.write_bytes(sb_off + 12, &(updated as u32).to_le_bytes());
+        Ok(())
+    }
+
+    /// 全局空闲 inode 计数增减（superblock @16）。
+    fn adjust_superblock_free_inodes(&self, delta: i32) -> Result<(), Ext2Error> {
+        let sb_off = self.inner.part_start_byte + 1024;
+        let mut buf = [0u8; 4];
+        if self.inner.dev.read_bytes(sb_off + 16, &mut buf) < 4 {
+            return Err(Ext2Error::ShortRead);
+        }
+        let cur = le_u32(&buf, 0) as i64;
+        let updated = cur + delta as i64;
+        if updated < 0 {
+            return Err(Ext2Error::CorruptSuperblock);
+        }
+        self.inner.dev.write_bytes(sb_off + 16, &(updated as u32).to_le_bytes());
+        Ok(())
+    }
+
+    /// 读回盘上 superblock 的**实时**空闲块计数（@12）。
+    ///
+    /// 写路径改的是盘上 superblock，`self.inner.sb`（[`Ext2Superblock`] 是
+    /// 打开时 Copy 快照）里的 `free_blocks_count` 不随写更新。分配前判定
+    /// "卷是否满"必须读实时值，否则基于陈旧快照会误判（如已分配若干块后
+    /// 快照仍显示非零，或本已耗尽却因缓存失真）。几何字段（blocks_count 等）
+    /// 不会变，仍用快照。
+    fn live_free_blocks(&self) -> Result<u32, Ext2Error> {
+        let sb_off = self.inner.part_start_byte + 1024;
+        let mut buf = [0u8; 4];
+        if self.inner.dev.read_bytes(sb_off + 12, &mut buf) < 4 {
+            return Err(Ext2Error::ShortRead);
+        }
+        Ok(le_u32(&buf, 0))
+    }
+
+    /// 读回盘上 superblock 的**实时**空闲 inode 计数（@16）。
+    fn live_free_inodes(&self) -> Result<u32, Ext2Error> {
+        let sb_off = self.inner.part_start_byte + 1024;
+        let mut buf = [0u8; 4];
+        if self.inner.dev.read_bytes(sb_off + 16, &mut buf) < 4 {
+            return Err(Ext2Error::ShortRead);
+        }
+        Ok(le_u32(&buf, 0))
+    }
+
+    /// 把 inode 结构写回 inode 表（M3）。
+    fn write_inode(&self, inode: &Inode) -> Result<(), Ext2Error> {
+        let sb = self.superblock();
+        if inode.ino == 0 || inode.ino > sb.inodes_count || sb.inodes_per_group == 0 {
+            return Err(Ext2Error::BadInode);
+        }
+        let group = self.inode_group(inode.ino);
+        let idx = (inode.ino - 1) % sb.inodes_per_group;
+        let gd = self.read_group_desc(group)?;
+        let bs = sb.block_size as u64;
+        let abs = self.inner.part_start_byte
+            + gd.inode_table as u64 * bs
+            + idx as u64 * sb.inode_size as u64;
+        let isz = sb.inode_size as usize;
+        // 先读回既有 inode 字节（保留我们未建模的字段，避免清零 i_flags 等），
+        // 再覆写我们建模的字段。
+        let mut raw = alloc::vec![0u8; isz];
+        if self.inner.dev.read_bytes(abs, &mut raw) < isz {
+            return Err(Ext2Error::ShortRead);
+        }
+        raw[0..2].copy_from_slice(&inode.mode.to_le_bytes());
+        raw[4..8].copy_from_slice(&inode.size.to_le_bytes());
+        raw[8..12].copy_from_slice(&inode.mtime.to_le_bytes());
+        raw[16..20].copy_from_slice(&inode.ctime.to_le_bytes());
+        raw[28..32].copy_from_slice(&inode.sectors.to_le_bytes());
+        for (i, b) in inode.blocks.iter().enumerate() {
+            raw[40 + i * 4..44 + i * 4].copy_from_slice(&b.to_le_bytes());
+        }
+        if self.inner.dev.write_bytes(abs, &raw) < isz {
+            return Err(Ext2Error::ShortRead);
+        }
+        Ok(())
+    }
+
+    /// 释放 inode 占用的全部数据块（含一级/二级间接块），随后释放 inode 本身。
+    fn free_inode_blocks(&self, inode: &Inode) -> Result<(), Ext2Error> {
+        let sb = self.superblock();
+        let bs = sb.block_size as usize;
+        // 直块 0..12。
+        for &b in &inode.blocks[..12] {
+            if b != 0 {
+                self.free_block(b)?;
+            }
+        }
+        // 一级间接块（blocks[12]）：每个指针指向一个数据块。
+        if inode.blocks[12] != 0 {
+            let map = self.read_block_buf(inode.blocks[12])?;
+            for i in 0..(bs / 4) {
+                let b = le_u32(&map, i * 4);
+                if b != 0 {
+                    self.free_block(b)?;
+                }
+            }
+            self.free_block(inode.blocks[12])?;
+        }
+        // 二级间接块（blocks[13]）：每个一级项指向一张 L1 表，L1 表每项指向数据块。
+        if inode.blocks[13] != 0 {
+            let dbl = self.read_block_buf(inode.blocks[13])?;
+            for i in 0..(bs / 4) {
+                let l1_ptr = le_u32(&dbl, i * 4);
+                if l1_ptr == 0 {
+                    continue;
+                }
+                let l1 = self.read_block_buf(l1_ptr)?;
+                for j in 0..(bs / 4) {
+                    let b = le_u32(&l1, j * 4);
+                    if b != 0 {
+                        self.free_block(b)?;
+                    }
+                }
+                self.free_block(l1_ptr)?;
+            }
+            self.free_block(inode.blocks[13])?;
+        }
+        // 三重间接（blocks[14]）：读侧不建模，写侧亦不支持——显式拒绝而非
+        // 静默泄漏（含三重间接的文件无法 unlink，如实报错）。
+        if inode.blocks[14] != 0 {
+            return Err(Ext2Error::UnsupportedTripleIndirect);
+        }
+        self.free_inode(inode.ino)
+    }
+
+    /// 把 inode 扩展到 `new_size`：分配直块 + 一级/二级间接块。
+    /// 不收缩（收缩走 truncate_inode）。
+    fn grow_inode_blocks(
+        &self,
+        inode: &mut Inode,
+        new_size: u64,
+    ) -> Result<(), Ext2Error> {
+        let sb = self.superblock();
+        let bs = sb.block_size as u64;
+        // size 存 u32：超过 u32::MAX 无法表示，显式拒绝（S04，杜绝 as u32 截断）。
+        if new_size > u32::MAX as u64 {
+            return Err(Ext2Error::BlockOutOfRange);
+        }
+        let new_blocks = new_size.div_ceil(bs) as u32;
+        // 当前已占块数（按 size 推算，稀疏块按 0 计但此处按连续分配模型）。
+        let cur_blocks = (inode.size as u64).div_ceil(bs) as u32;
+        if new_blocks <= cur_blocks {
+            inode.size = new_size as u32;
+            return Ok(());
+        }
+        for logical in cur_blocks..new_blocks {
+            let phys = self.alloc_block()?;
+            self.set_inode_block(inode, logical, phys)?;
+        }
+        inode.size = new_size as u32;
+        Ok(())
+    }
+
+    /// 设置 inode 的第 `logical` 个逻辑块的物理块号（含一级/二级间接块分配）。
+    ///
+    /// 与读侧 [`Self::map_logical_block`] 的寻址语义严格对称：直块 0..12、
+    /// 一级间接（`blocks[12]`，覆盖 per_block 项）、二级间接（`blocks[13]`，
+    /// 覆盖 per_block² 项）。超出直块+二级间接范围才 `UnsupportedTripleIndirect`
+    /// （`blocks[14]` 三重间接写仍未实现，读侧亦不支持，对称）。
+    fn set_inode_block(&self, inode: &mut Inode, logical: u32, phys: u32) -> Result<(), Ext2Error> {
+        let per_block = self.superblock().block_size / 4;
+        if logical < 12 {
+            inode.blocks[logical as usize] = phys;
+            return Ok(());
+        }
+        let rem = logical - 12;
+        // 一级间接区：rem < per_block。
+        if rem < per_block {
+            // 一级间接块尚未分配则先分配。
+            if inode.blocks[12] == 0 {
+                inode.blocks[12] = self.alloc_block()?;
+            }
+            let mut map = self.read_block_buf(inode.blocks[12])?;
+            map[rem as usize * 4..rem as usize * 4 + 4].copy_from_slice(&phys.to_le_bytes());
+            return self.write_block(inode.blocks[12], &map);
+        }
+        // 二级间接区：rem in [per_block, per_block + per_block²)。
+        let rem2 = rem - per_block;
+        let l2_span = per_block * per_block;
+        if rem2 < l2_span {
+            let l1_idx = rem2 / per_block;
+            let l1_off = (rem2 % per_block) as usize;
+            // 二级间接表（blocks[13]）尚未分配则先分配。
+            if inode.blocks[13] == 0 {
+                inode.blocks[13] = self.alloc_block()?;
+            }
+            // 取/建一级间接表块。
+            let mut l1_map = self.read_block_buf(inode.blocks[13])?;
+            let l1_ptr = le_u32(&l1_map, l1_idx as usize * 4);
+            let l1_block = if l1_ptr == 0 {
+                let b = self.alloc_block()?;
+                l1_map[l1_idx as usize * 4..l1_idx as usize * 4 + 4]
+                    .copy_from_slice(&b.to_le_bytes());
+                self.write_block(inode.blocks[13], &l1_map)?;
+                b
+            } else {
+                l1_ptr
+            };
+            let mut map = self.read_block_buf(l1_block)?;
+            map[l1_off * 4..l1_off * 4 + 4].copy_from_slice(&phys.to_le_bytes());
+            return self.write_block(l1_block, &map);
+        }
+        // 超出直块+二级间接：需要三重间接，显式拒绝。
+        Err(Ext2Error::UnsupportedTripleIndirect)
+    }
+
+    /// truncate：收缩释放尾部块，扩展分配新块；更新 size/sectors/mtime/ctime。
+    fn truncate_inode(&self, inode: &mut Inode, new_size: u64) -> Result<(), Ext2Error> {
+        let sb = self.superblock();
+        let bs = sb.block_size as u64;
+        // size 存 u32：超过 u32::MAX 无法表示，显式拒绝（S04，杜绝 as u32 截断）。
+        if new_size > u32::MAX as u64 {
+            return Err(Ext2Error::BlockOutOfRange);
+        }
+        let cur_blocks = (inode.size as u64).div_ceil(bs) as u32;
+        let new_blocks = new_size.div_ceil(bs) as u32;
+        if new_blocks < cur_blocks {
+            // 收缩：释放 [new_blocks, cur_blocks) 的逻辑块。
+            for logical in new_blocks..cur_blocks {
+                let phys = self.map_logical_block(inode, logical)?;
+                if phys != 0 {
+                    self.clear_inode_block(inode, logical)?;
+                    self.free_block(phys)?;
+                }
+            }
+        } else if new_blocks > cur_blocks {
+            for logical in cur_blocks..new_blocks {
+                let phys = self.alloc_block()?;
+                self.set_inode_block(inode, logical, phys)?;
+            }
+        }
+        inode.size = new_size as u32;
+        // i_blocks 按规范含间接表块占用（count_sectors），非 size/512。
+        inode.sectors = self.count_sectors(inode)?;
+        let now = now_monotonic_secs();
+        inode.mtime = now;
+        inode.ctime = now;
+        self.write_inode(inode)
+    }
+
+    /// 清零 inode 第 `logical` 个逻辑块指针（与 [`Self::set_inode_block`] 的
+    /// 直块/一级/二级间接寻址语义对称）。
+    fn clear_inode_block(&self, inode: &mut Inode, logical: u32) -> Result<(), Ext2Error> {
+        let per_block = self.superblock().block_size / 4;
+        if logical < 12 {
+            inode.blocks[logical as usize] = 0;
+            return Ok(());
+        }
+        let rem = logical - 12;
+        // 一级间接区。
+        if rem < per_block {
+            if inode.blocks[12] == 0 {
+                return Ok(());
+            }
+            let mut map = self.read_block_buf(inode.blocks[12])?;
+            map[rem as usize * 4..rem as usize * 4 + 4].fill(0);
+            return self.write_block(inode.blocks[12], &map);
+        }
+        // 二级间接区。
+        let rem2 = rem - per_block;
+        let l2_span = per_block * per_block;
+        if rem2 < l2_span {
+            if inode.blocks[13] == 0 {
+                return Ok(());
+            }
+            let l1_idx = rem2 / per_block;
+            let l1_off = (rem2 % per_block) as usize;
+            let dbl = self.read_block_buf(inode.blocks[13])?;
+            let l1_ptr = le_u32(&dbl, l1_idx as usize * 4);
+            if l1_ptr == 0 {
+                return Ok(());
+            }
+            let mut l1 = self.read_block_buf(l1_ptr)?;
+            l1[l1_off * 4..l1_off * 4 + 4].fill(0);
+            self.write_block(l1_ptr, &l1)
+        } else {
+            // 三重间接：读侧不建模，写侧亦不支持，如实拒绝。
+            Err(Ext2Error::UnsupportedTripleIndirect)
+        }
+    }
+
+    /// 写入 inode 数据（M3.4）：`[offset, offset+buf.len())` 范围内按需分配
+    /// 块、读改写部分块、写穿落盘；返回实际写入字节数。
+    pub fn write_inode_data(
+        &self,
+        inode: &mut Inode,
+        mut offset: u64,
+        buf: &[u8],
+    ) -> Result<usize, Ext2Error> {
+        let sb = self.superblock();
+        let bs = sb.block_size as u64;
+        // 写越界需扩展文件：先 grow 到目标末尾。
+        let end = offset + buf.len() as u64;
+        if end > inode.size as u64 {
+            self.grow_inode_blocks(inode, end)?;
+        }
+        let mut done = 0usize;
+        let mut scratch = alloc::vec![0u8; bs as usize];
+        while done < buf.len() {
+            let logical = (offset / bs) as u32;
+            let in_block = (offset % bs) as usize;
+            let take = core::cmp::min(buf.len() - done, bs as usize - in_block);
+            let phys = self.map_logical_block(inode, logical)?;
+            if take == bs as usize {
+                // 整块覆盖：直接写新数据，免读旧块。
+                scratch[..take].copy_from_slice(&buf[done..done + take]);
+            } else {
+                // 部分块：读-改-写。
+                if phys == 0 {
+                    scratch.fill(0);
+                } else {
+                    self.read_block(phys, &mut scratch)?;
+                }
+                scratch[in_block..in_block + take].copy_from_slice(&buf[done..done + take]);
+            }
+            let phys2 = if phys == 0 {
+                // 稀疏块首次写入：分配新块（grow 阶段已按 size 分配，但
+                // 部分块写且 phys==0 只可能在分配被绕过时出现——防御性分配）。
+                let p = self.alloc_block()?;
+                self.set_inode_block(inode, logical, p)?;
+                p
+            } else {
+                phys
+            };
+            self.write_block(phys2, &scratch)?;
+            done += take;
+            offset += take as u64;
+        }
+        let now = now_monotonic_secs();
+        inode.mtime = now;
+        inode.ctime = now;
+        // i_blocks 按规范含间接表块占用（count_sectors），非 size/512。
+        inode.sectors = self.count_sectors(inode)?;
+        self.write_inode(inode)?;
+        Ok(done)
+    }
+
+    /// 在目录 `dir` 中新增目录项（M3.3），必要时扩展目录块。
+    fn add_dir_entry(
+        &self,
+        dir: &mut Inode,
+        ino: u32,
+        name: &str,
+        ft: u8,
+    ) -> Result<(), Ext2Error> {
+        let name_bytes = name.as_bytes();
+        // 统一校验（非空、≤255、无 `/`、无控制字符）——与 create_entry 同源。
+        validate_component_name(name)?;
+        let rec_len = ((8 + name_bytes.len() + 3) & !3) as usize;
+        // 读目录现有数据。
+        let dir_bytes = dir.size as usize;
+        let mut data = alloc::vec![0u8; dir_bytes];
+        if dir_bytes > 0 {
+            let n = self.read_inode_data(dir, 0, &mut data)?;
+            data.truncate(n);
+        }
+        // 扫描已有项，尝试把新项塞进某个末项的空隙（分裂）。
+        let mut cur = 0usize;
+        while cur + 8 <= data.len() {
+            let rec_len_cur = le_u16(&data, cur + 4) as usize;
+            let name_len = data[cur + 6] as usize;
+            let min_need = 8 + name_len;
+            let is_last = cur + rec_len_cur >= data.len();
+            if is_last {
+                // 末项实际占用 = 对齐到 4 的 min_need；空隙 = rec_len_cur - 占用。
+                let occupied = (min_need + 3) & !3;
+                let leftover = rec_len_cur - occupied;
+                if leftover >= rec_len {
+                    // 空隙足够：收缩末项 rec_len，新项紧随其后并**继承剩余空间**
+                    // 作为其 rec_len（EXT2 末项 rec_len 延至块尾的约定——否则
+                    // 后续扫描遇到 rec_len 为 0 的残段会误判 CorruptDirEntry）。
+                    data[cur + 4..cur + 6].copy_from_slice(&(occupied as u16).to_le_bytes());
+                    let new_off = cur + occupied;
+                    self.write_dir_entry_at(&mut data, new_off, ino, name, ft, leftover)?;
+                    self.write_dir_data(dir, &data)?;
+                    let now = now_monotonic_secs();
+                    dir.mtime = now;
+                    dir.ctime = now;
+                    self.write_inode(dir)?;
+                    return Ok(());
+                }
+            }
+            cur += rec_len_cur;
+        }
+        // 目录无空隙：扩展一个块并追加到末尾。
+        let old_size = data.len();
+        let new_size = old_size + rec_len;
+        data.resize(new_size, 0);
+        // 增长目录 size 并分配块。
+        dir.size = new_size as u32;
+        self.grow_inode_blocks(dir, new_size as u64)?;
+        self.write_dir_entry_at(&mut data, old_size, ino, name, ft, rec_len)?;
+        self.write_dir_data(dir, &data)?;
+        let now = now_monotonic_secs();
+        dir.mtime = now;
+        dir.ctime = now;
+        self.write_inode(dir)?;
+        Ok(())
+    }
+
+    /// 在目录数据缓冲的 `off` 处写一个目录项（含 rec_len 尾部填充语义）。
+    fn write_dir_entry_at(
+        &self,
+        data: &mut [u8],
+        off: usize,
+        ino: u32,
+        name: &str,
+        ft: u8,
+        rec_len: usize,
+    ) -> Result<(), Ext2Error> {
+        let nb = name.as_bytes();
+        if off + 8 + nb.len() > data.len() {
+            return Err(Ext2Error::CorruptDirEntry);
+        }
+        // name_len 字段只有 1 字节：>255 的名字必须在此显式拒绝（S04），绝不
+        // 用 `as u8` 静默截断字节。调用方应已过 validate_component_name，此处
+        // 为第二道防线（跨模块直接调用本函数的路径不受上层校验约束）。
+        let name_len: u8 = nb.len().try_into().map_err(|_| Ext2Error::CorruptDirEntry)?;
+        data[off..off + 4].copy_from_slice(&ino.to_le_bytes());
+        data[off + 4..off + 6].copy_from_slice(&(rec_len as u16).to_le_bytes());
+        data[off + 6] = name_len;
+        data[off + 7] = ft;
+        data[off + 8..off + 8 + nb.len()].copy_from_slice(nb);
+        Ok(())
+    }
+
+    /// 把目录数据写回（按块对齐；data.len() 必须是块大小的倍数或按 size 截断）。
+    fn write_dir_data(&self, dir: &Inode, data: &[u8]) -> Result<(), Ext2Error> {
+        let bs = self.superblock().block_size as usize;
+        let mut scratch = alloc::vec![0u8; bs];
+        let mut off = 0usize;
+        let mut logical = 0u32;
+        while off < data.len() {
+            let take = core::cmp::min(bs, data.len() - off);
+            let phys = self.map_logical_block(dir, logical)?;
+            if phys == 0 {
+                return Err(Ext2Error::BlockOutOfRange);
+            }
+            if take < bs {
+                // 末块部分写：读-改-写。
+                self.read_block(phys, &mut scratch)?;
+                scratch[..take].copy_from_slice(&data[off..off + take]);
+            } else {
+                scratch.copy_from_slice(&data[off..off + take]);
+            }
+            self.write_block(phys, &scratch)?;
+            off += take;
+            logical += 1;
+        }
+        Ok(())
+    }
+
+    /// 从目录删除指定名字的目录项（M3.3）：inode 置 0 并合并前项 rec_len。
+    ///
+    /// R7 同型防线：分配目录数据前先过 [`Self::device_byte_capacity`] 上界——
+    /// 与 [`Self::read_dir_raw`] 同一防 OOM 政策。损坏镜像声明超大目录 size
+    /// 在此被拒，绝不转化为内核巨型分配。
+    fn remove_dir_entry(&self, dir: &mut Inode, name: &str) -> Result<u32, Ext2Error> {
+        if dir.size as u64 > self.device_byte_capacity() {
+            return Err(Ext2Error::CorruptDirEntry);
+        }
+        let dir_bytes = dir.size as usize;
+        let mut data = alloc::vec![0u8; dir_bytes];
+        if dir_bytes > 0 {
+            let n = self.read_inode_data(dir, 0, &mut data)?;
+            data.truncate(n);
+        }
+        let mut cur = 0usize;
+        let mut prev_off: Option<usize> = None;
+        while cur + 8 <= data.len() {
+            let ino = le_u32(&data, cur);
+            let rec_len = le_u16(&data, cur + 4) as usize;
+            let name_len = data[cur + 6] as usize;
+            if ino != 0 && &data[cur + 8..cur + 8 + name_len] == name.as_bytes() {
+                let removed_ino = ino;
+                // 清零 inode（标记为空闲项），并把 rec_len 合并给前一项。
+                data[cur..cur + 4].fill(0);
+                if let Some(prev) = prev_off {
+                    let prev_rec = le_u16(&data, prev + 4) as usize;
+                    let merged = prev_rec + rec_len;
+                    data[prev + 4..prev + 6].copy_from_slice(&(merged as u16).to_le_bytes());
+                }
+                self.write_dir_data(dir, &data)?;
+                return Ok(removed_ino);
+            }
+            prev_off = Some(cur);
+            cur += rec_len;
+        }
+        Err(Ext2Error::CorruptDirEntry)
+    }
+
+    /// 创建文件/目录/symlink inode 并加入目录项（M3.3 统一入口）。
+    fn create_entry(
+        &self,
+        dir: &mut Inode,
+        name: &str,
+        mode: u16,
+        init_block: Option<u32>,
+    ) -> Result<(u32, Inode), Ext2Error> {
+        // 名字合法性（统一校验：非空、≤255、无 `/`、无控制字符）。入口即拒，
+        // 不把超长名放行进 add_dir_entry 才拦截，杜绝后续 `as u8` 截断路径。
+        validate_component_name(name)?;
+        // 重名检查。
+        if self.lookup_in_dir(dir, name).is_ok() {
+            return Err(Ext2Error::CorruptDirEntry); // AlreadyExists 语义由调用方映射
+        }
+        let ino = self.alloc_inode()?;
+        let now = now_monotonic_secs();
+        let mut inode = Inode {
+            ino,
+            mode,
+            size: 0,
+            blocks: [0u32; 15],
+            sectors: 0,
+            mtime: now,
+            ctime: now,
+        };
+        if let Some(block) = init_block {
+            inode.blocks[0] = block;
+        }
+        self.write_inode(&inode)?;
+        let ft = match mode & 0xF000 {
+            0x4000 => 2, // EXT2_FT_DIR
+            0xA000 => 7, // EXT2_FT_SYMLINK
+            _ => 1,      // EXT2_FT_REG_FILE
+        };
+        self.add_dir_entry(dir, ino, name, ft)?;
+        Ok((ino, inode))
+    }
+
+    /// 创建普通文件（M3.3）。
+    pub fn create_file(
+        &self,
+        dir: &mut Inode,
+        name: &str,
+        _perm: Permissions,
+    ) -> Result<Inode, Ext2Error> {
+        let (_, inode) = self.create_entry(dir, name, 0x8000 | 0o644, None)?;
+        Ok(inode)
+    }
+
+    /// 创建子目录（M3.3）：含 `.`/`..` 两项，`..` 指向父目录。
+    pub fn mkdir(&self, dir: &mut Inode, name: &str, _perm: Permissions) -> Result<Inode, Ext2Error> {
+        // 先分配目录数据块。
+        let block = self.alloc_block()?;
+        let (ino, mut inode) = self.create_entry(dir, name, 0x4000 | 0o755, Some(block))?;
+        // 写 `.` 和 `..` 两项，size=块大小。
+        let bs = self.superblock().block_size as usize;
+        let mut d = alloc::vec![0u8; bs];
+        self.write_dir_entry_at(&mut d, 0, ino, ".", 2, 12)?;
+        self.write_dir_entry_at(&mut d, 12, dir.ino, "..", 2, bs - 12)?;
+        self.write_block(block, &d)?;
+        inode.size = bs as u32;
+        inode.sectors = bs.div_ceil(512) as u32;
+        self.write_inode(&inode)?;
+        Ok(inode)
+    }
+
+    /// 删除目录项并释放其 inode 与数据块（M3.3）。
+    pub fn unlink(&self, dir: &mut Inode, name: &str) -> Result<(), Ext2Error> {
+        let (_, inode) = self.lookup_in_dir(dir, name).map_err(|_| Ext2Error::CorruptDirEntry)?;
+        if inode.is_dir() {
+            return Err(Ext2Error::CorruptDirEntry); // rmdir 需空目录，此处拒绝非空删除
+        }
+        self.remove_dir_entry(dir, name)?;
+        self.free_inode_blocks(&inode)?;
+        // 更新父目录 mtime/ctime。
+        let now = now_monotonic_secs();
+        dir.mtime = now;
+        dir.ctime = now;
+        self.write_inode(dir)
+    }
+
+    /// 创建软链接（M3.3）：目标 ≤60B 内联（fast），否则走数据块（slow）。
+    pub fn symlink(&self, dir: &mut Inode, name: &str, target: &str) -> Result<Inode, Ext2Error> {
+        let target_bytes = target.as_bytes();
+        if target_bytes.len() <= FAST_SYMLINK_MAX as usize {
+            // fast：目标内联 i_block 区，blocks 全 0。
+            let (_, mut inode) = self.create_entry(dir, name, 0xA000 | 0o777, None)?;
+            inode.size = target_bytes.len() as u32;
+            inode.sectors = 0; // fast 判别位
+            let mut raw = alloc::vec![0u8; FAST_SYMLINK_MAX as usize];
+            raw[..target_bytes.len()].copy_from_slice(target_bytes);
+            // 把目标写进 i_block 字节区（blocks 数组即该区 LE u32 视图）。
+            for (i, chunk) in raw.chunks(4).enumerate() {
+                let mut w = [0u8; 4];
+                w[..chunk.len()].copy_from_slice(chunk);
+                inode.blocks[i] = u32::from_le_bytes(w);
+            }
+            self.write_inode(&inode)?;
+            Ok(inode)
+        } else {
+            // slow：目标存数据块（目标 > 60B）。按需分配 1..n 块并写穿——
+            // 目标长度可能跨多个块（如 1024B 块 + 2000B 目标），绝不把整串
+            // 目标写进单个数据块（旧实现 `d[..target_bytes.len()]` 会越界
+            // panic）。目标上限仍受 size 字段 u32 约束，grow 侧已显式拒绝
+            // 超限。
+            let (_, mut inode) = self.create_entry(dir, name, 0xA000 | 0o777, None)?;
+            let bs = self.superblock().block_size as u64;
+            // 先 grow 再设 size：grow 以 inode.size 为"当前已占"基准，若预先
+            // 把 size 提到目标值会让 grow 误判"无需扩展"而不分配任何块（见
+            // write_inode_data 的既有模式：grow 内负责把 size 设为 new_size）。
+            self.grow_inode_blocks(&mut inode, target_bytes.len() as u64)?;
+            inode.size = target_bytes.len() as u32;
+            // 逐逻辑块写穿目标字节（末块部分写需读-改-写）。
+            let mut done = 0usize;
+            let mut logical = 0u32;
+            while done < target_bytes.len() {
+                let phys = self.map_logical_block(&inode, logical)?;
+                let in_block = done % bs as usize;
+                let take = core::cmp::min(target_bytes.len() - done, bs as usize - in_block);
+                let mut d = alloc::vec![0u8; bs as usize];
+                if take < bs as usize {
+                    self.read_block(phys, &mut d)?;
+                }
+                d[in_block..in_block + take]
+                    .copy_from_slice(&target_bytes[done..done + take]);
+                self.write_block(phys, &d)?;
+                done += take;
+                logical += 1;
+            }
+            // i_blocks 按规范含间接表块占用（count_sectors），非 size/512。
+            inode.sectors = self.count_sectors(&inode)?;
+            self.write_inode(&inode)?;
+            Ok(inode)
+        }
+    }
 }
 
 /// fs1 FA3b：错误分类学忠实映射。五类故障不再压扁成单一 Io——
@@ -525,6 +1539,20 @@ pub(crate) fn ext2_to_klib(e: Ext2Error) -> Error {
         | Ext2Error::UnsupportedFragmentSize
         | Ext2Error::UnsupportedBlockSize => Error::NotSupported,
     }
+}
+
+/// M3 写路径时间戳源：单调秒（**非 POSIX epoch**）。
+///
+/// 时间戳政策（inode.rs A3）：本内核未接线 wall clock（S03，wall clock
+/// 时间源是独立里程碑），故此处取 `klib::time::now_millis()/1000`（单调
+/// 毫秒 → 秒）——值是"自启动起的单调秒"，不是 1970 epoch。函数名用
+/// `monotonic` 而非 `posix` 正是为了名实相符（S06/S19）：该值写入磁盘
+/// `i_mtime`/`i_ctime` 后，外部 EXT2 工具读盘会把它解释成
+/// `1970-01-01 + 启动秒`（非真实日期）——这是本内核 wall clock 缺失下的
+/// 诚实折中，绝非伪装成真实 epoch。时钟未就绪（None）时退 0（与 RamFS
+/// 的 monotonic 政策同族，非伪造时间点）。
+fn now_monotonic_secs() -> u32 {
+    klib::time::now_millis().map(|ms| (ms / 1000) as u32).unwrap_or(0)
 }
 
 // ---- VFS 集成 ----
@@ -561,22 +1589,34 @@ impl INode for Ext2Node {
         if self.inode.is_dir() {
             return Err(Error::IsDirectory);
         }
+        // M3：重读最新 inode（写路径会更新 size/blocks，缓存的 inode 已陈旧），
+        // 读到的 size 才是盘上真值——否则写后立即读会按旧 size 截断。
+        let inode = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
         self.fs
-            .read_inode_data(&self.inode, offset, buf)
+            .read_inode_data(&inode, offset, buf)
             .map_err(ext2_to_klib)
     }
 
-    /// fs1 FA3a：只读介质的写访问如实返回 ReadOnly（EROFS）。
-    ///
-    /// trait 默认值是 NotSupported 或 NotDirectory——前者谎称"没实现"
-    ///（暗示将来会有），后者谎称"你不是目录"。真相只有一句话：介质只读，
-    /// 任何调用者都不可写。
-    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Error> {
-        Err(Error::ReadOnly)
+    /// M3：可写介质——经 [`Ext2Fs::write_inode_data`] 落盘。目录写按
+    /// [`Error::IsDirectory`] 拒绝（与 read_at 对称）。
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, Error> {
+        if self.inode.is_dir() {
+            return Err(Error::IsDirectory);
+        }
+        // 重读最新 inode（本节点缓存的 inode 可能已被先前写路径更新），
+        // 写后写回——写路径的 inode 权威始终是盘上最新态。
+        let mut inode = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
+        self.fs
+            .write_inode_data(&mut inode, offset, buf)
+            .map_err(ext2_to_klib)
     }
 
-    fn truncate(&self, _size: u64) -> Result<(), Error> {
-        Err(Error::ReadOnly)
+    fn truncate(&self, size: u64) -> Result<(), Error> {
+        let mut inode = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
+        if inode.is_dir() {
+            return Err(Error::IsDirectory);
+        }
+        self.fs.truncate_inode(&mut inode, size).map_err(ext2_to_klib)
     }
 
     /// A5（ADR-023 §4）：类型从缓存 mode 派生，零盘访问零分配——
@@ -592,24 +1632,27 @@ impl INode for Ext2Node {
     /// created_time 恒 0——EXT2 rev1 无创建时间字段（crtime 仅 rev2 且
     /// inode_size>128 才有），0 是成文的"字段不存在"，不是伪造的时间。
     fn metadata(&self) -> Result<FileMetadata, Error> {
+        // M3：重读最新 inode——写路径会更新 size/mtime/ctime，缓存副本已陈旧。
+        // mode 用于类型与权限判定，重读保证 size/时间戳是盘上真值。
+        let inode = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
         let node_type =
-            node_type_of(self.inode.mode).ok_or(Error::Corrupt)?;
+            node_type_of(inode.mode).ok_or(Error::Corrupt)?;
         Ok(FileMetadata {
             node_type,
-            size: self.inode.size as u64,
+            size: inode.size as u64,
             permissions: Permissions {
                 // fd1 FD3 映射取舍：单用户内核无身份区分，owner/group/other
                 // 抹平为"任意一位即可"。粒度损失是有意的简化，接线多用户
                 // 身份模型时此处必须重审。
-                readable: self.inode.mode & 0o444 != 0,
-                // C13.2：只读挂载，writable 必须如实为 false。
-                writable: false,
-                executable: self.inode.mode & 0o111 != 0,
+                readable: inode.mode & 0o444 != 0,
+                // M3：可写挂载，writable 如实为 true（写路径已接通）。
+                writable: true,
+                executable: inode.mode & 0o111 != 0,
                 system_only: false,
             },
             created_time: 0,
-            modified_time: self.inode.mtime as u64,
-            changed_time: self.inode.ctime as u64,
+            modified_time: inode.mtime as u64,
+            changed_time: inode.ctime as u64,
         })
     }
 
@@ -617,27 +1660,61 @@ impl INode for Ext2Node {
         if !self.inode.is_dir() {
             return Err(Error::NotDirectory);
         }
-        let (_, inode) = self.fs.lookup_in_dir(&self.inode, name)?;
+        // M3：重读目录 inode（新增目录项会改变 size，缓存副本陈旧）。
+        let dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
+        let (_, inode) = self.fs.lookup_in_dir(&dir, name)?;
         Ok(Arc::new(Ext2Node {
             fs: self.fs.clone(),
             inode,
         }))
     }
 
-    fn create(&self, _name: &str, _perm: Permissions) -> Result<Arc<dyn INode>, Error> {
-        Err(Error::ReadOnly)
+    /// M3：创建普通文件（EXT2 可写支集）。
+    fn create(&self, name: &str, perm: Permissions) -> Result<Arc<dyn INode>, Error> {
+        if !self.inode.is_dir() {
+            return Err(Error::NotDirectory);
+        }
+        let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
+        let inode = self.fs.create_file(&mut dir, name, perm).map_err(ext2_to_klib)?;
+        Ok(Arc::new(Ext2Node {
+            fs: self.fs.clone(),
+            inode,
+        }))
     }
 
-    fn mkdir(&self, _name: &str, _perm: Permissions) -> Result<Arc<dyn INode>, Error> {
-        Err(Error::ReadOnly)
+    /// M3：创建子目录（含 `.`/`..`）。
+    fn mkdir(&self, name: &str, perm: Permissions) -> Result<Arc<dyn INode>, Error> {
+        if !self.inode.is_dir() {
+            return Err(Error::NotDirectory);
+        }
+        let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
+        let inode = self.fs.mkdir(&mut dir, name, perm).map_err(ext2_to_klib)?;
+        Ok(Arc::new(Ext2Node {
+            fs: self.fs.clone(),
+            inode,
+        }))
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), Error> {
-        Err(Error::ReadOnly)
+    /// M3：删除子项并释放 inode/数据块。
+    fn unlink(&self, name: &str) -> Result<(), Error> {
+        if !self.inode.is_dir() {
+            return Err(Error::NotDirectory);
+        }
+        let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
+        self.fs.unlink(&mut dir, name).map_err(ext2_to_klib)
     }
 
-    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn INode>, Error> {
-        Err(Error::ReadOnly)
+    /// M3：创建软链接（fast/slow 双形态）。
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn INode>, Error> {
+        if !self.inode.is_dir() {
+            return Err(Error::NotDirectory);
+        }
+        let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
+        let inode = self.fs.symlink(&mut dir, name, target).map_err(ext2_to_klib)?;
+        Ok(Arc::new(Ext2Node {
+            fs: self.fs.clone(),
+            inode,
+        }))
     }
 
     /// 列出子项：size 与 node_type 全部来自关联 inode 真值（fs1 F1/FA1）。
@@ -647,7 +1724,9 @@ impl INode for Ext2Node {
         if !self.inode.is_dir() {
             return Err(Error::NotDirectory);
         }
-        let entries = self.fs.read_dir_raw(&self.inode).map_err(ext2_to_klib)?;
+        // M3：重读目录 inode（目录项增删会改变 size）。
+        let dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
+        let entries = self.fs.read_dir_raw(&dir).map_err(ext2_to_klib)?;
         entries
             .into_iter()
             .map(|e| {
@@ -779,6 +1858,9 @@ mod tests {
         img.w16(sb + 56, EXT2_SUPER_MAGIC);
         img.w32(sb + 76, 1); // s_rev_level
         img.w16(sb + 88, 128); // s_inode_size
+        // 卷标 @120（16B）与 FS UUID @104（16B）：M0.1 解析锚点。
+        img.write_bytes(sb + 104, &[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C]);
+        img.write_bytes(sb + 120, b"BORUIX_DATA");
         // GDT @block2: inode_table = block 5
         img.w32(img.part + 2 * BS + 8, 5);
         // Inode 表 @block5
@@ -884,8 +1966,8 @@ mod tests {
         let hello = root.lookup("hello.txt").expect("hello.txt present");
         let meta = hello.metadata().expect("metadata");
         assert_eq!(meta.node_type, INodeType::RegularFile);
-        // C13.2 只读契约：writable 必须如实为 false。
-        assert!(!meta.permissions.writable);
+        // M3 可写契约：writable 如实为 true（写路径已接通）。
+        assert!(meta.permissions.writable);
         assert!(meta.permissions.readable);
         // 对文件做 lookup 必须 NotDirectory。
         assert_eq!(
@@ -994,22 +2076,180 @@ mod tests {
         assert_eq!(&buf[..], &hello[..], "content identical through link path");
     }
 
-    /// fs1 FA3a：全部写族操作如实 EROFS——不再是默认 trait 的
-    /// NotDirectory/NotSupported 谎言。
+    /// M3 写路径夹具：一个含正确位图与空闲计数的干净 EXT2 镜像——
+    /// 根目录只有 `.`/`..`，块 0..7 已占（boot/sb/gdt/两 bitmap/inode表/根数据块），
+    /// inode 1..2 已占（根），其余全部空闲。供 create/write/mkdir/unlink 测试。
+    fn build_writable_image() -> Vec<u8> {
+        let mut img = Img::new(8192); // 4MB 盘，分区 4096 扇区 = 2048 块
+        // MBR
+        img.w8(510, 0x55);
+        img.w8(511, 0xAA);
+        img.w8(0x1BE, 0x80);
+        img.w8(0x1BE + 4, 0x83);
+        img.w32(0x1BE + 8, PART_START_LBA as u32);
+        img.w32(0x1BE + 12, 4096);
+        // Superblock：2048 块、256 inode、单组。
+        let sb = img.part + 1024;
+        img.w32(sb, 256); // s_inodes_count
+        img.w32(sb + 4, 2048); // s_blocks_count
+        img.w32(sb + 8, 0); // s_r_blocks_count
+        img.w32(sb + 12, 2048 - 8); // s_free_blocks_count（块 0..7 已占）
+        img.w32(sb + 16, 256 - 2); // s_free_inodes_count（inode 1..2 已占）
+        img.w32(sb + 20, 1); // s_first_data_block
+        img.w32(sb + 24, 0); // s_log_block_size
+        img.w32(sb + 28, 0); // s_log_frag_size
+        img.w32(sb + 32, 8192); // s_blocks_per_group
+        img.w32(sb + 40, 256); // s_inodes_per_group
+        img.w16(sb + 56, EXT2_SUPER_MAGIC);
+        img.w32(sb + 76, 1); // s_rev_level
+        img.w16(sb + 88, 128); // s_inode_size
+        img.write_bytes(sb + 104, &[0xAB; 16]); // s_uuid 非零
+        img.write_bytes(sb + 120, b"WRITABLE"); // 卷标
+        // GDT @block2：bitmap=3/4，inode 表=5，空闲计数。
+        img.w32(img.part + 2 * BS, 3); // bg_block_bitmap
+        img.w32(img.part + 2 * BS + 4, 4); // bg_inode_bitmap
+        img.w32(img.part + 2 * BS + 8, 5); // bg_inode_table
+        img.w16(img.part + 2 * BS + 12, (2048 - 8) as u16); // bg_free_blocks_count
+        img.w16(img.part + 2 * BS + 14, (256 - 2) as u16); // bg_free_inodes_count
+        img.w16(img.part + 2 * BS + 16, 1); // bg_used_dirs_count
+        // 块位图 @3：块 0..7 已占（字节 0 = 0xFF，其余空闲）。
+        let mut blk_bmp = [0u8; BS];
+        blk_bmp[0] = 0xFF;
+        img.write_block(3, &blk_bmp);
+        // inode 位图 @4：inode 1..2 已占（0x03）。
+        let mut ino_bmp = [0u8; BS];
+        ino_bmp[0] = 0x03;
+        img.write_block(4, &ino_bmp);
+        // inode 表 @5：根 ino2 目录，block[0]=7，size=块大小。
+        let itab = img.part + 5 * BS;
+        img.w16(itab + 128, 0x4000 | 0o755);
+        img.w32(itab + 128 + 4, BS as u32);
+        img.w32(itab + 128 + 26, 2); // i_links_count
+        img.w32(itab + 128 + 28, 2); // i_blocks
+        img.w32(itab + 128 + 40, 7); // i_block[0] = block 7
+        // 根目录数据块 @7：`.` 与 `..`。
+        let mut d = [0u8; BS];
+        put_de(&mut d, 0, 2, ".", 2, 12);
+        put_de(&mut d, 12, 2, "..", 2, BS - 12);
+        img.write_block(7, &d);
+        img.data
+    }
+
+    fn open_writable() -> Ext2Fs {
+        let img = build_writable_image();
+        let dev = Arc::new(MockByteDevice::new(img));
+        Ext2Fs::open(dev, PART_START_LBA * SECTOR).expect("writable fixture opens")
+    }
+
+    /// M3 端到端 + 重挂一致性（M3.5）：建文件 → 写入 → 重开（重挂）→ 读回一致。
     #[test]
-    fn test_write_paths_return_read_only() {
-        use vfs::inode::{FileSystem, INode, Permissions};
-        let (fs, _, _) = open_fs();
+    fn test_write_create_and_remount_consistency() {
+        use vfs::inode::{FileSystem, Permissions};
+        let perm = Permissions::all();
+        let img = build_writable_image();
+        let dev: Arc<dyn ByteDevice> = Arc::new(MockByteDevice::new(img));
+        let payload = b"M3 write-through payload: hello ext2 write path!";
+        // 阶段 1：首次挂载，建文件并写入。
+        {
+            let fs = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("open 1");
+            let root = FileSystem::root(&fs);
+            let f = root.create("new.txt", perm).expect("create file");
+            assert_eq!(f.metadata().expect("meta").permissions.writable, true);
+            let n = f.write_at(0, payload).expect("write");
+            assert_eq!(n, payload.len());
+        }
+        // 阶段 2：重开同一设备（模拟重挂），读回应与写入一致。
+        {
+            let fs2 = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("open 2 (remount)");
+            let root2 = FileSystem::root(&fs2);
+            let f2 = root2.lookup("new.txt").expect("new.txt persists across remount");
+            let mut back = alloc::vec![0u8; payload.len()];
+            let rn = f2.read_at(0, &mut back).expect("read after remount");
+            assert_eq!(rn, payload.len());
+            assert_eq!(&back[..], payload, "content identical across remount");
+            assert_eq!(f2.metadata().expect("meta").size, payload.len() as u64);
+            let names: Vec<String> = root2.list_dir().unwrap().iter().map(|e| e.name.clone()).collect();
+            assert!(names.iter().any(|n| n == "new.txt"), "new.txt listed after remount");
+        }
+    }
+
+    /// M3：create/mkdir/unlink/symlink 的目录项增删与 inode/块分配释放记账。
+    ///
+    /// 空闲计数以**重挂（重开设备）读回的盘上真值**为准——写路径把记账
+    /// 落在 superblock/GDT 上，缓存的 `Ext2Superblock` 是打开时的快照，
+    /// 用它断言增量会读到陈旧值（那正是"重挂一致性"要锁定的真值）。
+    #[test]
+    fn test_write_dir_ops_and_free_count_accounting() {
+        use vfs::inode::{FileSystem, Permissions};
+        let perm = Permissions::all();
+        let img = build_writable_image();
+        let dev: Arc<dyn ByteDevice> = Arc::new(MockByteDevice::new(img));
+        let (free_blocks_before, free_inodes_before) = {
+            let fs = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("open");
+            let sb = *fs.superblock();
+            (sb.free_blocks_count, sb.free_inodes_count)
+        };
+        {
+            let fs = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("open");
+            let root = FileSystem::root(&fs);
+            // 建目录（耗 1 inode + 1 块），建文件（耗 1 inode），symlink（耗 1 inode）。
+            let d = root.mkdir("subdir", perm).expect("mkdir");
+            root.create("afile", perm).expect("create");
+            root.symlink("alink", "afile").expect("symlink");
+            // 目录列出新项。
+            let names: Vec<String> = root.list_dir().unwrap().iter().map(|e| e.name.clone()).collect();
+            assert!(names.iter().any(|n| n == "subdir"));
+            assert!(names.iter().any(|n| n == "afile"));
+            assert!(names.iter().any(|n| n == "alink"));
+            // subdir 内 `.`/`..`。
+            let sub_entries = d.list_dir().expect("subdir list");
+            let sub_names: Vec<&str> = sub_entries.iter().map(|e| e.name.as_str()).collect();
+            assert!(sub_names.contains(&"."));
+            assert!(sub_names.contains(&".."));
+            // 删除 afile：inode 与块归还。
+            root.unlink("afile").expect("unlink afile");
+            assert_eq!(root.lookup("afile").map(|_| ()).unwrap_err(), Error::NotFound);
+        }
+        // 重挂读回盘上真值记账：free_inodes 减 2（subdir + alink，afile 已删归还），
+        // free_blocks 减 1（subdir 数据块；afile/alink 无数据块）。
+        {
+            let fs = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("remount");
+            let sb = *fs.superblock();
+            assert_eq!(sb.free_inodes_count, free_inodes_before - 2, "2 inodes remain allocated (subdir, alink)");
+            assert_eq!(sb.free_blocks_count, free_blocks_before - 1, "1 block (subdir data) allocated");
+            let root = FileSystem::root(&fs);
+            assert_eq!(root.lookup("afile").map(|_| ()).unwrap_err(), Error::NotFound, "afile gone after remount");
+            assert!(root.lookup("subdir").is_ok(), "subdir persists after remount");
+            assert!(root.lookup("alink").is_ok(), "alink persists after remount");
+        }
+    }
+
+    /// M3：文件写越界自动扩展（grow）与 truncate 收缩。
+    #[test]
+    fn test_write_grow_and_truncate() {
+        use vfs::inode::{FileSystem, Permissions};
+        let perm = Permissions::all();
+        let fs = open_writable();
         let root = FileSystem::root(&fs);
-        let ro = Error::ReadOnly;
-        let perm = Permissions { readable: true, writable: false, executable: false, system_only: false };
-        assert_eq!(root.create("x", perm).map(|_| ()).unwrap_err(), ro);
-        assert_eq!(root.mkdir("x", perm).map(|_| ()).unwrap_err(), ro);
-        assert_eq!(root.unlink("hello.txt").unwrap_err(), ro);
-        assert_eq!(root.symlink("x", "/y").map(|_| ()).unwrap_err(), ro);
-        let f = root.lookup("hello.txt").expect("present");
-        assert_eq!(f.write_at(0, b"no").unwrap_err(), ro);
-        assert_eq!(f.truncate(0).unwrap_err(), ro);
+        let f = root.create("grow.bin", perm).expect("create");
+        // 写 3000 字节（跨 3 个 1KB 块，触发 grow + 多块分配）。
+        let payload: Vec<u8> = (0..3000usize).map(|i| (i % 251) as u8).collect();
+        let n = f.write_at(0, &payload).expect("write 3000B");
+        assert_eq!(n, 3000);
+        assert_eq!(n, 3000);
+        // 读回整段。
+        let mut back = alloc::vec![0u8; 3000];
+        let rn = f.read_at(0, &mut back).expect("read back");
+        assert_eq!(rn, 3000);
+        assert_eq!(back, payload);
+        assert_eq!(f.metadata().expect("meta").size, 3000);
+        // truncate 到 1500：size 收缩，尾部块释放。
+        f.truncate(1500).expect("truncate");
+        assert_eq!(f.metadata().expect("meta").size, 1500);
+        let mut small = alloc::vec![0u8; 1500];
+        let rn2 = f.read_at(0, &mut small).expect("read after truncate");
+        assert_eq!(rn2, 1500);
+        assert_eq!(&small[..], &payload[..1500]);
     }
 
     /// fs1 FA2：目录 size 声明超过设备容量必须被拒——绝不允许把损坏
@@ -1059,6 +2299,36 @@ mod tests {
             real_cap,
             "device_byte_capacity must be anchored to the real device byte length"
         );
+    }
+
+    /// M0.1：卷标与 FS UUID 从超级块忠实读回——`volume_name_str` 截断到
+    /// 首个 NUL、返回空串/None 的策略，以及 UUID 全零判定。
+    #[test]
+    fn test_superblock_volume_name_and_uuid() {
+        let (img, _, _) = build_image();
+        let sb = img[(PART_START_LBA * SECTOR) as usize + 1024..][..1024].try_into().unwrap();
+        let sb = parse_superblock(sb).expect("fixture sb parses");
+        // 卷标 "BORUIX_DATA"（11 字节）后接 NUL，截断到首个 NUL 得完整标签。
+        assert_eq!(sb.volume_name_str(), Some("BORUIX_DATA"));
+        // 无卷标（首字节 0）→ 空串（不是 None，也不是伪造名）。
+        let mut bare = build_image().0;
+        let base = (PART_START_LBA * SECTOR) as usize;
+        bare[base + 1024 + 120..base + 1024 + 136].fill(0);
+        let sb_bare = parse_superblock(&bare[base + 1024..][..1024].try_into().unwrap()).unwrap();
+        assert_eq!(sb_bare.volume_name_str(), Some(""));
+        // 非 UTF-8 卷标（0xFF 单字节）→ None（不得 lossy 篡改，S02）。
+        let mut bad = build_image().0;
+        bad[base + 1024 + 120] = 0xFF;
+        let sb_bad = parse_superblock(&bad[base + 1024..][..1024].try_into().unwrap()).unwrap();
+        assert_eq!(sb_bad.volume_name_str(), None);
+        // UUID 真读：DEADBEEF... 非零；全零即未声明。
+        assert!(!sb.uuid_is_zero());
+        assert_eq!(sb.uuid[0], 0xDE);
+        assert_eq!(sb.uuid[1], 0xAD);
+        let mut zero = build_image().0;
+        zero[base + 1024 + 104..base + 1024 + 120].fill(0);
+        let sb_zero = parse_superblock(&zero[base + 1024..][..1024].try_into().unwrap()).unwrap();
+        assert!(sb_zero.uuid_is_zero());
     }
 
     /// fs1 FA2：超级块结构性 sanity——first_data_block 与块大小矛盾、
@@ -1399,5 +2669,223 @@ mod tests {
         // 按字节读读出的是一堆无意义的结构编码，绝不能伪装成文件内容。
         let mut buf = [0u8; 16];
         assert_eq!(root.read_at(0, &mut buf).map(|_| ()).unwrap_err(), Error::IsDirectory);
+    }
+
+    // ---- 限制点修复回归（S04/S09/S31）----
+
+    /// S04：create_entry 入口即拒超长名（>255），不等到 add_dir_entry 才拦，
+    /// 杜绝后续 `as u8` 静默截断字节。VFS create 经 mount 层再下到 ext2，
+    /// 超长名在入口被显式拒绝为 CorruptDirEntry。
+    #[test]
+    fn test_create_rejects_name_over_255() {
+        use vfs::inode::{FileSystem, Permissions};
+        let fs = open_writable();
+        let root = FileSystem::root(&fs);
+        let long = "a".repeat(256);
+        let err = root.create(&long, Permissions::all()).map(|_| ()).unwrap_err();
+        assert_eq!(err, Error::Corrupt, "256-byte name must be rejected (name_len is u8)");
+        // 恰好 255 应成功。
+        let ok255 = "b".repeat(255);
+        assert!(root.create(&ok255, Permissions::all()).is_ok(), "255-byte name must succeed");
+    }
+
+    /// S04/S31：名字校验与 VFS validate_name 对齐——含控制字符的名字在
+    /// create_entry 入口即拒，不产生一条 VFS 能建而 ext2 拒绝（或反之）的
+    /// 不一致条目。
+    #[test]
+    fn test_create_rejects_control_chars() {
+        use vfs::inode::{FileSystem, Permissions};
+        let fs = open_writable();
+        let root = FileSystem::root(&fs);
+        for bad in ["bad\nname", "ctl\x01name", "tab\tname", "del\x7fname"] {
+            let err = root.create(bad, Permissions::all()).map(|_| ()).unwrap_err();
+            assert_eq!(err, Error::Corrupt, "control-char name '{}' must be rejected", bad);
+        }
+        // 正例：合法名字可建。
+        assert!(root.create("ok-name.txt", Permissions::all()).is_ok());
+    }
+
+    /// S31：超块缓存陈旧修复——分配后不重挂，同进程内再分配不会因缓存
+    /// 快照里的旧 free_blocks_count 误判"卷满"。直接调用底层 alloc 原语
+    /// 两次，第二次仍应成功（位图实际有剩余块）。
+    #[test]
+    fn test_alloc_after_alloc_uses_live_free_count() {
+        let fs = open_writable();
+        // 快照 free_blocks=2040；连续分配两块，第二次若误读陈旧缓存仍非零，
+        // 但为验证"实时读取"正确性：连续分配直到耗尽前都能成功。
+        let b1 = fs.alloc_block().expect("first alloc");
+        let b2 = fs.alloc_block().expect("second alloc (must not use stale count)");
+        assert_ne!(b1, b2, "two allocations must yield distinct blocks");
+        let i1 = fs.alloc_inode().expect("first inode alloc");
+        let i2 = fs.alloc_inode().expect("second inode alloc");
+        assert_ne!(i1, i2, "two inode allocations must yield distinct inodes");
+    }
+
+    /// S31：重挂读回的空闲块/inode 计数与未重挂时的实时计数一致——
+    /// alloc 每次从盘上实时读取，故同一 fs 实例内 alloc 若干次后盘上记账
+    /// 已递减（重挂也读到相同值）。
+    #[test]
+    fn test_free_counts_decrement_on_disk() {
+        let img = build_writable_image();
+        let dev: Arc<dyn ByteDevice> = Arc::new(MockByteDevice::new(img));
+        let fs = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("open");
+        let before = *fs.superblock();
+        fs.alloc_block().expect("alloc block");
+        fs.alloc_inode().expect("alloc inode");
+        // 重挂读盘上真值：各减 1。
+        let fs2 = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("remount");
+        let after = *fs2.superblock();
+        assert_eq!(after.free_blocks_count, before.free_blocks_count - 1);
+        assert_eq!(after.free_inodes_count, before.free_inodes_count - 1);
+    }
+
+    /// S04：truncate 目标超过 u32::MAX 显式拒绝（不再 `as u32` 静默截断）。
+    #[test]
+    fn test_truncate_rejects_size_overflow() {
+        use vfs::inode::{FileSystem, INode, Permissions};
+        let fs = open_writable();
+        let root = FileSystem::root(&fs);
+        let f = root.create("big.bin", Permissions::all()).expect("create");
+        // 目标超过 u32::MAX：底层 truncate_inode 必须显式 BlockOutOfRange 拒绝，
+        // 而非 `as u32` 静默截断成一个看似合法的错误 size。4GB 目标远超镜像
+        // 容量，但先触发的应是 size 越界判据（在分配任何块之前）。
+        let err = f.truncate((u32::MAX as u64) + 1).unwrap_err();
+        assert_eq!(err, Error::Corrupt, "size beyond u32::MAX must be rejected (BlockOutOfRange -> Corrupt)");
+    }
+
+    /// S04 消除 as u8 截断：write_dir_entry_at 对 >255 名显式拒绝而非截断。
+    #[test]
+    fn test_write_dir_entry_rejects_overlong_name() {
+        let fs = open_writable();
+        let bs = fs.superblock().block_size as usize;
+        let mut buf = alloc::vec![0u8; bs];
+        let long = "a".repeat(256);
+        // 直接调 write_dir_entry_at（绕开上层校验的防线）：应显式 CorruptDirEntry。
+        let err = fs
+            .write_dir_entry_at(&mut buf, 0, 3, &long, 1, bs)
+            .map(|_| ()).unwrap_err();
+        assert_eq!(err, Ext2Error::CorruptDirEntry, "over-255 name must be rejected, not truncated");
+    }
+
+    /// R7 同型：remove_dir_entry 对超大目录 size 在分配前即拒（无帽分配的
+    /// 欠账已补）。
+    #[test]
+    fn test_remove_dir_entry_caps_size() {
+        let fs = open_writable();
+        // 构造一个 size 声明超设备容量的目录 inode（Corrupt 镜像）。
+        let mut bogus = fs.read_inode(2).expect("root inode");
+        bogus.size = u32::MAX;
+        let err = fs
+            .remove_dir_entry(&mut bogus, "nope")
+            .map(|_| ()).unwrap_err();
+        assert_eq!(err, Ext2Error::CorruptDirEntry, "oversized dir size must be rejected pre-alloc");
+    }
+
+    /// 二级间接写 + 读 + unlink 对称：写入超过一级间接区（直块 12 + 每块
+    /// per_block 项）的大文件，读回一致，unlink 释放全部块（含二级间接
+    /// 表与数据），不报 UnsupportedTripleIndirect。
+    #[test]
+    fn test_write_read_unlink_double_indirect() {
+        use vfs::inode::{FileSystem, Permissions};
+        let fs = open_writable();
+        let root = FileSystem::root(&fs);
+        let f = root.create("dbl.bin", Permissions::all()).expect("create");
+        // 每块 1KB，per_block=256；跨一级间接区需 > (12+256)*1024 字节。
+        let size = (12 + 256 + 5) * 1024; // 进入二级间接区 5 块
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let n = f.write_at(0, &payload).expect("write across double indirect");
+        assert_eq!(n, size);
+        let mut back = alloc::vec![0u8; size];
+        let rn = f.read_at(0, &mut back).expect("read back");
+        assert_eq!(rn, size);
+        assert_eq!(back, payload, "double-indirect file round-trips");
+        assert_eq!(f.metadata().expect("meta").size, size as u64);
+        // unlink：含二级间接的文件可删除，不报 UnsupportedTripleIndirect。
+        root.unlink("dbl.bin").expect("unlink double-indirect file");
+        assert_eq!(root.lookup("dbl.bin").map(|_| ()).unwrap_err(), Error::NotFound);
+    }
+
+    /// slow symlink 目标跨多块（> 块大小）不再越界 panic，读回一致。
+    #[test]
+    fn test_slow_symlink_multiblock_target() {
+        use vfs::inode::FileSystem;
+        let fs = open_writable();
+        let root = FileSystem::root(&fs);
+        // 目标 > 块大小（1KB）：如 2000 字节，跨 2 块。
+        let target = "x".repeat(2000);
+        let l = root.symlink("longlink", &target).expect("slow multi-block symlink");
+        let resolved = l.read_link().expect("read_link");
+        assert_eq!(resolved, target, "multi-block symlink target round-trips");
+    }
+
+    /// i_blocks（sectors）按 EXT2 规范计入间接表块占用：文件大小对应的
+    /// 数据扇区数 < count_sectors（后者含一级/二级间接表块自身）。
+    #[test]
+    fn test_sectors_accounts_for_indirect_blocks() {
+        use vfs::inode::{FileSystem, Permissions};
+        let fs = open_writable();
+        let root = FileSystem::root(&fs);
+        let f = root.create("sect.bin", Permissions::all()).expect("create");
+        // 覆盖一级+二级间接区的大文件（块 1KB，per_block=256）。
+        let size = (12 + 256 + 5) * 1024;
+        let payload = alloc::vec![0u8; size];
+        f.write_at(0, &payload).expect("write");
+        // 经目录查找重读 inode 得真实 i_blocks（count_sectors）。
+        let root_inode = fs.read_inode(EXT2_ROOT_INO).expect("root inode");
+        let (_, inode) = fs.lookup_in_dir(&root_inode, "sect.bin").expect("lookup");
+        let data_only_sectors = (size as u32).div_ceil(512);
+        assert!(
+            inode.sectors > data_only_sectors,
+            "i_blocks must include indirect table blocks: sectors={} > data_only={}",
+            inode.sectors,
+            data_only_sectors
+        );
+        // 精确验证：273 数据块 + 1 一级表 + 1 二级表 + 1 个 L1 表 = 276 块，
+        // ×2 扇区/块 = 552。
+        assert_eq!(inode.sectors, 276 * 2, "expected 276 blocks × 2 sectors");
+    }
+
+    /// N1 回归：新分配块内容清零（间接表块、数据块都经 alloc_block）。
+    /// 直接调底层 alloc_block，读回内容必须全 0——若不清零，会读入被删
+    /// 文件残留（间接指针污染 / 数据泄漏的根）。
+    #[test]
+    fn test_alloc_block_zeroes_fresh_block() {
+        let fs = open_writable();
+        let b = fs.alloc_block().expect("alloc");
+        let buf = fs.read_block_buf(b).expect("read");
+        assert!(
+            buf.iter().all(|&x| x == 0),
+            "newly allocated block {} must be zeroed, got {:02X?}",
+            b,
+            &buf[..8]
+        );
+    }
+
+    /// N2 回归：文件增长后未写区域读回 0，而非被删文件的残留数据。
+    /// 写满一个含 0xAB 残留的文件并删除（释放块但残留仍在盘上），再建新
+    /// 文件写部分块——新块复用被删块时，未写字节必须为 0（不泄漏旧数据）。
+    #[test]
+    fn test_file_grow_does_not_leak_stale_data() {
+        use vfs::inode::{FileSystem, Permissions};
+        let perm = Permissions::all();
+        let fs = open_writable();
+        let root = FileSystem::root(&fs);
+        // 1) 建文件写满整个块为 0xAB，删除（free_block 只清位图位，残留保留）。
+        let f = root.create("stale.bin", perm).expect("create");
+        let garbage = alloc::vec![0xABu8; 1024];
+        f.write_at(0, &garbage).expect("write garbage");
+        root.unlink("stale.bin").expect("unlink");
+        // 2) 建新文件，truncate 到整块（grow 复用到刚释放的块），再写部分字节。
+        let g = root.create("fresh.bin", perm).expect("create");
+        g.truncate(1024).expect("grow to full block");
+        g.write_at(0, b"abc").expect("write partial");
+        // 3) 读整块：字节 0..3 为 'abc'，其余必须为 0（不得是残留 0xAB）。
+        let mut back = alloc::vec![0xEEu8; 1024];
+        let n = g.read_at(0, &mut back).expect("read");
+        assert_eq!(n, 1024, "read full grown block");
+        assert_eq!(&back[..3], b"abc", "written bytes preserved");
+        for &x in &back[3..] {
+            assert_eq!(x, 0, "unwritten grown region must read back 0, got {:02X}", x);
+        }
     }
 }

@@ -14,6 +14,8 @@ pub const PARTITION_ENTRY_COUNT: usize = 4;
 pub const PARTITION_TABLE_OFFSET: usize = 0x1BE;
 /// 单个分区表项大小。
 pub const PARTITION_ENTRY_SIZE: usize = 16;
+/// MBR 磁盘签名偏移（4 字节 LE，Windows 磁盘签名 / Limine `mbr_disk_id` 来源）。
+pub const MBR_DISK_SIG_OFFSET: usize = 0x1B8;
 
 /// 解析错误。签名不符时整个扇区不能被信任为 MBR。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +43,9 @@ impl PartitionEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mbr {
     pub partitions: [PartitionEntry; PARTITION_ENTRY_COUNT],
+    /// MBR 磁盘签名 @0x1B8（4 字节 LE）。0 表示未声明（boot 来源比对时
+    /// 视为"无签名"而非"签名等于 0"，S09 宁缺毋假）。
+    pub disk_signature: u32,
 }
 
 impl Mbr {
@@ -75,7 +80,15 @@ pub fn parse_mbr(sector: &[u8; 512]) -> Result<Mbr, MbrError> {
             sector[base + 12..base + 16].try_into().expect("fixed 4-byte slice"),
         );
     }
-    Ok(Mbr { partitions })
+    let disk_signature = u32::from_le_bytes(
+        sector[MBR_DISK_SIG_OFFSET..MBR_DISK_SIG_OFFSET + 4]
+            .try_into()
+            .expect("fixed 4-byte slice"),
+    );
+    Ok(Mbr {
+        partitions,
+        disk_signature,
+    })
 }
 
 #[cfg(test)]
@@ -94,6 +107,20 @@ mod tests {
         s[p + 8..p + 12].copy_from_slice(&2048u32.to_le_bytes());
         s[p + 12..p + 16].copy_from_slice(&(total_sectors - 2048).to_le_bytes());
         s
+    }
+
+    #[test]
+    fn test_mbr_disk_signature_parsed() {
+        // MBR 磁盘签名 @0x1B8（4 字节 LE）如实读回；全零即未声明。
+        let mut s = disk_py_sector(131072);
+        s[MBR_DISK_SIG_OFFSET..MBR_DISK_SIG_OFFSET + 4]
+            .copy_from_slice(&0x424F5255u32.to_le_bytes());
+        let mbr = parse_mbr(&s).expect("parse");
+        assert_eq!(mbr.disk_signature, 0x424F5255);
+        // 全零签名 = 未声明。
+        let s2 = disk_py_sector(131072);
+        let mbr2 = parse_mbr(&s2).expect("parse");
+        assert_eq!(mbr2.disk_signature, 0);
     }
 
     #[test]

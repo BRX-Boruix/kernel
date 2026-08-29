@@ -743,9 +743,136 @@ fn read_disk_mbr(name: &str) -> Result<fs::mbr::Mbr, &'static str> {
 
 /// 初始化根文件系统并构建默认 RESTful 目录骨架与特殊文件系统挂载（ADR-005 / ADR-011 / ADR-012 / ADR-013）。
 pub fn init() {
+    // ADR-029 M2.1：boot 来源驱动 root 选择——由启动来源决定根，而非盘里
+    // 是否装了系统。ISO 启动 → liveCD（RAMFS 根）；磁盘启动 → 安装模式
+    // （启动盘分区为根，/programs 是池内普通目录、无 payload 兜底）。
+    let boot = crate::boot_source();
+    match boot {
+        crate::BootSource::LiveCd | crate::BootSource::Unknown => {
+            klib::info!("[boot] liveCD mode (RAMFS root); block devices mount at /volumes/<label>");
+            init_livecd();
+        }
+        crate::BootSource::Disk {
+            mbr_disk_id,
+            partition_index,
+        } => {
+            klib::info!(
+                "[boot] install mode detected: boot disk mbr_disk_id={:#x} partition_index={}",
+                mbr_disk_id,
+                partition_index
+            );
+            // 安装模式：启动盘分区为系统池根。找不到匹配盘（损坏/签名缺失）
+            // 如实退化回 liveCD 兜底，绝不伪造安装模式（S09）。
+            if !init_install(mbr_disk_id, partition_index) {
+                klib::error!(
+                    "[boot] boot disk (id={:#x} part={}) not found; falling back to liveCD",
+                    mbr_disk_id,
+                    partition_index
+                );
+                init_livecd();
+            }
+        }
+    }
+}
+
+/// liveCD 模式：RAMFS 根 + `/programs` 内置 payload + 所有块设备挂 `/volumes`。
+fn init_livecd() {
     let ramfs = Arc::new(RamFS::new());
     let mount_table = Arc::new(MountTable::new(ramfs));
+    build_skeleton(&mount_table);
+    populate_builtin_programs(&mount_table);
+    let volumes_mounted = try_mount_ext2_volumes(&mount_table, None);
 
+    VFS_ROOT.call_once(|| mount_table);
+    if volumes_mounted {
+        klib::info!(
+            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /programs = built-in liveCD payload, external disk mounted at /volumes/<label>"
+        );
+    } else {
+        klib::info!(
+            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /programs = built-in liveCD payload (no external disk)"
+        );
+    }
+}
+
+/// 安装模式：把启动盘分区（mbr_disk_id + partition_index）的 EXT2 挂为根，
+/// `/programs` 是池内普通目录（**不**做内置 payload 兜底，ADR-029 §决策4）。
+///
+/// 返回 true 表示成功建立安装模式根；false 表示找不到匹配盘（调用方退化
+/// liveCD）。骨架目录（/programs /config /system /volumes ...）直接在池上
+/// 创建；其余块设备（非启动盘）挂 `/volumes/{label}`。
+fn init_install(mbr_disk_id: u32, partition_index: u32) -> bool {
+    // 扫描块设备，找 MBR 磁盘签名匹配且分区号匹配的盘。
+    let count = driver::DriverHub::device_count();
+    for i in 0..count {
+        let Some(info) = driver::DriverHub::device_info_at(i) else {
+            continue;
+        };
+        if info.kind != driver::DeviceKind::Block || info.volatile {
+            continue;
+        }
+        let Some(ops) = driver::DriverHub::device_at(i) else {
+            continue;
+        };
+        let bridge: Arc<dyn fs::ByteDevice> = Arc::new(DrvByteBridge(ops));
+        let mut sector = [0u8; 512];
+        if bridge.read_bytes(0, &mut sector) < 512 {
+            continue;
+        }
+        let Ok(mbr) = fs::mbr::parse_mbr(&sector) else {
+            continue;
+        };
+        // MBR 磁盘签名必须匹配（boot 来源比对，ADR-029 M2.2）。签名为 0 或
+        // 不匹配都排除。
+        if mbr.disk_signature != mbr_disk_id || mbr.disk_signature == 0 {
+            continue;
+        }
+        // 定位 boot 分区：partition_index 为 0（未分区）时取首分区，否则取
+        // 对应 1-based 槽位（本内核 MBR 最多 4 分区，超界即视为不匹配）。
+        let part = if partition_index == 0 {
+            mbr.first_partition()
+        } else if (partition_index as usize) <= fs::mbr::PARTITION_ENTRY_COUNT {
+            let p = mbr.partitions[partition_index as usize - 1];
+            if p.is_empty() {
+                None
+            } else {
+                Some(p)
+            }
+        } else {
+            None
+        };
+        let Some(part) = part else {
+            continue;
+        };
+        let part_start_byte = part.start_lba as u64 * 512;
+        let Ok(ext2) = fs::ext2::Ext2Fs::open(bridge, part_start_byte) else {
+            klib::warn!(
+                "[boot] boot partition lba={} is not a valid EXT2; cannot use as root",
+                part.start_lba
+            );
+            continue;
+        };
+        // 以启动盘 EXT2 为根建立安装模式根。
+        let mount_table = Arc::new(MountTable::new(Arc::new(ext2)));
+        build_skeleton(&mount_table);
+        // ADR-029 §决策4：安装模式 /programs 是池内普通目录，不做内置
+        // payload 兜底——盘里没有就是没有。
+        klib::info!(
+            "[boot] install mode root = '{}' partition lba={} (EXT2), /programs = pool directory (no built-in fallback)",
+            info.name,
+            part.start_lba
+        );
+        // 其余块设备（非启动盘）挂 /volumes/{label}；排除已作为 root 的启动盘
+        // （按 MBR 磁盘签名，避免系统盘分区被二次挂载，S26/S29）。
+        let _volumes = try_mount_ext2_volumes(&mount_table, Some(mbr_disk_id));
+        VFS_ROOT.call_once(|| mount_table);
+        return true;
+    }
+    false
+}
+
+/// 构建默认 RESTful 顶层目录骨架与特殊文件系统挂载（liveCD 与安装模式共用）。
+fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
     // 构建默认顶层骨架（词法规范 v2，ADR-005：集合目录用复数名词，
     // 域目录用单数物质名词，禁止形容词/缩写）
     mount_table
@@ -798,29 +925,11 @@ pub fn init() {
 
     let devfs = Arc::new(DevFS::new(Arc::new(KernelDeviceProvider)));
     mount_table.mount("/devices", devfs).expect("mount devfs");
-
-    // ADR-017（liveCD 回归）：先以构建期内置 payload 填充 ramfs /programs
-    // （无外部盘也可启动），随后尝试挂载外部盘 EXT2 —— 挂载成功即整体覆盖
-    // 内置（盘优先，U 盘上放新版/测试程序可生效）。两源皆缺时 /programs
-    // 保持空目录，init 加载将显式失败并可见，绝不伪造成功。
-    populate_builtin_programs(&mount_table);
-    let disk_mounted = try_mount_ext2_programs(&mount_table);
-
-    VFS_ROOT.call_once(|| mount_table);
-    if disk_mounted {
-        klib::info!(
-            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /programs = EXT2 (external disk overrides built-in)"
-        );
-    } else {
-        klib::info!(
-            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /programs = built-in liveCD payload (no external disk)"
-        );
-    }
 }
 
 /// liveCD 基线：把构建期嵌入的用户程序 payload（SDK 生成 `binaries_payload.rs`）
-/// 写入 ramfs `/programs`——无外部盘时系统仍可启动（ADR-017）。外部盘随后
-/// 经 [`try_mount_ext2_programs`] 挂载时以 mount 语义整体覆盖（盘优先）。
+/// 写入 ramfs `/programs`——无外部盘时系统仍可启动（ADR-017）。外部盘不再
+/// 遮蔽 `/programs`（ADR-028 单源：外部盘改挂 `/volumes/{label}`）。
 /// 任一写入失败如实报错并继续（残留部分 payload 会使 init 加载失败可见，
 /// 不静默伪装成功）。
 fn populate_builtin_programs(mount_table: &Arc<vfs::mount::MountTable>) {
@@ -861,26 +970,44 @@ fn populate_builtin_programs(mount_table: &Arc<vfs::mount::MountTable>) {
     }
 }
 
-/// drv 块设备 → fs::ByteDevice 桥接（只读路径足够；EXT2 驱动本身只读）。
+/// drv 块设备 → fs::ByteDevice 桥接（M0.2 起提供读写双向；EXT2 只读挂载
+/// 阶段只用到读，写路径为 PRE-1 可写 EXT2 的地基）。
 struct DrvByteBridge(&'static dyn driver::Device);
 
 impl fs::ByteDevice for DrvByteBridge {
     fn read_bytes(&self, offset: u64, out: &mut [u8]) -> usize {
         self.0.as_io().map(|io| io.read_at(offset, out)).unwrap_or(0)
     }
+    /// M0.2：透传 `IoDevice::write_at`。短写/越界如实返回实际写入字节数
+    /// （可能 < 请求值或 0），与 [`ByteDevice::write_bytes`] 契约一致——
+    /// 绝不把部分写伪装成全量成功。
+    fn write_bytes(&self, offset: u64, data: &[u8]) -> usize {
+        self.0.as_io().map(|io| io.write_at(offset, data)).unwrap_or(0)
+    }
     fn byte_len(&self) -> Option<u64> {
         self.0.as_io().and_then(|io| io.size())
     }
 }
 
-/// 尝试从注册表的持久块设备挂载 EXT2 到 /programs（C13.1+C13.2+#13）。
+/// 尝试从注册表的持久块设备挂载 EXT2 到 `/volumes/{label}`（ADR-028 §决策2）。
 ///
 /// 链路：DriverHub → volatile 拒载（C13.2 前置条件）→ MBR 首分区 →
-/// EXT2 超级块校验 → mount。**单设备失败只淘汰该设备**（KM10 修复：原实现
-/// 在 volatile/短读/MBR 失败时直接 `return false`，放弃全部后续候选——一旦
-/// 未来出现"第一块易失 + 第二块持久"的注册顺序，持久盘将被静默跳过），
-/// 全部候选耗尽才返回 false 并留下可见日志，绝不伪造挂载成功。
-fn try_mount_ext2_programs(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
+/// EXT2 超级块校验 → 读卷标（M0.1 `volume_name_str`）→ `mount_volume`。
+/// 卷标命名：有卷标挂 `/volumes/{label}`；无卷标降级 `storage-{ShortUUID}`
+/// （ShortUUID = FS UUID 前 4 hex，M0.1 `uuid`；UUID 全零则回退到
+/// `mount_unnamed_volume` 的确定性 `storage-{seq}`）。
+///
+/// **单设备失败只淘汰该设备**（KM10 修复）：volatile/短读/MBR/非 EXT2 的
+/// 盘被跳过并留下可见日志，全部候选耗尽才返回 false，绝不伪造挂载成功。
+///
+/// `exclude_boot_disk`：安装模式传入已作为 root 的启动盘 MBR 磁盘签名，遍历时
+/// 跳过该盘（S26/S29：启动盘分区已挂为根，不得二次挂到 `/volumes/{label}`）。
+/// liveCD 模式（RAMFS 根，无盘作根）传 `None`。
+fn try_mount_ext2_volumes(
+    mount_table: &Arc<vfs::mount::MountTable>,
+    exclude_boot_disk: Option<u32>,
+) -> bool {
+    let mut any_mounted = false;
     let count = driver::DriverHub::device_count();
     for i in 0..count {
         let Some(info) = driver::DriverHub::device_info_at(i) else {
@@ -909,7 +1036,21 @@ fn try_mount_ext2_programs(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
             continue;
         }
         let first = match fs::mbr::parse_mbr(&sector) {
-            Ok(mbr) => mbr.first_partition(),
+            Ok(mbr) => {
+                // 安装模式：跳过已作为 root 的启动盘（按 MBR 磁盘签名匹配）。
+                // 启动盘签名 0 或与排除值不匹配则继续正常考察。
+                if let Some(boot_id) = exclude_boot_disk {
+                    if mbr.disk_signature == boot_id {
+                        klib::info!(
+                            "[ext2] skip '{}': is the boot/root disk (disk_sig={:08X}), not remounted as a volume",
+                            name,
+                            boot_id
+                        );
+                        continue;
+                    }
+                }
+                mbr.first_partition()
+            }
             Err(e) => {
                 klib::warn!("[ext2] skip '{}': MBR parse failed: {:?}", name, e);
                 continue;
@@ -932,22 +1073,101 @@ fn try_mount_ext2_programs(mount_table: &Arc<vfs::mount::MountTable>) -> bool {
                 continue;
             }
         };
-        match mount_table.mount("/programs", Arc::new(ext2)) {
-            Ok(()) => {
-                klib::info!(
-                    "[ext2] mounted '{}' partition start_lba={} at /programs (read-only)",
-                    name,
-                    part.start_lba
-                );
-                return true;
+        // M0.1：卷标命名——有卷标挂 /volumes/{label}；无卷标降级
+        // storage-{ShortUUID}（FS UUID 前 4 hex）。非 UTF-8 卷标按无卷标
+        // 处理（S02：不 lossy 篡改，如实降级）。`Ext2Superblock` 为 Copy，
+        // 取值副本后即可安全 move `ext2`。
+        let sb = *ext2.superblock();
+        let mount_result = match sb.volume_name_str() {
+            Some(label) if !label.is_empty() => mount_table.mount_volume(label, Arc::new(ext2)),
+            Some(_) | None => {
+                // 无卷标（空串）或非 UTF-8：降级命名。
+                if !sb.uuid_is_zero() {
+                    let short = alloc::format!(
+                        "storage-{:02x}{:02x}",
+                        sb.uuid[0], sb.uuid[1]
+                    );
+                    mount_table.mount_volume(&short, Arc::new(ext2))
+                } else {
+                    // 无 UUID 源：确定性 storage-{seq}（不伪造硬件身份）。
+                    mount_table.mount_unnamed_volume(None, Arc::new(ext2))
+                }
             }
-            // mount 点被占等全局性失败与设备无关，直接终止。
+        };
+        match mount_result {
+            Ok(final_path) => {
+                klib::info!(
+                    "[ext2] mounted '{}' partition start_lba={} at {} (writable)",
+                    name,
+                    part.start_lba,
+                    final_path
+                );
+                any_mounted = true;
+            }
+            // mount 点被占等全局性失败与设备无关，记录后继续考察下一候选。
             Err(e) => {
-                klib::error!("[ext2] mount /programs failed: {:?}", e);
-                return false;
+                klib::error!("[ext2] mount volume for '{}' failed: {:?}", name, e);
             }
         }
     }
-    klib::warn!("[ext2] no mountable persistent block device; built-in liveCD payload remains active");
-    false
+    if !any_mounted {
+        klib::warn!("[ext2] no mountable persistent block device; /volumes remains empty");
+    }
+    any_mounted
+}
+
+/// 按块设备名把其首分区的 EXT2 挂载到 `/volumes/{label}`（M4.2 `VOLUME_MOUNT`）。
+///
+/// 与 [`try_mount_ext2_volumes`] 同链路（volatile 拒载 → MBR 首分区 → EXT2 校验
+/// → 卷标命名 → `mount_volume`），但只针对**指定名字**的单块设备，并把失败
+/// 如实映射为 `vfs::Error`（供 syscall `pack_err` 上抛），不吞错。
+///
+/// 找不到设备 → `NotFound`；MBR 缺失/损坏 → `Corrupt`；非 EXT2 → `NotSupported`；
+/// 卷标命名冲突由 `mount_volume` 自增消解并返回最终路径。
+pub fn mount_device_volume(name: &str) -> Result<String, klib::error::Error> {
+    let count = driver::DriverHub::device_count();
+    for i in 0..count {
+        let Some(info) = driver::DriverHub::device_info_at(i) else {
+            continue;
+        };
+        if info.kind != driver::DeviceKind::Block || info.name != name {
+            continue;
+        }
+        // C13.2 前置条件：易失载体禁止冒充持久文件系统。
+        if info.volatile {
+            return Err(klib::error::Error::ReadOnly);
+        }
+        let Some(ops) = driver::DriverHub::device_at(i) else {
+            return Err(klib::error::Error::NotFound);
+        };
+        let bridge: Arc<dyn fs::ByteDevice> = Arc::new(DrvByteBridge(ops));
+        let mut sector = [0u8; 512];
+        if bridge.read_bytes(0, &mut sector) < 512 {
+            return Err(klib::error::Error::Corrupt);
+        }
+        let first = fs::mbr::parse_mbr(&sector)
+            .map_err(|_| klib::error::Error::Corrupt)?
+            .first_partition()
+            .ok_or(klib::error::Error::Corrupt)?;
+        let part_start_byte = first.start_lba as u64 * 512;
+        let ext2 = fs::ext2::Ext2Fs::open(bridge, part_start_byte)
+            .map_err(|_| klib::error::Error::NotSupported)?;
+        let sb = *ext2.superblock();
+        let mount_table = root();
+        let result = match sb.volume_name_str() {
+            Some(label) if !label.is_empty() => {
+                mount_table.mount_volume(label, Arc::new(ext2))
+            }
+            Some(_) | None => {
+                if !sb.uuid_is_zero() {
+                    let short = alloc::format!("storage-{:02x}{:02x}", sb.uuid[0], sb.uuid[1]);
+                    mount_table.mount_volume(&short, Arc::new(ext2))
+                } else {
+                    mount_table.mount_unnamed_volume(None, Arc::new(ext2))
+                }
+            }
+        };
+        return result;
+    }
+    Err(klib::error::Error::NotFound)
 }

@@ -36,6 +36,63 @@ static BASE_REVISION: BaseRevision = BaseRevision::new(6);
 #[limine::limine_tag]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new(0);
 
+// 请求内核文件信息（ADR-029 M2.1：boot 来源检测）。
+//
+// Limine 12.5.2 协议里不存在 `BootVolumeRequest`——boot 来源经
+// `KernelFileRequest` 的响应 `File` 携带：`media_type`（1=optical 即 ISO
+// 启动，0=generic 即磁盘启动）、`partition_index`（1-based 分区号）、
+// `mbr_disk_id`（MBR 盘签名 @0x1B8）。这是 ADR-029 落地前实核对结论。
+#[limine::limine_tag]
+static KERNEL_FILE_REQUEST: limine::KernelFileRequest = limine::KernelFileRequest::new(0);
+
+/// Limine `File.media_type` 值（`common/protos/limine.c` 的 `get_file`）。
+/// 0=generic（磁盘/可引导分区）、1=optical（ISO/CD）、2=tftp。
+const LIMINE_MEDIA_GENERIC: u64 = 0;
+const LIMINE_MEDIA_OPTICAL: u64 = 1;
+
+/// boot 来源（ADR-029 §决策3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootSource {
+    /// 从 ISO/CD 启动（media_type=optical）→ liveCD 模式，root 为 RAMFS。
+    LiveCd,
+    /// 从磁盘启动（media_type=generic）→ 安装模式，启动盘分区为 root。
+    /// 携带 MBR 盘签名（@0x1B8）与 1-based 分区号用于定位本位盘。
+    Disk { mbr_disk_id: u32, partition_index: u32 },
+    /// 无法判定（未取得内核文件响应）→ 保守退化为 liveCD 兜底。
+    Unknown,
+}
+
+/// 读取 boot 来源（M2.1）。
+///
+/// 响应不可得（bootloader 未填）时如实返回 [`BootSource::Unknown`]，由调用方
+/// 走 liveCD 兜底——绝不伪造"磁盘启动"（那会导致把错误的盘当系统池挂为
+/// 根，S09 宁缺毋假）。
+pub fn boot_source() -> BootSource {
+    let Some(resp) = KERNEL_FILE_REQUEST.get_response().get() else {
+        klib::warn!("[boot] KernelFileRequest response unavailable; falling back to liveCD");
+        return BootSource::Unknown;
+    };
+    let Some(file) = resp.kernel_file.get() else {
+        klib::warn!("[boot] kernel_file unavailable; falling back to liveCD");
+        return BootSource::Unknown;
+    };
+    if file.media_type == LIMINE_MEDIA_OPTICAL {
+        BootSource::LiveCd
+    } else if file.media_type == LIMINE_MEDIA_GENERIC {
+        BootSource::Disk {
+            mbr_disk_id: file.mbr_disk_id,
+            partition_index: file.partition_index,
+        }
+    } else {
+        // tftp(2) 或未知 media_type：本内核只支持 optical/generic，如实降级。
+        klib::warn!(
+            "[boot] unsupported media_type={}; falling back to liveCD",
+            file.media_type
+        );
+        BootSource::Unknown
+    }
+}
+
 /// 内核堆增长源：从物理帧分配器分配连续页并映射到虚拟地址。
 /// 成功返回 `2^order` 个连续物理页映射后的虚拟地址基址；耗尽返回 `None`
 /// （KM11：类型化失败，不用魔法 0 哨兵）。
@@ -723,9 +780,13 @@ fn init_display() {
     info!("[display] terminal init returned");
 }
 
-/// 从 /programs/<name> 经 VFS 读出完整文件内容；任何失败返回 None（可见、不伪造）。
-/// KM3：原 program_elf(idx) 已删除——它与 sys_exec 小索引模式解析同一路径，
-/// 回退链是死亡分支；内建程序加载统一走 sys_exec 的 VFS 路径。
+/// ADR-028 单源读取：`/programs/<name>` 是**唯一**程序来源。
+///
+/// `/programs` 只由构建期内置 liveCD payload 填充（`vfs_init` 的
+/// `populate_builtin_programs`），外部盘不再遮蔽 `/programs`（ADR-025 的
+/// "盘优先"双源机制已废除，见 ADR-028 §决策1/3）。故本函数读到的恒是
+/// 内置 payload；任何失败（文件缺失/短读/超限）返回 None，由调用方显式
+/// 失败，绝不伪造成功、绝不回退到第二条来源。
 pub fn read_binary_from_programs(name: &str) -> Option<alloc::vec::Vec<u8>> {
     let root = crate::vfs_init::root();
     let path = alloc::format!("/programs/{}", name);
@@ -763,29 +824,6 @@ pub fn read_binary_from_programs(name: &str) -> Option<alloc::vec::Vec<u8>> {
     Some(buf)
 }
 
-/// ADR-017 双源读取：先经 VFS `/programs/<name>` 读取（外部盘挂载时读到
-/// 盘内容，盘优先）；VFS 不可得（盘遮蔽但盘中缺该文件 / 无盘但 payload
-/// 缺失）时回退到构建期内置 liveCD payload。两源皆缺返回 None。
-///
-/// 这不是 KM3 禁止的"同路重试"：KM3 删的是"同一 /programs 路径 resolve
-/// 两次"的死亡分支（必然同样失败）；此处两源是**不同数据载体**（VFS/
-/// 磁盘 vs 内核静态内存），回退有真实语义。回退经 warn 日志如实披露
-/// （S10：来源不捏造、不静默）。
-pub fn read_binary_dual_source(name: &str, builtin: &'static [u8]) -> Option<alloc::vec::Vec<u8>> {
-    if let Some(v) = read_binary_from_programs(name) {
-        return Some(v);
-    }
-    if builtin.is_empty() {
-        return None;
-    }
-    klib::warn!(
-        "[programs] {} unavailable via /programs; falling back to built-in liveCD payload ({} bytes)",
-        name,
-        builtin.len()
-    );
-    Some(builtin.to_vec())
-}
-
 /// panic 时的 CPU id 读取器：LAPIC 已映射才读，否则返回 0（早期未就绪安全）。
 fn panic_cpu_id() -> u32 {
     if arch_x86_64::lapic::is_mapped() {
@@ -809,13 +847,12 @@ fn start_init() -> ! {
     use mm::user_space::UserAddressSpace;
 
     info!("[kmain] booting user init (PID 1) ...");
-    // ADR-017（liveCD）：init.elf 双源——构建期内置 payload 垫底（ramfs
-    // /programs，无盘可启动）；外部盘（disk.img → ATA → MBR → EXT2）挂载
-    // 成功后将其遮蔽（盘优先），盘中缺失该文件时经 read_binary_dual_source
-    // 文件级回退内置（数据盘插上不会搞挂 liveCD）。两源皆缺才失败并 idle
-    // 停机（错误可见、不 panic）。
-    let Some(elf_bytes) = read_binary_dual_source("init.elf", crate::binaries_payload::INIT_ELF) else {
-        error!("[kmain] init: /programs/init.elf unavailable (neither built-in liveCD payload nor external disk)");
+    // ADR-028（单源）：init.elf 只从 `/programs/init.elf` 读取——`/programs`
+    // 由构建期内置 liveCD payload 填充（无盘可启动），外部盘不再遮蔽
+    // `/programs`（盘优先双源已废除）。读取失败即显式失败并 idle 停机
+    // （错误可见、不 panic），绝不伪造成功、绝不回退到第二来源。
+    let Some(elf_bytes) = read_binary_from_programs("init.elf") else {
+        error!("[kmain] init: /programs/init.elf unavailable (built-in liveCD payload missing)");
         info!("[kmain] reached idle loop");
         CurrentArch::halt();
     };
