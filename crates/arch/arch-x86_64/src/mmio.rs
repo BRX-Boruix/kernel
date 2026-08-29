@@ -251,7 +251,12 @@ pub fn set_smap_active(on: bool) {
 #[inline]
 pub unsafe fn stac() {
     if SMAP_ACTIVE.load(Ordering::Relaxed) {
-        core::arch::asm!("stac", options(nomem, nostack, preserves_flags));
+        // SAFETY：stac 指令只在 EFLAGS.AC 位操作，无内存副作用，符合
+        // asm! 的 nomem/nostack/preserves_flags 声明；调用方保证后续
+        // 必配 clac 成对恢复，不放行期间发生特权级转换。
+        unsafe {
+            core::arch::asm!("stac", options(nomem, nostack, preserves_flags));
+        }
     }
 }
 
@@ -259,7 +264,11 @@ pub unsafe fn stac() {
 #[inline]
 pub unsafe fn clac() {
     if SMAP_ACTIVE.load(Ordering::Relaxed) {
-        core::arch::asm!("clac", options(nomem, nostack, preserves_flags));
+        // SAFETY：clac 指令只在 EFLAGS.AC 位操作，无内存副作用，符合
+        // asm! 的 nomem/nostack/preserves_flags 声明。
+        unsafe {
+            core::arch::asm!("clac", options(nomem, nostack, preserves_flags));
+        }
     }
 }
 
@@ -270,11 +279,16 @@ pub unsafe fn copy_from_user(dst: *mut u8, src: u64, len: usize) {
     if len == 0 {
         return;
     }
-    stac();
-    core::sync::atomic::compiler_fence(Ordering::SeqCst);
-    core::ptr::copy_nonoverlapping(src as *const u8, dst, len);
-    core::sync::atomic::compiler_fence(Ordering::SeqCst);
-    clac();
+    // SAFETY：stac/clac 为成对的 SMAP 放行/恢复原语；放行区间内的
+    // copy_nonoverlapping 要求 dst 已由调用方验证为目标区（内核可写地址）、
+    // src 为通过 validate_user_range 校验的用户半区映射、len 在区间内。
+    unsafe {
+        stac();
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        core::ptr::copy_nonoverlapping(src as *const u8, dst, len);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        clac();
+    }
 }
 
 /// 从内核 `src` 拷贝 `len` 字节到用户虚拟地址 `dst`（SMAP 安全）。
@@ -282,9 +296,14 @@ pub unsafe fn copy_to_user(dst: u64, src: *const u8, len: usize) {
     if len == 0 {
         return;
     }
-    stac();
-    core::sync::atomic::compiler_fence(Ordering::SeqCst);
-    core::ptr::copy_nonoverlapping(src, dst as *mut u8, len);
-    core::sync::atomic::compiler_fence(Ordering::SeqCst);
-    clac();
+    // SAFETY：stac/clac 为成对的 SMAP 放行/恢复原语；放行区间内的
+    // copy_nonoverlapping 要求 dst 为通过 validate_user_range 校验的用户半区
+    // 映射、src 指向内核侧 len 字节、len 在区间内。
+    unsafe {
+        stac();
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        core::ptr::copy_nonoverlapping(src, dst as *mut u8, len);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        clac();
+    }
 }

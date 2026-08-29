@@ -1036,7 +1036,7 @@ fn sys_munmap(frame: &mut SyscallFrame) -> u64 {
                 klib::info!("[munmap] shm_unmap id={} at {:#x}", id, addr);
                 pack_ok(0)
             }
-            Err(e) => pack_err(Error::NotFound),
+            Err(_) => pack_err(Error::NotFound),
         };
     }
     match proc.addr_space_mut().munmap_anonymous(addr, size) {

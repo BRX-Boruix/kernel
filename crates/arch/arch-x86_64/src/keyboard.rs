@@ -37,7 +37,6 @@ const CFG_TRANSLATE: u8 = 0x40; // bit6：扫描码集 1 翻译
 // 状态寄存器位
 const STATUS_OUTPUT_FULL: u8 = 0x01; // 输出缓冲满（可读数据）
 const STATUS_INPUT_FULL: u8 = 0x02; // 输入缓冲满（忙）
-const STATUS_SELF_TEST_OK: u8 = 0x04; // 自检通过
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 

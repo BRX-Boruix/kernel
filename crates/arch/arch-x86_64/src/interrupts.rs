@@ -746,7 +746,6 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             enable();
         }
         let slot = &IRQ_HANDLERS[irq as usize];
-        let mut handled = false;
         for entry in slot {
             let handler_ptr = entry.load(Ordering::Acquire);
             if handler_ptr == 0 {
@@ -755,7 +754,6 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             // 指针来自 register_irq 写入的合法 'static 函数地址，读回安全。
             let h = unsafe { core::mem::transmute::<usize, IrqHandler>(handler_ptr) };
             if h(irq) {
-                handled = true;
                 break;
             }
         }
