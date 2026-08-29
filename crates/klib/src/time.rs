@@ -20,8 +20,17 @@ use crate::sync::irq::IrqSpinLock;
 /// tick 计数读取函数。
 pub type TickFn = fn() -> u64;
 
+/// wall clock（真实纪元秒）读取函数。
+///
+/// 返回 Unix epoch 秒（1970-01-01T00:00:00Z 起的秒数）。与单调时钟正交——
+/// 单调时钟回答"开机至今多久"，墙钟回答"现在是哪个真实时刻"。来源为
+/// 架构层 RTC/CMOS（`arch_x86_64::rtc`）。注入机制与 `set_clock_source`
+/// 同模式（函数指针运行时注入，保持 klib 零依赖）。
+pub type WallFn = fn() -> Option<u64>;
+
 static TICK_FN: AtomicUsize = AtomicUsize::new(0);
 static TICK_HZ: AtomicU64 = AtomicU64::new(1);
+static WALL_FN: AtomicUsize = AtomicUsize::new(0);
 
 /// 注入时钟源：`tick_fn` 返回单调 tick 计数，`tick_hz` 为其频率（Hz）。
 ///
@@ -34,6 +43,27 @@ static TICK_HZ: AtomicU64 = AtomicU64::new(1);
 pub fn set_clock_source(tick_fn: TickFn, tick_hz: u64) {
     TICK_FN.store(tick_fn as usize, Ordering::SeqCst);
     TICK_HZ.store(tick_hz.max(1), Ordering::SeqCst);
+}
+
+/// 注入 wall clock 源：`wall_fn` 返回 Unix epoch 秒。
+///
+/// 应在架构层 RTC 初始化完成（能读到真实年月日时分秒）后调用一次。可重复
+/// 调用以切换来源（如后续接入 NTP/网络时钟）。
+pub fn set_wall_clock_source(wall_fn: WallFn) {
+    WALL_FN.store(wall_fn as usize, Ordering::SeqCst);
+}
+
+/// 当前 wall clock（Unix epoch 秒）。未注入来源时返回 `None`。
+///
+/// **S09**：墙钟未就绪（[`set_wall_clock_source`] 未调用、或底层 RTC 不可
+/// 读）返回 `None`——用 `Option` 显式表达"不可用"，绝不把 0（1970-01-01）
+/// 伪装成"真实时间恰好是纪元起点"的哨兵值。
+pub fn wall_clock_secs() -> Option<u64> {
+    let f = WALL_FN.load(Ordering::Acquire);
+    if f == 0 {
+        return None;
+    }
+    unsafe { core::mem::transmute::<usize, WallFn>(f)() }
 }
 
 /// 时钟源是否已注入。
@@ -280,6 +310,18 @@ mod tests {
         FAKE_TICK.load(Ordering::Relaxed)
     }
 
+    /// 假 wall 源：测试控制返回的 epoch 秒。
+    static FAKE_EPOCH: AtomicU64 = AtomicU64::new(0);
+    static FAKE_WALL_ENABLED: AtomicBool = AtomicBool::new(false);
+
+    fn fake_wall() -> Option<u64> {
+        if FAKE_WALL_ENABLED.load(Ordering::Relaxed) {
+            Some(FAKE_EPOCH.load(Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
+
     // 回调无捕获（fn 指针），用全局状态收集结果。
     static FIRED: AtomicU64 = AtomicU64::new(0);
     static LAST_ARG: AtomicU64 = AtomicU64::new(0);
@@ -304,6 +346,10 @@ mod tests {
     fn reset() {
         set_clock_source(fake_tick, 1_000_000); // 1 tick = 1us
         FAKE_TICK.store(0, Ordering::Relaxed);
+        // 隔离 wall clock 全局状态：默认关（未注入）。
+        set_wall_clock_source(fake_wall);
+        FAKE_WALL_ENABLED.store(false, Ordering::Relaxed);
+        FAKE_EPOCH.store(0, Ordering::Relaxed);
         FIRED.store(0, Ordering::Relaxed);
         LAST_ARG.store(0, Ordering::Relaxed);
         ORDER.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -487,16 +533,36 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 未注入时钟源：所有操作退化为安全空转，now_* 如实返回 None。
         TICK_FN.store(0, Ordering::SeqCst);
+        WALL_FN.store(0, Ordering::SeqCst); // wall 也未注入
         assert!(!clock_ready());
         assert_eq!(now_nanos(), None);
         assert_eq!(now_micros(), None);
         assert_eq!(now_millis(), None);
+        // wall clock 未注入：如实 None，绝不伪装成 1970 epoch 的 0。
+        assert_eq!(wall_clock_secs(), None);
         assert!(set_timeout(10, cb_count, 0).is_none());
         poll_timeouts(); // 不 panic
         sleep_ms(1); // 立即返回，不 panic
         sleep_us(1);
         sleep_nanos(1);
+        reset(); // 恢复全局状态，隔离后续测试
     }
+
+    #[test]
+    fn wall_clock_injection_and_values() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset(); // 注入 fake_wall 但默认关闭
+        assert_eq!(wall_clock_secs(), None, "wall disabled -> None");
+        // 启用假 wall：返回注入的 epoch 秒。
+        FAKE_EPOCH.store(946_684_800, Ordering::Relaxed); // 2000-01-01T00:00:00Z
+        FAKE_WALL_ENABLED.store(true, Ordering::Relaxed);
+        assert_eq!(wall_clock_secs(), Some(946_684_800));
+        // 来源可换：换一个 epoch（后续 NTP/网络时钟接入的替换点）。
+        set_wall_clock_source(|| Some(1_700_000_000));
+        assert_eq!(wall_clock_secs(), Some(1_700_000_000));
+        reset();
+    }
+
 
     #[test]
     fn sleep_busy_waits_until_deadline() {

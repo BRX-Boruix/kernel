@@ -1129,7 +1129,7 @@ impl Ext2Fs {
         inode.size = new_size as u32;
         // i_blocks 按规范含间接表块占用（count_sectors），非 size/512。
         inode.sectors = self.count_sectors(inode)?;
-        let now = now_monotonic_secs();
+        let now = now_timestamp_secs();
         inode.mtime = now;
         inode.ctime = now;
         self.write_inode(inode)
@@ -1223,7 +1223,7 @@ impl Ext2Fs {
             done += take;
             offset += take as u64;
         }
-        let now = now_monotonic_secs();
+        let now = now_timestamp_secs();
         inode.mtime = now;
         inode.ctime = now;
         // i_blocks 按规范含间接表块占用（count_sectors），非 size/512。
@@ -1270,7 +1270,7 @@ impl Ext2Fs {
                     let new_off = cur + occupied;
                     self.write_dir_entry_at(&mut data, new_off, ino, name, ft, leftover)?;
                     self.write_dir_data(dir, &data)?;
-                    let now = now_monotonic_secs();
+                    let now = now_timestamp_secs();
                     dir.mtime = now;
                     dir.ctime = now;
                     self.write_inode(dir)?;
@@ -1288,7 +1288,7 @@ impl Ext2Fs {
         self.grow_inode_blocks(dir, new_size as u64)?;
         self.write_dir_entry_at(&mut data, old_size, ino, name, ft, rec_len)?;
         self.write_dir_data(dir, &data)?;
-        let now = now_monotonic_secs();
+        let now = now_timestamp_secs();
         dir.mtime = now;
         dir.ctime = now;
         self.write_inode(dir)?;
@@ -1402,7 +1402,7 @@ impl Ext2Fs {
             return Err(Ext2Error::CorruptDirEntry); // AlreadyExists 语义由调用方映射
         }
         let ino = self.alloc_inode()?;
-        let now = now_monotonic_secs();
+        let now = now_timestamp_secs();
         let mut inode = Inode {
             ino,
             mode,
@@ -1462,7 +1462,7 @@ impl Ext2Fs {
         self.remove_dir_entry(dir, name)?;
         self.free_inode_blocks(&inode)?;
         // 更新父目录 mtime/ctime。
-        let now = now_monotonic_secs();
+        let now = now_timestamp_secs();
         dir.mtime = now;
         dir.ctime = now;
         self.write_inode(dir)
@@ -1541,18 +1541,20 @@ pub(crate) fn ext2_to_klib(e: Ext2Error) -> Error {
     }
 }
 
-/// M3 写路径时间戳源：单调秒（**非 POSIX epoch**）。
+/// M3 写路径时间戳源：优先 Unix epoch 秒，退单调秒。
 ///
-/// 时间戳政策（inode.rs A3）：本内核未接线 wall clock（S03，wall clock
-/// 时间源是独立里程碑），故此处取 `klib::time::now_millis()/1000`（单调
-/// 毫秒 → 秒）——值是"自启动起的单调秒"，不是 1970 epoch。函数名用
-/// `monotonic` 而非 `posix` 正是为了名实相符（S06/S19）：该值写入磁盘
-/// `i_mtime`/`i_ctime` 后，外部 EXT2 工具读盘会把它解释成
-/// `1970-01-01 + 启动秒`（非真实日期）——这是本内核 wall clock 缺失下的
-/// 诚实折中，绝非伪装成真实 epoch。时钟未就绪（None）时退 0（与 RamFS
-/// 的 monotonic 政策同族，非伪造时间点）。
-fn now_monotonic_secs() -> u32 {
-    klib::time::now_millis().map(|ms| (ms / 1000) as u32).unwrap_or(0)
+/// 接线 wall clock 后（`klib::time::wall_clock_secs`），EXT2 写盘的
+/// `i_mtime`/`i_ctime` 应为**真实 epoch**（外部工具可正确读成真实日期）。
+/// 但墙钟是独立里程碑（arch RTC → epoch 换算，S03 允许 UTC0）：墙钟未
+/// 注入或 RTC 时间无效（`wall_clock_secs` 返回 `None`）时，诚实退回单调
+/// 秒（自启动起的秒数，非 1970 epoch）并在此成文——绝不用 0 或伪造时间
+/// 填充（S09）。函数返回值类型与 EXT2 `i_*time` 字段（u32 epoch 秒）一致。
+fn now_timestamp_secs() -> u32 {
+    // 优先真实墙钟 epoch；不可用退单调秒。
+    match klib::time::wall_clock_secs() {
+        Some(epoch) => epoch.min(u32::MAX as u64) as u32,
+        None => klib::time::now_millis().map(|ms| (ms / 1000) as u32).unwrap_or(0),
+    }
 }
 
 // ---- VFS 集成 ----

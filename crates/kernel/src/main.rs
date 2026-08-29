@@ -348,6 +348,16 @@ unsafe fn kmain_body() -> ! {
         "[kmain] RTC wall clock {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         rtc.year, rtc.month, rtc.day, rtc.hour, rtc.minute, rtc.second
     );
+    // 注入 wall clock 源（RTC → Unix epoch 秒）：EXT2 写盘时间戳、任何需要
+    // 真实时刻的路径从此刻起可用 `klib::time::wall_clock_secs()`。RTC 时间
+    // 无效（字段越界）时 read_epoch_secs 返回 None，wall_clock_secs 亦为 None，
+    // 调用方诚实降级（S09：绝不伪造时间）。
+    klib::time::set_wall_clock_source(arch_x86_64::rtc::read_epoch_secs);
+    if let Some(epoch) = klib::time::wall_clock_secs() {
+        info!("[kmain] wall clock epoch = {} (Unix secs)", epoch);
+    } else {
+        klib::warn!("[kmain] RTC time invalid; wall clock unavailable (EXT2 timestamps fall back to monotonic)");
+    }
     // 此时 LAPIC 定时器已注入时钟源，now_* 必为 Some。
     info!(
         "[kmain] monotonic clock ready: now={} ns ({} ms since boot)",
