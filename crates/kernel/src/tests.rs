@@ -5012,10 +5012,10 @@ pub fn test_vfs_m63() {
     // ADR-005/012：/devices/disks 块设备子树。对 DriverHub 中每个 Block 设备，
     // 断言 /devices/disks/{name}/info 暴露真实容量/易失性/驱动绑定，且
     // /devices/disks/{name}/partitions 为真实 MBR 分区数组或显式诚实错误。
-    // 注意：PCI IDE 等"块类候选但未绑定 IO 驱动"的设备（如
-    // pci-ide-storage-*）**诚实返回** {"error":"no_io_ops",...}——无驱动即无
-    // 真实容量来源，宁缺毋假；测试须同时接受"真实磁盘"与"诚实错误"两种形态，
-    // 并断言至少有一个真实磁盘（携带 capacity_bytes）。
+    // 注：PCI mass-storage **主机控制器**（IDE/SATA，如 pci-ide-storage-*）已按
+    // 诚实分类归 Misc（非盘，无 IO 操作集），不会混入 /devices/disks；该子树
+    // 只含真实块盘（ata0 等由块驱动登记）。测试断言至少有一个真实磁盘
+    // （携带 capacity_bytes）。
     {
         let disks_dir = root
             .resolve("/devices/disks", true)

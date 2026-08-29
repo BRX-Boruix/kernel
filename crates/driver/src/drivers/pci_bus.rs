@@ -271,12 +271,22 @@ pub fn cached_pci_bars(dev_name: &str) -> Option<[PciBar; 6]> {
     })
 }
 
-fn kind_for_class(class_code: u8) -> DeviceKind {
-    match class_code {
-        PCI_CLASS_MASS_STORAGE => DeviceKind::Block,
-        PCI_CLASS_NETWORK => DeviceKind::Net,
-        PCI_CLASS_DISPLAY => DeviceKind::Display,
-        PCI_CLASS_SIMPLE_COMM => DeviceKind::Char,
+/// 把 PCI (class_code, subclass) 映射为 [`DeviceKind`]。
+///
+/// 关键区分（修复"IDE 控制器被误当块设备"刷屏 bug）：mass storage 类下的
+/// **主机控制器**（IDE 0x01、SATA/AHCI 0x06）只是 ATA/SATA 宿主，本身不是
+/// 可挂载的盘——真正的盘由对应块驱动（如 `ata_pio` 登记的 `ata0`）单独登记。
+/// 若把它们也标为 `Block`，会混进 `/devices/disks` 并被卷守护进程当作盘尝试
+/// 挂载（无 IO 操作集 → 反复失败刷屏）。故主机控制器归 `Misc`；其余代表真实
+/// 存储介质的 mass storage 子类仍为 `Block`。
+fn kind_for_class(class_code: u8, subclass: u8) -> DeviceKind {
+    match (class_code, subclass) {
+        (PCI_CLASS_MASS_STORAGE, PCI_SUBCLASS_IDE) => DeviceKind::Misc,
+        (PCI_CLASS_MASS_STORAGE, PCI_SUBCLASS_SATA) => DeviceKind::Misc,
+        (PCI_CLASS_MASS_STORAGE, _) => DeviceKind::Block,
+        (PCI_CLASS_NETWORK, _) => DeviceKind::Net,
+        (PCI_CLASS_DISPLAY, _) => DeviceKind::Display,
+        (PCI_CLASS_SIMPLE_COMM, _) => DeviceKind::Char,
         _ => DeviceKind::Misc,
     }
 }
@@ -321,7 +331,7 @@ pub fn scan_pci_bus() -> usize {
                 let class_code = read_config_u8(bus, device, function, 0x0B);
 
                 let location = ((bus as u32) << 16) | ((device as u32) << 8) | (function as u32);
-                let kind = kind_for_class(class_code);
+                let kind = kind_for_class(class_code, subclass);
                 // KM6：唯一注册名 = 类别描述 + PCI 位置（泄漏为 'static，
                 // 注册表条目本就终生存在）。
                 //
