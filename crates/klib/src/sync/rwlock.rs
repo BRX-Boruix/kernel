@@ -264,11 +264,13 @@ mod tests {
 
     /// KA1（确定性红证）：写者**等待中**必须把新读者拒之门外。
     ///
-    /// 持有读锁 → 后台写者阻塞在 write()（成为等待者）→ 主线程反复尝试
-    /// try_read。正确实现里等待写者一经登记，try_read 立即返回 None；
-    /// 虚构"写者优先"的旧实现永远返回 Some——有限次轮询后断言失败，
-    /// 不依赖任何时序假设。轮询上限只是防死循环的护栏，正常路径几次
-    /// 迭代内即可观察到门控。
+    /// 持有读锁 → 后台写者阻塞在 write()（成为等待者）。主线程轮询 try_read
+    /// 检测"等待写者已登记 pending"。**必须用 `yield_now` 而非 `spin_loop`**：
+    /// 纯自旋在 host 线程调度器饿死后台写者线程时，主线程可能空转数万次仍
+    /// 未观察到门控（偶发断言失败）；`yield_now` 每次让出 CPU，后台写者
+    /// 有充足调度机会执行 `write()` 的 pending 登记。轮询上限只是防死循环
+    /// 护栏，正常路径几次迭代内即可观察到门控。虚构"写者优先"的旧实现
+    /// 永远返回 Some，有限轮询后断言失败。
     #[test]
     fn waiting_writer_gates_new_readers() {
         let l = Arc::new(RwLock::new(0u32));
@@ -278,12 +280,12 @@ mod tests {
             let _w = l2.write(); // 阻塞直至主线程放行
         });
         let mut gated = false;
-        for _ in 0..100_000 {
+        for _ in 0..1_000_000 {
             if l.try_read().is_none() {
                 gated = true;
                 break;
             }
-            core::hint::spin_loop();
+            std::thread::yield_now(); // 让出 CPU，给写者线程调度机会
         }
         assert!(
             gated,
@@ -296,6 +298,12 @@ mod tests {
     /// KA1 补充：等待写者在既有读者全部离开后必须能取得锁，且第二个
     /// 等待写者在其之后串行取得；全部结束后状态字归零（pending 计数
     /// 无残留——残留会让读者被永久拒之门外）。
+    ///
+    /// 主线程持读锁，两个后台写者阻塞登记 pending。检测"已登记"用
+    /// try_read 门控轮询，且**必须用 `yield_now` 而非 `spin_loop`**（纯自旋
+    /// 在 host 调度器饿死写者线程时偶发断言失败，见
+    /// [`waiting_writer_gates_new_readers`]）。放行读锁后两写者串行取得，
+    /// 结果应累加为 11，且最终状态完全空闲（try_write 成功）。
     #[test]
     fn pending_writers_drain_and_state_returns_to_idle() {
         let l = Arc::new(RwLock::new(0u32));
@@ -310,14 +318,15 @@ mod tests {
             let mut g = w2.write();
             *g += 10;
         });
-        // 等 pending 登记生效（try_read 被 门控 = 至少一个写者在等待）
+        // 等 pending 登记生效（try_read 被门控 = 至少一个写者在等待）。
+        // yield_now 让出 CPU 给写者线程，避免自旋饿死。
         let mut gated = false;
-        for _ in 0..100_000 {
+        for _ in 0..1_000_000 {
             if l.try_read().is_none() {
                 gated = true;
                 break;
             }
-            core::hint::spin_loop();
+            std::thread::yield_now();
         }
         assert!(gated, "writers failed to register as pending");
         drop(gate);
