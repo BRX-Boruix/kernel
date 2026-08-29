@@ -94,7 +94,9 @@ pub enum Error {
 
 impl Error {
     /// 转为 POSIX errno 风格数值（ADR-003 syscall 边界铺路，可后续直接映射）。
-    pub fn to_errno(self) -> i32 {
+    /// `const fn`：允许调用方在常量上下文（如哨兵值）引用集中错误码，杜绝
+    /// 在别处内联裸字面量重复定义（S13 单一事实源）。
+    pub const fn to_errno(self) -> i32 {
         match self {
             Error::OutOfMemory => 12,      // ENOMEM
             Error::InvalidParam => 22,     // EINVAL

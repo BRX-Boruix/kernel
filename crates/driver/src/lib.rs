@@ -32,6 +32,7 @@ pub use device::{
 pub use driver::{Driver, DriverEntry, DriverStage};
 pub use event::{
     DeviceEvent, dropped_event_count, peek_event, pending_event_count, pop_event, publish_event,
+    set_event_wake_callback,
 };
 pub use hub::DriverHub;
 pub use uio::{

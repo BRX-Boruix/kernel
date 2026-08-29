@@ -527,6 +527,26 @@ fn pop_ready(s: &mut Scheduler, exclude: usize) -> Option<usize> {
     None
 }
 
+/// 从就绪队列中取出**特定的** `target`（不在队头时保持其它就绪进程）。
+///
+/// 用于事件路径 idle-halt 唤醒：事件等待者 cur_pid 在队列中可能不是队头——
+/// 队列头可能是被键盘/其它唤醒源并发入队的另一 Ready 进程。若用 `pop_ready`
+/// 弹队头会切错进程，事件等待者永久挂起（O1 竞争面）。本函数弹出队头，非
+/// 目标者挪回队尾（保持其 Ready 可调度性），直到取到 `target`；不在队列返回
+/// `None`。
+fn extract_from_ready(s: &mut Scheduler, target: usize) -> Option<usize> {
+    let n = s.ready.len();
+    for _ in 0..n {
+        let pid = s.ready.pop_front().expect("len>0 in bounded loop");
+        if pid == target {
+            return Some(pid);
+        }
+        // 非目标：保持就绪，放回队尾（不破坏其可调度性/公平轮转）。
+        s.ready.push_back(pid);
+    }
+    None
+}
+
 /// 阻塞当前进程（IPC 等待用）：保存帧并置 `Blocked`，切换到下一个就绪进程。
 ///
 /// 与 [`yield_now`] 不同，当前进程**不**放回就绪队列，而是置 `Blocked`（等待某
@@ -742,6 +762,221 @@ pub fn wake_kbd() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// interrupt-to-futex：设备事件驱动的用户态阻塞等待（interrupt→publish_event→
+// wake_event→唤醒阻塞进程）。与键盘路径（block_for_kbd/wake_kbd）同构，但条件
+// 源是 `driver::event` 硬件拓扑环形日志——设备注册/拔除（DriverHub）发布事件时
+// 唤醒在此阻塞等待的进程（volumed），使 ADR-030 §决策3 "不做轮询" 兑现：
+// 事件驱动取代有界休眠轮询。
+// ---------------------------------------------------------------------------
+
+/// 阻塞等待设备事件的进程 pid（`u32::MAX` 表示无）。`block_for_event` 以 CAS
+/// 登记唯一等待者，`publish_event` 经回调 [`wake_event`] 唤醒；第二个并发
+/// 事件读者得到 NotSwitched（EAGAIN），不顶掉既有等待者（与 KBD_WAITER 同款
+/// KM15 单读者仲裁）。
+static EVENT_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// 阻塞当前进程等待设备事件（`driver::event` 队列非空），或事件到达前一直挂起。
+///
+/// 返回 [`SwitchOutcome`]：
+/// - `Switched`：本进程已置 Blocked 切走。唤醒后经中断路径（tick）回归用户态，
+///   `slot.saved.rax` 由唤醒方预置结果——事件唤醒置 `-EAGAIN` 哨兵（用户态封装
+///   识别为"曾阻塞、重试"），超时唤醒置 `0`（返回空）。调用方须以
+///   `DispatchResult::Switched` 收尾。
+/// - `NotSwitched`：**事件已在登记复检时就绪**（调用方应立即返回事件）、或已有
+///   并发等待者（EVENT_WAITER 被占）。现场未动、无副作用。**不再因"无同伴可切"
+///   返回 NotSwitched**——与 block_for_kbd 同构，无就绪进程时走 idle halt 真实
+///   挂起（绝不忙转，见 None 分支）。
+///
+/// **lost-wakeup 论证**：登记（CAS 写 EVENT_WAITER）与"事件队列复检 + 置 Blocked"
+/// 都在 `SCHED` 锁临界区完成；[`wake_event`]/[`wake_event_timeout`] 也持 `SCHED`
+/// 锁才改 Ready。故"事件到达（publish_event → wake_event）"与"本进程登记"二者
+/// 被锁完全串行——若事件先到，wake_event 见无等待者直接返回，本进程随后复检
+/// 队列**非空** → 不阻塞，返回 NotSwitched 让调用方取事件；若本进程先登记，
+/// wake_event 必在登记后（锁内）读到 pid 并唤醒。不存在"登记后事件到达却无人
+/// 唤醒"的窗口。`publish_event` 先入队再唤醒，保证唤醒者复检时必见事件。
+pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
+    let cur_pid = {
+        let s = SCHED.lock();
+        let cur = s.current.expect("block_for_event outside process");
+        assert!(
+            cur < u32::MAX as usize,
+            "pid {} collides with EVENT_WAITER sentinel",
+            cur
+        );
+        cur
+    };
+    if EVENT_WAITER
+        .compare_exchange(
+            u32::MAX,
+            cur_pid as u32,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // 已有并发等待者：不阻塞。
+        return SwitchOutcome::NotSwitched;
+    }
+    // 登记后复检事件队列：若已非空，撤销登记、不阻塞（调用方返回该事件）。
+    // 这是 lost-wakeup 的关键防线：事件先到则此处直接取到，绝不错过。
+    if driver::event::pending_event_count() > 0 {
+        EVENT_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+        return SwitchOutcome::NotSwitched;
+    }
+    // 置 Blocked 并保存现场。浮点现场由 cpu_switch_locked(prev=None) 路径在
+    // 唤醒后显式保存（同 block_for_kbd，K2 纪律），此处不重复归档。
+    let mut s = SCHED.lock();
+    if let Some(slot) = s.procs[cur_pid].as_mut() {
+        slot.saved = *frame;
+        fpu::save(&mut slot.fpu);
+        slot.proc.set_state(TaskState::Blocked);
+    }
+    s.current = None;
+    clear_current_proc();
+
+    // 取下一个有效就绪进程切换（跳过已退出残留引用）。
+    match pop_ready(&mut s, usize::MAX) {
+        Some(next) => {
+            let slot = s.procs[next].as_mut().expect("ready proc exists");
+            slot.proc.set_state(TaskState::Running);
+            *frame = slot.saved;
+            cpu_switch_locked(&mut s, None, next);
+            // 清理登记：CAS 只在仍指向本 pid 时清除（事件唤醒已 swap 走则无事）。
+            let _ = EVENT_WAITER.compare_exchange(
+                cur_pid as u32,
+                u32::MAX,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            );
+            SwitchOutcome::Switched
+        }
+        None => {
+            // 无就绪进程：idle halt 等事件/超时唤醒（先释放锁再 halt，中断可达）。
+            // 与 block_for_kbd 的 None 分支同构（B17 单核不变式）：EVENT_WAITER
+            // 唯一事件等待者，唤醒方（wake_event / wake_event_timeout）只会把本
+            // 进程加入就绪队列，halt 循环检测到后切回。**绝不忙转**：每次 halt 让
+            // CPU 真正停机直到中断到达（V4）。
+            //
+            // O1 竞争面（低，继承 B17 单核不变式但已消除）：事件路径有**事件 +
+            // 定时器两个唤醒源**，且全系统可能并存被键盘中断唤醒的键盘等待者
+            // （都在同一就绪队列）。故不能只在"队列非空"时弹队头——队头可能是
+            // 并发唤醒的其它进程，切错即事件等待者永久挂起。这里改为**等待本
+            // 事件等待者 cur_pid 就绪**并专门取出它，而非弹任意队头。
+            drop(s);
+            arch_x86_64::interrupts::enable();
+            loop {
+                let s = SCHED.lock();
+                let woke = s.ready.contains(&cur_pid);
+                drop(s);
+                if woke {
+                    break;
+                }
+                arch_x86_64::interrupts::halt();
+            }
+            arch_x86_64::interrupts::disable();
+            let mut s = SCHED.lock();
+            // 取出特定的本事件等待者（队列头可能已被键盘/其它唤醒并发入队的
+            // 其它 Ready 进程占据；extract_from_ready 保持它们就绪）。
+            let next = extract_from_ready(&mut s, cur_pid).expect("woken event waiter");
+            let slot = s.procs[next].as_mut().expect("woken proc exists");
+            slot.proc.set_state(TaskState::Running);
+            *frame = slot.saved;
+            cpu_switch_locked(&mut s, None, next);
+            drop(s);
+            // 清理登记：事件唤醒已 swap 走 EVENT_WAITER（本 pid 不在），CAS 无
+            // 效；超时唤醒走 wake_event_timeout（EVENT_WAITER 仍指向本 pid），
+            // 此 CAS 清除之，保证后继新等待者不被"占位"拒之门外。
+            let _ = EVENT_WAITER.compare_exchange(
+                cur_pid as u32,
+                u32::MAX,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            );
+            SwitchOutcome::Switched
+        }
+    }
+}
+
+/// 有设备事件入队时唤醒阻塞等待的进程（由 `driver::event::publish_event` 经
+/// 回调调用）。取出 [`EVENT_WAITER`] 登记的 pid 置 `Ready` 并入就绪队列。
+/// 在发布上下文调用，持锁时间极短（仅入队）。仅当等待者仍处 `Blocked` 才唤醒
+/// （已因超时等其它途径醒来的进程由 `block_for_event` 返回后 CAS 清理登记）。
+/// 事件唤醒回调（`driver::event::publish_event` 入队后调用）。取走唯一等待者
+/// `EVENT_WAITER`，若其在 `Blocked` 且未等待 waitpid，则置 `Ready` 并加入就绪
+/// 队列。唤醒前把该进程保存帧 rax 预置为"曾阻塞、请重试"哨兵（`-EAGAIN`）：
+/// 进程经中断路径（tick）回归用户态时，用户态封装据此**重试** syscall 取事件。
+/// 同时取消等待端注册的未到期超时定时器（避免 stale 定时器在事件唤醒后继续
+/// 触发、累积占满定时器表）。
+pub fn wake_event() {
+    let p = EVENT_WAITER.swap(u32::MAX, core::sync::atomic::Ordering::AcqRel);
+    let stale = EVENT_TIMER.swap(u64::MAX, core::sync::atomic::Ordering::AcqRel);
+    if stale != u64::MAX {
+        klib::time::cancel_timeout(stale);
+    }
+    if p == u32::MAX {
+        return;
+    }
+    let mut s = SCHED.lock();
+    if let Some(slot) = s.procs[p as usize].as_mut() {
+        // waiting_for 由 waitpid 机制独占管理，不得被事件路径提前唤醒；
+        // 非 Blocked（已醒/超时）也不得再置 Ready（避免重入就绪队列）。
+        if slot.waiting_for.is_none() && slot.proc.state() == TaskState::Blocked {
+            slot.saved.rax = EVENT_WAKE_RETRY_SENTINEL;
+            slot.proc.set_state(TaskState::Ready);
+            s.ready.push_back(p as usize);
+        }
+    }
+}
+
+/// 事件等待的超时唤醒（`klib::time::set_timeout` 回调，等待端注册）。
+/// 与 [`wake_event`] 的差异：把保存帧 rax 预置为 `0`（空），用户态封装识别为
+/// "超时无事件"，volumed 据此做周期对账后重新阻塞——不把超时唤醒误当事件重试。
+/// 超时触发即说明定时器已到期，无需再 cancel（回调自身就是到期处置）。
+///
+/// O2 竞争消解：事件唤醒（wake_event）与超时唤醒对 `saved.rax` 竞争时，由下方
+/// 的 `if state == Blocked` 检查保证**事件优先**——wake_event 已把等待者置
+/// `Ready` 时，本回调不会覆盖其 `-EAGAIN` 哨兵（非 Blocked 不写入）；仅当等待者
+/// 仍处 `Blocked`（事件尚未接管，超时是实际唤醒源）才写入 `0`。等待者在
+/// `block_for_event` 的 `Some(next)` 阻塞分支切走时 EVENT_WAITER 会被 CAS 提前
+/// 清理，故**不能**以 EVENT_WAITER 状态作为是否写入的依据（那会导致超时唤醒
+/// 漏写哨兵、用户态把垃圾当事件长度）。`Blocked` 状态才是可靠判据。
+pub fn wake_event_timeout(pid: usize) {
+    EVENT_TIMER.store(u64::MAX, core::sync::atomic::Ordering::Release);
+    let mut s = SCHED.lock();
+    if let Some(slot) = s.procs[pid].as_mut() {
+        if slot.proc.state() == TaskState::Blocked {
+            slot.saved.rax = 0;
+        }
+    }
+    drop(s);
+    wake(pid);
+}
+
+/// 记录当前事件等待注册的超时定时器 id，供 [`wake_event`] 在事件唤醒时取消
+/// （`u64::MAX` = 无待取消定时器）。
+pub fn set_event_timeout_timer(id: u64) {
+    EVENT_TIMER.store(id, core::sync::atomic::Ordering::Release);
+}
+
+/// 清空事件等待超时定时器 id 槽（`u64::MAX` = 无）。在事件等待的**提前返回**
+/// 路径（事件已就绪 / NotSwitched 取到事件 / 退化非阻塞）调用，配合
+/// `klib::time::cancel_timeout` 防止 stale 定时器泄漏与级联污染新等待（S18/S21）。
+pub fn clear_event_timeout_timer() {
+    EVENT_TIMER.store(u64::MAX, core::sync::atomic::Ordering::Release);
+}
+
+/// 事件等待超时定时器 id 槽（`u64::MAX` = 无）。
+static EVENT_TIMER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// 事件唤醒预置到保存帧 rax 的"曾阻塞、请重试"哨兵（`-EAGAIN`）。
+/// 用户态封装看到 `-EAGAIN` 即重试；`0` 表示超时无事件（见 [`wake_event_timeout`]）。
+///
+/// errno 值取自集中定义 [`Error::WouldBlock`]（S13 错误码单一事实源），不内联
+/// 裸字面量：`klib::error::Error::to_errno` 与 libsys 同口径，改码一处即同步。
+const EVENT_WAKE_RETRY_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as u64;
+
 // ---------- B21/KM15 测试钩子（仅 kernel-tests 构建存在）----------
 
 /// 预占 KBD_WAITER（审计 B21：使 `block_for_kbd` 的 Busy 分支在单核测试中
@@ -777,6 +1012,47 @@ pub fn debug_set_scheduler_current(pid: usize) {
 #[cfg(feature = "kernel-tests")]
 pub fn debug_clear_scheduler_current() {
     SCHED.lock().current = None;
+}
+
+/// 预占 EVENT_WAITER（测试钩子，V6）：使 `block_for_event` 的"已有并发等待者"
+/// 分支在单核测试中可达（Busy 语义 = 第二并发事件读者得到 NotSwitched）。
+#[cfg(feature = "kernel-tests")]
+pub fn debug_occupy_event_waiter(pid: u32) -> bool {
+    EVENT_WAITER
+        .compare_exchange(
+            u32::MAX,
+            pid,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// 释放 [`debug_occupy_event_waiter`] 的占用（恢复空槽哨兵）。
+#[cfg(feature = "kernel-tests")]
+pub fn debug_release_event_waiter() {
+    EVENT_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+}
+
+/// 事件等待全局探针（V6 断言用）：返回 (EVENT_WAITER, EVENT_TIMER)。
+#[cfg(feature = "kernel-tests")]
+pub fn debug_probe_event_globals() -> (u32, u64) {
+    (
+        EVENT_WAITER.load(core::sync::atomic::Ordering::Acquire),
+        EVENT_TIMER.load(core::sync::atomic::Ordering::Acquire),
+    )
+}
+
+/// 把 `pid` 进程的保存帧 rax 置为指定值（测试钩子，V6 断言唤醒哨兵用）。
+/// 进程须存在；配合 [`test_hooks::simulate_blocked`] 构造"已阻塞的事件等待者"。
+#[cfg(feature = "kernel-tests")]
+pub fn debug_set_saved_rax(pid: usize, rax: u64) -> bool {
+    let mut s = SCHED.lock();
+    let Some(slot) = s.procs.get_mut(pid).and_then(|p| p.as_mut()) else {
+        return false;
+    };
+    slot.saved.rax = rax;
+    true
 }
 
 // ---------- C7.1 终止核心：zombie / 退出码交付 / 孤儿级联 ----------
@@ -1244,6 +1520,18 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
     if KBD_WAITER.load(core::sync::atomic::Ordering::Acquire) == target as u32 {
         KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
     }
+    // 若是设备事件 waiter（interrupt-to-futex），清空登记并取消其超时定时器：
+    // 被杀进程正阻塞在 block_for_event（EVENT_WAITER=pid）时，残留的死 pid 会让
+    // 后继事件读者的 CAS 失败、永久 NotSwitched，事件等待功能损坏（S18/S21，V3）。
+    // 与 KBD_WAITER 清理路径对称。EVENT_TIMER 同时清空并 cancel，防 stale 定时器
+    // 到期唤醒一个已死进程。
+    if EVENT_WAITER.load(core::sync::atomic::Ordering::Acquire) == target as u32 {
+        EVENT_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+        let stale = EVENT_TIMER.swap(u64::MAX, core::sync::atomic::Ordering::AcqRel);
+        if stale != u64::MAX {
+            klib::time::cancel_timeout(stale);
+        }
+    }
     // 统一终止核心：置 Exit、按父子关系交付/保留/回收、孤儿级联、UIO 清理。
     let _ = terminate_locked(&mut s, target, sig as u64);
     Ok(0)
@@ -1395,6 +1683,11 @@ pub mod test_hooks {
         s.ready.clear();
         s.current = None;
         KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+        // 同步复位事件等待全局（S18/S21，V3/V6）：EVENT_WAITER 残留会让后继
+        // 用例的 block_for_event 永久 NotSwitched；EVENT_TIMER 残留的 stale id
+        // 会污染新等待的定时器取消。
+        EVENT_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+        EVENT_TIMER.store(u64::MAX, core::sync::atomic::Ordering::Release);
         drop(s);
         drain_dead_kstacks();
         clear_current_proc();

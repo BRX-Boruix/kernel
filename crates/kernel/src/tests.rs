@@ -7535,6 +7535,143 @@ pub fn test_drv1_remediation() {
 }
 
 /// 构造填充用设备描述符（测试专用，Misc/Virtual/易失）。
+/// interrupt-to-futex 事件等待机制单测（V6，S23/S29/S30）：
+///
+/// 覆盖本次新增的 `block_for_event`/`wake_event`/`wake_event_timeout` 的可
+/// 单核测试的**表级语义**——事件到达时登记复检（lost-wakeup）、并发等待者仲裁
+/// （NotSwitched）、唤醒哨兵（saved.rax=-EAGAIN/0）、以及 kill_pid 对
+/// EVENT_WAITER/EVENT_TIMER 的清理（V3）。全程关中断（同 test_waitpid_core
+/// 纪律），不触发物理上下文切换；`block_for_event` 的 Switched 分支（真实挂起
+/// 切走）由 QEMU 停机/交互验收覆盖（`kernel-test-waitpid` 之外的运行时路径）。
+#[cfg(feature = "kernel-tests")]
+pub fn test_event_wait_mechanism() {
+    use task::TaskState;
+    use task::scheduler::test_hooks as th;
+
+    info!("[test-event-wait] === interrupt-to-futex: event-wait core semantics ===");
+    arch_x86_64::interrupts::disable();
+
+    // 哨兵数值必须取自集中错误码（V1，S13）：不内联裸字面量。
+    let eagain = (-(klib::error::Error::WouldBlock.to_errno() as i64)) as u64;
+
+    // ---- 1. lost-wakeup：事件先入队 → block_for_event 不阻塞（NotSwitched）----
+    // 等待者登记前事件已就绪：复检必见，调用方应立即取事件而非挂起。
+    driver::publish_event(driver::DeviceEvent::DeviceArrived(fill_dev_info("evt-lw-a")));
+    assert!(
+        driver::pending_event_count() > 0,
+        "pre-published event must be visible"
+    );
+    // 需要一个真实进程充当当前（block_for_event 从 SCHED.current 取等待者 pid）。
+    let waiter = th::spawn_named_child_of(0, "evt-waiter.elf").expect("spawn waiter");
+    task::scheduler::debug_set_scheduler_current(waiter);
+    let mut frame = arch_x86_64::interrupts::InterruptFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+        vector: 0, error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+    assert_eq!(
+        task::block_for_event(&mut frame),
+        task::SwitchOutcome::NotSwitched,
+        "event already queued → caller must NOT block, takes event instead"
+    );
+    // 复检取到事件。
+    assert!(
+        driver::peek_event().is_some(),
+        "pre-published event must remain available after NotSwitched"
+    );
+    // 登记已撤销，无残留占位。
+    assert_eq!(
+        task::scheduler::debug_probe_event_globals().0,
+        u32::MAX,
+        "EVENT_WAITER must be cleared after NotSwitched"
+    );
+    // 排空事件队列，为后续用例钉死空起点。
+    while driver::pop_event().is_some() {}
+
+    // ---- 2. 并发等待者仲裁：EVENT_WAITER 被占 → NotSwitched ----
+    // 已有并发事件读者登记时，第二个读者不顶掉既有等待者（KM15 单读者）。
+    assert!(
+        task::scheduler::debug_occupy_event_waiter(waiter as u32),
+        "occupy EVENT_WAITER must succeed on free slot"
+    );
+    assert_eq!(
+        task::block_for_event(&mut frame),
+        task::SwitchOutcome::NotSwitched,
+        "concurrent event waiter must be refused, not override"
+    );
+    task::scheduler::debug_release_event_waiter();
+
+    // ---- 3. wake_event：把 Blocked 事件等待者置 Ready 并预置 -EAGAIN 哨兵 ----
+    // 构造一个阻塞在 block_for_event 的进程（模拟登记已发生 + Blocked）。
+    assert!(
+        th::simulate_blocked(waiter),
+        "waiter must become Blocked (dummy, never scheduled)"
+    );
+    // 登记 EVENT_WAITER = waiter，使 wake_event 能定位它。
+    assert!(
+        task::scheduler::debug_occupy_event_waiter(waiter as u32),
+        "occupy EVENT_WAITER before wake_event"
+    );
+    task::wake_event();
+    // wake_event 取走 EVENT_WAITER，把进程置 Ready 并入就绪队列，且预置哨兵。
+    assert_eq!(
+        task::scheduler::debug_probe_event_globals().0,
+        u32::MAX,
+        "wake_event must consume EVENT_WAITER"
+    );
+    let (st, _, _, saved_rax, _) = th::probe(waiter).expect("waiter probed");
+    assert_eq!(st, TaskState::Ready, "wake_event must wake the blocked waiter");
+    assert_eq!(
+        saved_rax, eagain,
+        "wake_event must preset saved.rax to -EAGAIN (retry sentinel)"
+    );
+
+    // ---- 4. wake_event_timeout：预置 0 哨兵并唤醒 ----
+    // 把进程置回 Blocked 并移出就绪队列（复用 simulate_blocked 语义）。
+    assert!(
+        th::simulate_blocked(waiter),
+        "re-block waiter for timeout wake"
+    );
+    task::scheduler::debug_occupy_event_waiter(waiter as u32);
+    task::wake_event_timeout(waiter);
+    let (st, _, _, saved_rax, _) = th::probe(waiter).expect("waiter probed");
+    assert_eq!(st, TaskState::Ready, "timeout must wake the blocked waiter");
+    assert_eq!(
+        saved_rax, 0,
+        "wake_event_timeout must preset saved.rax=0 (empty/timeout)"
+    );
+    // wake_event_timeout 本身不清除 EVENT_WAITER（定时器到期唤醒路径），故测试
+    // 显式释放，避免残留占用污染 test 5 的占用断言。
+    task::scheduler::debug_release_event_waiter();
+
+    // ---- 5. V3：kill_pid 清理 EVENT_WAITER/EVENT_TIMER ----
+    // 模拟：进程正阻塞在 block_for_event（EVENT_WAITER=pid, EVENT_TIMER=tid）。
+    // 先把调度器 current 清空，使 kill 走 he-kill 分支（非自杀，不触发物理切换
+    // exit_current 的 iretq）。
+    task::scheduler::debug_clear_scheduler_current();
+    assert!(
+        th::simulate_blocked(waiter),
+        "re-block waiter before kill"
+    );
+    assert!(
+        task::scheduler::debug_occupy_event_waiter(waiter as u32),
+        "occupy EVENT_WAITER to simulate in-flight block"
+    );
+    task::set_event_timeout_timer(0x1234); // 假 timer id，验证 kill 清空
+    // frame 仅在 target==current 的自杀路径使用；此处杀的是非当前进程（he-kill
+    // 路径不触碰 frame），传入哑帧满足签名。
+    task::kill_pid(waiter, task::SIGKILL as u32, &mut frame).expect("kill waiter");
+    let (ew, et) = task::scheduler::debug_probe_event_globals();
+    assert_eq!(ew, u32::MAX, "kill_pid must clear EVENT_WAITER (V3)");
+    assert_eq!(et, u64::MAX, "kill_pid must clear EVENT_TIMER (V3)");
+
+    // ---- 清场 ----
+    th::reset_all();
+    task::scheduler::debug_clear_scheduler_current();
+    arch_x86_64::interrupts::enable();
+    info!("[test-event-wait] interrupt-to-futex core semantics OK");
+}
+
 fn fill_dev_info(name: &'static str) -> driver::DeviceInfo {
     driver::DeviceInfo {
         name,

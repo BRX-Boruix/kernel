@@ -568,6 +568,8 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_task_block_fpu_handoff();
     #[cfg(feature = "kernel-tests")]
+    tests::test_event_wait_mechanism();
+    #[cfg(feature = "kernel-tests")]
     tests::test_ipc1_semantics();
 
     // S26 回归：block_current_with 登记点失败时已弹出的就绪进程必须重新入队。
@@ -658,6 +660,10 @@ unsafe fn kmain_body() -> ! {
     // 注册键盘输入回调：有按键时唤醒阻塞在 `read` 的进程（如 shell）。arch 层
     // 不反向依赖 kernel，经函数指针解耦（指向 `task::wake_kbd`）。
     arch_x86_64::keyboard::set_input_callback(task::wake_kbd);
+    // 注册设备事件唤醒回调（interrupt-to-futex）：`driver::event::publish_event`
+    // 发布硬件拓扑事件时唤醒阻塞在事件等待的进程（volumed 的 SYS_DRIVER_EVENT_NEXT
+    // 阻塞态）。driver 不反向依赖 task，经函数指针解耦（指向 `task::wake_event`）。
+    driver::event::set_event_wake_callback(task::wake_event);
 
     // C7.1/#7：waitpid 真实父子链停机验收（kernel-test-waitpid 显式启用；
     // 验收后停机、不返回主流程，故必须放在 start_init 之前）。

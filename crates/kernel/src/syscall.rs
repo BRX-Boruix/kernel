@@ -1555,12 +1555,15 @@ fn sys_driver_query(frame: &mut SyscallFrame) -> u64 {
     pack_ok(n as u64)
 }
 
-/// `driver_event_next(buf_ptr, cap) -> len`（P2-2，DEVICE 域 0x57）。
+/// `driver_event_next(buf_ptr, cap, timeout_ns) -> len`（P2-2/interrupt-to-futex，
+/// DEVICE 域 0x57）。
 ///
 /// 消费**下一条**硬件拓扑事件（`driver::event::DeviceEvent`：DeviceArrived /
-/// DeviceDeparted），序列化为 JSON 写入用户缓冲，返回写出长度；无待消费事件
-/// 时返回 `0`（空）。供用户态 `volumed` 订阅内核块设备事件（ADR-030 §决策3
-/// 事件通道；`driver::event` 环形日志是唯一事实源，本 syscall 是它的用户态出口）。
+/// DeviceDeparted），序列化为 JSON 写入用户缓冲，返回写出长度；无待消费事件且
+/// `timeout_ns == 0` 时返回 `0`（非阻塞空）。`timeout_ns > 0` 时为**阻塞等待**：
+/// 队列空则挂起本进程，直到事件到达（`driver::event::publish_event` 经回调唤醒）
+/// 或超时到期，随后重试取事件——这是 ADR-030 §决策3 的 interrupt-to-futex：
+/// 设备注册/拔除中断直达用户态等待者，取代 volumed 的有界休眠轮询。
 ///
 /// **S09 诚实**：无事件返回 0（空），绝不编造事件；事件种类/设备名都来自
 /// `DeviceInfo` 真实描述符。错误码口径：`cap` 超过内部上限（512）→
@@ -1570,27 +1573,46 @@ fn sys_driver_query(frame: &mut SyscallFrame) -> u64 {
 /// 不同：本处事件是"一次性的"，丢不得，故用 `NoSpace` 且不消费。
 ///
 /// **单消费者前提**：peek（量测）+ pop（消费）是两次独立锁临界区，非原子对。
-/// 跨调用者并发（两个进程同时调用本 syscall）存在 TOCTOU 错配面（A 按 X 序列化、
-/// 却消费 B 已取走的 Y）。当前唯一消费者是 `volumed`（单进程单线程顺序排空），
-/// 错配不可达；引入第二消费者须把 peek+pop 并入同一临界区（见 driver::event 头注释）。
-fn sys_driver_event_next(frame: &mut SyscallFrame) -> u64 {
+/// 跨调用者并发存在 TOCTOU 错配面（见 driver::event 头注释）。当前唯一消费者
+/// 是 `volumed`（单进程单线程顺序排空），错配不可达；阻塞等待经 `EVENT_WAITER`
+/// 登记唯一等待者（同 KBD_WAITER 单读者仲裁，并发第二个等待者返回 WouldBlock）。
+fn sys_driver_event_next(frame: &mut SyscallFrame) -> DispatchResult {
     const MAX_EVENT_BYTES: usize = 512;
+    // 阻塞等待的超时上界（S31 对抗输入边界）：1 小时。设备事件等待是短时
+    // 驱动的（volumed 用 1s 周期对账）；超长 timeout 只会占住一个定时器槽
+    // 直到其远未来 deadline（且被 V2 提前返回/V3 被杀时取消），但对调用方
+    // 无真实收益，故显式拒绝，避免把 u64::MAX 之类对抗值当合法超时吞下。
+    const MAX_WAIT_TIMEOUT_NS: u64 = 3_600_000_000_000; // 1h
     let out_ptr = frame.a1;
     let cap = frame.a2 as usize;
+    let timeout_ns = frame.a3;
     if cap > MAX_EVENT_BYTES {
-        return pack_err(Error::InvalidParam);
+        return done(pack_err(Error::InvalidParam));
+    }
+    if timeout_ns > MAX_WAIT_TIMEOUT_NS {
+        return done(pack_err(Error::InvalidParam));
     }
     // 先窥视不消费：量测 JSON 长度，cap 不足时事件留在队列（调用方加大缓冲
     // 重试仍能取回）——绝不"先消费再因装不下而丢弃"（S18 事件不丢失）。
-    let Some(event) = driver::event::peek_event() else {
-        // 无待消费事件：返回 0（空），调用方应稍后重试（当前无 futex 等待原语，
-        // volumed 以有界休眠轮询——honest，见 volumed 源码注释）。
-        return pack_ok(0);
-    };
+    if let Some(ev) = driver::event::peek_event() {
+        return done(driver_event_serialize(&ev, out_ptr, cap));
+    }
+    // 无待消费事件。
+    if timeout_ns == 0 {
+        // 非阻塞：返回 0（空），调用方稍后重试。
+        return done(pack_ok(0));
+    }
+    // 阻塞等待：挂起本进程直到事件到达或超时。
+    event_wait_blocking(frame, timeout_ns)
+}
+
+/// 把队头事件序列化为 JSON 并拷回用户缓冲（peek 已取拷贝，不消费）。
+/// 返回 syscall 返回值（成功=长度，失败=错误）。
+fn driver_event_serialize(ev: &driver::event::DeviceEvent, out_ptr: u64, cap: usize) -> u64 {
     let mut target = klib::json::VecTarget::new();
     let mut writer = klib::json::JsonWriter::new(&mut target);
     // DeviceInfo → JSON：kind/name/volatile 是 volumed 做挂载决策所需的全部。
-    let (event_type, info) = match event {
+    let (event_type, info) = match ev {
         driver::event::DeviceEvent::DeviceArrived(info) => ("arrived", info),
         driver::event::DeviceEvent::DeviceDeparted(info) => ("departed", info),
     };
@@ -1628,6 +1650,76 @@ fn sys_driver_event_next(frame: &mut SyscallFrame) -> u64 {
         arch_x86_64::mmio::copy_to_user(out_ptr, bytes.as_ptr(), n);
     }
     pack_ok(n as u64)
+}
+
+/// 阻塞等待事件到达或超时（interrupt-to-futex 的等待端）。
+///
+/// 与 `sleep_blocking` 同构（ADR-030 §决策3"不做轮询"）：事件队列空时
+/// `block_for_event` 挂起本进程并切走，本函数返回 `DispatchResult::Switched`；
+/// 进程经中断路径（tick）回归用户态时，保存帧 rax 由唤醒方预置结果——事件
+/// 唤醒置 `-EAGAIN` 哨兵（用户态封装**重试**取事件），超时唤醒置 `0`（返回
+/// 空，volumed 做周期对账）。事件到达经 `publish_event` → [`task::wake_event`]
+/// 唤醒；超时经定时器 [`task::wake_event_timeout`] 唤醒。
+///
+/// lost-wakeup 由 `block_for_event` 的锁内事件队列复检（register 闭包）闭合：
+/// 事件先到则复检非空→不阻塞，本函数直接取到；本进程先登记则事件到达唤醒。
+/// `publish_event` 先入队再唤醒，保证唤醒者复检时必见事件。
+///
+/// 返回：事件序列化结果（`done(len)`）、超时无事件（`done(0)`）或 `Switched`
+/// （已挂起，用户态以哨兵重试）。
+fn event_wait_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
+    let out_ptr = frame.a1;
+    let cap = frame.a2 as usize;
+    // 时钟未就绪：退化非阻塞（如实返回 0，volumed 上层回退周期对账）。
+    if !klib::time::clock_ready() {
+        return done(pack_ok(0));
+    }
+    let Some(cur_pid) = current_proc_mut().map(|p| p.pid()) else {
+        return done(pack_err(Error::NotFound));
+    };
+    // 注册超时定时器（一次性）：到期经 `task::wake_event_timeout` 把保存帧 rax
+    // 预置 `0`（超时无事件）并唤醒本进程。记录 id 供 [`task::wake_event`] 在
+    // 事件唤醒时取消；本函数所有"立即返回成功/空"的路径也在此显式取消并清
+    // EVENT_TIMER，杜绝 stale 定时器泄漏与级联污染新等待（S18/S21，见 V2）。
+    // 定时器表满时静默退化——事件到达仍能唤醒，超时仅是对活性的兜底。
+    let registered_timer = match klib::time::set_timeout(timeout_ns, task::wake_event_timeout, cur_pid)
+    {
+        Some(tid) => {
+            task::set_event_timeout_timer(tid);
+            Some(tid)
+        }
+        None => None,
+    };
+    // 返回前取消超时定时器并清 EVENT_TIMER（仅"已确定交付/返回"的路径调用；
+    // Switched 阻塞路径不清，交给事件唤醒取消或到期自然触发）。
+    let cancel_timer = |registered: Option<u64>| {
+        if let Some(tid) = registered {
+            klib::time::cancel_timeout(tid);
+        }
+        task::clear_event_timeout_timer();
+    };
+    // 事件已就绪 → 交付（提前返回：取消定时器）。
+    if let Some(ev) = driver::event::peek_event() {
+        let r = done(driver_event_serialize(&ev, out_ptr, cap));
+        cancel_timer(registered_timer);
+        return r;
+    }
+    match task::block_for_event(arch_frame(frame)) {
+        // 已挂起切走：用户态经哨兵重试。定时器保持待触发，由事件唤醒取消或
+        // 到期自然触发——不留 stale（两条路径都收敛到 EVENT_TIMER=MAX）。
+        task::SwitchOutcome::Switched => DispatchResult::Switched,
+        // 未挂起（事件已就绪 / 无同伴可切 / 已有并发等待者）：重取事件并取消
+        // 定时器（此路径返回结果，定时器不再需要）。
+        task::SwitchOutcome::NotSwitched => {
+            let r = if let Some(ev) = driver::event::peek_event() {
+                done(driver_event_serialize(&ev, out_ptr, cap))
+            } else {
+                done(pack_ok(0))
+            };
+            cancel_timer(registered_timer);
+            r
+        }
+    }
 }
 
 fn sys_driver_unregister(frame: &mut SyscallFrame) -> u64 {
@@ -1865,7 +1957,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_DRIVER_QUERY => done(sys_driver_query(frame)),
         SYS_DRIVER_CLAIM => done(sys_driver_claim(frame)),
         SYS_DRIVER_UNREGISTER => done(sys_driver_unregister(frame)),
-        SYS_DRIVER_EVENT_NEXT => done(sys_driver_event_next(frame)),
+        // 事件等待可能阻塞切换（interrupt-to-futex），自带 DispatchResult 语义。
+        SYS_DRIVER_EVENT_NEXT => sys_driver_event_next(frame),
 
         // VOLUME Domain (0x60, ADR-030)
         SYS_VOLUME_MOUNT => done(sys_volume_mount(frame)),
