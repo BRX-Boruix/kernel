@@ -1131,14 +1131,73 @@ fn sys_task_wait(frame: &mut SyscallFrame) -> DispatchResult {
     }
 
     if target_pid == 0 && timeout_ns > 0 {
-        klib::time::sleep_nanos(timeout_ns);
-        return done(pack_ok(0));
+        // ADR-014 §4.3：`SYS_TASK_WAIT(0, timeout)` 的语义是"精准时钟挂起
+        // 睡眠"（挂起，而非忙等）。原实现直接 `klib::time::sleep_nanos` 在
+        // 内核态自旋忙等——klib time.rs 注释自陈"当前无调度器，只能忙等"；
+        // 而 ADR-017 的 CPL 门控又使 tick 无法抢占内核态（`cs&3!=3` 直接
+        // return），于是后台 `sleep &` 会占死 CPU，前台进程被彻底饿死。
+        // 改用"注册定时器到期唤醒 + 调度器显式阻塞原语挂起本进程"——主动
+        // 切换原语（block/yield/exit）与"被动抢占仅限用户态"正交（ADR-017
+        // §决策），进程挂起不占 CPU，前台进程得以正常调度。
+        return sleep_blocking(frame, timeout_ns);
     }
 
     match task::waitpid(target_pid, arch_frame(frame)) {
         Ok(task::Waited::Code(code)) => done(pack_ok(code)),
         Ok(task::Waited::Blocked) => DispatchResult::Switched,
         Err(e) => done(pack_err(e)),
+    }
+}
+
+/// 精准时钟挂起睡眠（ADR-014 §4.3 `SYS_TASK_WAIT(0, timeout)`）：注册定时器
+/// 到期唤醒 + 调度器显式阻塞原语挂起本进程，取代内核态忙等。
+///
+/// 优雅路径：`set_timeout` 注册成功且就绪队列有其它进程（可阻塞切换）→
+/// 阻塞挂起，定时器到期由 `task::wake` 唤醒（tick 中断驱动 `poll_timeouts`
+/// 触发）。退化路径（定时器表满 / 就绪队列空无法阻塞 / 时钟未就绪）退化为
+/// 忙等 `sleep_nanos`，保证 sleep 语义不丢——就绪队列空时本进程是唯一执行
+/// 体，忙等占 CPU 无害。
+///
+/// lost-wakeup 论证（与 `block_current_with` 的 register 复检语义一致）：
+/// 定时器到期触发 `task::wake` 时，`poll_timeouts` 的条件是 `deadline <= now`，
+/// 故 wake 执行时刻必然 `now >= deadline`；此时进程尚未 Blocked（wake 会因
+/// 非 Blocked 而被忽略）。register 复检 `now < deadline` 因此必然为 false，
+/// 判定"不阻塞"，杜绝"定时器已触发却仍阻塞而永睡"的窗口。正常情形
+/// `now < deadline`（wake 未触发）→ register 为 true → 阻塞，之后定时器
+/// 触发 wake 正确唤醒。
+fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
+    if !klib::time::clock_ready() {
+        // 时钟未注入（启动早期兜底，klib time.rs S09）：忙等语义不变。
+        klib::time::sleep_nanos(timeout_ns);
+        return done(pack_ok(0));
+    }
+    let deadline = klib::time::now_nanos()
+        .expect("clock_ready checked")
+        .saturating_add(timeout_ns);
+    // 当前 pid：供定时器到期回调唤醒本进程。借用在进入 `block_current_with`
+    // 之前立即结束并释放引用，不跨越调度切换——符合 CURRENT_PROC 别名纪律
+    // （task1 KA3：借用不得跨越任何可能改写 CURRENT_PROC 的调度调用）。
+    let Some(cur_pid) = current_proc_mut().map(|p| p.pid()) else {
+        return done(pack_err(Error::NotFound));
+    };
+    // 注册一次性定时器，到期以 `task::wake(cur_pid)` 唤醒本进程。
+    // 回调在 tick 中断的 `poll_timeouts`（锁外）执行，拿 SCHED 锁安全。
+    if klib::time::set_timeout(timeout_ns, task::wake, cur_pid).is_none() {
+        // 定时器表满（klib time.rs：有界静态槽位，MAX_TIMERS）：退化忙等，
+        // 不丢 sleep 语义。
+        klib::time::sleep_nanos(timeout_ns);
+        return done(pack_ok(0));
+    }
+    // 原子阻塞：register 在调度锁内复检 deadline，消除 lost-wakeup。
+    let register = &mut || klib::time::now_nanos().map_or(false, |n| n < deadline);
+    match task::block_current_with(arch_frame(frame), register) {
+        task::SwitchOutcome::Switched => DispatchResult::Switched,
+        task::SwitchOutcome::NotSwitched => {
+            // 就绪队列空 / 仅自身（阻塞会自锁），或 deadline 已过（定时器已
+            // 触发）：退化为忙等剩余时间（deadline 已过时立即返回，占 CPU 无害）。
+            klib::time::sleep_nanos(timeout_ns);
+            done(pack_ok(0))
+        }
     }
 }
 

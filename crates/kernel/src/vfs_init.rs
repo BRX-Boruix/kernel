@@ -149,6 +149,30 @@ impl SystemInfoProvider for KernelSystemProvider {
             .into_string()
             .expect("kernel JSON keys and env values are UTF-8")
     }
+
+    fn time_json(&self) -> String {
+        // 墙钟（真实年月日时分秒）直接来自 CMOS/BIOS 硬件时钟。
+        // 唯一实现是 arch 层 `rtc::read_time`（双读一致性校验、UIP 轮询上界、
+        // BCD/二进制与 12/24 小时制处理都在那一处，AA1）。本函数只做 JSON 投影。
+        let t = arch_x86_64::rtc::read_time();
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        writer
+            .start_object()
+            .and_then(|mut o| {
+                o.field_u64("year", t.year as u64)?;
+                o.field_u64("month", t.month as u64)?;
+                o.field_u64("day", t.day as u64)?;
+                o.field_u64("hour", t.hour as u64)?;
+                o.field_u64("minute", t.minute as u64)?;
+                o.field_u64("second", t.second as u64)?;
+                o.end()
+            })
+            .expect("Vec-backed time JSON serialization cannot fail");
+        target
+            .into_string()
+            .expect("time JSON keys are ASCII")
+    }
 }
 
 /// 内核 DevFS Provider 实现。

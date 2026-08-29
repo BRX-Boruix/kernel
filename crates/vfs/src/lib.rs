@@ -233,6 +233,11 @@ mod tests {
         fn kernel_json(&self) -> alloc::string::String {
             alloc::string::String::from(r#"{"version":"0.1.0","git_commit":"abcdef"}"#)
         }
+        fn time_json(&self) -> alloc::string::String {
+            alloc::string::String::from(
+                r#"{"year":2026,"month":1,"day":1,"hour":0,"minute":0,"second":0}"#,
+            )
+        }
     }
 
     struct MockDeviceProvider {
