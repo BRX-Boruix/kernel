@@ -2,6 +2,9 @@
 //!
 //! 遵循 ADR-005（RESTful 资源观）、ADR-011（属性子文件控制）与 ADR-013（JSON 第一公民）：
 //! - `/devices/list`：枚举所有已注册设备的 JSON 数组；
+//! - `/devices/random`：随机数字符设备（`read` 取随机字节流；ADR-014：无
+//!   `SYS_RANDOM`，随机数统一走此路径），`/devices/random/status` 如实披露
+//!   熵源与是否密码学安全（JSON）；
 //! - `/devices/serial-com1`：主数据通道，直接读写原始串口字节流；
 //! - `/devices/serial-com1/baudrate`：纯文本属性（写入调速，读取查询）；
 //! - `/devices/displays/primary/mode`：读取 JSON 分辨率配置（真实几何）；
@@ -122,6 +125,23 @@ pub trait DeviceInfoProvider: Send + Sync {
             name,
             part_id
         )
+    }
+
+    /// `/devices/random` 主节点：把 `buf` 填满随机字节（ADR-014：随机数统一走
+    /// `STREAM_READ("/devices/random")`，无 `SYS_RANDOM`）。默认显式
+    /// NotSupported，由内核 provider 覆写。
+    fn random_bytes(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        Err(Error::NotSupported)
+    }
+
+    /// `/devices/random/status` JSON：如实披露当前熵源（硬件熵 / 时钟垫底）与
+    /// 是否密码学安全（S07/S09 宁缺毋假——绝不把确定性时钟垫底谎报为安全熵）。
+    /// 默认显式 not_supported，由内核 provider 覆写。
+    fn random_status_json(&self) -> String {
+        alloc::string::String::from(r#"{"error":"no_random_source"}"#)
     }
 }
 
@@ -247,6 +267,85 @@ impl INode for SerialDeviceNode {
     }
 }
 
+/// 随机数设备节点（ADR-014：随机数统一走 `/devices/random`，无 `SYS_RANDOM`）。
+///
+/// 主节点是只读字符设备：`read` 每次返回新的随机字节（provider 从内核熵池
+/// 填充）；`status` 子文件如实披露当前熵源与是否密码学安全（S07/S09 宁缺毋假）。
+/// 写路径如实拒绝（用户态喂熵对当前系统是过度设计，且无真实入口）。
+pub struct RandomDeviceNode {
+    provider: Arc<dyn DeviceInfoProvider>,
+    children: DynamicDirNode,
+}
+
+impl RandomDeviceNode {
+    pub fn new(provider: Arc<dyn DeviceInfoProvider>) -> Self {
+        let children = DynamicDirNode::new();
+        let p_status = provider.clone();
+        let status_node = DynamicFileNode::read_only(move || {
+            let mut json = p_status.random_status_json().into_bytes();
+            json.push(b'\n');
+            json
+        });
+        children.add_child("status", Arc::new(status_node));
+        Self { provider, children }
+    }
+}
+
+impl INode for RandomDeviceNode {
+    /// 忽略 offset（随机流无定位语义），每次读返回新随机字节。
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.provider.random_bytes(buf)
+    }
+
+    /// 只读字符设备：写随机流没有语义，如实 NotSupported（M17 同串口）。
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Error> {
+        Err(Error::NotSupported)
+    }
+
+    fn metadata(&self) -> Result<FileMetadata, Error> {
+        Ok(FileMetadata {
+            size: 0,
+            node_type: INodeType::CharacterDevice,
+            permissions: Permissions::readonly(),
+            created_time: 0,
+            modified_time: 0,
+            changed_time: 0,
+        })
+    }
+
+    fn node_type(&self) -> Result<INodeType, Error> {
+        Ok(INodeType::CharacterDevice)
+    }
+
+    /// 字符流无截断语义（M17）。
+    fn truncate(&self, _size: u64) -> Result<(), Error> {
+        Err(Error::NotSupported)
+    }
+
+    fn lookup(&self, name: &str) -> Result<Arc<dyn INode>, Error> {
+        self.children.lookup(name)
+    }
+
+    fn create(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+        Err(Error::PermissionDenied)
+    }
+
+    fn mkdir(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+        Err(Error::PermissionDenied)
+    }
+
+    fn unlink(&self, _name: &str) -> Result<(), Error> {
+        Err(Error::PermissionDenied)
+    }
+
+    fn list_dir(&self) -> Result<Vec<DirEntry>, Error> {
+        self.children.list_dir()
+    }
+}
+
 /// DevFS 文件系统实现。
 pub struct DevFS {
     root: Arc<DynamicDirNode>,
@@ -317,6 +416,10 @@ impl DevFS {
             json
         }));
         root.add_child("telemetry", telemetry_node);
+
+        // 4.5 /devices/random (ADR-014 随机数设备：字符流 + status 诚实披露)
+        let random_node = Arc::new(RandomDeviceNode::new(provider.clone()));
+        root.add_child("random", random_node);
 
         // 5. /devices/pci (M10.1 PCI 深度自省目录)
         // C5.1/#5：按设备名参数化 BAR 查询。为每个已注册 PCI 设备创建

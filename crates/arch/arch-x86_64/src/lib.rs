@@ -20,6 +20,7 @@ pub mod mmio;
 pub mod paging;
 pub mod pic;
 pub mod port;
+pub mod random;
 pub mod rtc;
 pub mod serial;
 pub mod smp;

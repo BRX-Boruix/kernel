@@ -667,6 +667,32 @@ impl DeviceInfoProvider for KernelDeviceProvider {
             .into_string()
             .expect("partition info JSON keys and device names are UTF-8")
     }
+
+    fn random_bytes(&self, buf: &mut [u8]) -> Result<usize, klib::error::Error> {
+        // 唯一数据源 = arch 熵池（rdseed→rdrand→时钟垫底，诚实披露 source）。
+        // 字符流 read 每次返回新随机字节，忽略 offset（由 DevFS 节点保证）。
+        arch_x86_64::random::fill_bytes(buf);
+        Ok(buf.len())
+    }
+
+    fn random_status_json(&self) -> String {
+        // S07/S09 宁缺毋假：如实披露熵源与是否密码学安全。时钟垫底是确定性
+        // 扰动，不是真随机——绝不让用户态误以为拿到密码学安全熵。
+        let src = arch_x86_64::random::source();
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        writer
+            .start_object()
+            .and_then(|mut o| {
+                o.field_str("source", src.name())?;
+                o.field_bool("crypto_safe", src.crypto_safe())?;
+                o.end()
+            })
+            .expect("Vec-backed random status JSON serialization cannot fail");
+        target
+            .into_string()
+            .expect("random status JSON keys are ASCII")
+    }
 }
 
 /// 统一磁盘错误对象 `{"error":<code>,"device":<name>}`（ADR-012 §4 诚实化：
