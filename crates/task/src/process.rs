@@ -156,6 +156,10 @@ pub struct Process<PT: PageTable> {
     /// 文件描述符表（FD Table，M6.2）。槽位可持有文件句柄或匿名管道端
     /// （ADR-014 §4.1 FLAG_PIPE）。
     fd_table: Vec<Option<vfs::file_handle::OpenHandle>>,
+    /// 当前工作目录（cwd，Unix chdir/getcwd 语义）。恒为规范绝对路径（`/` 或
+    /// 无尾斜杠）。syscall 层把相对路径与它拼接成绝对路径再交给 VFS（VFS 层
+    /// 只接受绝对路径，ADR-011 M1 契约不变）。
+    cwd: alloc::string::String,
 }
 
 impl<PT: PageTable> Process<PT> {
@@ -188,6 +192,7 @@ impl<PT: PageTable> Process<PT> {
             entry_rip,
             user_stack_top,
             fd_table,
+            cwd: alloc::string::String::from("/"),
         }
     }
 
@@ -239,6 +244,14 @@ impl<PT: PageTable> Process<PT> {
     /// 进程 id。
     pub fn pid(&self) -> usize {
         self.pid
+    }
+    /// 当前工作目录（规范绝对路径）。
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+    /// 设置当前工作目录（调用方保证为规范绝对路径）。
+    pub fn set_cwd(&mut self, cwd: alloc::string::String) {
+        self.cwd = cwd;
     }
     /// 当前状态。
     pub fn state(&self) -> TaskState {

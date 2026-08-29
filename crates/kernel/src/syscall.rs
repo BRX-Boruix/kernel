@@ -116,6 +116,14 @@ pub const SYS_ENTRY_READ: u32 = nr(domain::VFS, op::READ); // 0x42
 pub const SYS_ENTRY_UPDATE: u32 = nr(domain::VFS, op::WRITE); // 0x43
 pub const SYS_ENTRY_DELETE: u32 = nr(domain::VFS, op::DELETE); // 0x44
 
+/// `chdir(path)`：切换当前进程工作目录（VFS 域扩展，0x45）。
+///
+/// VFS 层仍只接受绝对路径（ADR-011 M1 契约不变）；本 syscall 与其余路径
+/// syscall 在 syscall 层把相对路径与进程 cwd 拼接成绝对路径。
+pub const SYS_ENTRY_CHDIR: u32 = nr(domain::VFS, 0x05); // 0x45
+/// `getcwd()`：读当前进程工作目录（VFS 域扩展，0x46）。
+pub const SYS_ENTRY_GETCWD: u32 = nr(domain::VFS, 0x06); // 0x46
+
 // ---------- SYS_ENTRY_CREATE kind 编码（ADR-014 §4.4，与 INodeType 对齐）----------
 /// 创建普通文件（kind=REG/FILE）。
 pub const ENTRY_KIND_FILE: u64 = 1;
@@ -243,6 +251,90 @@ fn copy_path_from_user(path_ptr: u64, max_len: usize) -> Result<alloc::string::S
     alloc::string::String::from_utf8(bytes).map_err(|_| Error::InvalidParam)
 }
 
+/// 把用户提供的路径规范化为**绝对路径**（ADR-011 M1：VFS 只接受绝对路径，
+/// cwd 拼接在 syscall 层完成，VFS 契约不变）。
+///
+/// - 绝对输入（`/` 开头）：直接规范化（消除 `.`/`..`/连续斜杠）；
+/// - 相对输入：与当前进程 cwd 拼接成 `{cwd}/{rel}` 再规范化（`../` 正确上溯）。
+///
+/// 用 `vfs::path::Path::canonicalize`（ADR-023 §2 成文契约：词法消解，不查
+/// 文件系统、不穿透符号链接/挂载点）。返回恒以 `/` 开头，VFS resolve 可接受。
+fn absolute_path(path: &str) -> Result<alloc::string::String, Error> {
+    if path.is_empty() {
+        return Err(Error::InvalidParam);
+    }
+    let abs = if path.starts_with('/') {
+        alloc::string::String::from(path)
+    } else {
+        let Some(proc) = current_proc_mut() else {
+            return Err(Error::NotFound);
+        };
+        let cwd = proc.cwd();
+        if cwd == "/" {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("{}/{}", cwd, path)
+        }
+    };
+    Ok(vfs::path::Path::canonicalize(&abs))
+}
+
+/// `chdir(path_ptr)`：切换当前进程工作目录（VFS 域 0x45）。
+///
+/// 目标必须是存在的目录（用 VFS `ENTRY_READ` 解析确认），否则不改动 cwd
+/// 并返回错误。相对路径相对当前 cwd 解析。
+fn sys_chdir(frame: &mut SyscallFrame) -> u64 {
+    let path = match copy_path_from_user(frame.a1, MAX_USER_PATH_BYTES) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    let abs = match absolute_path(&path) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
+    // 确认目标是目录；非目录或不存在如实报错（宁缺毋假）。
+    let root = crate::vfs_init::root();
+    let node = match root.resolve(&abs, true) {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    if node.node_type().map(|t| t != vfs::inode::INodeType::Directory).unwrap_or(true) {
+        return pack_err(Error::NotDirectory);
+    }
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    proc.set_cwd(abs);
+    pack_ok(0)
+}
+
+/// `getcwd(buf_ptr, cap)`：读当前进程工作目录到用户缓冲（VFS 域 0x46）。
+///
+/// 写入含终止 NUL；`cap` 不足时如实 `Error::NoSpace`，绝不静默截断。
+fn sys_getcwd(frame: &mut SyscallFrame) -> u64 {
+    let buf_ptr = frame.a1;
+    let cap = frame.a2 as usize;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let cwd = proc.cwd();
+    // 需要 cap 容纳 cwd 字节 + 终止 NUL。
+    if cwd.len() + 1 > cap {
+        return pack_err(Error::NoSpace);
+    }
+    let mut out_buf = alloc::vec::Vec::with_capacity(cwd.len() + 1);
+    out_buf.extend_from_slice(cwd.as_bytes());
+    out_buf.push(0);
+    // 逐块写回用户缓冲（与其余 syscall 同款 validate + copy 纪律）。
+    if let Err(e) = validate_user_range(buf_ptr, out_buf.len() as u64, UserAccess::Write) {
+        return pack_err(e);
+    }
+    unsafe {
+        arch_x86_64::mmio::copy_to_user(buf_ptr, out_buf.as_ptr(), out_buf.len());
+    }
+    pack_ok(cwd.len() as u64)
+}
+
 /// `open(path_ptr, flags_bits, perm_bits)`：打开或创建文件，返回 fd。
 ///
 /// ADR-014 §4.1 FLAG_PIPE：当 `flags` 含 `pipe` 位且 `path_ptr` 指向空串
@@ -266,6 +358,12 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
     if flags.pipe {
         return sys_open_pipe(path, frame);
     }
+
+    // 相对路径与进程 cwd 拼接成绝对路径（VFS 只接受绝对路径，ADR-011 M1）。
+    let path = match absolute_path(&path) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
 
     let root = crate::vfs_init::root();
 
@@ -401,6 +499,11 @@ fn sys_entry_create(frame: &mut SyscallFrame) -> u64 {
         Err(e) => return pack_err(e),
     };
     let perm = vfs::inode::Permissions::from_bits(perm_bits);
+    // 相对路径与进程 cwd 拼接（VFS 只接受绝对路径）。
+    let path = match absolute_path(&path) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
     let root = crate::vfs_init::root();
     match kind {
         crate::syscall::ENTRY_KIND_DIRECTORY => match root.mkdir(&path, perm) {
@@ -425,6 +528,11 @@ fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
     let path_ptr = frame.a1;
     let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    // 相对路径与进程 cwd 拼接（VFS 只接受绝对路径）。
+    let path = match absolute_path(&path) {
+        Ok(a) => a,
         Err(e) => return pack_err(e),
     };
     let root = crate::vfs_init::root();
@@ -454,6 +562,15 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
         Ok(p) => p,
         Err(e) => return pack_err(e),
     };
+    // 相对路径与进程 cwd 拼接（VFS 只接受绝对路径）。
+    let old_path = match absolute_path(&old_path) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
+    let new_path = match absolute_path(&new_path) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
     let root = crate::vfs_init::root();
     match root.rename(&old_path, &new_path) {
         Ok(()) => pack_ok(0),
@@ -477,6 +594,11 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
 
     let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    // 相对路径与进程 cwd 拼接（VFS 只接受绝对路径）。
+    let path = match absolute_path(&path) {
+        Ok(a) => a,
         Err(e) => return pack_err(e),
     };
 
@@ -857,6 +979,11 @@ fn sys_exec(frame: &mut SyscallFrame) -> u64 {
         _ => {
             let path = match copy_path_from_user(arg1, MAX_USER_PATH_BYTES) {
                 Ok(p) => p,
+                Err(e) => return pack_err(e),
+            };
+            // 相对路径与进程 cwd 拼接（VFS 只接受绝对路径）。
+            let path = match absolute_path(&path) {
+                Ok(a) => a,
                 Err(e) => return pack_err(e),
             };
             match root.resolve(&path, true) {
@@ -1484,6 +1611,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_ENTRY_READ => done(sys_readdir(frame)),
         SYS_ENTRY_UPDATE => done(sys_entry_update(frame)),
         SYS_ENTRY_DELETE => done(sys_unlink(frame)),
+        SYS_ENTRY_CHDIR => done(sys_chdir(frame)),
+        SYS_ENTRY_GETCWD => done(sys_getcwd(frame)),
 
         // DEVICE Domain (0x50)
         SYS_DRIVER_REGISTER => done(sys_driver_register(frame)),
