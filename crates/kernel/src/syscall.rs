@@ -82,6 +82,9 @@ pub mod op {
     pub const FORMAT: u32 = 0x05;
     /// VOLUME 域扩展动词：卸载卷。
     pub const UNMOUNT: u32 = 0x06;
+    /// DEVICE 域扩展动词（P2-2）：消费下一条硬件拓扑事件（DeviceArrived/Departed）。
+    /// 供用户态 `volumed` 订阅内核块设备事件（ADR-030 §决策3 事件通道）。
+    pub const EVENT: u32 = 0x07;
 }
 
 const fn nr(d: u32, o: u32) -> u32 {
@@ -151,6 +154,8 @@ pub const SYS_DRIVER_REGISTER: u32 = nr(domain::DEVICE, op::CREATE); // 0x51
 pub const SYS_DRIVER_QUERY: u32 = nr(domain::DEVICE, op::READ); // 0x52
 pub const SYS_DRIVER_CLAIM: u32 = nr(domain::DEVICE, op::WRITE); // 0x53
 pub const SYS_DRIVER_UNREGISTER: u32 = nr(domain::DEVICE, op::DELETE); // 0x54
+/// 消费下一条硬件拓扑事件（P2-2，DEVICE 域 op::EVENT=0x07 → 0x57）。
+pub const SYS_DRIVER_EVENT_NEXT: u32 = nr(domain::DEVICE, op::EVENT); // 0x57
 
 // ---------- 6. VOLUME Domain (0x60, ADR-030) ----------
 pub const SYS_VOLUME_MOUNT: u32 = nr(domain::VOLUME, op::CREATE); // 0x61
@@ -1550,11 +1555,81 @@ fn sys_driver_query(frame: &mut SyscallFrame) -> u64 {
     pack_ok(n as u64)
 }
 
-/// `driver_unregister(slot) -> 0` (ADR-014 0x54)
+/// `driver_event_next(buf_ptr, cap) -> len`（P2-2，DEVICE 域 0x57）。
 ///
-/// 注销驱动（DELETE）：以 `uio_id` 释放注册槽位并解绑其设备。与 claim 同源
-/// 授权——调用者必须就是注册者本人（他人 id 报 `PermissionDenied`，不存在的
-/// id 报 `NotFound`）。
+/// 消费**下一条**硬件拓扑事件（`driver::event::DeviceEvent`：DeviceArrived /
+/// DeviceDeparted），序列化为 JSON 写入用户缓冲，返回写出长度；无待消费事件
+/// 时返回 `0`（空）。供用户态 `volumed` 订阅内核块设备事件（ADR-030 §决策3
+/// 事件通道；`driver::event` 环形日志是唯一事实源，本 syscall 是它的用户态出口）。
+///
+/// **S09 诚实**：无事件返回 0（空），绝不编造事件；事件种类/设备名都来自
+/// `DeviceInfo` 真实描述符。错误码口径：`cap` 超过内部上限（512）→
+/// [`Error::InvalidParam`]；**事件 JSON 长度超过 `cap` → [`Error::NoSpace`]，
+/// 事件不被消费**（[`driver::event::peek_event`] 先量测再 pop，避免缓冲不足时
+/// 事件永久丢失，S18）。与 `sys_driver_query` 的 `n>cap→InvalidParam` 口径
+/// 不同：本处事件是"一次性的"，丢不得，故用 `NoSpace` 且不消费。
+///
+/// **单消费者前提**：peek（量测）+ pop（消费）是两次独立锁临界区，非原子对。
+/// 跨调用者并发（两个进程同时调用本 syscall）存在 TOCTOU 错配面（A 按 X 序列化、
+/// 却消费 B 已取走的 Y）。当前唯一消费者是 `volumed`（单进程单线程顺序排空），
+/// 错配不可达；引入第二消费者须把 peek+pop 并入同一临界区（见 driver::event 头注释）。
+fn sys_driver_event_next(frame: &mut SyscallFrame) -> u64 {
+    const MAX_EVENT_BYTES: usize = 512;
+    let out_ptr = frame.a1;
+    let cap = frame.a2 as usize;
+    if cap > MAX_EVENT_BYTES {
+        return pack_err(Error::InvalidParam);
+    }
+    // 先窥视不消费：量测 JSON 长度，cap 不足时事件留在队列（调用方加大缓冲
+    // 重试仍能取回）——绝不"先消费再因装不下而丢弃"（S18 事件不丢失）。
+    let Some(event) = driver::event::peek_event() else {
+        // 无待消费事件：返回 0（空），调用方应稍后重试（当前无 futex 等待原语，
+        // volumed 以有界休眠轮询——honest，见 volumed 源码注释）。
+        return pack_ok(0);
+    };
+    let mut target = klib::json::VecTarget::new();
+    let mut writer = klib::json::JsonWriter::new(&mut target);
+    // DeviceInfo → JSON：kind/name/volatile 是 volumed 做挂载决策所需的全部。
+    let (event_type, info) = match event {
+        driver::event::DeviceEvent::DeviceArrived(info) => ("arrived", info),
+        driver::event::DeviceEvent::DeviceDeparted(info) => ("departed", info),
+    };
+    let kind = match info.kind {
+        driver::DeviceKind::Char => "char",
+        driver::DeviceKind::Block => "block",
+        driver::DeviceKind::Net => "net",
+        driver::DeviceKind::Display => "display",
+        driver::DeviceKind::Misc => "misc",
+    };
+    writer
+        .start_object()
+        .and_then(|mut o| {
+            o.field_str("event", event_type)?;
+            o.field_str("kind", kind)?;
+            o.field_str("name", info.name)?;
+            o.field_bool("volatile", info.volatile)?;
+            o.end()
+        })
+        .expect("Vec-backed event JSON cannot fail");
+    let bytes = target.as_bytes();
+    let n = bytes.len();
+    if n == 0 || n > cap {
+        // cap 不足：事件未被消费（仅 peek），返回 NoSpace，调用方可加大缓冲重试。
+        return pack_err(Error::NoSpace);
+    }
+    // 用户指针校验在 pop 之前（R2）：调用方传非法指针时事件不被消费，重试仍可
+    // 取回——契约内（volumed 传合法缓冲）不触发，但坏指针调用方不吞事件。
+    if let Err(e) = validate_user_range(out_ptr, n as u64, UserAccess::Write) {
+        return pack_err(e);
+    }
+    // 缓冲与指针都合法：现在才消费（peek 保证 pop 必成功）。
+    let _ = driver::event::pop_event();
+    unsafe {
+        arch_x86_64::mmio::copy_to_user(out_ptr, bytes.as_ptr(), n);
+    }
+    pack_ok(n as u64)
+}
+
 fn sys_driver_unregister(frame: &mut SyscallFrame) -> u64 {
     let uio_id = frame.a1 as usize;
     let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
@@ -1577,13 +1652,20 @@ fn sys_driver_unregister(frame: &mut SyscallFrame) -> u64 {
 
 // ---------- VOLUME Domain (0x60, ADR-030) ----------
 
-/// `volume_mount(dev_name_ptr) -> 0`（M4.2，0x61）。
+/// `volume_mount(dev_name_ptr, out_path_ptr, out_cap) -> len`（M4.2，0x61）。
 ///
 /// 按块设备名把其首分区的 EXT2 挂载到 `/volumes/{label}`（复用 M1.2 链路），
-/// 卷标命名/冲突消解由 [`MountTable::mount_volume`] 承担。成功返回 0；
-/// 失败如实上抛（NotFound/Corrupt/NotSupported/ReadOnly），绝不伪挂成功。
+/// 卷标命名/冲突消解由 [`MountTable::mount_volume`] 承担。成功后把**真实挂载
+/// 路径**（含同名自增消解后缀，如 `/volumes/X-2`）写入 `out_path_ptr`，返回其
+/// 字节长度。失败如实上抛（NotFound/Corrupt/NotSupported/ReadOnly），绝不伪挂
+/// 成功。路径长度超内部上限（255）→ `OutOfRange`；超 `out_cap` → `NoSpace`。
 fn sys_volume_mount(frame: &mut SyscallFrame) -> u64 {
+    // 路径上限 255：保证回传路径（含最长卷标后缀）落在 libsys 的 256 字节
+    // 缓冲内且留出终结判断余量，与 libsys `n >= 256` 拒绝口径一致（V4）。
+    const MAX_MOUNT_PATH_BYTES: usize = 255;
     let dev_name_ptr = frame.a1;
+    let out_path_ptr = frame.a2;
+    let out_cap = frame.a3 as usize;
     let dev_name = match copy_path_from_user(dev_name_ptr, MAX_USER_PATH_BYTES) {
         Ok(n) => n,
         Err(e) => return pack_err(e),
@@ -1594,7 +1676,22 @@ fn sys_volume_mount(frame: &mut SyscallFrame) -> u64 {
     match crate::vfs_init::mount_device_volume(&dev_name) {
         Ok(final_path) => {
             klib::info!("[volume] mounted '{}' at {}", dev_name, final_path);
-            pack_ok(0)
+            // 回传**真实挂载路径**（含同名自增消解后缀，如 -2）：调用方据此
+            // 精确掌握本次挂载目标，无需从 volume_list 反查（S06 真实链路）。
+            let bytes = final_path.as_bytes();
+            if bytes.len() >= MAX_MOUNT_PATH_BYTES {
+                return pack_err(Error::OutOfRange);
+            }
+            if bytes.len() > out_cap {
+                return pack_err(Error::NoSpace);
+            }
+            if let Err(e) = validate_user_range(out_path_ptr, bytes.len() as u64, UserAccess::Write) {
+                return pack_err(e);
+            }
+            unsafe {
+                arch_x86_64::mmio::copy_to_user(out_path_ptr, bytes.as_ptr(), bytes.len());
+            }
+            pack_ok(bytes.len() as u64)
         }
         Err(e) => {
             klib::info!("[volume] mount '{}' failed: {:?}", dev_name, e);
@@ -1702,6 +1799,8 @@ fn sys_volume_unmount(frame: &mut SyscallFrame) -> u64 {
     let root = crate::vfs_init::root();
     match root.unmount(&path) {
         Ok(()) => {
+            // 反向注销设备登记（V5）：该设备可被再次挂载（热插拔往返/手动重挂）。
+            crate::vfs_init::unmark_device_by_path(&path);
             klib::info!("[volume] unmounted {}", path);
             pack_ok(0)
         }
@@ -1766,6 +1865,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_DRIVER_QUERY => done(sys_driver_query(frame)),
         SYS_DRIVER_CLAIM => done(sys_driver_claim(frame)),
         SYS_DRIVER_UNREGISTER => done(sys_driver_unregister(frame)),
+        SYS_DRIVER_EVENT_NEXT => done(sys_driver_event_next(frame)),
 
         // VOLUME Domain (0x60, ADR-030)
         SYS_VOLUME_MOUNT => done(sys_volume_mount(frame)),

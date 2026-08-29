@@ -6,6 +6,14 @@
 //! `DeviceError`/`PowerStateChanged` 变体零发布点、且持 `SpinMutex` 分发
 //! 回调存在重入自旋死锁面而被整体裁剪；出现第一个真实订阅者时按新设计
 //! 重建（先成文锁序再编码），不在返工轮伪造中间态。
+//!
+//! **单消费者前提**：本环是 FIFO，且 [`peek_event`]/[`pop_event`] 作为"先
+//! 量测再消费"的一对操作**不是原子**（peek 与 pop 分别持锁、两次独立的临界
+//! 区）。跨调用者并发下会出现 TOCTOU：进程 A peek 到 X、进程 B 也 peek 到 X，
+//! 随后 A pop 拿 X、B pop 拿 Y——A 会把按 X 序列化的字节与"消费 Y"错配。当前
+//! 唯一消费者是用户态 `volumed`（单进程单线程，顺序排空），故该错配不可达。
+//! 若将来引入第二个并发消费者，须把"peek 量测 + pop 消费"纳入同一个
+//! `Mutex` 临界区（或提供带回调的原子取件），先成文锁序再编码。
 
 use crate::device::DeviceInfo;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -87,6 +95,22 @@ pub fn publish_event(event: DeviceEvent) {
 /// 消费/读取最旧的一个硬件拓扑事件。
 pub fn pop_event() -> Option<DeviceEvent> {
     EVENT_QUEUE.lock().pop()
+}
+
+/// 窥视最旧的一个硬件拓扑事件（**不消费**），返回其**按值拷贝**。
+///
+/// `DeviceEvent` 为 `Copy`（`DeviceInfo` 全原始字段 + `&'static str`），返回
+/// 独立拷贝不持有环内引用，完全无野指针/借用面——消费方先据拷贝量测/序列化，
+/// 再决定是否 `pop_event`，避免"先消费再因缓冲不足而丢弃"的事件丢失面
+/// （`sys_driver_event_next` 的 S18 健壮性：cap 不足时不丢事件，重试可再取）。
+/// 锁仅在拷贝期间持有，返回即释放。
+pub fn peek_event() -> Option<DeviceEvent> {
+    let q = EVENT_QUEUE.lock();
+    if q.count == 0 {
+        return None;
+    }
+    // DeviceEvent: Copy —— `q.events[q.tail]` 为 `Option<DeviceEvent>`，整体拷贝即出。
+    q.events[q.tail]
 }
 
 /// 返回当前未消费的事件数量。

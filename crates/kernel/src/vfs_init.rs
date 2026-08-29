@@ -14,6 +14,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use arch::Platform;
 use core::sync::atomic::{AtomicBool, Ordering};
+use spin::Mutex;
 use spin::Once;
 
 use vfs::devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
@@ -24,6 +25,38 @@ use vfs::ramfs::RamFS;
 use vfs::sysfs::{SysFS, SystemInfoProvider};
 
 static VFS_ROOT: Once<Arc<MountTable>> = Once::new();
+
+/// 已挂载块设备登记：设备名 → 挂载路径（`try_mount_ext2_volumes` 启动期静态
+/// 挂载与 `mount_device_volume` 设备挂载成功时登记，两处同源）。
+///
+/// 用途：
+/// - **幂等（V5/R1）**：`mount_device_volume` 对**同一设备**重复调用返回
+///   `AlreadyExists`（按设备名判定，`/volumes/{label}` 被占用不构成拒绝），
+///   而非经 `mount_volume` 同名自增消解再挂到 `/volumes/{label}-2` 产生幽灵
+///   重复卷。**不同设备同名卷仍走 `mount_volume` 的 -N 冲突消解**（挂到
+///   `-2`）——本登记只按设备区分，注释语义与实现一致，不依赖脆弱的 `-N`
+///   后缀启发式判断。
+/// - **卸载反向**：`sys_volume_unmount` 据路径找回设备并注销登记，使设备可被
+///   再次挂载（热插拔往返）。
+///
+/// **并发诚实**：本登记在启动期（单线程）与用户态 syscall 路径填充。每个
+/// `lock()` 临界区（查询/登记/注销）自身都是原子的短操作、无嵌套锁序、无
+/// 死锁面；但"查询未挂→挂载→登记"并非整体原子（两进程并发 `mount_device_volume`
+/// 同一新设备可能都通过 `is_device_mounted` 检查而重复挂载）。此竞态在**当前
+/// 唯一调用方 volumed 顺序驱动**下不可达（对账与事件循环单进程单线程）；若将来
+/// 引入第二个并发挂载者，需在 `mount_device_volume` 内把"判幂等+挂载+登记"纳入
+/// 同一把锁或引入 per-device 状态机，先成文锁序再编码。
+static MOUNTED_DEVICES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// 查询某块设备是否已挂载（`MOUNTED_DEVICES` 登记过）。
+pub fn is_device_mounted(name: &str) -> bool {
+    MOUNTED_DEVICES.lock().iter().any(|(d, _)| d == name)
+}
+
+/// 按挂载路径注销设备登记（`sys_volume_unmount` 调用），使设备可再次挂载。
+pub fn unmark_device_by_path(path: &str) {
+    MOUNTED_DEVICES.lock().retain(|(_, p)| p != path);
+}
 
 /// 获取全局 VFS 挂载表。
 pub fn root() -> &'static Arc<MountTable> {
@@ -1102,6 +1135,9 @@ fn try_mount_ext2_volumes(
                     part.start_lba,
                     final_path
                 );
+                // 登记设备→挂载路径（与 mount_device_volume 同源），使后续
+                // volumed 对同一设备幂等跳过、对"不同设备同名卷"走 -N 消解。
+                MOUNTED_DEVICES.lock().push((String::from(name), final_path));
                 any_mounted = true;
             }
             // mount 点被占等全局性失败与设备无关，记录后继续考察下一候选。
@@ -1125,6 +1161,14 @@ fn try_mount_ext2_volumes(
 /// 找不到设备 → `NotFound`；MBR 缺失/损坏 → `Corrupt`；非 EXT2 → `NotSupported`；
 /// 卷标命名冲突由 `mount_volume` 自增消解并返回最终路径。
 pub fn mount_device_volume(name: &str) -> Result<String, klib::error::Error> {
+    // 同一设备幂等（V5/R1）：若该设备已挂载（`MOUNTED_DEVICES` 登记，含启动期
+    // 静态挂载与先前 volumed 挂载），返回 AlreadyExists。**只按设备名判定**——
+    // 不因 `/volumes/{label}` 被占用而拒绝，故"不同设备同名卷"仍能经
+    // `mount_volume` 的 -N 自增消解挂到 /volumes/{label}-2（注释语义真实兑现，
+    // 不做注释声称之外的过度拒绝）。
+    if is_device_mounted(name) {
+        return Err(klib::error::Error::AlreadyExists);
+    }
     let count = driver::DriverHub::device_count();
     for i in 0..count {
         let Some(info) = driver::DriverHub::device_info_at(i) else {
@@ -1167,6 +1211,12 @@ pub fn mount_device_volume(name: &str) -> Result<String, klib::error::Error> {
                 }
             }
         };
+        // 挂载成功才登记（设备名 → 真实路径），卸载据路径反向注销。
+        if let Ok(final_path) = &result {
+            MOUNTED_DEVICES
+                .lock()
+                .push((String::from(name), final_path.clone()));
+        }
         return result;
     }
     Err(klib::error::Error::NotFound)
