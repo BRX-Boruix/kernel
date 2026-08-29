@@ -3505,7 +3505,8 @@ pub fn test_syscall_seq_large_io() {
 /// 2. 源不存在 → NotFound。
 /// 3. 目标已存在 → AlreadyExists（绝不静默覆盖）。
 /// 4. 跨目录 → NotSupported（宁缺毋假）。
-/// 5. 相对路径（M1）→ InvalidParam；flags 非 0 → InvalidParam。
+/// 5. 相对路径相对进程 cwd 解析（cwd=/ 时跨目录 → NotSupported）；flags 非 0 →
+///    InvalidParam。
 pub fn test_syscall_entry_update() {
     use alloc::boxed::Box;
     use arch::syscall::SyscallFrame;
@@ -3653,13 +3654,17 @@ pub fn test_syscall_entry_update() {
         "cross-directory move must be NotSupported (honest absence)"
     );
 
-    // 5a. 相对路径 → InvalidParam（M1）。
+    // 5a. 相对源路径：相对进程 cwd 解析（absolute_path 统一拼 cwd，非
+    // InvalidParam——cwd 机制后相对路径不再被拒绝）。本测试进程 cwd 恒为 `/`，
+    // 故相对源 `relative.txt` 解析为 `/relative.txt`（父目录 `/`），与目标
+    // `/scratch/...` 不同目录 → 跨目录 NotSupported（与 4 同分支，诚实不做
+    // 跨目录移动）。此断言验证"相对路径走 cwd 解析"而非旧 InvalidParam 语义。
     let mut rel = frame(crate::syscall::SYS_ENTRY_UPDATE, rel_ptr, new_ptr, 0);
     assert!(crate::syscall::syscall_entry(&mut rel));
     assert_eq!(
         rel.result,
-        (-(klib::error::Error::InvalidParam.to_errno() as i64)) as u64,
-        "relative source path must be InvalidParam"
+        (-(klib::error::Error::NotSupported.to_errno() as i64)) as u64,
+        "relative source resolves against cwd (cwd=/) then crosses dirs → NotSupported"
     );
     // 5b. flags 非 0 → InvalidParam（未实现扩展不静默忽略）。
     let mut fl = frame(crate::syscall::SYS_ENTRY_UPDATE, new_ptr, buf + 0x40, 0x1);
