@@ -6350,25 +6350,64 @@ pub fn test_loader_adversarial() {
         "segment beyond user half",
     );
 
-    // -- 4b. 物理帧池真耗尽（L3/S31 资源耗尽轴）：合法但巨大的段把自检
-    // 环境的可用帧抽干，必须优雅收敛为 OutOfMemory（绝不 panic / alloc
-    // abort）；错误返回后 Vec Drop 全额归还已分配帧——后续用例正常分配
-    // 即回收正确性的内建证明。需求量取 120MiB ≥ 可用池上界（QEMU -m 128M
-    // 扣除内核/页表占用），保证必然触底。--
+    // -- 4b-1. 单段超用户区配额（S31 确定性轴）：合法但巨大的段（120MiB）
+    // > MAX_USER_AREA_TOTAL_BYTES(64MiB)。loader 现在**先**过配额预检再
+    // 分配物理帧——此拒绝码为 NoSpace，且与机器物理内存多寡无关。历史
+    // 缺陷：配额校验只在 map_user 内、位于 collect_frames 之后，超大段先
+    // 抽帧后撞配额，拒绝码随 -m 漂移（-m 小 → 池耗尽 OutOfMemory；-m 大
+    // → 配额 NoSpace），同一请求结果不确定。此处断言确定性契约：恒为
+    // NoSpace。--
     {
-        const EXHAUST_DEMAND_BYTES: u64 = 120 * 1024 * 1024;
+        const OVER_QUOTA_BYTES: u64 = 120 * 1024 * 1024;
         let spec = LoaderElfSpec {
             p_vaddr: 0x1000, // 页对齐低位起点（校验面：合法但巨大）
             p_filesz: 0x10,
-            p_memsz: EXHAUST_DEMAND_BYTES,
+            p_memsz: OVER_QUOTA_BYTES,
             ..LoaderElfSpec::BASE
         };
         expect_loader_reject(
             &build_loader_elf(&spec),
             &[],
-            Error::OutOfMemory,
-            "physical frame pool exhausted",
+            Error::NoSpace,
+            "single segment over per-address-space quota",
         );
+    }
+
+    // -- 4b-2. 物理帧池真耗尽（L3/S31 资源耗尽轴的**防御回退**）：collect_frames
+    // 在帧池见底时返回 OutOfMemory（绝不 panic / alloc abort），错误返回后
+    // Vec Drop 全额归还已分配帧。本路径天然依赖物理内存多寡——只有当可用
+    // 帧数不足 64MiB 配额时，才可能在配额预检放行后把池抽干；池更大时该
+    // 路径不可达（配额 NoSpace 先拦截）。故按运行时可用帧数计算需求量：
+    // 需求量 = (free_frames + 1) 页（逼最后一帧分配失败），且须 < 64MiB
+    // 配额。满足则断言 OutOfMemory；否则记录跳过（-m 过大，池无法在配额
+    // 内耗尽，属预期而非失败）。--
+    {
+        use mm::frame_allocator::total_frames;
+        const PAGE: u64 = 4096;
+        const QUOTA_BYTES: u64 = 64 * 1024 * 1024;
+        let free_frames = total_frames()
+            .saturating_sub(mm::frame_stats().allocated_frames);
+        let demand_bytes = (free_frames as u64 + 1).saturating_mul(PAGE);
+        if demand_bytes < QUOTA_BYTES {
+            let spec = LoaderElfSpec {
+                p_vaddr: 0x1000,
+                p_filesz: 0x10,
+                p_memsz: demand_bytes,
+                ..LoaderElfSpec::BASE
+            };
+            expect_loader_reject(
+                &build_loader_elf(&spec),
+                &[],
+                Error::OutOfMemory,
+                "physical frame pool exhausted within quota",
+            );
+        } else {
+            klib::info!(
+                "[test-loader] pool-exhaustion path skipped: free pool {:#x}B >= quota {:#x}B (unreachable within quota)",
+                (free_frames as u64) * PAGE,
+                QUOTA_BYTES
+            );
+        }
     }
 
     // -- 4c. 无任何可装载段（LD2/ENOEXEC）：头与表全部合法但没有 PT_LOAD，

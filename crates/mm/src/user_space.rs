@@ -953,7 +953,12 @@ where
     /// 占用量 = areas 区间长度和 + shm_maps 区间长度和（共享内存同样占用
     /// 本地址空间的页表页与 OOM 承诺）。锁序：areas → shm_maps，与 brk 的
     /// heap_clashes 检查一致（S21）。
-    fn check_area_quota(&self, extra: u64) -> Result<(), PT::Error> {
+    ///
+    /// `pub`：loader 在 `collect_frames`（物理帧分配）**之前**调用本方法做
+    /// 配额预检——超配额段必须在此处以 NoSpace 确定性拒绝，绝不能先分配
+    /// 物理帧再于 map_user 里拒（否则拒绝码随物理内存多寡漂移，见
+    /// docs/adr/032 同期修复；S31 确定性轴）。
+    pub fn check_area_quota(&self, extra: u64) -> Result<(), PT::Error> {
         let used = {
             let areas = self.areas.lock();
             let shms = self.shm_maps.lock();

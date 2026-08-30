@@ -691,6 +691,14 @@ mod backend {
         // 的整批帧泄漏窗口（audit-r2 四步自查补漏）。
         let off = hhdm_offset()?;
 
+        // S31 确定性轴：超配额段必须在**分配物理帧**之前以 NoSpace 确定性
+        // 拒绝。历史缺陷：配额校验只在 map_user 内、位于 collect_frames
+        // 之后——超大段先抽帧、后撞配额，拒绝码随物理内存多寡漂移
+        // （-m 小 → 池耗尽 OutOfMemory，-m 大 → 配额 NoSpace），同一请求
+        // 结果不确定。此处前置校验使拒绝与 RAM 无关。与 map_user 内
+        // check_area_quota(e-s) 用同一字节口径，故结果一致。
+        addr_space.check_area_quota(plan.vaddr_end - plan.vaddr_start)?;
+
         let frames = collect_frames(plan.npages)?;
 
         for i in 0..plan.npages {
