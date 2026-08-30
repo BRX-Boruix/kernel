@@ -294,15 +294,19 @@ impl DriverHub {
         false
     }
 
-    /// 对指定块设备做一次**缓存穿透探测读**（绕过 VFS 页缓存），触发其底层
-    /// IO 驱动真实访问设备。若设备已消失（总线无响应/后端移除），驱动在
-    /// `read_at` 内部经 `is_device_gone` + `notify_device_gone` 主动发布
-    /// `DeviceDeparted`（ADR-030 热插拔闭环）。用于 `volumed` 低频对账：对
-    /// 已挂卷做探测，把"拔除但无事件"的空闲卷兜底发现出来——比高频周期
-    /// 对账更低频、且只触达真实设备，不扫缓存。
+    /// 对指定块设备做一次**轻量存活探测**（经 `IoDevice::probe_alive`，非阻塞、
+    /// 只读状态不触发完整 I/O）。设备已消失时，驱动在 `probe_alive` 内部经
+    /// `is_device_gone` + `notify_device_gone` 主动发布 `DeviceDeparted`
+    /// （ADR-030 热插拔闭环）。用于 `volumed` 低频对账：对已挂卷做探测，把
+    /// "拔除但无事件"的空闲卷兜底发现出来。
+    ///
+    /// **轻量性关键**：不使用 `read_at`（其同步 PIO 忙等最多轮询 20 万次
+    /// `inb`，QEMU 下每次是一次 VM-exit，长时间内核态自旋会阻塞调度与键盘
+    /// IRQ——本会话实测对账时输入积压）。`probe_alive` 只读几次 status，代价
+    /// 可忽略，专供对账/心跳等低频存活性检查。
     pub fn probe_io_device(name: &str) -> ProbeStatus {
         let dev_count = DEVICE_COUNT.load(Acquire);
-        // 拿设备实例做探测读（保持短临界区：只读快照，IO 在锁外执行）。
+        // 拿设备实例做探测（保持短临界区：只读快照，探测在锁外执行）。
         let dev = {
             let devices = DEVICES.lock();
             let mut found: Option<&'static dyn Device> = None;
@@ -324,14 +328,19 @@ impl DriverHub {
             // 非 IO 设备（如显示/网络纯元数据）：不探测。
             return ProbeStatus::NotIo;
         };
-        // 512B 探测读。真实 ATA 盘在拔除后 read_at 返回 0 且内部已触发
-        // notify_device_gone → DeviceDeparted；RAM 回退盘返回成功（volatile）。
-        let mut buf = [0u8; 512];
-        let n = io.read_at(0, &mut buf);
-        if n > 0 {
-            ProbeStatus::Alive
-        } else {
-            ProbeStatus::Gone
+        // 轻量存活探测：设备支持 probe_alive 则用之；否则回退到一次 read_at
+        // （仅当设备无 probe 能力，如非块 IO 设备，此时 read_at 也快）。
+        match io.probe_alive() {
+            Some(true) => ProbeStatus::Alive,
+            Some(false) => ProbeStatus::Gone,
+            None => {
+                let mut buf = [0u8; 512];
+                if io.read_at(0, &mut buf) > 0 {
+                    ProbeStatus::Alive
+                } else {
+                    ProbeStatus::Gone
+                }
+            }
         }
     }
 

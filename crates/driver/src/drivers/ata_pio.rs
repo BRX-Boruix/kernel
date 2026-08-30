@@ -455,6 +455,24 @@ impl IoDevice for AtaPioDevice {
     fn io_stats(&self) -> Option<&IoStats> {
         Some(&self.stats)
     }
+
+    fn probe_alive(&self) -> Option<bool> {
+        // 轻量存活探测：**只读 status 寄存器判定设备在不在，不触发完整 PIO 读**
+        // （不发 read 命令、不忙等数据相位）。`is_device_gone` 只读 3 次 status，
+        // 代价可忽略——与 `read_at` 的 20 万次 inb 忙等相比，对账/心跳用本方法
+        // 不会阻塞调度与键盘 IRQ（本会话实测：read_at 探测导致输入积压）。
+        // 已消失的设备在此触发拔除（unregister + DeviceDeparted），供 volumed 卸载。
+        let is_hw = *self.is_hardware.lock();
+        if !is_hw {
+            // RAM 回退盘恒在（内存介质，无总线可拔）。
+            return Some(true);
+        }
+        if is_device_gone(self.channel) {
+            notify_device_gone(self);
+            return Some(false);
+        }
+        Some(true)
+    }
 }
 
 impl BlockDevice for AtaPioDevice {

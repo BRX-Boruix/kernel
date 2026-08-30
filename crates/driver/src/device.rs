@@ -101,6 +101,20 @@ pub trait IoDevice: Send + Sync {
     fn io_stats(&self) -> Option<&IoStats> {
         None
     }
+    /// **轻量存活探测**：非阻塞检查设备是否仍在线/可服务。
+    ///
+    /// 返回 `Some(alive)` 表示设备支持无阻塞存活探测（`alive=true` 可服务、
+    /// `false` 已消失/不可用）；`None` 表示无探测能力（调用方应回退到其它手段）。
+    ///
+    /// **为什么需要轻量探测**：`read_at` 对块设备走同步 PIO 忙等（QEMU 下每次
+    /// `inb` 是一次 VM-exit，`wait_not_busy`/`wait_drq` 各轮询最多 20 万次），
+    /// 在内核态长时间自旋会阻塞调度与中断处理——volumed 周期对账用它探测已挂卷
+    /// 时，用户敲键的 IRQ1 中断被延迟、输入积压（本会话实测复现）。本方法只做
+    /// 极轻量的状态读取（如 ATA status 寄存器），不触发完整数据相位，代价可忽略，
+    /// 专供对账/心跳等低频存活性检查使用。
+    fn probe_alive(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// 字符设备（如串口、终端、控制台）。
