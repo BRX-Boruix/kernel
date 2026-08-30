@@ -547,6 +547,84 @@ fn extract_from_ready(s: &mut Scheduler, target: usize) -> Option<usize> {
     None
 }
 
+/// [`schedule_from_block`] 的切走结果（K1-1，ADR-031 决策-改造要点 1 的
+/// frame-based 落地）。两分支都表示 `frame` 已被改写为下一进程的保存帧，
+/// 调用方必须以 `Switched` 纪律收尾（不再触碰 frame）；差异仅在于等待者登记
+/// （KBD_WAITER / EVENT_WAITER）是否需要在切回后清理。
+enum BlockResume {
+    /// 切到**另一个**就绪进程（cur_pid 保持 Blocked + 等待者登记不变）。等待者
+    /// 尚未被唤醒，登记必须保留（否则后续事件/键盘到达时无人唤醒它）。
+    SwitchedOther,
+    /// 切回**自己**（cur_pid 已被唤醒入队）。调用方须在切回后清理自己的等待者
+    /// 登记（与既有自唤醒路径的 CAS 清理同构）。
+    SwitchedSelf,
+}
+
+/// (K1-1, ADR-031) 阻塞等待者的 idle-halt None 分支统一切换原语。
+///
+/// `block_for_kbd` / `block_for_event` 的"无就绪进程可切"分支（`pop_ready` 返回
+/// None）不再"halt 只等自己"（旧实现仅检查 `ready.contains(&cur_pid)`），而是：
+/// **当就绪队列出现任一进程（自己或其它）时，用 frame-based 切换让出 CPU**——
+/// 与既有 `Some(next)` 分支完全同构（`cpu_switch_locked(None, next)` + iret），
+/// 自己保持 Blocked + 等待者登记。只有就绪队列确实为空才 `halt`（此时无任何
+/// 可调度进程，halt 合理，绝无忙转）。
+///
+/// 设计依据（PRE-1 现场交接矩阵 + 本会话对 ADR-031 的实核修正）：
+/// BORUIX 进程恢复走**用户态中断帧 + iret** 模型——进程在用户态被切走时只保存
+/// `slot.saved`（用户 `InterruptFrame`），`Process.context`（`TaskContext`）在
+/// 生产路径恒为空（`process.rs` `TaskContext::empty()`），`arch::task::switch_to`
+/// 当前仅内核自测使用。因此 ADR-031 原拟的 `switch_to` 版 `schedule_from_block`
+/// （切到**用户态就绪进程**的内核 `TaskContext`）会跳到空上下文崩溃，与现有
+/// frame-resume 模型不兼容；正确实现是复用 frame-based `cpu_switch_locked`，
+/// 保证与 tick/yield/block_current/exit_current 的既有切换机制完全一致、可回滚。
+///
+/// 上下文约定：调用方须已 `drop` SCHED 锁并处于中断**已使能**态（None 分支
+/// 进入前的现场）。本函数自行管理 SCHED 锁获取/释放与 `enable`/`disable`/`halt`
+/// 的节奏，返回时中断处于**已禁用**态（与既有 None 分支的返回现场一致，供
+/// 调用方在 syscall 层 iret 前保持）。
+///
+/// `prev=None` 纪律：cur_pid 是等待者，其浮点现场已在置 Blocked 前由调用方显式
+/// `fpu::save`（PRE-1），切走时 `cpu_switch_locked(None, _)` 不重复归档。
+fn schedule_from_block(frame: &mut InterruptFrame, cur_pid: usize) -> BlockResume {
+    // 等就绪队列出现任一进程（自己或其它）。每次 halt 直到中断到达（绝不忙转）。
+    arch_x86_64::interrupts::enable();
+    loop {
+        let s = SCHED.lock();
+        let nonempty = !s.ready.is_empty();
+        drop(s);
+        if nonempty {
+            break;
+        }
+        arch_x86_64::interrupts::halt();
+    }
+    arch_x86_64::interrupts::disable();
+    let mut s = SCHED.lock();
+    if s.ready.contains(&cur_pid) {
+        // 自己已就绪（被键盘/事件唤醒入队）：专门取出自己，放回其它就绪进程。
+        // 队列头可能被并发入队的其它 Ready 进程占据，extract_from_ready 保证
+        // 只取 cur_pid 而不误切（O1 竞争面，既有自唤醒纪律）。
+        let next = extract_from_ready(&mut s, cur_pid).expect("woken waiter in ready");
+        let slot = s.procs[next].as_mut().expect("woken proc exists");
+        slot.proc.set_state(TaskState::Running);
+        *frame = slot.saved;
+        cpu_switch_locked(&mut s, None, next);
+        drop(s);
+        BlockResume::SwitchedSelf
+    } else {
+        // 就绪队列非空但自己不在其中：是**另一个**就绪进程（如被 tick/超时/事件
+        // 并发唤醒的其它等待者）。切到它，自己保持 Blocked + 等待者登记不变。
+        // 既然队列非空且不含 cur_pid，必存在有效 Ready 项（wake_kbd/wake_event
+        // 只入队有效进程）；pop_ready 返回的即是队头有效进程。
+        let next = pop_ready(&mut s, usize::MAX).expect("ready non-empty");
+        let slot = s.procs[next].as_mut().expect("ready proc exists");
+        slot.proc.set_state(TaskState::Running);
+        *frame = slot.saved;
+        cpu_switch_locked(&mut s, None, next);
+        drop(s);
+        BlockResume::SwitchedOther
+    }
+}
+
 /// 阻塞当前进程（IPC 等待用）：保存帧并置 `Blocked`，切换到下一个就绪进程。
 ///
 /// 与 [`yield_now`] 不同，当前进程**不**放回就绪队列，而是置 `Blocked`（等待某
@@ -708,57 +786,32 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
         }
         None => {
             drop(s);
-            // 无就绪进程：idle halt 等键盘中断唤醒（先释放锁再 halt，使中断可达）。
-            //
-            // 方案 B（与 block_for_event 的 None 分支完全同构）：idle-halt 的
-            // 唤醒者**未必是键盘等待者**。volumed 的周期对账 / init 被 tick 或
-            // 事件唤醒时，ready 队列会非空，但被唤醒的未必是**本键盘等待者
-            // cur_pid**（队列里可能有并发入队的其它进程）。若只在"队列非空"
-            // 时弹任意队头，可能切到非键盘等待者；本路径只切回键盘等待者自身。
-            // 故改为**等待本键盘等待者 cur_pid 就绪**并专门取出它，而非弹任意队头。
+            // 无就绪进程可切（`pop_ready` 空）：不再"halt 只等自己"，改用
+            // `schedule_from_block`——当就绪队列出现**任一**进程（自己或其它）
+            // 时 frame-based 让出 CPU，自己保持 Blocked + KBD_WAITER 登记；
+            // 只有就绪队列确实为空才 halt（ADR-031，PRE-1 交接矩阵）。
             //
             // 审计 B17 单核不变式（S21 显式化）：本路径假设**全系统只有本核
-            // 执行调度决策**——KBD_WAITER 唯一等待者 + "就绪队列里只会有本
-            // cur_pid 这一个键盘等待者"都依赖没有第二个 CPU 同时在调度。当前
-            // SMP 拓扑下 AP 不进入本函数（调度仅 BSP tick/block 路径驱动，
-            // 见 smp.rs AP 入口无 scheduler 接线）；若未来引入 AP 调度，
-            // 本段必须先改造为跨核唤醒协议，否则切错进程 = 永久阻塞。
-            arch_x86_64::interrupts::enable();
-            loop {
-                // 极短持锁检查本键盘等待者是否已被唤醒入队；未就绪则释放锁后
-                // halt（中断可达）。其它进程（volumed/init）被唤醒只会让队列非
-                // 空，但**不会**提前跳出——我们只关心 cur_pid 本身就绪。
-                let s = SCHED.lock();
-                let woke = s.ready.contains(&cur_pid);
-                drop(s);
-                if woke {
-                    break;
+            // 执行调度决策**——KBD_WAITER 唯一等待者 + 调度仅 BSP tick/block
+            // 路径驱动（见 smp.rs AP 入口无 scheduler 接线）；若未来引入 AP
+            // 调度，本段必须先改造为跨核唤醒协议，否则切错进程 = 永久阻塞。
+            match schedule_from_block(frame, cur_pid) {
+                // 切到其它就绪进程：自己仍 Blocked + KBD_WAITER 登记不变。
+                // 不清理登记——键盘尚未到达，后续 wake_kbd 仍需借登记唤醒本进程。
+                BlockResume::SwitchedOther => BlockKbdOutcome::Switched,
+                // 自己被键盘唤醒（wake_kbd 已 swap 取走 KBD_WAITER）：切回自身。
+                // 保留对称的条件清理作为防御——只在 KBD_WAITER 仍指向本 pid 时
+                // 清除，绝不误伤后续可能的新等待者（与 block_for_event 同构）。
+                BlockResume::SwitchedSelf => {
+                    let _ = KBD_WAITER.compare_exchange(
+                        cur_pid as u32,
+                        u32::MAX,
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                    );
+                    BlockKbdOutcome::Switched // frame 已改，由 syscall_entry iret 切换
                 }
-                arch_x86_64::interrupts::halt();
             }
-            arch_x86_64::interrupts::disable();
-            let mut s = SCHED.lock();
-            // 取出特定的本键盘等待者（队列头可能已被其它并发入队的 Ready 进程
-            // 占据；extract_from_ready 弹出队头、非目标放回队尾，直到取到 cur_pid）。
-            let next = extract_from_ready(&mut s, cur_pid).expect("woken keyboard waiter");
-            let slot = s.procs[next].as_mut().expect("woken proc exists");
-            slot.proc.set_state(TaskState::Running);
-            *frame = slot.saved;
-            // prev=None：阻塞等待者的浮点现场已在置 Blocked 前显式保存，
-            // 此处只做切入方恢复（等待者不是被"切出"的运行进程）。
-            cpu_switch_locked(&mut s, None, next);
-            drop(s);
-            // 清理登记（CAS 条件式，与 block_for_event 同构）：键盘唤醒已用
-            // `wake_kbd` 的 swap 取走并重置 KBD_WAITER（本 pid 已不在），此 CAS
-            // 无效；保留对称的条件清理作为防御——只在 KBD_WAITER 仍指向本 pid
-            // 时才清除，绝不误伤后续可能的新等待者。
-            let _ = KBD_WAITER.compare_exchange(
-                cur_pid as u32,
-                u32::MAX,
-                core::sync::atomic::Ordering::AcqRel,
-                core::sync::atomic::Ordering::Acquire,
-            );
-            BlockKbdOutcome::Switched // frame 已改，由 syscall_entry iret 切换
         }
     }
 }
@@ -875,48 +928,43 @@ pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
             SwitchOutcome::Switched
         }
         None => {
-            // 无就绪进程：idle halt 等事件/超时唤醒（先释放锁再 halt，中断可达）。
-            // 与 block_for_kbd 的 None 分支同构（B17 单核不变式）：EVENT_WAITER
-            // 唯一事件等待者，唤醒方（wake_event / wake_event_timeout）只会把本
-            // 进程加入就绪队列，halt 循环检测到后切回。**绝不忙转**：每次 halt 让
-            // CPU 真正停机直到中断到达（V4）。
+            drop(s);
+            // 无就绪进程可切（`pop_ready` 空）：不再"halt 只等自己"，改用
+            // `schedule_from_block`——当就绪队列出现**任一**进程（自己或其它）
+            // 时 frame-based 让出 CPU，自己保持 Blocked + EVENT_WAITER 登记；
+            // 只有就绪队列确实为空才 halt（ADR-031，PRE-1 交接矩阵）。
             //
             // O1 竞争面（低，继承 B17 单核不变式但已消除）：事件路径有**事件 +
             // 定时器两个唤醒源**，且全系统可能并存被键盘中断唤醒的键盘等待者
-            // （都在同一就绪队列）。故不能只在"队列非空"时弹队头——队头可能是
-            // 并发唤醒的其它进程，切错即事件等待者永久挂起。这里改为**等待本
-            // 事件等待者 cur_pid 就绪**并专门取出它，而非弹任意队头。
-            drop(s);
-            arch_x86_64::interrupts::enable();
-            loop {
-                let s = SCHED.lock();
-                let woke = s.ready.contains(&cur_pid);
-                drop(s);
-                if woke {
-                    break;
+            // （都在同一就绪队列）。`schedule_from_block` 在队列非空时经
+            // `extract_from_ready`（自己就绪时）或 `pop_ready`（其它进程就绪时）
+            // 精确切到目标，不会弹错队头切到无关进程。
+            //
+            // 审计 B17 单核不变式（S21 显式化）：调度仅 BSP tick/block 路径驱动
+            // （见 smp.rs AP 入口无 scheduler 接线）；若未来引入 AP 调度，
+            // 本段必须先改造为跨核唤醒协议。
+            match schedule_from_block(frame, cur_pid) {
+                // 切到其它就绪进程：自己仍 Blocked + EVENT_WAITER 登记不变。
+                // **不清理登记**（与 Some 分支同一条纪律）：EVENT_WAITER 的清除
+                // 由唤醒方负责（事件唤醒经 wake_event 的 swap；超时唤醒后由
+                // event_wait_blocking 重新登记前清理残留）。此处若清掉登记，
+                // 后续事件发布时 wake_event 读到 MAX、无法唤醒本进程（ADR-030
+                // 热插拔端到端暴露的教训）。
+                BlockResume::SwitchedOther => SwitchOutcome::Switched,
+                // 自己被事件/超时唤醒入队：切回自身。清理登记：事件唤醒已 swap
+                // 走 EVENT_WAITER（本 pid 不在），CAS 无效；超时唤醒走
+                // wake_event_timeout（EVENT_WAITER 仍指向本 pid），此 CAS 清除之，
+                // 保证后继新等待者不被"占位"拒之门外。
+                BlockResume::SwitchedSelf => {
+                    let _ = EVENT_WAITER.compare_exchange(
+                        cur_pid as u32,
+                        u32::MAX,
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                    );
+                    SwitchOutcome::Switched
                 }
-                arch_x86_64::interrupts::halt();
             }
-            arch_x86_64::interrupts::disable();
-            let mut s = SCHED.lock();
-            // 取出特定的本事件等待者（队列头可能已被键盘/其它唤醒并发入队的
-            // 其它 Ready 进程占据；extract_from_ready 保持它们就绪）。
-            let next = extract_from_ready(&mut s, cur_pid).expect("woken event waiter");
-            let slot = s.procs[next].as_mut().expect("woken proc exists");
-            slot.proc.set_state(TaskState::Running);
-            *frame = slot.saved;
-            cpu_switch_locked(&mut s, None, next);
-            drop(s);
-            // 清理登记：事件唤醒已 swap 走 EVENT_WAITER（本 pid 不在），CAS 无
-            // 效；超时唤醒走 wake_event_timeout（EVENT_WAITER 仍指向本 pid），
-            // 此 CAS 清除之，保证后继新等待者不被"占位"拒之门外。
-            let _ = EVENT_WAITER.compare_exchange(
-                cur_pid as u32,
-                u32::MAX,
-                core::sync::atomic::Ordering::AcqRel,
-                core::sync::atomic::Ordering::Acquire,
-            );
-            SwitchOutcome::Switched
         }
     }
 }
