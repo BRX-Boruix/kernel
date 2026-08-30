@@ -710,40 +710,54 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
             drop(s);
             // 无就绪进程：idle halt 等键盘中断唤醒（先释放锁再 halt，使中断可达）。
             //
+            // 方案 B（与 block_for_event 的 None 分支完全同构）：idle-halt 的
+            // 唤醒者**未必是键盘等待者**。volumed 的周期对账 / init 被 tick 或
+            // 事件唤醒时，ready 队列会非空，但被唤醒的未必是**本键盘等待者
+            // cur_pid**（队列里可能有并发入队的其它进程）。若只在"队列非空"
+            // 时弹任意队头，可能切到非键盘等待者；本路径只切回键盘等待者自身。
+            // 故改为**等待本键盘等待者 cur_pid 就绪**并专门取出它，而非弹任意队头。
+            //
             // 审计 B17 单核不变式（S21 显式化）：本路径假设**全系统只有本核
-            // 执行调度决策**——KBD_WAITER 唯一等待者 + "pop_ready 得到的
-            // next 必是刚被唤醒者"都依赖没有第二个 CPU 同时在 pop。当前
+            // 执行调度决策**——KBD_WAITER 唯一等待者 + "就绪队列里只会有本
+            // cur_pid 这一个键盘等待者"都依赖没有第二个 CPU 同时在调度。当前
             // SMP 拓扑下 AP 不进入本函数（调度仅 BSP tick/block 路径驱动，
             // 见 smp.rs AP 入口无 scheduler 接线）；若未来引入 AP 调度，
             // 本段必须先改造为跨核唤醒协议，否则切错进程 = 永久阻塞。
             arch_x86_64::interrupts::enable();
             loop {
-                // 极短持锁检查是否有进程被唤醒；空则释放锁后 halt（中断可达）。
-                let ready = !SCHED.lock().ready.is_empty();
-                if ready {
+                // 极短持锁检查本键盘等待者是否已被唤醒入队；未就绪则释放锁后
+                // halt（中断可达）。其它进程（volumed/init）被唤醒只会让队列非
+                // 空，但**不会**提前跳出——我们只关心 cur_pid 本身就绪。
+                let s = SCHED.lock();
+                let woke = s.ready.contains(&cur_pid);
+                drop(s);
+                if woke {
                     break;
                 }
                 arch_x86_64::interrupts::halt();
             }
             arch_x86_64::interrupts::disable();
             let mut s = SCHED.lock();
-            let next = pop_ready(&mut s, usize::MAX).expect("woken keyboard waiter");
+            // 取出特定的本键盘等待者（队列头可能已被其它并发入队的 Ready 进程
+            // 占据；extract_from_ready 弹出队头、非目标放回队尾，直到取到 cur_pid）。
+            let next = extract_from_ready(&mut s, cur_pid).expect("woken keyboard waiter");
             let slot = s.procs[next].as_mut().expect("woken proc exists");
             slot.proc.set_state(TaskState::Running);
             *frame = slot.saved;
             // prev=None：阻塞等待者的浮点现场已在置 Blocked 前显式保存，
             // 此处只做切入方恢复（等待者不是被"切出"的运行进程）。
             cpu_switch_locked(&mut s, None, next);
-            // 注意：**不在此处重置 KBD_WAITER**。KBD_WAITER 的生命周期由
-            // `wake_kbd` 独占管理（每次键盘中断用 swap 取出并重置为空）。
-            // 本 idle-halt 路径的唤醒者未必是键盘等待者——其他进程（如
-            // volumed 的周期对账、init）被 tick/事件唤醒时，`pop_ready`
-            // 弹出的 `next` 不是阻塞等键盘的进程；若在此无条件重置
-            // KBD_WAITER，会把仍阻塞等键盘的 shell 的等待者身份错误清空，
-            // 导致后续键盘中断 `wake_kbd` 找不到等待者 → shell 永久阻塞、
-            // 键盘输入失效（"完全启动后无法输入"）。等待者身份只应被真正
-            // 消费它的 `wake_kbd` 复位。
             drop(s);
+            // 清理登记（CAS 条件式，与 block_for_event 同构）：键盘唤醒已用
+            // `wake_kbd` 的 swap 取走并重置 KBD_WAITER（本 pid 已不在），此 CAS
+            // 无效；保留对称的条件清理作为防御——只在 KBD_WAITER 仍指向本 pid
+            // 时才清除，绝不误伤后续可能的新等待者。
+            let _ = KBD_WAITER.compare_exchange(
+                cur_pid as u32,
+                u32::MAX,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            );
             BlockKbdOutcome::Switched // frame 已改，由 syscall_entry iret 切换
         }
     }
