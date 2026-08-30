@@ -5341,6 +5341,90 @@ pub fn test_vfs_m65() {
     info!("[test-vfs-m65] PASS");
 }
 
+/// D-S32：Benchmark 设施第一组基准——页缓存命中率 + 每读周期数（吞吐）。
+///
+/// 依赖 [`klib::time::read_cycle_counter`]（x86 rdtsc）做最高分辨率相对计时，
+/// 用现有 `PageCache` 的 hit/miss 统计计算命中率。这是 S32 登记项的**地基
+/// 落地**：周期计数设施 + 一组可复现的页缓存基准，供后续重校
+/// `READ_BULK_THRESHOLD_BYTES` 等工程阈值（ADR-027 §3.2 从理由成文转向实测）。
+///
+/// QEMU TCG 下 rdtsc 仍单调递增（周期计数语义可用），跨运行周期绝对数值
+/// 不具可比性，但**命中 vs 未命中的相对比**与**命中率**是稳定可断言的。
+pub fn test_bench_ds32() {
+    use crate::vfs_init;
+    use klib::time::read_cycle_counter;
+    use vfs::inode::Permissions;
+    use vfs::page_cache::PageCache;
+
+    info!("[test-bench-ds32] === D-S32: cycle counter + PageCache hit-rate/throughput ===");
+
+    // 1. 构造一个 16KB 文件（ramfs，写入 4 个 4KB 块）。
+    let root = vfs_init::root();
+    let path = "/scratch/bench_ds32.dat";
+    let node = root
+        .create_file(path, Permissions::read_write())
+        .expect("create bench file");
+    let chunk = [0x5Au8; 4096];
+    for i in 0..4 {
+        node.write_at((i * 4096) as u64, &chunk)
+            .expect("write bench chunk");
+    }
+
+    // 2. 冷读（未命中）：每块首次 read_cached 触发底层 inode.read_at 装载。
+    let cache = PageCache::new();
+    let mut buf = [0u8; 4096];
+    let cold_start = read_cycle_counter();
+    for i in 0..4 {
+        cache
+            .read_cached(&node, (i * 4096) as u64, &mut buf)
+            .expect("cold cached read");
+    }
+    let cold_cycles = read_cycle_counter() - cold_start;
+
+    // 3. 热读（命中）：同一块二次读应全部命中缓存。
+    let hot_start = read_cycle_counter();
+    for i in 0..4 {
+        cache
+            .read_cached(&node, (i * 4096) as u64, &mut buf)
+            .expect("hot cached read");
+    }
+    let hot_cycles = read_cycle_counter() - hot_start;
+
+    let stats = cache.stats();
+    let total = stats.hits + stats.misses;
+    let hit_rate = if total > 0 {
+        stats.hits as f64 / total as f64
+    } else {
+        0.0
+    };
+
+    // 冷读应产生未命中（misses==4），热读全命中（hits==4）。
+    assert_eq!(stats.misses, 4, "4 cold reads must miss");
+    assert_eq!(stats.hits, 4, "4 hot reads must hit");
+    assert!(
+        hot_cycles <= cold_cycles,
+        "hot (cached) read should cost <= cold (miss) read cycles"
+    );
+
+    info!(
+        "[test-bench-ds32] cycle counter ready={} (0=unsupported, non-x86)",
+        if read_cycle_counter() > 0 { 1 } else { 0 }
+    );
+    info!(
+        "[test-bench-ds32] 4x4KB read: cold={} cycles, hot={} cycles (cycles/read cold={}, hot={})",
+        cold_cycles,
+        hot_cycles,
+        cold_cycles / 4,
+        hot_cycles / 4
+    );
+    info!(
+        "[test-bench-ds32] page_cache: hits={} misses={} hit_rate={:.3}",
+        stats.hits, stats.misses, hit_rate
+    );
+
+    info!("[test-bench-ds32] PASS");
+}
+
 /// M7.2 & M8.1：验证 Platform 平台基础驱动接入与 DriverHub 智能竞标打分（Early 串口、PS/2 键盘、CMOS RTC、伪设备、PCI Bidding）。
 pub fn test_driver_hub_m72() {
     use driver::DriverHub;

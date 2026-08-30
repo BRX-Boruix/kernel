@@ -545,6 +545,8 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m65();
     #[cfg(feature = "kernel-tests")]
+    tests::test_bench_ds32(); // D-S32: cycle-counter + page-cache hit-rate/throughput benchmark
+    #[cfg(feature = "kernel-tests")]
     tests::test_driver_hub_m72();
     #[cfg(feature = "kernel-tests")]
     tests::test_ata_tail_probe();

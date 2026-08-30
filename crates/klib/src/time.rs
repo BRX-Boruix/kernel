@@ -136,6 +136,27 @@ pub fn sleep_ms(ms: u64) {
     sleep_nanos(ms.saturating_mul(1_000_000));
 }
 
+// ---------- 周期计数（benchmark 设施，D-S32 地基） ----------
+
+/// 读取 CPU 周期计数器（x86 `rdtsc`）。D-S32 Benchmark 设施的计时地基：
+/// 基准（如页缓存命中率/吞吐）用两次 [`read_cycle_counter`] 之差除以
+/// 已知 TSC 频率（`arch_x86_64` 的 TSC 探测结果，见 `mm::frame_allocator`
+/// 的 `tsc_hz`）得耗时。与单调时钟（[`now_nanos`]，tick 粒度）正交——周期
+/// 计数提供**最高分辨率**的相对计时，适合微基准（页缓存读、锁开销等）。
+///
+/// 无架构 TSC 时返回 `0`（计时不可用，调用方应退化）。读 TSC 是相对计时，
+/// 不保证跨 CPU 一致（多核热迁移会引入误差），单核基准语义足够。
+#[inline]
+pub fn read_cycle_counter() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: rdtsc 是单条无副作用的指令，可安全内联。
+    unsafe {
+        return core::arch::x86_64::_rdtsc();
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    0
+}
+
 // ---------- 软件定时器队列 ----------
 
 /// 定时器回调：`fn(arg: usize)`（`'static`，由注册方保证生命周期）。
