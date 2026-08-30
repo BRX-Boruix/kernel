@@ -1786,9 +1786,9 @@ fn sys_volume_mount(frame: &mut SyscallFrame) -> u64 {
             pack_ok(bytes.len() as u64)
         }
         Err(e) => {
-            // AlreadyExists = 设备已挂载（含内核启动期静态挂载兜底），是幂等
-            // 跳过的**正常情况**（volumed 对账每周期都会重试已挂设备），不做
-            // 失败日志刷屏；其余错误（NotFound/Corrupt/NotSupported/ReadOnly）
+            // 自 vfs_init 改造后，mount_device_volume 对已挂载设备返回已有路径
+            // （Ok），AlreadyExists 仅剩登记表异常态（有设备名无路径）的防御，
+            // 正常路径不再触发。其余错误（NotFound/Corrupt/NotSupported/ReadOnly）
             // 如实留痕。
             if e != klib::error::Error::AlreadyExists {
                 klib::info!("[volume] mount '{}' failed: {:?}", dev_name, e);

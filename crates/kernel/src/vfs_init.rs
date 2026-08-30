@@ -1162,11 +1162,20 @@ fn try_mount_ext2_volumes(
 /// 卷标命名冲突由 `mount_volume` 自增消解并返回最终路径。
 pub fn mount_device_volume(name: &str) -> Result<String, klib::error::Error> {
     // 同一设备幂等（V5/R1）：若该设备已挂载（`MOUNTED_DEVICES` 登记，含启动期
-    // 静态挂载与先前 volumed 挂载），返回 AlreadyExists。**只按设备名判定**——
-    // 不因 `/volumes/{label}` 被占用而拒绝，故"不同设备同名卷"仍能经
-    // `mount_volume` 的 -N 自增消解挂到 /volumes/{label}-2（注释语义真实兑现，
-    // 不做注释声称之外的过度拒绝）。
+    // 静态挂载与先前 volumed 挂载），**返回已有挂载路径**（而非报 AlreadyExists）——
+    // 使 volumed 对账时能拿到 boot-time 静态挂载卷的真实路径并加入追踪，从而在
+    // 设备拔除（`DeviceDeparted`）时能卸载对应卷（ADR-030 热插拔闭环 P2-2）。
+    // 幂等性保持：同一设备不产生第二挂载点。
     if is_device_mounted(name) {
+        if let Some((_, path)) = MOUNTED_DEVICES
+            .lock()
+            .iter()
+            .find(|(d, _)| d == name)
+            .cloned()
+        {
+            return Ok(path);
+        }
+        // 登记表有设备名但无路径（异常态）：如实报 AlreadyExists，不伪造路径。
         return Err(klib::error::Error::AlreadyExists);
     }
     let count = driver::DriverHub::device_count();

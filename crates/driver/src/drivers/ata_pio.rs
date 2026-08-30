@@ -25,6 +25,7 @@ use crate::hub::DriverHub;
 use arch_x86_64::port::{inb, inw, outb, outw};
 use klib::{error::Error, info};
 use spin::Mutex;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Primary 通道寄存器基址（0x1F0 系列）。
 const ATA_PRIMARY_BASE: u16 = 0x1F0;
@@ -301,6 +302,10 @@ pub struct AtaPioDevice {
     /// 真实 I/O 计数（C16.1）：硬件路径按成功 sector 命令计数，
     /// 回退路径按触碰扇区块计数。
     pub stats: IoStats,
+    /// 热插拔拔除通知一次性守卫（ADR-030 热插拔）：设备消失（IO 暴露
+    /// status=0xFF）时触发一次 unregister + DeviceDeparted；`swap` 置 true
+    /// 保证每个槽位只拔除一次，避免后续每次失败 IO 重复拔除。
+    pub gone: AtomicBool,
 }
 
 impl Device for AtaPioDevice {
@@ -355,6 +360,12 @@ impl IoDevice for AtaPioDevice {
         let mut remaining = out.len();
         while remaining > 0 && lba < total_sectors {
             if !ata_read_sector(self.channel, self.slave, lba, &mut buf) {
+                // 热插拔被动检测：IO 失败后总线飘高为 0xFF ⇒ 设备已消失
+                // （拔盘/掉线）。触发一次 unregister + DeviceDeparted，使
+                // volumed 卸载对应卷（ADR-030 热插拔闭环）。
+                if is_device_gone(self.channel) {
+                    notify_device_gone(self);
+                }
                 break;
             }
             // C16.1：每条成功 sector 读命令计 1。
@@ -404,17 +415,26 @@ impl IoDevice for AtaPioDevice {
             if sector_off != 0 || take < 512 {
                 // 部分扇区写：真实的读-改-写序列，两条命令各计其账。
                 if !ata_read_sector(self.channel, self.slave, lba, &mut buf) {
+                    if is_device_gone(self.channel) {
+                        notify_device_gone(self);
+                    }
                     break;
                 }
                 self.stats.record_read(1);
                 buf[sector_off..sector_off + take].copy_from_slice(&data[done..done + take]);
                 if !ata_write_sector(self.channel, self.slave, lba, &buf) {
+                    if is_device_gone(self.channel) {
+                        notify_device_gone(self);
+                    }
                     break;
                 }
                 self.stats.record_write(1);
             } else {
                 buf.copy_from_slice(&data[done..done + 512]);
                 if !ata_write_sector(self.channel, self.slave, lba, &buf) {
+                    if is_device_gone(self.channel) {
+                        notify_device_gone(self);
+                    }
                     break;
                 }
                 self.stats.record_write(1);
@@ -457,6 +477,7 @@ pub static ATA_PRIMARY_MASTER: AtaPioDevice = AtaPioDevice {
     sectors: Mutex::new(0),
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
+    gone: AtomicBool::new(false),
 };
 pub static ATA_PRIMARY_SLAVE: AtaPioDevice = AtaPioDevice {
     name: "ata1",
@@ -466,6 +487,7 @@ pub static ATA_PRIMARY_SLAVE: AtaPioDevice = AtaPioDevice {
     sectors: Mutex::new(0),
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
+    gone: AtomicBool::new(false),
 };
 pub static ATA_SECONDARY_MASTER: AtaPioDevice = AtaPioDevice {
     name: "ata2",
@@ -475,6 +497,7 @@ pub static ATA_SECONDARY_MASTER: AtaPioDevice = AtaPioDevice {
     sectors: Mutex::new(0),
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
+    gone: AtomicBool::new(false),
 };
 pub static ATA_SECONDARY_SLAVE: AtaPioDevice = AtaPioDevice {
     name: "ata3",
@@ -484,6 +507,7 @@ pub static ATA_SECONDARY_SLAVE: AtaPioDevice = AtaPioDevice {
     sectors: Mutex::new(0),
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
+    gone: AtomicBool::new(false),
 };
 
 /// identify 失败时的内存回退盘身份（DMYGH #15）：
@@ -496,6 +520,7 @@ static ATA_RAM_FALLBACK: AtaPioDevice = AtaPioDevice {
     sectors: Mutex::new(0),
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
+    gone: AtomicBool::new(false),
 };
 
 /// 回退盘容量：128 扇区 × 512B = 64KiB。
@@ -566,6 +591,37 @@ pub fn init_ata(_hub: &DriverHub) {
         (FALLBACK_SECTOR_COUNT * 512) / 1024
     );
     register_device(&ATA_RAM_FALLBACK, ATA_RAM_FALLBACK.name, true);
+}
+
+/// 设备是否已从 ATA 总线消失/不可用：status 持续为 `0xFF`（总线空闲飘高、
+/// 设备无响应）或持续报 `ERR/DF`（设备报错且无法恢复），经短暂重读排除瞬时
+/// 抖动。真实物理拔盘呈现 0xFF；后端移除（如 QEMU `drive_del`）呈现 ERR——
+/// 两者都表示设备已不可服务，判定消失并触发热插拔拔除。
+fn is_device_gone(channel: u16) -> bool {
+    for _ in 0..3 {
+        let s = status_read(channel);
+        if s != 0xFF && (s & (ATA_SR_ERR | ATA_SR_DF)) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// 热插拔拔除通知（ADR-030 热插拔闭环）：IO 失败暴露设备无响应
+/// （status=0xFF）时，判定设备已从总线消失，触发一次 unregister +
+/// `DeviceDeparted`，使 volumed 卸载对应挂载点。**被动检测**——只在真实
+/// IO 失败暴露总线飘高时判定，不做主动周期探测（ADR-030 §决策3 不做轮询）。
+/// 一次性守卫：每个槽位 `gone` 经 `swap` 只置位一次，后续失败 IO 不再重复
+/// 拔除（避免对已移除设备重复发布 departed 事件）。
+fn notify_device_gone(dev: &AtaPioDevice) {
+    if dev.gone.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    info!(
+        "[ata_pio] device '{}' gone (IO status=0xFF, no response); hot-unplug",
+        dev.name
+    );
+    DriverHub::unregister_device_by_name(dev.name);
 }
 
 /// 登记一块盘到 DriverHub（volatile 语义直通，无影子状态）。

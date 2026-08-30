@@ -1,0 +1,16 @@
+ATA hotplug detection + wake_event timer fix (ADR-030 closed-loop)
+
+- ata_pio: add gone:AtomicBool one-shot guard + is_device_gone(channel) that
+  judges device vanished when status reads 0xFF (physical unplug) or ERR|DF
+  (QEMU drive_del backend removal), with 3-read debounce. notify_device_gone()
+  calls DriverHub::unregister_device_by_name -> publishes DeviceDeparted.
+  Passive-only detection on real IO failure (ADR-030 decision-3 no polling).
+- vfs_init: mount_device_volume now returns the existing mount path (Ok) for
+  an already-mounted device instead of Err(AlreadyExists), so volumed can track
+  boot-time static mounts and unmount them on DeviceDeparted.
+- scheduler wake_event: never touch EVENT_TIMER when there is no event waiter
+  (p==u32::MAX). Previously it unconditionally swapped+cancelled EVENT_TIMER,
+  wrongly cancelling volumed's 1s timeout timer in the set_timeout ->
+  block_for_event registration window, permanently stranding volumed and
+  leaving departed events unconsumed (caught by hotplug E2E verification:
+  wake_event waiter=MAX timer=69).

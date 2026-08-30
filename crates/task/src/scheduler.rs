@@ -932,12 +932,19 @@ pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
 /// 触发、累积占满定时器表）。
 pub fn wake_event() {
     let p = EVENT_WAITER.swap(u32::MAX, core::sync::atomic::Ordering::AcqRel);
+    // 关键：**无事件等待者（p==u32::MAX）时绝不触碰 EVENT_TIMER**。
+    // 若在 p==MAX 时无条件 swap+cancel EVENT_TIMER，会误取消"刚注册了超时
+    // 定时器、尚未登记 EVENT_WAITER"的 volumed（set_timeout → block_for_event
+    // 之间的窗口），导致其 1s 超时唤醒失效、永久卡死在事件等待（ADR-030 热
+    // 插拔端到端验证暴露：wake_event waiter=MAX timer=69 误取消 volumed 定时器，
+    // departed 事件滞留无人消费）。只有真正取到一个事件等待者（p!=MAX）才
+    // 取消其注册的超时定时器。
+    if p == u32::MAX {
+        return;
+    }
     let stale = EVENT_TIMER.swap(u64::MAX, core::sync::atomic::Ordering::AcqRel);
     if stale != u64::MAX {
         klib::time::cancel_timeout(stale);
-    }
-    if p == u32::MAX {
-        return;
     }
     let mut s = SCHED.lock();
     if let Some(slot) = s.procs[p as usize].as_mut() {
