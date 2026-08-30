@@ -1704,6 +1704,11 @@ fn event_wait_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchRes
         cancel_timer(registered_timer);
         return r;
     }
+    // 重新登记前清理本进程残留的事件等待者身份：超时唤醒路径不清 EVENT_WAITER
+    // （事件唤醒才经 wake_event swap 清），残留会让本次 block_for_event 的 CAS
+    // 登记失败（NotSwitched）且让 wake_event 误读本 pid。只在仍指向本 pid 时清，
+    // 不误伤并发等待者。
+    task::clear_event_waiter_if(cur_pid);
     match task::block_for_event(arch_frame(frame)) {
         // 已挂起切走：用户态经哨兵重试。定时器保持待触发，由事件唤醒取消或
         // 到期自然触发——不留 stale（两条路径都收敛到 EVENT_TIMER=MAX）。

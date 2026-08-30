@@ -864,13 +864,14 @@ pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
             slot.proc.set_state(TaskState::Running);
             *frame = slot.saved;
             cpu_switch_locked(&mut s, None, next);
-            // 清理登记：CAS 只在仍指向本 pid 时清除（事件唤醒已 swap 走则无事）。
-            let _ = EVENT_WAITER.compare_exchange(
-                cur_pid as u32,
-                u32::MAX,
-                core::sync::atomic::Ordering::AcqRel,
-                core::sync::atomic::Ordering::Acquire,
-            );
+            // NOTE：**此处不再 CAS 清除 EVENT_WAITER**。cpu_switch_locked 只更新
+            // 调度元数据（current/CR3/RSP0），不真正切换执行流——本分支在**切走时**
+            // 立即执行，若此时清 EVENT_WAITER 会抹掉本进程已登记的等待者身份，
+            // 导致后续事件发布时 wake_event 读到 MAX、无法唤醒本进程（ADR-030
+            // 热插拔端到端暴露：volumed 置 Blocked 后登记被误清，departed 滞留
+            // 无人消费，volumed 永久卡死）。EVENT_WAITER 的清除由唤醒方负责：
+            // 事件唤醒经 wake_event 的 swap；超时唤醒后由 event_wait_blocking 在
+            // 重新登记前显式清理残留（见该函数）。本处保持登记不变，事件才能到达。
             SwitchOutcome::Switched
         }
         None => {
@@ -993,6 +994,21 @@ pub fn set_event_timeout_timer(id: u64) {
 /// `klib::time::cancel_timeout` 防止 stale 定时器泄漏与级联污染新等待（S18/S21）。
 pub fn clear_event_timeout_timer() {
     EVENT_TIMER.store(u64::MAX, core::sync::atomic::Ordering::Release);
+}
+
+/// 若 EVENT_WAITER 仍残留 `pid`（超时唤醒后本进程登记未清），CAS 清为 MAX。
+///
+/// 由 `event_wait_blocking` 在每次 block_for_event **重新登记前**调用：超时唤醒
+/// 路径不清 EVENT_WAITER（事件唤醒才经 swap 清），残留的登记会让下次 CAS 登记
+/// 失败（NotSwitched）且让 wake_event 误读本 pid、误 cancel 新定时器。只在仍
+/// 指向 `pid` 时清除，绝不误伤并发等待者。
+pub fn clear_event_waiter_if(pid: usize) {
+    let _ = EVENT_WAITER.compare_exchange(
+        pid as u32,
+        u32::MAX,
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Acquire,
+    );
 }
 
 /// 事件等待超时定时器 id 槽（`u64::MAX` = 无）。

@@ -1,0 +1,25 @@
+fix(hotplug): don't clear EVENT_WAITER on switch-away - root-cause of departed stranding
+
+Root cause of the intermittent ADR-030 hotplug stranding: block_for_event's
+Some(next) branch ran its EVENT_WAITER CAS-clear at switch-AWAY time, because
+cpu_switch_locked only updates scheduler metadata (current/CR3/RSP0) and returns
+immediately - it does NOT truly switch execution. So the CAS wiped the process's
+registered waiter identity right after it went Blocked. When DeviceDeparted was
+later published, wake_event read EVENT_WAITER==MAX, could not wake volumed, and
+the departed event stranded forever (volumed permanently Blocked, never consumed
+it, never unmounted).
+
+Fix:
+- block_for_event: do NOT clear EVENT_WAITER on the switch-away branch. The
+  registration stays so events can reach the waiter. Clearing is the wake side's
+  job: event wake via wake_event's swap; timeout wake handled by
+  event_wait_blocking which clears any residue (clear_event_waiter_if) before
+  re-registering.
+- task::clear_event_waiter_if: CAS-clears EVENT_WAITER only if it still points at
+  pid (timeout wake leaves it set; event wake already swapped it away). Never
+  clobbers a concurrent waiter.
+
+Verified end-to-end 4x (QEMU drive_del + ATA IO trigger -> gone -> DeviceDeparted
+-> volumed unmount ata0 -> reconcile skip-mount NotFound). Before fix it stranded
+intermittently (wake_event pre=MAX, departed pending=1 forever); after fix
+wake_event reads the registered waiter (pre=2) and volumed unmounts reliably.
