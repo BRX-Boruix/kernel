@@ -734,7 +734,15 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
             // prev=None：阻塞等待者的浮点现场已在置 Blocked 前显式保存，
             // 此处只做切入方恢复（等待者不是被"切出"的运行进程）。
             cpu_switch_locked(&mut s, None, next);
-            KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+            // 注意：**不在此处重置 KBD_WAITER**。KBD_WAITER 的生命周期由
+            // `wake_kbd` 独占管理（每次键盘中断用 swap 取出并重置为空）。
+            // 本 idle-halt 路径的唤醒者未必是键盘等待者——其他进程（如
+            // volumed 的周期对账、init）被 tick/事件唤醒时，`pop_ready`
+            // 弹出的 `next` 不是阻塞等键盘的进程；若在此无条件重置
+            // KBD_WAITER，会把仍阻塞等键盘的 shell 的等待者身份错误清空，
+            // 导致后续键盘中断 `wake_kbd` 找不到等待者 → shell 永久阻塞、
+            // 键盘输入失效（"完全启动后无法输入"）。等待者身份只应被真正
+            // 消费它的 `wake_kbd` 复位。
             drop(s);
             BlockKbdOutcome::Switched // frame 已改，由 syscall_entry iret 切换
         }
