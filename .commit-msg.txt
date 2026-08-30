@@ -1,9 +1,0 @@
-feat(bench): D-S32 benchmark facility - cycle counter + PageCache hit-rate/throughput
-
-- klib::time::read_cycle_counter(): public x86 rdtsc cycle counter (core::arch,
-  klib stays zero-dep) - the timing ground for micro-benchmarks.
-- test_bench_ds32 (kernel-tests): first PageCache benchmark - 4x4KB cold vs hot
-  reads, prints per-read cycles and hit-rate. QEMU measured cold ~304K cycles/read,
-  hot ~87K cycles/read (~3.5x faster), hit_rate=0.500.
-- Makes READ_BULK_THRESHOLD_BYTES etc. re-calibratable (ADR-027 1.5 was
-  'no benchmark facility' -> now measured).
