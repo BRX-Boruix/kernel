@@ -20,7 +20,7 @@ pub use process::{
 pub use scheduler::{
     SwitchOutcome, Waited, block_current, block_current_with, block_for_event, block_for_kbd,
     exit_current, get_process_snapshot, init_pid, kill_pid, process_snapshots, ps_snapshot,
-    set_init_pid, spawn, spawn_with_ppid, start, tick, waitpid, wake, wake_event,
+    set_init_pid, spawn, spawn_with_ppid, spawn_with_ppid_fds, start, tick, waitpid, wake, wake_event,
     wake_event_timeout, wake_kbd, set_event_timeout_timer, clear_event_timeout_timer,
     clear_event_waiter_if, yield_now,
 };

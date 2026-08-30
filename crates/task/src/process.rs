@@ -241,6 +241,51 @@ impl<PT: PageTable> Process<PT> {
         }
     }
 
+    /// 把句柄安装到指定 fd 槽位（`dup2` 目标）。原槽位若已有句柄则**被覆盖
+    /// 丢弃**——调用方必须先把旧句柄取出并正确处理（pipe 端 `pipe_ref_dec`），
+    /// 否则泄漏/错账。槽位超出当前表长则扩展填充到 `fd`（含空槽），受
+    /// [`Self::MAX_FDS`] 上限约束。
+    ///
+    /// 用于 `dup2(old, new)` 的"复制到指定编号"，与 [`Self::alloc_fd`]（找
+    /// 最低空闲槽）互补。
+    pub fn set_fd(
+        &mut self,
+        fd: usize,
+        handle: vfs::file_handle::OpenHandle,
+    ) -> Result<(), klib::error::Error> {
+        if fd >= Self::MAX_FDS {
+            return Err(klib::error::Error::NoSpace);
+        }
+        if fd >= self.fd_table.len() {
+            self.fd_table.resize(fd + 1, None);
+        }
+        self.fd_table[fd] = Some(handle);
+        Ok(())
+    }
+
+    /// 克隆整张 fd 表（spawn 时子进程继承父进程句柄）。
+    ///
+    /// 仅做结构性克隆（`OpenHandle` 的 `Clone`）。**pipe 端引用计数递增不在
+    /// 本方法内**——由 kernel syscall 层在克隆后对每个 `Pipe { id }` 调
+    /// `ipc::pipe_ref_inc(id)`，保证子进程继承的 pipe 端也持有一个 ref。
+    pub fn clone_fd_table(&self) -> alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>> {
+        self.fd_table.clone()
+    }
+
+    /// 以父进程继承的 fd 表替换本进程的默认标准流表（spawn 时注入）。
+    ///
+    /// 仅当继承表**非空**时替换：默认标准流表（0/1/2）由 [`Self::new`] 已装好，
+    /// 空表保留默认（等价于无继承、新进程有独立标准流）。pipe 端引用计数由
+    /// 调用方（syscall 层）在替换后对每个 `Pipe { id }` 调 `ipc::pipe_ref_inc`。
+    pub fn set_inherited_fd_table(
+        &mut self,
+        inherited: alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>>,
+    ) {
+        if !inherited.is_empty() {
+            self.fd_table = inherited;
+        }
+    }
+
     /// 进程 id。
     pub fn pid(&self) -> usize {
         self.pid

@@ -263,7 +263,7 @@ pub fn spawn(
     user_stack_top: u64,
     addr_space: UserAddressSpace<X86PageTable>,
 ) -> Result<usize, Error> {
-    spawn_with_ppid(0, name, entry_rip, user_stack_top, addr_space)
+    spawn_with_ppid_fds(0, name, entry_rip, user_stack_top, addr_space, None)
 }
 
 /// 校验并拷贝程序名进定长 PCB 缓冲。
@@ -279,17 +279,32 @@ fn store_name(name: &str) -> Result<([u8; PROCESS_NAME_MAX], u8), Error> {
     Ok((buf, bytes.len() as u8))
 }
 
-/// 创建一个进程并登记其父进程与真实程序名（C7.1 父子关系 + C1.1 名称单点）。
-///
-/// `ppid` 为父进程 pid；`0` 表示内核直创（无收尸人，退出即回收）。`name`
-/// 必须是调用方提供的真实可执行程序名（如 `init.elf`、`shell.elf`），
-/// ProcFS 直接展示该值，不再按 pid 推断。
+/// 带 fd 表继承的 spawn（pipe-features 方案 A）。`None` 等价于 [`spawn`]
+/// （新进程独立标准流表）；`Some(inherited)` 时子进程以父进程 fd 表启动，
+/// 供管道 `A | B` 把前段 stdout / 后段 stdin 重定向到 pipe 端。pipe 端引用
+/// 计数由调用方（kernel syscall 层）在克隆表后递增（task 不依赖 ipc）。
 pub fn spawn_with_ppid(
     ppid: usize,
     name: &str,
     entry_rip: u64,
     user_stack_top: u64,
     addr_space: UserAddressSpace<X86PageTable>,
+) -> Result<usize, Error> {
+    spawn_with_ppid_fds(ppid, name, entry_rip, user_stack_top, addr_space, None)
+}
+
+/// 带 fd 表继承的 spawn 公开形态（pipe-features 方案 A）。`None` 等价于
+/// [`spawn_with_ppid`]（新进程独立标准流表）；`Some(inherited)` 时子进程以
+/// 父进程 fd 表启动，供管道 `A | B` 把前段 stdout / 后段 stdin 重定向到
+/// pipe 端。pipe 端引用计数由调用方（kernel syscall 层）在克隆表后递增
+/// （task 不依赖 ipc）。
+pub fn spawn_with_ppid_fds(
+    ppid: usize,
+    name: &str,
+    entry_rip: u64,
+    user_stack_top: u64,
+    addr_space: UserAddressSpace<X86PageTable>,
+    inherited_fds: Option<alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>>>,
 ) -> Result<usize, Error> {
     // 延迟回收先于新分配执行（task1 K3）：把已退出进程的内核栈帧还池，
     // 提高 spawn 在内存压力下的成功率。
@@ -310,13 +325,18 @@ pub fn spawn_with_ppid(
     // 分配独立内核栈（16 帧；HHDM 高半区在所有进程页表继承可见）。
     let stack_frame = mm::allocate_frames(KSTACK_ORDER).ok_or(Error::OutOfMemory)?;
     let kstack_top = arch::phys_to_virt(stack_frame.start_paddr()) + KSTACK_SIZE as u64;
-    let proc = Box::new(Process::<X86PageTable>::new(
+    let mut proc = Box::new(Process::<X86PageTable>::new(
         pid,
         entry_rip,
         user_stack_top,
         kstack_top,
         addr_space,
     ));
+    // 管道方案 A：注入父进程继承的 fd 表（若提供）。非空才替换（空表保留
+    // 默认标准流）。pipe 端引用计数已由 syscall 层在克隆时递增，此处仅挂表。
+    if let Some(fds) = inherited_fds {
+        proc.set_inherited_fd_table(fds);
+    }
     let entry = ProcEntry {
         proc,
         saved: initial_frame(entry_rip, user_stack_top),

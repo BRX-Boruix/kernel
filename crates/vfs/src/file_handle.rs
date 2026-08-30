@@ -118,10 +118,29 @@ impl OpenFlags {
 }
 
 /// 进程打开文件句柄（持有底层 INode + 独立读写偏移量 offset + 打开标志）。
+///
+/// `Clone` 供 `dup2`/spawn fd 继承共享同一文件描述（`Arc<dyn INode>` 与
+/// `AtomicU64 offset` 共享，`OpenFlags` 值拷贝）——Unix dup2 语义：副本与
+/// 原句柄指向同一文件、共享读写偏移（pipe-features 方案 A）。
 pub struct FileHandle {
     pub inode: Arc<dyn INode>,
-    pub offset: AtomicU64,
+    /// 读写偏移量。用 `Arc<AtomicU64>` 承载：dup2 副本共享**同一**文件描述
+    /// （同一偏移计数器，跨副本同步推进）——Unix dup2 语义（pipe-features
+    /// 方案 A）。`AtomicU64` 本身非 `Clone`，包一层 `Arc` 使 clone 共享之。
+    pub offset: Arc<AtomicU64>,
     pub flags: OpenFlags,
+}
+
+impl Clone for FileHandle {
+    fn clone(&self) -> Self {
+        // dup2 语义：副本共享同一 INode（Arc）与同一读写偏移（Arc<AtomicU64>
+        // 共享，跨副本读写推进同一计数器）。
+        Self {
+            inode: Arc::clone(&self.inode),
+            offset: Arc::clone(&self.offset),
+            flags: self.flags,
+        }
+    }
 }
 
 /// 进程 fd 表槽位可持有的句柄种类（ADR-014 §4.1）。
@@ -130,6 +149,13 @@ pub struct FileHandle {
 /// `ipc::pipe_read/pipe_write` 直接路由到 ipc crate 的环形缓冲（阻塞/等待
 /// 语义属 ipc 层，见 `kernel/crates/ipc`），故 fd 表不再假设每个槽位都是
 /// 文件节点句柄。
+///
+/// `Clone` 是**结构性**拷贝（pipe 端仅复制 `id`、file 共享 `Arc`）。注意
+/// `Pipe { id }` 被复制进一个新 fd 时，**调用方必须同步 `ipc::pipe_ref_inc(id)`**
+/// 维持引用计数（每个持有该 id 的 fd 端记 1 个 ref），关闭副本时经
+/// `ipc::pipe_ref_dec` 释放——否则管道会在仍有 fd 端引用时被销毁（UAF）。
+/// vfs 不反向依赖 ipc，故 ref 递增由 kernel syscall 层（dup2 / spawn 继承）负责。
+#[derive(Clone)]
 pub enum OpenHandle {
     /// 普通文件/设备/流节点句柄（原有语义）。
     File(FileHandle),
@@ -157,7 +183,7 @@ impl FileHandle {
         };
         Ok(Self {
             inode,
-            offset: AtomicU64::new(initial_offset),
+            offset: Arc::new(AtomicU64::new(initial_offset)),
             flags,
         })
     }

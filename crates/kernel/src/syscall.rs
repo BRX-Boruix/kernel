@@ -96,6 +96,10 @@ pub const SYS_STREAM_CREATE: u32 = nr(domain::STREAM, op::CREATE); // 0x11
 pub const SYS_STREAM_READ: u32 = nr(domain::STREAM, op::READ); // 0x12
 pub const SYS_STREAM_WRITE: u32 = nr(domain::STREAM, op::WRITE); // 0x13
 pub const SYS_STREAM_CLOSE: u32 = nr(domain::STREAM, op::DELETE); // 0x14
+/// SYS_STREAM_DUP（0x15，dup2）：把 `old_fd` 句柄复制到 `new_fd`（pipe-features
+/// 方案 A，fd 重定向）。副本与原句柄共享文件描述/管道端；管道端引用计数由
+/// 本路径同步 `ipc::pipe_ref_inc`。
+pub const SYS_STREAM_DUP: u32 = nr(domain::STREAM, 0x05); // 0x15
 
 /// STREAM read/write 的顺序 I/O 哨兵值。
 ///
@@ -502,6 +506,60 @@ fn sys_close(frame: &mut SyscallFrame) -> u64 {
         }
         Some(vfs::file_handle::OpenHandle::File(_)) => pack_ok(0),
         None => pack_err(Error::NotFound),
+    }
+}
+
+/// `dup2(old_fd, new_fd)`（SYS_STREAM_DUP，pipe-features 方案 A）。
+///
+/// 把 `old_fd` 的句柄复制到 `new_fd`：先关 `new_fd` 旧句柄（pipe 端
+/// `pipe_ref_dec`），再把 `old_fd` 副本装入 `new_fd`（pipe 端 `pipe_ref_inc`）。
+/// `old_fd == new_fd` 时仅校验存在性返回 `new_fd`。副本与原句柄共享同一文件
+/// 描述（`Arc` + 共享 offset）/管道端。旧 fd 越界或不存在如实 `NotFound`。
+fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
+    let old_fd = frame.a1 as usize;
+    let new_fd = frame.a2 as usize;
+    // 目标 fd 槽位上限（与 Process::MAX_FDS 对齐，NA6 防无界扩展）。
+    if new_fd >= task::process::Process::<arch_x86_64::paging::X86PageTable>::MAX_FDS {
+        return pack_err(Error::NoSpace);
+    }
+    // 校验 old 存在并取得副本句柄（值拷贝，随后可释放 proc 借用做 ipc）。
+    let old_handle = {
+        let Some(proc) = current_proc_mut() else {
+            return pack_err(Error::NotFound);
+        };
+        match proc.get_fd(old_fd) {
+            Some(h) => h.clone(),
+            None => return pack_err(Error::NotFound),
+        }
+    };
+    if old_fd == new_fd {
+        return pack_ok(new_fd as u64);
+    }
+    // 副本是 pipe 端：递增引用计数（每个持有该 id 的 fd 记 1 ref）。
+    // 用引用绑定取 id（Pipe 的 u64 是 Copy），不 move old_handle——它稍后
+    // 要整体 move 进 set_fd。
+    if let vfs::file_handle::OpenHandle::Pipe { id } = &old_handle {
+        if ipc::pipe_ref_inc(*id).is_err() {
+            return pack_err(Error::NoSpace);
+        }
+    }
+    // 关 new 的旧句柄（若为 pipe 端递减引用）。
+    if let Some(old) = { current_proc_mut().and_then(|p| p.close_fd(new_fd)) } {
+        if let vfs::file_handle::OpenHandle::Pipe { id } = old {
+            let _ = ipc::pipe_ref_dec(id);
+        }
+    }
+    // 装入副本（new_fd 已在入口校验 < MAX_FDS，set_fd 必成功）。
+    let Some(proc) = current_proc_mut() else {
+        // proc 消失的极小窗口：回滚刚递增的 pipe 引用。
+        if let vfs::file_handle::OpenHandle::Pipe { id } = &old_handle {
+            let _ = ipc::pipe_ref_dec(*id);
+        }
+        return pack_err(Error::NotFound);
+    };
+    match proc.set_fd(new_fd, old_handle) {
+        Ok(()) => pack_ok(new_fd as u64),
+        Err(_) => pack_err(Error::NoSpace),
     }
 }
 
@@ -1099,7 +1157,24 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
     // exec 派生的是**当前调用进程的子进程**（C7.1）：登记真实 ppid，
     // 使 waitpid/退出码交付对 shell 前台等待等场景成立。
     let parent_pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
-    match task::spawn_with_ppid(parent_pid, &prog_name, loaded.entry, loaded.user_stack_top, us) {
+    // 管道方案 A：子进程继承父进程 fd 表（含 pipe 端）。克隆表并为每个
+    // Pipe { id } 递增引用计数，使子进程继承的 pipe 端也持有一个 ref。
+    let inherited = match current_proc_mut() {
+        Some(parent) => match clone_inherited_fd_table(parent) {
+            Ok(t) => Some(t),
+            // 引用计数上限不可达的极端防御：如实上抛而非静默丢表。
+            Err(e) => return pack_err(e),
+        },
+        None => None,
+    };
+    match task::spawn_with_ppid_fds(
+        parent_pid,
+        &prog_name,
+        loaded.entry,
+        loaded.user_stack_top,
+        us,
+        inherited,
+    ) {
         Ok(pid) => {
             klib::info!(
                 "[syscall] exec prog={} -> pid={} (ppid={}) entry={:#x}",
@@ -1112,6 +1187,31 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
         }
         Err(e) => pack_err(e),
     }
+}
+
+/// 克隆当前进程 fd 表供子进程继承，并对每个 `Pipe { id }` 端递增引用计数。
+///
+/// 返回克隆表；pipe 端引用计数同步递增，保证子进程继承后该管道在父进程
+/// 关闭/退出后仍存活（UAF 防线）。任意 pipe_ref_inc 失败（引用计数回绕上限）
+/// 即如实上抛——绝不静默丢表造成子进程缺句柄。
+fn clone_inherited_fd_table(
+    parent: &mut task::process::Process<arch_x86_64::paging::X86PageTable>,
+) -> Result<alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>>, Error> {
+    let table = parent.clone_fd_table();
+    // 克隆后为每个 pipe 端递增引用（记下已增项，失败即回滚）。
+    let mut incd: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for slot in table.iter() {
+        if let Some(vfs::file_handle::OpenHandle::Pipe { id }) = slot {
+            if ipc::pipe_ref_inc(*id).is_err() {
+                for done in incd {
+                    let _ = ipc::pipe_ref_dec(done);
+                }
+                return Err(Error::NoSpace);
+            }
+            incd.push(*id);
+        }
+    }
+    Ok(table)
 }
 
 /// `mmap(size)`：在当前进程用户空间预留一段按需分页区，返回起始地址。
@@ -1963,6 +2063,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_STREAM_READ => sys_read(frame),
         SYS_STREAM_WRITE => done(sys_write(frame)),
         SYS_STREAM_CLOSE => done(sys_close(frame)),
+        SYS_STREAM_DUP => done(sys_dup2(frame)),
 
         // MEMORY Domain (0x20)
         SYS_MEMORY_MAP => done(sys_mmap(frame)),
