@@ -10,7 +10,7 @@
 
 | crate | 版本 | 使用者 | 用途 | 引入理由 |
 |---|---|---|---|---|
-| `spin` | "0.9"（mm 钉 0.9.8） | klib 之外的各内核 crate（drv/fs/mm/vfs/kernel） | no_std 自旋锁 `Mutex`/`RwLock` 与 `Once` | no_std 下无 std 同步原语；中断上下文需要无阻塞锁。自研替代需正确处理内存序与 MCS 公平性，收益为零——锁原语不是本项目的差异化目标 |
+| `spin` | "0.9"（各 crate 已统一写法，T-MM） | klib 之外的各内核 crate（drv/fs/mm/vfs/kernel） | no_std 自旋锁 `Mutex`/`RwLock` 与 `Once` | no_std 下无 std 同步原语；中断上下文需要无阻塞锁。自研替代需正确处理内存序与 MCS 公平性，收益为零——锁原语不是本项目的差异化目标 |
 | `buddy_system_allocator` | "0.9" | klib | 内核堆分配器（LockedHeap 挂接 GlobalAlloc） | 堆分配器要求与 LazyBuddy 物理帧分配器语义正交；该 crate 是 no_std 事实标准实现，经审计的伙伴系统。自研需完整对齐/分裂/合并测试面 |
 | `limine` | "0.1"（features: requests-section） | kernel | 启动协议（Limine boot protocol 请求结构） | 手写 Limine 请求节是纯 ABI 样板且极易因版本漂移损坏；该 crate 仅声明请求结构，不含运行时行为 |
 
@@ -24,9 +24,8 @@
 
 ## 版本钉策略
 
-- `spin` 各 crate 写法不一（"0.9" vs "0.9.8"）：Cargo 语义化解析下同树收敛
-  到单一版本；mm 的 0.9.8 是历史钉点。统一为 "0.9" 属低风险清理项，
-  不在本轮强制。
+- `spin` 各 crate 写法已统一为 "0.9"（T-MM 清理闭合）：Cargo 语义化解析下
+  同树收敛到单一版本（Cargo.lock 固化 0.9.9）。mm 的 0.9.8 历史钉点已清除。
 - 禁止出现同一外部依赖的两个大版本共存于最终内核镜像。
 
 ## 审查锚点
