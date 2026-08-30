@@ -156,6 +156,10 @@ pub const SYS_DRIVER_CLAIM: u32 = nr(domain::DEVICE, op::WRITE); // 0x53
 pub const SYS_DRIVER_UNREGISTER: u32 = nr(domain::DEVICE, op::DELETE); // 0x54
 /// 消费下一条硬件拓扑事件（P2-2，DEVICE 域 op::EVENT=0x07 → 0x57）。
 pub const SYS_DRIVER_EVENT_NEXT: u32 = nr(domain::DEVICE, op::EVENT); // 0x57
+/// 对指定块设备做缓存穿透探测读（DEVICE 域 0x08 → 0x58）：volumed 低频对账
+/// 用它兜底发现"拔除但无事件"的空闲卷。返回 `ProbeStatus`（alive=0/gone=1/
+/// notfound=2/notio=3）。
+pub const SYS_DEVICE_PROBE: u32 = nr(domain::DEVICE, 0x08); // 0x58
 
 // ---------- 6. VOLUME Domain (0x60, ADR-030) ----------
 pub const SYS_VOLUME_MOUNT: u32 = nr(domain::VOLUME, op::CREATE); // 0x61
@@ -1555,9 +1559,31 @@ fn sys_driver_query(frame: &mut SyscallFrame) -> u64 {
     pack_ok(n as u64)
 }
 
+/// `device_probe(name_ptr) -> ProbeStatus`（DEVICE 域 0x58，ADR-030 热插拔兜底）。
+///
+/// 对指定块设备做一次**缓存穿透探测读**（绕过 VFS 页缓存，直接触达底层驱动
+/// 真实访问设备）。若设备已消失（拔盘/后端移除），驱动在 `read_at` 内部经
+/// `is_device_gone` + `notify_device_gone` 发布 `DeviceDeparted`（热插拔闭环）。
+/// `volumed` 低频对账用它兜底发现"拔除但无事件"的空闲卷。
+///
+/// 返回 `ProbeStatus` 数值：`Alive=0` / `Gone=1` / `NotFound=2` / `NotIo=3`。
+/// 不做缓存、不创建文件，一次性真实读；调用方（volumed）低频调用（秒级/分钟级
+/// 对账），不构成高频轮询。
+fn sys_device_probe(frame: &mut SyscallFrame) -> u64 {
+    const MAX_NAME: usize = 256;
+    let Ok(name) = copy_path_from_user(frame.a1, MAX_NAME) else {
+        return pack_err(Error::InvalidParam);
+    };
+    match driver::DriverHub::probe_io_device(&name) {
+        driver::ProbeStatus::Alive => pack_ok(0),
+        driver::ProbeStatus::Gone => pack_ok(1),
+        driver::ProbeStatus::NotFound => pack_ok(2),
+        driver::ProbeStatus::NotIo => pack_ok(3),
+    }
+}
+
 /// `driver_event_next(buf_ptr, cap, timeout_ns) -> len`（P2-2/interrupt-to-futex，
 /// DEVICE 域 0x57）。
-///
 /// 消费**下一条**硬件拓扑事件（`driver::event::DeviceEvent`：DeviceArrived /
 /// DeviceDeparted），序列化为 JSON 写入用户缓冲，返回写出长度；无待消费事件且
 /// `timeout_ns == 0` 时返回 `0`（非阻塞空）。`timeout_ns > 0` 时为**阻塞等待**：
@@ -1970,6 +1996,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_DRIVER_UNREGISTER => done(sys_driver_unregister(frame)),
         // 事件等待可能阻塞切换（interrupt-to-futex），自带 DispatchResult 语义。
         SYS_DRIVER_EVENT_NEXT => sys_driver_event_next(frame),
+        // 块设备缓存穿透探测读（volumed 低频对账）。
+        SYS_DEVICE_PROBE => done(sys_device_probe(frame)),
 
         // VOLUME Domain (0x60, ADR-030)
         SYS_VOLUME_MOUNT => done(sys_volume_mount(frame)),

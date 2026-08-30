@@ -23,6 +23,21 @@ use crate::event::{DeviceEvent, publish_event};
 pub const MAX_DRIVERS: usize = 32;
 pub const MAX_DEVICES: usize = 64;
 
+/// 对块设备做缓存穿透探测读的结果（`DriverHub::probe_io_device`）。
+///
+/// - [`Alive`](ProbeStatus::Alive)：探测读成功，设备可服务。
+/// - [`Gone`](ProbeStatus::Gone)：探测读失败（真实设备拔除/后端移除），
+///   驱动已在 `read_at` 内部触发 `DeviceDeparted`。
+/// - [`NotFound`](ProbeStatus::NotFound)：设备表无此名或实例为 None。
+/// - [`NotIo`](ProbeStatus::NotIo)：设备存在但不是 IO 设备，无可探测。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeStatus {
+    Alive,
+    Gone,
+    NotFound,
+    NotIo,
+}
+
 /// 显式带驱动名注册设备时的绑定分。
 ///
 /// 该路径的驱动在注册前已在自己的 init 中完成真实初始化与接管
@@ -277,6 +292,47 @@ impl DriverHub {
         }
 
         false
+    }
+
+    /// 对指定块设备做一次**缓存穿透探测读**（绕过 VFS 页缓存），触发其底层
+    /// IO 驱动真实访问设备。若设备已消失（总线无响应/后端移除），驱动在
+    /// `read_at` 内部经 `is_device_gone` + `notify_device_gone` 主动发布
+    /// `DeviceDeparted`（ADR-030 热插拔闭环）。用于 `volumed` 低频对账：对
+    /// 已挂卷做探测，把"拔除但无事件"的空闲卷兜底发现出来——比高频周期
+    /// 对账更低频、且只触达真实设备，不扫缓存。
+    pub fn probe_io_device(name: &str) -> ProbeStatus {
+        let dev_count = DEVICE_COUNT.load(Acquire);
+        // 拿设备实例做探测读（保持短临界区：只读快照，IO 在锁外执行）。
+        let dev = {
+            let devices = DEVICES.lock();
+            let mut found: Option<&'static dyn Device> = None;
+            for idx in 0..dev_count {
+                if let Some(entry) = devices.get(idx).and_then(|e| e.as_ref()) {
+                    if entry.info.name == name {
+                        found = entry.dev;
+                        break;
+                    }
+                }
+            }
+            found
+        };
+        let Some(dev) = dev else {
+            // 无设备实例（纯元数据登记）或未找到：无从探测。
+            return ProbeStatus::NotFound;
+        };
+        let Some(io) = dev.as_io() else {
+            // 非 IO 设备（如显示/网络纯元数据）：不探测。
+            return ProbeStatus::NotIo;
+        };
+        // 512B 探测读。真实 ATA 盘在拔除后 read_at 返回 0 且内部已触发
+        // notify_device_gone → DeviceDeparted；RAM 回退盘返回成功（volatile）。
+        let mut buf = [0u8; 512];
+        let n = io.read_at(0, &mut buf);
+        if n > 0 {
+            ProbeStatus::Alive
+        } else {
+            ProbeStatus::Gone
+        }
     }
 
     /// 驱动在线热重载（Live Reloading）：安全解绑当前绑定 -> 重新执行候选

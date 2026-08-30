@@ -34,7 +34,7 @@ pub use event::{
     DeviceEvent, dropped_event_count, peek_event, pending_event_count, pop_event, publish_event,
     set_event_wake_callback,
 };
-pub use hub::DriverHub;
+pub use hub::{DriverHub, ProbeStatus};
 pub use uio::{
     UioDriverEntry, device_mmio_window, publish_device_window, uio_claim_device,
     uio_device_window_of, uio_is_device_claimed, uio_on_process_exit, uio_register_driver,
