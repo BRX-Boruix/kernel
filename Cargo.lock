@@ -186,6 +186,7 @@ dependencies = [
  "arch",
  "arch-x86_64",
  "driver",
+ "ipc",
  "klib",
  "mm",
  "vfs",

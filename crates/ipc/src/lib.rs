@@ -34,6 +34,9 @@
 
 #![no_std]
 
+mod sync;
+pub use sync::*;
+
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
@@ -88,6 +91,9 @@ pub enum BlockOutcome {
 pub trait IpcTaskNotifier: Send + Sync {
     fn current_pid(&self) -> usize;
     fn wake_process(&self, pid: usize);
+    /// 带值唤醒：预置目标进程保存帧 rax 为 `value` 后唤醒（SYNC 域唤醒值交付，
+    /// 同事件机制 `wake_event_timeout` 预置哨兵的手法）。供 `ipc::sync_wake` 使用。
+    fn wake_process_with_value(&self, pid: usize, value: u64);
     /// 原子阻塞原语：在**调度锁内**执行 `register`（返回 false = 登记被拒，
     /// 此时不阻塞、零副作用），随后置 Blocked 并切换到下一就绪进程。语义与
     /// 键盘路径 block_for_kbd 的 CAS 纪律同源（crate 级"阻塞原子性契约"）。
@@ -435,6 +441,14 @@ fn current_pid() -> usize {
 fn wake_proc(pid: usize) {
     if let Some(notifier) = *NOTIFIER.lock() {
         notifier.wake_process(pid);
+    }
+}
+
+/// 带值唤醒 helper（SYNC 域）：预置目标 pid 保存帧 rax 为 `value` 后唤醒。
+/// notifier 未注册（早期/单测）时安全 no-op。
+fn wake_proc_with_value(pid: usize, value: u64) {
+    if let Some(notifier) = *NOTIFIER.lock() {
+        notifier.wake_process_with_value(pid, value);
     }
 }
 

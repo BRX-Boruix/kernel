@@ -1240,6 +1240,7 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
 
     let outcome = if !parent_reapable(s, ppid) {
         driver::uio_on_process_exit(pid);
+        ipc::sync_release_process(pid);
         if let Some(e) = s.procs[pid].take() {
             retire_entry(e);
         }
@@ -1247,6 +1248,7 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
     } else if deliver {
         s.ready.push_back(ppid);
         driver::uio_on_process_exit(pid);
+        ipc::sync_release_process(pid);
         if let Some(e) = s.procs[pid].take() {
             retire_entry(e);
         }
@@ -1261,6 +1263,7 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
             if e.ppid == pid && e.proc.state() == TaskState::Exit);
         if orphan_zombie {
             driver::uio_on_process_exit(i);
+            ipc::sync_release_process(i);
             if let Some(e) = s.procs[i].take() {
                 retire_entry(e);
             }
@@ -1300,6 +1303,7 @@ fn reap_child_locked(s: &mut Scheduler, cur: usize, child: usize) -> Option<u64>
     }
     let code = s.procs[child].as_ref().map(|e| e.exit_code).unwrap_or(0);
     driver::uio_on_process_exit(child);
+    ipc::sync_release_process(child);
     if let Some(e) = s.procs[child].take() {
         retire_entry(e);
     }
@@ -1659,6 +1663,30 @@ pub fn wake(pid: usize) {
     let mut s = SCHED.lock();
     if let Some(slot) = s.procs.get_mut(pid).and_then(|p| p.as_mut()) {
         if slot.proc.state() == TaskState::Blocked && slot.waiting_for.is_none() {
+            slot.proc.set_state(TaskState::Ready);
+            s.ready.push_back(pid);
+        }
+    }
+}
+
+/// 唤醒一个阻塞的进程并把其保存帧 `rax` 预置为 `value`（SYNC 域 futex 唤醒）。
+///
+/// 与 [`wake`] 的差异：唤醒方（`sync_wake`）除了把进程置回 `Ready`，还要让被唤醒
+/// 进程的 `SYNC_WAIT` 返回**唤醒时的同步字值**（ADR-032 §4.3）。实现上先写
+/// `saved.rax = value`，再走与 [`wake`] 相同的 Blocked + `waiting_for` 守卫入队。
+///
+/// 竞态与 [`wake_event_timeout`] 同源：超时唤醒与事件唤醒对 `saved.rax` 竞争时，
+/// 由 `state == Blocked` 检查保证**先到者胜**——已置 Ready 则后到者不覆盖（不会
+/// 把已交付的唤醒值写穿）。
+///
+/// 仅当目标进程处于 `Blocked` 时才生效（已就绪/运行中进程忽略，避免重复入队）。
+/// 由 waitpid 机制独占管理的进程（`waiting_for` 已登记）不得经此唤醒——其
+/// `saved.rax` 只能由子进程终止路径填写。
+pub fn wake_with_value(pid: usize, value: u64) {
+    let mut s = SCHED.lock();
+    if let Some(slot) = s.procs.get_mut(pid).and_then(|p| p.as_mut()) {
+        if slot.proc.state() == TaskState::Blocked && slot.waiting_for.is_none() {
+            slot.saved.rax = value;
             slot.proc.set_state(TaskState::Ready);
             s.ready.push_back(pid);
         }

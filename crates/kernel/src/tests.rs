@@ -7781,3 +7781,183 @@ fn fill_dev_info(name: &'static str) -> driver::DeviceInfo {
 fn leak_name(args: core::fmt::Arguments<'_>) -> &'static str {
     alloc::boxed::Box::leak(alloc::format!("{}", args).into_boxed_str())
 }
+
+/// SYNC 域（0x70，ADR-032）syscall 验收：通用 futex 等待/唤醒。
+///
+/// 直接经 `syscall_entry`（真实 int 0x80 分发路径）派发 SYNC_CREATE/WAIT/WAKE/DELETE，
+/// 覆盖：创建、值已满足的非阻塞快路径、无等待者唤醒、唤醒值预置到已阻塞等待者、
+/// 不可阻塞时如实 WouldBlock、有等待者时 DELETE Busy、不存在的对象 NotFound。
+/// 阻塞唤醒路径用测试探针构造"已阻塞等待者"（同事件测试 debug_occupy 手法）。
+#[cfg(feature = "kernel-tests")]
+pub fn test_sync_syscalls() {
+    use arch::syscall::SyscallFrame;
+    use klib::error::Error;
+    use task::TaskState;
+
+    info!("[test-sync] === SYNC domain (0x70) futex syscalls ===");
+    // KM16：全程关中断，结束时恢复（与 test_syscall_munmap 同纪律）。
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    // 安装哑当前进程：`sys_sync_wait` 经 `current_proc_mut().pid()` 取阻塞 pid，
+    // 无当前进程则如实 NotFound。与 test_syscall_munmap 同款伪进程纪律。
+    use alloc::boxed::Box;
+    use task::Process;
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4: 0,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
+        }
+    }
+
+    // 阻塞路径的 `arch_frame` 需要真实（非空）InterruptFrame 指针（`arch_frame`
+    // 解引用 frame.arch_frame）。本测试的阻塞调用在 `SCHED.current == None` 时
+    // 经 `block_current_with` 立即 NotSwitched、不读写 frame 内容，故传入一个栈上
+    // 哑帧即可满足非空要求。纯 Done 路径（非阻塞）不触 arch_frame，填 0 无害。
+    fn dummy_interrupt_frame() -> arch_x86_64::interrupts::InterruptFrame {
+        arch_x86_64::interrupts::InterruptFrame {
+            r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+            rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+            vector: 0, error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+        }
+    }
+
+    // ---- 1. create ----
+    let mut c = frame(crate::syscall::SYS_SYNC_CREATE, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut c));
+    let id = c.result;
+    assert!(id != 0, "sync_create must return non-zero id");
+    assert!(ipc::debug_sync_exists(id), "object must exist after create");
+    assert_eq!(ipc::debug_sync_value(id), Some(0), "init value = 0");
+    info!("[test-sync] create id={} ok", id);
+
+    // ---- 2. wait 非阻塞快路径：值已 != expected → 立即返回当前值 ----
+    let mut w1 = frame(crate::syscall::SYS_SYNC_WAIT, id, 1, 0); // expected=1, value=0
+    assert!(crate::syscall::syscall_entry(&mut w1));
+    assert_eq!(w1.result, 0, "value != expected → immediate return of current value");
+
+    // ---- 3. wake（无等待者）：设值并返回 0 ----
+    let mut k = frame(crate::syscall::SYS_SYNC_WAKE, id, 1, 1);
+    assert!(crate::syscall::syscall_entry(&mut k));
+    assert_eq!(k.result, 0, "wake with no waiters → 0");
+    assert_eq!(ipc::debug_sync_value(id), Some(1), "wake set value to 1");
+
+    // ---- 4. wait 非阻塞：值已变 → 返回新值 1 ----
+    let mut w2 = frame(crate::syscall::SYS_SYNC_WAIT, id, 0, 0); // expected=0, value=1
+    assert!(crate::syscall::syscall_entry(&mut w2));
+    assert_eq!(w2.result, 1, "value changed → return new value");
+
+    // ---- 5. 阻塞路径：值 == expected 且无可切换同伴 → 如实 WouldBlock ----
+    // 无真实就绪同伴时 block_current_with 返回 NotSwitched → 处理返回 WouldBlock。
+    // 阻塞路径会经 `arch_frame` 解引用 frame.arch_frame，须填真实帧指针。
+    let mut iframe = dummy_interrupt_frame();
+    let mut w3 = frame(crate::syscall::SYS_SYNC_WAIT, id, 1, 0); // value==1==expected
+    w3.arch_frame = &mut iframe as *mut _ as usize;
+    assert!(crate::syscall::syscall_entry(&mut w3));
+    let wb = (Error::WouldBlock.to_errno() as i64).wrapping_neg() as u64;
+    assert_eq!(w3.result, wb, "sync_wait on un-woken value with no peer → WouldBlock(-EAGAIN)");
+
+    // ---- 6. 唤醒已阻塞等待者：预置值并置 Ready ----
+    let waiter = task::scheduler::test_hooks::spawn_named_child_of(0, "sync-waiter.elf")
+        .expect("spawn sync waiter");
+    assert!(
+        task::scheduler::test_hooks::simulate_blocked(waiter),
+        "waiter must become Blocked (dummy)"
+    );
+    // 在同步字 id 上登记该已阻塞进程为等待者（模拟其已阻塞）。
+    assert!(
+        ipc::debug_sync_add_waiter(id, waiter, 1),
+        "register blocked waiter on sync id"
+    );
+    assert_eq!(ipc::debug_sync_waiter_count(id), Some(1), "1 waiter registered");
+    // wake 设值 2 并唤醒该等待者。
+    let mut k2 = frame(crate::syscall::SYS_SYNC_WAKE, id, 2, 1);
+    assert!(crate::syscall::syscall_entry(&mut k2));
+    assert_eq!(k2.result, 1, "wake woke exactly 1 waiter");
+    let (st, _, _, saved_rax, _) =
+        task::scheduler::test_hooks::probe(waiter).expect("waiter probed");
+    assert_eq!(st, TaskState::Ready, "wake must set waiter Ready");
+    assert_eq!(saved_rax, 2, "wake must preset saved.rax to new value 2");
+    assert_eq!(ipc::debug_sync_waiter_count(id), Some(0), "waiter removed");
+
+    // ---- 7. delete 有等待者 → Busy ----
+    assert!(
+        task::scheduler::test_hooks::simulate_blocked(waiter),
+        "re-block waiter for delete-busy"
+    );
+    assert!(
+        ipc::debug_sync_add_waiter(id, waiter, 2),
+        "re-register waiter"
+    );
+    let busy = (Error::Busy.to_errno() as i64).wrapping_neg() as u64;
+    let mut d1 = frame(crate::syscall::SYS_SYNC_DELETE, id, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut d1));
+    assert_eq!(d1.result, busy, "delete with waiter → Busy");
+    assert!(ipc::debug_sync_exists(id), "object survives Busy delete");
+    // 唤醒该等待者并清空，使 delete 成功。
+    let mut k3 = frame(crate::syscall::SYS_SYNC_WAKE, id, 3, 1);
+    assert!(crate::syscall::syscall_entry(&mut k3));
+    assert_eq!(k3.result, 1, "wake the last waiter");
+
+    // ---- 8. delete 成功 ----
+    let mut d2 = frame(crate::syscall::SYS_SYNC_DELETE, id, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut d2));
+    assert_eq!(d2.result, 0, "delete success");
+    assert!(!ipc::debug_sync_exists(id), "object gone after delete");
+
+    // ---- 9. 不存在的对象：wait/wake/delete 一律 NotFound ----
+    let nf = (Error::NotFound.to_errno() as i64).wrapping_neg() as u64;
+    let mut w4 = frame(crate::syscall::SYS_SYNC_WAIT, id, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut w4));
+    assert_eq!(w4.result, nf, "wait on deleted id → NotFound");
+    let mut k4 = frame(crate::syscall::SYS_SYNC_WAKE, id, 1, 1);
+    assert!(crate::syscall::syscall_entry(&mut k4));
+    assert_eq!(k4.result, nf, "wake on deleted id → NotFound");
+
+    // ---- 10. 超时参数越界 → InvalidParam ----
+    let mut c2 = frame(crate::syscall::SYS_SYNC_CREATE, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut c2));
+    let id2 = c2.result;
+    let ip = (Error::InvalidParam.to_errno() as i64).wrapping_neg() as u64;
+    let mut w5 = frame(crate::syscall::SYS_SYNC_WAIT, id2, 0, 3_700_000_000_000); // >1h
+    assert!(crate::syscall::syscall_entry(&mut w5));
+    assert_eq!(w5.result, ip, "timeout beyond bound → InvalidParam");
+
+    // ---- 11. bit63 值域约束（S09/S31）：CREATE init_value bit63 置位 → InvalidParam ----
+    let mut c3 = frame(crate::syscall::SYS_SYNC_CREATE, 1 << 63, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut c3));
+    assert_eq!(c3.result, ip, "create with bit63-set init_value → InvalidParam");
+
+    // ---- 12. WAKE value bit63 置位 → InvalidParam（不改值、不唤醒）----
+    let mut k5 = frame(crate::syscall::SYS_SYNC_WAKE, id2, 1 << 63, 1);
+    assert!(crate::syscall::syscall_entry(&mut k5));
+    assert_eq!(k5.result, ip, "wake with bit63-set value → InvalidParam");
+    assert_eq!(ipc::debug_sync_value(id2), Some(0), "bit63 wake rejected: value unchanged");
+
+    // ---- 13. refs 生命周期（ADR-032 §4.4）：create refs=1，delete 后归零即移除 ----
+    assert_eq!(ipc::debug_sync_refs(id2), Some(1), "create sets refs=1 (owner held)");
+    let mut d3 = frame(crate::syscall::SYS_SYNC_DELETE, id2, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut d3));
+    assert_eq!(d3.result, 0, "delete success (refs 1→0 → removed)");
+    assert!(!ipc::debug_sync_exists(id2), "object removed when refs hits 0");
+
+    // ---- 清场 ----
+    ipc::debug_sync_reset();
+    task::scheduler::test_hooks::reset_all();
+    task::scheduler::debug_clear_scheduler_current();
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-sync] SYNC domain futex syscall semantics OK");
+}

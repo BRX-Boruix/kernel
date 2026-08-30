@@ -14,6 +14,10 @@ impl ipc::IpcTaskNotifier for KernelIpcNotifier {
         task::wake(pid);
     }
 
+    fn wake_process_with_value(&self, pid: usize, value: u64) {
+        task::wake_with_value(pid, value);
+    }
+
     /// 词汇表翻译：task 的 `SwitchOutcome` → ipc 的 `BlockOutcome`。
     /// 两侧各自拥有语义枚举、由本适配层一次性映射——bool 可无视的旧形状
     /// 不再跨任何 crate 边界（KA6）。

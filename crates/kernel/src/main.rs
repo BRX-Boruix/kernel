@@ -526,6 +526,9 @@ unsafe fn kmain_body() -> ! {
     // ADR-014 SYS_STREAM_CREATE FLAG_PIPE (0x11)：匿名管道端。
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_pipe();
+    // ADR-032 SYNC 域 (0x70)：通用 futex 等待/唤醒 syscall 验收。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_sync_syscalls();
     // ADR-014 SYS_ENTRY_READ (0x42)：标准紧凑 JSON 输出。
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_entry_read_json();

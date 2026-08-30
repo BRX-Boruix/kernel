@@ -71,6 +71,8 @@ pub mod domain {
     pub const DEVICE: u32 = 0x50;
     /// VOLUME 域（ADR-030 §决策6）：卷管理能力（挂/列/更/格/卸）。
     pub const VOLUME: u32 = 0x60;
+    /// SYNC 域（ADR-032 ACCEPTED）：跨进程同步字对象（通用 futex 等待/唤醒）。
+    pub const SYNC: u32 = 0x70;
 }
 
 pub mod op {
@@ -171,6 +173,17 @@ pub const SYS_VOLUME_LIST: u32 = nr(domain::VOLUME, op::READ); // 0x62
 pub const SYS_VOLUME_UPDATE: u32 = nr(domain::VOLUME, op::WRITE); // 0x63
 pub const SYS_VOLUME_FORMAT: u32 = nr(domain::VOLUME, op::FORMAT); // 0x65
 pub const SYS_VOLUME_UNMOUNT: u32 = nr(domain::VOLUME, op::UNMOUNT); // 0x66
+
+// ---------- 7. SYNC Domain (0x70, ADR-032 ACCEPTED) ----------
+/// `sync_create(init_value) -> sync_id`：创建内核同步字对象，初值 `init_value`。
+pub const SYS_SYNC_CREATE: u32 = nr(domain::SYNC, op::CREATE); // 0x71
+/// `sync_wait(sync_id, expected, timeout_ns)`：值 `== expected` 则阻塞；否则立即
+/// 返回当前值。唤醒/超时返回唤醒时当前值（ADR-032 §4.2）。
+pub const SYS_SYNC_WAIT: u32 = nr(domain::SYNC, op::READ); // 0x72
+/// `sync_wake(sync_id, value, n)`：设值为 `value`，唤醒至多 `n` 个等待者，返回实际唤醒数。
+pub const SYS_SYNC_WAKE: u32 = nr(domain::SYNC, op::WRITE); // 0x73
+/// `sync_delete(sync_id)`：销毁对象；仍有等待者返回 `Busy`。
+pub const SYS_SYNC_DELETE: u32 = nr(domain::SYNC, op::DELETE); // 0x74
 
 // ---------- ABI 打包（成功 / 错误） ----------
 
@@ -2037,6 +2050,70 @@ fn sys_volume_unmount(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
+// ---------- SYNC Domain (0x70, ADR-032 ACCEPTED) ----------
+
+/// 同步字对象/生命周期/值域校验/进程退出清理的**数据与状态**实现在 `ipc::sync_*`
+/// （ADR-032 §9：SYNC 表与 shm/pipe 同置 ipc crate）。本文件只保留薄 syscall 分发壳：
+/// 取值、边界校验（bit63）、阻塞/唤醒的平台翻译（arch frame + task 调度）由 ipc 侧
+/// 经 `IpcTaskNotifier`（ipc_init.rs 适配）完成，这里不再持任何同步字表。
+
+/// `sync_create(init_value) -> sync_id`（SYS_SYNC_CREATE / 0x71）。
+/// 创建进程即 owner（进程退出时经 `ipc::sync_release_process` 释放其 ref，S18）。
+fn sys_sync_create(frame: &mut SyscallFrame) -> u64 {
+    let init_value = frame.a1;
+    let owner = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+    match ipc::sync_create(init_value, owner) {
+        Ok(id) => pack_ok(id),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `sync_wait(sync_id, expected, timeout_ns)`（SYS_SYNC_WAIT / 0x72，可阻塞）。
+/// 可阻塞路径经 `ipc::sync_wait` 完成（调度锁内登记 + 复检 + 阻塞/切走）。
+fn sys_sync_wait(frame: &mut SyscallFrame) -> DispatchResult {
+    let id = frame.a1;
+    let expected = frame.a2;
+    let timeout_ns = frame.a3;
+    // 传原始 arch_frame 指针（usize）而非解引用：ipc 侧仅在真正阻塞/切换路径才读它
+    // （S21 契约：非切换路径不读 arch_frame）。
+    match ipc::sync_wait(frame.arch_frame, id, expected, timeout_ns) {
+        ipc::SyncWaitResult::Done(v) => done(pack_ok(v)),
+        ipc::SyncWaitResult::Switched => DispatchResult::Switched,
+        ipc::SyncWaitResult::WouldBlock => done(pack_err(Error::WouldBlock)),
+        ipc::SyncWaitResult::NotFound => done(pack_err(Error::NotFound)),
+        ipc::SyncWaitResult::InvalidParam => done(pack_err(Error::InvalidParam)),
+    }
+}
+
+/// `sync_wake(sync_id, value, n) -> n`（SYS_SYNC_WAKE / 0x73）。
+/// ipc 侧改值 + drain 等待者，本壳在表锁外逐个带值唤醒（锁序纪律同 pipe）。
+fn sys_sync_wake(frame: &mut SyscallFrame) -> u64 {
+    let id = frame.a1;
+    let value = frame.a2;
+    let n = frame.a3 as usize;
+    let (cnt, removed) = match ipc::sync_wake(id, value, n) {
+        Ok(x) => x,
+        Err(e) => return pack_err(e),
+    };
+    for w in &removed {
+        if w.timer != 0 {
+            let _ = klib::time::cancel_timeout(w.timer);
+        }
+        task::wake_with_value(w.pid, value);
+    }
+    pack_ok(cnt as u64)
+}
+
+/// `sync_delete(sync_id)`（SYS_SYNC_DELETE / 0x74）。
+/// refs 归零才真正移除（ADR-032 §4.4），仍有等待者返回 `Busy`。
+fn sys_sync_delete(frame: &mut SyscallFrame) -> u64 {
+    match ipc::sync_delete(frame.a1) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
+
 // ---------- 分发 ----------
 
 /// 分发结果：`Done(v)` = 正常返回值（写入 `frame.result`，架构层写回 rax 带
@@ -2106,6 +2183,13 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_VOLUME_UPDATE => done(sys_volume_update(frame)),
         SYS_VOLUME_FORMAT => done(sys_volume_format(frame)),
         SYS_VOLUME_UNMOUNT => done(sys_volume_unmount(frame)),
+
+        // SYNC Domain (0x70, ADR-032 ACCEPTED)
+        SYS_SYNC_CREATE => done(sys_sync_create(frame)),
+        // WAIT 可能阻塞切换（futex 阻塞），自带 DispatchResult 语义。
+        SYS_SYNC_WAIT => sys_sync_wait(frame),
+        SYS_SYNC_WAKE => done(sys_sync_wake(frame)),
+        SYS_SYNC_DELETE => done(sys_sync_delete(frame)),
 
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);
