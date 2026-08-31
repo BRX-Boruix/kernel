@@ -5502,6 +5502,224 @@ pub fn test_bench_ds32() {
 
     info!("[test-bench-ds32] PASS");
 }
+/// D-VFS1-R4 第一阶段 R4-1 / R4-2 / R4-4：真·物理大页直通读缓存——对象、页表映射证据、淘汰与一致性。
+///
+/// R4-1 大页直通对象：大块读取经 ORDER_2M 物理大页（HHDM 页表映射）取数，huge blocks 计数正确；
+/// R4-2 页表映射证据：物理帧 2MiB 对齐 + HHDM 别名经当前活动页表翻译回同一物理帧（证明非堆拷贝）；
+/// R4-4 淘汰与一致性：evict 归还物理大页、写穿作废受影响大页、失效后不串读。
+pub fn test_huge_page_direct_r4() {
+    use crate::vfs_init;
+    use alloc::vec::Vec;
+    use arch::phys_to_virt;
+    use arch::ActivePageTable;
+    use arch::VirtAddr;
+    use arch_x86_64::paging::X86PageTable;
+    use vfs::huge_page_cache::HugePageDirectCache;
+    use vfs::inode::Permissions;
+    use vfs::page_cache::{HUGE_PAGE_SIZE, READ_BULK_THRESHOLD_BYTES};
+
+    info!("[test-huge-r4] === D-VFS1-R4: physical huge-page direct cache (R4-1/R4-2/R4-4) ===");
+
+    // 构造 4MiB 已知模式文件（ramfs）：1024 块 × 4KiB = 4MiB，覆盖 2 个 2MiB 大页块。
+    let root = vfs_init::root();
+    let path = "/scratch/huge_r4.dat";
+    let node = root
+        .create_file(path, Permissions::read_write())
+        .expect("create file");
+    // 0xA5 = 文件基准数据模式（R4-1 读回校验）；4096 = 4KiB 块粒度。
+    let pattern = [0xA5u8; 4096];
+    // 1024 块 × 4096 = 4MiB（足够容纳 R4-4 的第二个 2MiB 块读取）。
+    for i in 0..1024 {
+        node.write_at((i * 4096) as u64, &pattern).expect("write chunk");
+    }
+
+    let cache = HugePageDirectCache::new();
+    let read_len = READ_BULK_THRESHOLD_BYTES; // 128KiB 大读
+
+    // ---- R4-1: 大读命中经大页映射取数；blocks 计数正确 ----
+    let mut buf = alloc::vec![0u8; read_len];
+    let n = cache
+        .read_cached(&node, 0, &mut buf)
+        .expect("huge alloc must succeed (R4-1)")
+        .expect("huge cached read");
+    assert_eq!(n, read_len, "big read returns full buffer");
+    for (i, b) in buf.iter().enumerate() {
+        assert_eq!(*b, 0xA5, "huge read data mismatch at {i}");
+    }
+    let s1 = cache.stats();
+    assert_eq!(s1.blocks, 1, "one huge block cached");
+    assert_eq!(s1.misses, 1, "first read is a miss");
+
+    // 二次同块读命中。
+    let n2 = cache
+        .read_cached(&node, 0, &mut buf)
+        .expect("huge alloc must succeed")
+        .expect("huge cached read hit");
+    assert_eq!(n2, read_len);
+    let s2 = cache.stats();
+    assert_eq!(s2.hits, 1, "second read hits");
+    assert_eq!(s2.blocks, 1, "still one block");
+
+    // ---- R4-2: 页表映射证据 ----
+    let phys = cache.frame_paddr(&node, 0).expect("cached block has phys frame");
+    // ORDER_2M 物理大页必须 2MiB 对齐。
+    assert_eq!(
+        phys & (HUGE_PAGE_SIZE as u64 - 1),
+        0,
+        "ORDER_2M frame is 2MiB aligned"
+    );
+    // HHDM 别名经当前活动页表翻译回同一物理帧 → 证明物理大页确实经页表映射。
+    let alias = phys_to_virt(phys);
+    let pt = X86PageTable::current();
+    let translated = pt
+        .translate(VirtAddr::new(alias))
+        .expect("HHDM alias must be mapped in active page table");
+    assert_eq!(
+        translated.as_u64(),
+        phys,
+        "HHDM alias maps back to same phys frame"
+    );
+    info!(
+        "[test-huge-r4] R4-2 evidence: phys={:#x} alias={:#x} translate_back={:#x}",
+        phys,
+        alias,
+        translated.as_u64()
+    );
+
+    // ---- R4-4a: 淘汰归还物理大页 ----
+    // 读第二个 2MiB 块，使 cache 有 2 块，再淘汰 1 块。
+    let n3 = cache
+        .read_cached(&node, HUGE_PAGE_SIZE as u64, &mut buf)
+        .expect("huge alloc must succeed")
+        .expect("read second block");
+    assert_eq!(n3, read_len);
+    assert_eq!(cache.stats().blocks, 2, "two blocks after second read");
+    let evicted = cache.evict(1);
+    assert_eq!(evicted, 1, "evict one block");
+    assert_eq!(cache.stats().blocks, 1, "one block after evict");
+
+    // ---- R4-4b: 写失效后命中不再串读 ----
+    // 写穿覆盖第一块（[0,4096)）为 0x3C，作废受影响大页（归还物理帧）。
+    // 0x3C = 覆盖新数据；4096 = 覆盖的前 4KiB 区域长度。
+    let new_data = [0x3Cu8; 4096];
+    cache.write_cached(&node, 0, &new_data).expect("write-through");
+    assert_eq!(cache.stats().blocks, 0, "affected huge block invalidated on write");
+    // 重新大读应拿到：前 4KiB = 0x3C（新数据），其后仍 = 0xA5（基准模式）——
+    // 若写失效未生效，会串读到陈旧 0xA5 全段，即 stale-read 回归。
+    let mut big_re = alloc::vec![0u8; READ_BULK_THRESHOLD_BYTES];
+    let nr = cache
+        .read_cached(&node, 0, &mut big_re)
+        .expect("huge alloc")
+        .expect("re-read");
+    assert_eq!(nr, READ_BULK_THRESHOLD_BYTES);
+    for (i, b) in big_re.iter().enumerate() {
+        // i < 4096 = 被 0x3C 覆盖的前 4KiB；其后区域仍为基准 0xA5。
+        let expect = if i < 4096 { 0x3C } else { 0xA5 };
+        assert_eq!(*b, expect, "stale-read regression at {i}");
+    }
+
+    info!("[test-huge-r4] PASS");
+}
+
+/// D-VFS1-R4 第一阶段 R4-3：物理大页直通 vs 堆缓冲分块缓存的冷/热读每读周期数对比。
+///
+/// 复用 D-S32 的 `klib::time::read_cycle_counter` 车辆；QEMU TCG 下 rdtsc 相对稳定，
+/// 断言热读不慢于冷读，并成文输出每读周期数（诚实边界：收益数据以实测为准，未宣称存在）。
+pub fn test_huge_page_bench_r43() {
+    use crate::vfs_init;
+    use klib::time::read_cycle_counter;
+    use vfs::huge_page_cache::HugePageDirectCache;
+    use vfs::inode::Permissions;
+    use vfs::page_cache::{PageCache, READ_BULK_THRESHOLD_BYTES, HUGE_PAGE_SIZE};
+
+    info!("[test-huge-bench-r43] === D-VFS1-R4: huge-page vs heap-cache cold/hot cycles ===");
+
+    // 8MiB 已知模式文件（ramfs）：2048 块 × 4KiB = 8MiB，覆盖 4 个独立 2MiB 块
+    // （offset 0/2/4/6 MiB），供冷读各自 miss、热读各自 hit。
+    let root = vfs_init::root();
+    let path = "/scratch/huge_bench_r43.dat";
+    let node = root
+        .create_file(path, Permissions::read_write())
+        .expect("create bench file");
+    // 0x7E = 基准文件数据模式；4096 = 4KiB 块粒度。
+    let pattern = [0x7Eu8; 4096];
+    for i in 0..2048 {
+        node.write_at((i * 4096) as u64, &pattern).expect("write bench");
+    }
+
+    let read_len = READ_BULK_THRESHOLD_BYTES;
+    // 4 = 独立 2MiB 块数（8MiB / 2MiB）；每块读一次冷、一次热。
+    let iters = 4u64;
+    let mut buf = alloc::vec![0u8; read_len];
+
+    // 堆缓冲分块缓存（既有 PageCache）
+    let heap = PageCache::new();
+    let heap_cold_start = read_cycle_counter();
+    for i in 0..iters {
+        let off = i * HUGE_PAGE_SIZE as u64;
+        heap.read_cached(&node, off, &mut buf).expect("heap cold");
+    }
+    let heap_cold_cycles = read_cycle_counter() - heap_cold_start;
+    let heap_hot_start = read_cycle_counter();
+    for i in 0..iters {
+        let off = i * HUGE_PAGE_SIZE as u64;
+        heap.read_cached(&node, off, &mut buf).expect("heap hot");
+    }
+    let heap_hot_cycles = read_cycle_counter() - heap_hot_start;
+
+    // 物理大页直通缓存
+    let huge = HugePageDirectCache::new();
+    let huge_cold_start = read_cycle_counter();
+    for i in 0..iters {
+        let off = i * HUGE_PAGE_SIZE as u64;
+        huge.read_cached(&node, off, &mut buf)
+            .expect("huge alloc must succeed")
+            .expect("huge cold");
+    }
+    let huge_cold_cycles = read_cycle_counter() - huge_cold_start;
+    let huge_hot_start = read_cycle_counter();
+    for i in 0..iters {
+        let off = i * HUGE_PAGE_SIZE as u64;
+        huge.read_cached(&node, off, &mut buf)
+            .expect("huge alloc must succeed")
+            .expect("huge hot");
+    }
+    let huge_hot_cycles = read_cycle_counter() - huge_hot_start;
+
+    // 时序断言容差化（审计 K4/S31）：冷读含 2MiB 块装载+分配，理应远慢于热读
+    // （后者仅 copy_out），故热读不慢于冷读是可靠的不变式；但 QEMU TCG 下 rdtsc
+    // 存在抖动，允许 ±1000 周期裕量（约等于几次 copy_out）以吸收噪声，同时仍能
+    // 捕获"缓存失效导致热读退化到冷读成本"的严重错误。
+    const TIMING_MARGIN: u64 = 1000;
+    assert!(
+        heap_hot_cycles <= heap_cold_cycles + TIMING_MARGIN,
+        "heap hot must not exceed cold (caching broken)"
+    );
+    assert!(
+        huge_hot_cycles <= huge_cold_cycles + TIMING_MARGIN,
+        "huge hot must not exceed cold (caching broken)"
+    );
+
+    info!(
+        "[test-huge-bench-r43] heap-cache : cold={} cycles, hot={} cycles (cycles/read cold={}, hot={})",
+        heap_cold_cycles, heap_hot_cycles, heap_cold_cycles / iters, heap_hot_cycles / iters
+    );
+    info!(
+        "[test-huge-bench-r43] huge-direct: cold={} cycles, hot={} cycles (cycles/read cold={}, hot={})",
+        huge_cold_cycles, huge_hot_cycles, huge_cold_cycles / iters, huge_hot_cycles / iters
+    );
+    info!(
+        "[test-huge-bench-r43] huge vs heap hot cycles/read ratio = {:.3}",
+        if heap_hot_cycles > 0 {
+            huge_hot_cycles as f64 / heap_hot_cycles as f64
+        } else {
+            0.0
+        }
+    );
+
+    info!("[test-huge-bench-r43] PASS");
+}
+
 
 /// M7.2 & M8.1：验证 Platform 平台基础驱动接入与 DriverHub 智能竞标打分（Early 串口、PS/2 键盘、CMOS RTC、伪设备、PCI Bidding）。
 pub fn test_driver_hub_m72() {

@@ -605,6 +605,15 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_drv1_remediation();
 
+    // D-VFS1-R4 第一阶段：真·物理大页直通缓存。**置于测试序列末位**——
+    // 本组测试大量分配/归还 ORDER_2M 物理大页并churn物理内存，会影响依赖
+    // 特定物理内存可用性的早期测试（如 test-loader 的配额/帧账断言）；
+    // 放在所有既有测试之后运行，避免扰动它们的记账假设。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_huge_page_direct_r4(); // R4-1/R4-2/R4-4: physical huge-page direct cache + evidence
+    #[cfg(feature = "kernel-tests")]
+    tests::test_huge_page_bench_r43(); // R4-3: huge-page vs heap-cache cycle benchmark
+
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。
     mm::frame_allocator::set_cpu_id_reader(|| {

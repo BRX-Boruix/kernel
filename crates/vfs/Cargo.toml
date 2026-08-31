@@ -4,5 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+arch = { path = "../arch/arch" }
 klib = { path = "../klib" }
+mm = { path = "../mm" }
 spin = "0.9"

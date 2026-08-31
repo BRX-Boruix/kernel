@@ -13,6 +13,7 @@ pub mod devfs;
 pub mod dynamic;
 pub mod file_handle;
 pub mod flock;
+pub mod huge_page_cache;
 pub mod inode;
 pub mod mount;
 pub mod page_cache;
@@ -34,6 +35,7 @@ pub use file_handle::OpenHandle;
 // 根再导出——调用方不应被要求钻进 file_handle 模块路径才能拼写类型。
 pub use file_handle::SeekWhence;
 pub use flock::{LockMode, LockOwner};
+pub use huge_page_cache::{HugeCacheStats, HugePageDirectCache};
 pub use inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
 pub use mount::MountTable;
 pub use page_cache::{
