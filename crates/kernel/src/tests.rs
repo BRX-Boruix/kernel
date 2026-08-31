@@ -6895,6 +6895,119 @@ pub fn test_loader_adversarial() {
 ///    写入父 saved.rax（含 64 位逐字节校验）、父置 Ready、waiting_for 清除；
 /// 7. waiting_for 独占期间通用 wake 必须无效（防提前唤醒带占位 rax 返回）；
 /// 8. 阻塞拒绝：无其他有效就绪进程时回滚登记并如实返回 WouldBlock（防自锁）。
+/// 信号机制前期工作验收（ADR-034 §2.1/§2.2 + §3.4 第 1-5 项，纯逻辑，返回主流程）。
+///
+/// 覆盖 ADR-034 §3.4 的宿主单测对应断言（本仓库 task crate 因依赖含 x86_64
+/// 内联汇编的 arch-x86_64 无法宿主 `cargo test`，按 ADR-033 先例改为 QEMU
+/// kernel-tests 实机断言，S06）：
+/// 1. `signal_set_math`：位图 set/clear/union/intersection、SIGKILL 不可清位；
+/// 2. `default_disposition_ok`：每信号默认动作查表正确（含越界兜底终止）；
+/// 3. `sigaction_rejects_kill`：对 SIGKILL 设 handler/ignore → InvalidParam；
+/// 4. `mask_unblock_sigkill_forced`：UNBLOCK 后 SIGKILL/SIGSTOP 仍强制置位；
+/// 5. `pending_priority`：同时投递多信号时取最低号（ADR-034 §2.4 决策成文）。
+///
+/// 纯逻辑、不 spawn 进程、不关中断，返回主流程继续启动。
+pub fn test_signal_foundation() {
+    use task::signal::{DefaultAction, SigDisposition, default_disposition, validate_disposition};
+    use task::signal_set::{NSIG, SignalSet};
+    use task::signals::{
+        SIGCHLD, SIGCONT, SIGINT, SIGKILL, SIGSEGV, SIGSTOP, SIGTERM, SIGUSR1,
+    };
+
+    info!("[test-signal] === ADR-034 前期工作: 信号集 + 默认处置 + 硬信号强制 ===");
+
+    // ---- 1. signal_set_math：set/clear/union/intersection + SIGKILL 不可清位 ----
+    let mut s = SignalSet::empty();
+    assert!(s.is_empty(), "empty set must be empty");
+    s.insert(SIGUSR1);
+    s.insert(SIGSEGV);
+    assert!(s.contains(SIGUSR1) && s.contains(SIGSEGV));
+    assert!(!s.contains(SIGTERM));
+
+    let u = s.union(SignalSet::of(SIGTERM));
+    assert!(u.contains(SIGUSR1) && u.contains(SIGSEGV) && u.contains(SIGTERM));
+
+    let i = s.intersection(SignalSet::of(SIGSEGV));
+    assert!(i.contains(SIGSEGV) && !i.contains(SIGUSR1));
+
+    let mut t = SignalSet::of(SIGUSR1).union(SignalSet::of(SIGTERM));
+    t.difference(SignalSet::of(SIGTERM));
+    assert!(t.contains(SIGUSR1) && !t.contains(SIGTERM));
+
+    let mut k = SignalSet::of(SIGKILL);
+    k.remove(SIGKILL);
+    assert!(k.contains(SIGKILL), "SIGKILL bit must be unremovable");
+    info!("[test-signal] 1/5 signal_set_math OK (SIGKILL unremovable)");
+
+    // ---- 2. default_disposition_ok：默认处置查表 ----
+    assert_eq!(default_disposition(SIGKILL), DefaultAction::Terminate);
+    assert_eq!(default_disposition(SIGSEGV), DefaultAction::Terminate);
+    assert_eq!(default_disposition(SIGTERM), DefaultAction::Terminate);
+    assert_eq!(default_disposition(SIGCHLD), DefaultAction::Ignore);
+    assert_eq!(default_disposition(SIGCONT), DefaultAction::Cont);
+    assert_eq!(default_disposition(SIGSTOP), DefaultAction::Stop);
+    assert_eq!(default_disposition(NSIG), DefaultAction::Terminate); // 越界兜底终止
+    info!("[test-signal] 2/5 default_disposition OK");
+
+    // ---- 3. sigaction_rejects_kill：硬信号不可设 handler/ignore ----
+    assert!(validate_disposition(SIGKILL, SigDisposition::Handler(0x1234)).is_err());
+    assert!(validate_disposition(SIGKILL, SigDisposition::Ignore).is_err());
+    assert!(validate_disposition(SIGKILL, SigDisposition::Default).is_ok());
+    assert!(validate_disposition(SIGUSR1, SigDisposition::Handler(0x1234)).is_ok());
+    info!("[test-signal] 3/5 sigaction_rejects_kill OK");
+
+    // ---- 4. mask_unblock_sigkill_forced：UNBLOCK 后硬信号仍强制置位 ----
+    let mut blocked = SignalSet::empty();
+    blocked.insert(SIGUSR1);
+    blocked.remove(SIGUSR1);
+    let forced = blocked.force_hard();
+    assert!(!forced.contains(SIGUSR1));
+    assert!(forced.contains(SIGKILL), "SIGKILL must stay in mask");
+    assert!(forced.contains(SIGSTOP), "SIGSTOP must stay in mask");
+    info!("[test-signal] 4/5 mask_unblock_sigkill_forced OK");
+
+    // ---- 5. pending_priority：投递取最低号（ADR-034 §2.4 决策成文）----
+    // 取号策略单点定义于 SignalSet::lowest_pending（S13，S3 整改），测试经此验证。
+    let mut pending = SignalSet::empty();
+    pending.insert(SIGSEGV); // 11
+    pending.insert(SIGUSR1); // 10
+    pending.insert(SIGINT);  // 2
+    assert_eq!(pending.lowest_pending(), Some(SIGINT), "lowest pending signal is SIGINT=2");
+    pending.remove(SIGINT);
+    assert_eq!(pending.lowest_pending(), Some(SIGUSR1), "next lowest is SIGUSR1=10");
+    pending.remove(SIGUSR1);
+    assert_eq!(pending.lowest_pending(), Some(SIGSEGV), "next lowest is SIGSEGV=11");
+    assert_eq!(SignalSet::empty().lowest_pending(), None, "empty set has no lowest");
+    info!("[test-signal] 5/5 pending_priority OK (SignalSet::lowest_pending)");
+
+    // ---- 6. difference 不变量（S2 整改）：SIGKILL 不可清除，但也不伪造置位 ----
+    let mut no_kill = SignalSet::of(SIGUSR1);
+    no_kill.difference(SignalSet::of(SIGKILL));
+    assert!(!no_kill.contains(SIGKILL), "difference must NOT force-add SIGKILL (S07/S09)");
+    assert!(no_kill.contains(SIGUSR1), "difference must preserve other bits");
+    let mut with_kill = SignalSet::of(SIGKILL).union(SignalSet::of(SIGUSR1));
+    with_kill.difference(SignalSet::of(SIGKILL));
+    assert!(with_kill.contains(SIGKILL), "difference must not clear existing SIGKILL");
+    assert!(with_kill.contains(SIGUSR1), "unrelated bits preserved");
+    info!("[test-signal] 6/6 difference SIGKILL invariant OK");
+
+    // ---- 7. validate_disposition 越界拒绝（S4 整改）：sig >= NSIG -> OutOfRange ----
+    assert_eq!(
+        validate_disposition(NSIG, SigDisposition::Default),
+        Err(klib::error::Error::OutOfRange),
+        "out-of-range signal must be rejected with OutOfRange"
+    );
+    assert_eq!(
+        validate_disposition(NSIG + 1, SigDisposition::Handler(0x1)),
+        Err(klib::error::Error::OutOfRange),
+        "over-limit signal must be OutOfRange"
+    );
+    assert!(validate_disposition(SIGUSR1, SigDisposition::Default).is_ok());
+    info!("[test-signal] 7/7 validate_disposition out-of-range rejection OK");
+
+    info!("[test-signal] === ADR-034 前期工作全部通过（返回主流程继续启动）===");
+}
+
 pub fn test_waitpid_core() {
     use klib::error::Error;
     use task::TaskState;

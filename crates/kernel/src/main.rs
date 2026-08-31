@@ -566,6 +566,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_ata_tail_probe();
 
+    // ADR-034 前期工作：信号集 + 默认处置 + 硬信号强制（纯逻辑，返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_signal_foundation();
+
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();

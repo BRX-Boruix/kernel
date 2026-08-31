@@ -11,6 +11,8 @@ extern crate alloc;
 
 pub mod process;
 pub mod scheduler;
+pub mod signal;
+pub mod signal_set;
 pub mod signals;
 
 pub use process::{
@@ -26,6 +28,9 @@ pub use scheduler::{
 };
 #[cfg(feature = "kernel-tests")]
 pub use scheduler::test_hooks;
+pub use signal::{DefaultAction, SigDisposition, default_disposition, is_hard_signal, validate_disposition};
+pub use signal_set::{FORCED, NSIG, SignalSet};
 pub use signals::{
-    SIGBUS, SIGFPE, SIGILL, SIGKILL, SIGSEGV, SIGTERM, signal_for_exception, signal_name,
+    SIGALRM, SIGBUS, SIGCHLD, SIGCONT, SIGFPE, SIGILL, SIGINT, SIGKILL, SIGPIPE, SIGSEGV,
+    SIGSTOP, SIGTERM, SIGUSR1, SIGUSR2, signal_for_exception, signal_name,
 };
