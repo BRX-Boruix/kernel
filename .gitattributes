@@ -1,0 +1,6 @@
+# BORUIX kernel repo 行尾规范（S04/S05）：Rust 源码统一 LF。
+# 覆盖全局 core.autocrlf=true，防止 CRLF 污染工作区/引入伪 diff。
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*      text=auto

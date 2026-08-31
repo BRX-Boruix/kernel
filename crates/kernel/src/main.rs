@@ -534,6 +534,13 @@ unsafe fn kmain_body() -> ! {
     tests::test_identity_inherit();
     #[cfg(feature = "kernel-tests")]
     tests::test_perm_system_only();
+    // R6 flock：冲突矩阵 + close 自动释放（ADR-014 承诺）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_flock_matrix();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_flock_close_release();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_flock_syscall();
     // ADR-014 SYS_ENTRY_READ (0x42)：标准紧凑 JSON 输出。
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_entry_read_json();

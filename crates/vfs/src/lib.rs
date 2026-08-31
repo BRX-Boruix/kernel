@@ -12,6 +12,7 @@ extern crate alloc;
 pub mod devfs;
 pub mod dynamic;
 pub mod file_handle;
+pub mod flock;
 pub mod inode;
 pub mod mount;
 pub mod page_cache;
@@ -32,6 +33,7 @@ pub use file_handle::OpenHandle;
 // M12（ADR-023 §5）：SeekWhence 是句柄 seek 契约的公共枚举，随 crate
 // 根再导出——调用方不应被要求钻进 file_handle 模块路径才能拼写类型。
 pub use file_handle::SeekWhence;
+pub use flock::{LockMode, LockOwner};
 pub use inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
 pub use mount::MountTable;
 pub use page_cache::{

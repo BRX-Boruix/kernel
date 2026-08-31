@@ -104,6 +104,9 @@ pub const SYS_STREAM_CLOSE: u32 = nr(domain::STREAM, op::DELETE); // 0x14
 /// 方案 A，fd 重定向）。副本与原句柄共享文件描述/管道端；管道端引用计数由
 /// 本路径同步 `ipc::pipe_ref_inc`。
 pub const SYS_STREAM_DUP: u32 = nr(domain::STREAM, 0x05); // 0x15
+/// STREAM 域扩展动词：flock 文件锁（ADR-014 / ADR-033 A2-1 R6）。
+/// a1=fd, a2=cmd（0=LOCK_SH, 1=LOCK_EX, 2=UNLOCK）。
+pub const SYS_STREAM_LOCK: u32 = nr(domain::STREAM, 0x06); // 0x16
 
 /// STREAM read/write 的顺序 I/O 哨兵值。
 ///
@@ -564,6 +567,33 @@ fn sys_close(frame: &mut SyscallFrame) -> u64 {
         }
         Some(vfs::file_handle::OpenHandle::File(_)) => pack_ok(0),
         None => pack_err(Error::NotFound),
+    }
+}
+
+/// flock 文件锁（SYS_STREAM_LOCK, 0x16，ADR-014 / ADR-033 A2-1 R6）。
+///
+/// a1=fd, a2=cmd（0=LOCK_SH, 1=LOCK_EX, 2=UNLOCK）。advisory：冲突返回 Busy，
+/// 不阻塞；不阻断无锁读写。锁按调用者 uid（ProcessIdentity.uid）登记，是
+/// flock 的**唯一生产加锁入口**（K1：syscall 层真链路，非仅测试温室）。
+fn sys_flock(frame: &mut SyscallFrame) -> u64 {
+    let fd = frame.a1 as usize;
+    let cmd = frame.a2;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let uid = proc.identity().uid;
+    let Some(vfs::file_handle::OpenHandle::File(fh)) = proc.get_fd(fd) else {
+        return pack_err(Error::NotFound); // fd 缺失或 pipe 端（flock 仅文件）
+    };
+    let owner = vfs::flock::LockOwner { uid };
+    match cmd {
+        0 => vfs::flock::flock_lock(&fh.inode, owner, false).map_or_else(pack_err, |_| pack_ok(0)),
+        1 => vfs::flock::flock_lock(&fh.inode, owner, true).map_or_else(pack_err, |_| pack_ok(0)),
+        2 => {
+            vfs::flock::flock_unlock(&fh.inode, owner);
+            pack_ok(0)
+        }
+        _ => pack_err(Error::InvalidParam),
     }
 }
 
@@ -2222,6 +2252,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_STREAM_WRITE => done(sys_write(frame)),
         SYS_STREAM_CLOSE => done(sys_close(frame)),
         SYS_STREAM_DUP => done(sys_dup2(frame)),
+        SYS_STREAM_LOCK => done(sys_flock(frame)),
 
         // MEMORY Domain (0x20)
         SYS_MEMORY_MAP => done(sys_mmap(frame)),

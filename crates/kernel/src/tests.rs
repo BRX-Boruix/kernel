@@ -8270,4 +8270,236 @@ pub fn test_perm_system_only() {
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-perm-system-only] PASS");
 }
+/// R6 flock 冲突矩阵（ADR-014 承诺 / todo.md D-VFS1-R6）。
+pub fn test_flock_matrix() {
+    use vfs::flock::{flock_lock, flock_release_all_for_owner, flock_unlock};
+    use vfs::LockOwner;
+
+    info!("[test-flock-matrix] === R6 flock conflict matrix ====");
+
+    let inode = crate::vfs_init::root()
+        .create_file("/scratch/flock_a.txt", vfs::inode::Permissions::read_write())
+        .expect("create flock test inode");
+    // 复位 uid=0 的残留锁（隔离本测试；K7）。
+    flock_release_all_for_owner(0);
+
+    // 三个互斥 owner（K7）：1/2/3 为不同 uid，模拟跨进程锁冲突矩阵。
+    let o1 = LockOwner { uid: 1 };
+    let o2 = LockOwner { uid: 2 };
+    let o3 = LockOwner { uid: 3 };
+
+    assert!(flock_lock(&inode, o1, false).is_ok(), "S+S(1) OK");
+    assert!(flock_lock(&inode, o2, false).is_ok(), "S+S(2) OK");
+    assert!(flock_lock(&inode, o1, false).is_ok(), "re-lock same owner OK");
+    assert_eq!(
+        flock_lock(&inode, o3, true),
+        Err(klib::error::Error::Busy),
+        "Shared held, new Exclusive must Busy"
+    );
+    // K2：同 owner 升级 Shared→Exclusive，而其他 owner（o2）仍持 Shared——必须 Busy，
+    // 否则 Exclusive 与 Shared 并存破坏互斥（旧实现直接改 mode 漏检）。
+    assert_eq!(
+        flock_lock(&inode, o1, true),
+        Err(klib::error::Error::Busy),
+        "upgrade to Exclusive while another owner holds Shared must Busy"
+    );
+    // 同 owner 降级（Exclusive→Shared 在此为恒真）：o1 仍是 Shared，请求 Shared 幂等。
+    assert!(flock_lock(&inode, o1, false).is_ok(), "re-lock same mode idempotent");
+    flock_unlock(&inode, o2);
+    // o2 释放后，o1 升级 Shared→Exclusive 成功。
+    assert!(flock_lock(&inode, o1, true).is_ok(), "upgrade after other owner released OK");
+    // 降级 Exclusive→Shared 恒成功。
+    assert!(flock_lock(&inode, o1, false).is_ok(), "downgrade Exclusive->Shared OK");
+    // 复位：o1 又降回 Shared，放回原流程（此刻表内仅 o1 Shared + o3 无锁）。
+    assert_eq!(
+        flock_lock(&inode, o3, true),
+        Err(klib::error::Error::Busy),
+        "one Shared still held, Exclusive must Busy"
+    );
+    flock_unlock(&inode, o1);
+    assert!(flock_lock(&inode, o3, true).is_ok(), "Exclusive after all Shared released OK");
+    assert_eq!(
+        flock_lock(&inode, o1, true),
+        Err(klib::error::Error::Busy),
+        "Exclusive held, new Exclusive must Busy"
+    );
+    assert_eq!(
+        flock_lock(&inode, o2, false),
+        Err(klib::error::Error::Busy),
+        "Exclusive held, new Shared must Busy"
+    );
+    flock_unlock(&inode, o3);
+    assert!(flock_lock(&inode, o1, false).is_ok(), "Shared after Exclusive released OK");
+
+    // 清理本测试的锁，避免污染后续用例（K7）。
+    flock_release_all_for_owner(0);
+    info!("[test-flock-matrix] PASS");
+}
+
+/// R6 flock close 自动释放（Process::close_fd 钩子）。
+pub fn test_flock_close_release() {
+    use task::{Privilege, Process, ProcessIdentity};
+    use vfs::file_handle::{FileHandle, OpenFlags, OpenHandle};
+    use vfs::flock::{flock_lock, flock_unlock};
+    use vfs::LockOwner;
+    use mm::user_space::UserAddressSpace;
+    use arch_x86_64::paging::X86PageTable;
+
+    info!("[test-flock-close] === R6 flock close auto-release ====");
+
+    // 测试身份（K7 命名化）：UID_LOCKER 为持锁进程，UID_OTHER 为冲突方。
+    // pid 999 是隔离的测试进程号（不与调度器真实 pid 冲突）。
+    const UID_LOCKER: u32 = 7;
+    const UID_OTHER: u32 = 8;
+
+    let inode = crate::vfs_init::root()
+        .create_file("/scratch/flock_b.txt", vfs::inode::Permissions::read_write())
+        .expect("create flock close inode");
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = UserAddressSpace::<X86PageTable>::new().expect("addr space");
+    let mut proc = Process::new(999, 0, 0, 0, addr_space);
+    proc.set_identity(ProcessIdentity { uid: UID_LOCKER, privilege: Privilege::User });
+
+    let fh = FileHandle::new(inode.clone(), OpenFlags::READ_ONLY).expect("open handle");
+    let fd = proc.alloc_fd(OpenHandle::File(fh)).expect("alloc fd");
+    let owner = LockOwner { uid: UID_LOCKER };
+
+    assert!(flock_lock(&inode, owner, true).is_ok(), "owner takes Exclusive");
+    assert_eq!(
+        flock_lock(&inode, LockOwner { uid: UID_OTHER }, true),
+        Err(klib::error::Error::Busy),
+        "other owner blocked before close"
+    );
+
+    let closed = proc.close_fd(fd);
+    assert!(closed.is_some(), "close_fd returns the handle");
+
+    assert!(flock_lock(&inode, LockOwner { uid: UID_OTHER }, true).is_ok(), "released after close");
+    flock_unlock(&inode, LockOwner { uid: UID_OTHER });
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-flock-close] PASS");
+}
+
+/// R6 flock 生产 syscall 链路（K1：SYS_STREAM_LOCK 真实入口，非仅测试温室）。
+pub fn test_flock_syscall() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Process, ProcessIdentity};
+    use vfs::inode::Permissions;
+
+    info!("[test-flock-syscall] === R6 flock production syscall ====");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3,
+            a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0,
+        }
+    }
+
+    const OPEN_READ: u64 = 1 << 0;
+    const OPEN_WRITE: u64 = 1 << 1;
+    const LOCK_EX: u64 = 1;
+    const LOCK_UN: u64 = 2;
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+    // 测试身份 uid（K7 命名化）：7/8 为两个不同 owner，模拟跨进程锁冲突。
+    const UID_A: u32 = 7;
+    const UID_B: u32 = 8;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // 建真实文件 + 映射一块用户内存放路径串。
+    crate::vfs_init::root().create_file("/scratch/flock_sys.txt", Permissions::read_write())
+        .expect("create flock syscall inode");
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x3000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
+    let base = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space_mut().handle_page_fault(base, arch_x86_64::paging::PageFaultCode::new(0));
+        p.addr_space_mut().handle_page_fault(base + 0x1000, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let path = b"/scratch/flock_sys.txt\x00";
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space().translate(arch::VirtAddr::new(base)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(path.as_ptr(), (pa + off) as *mut u8, path.len());
+    }
+
+    // uid=7 打开并取独占锁。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity { uid: UID_A, privilege: task::Privilege::User });
+    }
+    let mut op = frame(crate::syscall::SYS_STREAM_CREATE, base, OPEN_READ | OPEN_WRITE, 0);
+    assert!(crate::syscall::syscall_entry(&mut op));
+    assert!(op.result & ERR_FLAG == 0, "open must succeed");
+    let fd_a = op.result;
+    let mut lk1 = frame(crate::syscall::SYS_STREAM_LOCK, fd_a, LOCK_EX, 0);
+    assert!(crate::syscall::syscall_entry(&mut lk1));
+    assert!(lk1.result & ERR_FLAG == 0, "LOCK_EX must succeed");
+    // 同 owner 重锁幂等（K2 回归）。
+    let mut lk2 = frame(crate::syscall::SYS_STREAM_LOCK, fd_a, LOCK_EX, 0);
+    assert!(crate::syscall::syscall_entry(&mut lk2));
+    assert!(lk2.result & ERR_FLAG == 0, "same-owner re-LOCK_EX idempotent");
+    info!("[test-flock-syscall] uid=7 LOCK_EX fd={} OK", fd_a);
+
+    // uid=8 打开同文件，LOCK_EX 必须 Busy（跨 uid 冲突，真实 syscall 路径）。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity { uid: UID_B, privilege: task::Privilege::User });
+    }
+    let mut op2 = frame(crate::syscall::SYS_STREAM_CREATE, base, OPEN_READ | OPEN_WRITE, 0);
+    assert!(crate::syscall::syscall_entry(&mut op2));
+    assert!(op2.result & ERR_FLAG == 0, "second open must succeed");
+    let fd_b = op2.result;
+    let mut lk3 = frame(crate::syscall::SYS_STREAM_LOCK, fd_b, LOCK_EX, 0);
+    assert!(crate::syscall::syscall_entry(&mut lk3));
+    assert!(lk3.result & ERR_FLAG != 0, "uid=8 LOCK_EX while uid=7 holds must Busy");
+    info!("[test-flock-syscall] uid=8 LOCK_EX blocked by uid=7 -> Busy OK");
+
+    // uid=7 释放（UNLOCK），uid=8 再取独占锁成功。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity { uid: UID_A, privilege: task::Privilege::User });
+    }
+    let mut ul = frame(crate::syscall::SYS_STREAM_LOCK, fd_a, LOCK_UN, 0);
+    assert!(crate::syscall::syscall_entry(&mut ul));
+    assert!(ul.result & ERR_FLAG == 0, "UNLOCK must succeed");
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity { uid: UID_B, privilege: task::Privilege::User });
+    }
+    let mut lk4 = frame(crate::syscall::SYS_STREAM_LOCK, fd_b, LOCK_EX, 0);
+    assert!(crate::syscall::syscall_entry(&mut lk4));
+    assert!(lk4.result & ERR_FLAG == 0, "uid=8 LOCK_EX after uid=7 unlock must succeed");
+    info!("[test-flock-syscall] uid=8 LOCK_EX after unlock OK");
+
+    // 清理：关 fd + 复位当前进程。
+    let mut c1 = frame(crate::syscall::SYS_STREAM_CLOSE, fd_a, 0, 0);
+    crate::syscall::syscall_entry(&mut c1);
+    let mut c2 = frame(crate::syscall::SYS_STREAM_CLOSE, fd_b, 0, 0);
+    crate::syscall::syscall_entry(&mut c2);
+    task::clear_current_proc();
+    // 回收测试进程（`set_current_proc` 的配对；unsafe 还原裸指针）。
+    unsafe { let _ = Box::from_raw(proc_raw); }
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-flock-syscall] PASS");
+}
+
+
 

@@ -1244,7 +1244,9 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
     let outcome = if !parent_reapable(s, ppid) {
         driver::uio_on_process_exit(pid);
         ipc::sync_release_process(pid);
+        // R6 flock（K3）：进程回收时释放其持有的全部锁，杜绝锁表泄漏。
         if let Some(e) = s.procs[pid].take() {
+            vfs::flock::flock_release_all_for_owner(e.proc.identity().uid);
             retire_entry(e);
         }
         Termination::Reclaimed
@@ -1252,7 +1254,9 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
         s.ready.push_back(ppid);
         driver::uio_on_process_exit(pid);
         ipc::sync_release_process(pid);
+        // R6 flock（K3）：进程回收时释放其持有的全部锁，杜绝锁表泄漏。
         if let Some(e) = s.procs[pid].take() {
+            vfs::flock::flock_release_all_for_owner(e.proc.identity().uid);
             retire_entry(e);
         }
         Termination::DeliveredToParent
@@ -1267,7 +1271,9 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
         if orphan_zombie {
             driver::uio_on_process_exit(i);
             ipc::sync_release_process(i);
+            // R6 flock（K3）：孤儿 zombie 回收时释放其持有的全部锁。
             if let Some(e) = s.procs[i].take() {
+                vfs::flock::flock_release_all_for_owner(e.proc.identity().uid);
                 retire_entry(e);
             }
         }

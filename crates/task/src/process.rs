@@ -283,7 +283,14 @@ impl<PT: PageTable> Process<PT> {
     /// 关闭并移除指定 fd 句柄。
     pub fn close_fd(&mut self, fd: usize) -> Option<vfs::file_handle::OpenHandle> {
         if fd < self.fd_table.len() {
-            self.fd_table[fd].take()
+            let handle = self.fd_table[fd].take();
+            if let Some(vfs::file_handle::OpenHandle::File(fh)) = &handle {
+                vfs::flock::flock_unlock(
+                    &fh.inode,
+                    vfs::flock::LockOwner { uid: self.identity.uid },
+                );
+            }
+            handle
         } else {
             None
         }
