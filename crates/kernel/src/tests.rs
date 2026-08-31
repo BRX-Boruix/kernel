@@ -3884,6 +3884,84 @@ pub fn test_syscall_pipe() {
         "FLAG_PIPE with non-empty path must be InvalidParam"
     );
 
+    // 4.5 无界缓冲（ipc1 同期修复）：写 >PIPE_CAPACITY(4096B) 到管道再读回。
+    // 顺序模型下旧实现写满 4096B 缓冲即阻塞死锁；现缓冲无界，写者一次产出
+    // 全部数据、后段再读。用 6000B（跨两页）验证 >4096 的单次写读往返无损。
+    {
+        // 用 8KB 映射区（base..base+0x2000）填充可辨识模式：字节 = 索引 mod 251。
+        let pattern_len = 6000usize;
+        unsafe {
+            let off_mask = arch::PageSize::Size4K.bytes() - 1;
+            for i in 0..pattern_len {
+                let pa = task::current_proc_mut()
+                    .expect("proc")
+                    .addr_space()
+                    .translate(arch::VirtAddr::new(base + i as u64))
+                    .expect("resident")
+                    .as_u64();
+                // translate 返回页基物理地址，须补页内偏移才能落到 base+i。
+                let phys = pa + ((i as u64) & off_mask);
+                core::ptr::write((phys + off) as *mut u8, (i % 251) as u8);
+            }
+        }
+        let mut big_w = pipe_frame(
+            crate::syscall::SYS_STREAM_WRITE,
+            write_fd as u64,
+            base as u64,
+            pattern_len as u64,
+            STREAM_OFFSET_CURRENT,
+        );
+        assert!(crate::syscall::syscall_entry(&mut big_w));
+        assert_eq!(
+            big_w.result, pattern_len as u64,
+            "unbounded pipe write must deliver all >PIPE_CAPACITY bytes"
+        );
+        let mut big_r = pipe_frame(
+            crate::syscall::SYS_STREAM_READ,
+            read_fd as u64,
+            base as u64,
+            pattern_len as u64,
+            STREAM_OFFSET_CURRENT,
+        );
+        assert!(crate::syscall::syscall_entry(&mut big_r));
+        assert_eq!(
+            big_r.result, pattern_len as u64,
+            "unbounded pipe read must deliver all bytes"
+        );
+        // 读回校验：内容与写入模式一致（逐字节比对）。
+        let mut mismatch = None;
+        unsafe {
+            let off_mask = arch::PageSize::Size4K.bytes() - 1;
+            for i in 0..pattern_len {
+                let pa = task::current_proc_mut()
+                    .expect("proc")
+                    .addr_space()
+                    .translate(arch::VirtAddr::new(base + i as u64))
+                    .expect("resident")
+                    .as_u64();
+                // 同填充：translate 返回页基 PA，须补页内偏移。
+                let phys = pa + ((i as u64) & off_mask);
+                let b = core::ptr::read((phys + off) as *const u8);
+                if b != (i % 251) as u8 {
+                    mismatch = Some((i, b));
+                    break;
+                }
+            }
+        }
+        match mismatch {
+            None => {}
+            Some((i, got)) => {
+                let want = (i % 251) as u8;
+                klib::warn!(
+                    "[test-syscall-pipe] mismatch at i={} got={:#x} want={:#x}",
+                    i, got, want
+                );
+                assert!(false, "pipe >4096B round-trip content mismatch");
+            }
+        }
+        info!("[test-syscall-pipe] unbounded >PIPE_CAPACITY round-trip OK ({} bytes)", pattern_len);
+    }
+
     // 5. 关闭两 fd → refcount 归零销毁 → 后续读 NotFound。
     let mut c1 = pipe_frame(crate::syscall::SYS_STREAM_CLOSE, write_fd as u64, 0, 0, 0);
     assert!(crate::syscall::syscall_entry(&mut c1));

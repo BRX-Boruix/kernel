@@ -48,12 +48,16 @@ use arch_x86_64::interrupts::InterruptFrame;
 use klib::error::Error;
 use klib::sync::irq::IrqSpinLock;
 
-/// 管道默认容量（字节，环形缓冲）。
+/// 管道单轮搬运的切块上限（字节，非总容量）。
 ///
 /// 为什么是 4096：与单页粒度一致——管道数据通常伴随页对齐的用户缓冲流动，
-/// 容量取页大小使"单次写满管道"与"单次校验页数"同为 1 页量级；亦与 Linux
-/// pipe buffer 的页粒度传统一致。容量不是并发上限（那是 [`MAX_PIPE_WAITERS`]），
-/// 只影响单轮搬运的切块大小（ipc1 ID1 选择理由成文）。
+/// 切块取页大小使"单次写满一页"与"单次校验一页数"同为 1 页量级；亦与 Linux
+/// pipe buffer 的页粒度传统一致。
+///
+/// **非总容量**：ipc1 同期修复后管道缓冲为**无界**（`pipe.buf` 按需增长），
+/// 写者绝不因"缓冲满"阻塞——彻底移除顺序管道模型下中间段写满 4096B 即
+/// 死锁的限制（shell `A | B | C` 可流通任意大中间数据）。单轮 staging 拷贝仍
+/// 以 4096B 为界（B2 有界上限纪律），故本常量保留为每轮切块上限。
 pub const PIPE_CAPACITY: usize = 4096;
 
 /// 单次用户范围校验的字节上限（S13：抽取散落魔法字面量）。与 syscall 层
@@ -518,7 +522,7 @@ fn write_registrant<'a>(
             Some(pipe) => register_waiter(
                 &mut pipe.write_waiters,
                 pid,
-                pipe.buf.len() < PIPE_CAPACITY,
+                true, // 无界缓冲：写方向恒有空位（ipc1 同期修复，顺序模型写者不因容量阻塞）
                 ready,
             ),
             None => false,
@@ -579,8 +583,12 @@ pub fn pipe_write<PT: arch::PageTable>(
             if len == 0 {
                 return Ok(0);
             }
-            let free = PIPE_CAPACITY - pipe.buf.len();
-            let chunk = free.min(len - written);
+            // 无界缓冲（ipc1 同期修复）：chunk 仅受单轮 staging 大小
+            // （PIPE_CAPACITY）约束，**总量不受缓冲容量限制**——顺序管道模型下
+            // 写者绝不会因"缓冲满"阻塞（彻底移除 PIPE_CAPACITY 顺序死锁限制）。
+            // 读端仍是按需排空；无界仅在顺序模型下成立，见 docs/adr/pipe 同期记录。
+            let remaining = len - written;
+            let chunk = remaining.min(PIPE_CAPACITY);
             if chunk > 0 {
                 validate_user_range(
                     space,
@@ -616,8 +624,14 @@ pub fn pipe_write<PT: arch::PageTable>(
         for w in wake_readers {
             wake_proc(w);
         }
+        // 无界缓冲下，只要还有剩余字节（written < len）本轮必已写入 chunk>0，
+        // 直接续写，绝不因"缓冲满"登记阻塞（顺序模型写者一次性产出全部数据）。
+        if written < len {
+            continue;
+        }
         // R6-F2：ready 置位 = 登记点复检发现唤醒条件已满足（主循环检查之后、
         // 登记之前被唤醒方翻转）——直接重试，绝不带"条件已真"的认知入睡。
+        // （此路径仅在 chunk==0 的理论不可达情形下命中，保留作防御回退。）
         let mut ready = false;
         let outcome = {
             let mut register = write_registrant(id, pid, &mut ready);
@@ -650,30 +664,38 @@ pub fn pipe_read<PT: arch::PageTable>(
 ) -> Result<u64, Error> {
     let pid = current_pid();
     let len = len as usize;
+    let mut total = 0usize;
     loop {
+        let mut writers = Vec::new();
+        let mut consumed = false;
         {
             let mut table = PIPE_TABLE.lock();
             let Some(pipe) = table.get_mut(&id) else {
+                // 管道已消失：若已读回部分数据则如实交付，否则 NotFound。
+                if total > 0 {
+                    return Ok(total as u64);
+                }
                 return Err(Error::NotFound);
             };
             if len == 0 {
                 return Ok(0);
             }
-            let chunk = pipe.buf.len().min(len);
-            if chunk > 0 {
+            let avail = pipe.buf.len();
+            if avail > 0 {
+                // 单轮 chunk 受 staging 大小（PIPE_CAPACITY）约束（ipc1 同期修复：
+                // 无界缓冲下 buf 可超 4096B，旧实现 chunk=buf.len() 会溢出 staging）。
+                // 循环搬运直到填满 len 或缓冲排空。
+                let chunk = avail.min(len - total).min(PIPE_CAPACITY);
                 // 校验先行：校验失败时缓冲零消费，语义与"读未发生"一致。
                 validate_user_range(
                     space,
-                    dst,
+                    dst + total as u64,
                     chunk,
                     mm::user_space::UserAccess::Write,
                 )?;
-                // S20/S09：不得在交付证明前消费共享缓冲。旧实现先 pop 进
-                // staging、再 drop 表锁、最后 copy_to_user——若拷贝在验证与
-                // 拷贝之间因页面换出触发故障，已消费的 pipe 字节即丢失。
-                // 修复：**锁内**先做不可故障的拷贝（validate_user_range 已
-                // 使目标页驻留，属"无内核态 #PF"契约路径），成功后才 pop
-                // 消费——数据交付与消费原子，杜绝"已消费但拷贝失败"丢失。
+                // S20/S09：不得在交付证明前消费共享缓冲。锁内先做不可故障的拷贝
+                // （validate_user_range 已使目标页驻留，属"无内核态 #PF"契约路径），
+                // 成功后才 pop 消费——数据交付与消费原子，杜绝"已消费但拷贝失败"丢失。
                 let mut staging = [0u8; PIPE_CAPACITY];
                 for (out, src) in staging
                     .iter_mut()
@@ -683,20 +705,36 @@ pub fn pipe_read<PT: arch::PageTable>(
                     *out = *src;
                 }
                 unsafe {
-                    arch_x86_64::mmio::copy_to_user(dst, staging.as_ptr(), chunk)
+                    arch_x86_64::mmio::copy_to_user(dst + total as u64, staging.as_ptr(), chunk)
                 };
                 // 拷贝成功（契约保证不 fault）后才消费缓冲。
                 for _ in 0..chunk {
                     pipe.buf.pop_front();
                 }
+                total += chunk;
+                consumed = true;
                 // 先收集后唤醒（同 write），唤醒在表锁之外。
-                let writers = core::mem::take(&mut pipe.write_waiters);
-                drop(table);
-                for w in writers {
-                    wake_proc(w);
+                writers = core::mem::take(&mut pipe.write_waiters);
+                if total == len {
+                    drop(table);
+                    for w in writers {
+                        wake_proc(w);
+                    }
+                    return Ok(total as u64);
                 }
-                return Ok(chunk as u64);
             }
+        }
+        for w in writers {
+            wake_proc(w);
+        }
+        if consumed {
+            // 缓冲仍有数据或剩余要读：继续循环（无界缓冲下逐轮搬运）。
+            continue;
+        }
+        // 已读回部分数据但缓冲此刻排空：如实交付部分读（POSIX：read 返回
+        // 当前可用量），绝不因等更多数据而悬挂——顺序模型下写端可能已关。
+        if total > 0 {
+            return Ok(total as u64);
         }
         // R6-F2：同 write 侧——登记点复检"缓冲非空"，条件已真则重试不入睡。
         let mut ready = false;
