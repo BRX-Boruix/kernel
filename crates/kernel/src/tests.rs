@@ -8078,3 +8078,196 @@ pub fn test_sync_syscalls() {
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-sync] SYNC domain futex syscall semantics OK");
 }
+
+/// A1 / ADR-033：进程身份机制单测（默认身份 / set_identity 往返 / init 引导特权 / 继承决策）。
+pub fn test_identity_inherit() {
+    use task::{Privilege, Process, ProcessIdentity};
+    use mm::user_space::UserAddressSpace;
+    use arch_x86_64::paging::X86PageTable;
+
+    info!("[test-identity-inherit] === A1/ADR-033: process identity ====");
+
+    // 1. 默认身份：Process::new 后为 User/uid=0。
+    let us = UserAddressSpace::<X86PageTable>::new().expect("new addr space");
+    let mut proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, us);
+    assert_eq!(
+        proc.identity(),
+        ProcessIdentity::default_user(),
+        "Process::new default identity must be User/uid=0"
+    );
+    info!("[test-identity-inherit] default User/uid=0 OK");
+
+    // 2. set_identity / identity() 往返：init 引导特权 System/uid=1。
+    proc.set_identity(ProcessIdentity::system(1));
+    assert_eq!(
+        proc.identity(),
+        ProcessIdentity::system(1),
+        "init bootstrap identity must be System/uid=1"
+    );
+    info!("[test-identity-inherit] set System/uid=1 OK");
+
+    // 3. set_identity 到任意普通用户（uid=42/User）。
+    let user42 = ProcessIdentity { uid: 42, privilege: Privilege::User };
+    proc.set_identity(user42);
+    assert_eq!(proc.identity(), user42, "set uid=42/User round-trip");
+    info!("[test-identity-inherit] set uid=42/User OK");
+
+    // 4. 派生身份决策 compute_child_identity（单点，非恒真；引用生产常量）。
+    use crate::syscall::{BUILTIN_INDEX_INIT, BUILTIN_INDEX_SHELL, compute_child_identity};
+    // 4a. init 索引 + System 调用者 → System/uid=1（真实可提权路径）。
+    let system_caller = ProcessIdentity::system(1);
+    assert_eq!(
+        compute_child_identity(BUILTIN_INDEX_INIT, system_caller),
+        Ok(ProcessIdentity::system(1)),
+        "System caller spawning init gets System/uid=1"
+    );
+    // 4b. init 索引 + User 调用者 → Err(PermissionDenied)（V2 提权门禁）。
+    assert_eq!(
+        compute_child_identity(BUILTIN_INDEX_INIT, user42),
+        Err(klib::error::Error::PermissionDenied),
+        "User caller spawning init must be denied (no privilege escalation)"
+    );
+    // 4c. 非 init 索引（shell）+ 任意调用者 → 原样继承调用者身份。
+    assert_eq!(
+        compute_child_identity(BUILTIN_INDEX_SHELL, user42),
+        Ok(user42),
+        "non-init child inherits User caller identity"
+    );
+    assert_eq!(
+        compute_child_identity(BUILTIN_INDEX_SHELL, system_caller),
+        Ok(system_caller),
+        "non-init child inherits System caller identity"
+    );
+    info!("[test-identity-inherit] compute_child_identity branches OK");
+
+    info!("[test-identity-inherit] PASS");
+}
+
+
+/// A1 / ADR-033: system_only permission enforcement stop-the-world acceptance.
+pub fn test_perm_system_only() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Process, ProcessIdentity};
+    use vfs::inode::Permissions;
+
+    info!("[test-perm-system-only] === A1/ADR-033: system_only enforcement ====");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3,
+            a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0,
+        }
+    }
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // system_only + normal nodes via root.create_file (test fixture).
+    let sysonly_perm = Permissions { readable: true, writable: true, executable: false, system_only: true };
+    {
+        let root = crate::vfs_init::root();
+        root.create_file("/scratch/perm_sysonly.txt", sysonly_perm).expect("create system_only node");
+        root.create_file("/scratch/perm_normal.txt", Permissions::read_write()).expect("create normal node");
+    }
+
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
+    let base = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space_mut().handle_page_fault(base, arch_x86_64::paging::PageFaultCode::new(0));
+        p.addr_space_mut().handle_page_fault(base + 0x1000, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let sysonly_path = b"/scratch/perm_sysonly.txt\x00";
+    let normal_path = b"/scratch/perm_normal.txt\x00";
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space().translate(arch::VirtAddr::new(base)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(sysonly_path.as_ptr(), (pa + off) as *mut u8, sysonly_path.len());
+        let pa2 = task::current_proc_mut().expect("proc").addr_space().translate(arch::VirtAddr::new(base + 0x1000)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(normal_path.as_ptr(), (pa2 + off) as *mut u8, normal_path.len());
+    }
+    const OPEN_READ: u64 = 1 << 0;
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+    const EACCES_U64: u64 = (-13i64) as u64;
+
+    // 1. User identity opens system_only node -> EACCES.
+    {
+        let p = task::current_proc_mut().expect("proc");
+        assert_eq!(p.identity(), ProcessIdentity::default_user(), "default is User");
+    }
+    let mut o1 = frame(crate::syscall::SYS_STREAM_CREATE, base, OPEN_READ, 0);
+    assert!(crate::syscall::syscall_entry(&mut o1));
+    assert!(o1.result & ERR_FLAG != 0, "User open of system_only must fail");
+    assert_eq!(o1.result, EACCES_U64, "User open of system_only must be EACCES(13)");
+    info!("[test-perm-system-only] User denied system_only -> EACCES OK");
+
+    // 2. Same proc set_identity(System) opens same node -> Ok.
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity::system(1));
+    }
+    let mut o2 = frame(crate::syscall::SYS_STREAM_CREATE, base, OPEN_READ, 0);
+    assert!(crate::syscall::syscall_entry(&mut o2));
+    assert!(o2.result & ERR_FLAG == 0, "System open of system_only must succeed");
+    let fd_sys = o2.result;
+    info!("[test-perm-system-only] System opened system_only fd={} OK", fd_sys);
+
+    // 3. Regression: normal node opens for User identity.
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity::default_user());
+    }
+    let mut o3 = frame(crate::syscall::SYS_STREAM_CREATE, base + 0x1000, OPEN_READ, 0);
+    assert!(crate::syscall::syscall_entry(&mut o3));
+    assert!(o3.result & ERR_FLAG == 0, "User open of normal node must succeed");
+    let fd_norm = o3.result;
+    info!("[test-perm-system-only] User opened normal node fd={} OK", fd_norm);
+
+    // 4. V7: User 进程不得创建 system_only 节点（open O_CREAT + system_only perm 位）。
+    //    create=bit2, write=bit1, system_only perm=bit3(=8)。User 身份创建 → EACCES。
+    const CREATE_WRITE: u64 = (1u64 << 1) | (1u64 << 2);
+    const SYSTEM_ONLY_PERM: u64 = 1u64 << 3;
+    let v7_path = b"/scratch/perm_user_create_sysonly.txt\x00";
+    unsafe {
+        let pa3 = task::current_proc_mut().expect("proc").addr_space().translate(arch::VirtAddr::new(base + 0x1000)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(v7_path.as_ptr(), (pa3 + off) as *mut u8, v7_path.len());
+    }
+    let mut o4 = frame(crate::syscall::SYS_STREAM_CREATE, base + 0x1000, CREATE_WRITE, SYSTEM_ONLY_PERM);
+    assert!(crate::syscall::syscall_entry(&mut o4));
+    assert_eq!(o4.result, EACCES_U64, "User create of system_only node must be EACCES(13)");
+    info!("[test-perm-system-only] User cannot create system_only node -> EACCES OK");
+
+    // cleanup: close fds + unlink nodes.
+    {
+        let mut c1 = frame(crate::syscall::SYS_STREAM_CLOSE, fd_sys, 0, 0);
+        assert!(crate::syscall::syscall_entry(&mut c1));
+        let mut c2 = frame(crate::syscall::SYS_STREAM_CLOSE, fd_norm, 0, 0);
+        assert!(crate::syscall::syscall_entry(&mut c2));
+    }
+    {
+        let root = crate::vfs_init::root();
+        root.unlink("/scratch/perm_sysonly.txt").expect("cleanup unlink sysonly");
+        root.unlink("/scratch/perm_normal.txt").expect("cleanup unlink normal");
+    }
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-perm-system-only] PASS");
+}
+

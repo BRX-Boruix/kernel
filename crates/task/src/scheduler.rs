@@ -43,7 +43,7 @@ use klib::sync::irq::IrqSpinLock;
 use mm::user_space::UserAddressSpace;
 
 use crate::process::{
-    Process, TaskState, clear_current_proc, set_current_proc, user_code_selector,
+    Process, ProcessIdentity, TaskState, clear_current_proc, set_current_proc, user_code_selector,
     user_data_selector, USER_RFLAGS,
 };
 use crate::signals::{SIGKILL, SIGTERM};
@@ -263,7 +263,7 @@ pub fn spawn(
     user_stack_top: u64,
     addr_space: UserAddressSpace<X86PageTable>,
 ) -> Result<usize, Error> {
-    spawn_with_ppid_fds(0, name, entry_rip, user_stack_top, addr_space, None)
+    spawn_with_ppid_fds(0, name, entry_rip, user_stack_top, addr_space, None, ProcessIdentity::default_user())
 }
 
 /// 校验并拷贝程序名进定长 PCB 缓冲。
@@ -290,7 +290,7 @@ pub fn spawn_with_ppid(
     user_stack_top: u64,
     addr_space: UserAddressSpace<X86PageTable>,
 ) -> Result<usize, Error> {
-    spawn_with_ppid_fds(ppid, name, entry_rip, user_stack_top, addr_space, None)
+    spawn_with_ppid_fds(ppid, name, entry_rip, user_stack_top, addr_space, None, ProcessIdentity::default_user())
 }
 
 /// 带 fd 表继承的 spawn 公开形态（pipe-features 方案 A）。`None` 等价于
@@ -305,6 +305,7 @@ pub fn spawn_with_ppid_fds(
     user_stack_top: u64,
     addr_space: UserAddressSpace<X86PageTable>,
     inherited_fds: Option<alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>>>,
+    identity: ProcessIdentity,
 ) -> Result<usize, Error> {
     // 延迟回收先于新分配执行（task1 K3）：把已退出进程的内核栈帧还池，
     // 提高 spawn 在内存压力下的成功率。
@@ -337,6 +338,8 @@ pub fn spawn_with_ppid_fds(
     if let Some(fds) = inherited_fds {
         proc.set_inherited_fd_table(fds);
     }
+    // A1 / ADR-033：注入子进程身份（init 引导特权或父进程继承值）。
+    proc.set_identity(identity);
     let entry = ProcEntry {
         proc,
         saved: initial_frame(entry_rip, user_stack_top),

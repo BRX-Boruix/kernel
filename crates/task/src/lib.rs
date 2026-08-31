@@ -14,8 +14,8 @@ pub mod scheduler;
 pub mod signals;
 
 pub use process::{
-    Process, ProcessTable, TaskState, clear_current_proc, current_proc_mut,
-    process_page_fault_handler, set_current_proc,
+    Privilege, Process, ProcessIdentity, ProcessTable, TaskState, clear_current_proc,
+    current_proc_mut, process_page_fault_handler, set_current_proc,
 };
 pub use scheduler::{
     SwitchOutcome, Waited, block_current, block_current_with, block_for_event, block_for_kbd,

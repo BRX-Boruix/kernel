@@ -137,6 +137,50 @@ impl TaskState {
     }
 }
 
+/// 进程身份（A1 / ADR-033）。
+///
+/// 权限强制（`system_only` 节点）与 flock owner 识别（R6）的事实来源。
+/// `Copy`：身份在 PCB 生命周期内不变（exec 派生时由父进程原样继承或
+/// init 引导时强制 `System`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    /// 用户 id。0 = 保留（未设身份/普通用户默认），1 = init/root 特权。
+    /// 也是 R6 flock owner token 的来源（同一 uid 的进程共享锁语义）。
+    pub uid: u32,
+    /// 特权级。`System` 才可访问 `system_only` 节点（A1 强制比较对象）。
+    pub privilege: Privilege,
+}
+
+impl ProcessIdentity {
+    /// 默认普通用户身份（`Process::new` 初始值）。
+    pub const fn default_user() -> Self {
+        Self {
+            uid: 0,
+            privilege: Privilege::User,
+        }
+    }
+
+    /// init/root 特权身份（内核引导第一个进程时使用）。
+    pub const fn system(uid: u32) -> Self {
+        Self {
+            uid,
+            privilege: Privilege::System,
+        }
+    }
+}
+
+/// 进程特权级（A1 / ADR-033）。
+///
+/// 单用户内核的两档模型（不臆造 owner/group/other 多用户 ACL——ABI §4
+/// 成文取舍）。`System` 才可通过 `system_only` 节点的权限强制。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Privilege {
+    /// 普通用户进程。
+    User,
+    /// 特权进程（init 及其授权的系统服务）。
+    System,
+}
+
 /// 进程控制块（PCB）。
 pub struct Process<PT: PageTable> {
     /// 进程标识。
@@ -160,6 +204,9 @@ pub struct Process<PT: PageTable> {
     /// 无尾斜杠）。syscall 层把相对路径与它拼接成绝对路径再交给 VFS（VFS 层
     /// 只接受绝对路径，ADR-011 M1 契约不变）。
     cwd: alloc::string::String,
+    /// 进程身份（A1 / ADR-033）：uid + 特权级。权限强制与 flock owner
+    /// 识别的事实来源（见 [`ProcessIdentity`]）。
+    identity: ProcessIdentity,
 }
 
 impl<PT: PageTable> Process<PT> {
@@ -193,6 +240,7 @@ impl<PT: PageTable> Process<PT> {
             user_stack_top,
             fd_table,
             cwd: alloc::string::String::from("/"),
+            identity: ProcessIdentity::default_user(),
         }
     }
 
@@ -289,6 +337,14 @@ impl<PT: PageTable> Process<PT> {
     /// 进程 id。
     pub fn pid(&self) -> usize {
         self.pid
+    }
+    /// 进程身份（A1 / ADR-033）。
+    pub fn identity(&self) -> ProcessIdentity {
+        self.identity
+    }
+    /// 设置进程身份（A1 / ADR-033）。
+    pub fn set_identity(&mut self, identity: ProcessIdentity) {
+        self.identity = identity;
     }
     /// 当前工作目录（规范绝对路径）。
     pub fn cwd(&self) -> &str {

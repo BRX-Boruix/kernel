@@ -19,7 +19,9 @@ use arch_x86_64::interrupts::InterruptFrame;
 use klib::error::Error;
 use mm::user_space::{USER_BASE, USER_TOP, UserAccess};
 
-use task::current_proc_mut;
+use task::{
+    current_proc_mut, Privilege, ProcessIdentity,
+};
 
 // ---------- 用户缓冲区资源边界（kernel1.md K7 / arch1.md AR1） ----------
 
@@ -374,6 +376,27 @@ fn sys_getcwd(frame: &mut SyscallFrame) -> u64 {
     pack_ok(cwd.len() as u64)
 }
 
+/// A1 / ADR-033：权限强制。
+///
+/// 在 `sys_open`（`resolve` 后、`FileHandle::new` 前）与 `sys_exec`（解析
+/// inode 后、装载前）调用。当前只强制 `system_only` 节点的特权门槛：
+/// `Permissions::system_only == true` 的节点仅 `Privilege::System` 进程
+/// 可打开/执行，其余身份返回 `Error::PermissionDenied`（EACCES）。
+///
+/// 诚实边界（PRE-3）：readable/writable/executable 的 owner 维度在多用户
+/// 立项前不做（ABI §4 单用户抹平）；本函数当前只比较 `system_only` 布尔 +
+/// 进程 `Privilege` 两档，无 owner/group/other 矩阵。
+fn enforce_open_permission(
+    identity: ProcessIdentity,
+    inode: &alloc::sync::Arc<dyn vfs::inode::INode>,
+) -> Result<(), Error> {
+    let meta = inode.metadata()?;
+    if meta.permissions.system_only && identity.privilege != Privilege::System {
+        return Err(Error::PermissionDenied);
+    }
+    Ok(())
+}
+
 /// `open(path_ptr, flags_bits, perm_bits)`：打开或创建文件，返回 fd。
 ///
 /// ADR-014 §4.1 FLAG_PIPE：当 `flags` 含 `pipe` 位且 `path_ptr` 指向空串
@@ -406,6 +429,18 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
 
     let root = crate::vfs_init::root();
 
+    // A1 / ADR-033 (V7 fix): 创建授权——User 进程不得创建 system_only=true 节点。
+    // 若创建时请求了 system_only 位，必须是 System 特权；否则 PermissionDenied，
+    // 杜绝"User 自建 system_only 节点后经强制打开被拒"的边界漏洞。
+    if flags.create && perm.system_only {
+        let creator = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if creator.privilege != Privilege::System {
+            return pack_err(Error::PermissionDenied);
+        }
+    }
+
     let inode = match root.resolve(&path, true) {
         Ok(n) => {
             if flags.truncate {
@@ -428,6 +463,16 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
         },
         Err(e) => return pack_err(e),
     };
+
+    // A1 / ADR-033：权限强制（system_only 节点仅 System 特权可开）。
+    // 无当前进程时回退 User（拒绝最严）。inode 已解析、句柄未构造，
+    // 为最低成本的拒绝点。
+    let identity = current_proc_mut()
+        .map(|p| p.identity())
+        .unwrap_or_else(ProcessIdentity::default_user);
+    if let Err(e) = enforce_open_permission(identity, &inode) {
+        return pack_err(e);
+    }
 
     // vfs1 M4/M3：O_DIRECTORY 强制与 append 起点真值在 FileHandle::new
     // 内完成；失败（目标非目录等）如实上抛，不再静默产出坏句柄。
@@ -1081,6 +1126,14 @@ fn sys_exec(frame: &mut SyscallFrame) -> u64 {
             };
             match root.resolve(&path, true) {
                 Ok(inode) => {
+                    // A1 / ADR-033：执行前强制——system_only 可执行文件仅
+                    // System 特权进程可装载。
+                    let identity = current_proc_mut()
+                        .map(|p| p.identity())
+                        .unwrap_or_else(ProcessIdentity::default_user);
+                    if let Err(e) = enforce_open_permission(identity, &inode) {
+                        return pack_err(e);
+                    }
                     let meta = match inode.metadata() {
                         Ok(m) => m,
                         Err(e) => return pack_err(e),
@@ -1107,9 +1160,27 @@ fn sys_exec(frame: &mut SyscallFrame) -> u64 {
 
 /// 内建程序索引：init（与 libsys nr::PROG_* 约定同源；内核不依赖
 /// 用户态 crate，双侧常量注释互指）。
-const BUILTIN_INDEX_INIT: u64 = 0;
+/// `pub`：A1 测试与继承决策逻辑引用单点，不重复硬编码（S13）。
+pub const BUILTIN_INDEX_INIT: u64 = 0;
 /// 内建程序索引：shell。
-const BUILTIN_INDEX_SHELL: u64 = 1;
+pub const BUILTIN_INDEX_SHELL: u64 = 1;
+
+/// A1 / ADR-033：计算派生子进程身份（单点决策，供 spawn_elf_image 与测试复用）。
+///
+/// - `idx_or_tag == BUILTIN_INDEX_INIT`：仅 `System` 特权调用者可派生
+///   `System/uid=1` 子进程；`User` 调用者返回 `Err(PermissionDenied)`——
+///   防"任意 User 经 exec(0,..) 未认证提权"（V2）。
+/// - 其余分支：原样继承调用者身份（caller 已由调用方解析为 current 或默认）。
+pub fn compute_child_identity(idx_or_tag: u64, caller: ProcessIdentity) -> Result<ProcessIdentity, Error> {
+    if idx_or_tag == BUILTIN_INDEX_INIT {
+        if caller.privilege != Privilege::System {
+            return Err(Error::PermissionDenied);
+        }
+        Ok(ProcessIdentity::system(1))
+    } else {
+        Ok(caller)
+    }
+}
 
 fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64) -> u64 {
     /// prog_name 末段长度上限（超长拒绝，防注册表/日志被撑爆）。
@@ -1180,6 +1251,15 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
         },
         None => None,
     };
+    // A1 / ADR-033 (V2 fix): 子进程身份经单点决策 compute_child_identity。
+    // init 内建索引仅 System 调用者可派生 System/uid=1；User 调用者被拒（PermissionDenied）。
+    let caller = current_proc_mut()
+        .map(|p| p.identity())
+        .unwrap_or_else(ProcessIdentity::default_user);
+    let child_identity = match compute_child_identity(idx_or_tag, caller) {
+        Ok(id) => id,
+        Err(e) => return pack_err(e),
+    };
     match task::spawn_with_ppid_fds(
         parent_pid,
         &prog_name,
@@ -1187,6 +1267,7 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
         loaded.user_stack_top,
         us,
         inherited,
+        child_identity,
     ) {
         Ok(pid) => {
             klib::info!(

@@ -529,6 +529,11 @@ unsafe fn kmain_body() -> ! {
     // ADR-032 SYNC 域 (0x70)：通用 futex 等待/唤醒 syscall 验收。
     #[cfg(feature = "kernel-tests")]
     tests::test_sync_syscalls();
+    // A1/ADR-033 进程身份模型：身份机制单测 + system_only 权限强制停机级验收。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_identity_inherit();
+    #[cfg(feature = "kernel-tests")]
+    tests::test_perm_system_only();
     // ADR-014 SYS_ENTRY_READ (0x42)：标准紧凑 JSON 输出。
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_entry_read_json();
@@ -902,7 +907,11 @@ fn start_init() -> ! {
         "[kmain] init: entry={:#x} stack_top={:#x}",
         loaded.entry, loaded.user_stack_top
     );
-    let pid = match task::spawn("init.elf", loaded.entry, loaded.user_stack_top, us) {
+    // A1 / ADR-033 (V1 fix): init 由内核自己拉起，必须显式以 System/uid=1 引导。
+    // 不得走默认 User 身份的 task::spawn——否则可信引导进程拿不到 System 特权。
+    let pid = match task::spawn_with_ppid_fds(
+        0, "init.elf", loaded.entry, loaded.user_stack_top, us, None, task::ProcessIdentity::system(1),
+    ) {
         Ok(p) => p,
         Err(e) => {
             error!("[kmain] init: spawn failed: {:?}", e);
