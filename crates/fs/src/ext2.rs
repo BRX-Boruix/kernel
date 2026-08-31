@@ -6,12 +6,11 @@
 //!
 //! 只读边界（fs1 整改后形态 → M3 可写）：本模块自 M3 起提供**最小可写
 //! 支集**（块/inode 分配释放、位图更新、目录项增删、superblock/GDT 记账、
-//! 直块 + 一级/二级间接块、文件数据写、truncate），写路径经页缓存写穿一致性
-//! 落盘（本内核无页缓存写回期，写即落盘）。读侧亦支持一级/二级间接
-//! 寻址；仅三重间接仍显式拒绝（当前镜像与工作负载不需要，写侧 blocks[14]
-//! 不分配，读侧遇三重间接文件如实报错）。VFS 节点 writable 恒为 true，写族方法
-//! 如实返回 [`Error::ReadOnly`] 仅当底层 `ByteDevice::write_bytes` 不可写
-//! （返回 0）时由短写映射为 IO 错误。
+//! 直块 + 一级/二级/**三重**间接块、文件数据写、truncate），写路径经页缓存
+//! 写穿一致性落盘（本内核无页缓存写回期，写即落盘）。读侧亦支持一级/二级/
+//! 三重间接全寻址。VFS 节点 writable 恒为 true，写族方法如实返回
+//! [`Error::ReadOnly`] 仅当底层 `ByteDevice::write_bytes` 不可写（返回 0）时由
+//! 短写映射为 IO 错误。
 //!
 //! ## 镜像元数据信任边界（fs1 FA2 / ADR-021）
 //!
@@ -61,8 +60,6 @@ pub enum Ext2Error {
     BadInode,
     /// 逻辑块号映射出的物理块越出 s_blocks_count。
     BlockOutOfRange,
-    /// 三重间接块：当前镜像与工作负载不需要，显式拒绝而非静默出错。
-    UnsupportedTripleIndirect,
     /// 片段(fragment)大小与块大小不等——本驱动只支持等大片段。
     UnsupportedFragmentSize,
     /// 块大小超过 4KiB（log_block_size > 2）——独立于片段语义的拒绝项
@@ -342,9 +339,9 @@ impl Ext2Fs {
     /// 规范定义 `i_blocks` 为文件占用的全部 512B 扇区数，**含间接指针表块
     /// 自身**——旧实现 `size.div_ceil(512)` 只按数据字节推算，把间接块占用
     /// 漏记（偏小）。本函数按块映射结构逐级清点：直块 + 一级间接表（含其
-    /// 数据指针）+ 二级间接表（含各级 L1 表及其数据指针），再乘以每块扇区数。
-    /// 数据块按映射中的非零指针计（稀疏区不计）。三重间接区（blocks[14]）
-    /// 不建模，若出现按真实占用量清点到 blocks[14] 本身仍照常计入其表块。
+    /// 数据指针）+ 二级间接表（含各级 L1 表及其数据指针）+ 三重间接表（含
+    /// 各级 L2/L1 表及其数据指针），再乘以每块扇区数。数据块按映射中的
+    /// 非零指针计（稀疏区不计）。
     fn count_sectors(&self, inode: &Inode) -> Result<u32, Ext2Error> {
         let bs = self.superblock().block_size as usize;
         let per_block = bs / 4;
@@ -384,10 +381,32 @@ impl Ext2Fs {
                 }
             }
         }
-        // 三重间接表（blocks[14]）：本驱动不建模数据分配，但表块本身若存在
-        // （外部工具写入）按真实占用量计入。
+        // 三重间接表（blocks[14]）：表块 1 + 各非零 L2 表块 + 各 L2 内非零 L1
+        // 表块 + 各 L1 内非零数据指针。
         if inode.blocks[14] != 0 {
             blocks += 1;
+            let tri = self.read_block_buf(inode.blocks[14])?;
+            for i in 0..per_block {
+                let l2_ptr = le_u32(&tri, i * 4);
+                if l2_ptr == 0 {
+                    continue;
+                }
+                blocks += 1; // L2 表块
+                let l2 = self.read_block_buf(l2_ptr)?;
+                for j in 0..per_block {
+                    let l1_ptr = le_u32(&l2, j * 4);
+                    if l1_ptr == 0 {
+                        continue;
+                    }
+                    blocks += 1; // L1 表块
+                    let l1 = self.read_block_buf(l1_ptr)?;
+                    for k in 0..per_block {
+                        if le_u32(&l1, k * 4) != 0 {
+                            blocks += 1;
+                        }
+                    }
+                }
+            }
         }
         Ok(blocks * sectors_per_block)
     }
@@ -472,7 +491,10 @@ impl Ext2Fs {
         })
     }
 
-    /// 逻辑块号 → 物理块号。直接 12 块 + 一级/二级间接；三重间接显式拒绝。
+    /// 逻辑块号 → 物理块号。直接 12 块 + 一级/二级/三重间接全寻址。
+    ///
+    /// 三重间接（blocks[14]）：逻辑块在 `12 + per_block + per_block²` 之后。
+    /// 链：blocks[14] 表[t2_idx] → L2 表[l1_idx] → L1 表[l1_off] → 数据块。
     fn map_logical_block(&self, inode: &Inode, logical: u32) -> Result<u32, Ext2Error> {
         let per_block = self.superblock().block_size / 4;
         if logical < 12 {
@@ -489,7 +511,15 @@ impl Ext2Fs {
             let l1 = self.map_indirect(inode.blocks[13], l1_idx)?;
             return self.map_indirect(l1, rem % per_block);
         }
-        Err(Ext2Error::UnsupportedTripleIndirect)
+        // 三重间接区：rem in [per_block², per_block³)。
+        let rem3 = rem - l2_span;
+        let t2_idx = rem3 / l2_span; // blocks[14] 表中索引 → L2 表指针
+        let t2_off = rem3 % l2_span;
+        let l1_idx = t2_off / per_block; // L2 表中索引 → L1 表指针
+        let l1_off = (t2_off % per_block) as usize; // L1 表中索引 → 数据块
+        let t2 = self.map_indirect(inode.blocks[14], t2_idx)?;
+        let l1 = self.map_indirect(t2, l1_idx)?;
+        self.map_indirect(l1, l1_off as u32)
     }
 
     /// 从一级间接块中取出第 `idx` 个块指针（稀疏块返回 0）。
@@ -683,7 +713,7 @@ impl Ext2Fs {
     // 更新、目录项增删、superblock/GDT 记账、直块 + 一级间接块分配、文件
     // 数据写、truncate。所有写都经 [`ByteDevice::write_bytes`] 落盘（M0.2
     // 桥接），写穿无延迟（本内核无页缓存写回期，PageCache 语义见 ADR-026）。
-    // 双重间接/三重间接仍显式拒绝（当前镜像与工作负载不需要，见只读注释）。
+    // 一级/二级/三重间接全寻址（与读侧 [`Self::map_logical_block`] 对称）。
 
     /// 写入一个完整块（M3 地基：与 [`Self::read_block`] 对称的写原语）。
     ///
@@ -1012,10 +1042,32 @@ impl Ext2Fs {
             }
             self.free_block(inode.blocks[13])?;
         }
-        // 三重间接（blocks[14]）：读侧不建模，写侧亦不支持——显式拒绝而非
-        // 静默泄漏（含三重间接的文件无法 unlink，如实报错）。
+        // 三重间接块（blocks[14]）：逐级释放 L1 表 + L2 表 + blocks[14] 表。
         if inode.blocks[14] != 0 {
-            return Err(Ext2Error::UnsupportedTripleIndirect);
+            let tri = self.read_block_buf(inode.blocks[14])?;
+            for i in 0..(bs / 4) {
+                let l2_ptr = le_u32(&tri, i * 4);
+                if l2_ptr == 0 {
+                    continue;
+                }
+                let l2 = self.read_block_buf(l2_ptr)?;
+                for j in 0..(bs / 4) {
+                    let l1_ptr = le_u32(&l2, j * 4);
+                    if l1_ptr == 0 {
+                        continue;
+                    }
+                    let l1 = self.read_block_buf(l1_ptr)?;
+                    for k in 0..(bs / 4) {
+                        let b = le_u32(&l1, k * 4);
+                        if b != 0 {
+                            self.free_block(b)?;
+                        }
+                    }
+                    self.free_block(l1_ptr)?;
+                }
+                self.free_block(l2_ptr)?;
+            }
+            self.free_block(inode.blocks[14])?;
         }
         self.free_inode(inode.ino)
     }
@@ -1048,12 +1100,11 @@ impl Ext2Fs {
         Ok(())
     }
 
-    /// 设置 inode 的第 `logical` 个逻辑块的物理块号（含一级/二级间接块分配）。
+    /// 设置 inode 的第 `logical` 个逻辑块的物理块号（含一级/二级/三重间接块分配）。
     ///
     /// 与读侧 [`Self::map_logical_block`] 的寻址语义严格对称：直块 0..12、
     /// 一级间接（`blocks[12]`，覆盖 per_block 项）、二级间接（`blocks[13]`，
-    /// 覆盖 per_block² 项）。超出直块+二级间接范围才 `UnsupportedTripleIndirect`
-    /// （`blocks[14]` 三重间接写仍未实现，读侧亦不支持，对称）。
+    /// 覆盖 per_block² 项）、三重间接（`blocks[14]`，覆盖 per_block³ 项）。
     fn set_inode_block(&self, inode: &mut Inode, logical: u32, phys: u32) -> Result<(), Ext2Error> {
         let per_block = self.superblock().block_size / 4;
         if logical < 12 {
@@ -1097,8 +1148,42 @@ impl Ext2Fs {
             map[l1_off * 4..l1_off * 4 + 4].copy_from_slice(&phys.to_le_bytes());
             return self.write_block(l1_block, &map);
         }
-        // 超出直块+二级间接：需要三重间接，显式拒绝。
-        Err(Ext2Error::UnsupportedTripleIndirect)
+        // 三重间接区：rem2 in [per_block², per_block³)。链：blocks[14]→L2→L1→数据。
+        let rem3 = rem2 - l2_span;
+        let t2_idx = rem3 / l2_span as u32; // blocks[14] 表中索引
+        let t2_off = rem3 % l2_span as u32;
+        let l1_idx = t2_off / per_block; // L2 表中索引
+        let l1_off = (t2_off % per_block) as usize; // L1 表中索引
+        // 三重间接表（blocks[14]）尚未分配则先分配。
+        if inode.blocks[14] == 0 {
+            inode.blocks[14] = self.alloc_block()?;
+        }
+        // 取/建 L2（二级间接）表块：blocks[14][t2_idx]。
+        let mut tri = self.read_block_buf(inode.blocks[14])?;
+        let l2_ptr = le_u32(&tri, t2_idx as usize * 4);
+        let l2_block = if l2_ptr == 0 {
+            let b = self.alloc_block()?;
+            tri[t2_idx as usize * 4..t2_idx as usize * 4 + 4].copy_from_slice(&b.to_le_bytes());
+            self.write_block(inode.blocks[14], &tri)?;
+            b
+        } else {
+            l2_ptr
+        };
+        // 取/建 L1（一级间接）表块：L2[l1_idx]。
+        let mut l2_map = self.read_block_buf(l2_block)?;
+        let l1_ptr = le_u32(&l2_map, l1_idx as usize * 4);
+        let l1_block = if l1_ptr == 0 {
+            let b = self.alloc_block()?;
+            l2_map[l1_idx as usize * 4..l1_idx as usize * 4 + 4].copy_from_slice(&b.to_le_bytes());
+            self.write_block(l2_block, &l2_map)?;
+            b
+        } else {
+            l1_ptr
+        };
+        // 写数据块指针：L1[l1_off] = phys。
+        let mut l1_map = self.read_block_buf(l1_block)?;
+        l1_map[l1_off * 4..l1_off * 4 + 4].copy_from_slice(&phys.to_le_bytes());
+        self.write_block(l1_block, &l1_map)
     }
 
     /// truncate：收缩释放尾部块，扩展分配新块；更新 size/sectors/mtime/ctime。
@@ -1171,8 +1256,28 @@ impl Ext2Fs {
             l1[l1_off * 4..l1_off * 4 + 4].fill(0);
             self.write_block(l1_ptr, &l1)
         } else {
-            // 三重间接：读侧不建模，写侧亦不支持，如实拒绝。
-            Err(Ext2Error::UnsupportedTripleIndirect)
+            // 三重间接区：rem2 in [per_block², per_block³)。
+            if inode.blocks[14] == 0 {
+                return Ok(());
+            }
+            let rem3 = rem2 - l2_span;
+            let t2_idx = rem3 / l2_span as u32;
+            let t2_off = rem3 % l2_span as u32;
+            let l1_idx = t2_off / per_block;
+            let l1_off = (t2_off % per_block) as usize;
+            let tri = self.read_block_buf(inode.blocks[14])?;
+            let l2_ptr = le_u32(&tri, t2_idx as usize * 4);
+            if l2_ptr == 0 {
+                return Ok(());
+            }
+            let l2 = self.read_block_buf(l2_ptr)?;
+            let l1_ptr = le_u32(&l2, l1_idx as usize * 4);
+            if l1_ptr == 0 {
+                return Ok(());
+            }
+            let mut l1 = self.read_block_buf(l1_ptr)?;
+            l1[l1_off * 4..l1_off * 4 + 4].fill(0);
+            self.write_block(l1_ptr, &l1)
         }
     }
 
@@ -1535,9 +1640,7 @@ pub(crate) fn ext2_to_klib(e: Ext2Error) -> Error {
         Ext2Error::CorruptDirEntry
         | Ext2Error::CorruptSuperblock
         | Ext2Error::BlockOutOfRange => Error::Corrupt,
-        Ext2Error::UnsupportedTripleIndirect
-        | Ext2Error::UnsupportedFragmentSize
-        | Ext2Error::UnsupportedBlockSize => Error::NotSupported,
+        Ext2Error::UnsupportedFragmentSize | Ext2Error::UnsupportedBlockSize => Error::NotSupported,
     }
 }
 
@@ -2436,23 +2539,6 @@ mod tests {
                 "name_len overflow"
             );
         }
-        // 三重间接显式拒绝：direct12 + L1(256) + L2(65536) 之后的第一个逻辑块
-        {
-            let mut tri = Inode {
-                ino: 99,
-                mode: 0x8000,
-                size: 200 * 1024,
-                blocks: [0u32; 15],
-                sectors: 0,
-                mtime: 0,
-                ctime: 0,
-            };
-            tri.blocks[14] = 77;
-            assert_eq!(
-                fs.map_logical_block(&tri, 12 + 256 + 256 * 256),
-                Err(Ext2Error::UnsupportedTripleIndirect)
-            );
-        }
         // 块指针越界
         {
             let mut oob = Inode {
@@ -2552,7 +2638,6 @@ mod tests {
         assert_eq!(ext2_to_klib(Ext2Error::BufferTooSmall), Error::InvalidParam);
         assert_eq!(ext2_to_klib(Ext2Error::CorruptDirEntry), Error::Corrupt);
         assert_eq!(ext2_to_klib(Ext2Error::BlockOutOfRange), Error::Corrupt);
-        assert_eq!(ext2_to_klib(Ext2Error::UnsupportedTripleIndirect), Error::NotSupported);
         assert_eq!(ext2_to_klib(Ext2Error::UnsupportedFragmentSize), Error::NotSupported);
         assert_eq!(ext2_to_klib(Ext2Error::UnsupportedBlockSize), Error::NotSupported);
     }
@@ -2785,7 +2870,7 @@ mod tests {
 
     /// 二级间接写 + 读 + unlink 对称：写入超过一级间接区（直块 12 + 每块
     /// per_block 项）的大文件，读回一致，unlink 释放全部块（含二级间接
-    /// 表与数据），不报 UnsupportedTripleIndirect。
+    /// 表与数据）。
     #[test]
     fn test_write_read_unlink_double_indirect() {
         use vfs::inode::{FileSystem, Permissions};
@@ -2802,11 +2887,98 @@ mod tests {
         assert_eq!(rn, size);
         assert_eq!(back, payload, "double-indirect file round-trips");
         assert_eq!(f.metadata().expect("meta").size, size as u64);
-        // unlink：含二级间接的文件可删除，不报 UnsupportedTripleIndirect。
+        // unlink：含二级间接的文件可删除。
         root.unlink("dbl.bin").expect("unlink double-indirect file");
         assert_eq!(root.lookup("dbl.bin").map(|_| ()).unwrap_err(), Error::NotFound);
     }
 
+
+    /// 三重间接：逻辑块号跨越 直块(12) + 一级(per_block) + 二级(per_block²) 之后
+    /// 进入 blocks[14] 三重间接区。用 **size 预设跨越阈值** 的方式绕过对 65K 个
+    /// 中间直块/间接数据块的顺序分配（那会让镜像在到达三重区前耗尽），直接驱动
+    /// set_inode_block 在首个三重逻辑块上构建 blocks[14]→L2→L1→数据 的链，再
+    /// 验证 map/clear/free/count 全部按 EXT2 规范寻址。
+    #[test]
+    fn test_triple_indirect_addressing() {
+        let fs = open_writable(); // 1KB 块，per_block=256
+        let bs = fs.superblock().block_size as u64;
+        let per_block = fs.superblock().block_size / 4;
+        // 三重区起始逻辑块号 = 直块12 + 一级per_block + 二级per_block²。
+        let triple_start = 12 + per_block + per_block * per_block;
+        // size 预设为跨越三重阈值（稀疏：中间块均未分配）。
+        let mut ino = Inode {
+            ino: 3, // 首个可分配 inode（inode 表块 5 内，不与数据块 8+ 冲突）
+            mode: 0x8000,
+            size: ((triple_start + 1) * per_block * 4) as u32,
+            blocks: [0u32; 15],
+            sectors: 0,
+            mtime: 0,
+            ctime: 0,
+        };
+        // 1) 写首个三重块：触发 set_inode_block 构建 blocks[14] 链。
+        let payload = alloc::vec![0x5Au8; bs as usize];
+        assert_eq!(payload.len() as u64, bs, "payload must be one block");
+        let n = fs
+            .write_inode_data(&mut ino, triple_start as u64 * bs, &payload)
+            .expect("write into triple region");
+        assert_eq!(n, bs as usize, "full block written (size={} end={})", ino.size, triple_start as u64 * bs + payload.len() as u64);
+        assert_ne!(ino.blocks[14], 0, "triple-indirect table (blocks[14]) must be allocated");
+
+        // 2) 读回一致。
+        let mut back = alloc::vec![0u8; bs as usize];
+        let rn = fs
+            .read_inode_data(&ino, triple_start as u64 * bs, &mut back)
+            .expect("read triple block");
+        assert_eq!(rn, bs as usize);
+        assert_eq!(back, payload, "triple-region data round-trips");
+
+        // 3) map_logical_block 解析三重链回数据块（非稀疏 0）。
+        let data = fs
+            .map_logical_block(&ino, triple_start)
+            .expect("map triple logical block");
+        assert_ne!(data, 0, "triple data block must be mapped");
+
+        // 4) count_sectors 计入三重表块：blocks[14]表1 + L2表1 + L1表1 + 数据1 = 4块 = 8扇区。
+        let sectors = fs.count_sectors(&ino).expect("count sectors");
+        // 链上块号自检：blocks[14] 表 + L2 + L1 + 数据 各一块。
+        let dbg_tri = fs.read_block_buf(ino.blocks[14]).unwrap();
+        let dbg_l2p = le_u32(&dbg_tri, 0);
+        let dbg_l2 = fs.read_block_buf(dbg_l2p).unwrap();
+        let dbg_l1p = le_u32(&dbg_l2, 0);
+        let dbg_l1 = fs.read_block_buf(dbg_l1p).unwrap();
+        let dbg_data = le_u32(&dbg_l1, 0);
+        let expected = 4 * (bs as u32 / 512);
+        assert_eq!(dbg_data, data, "L1[0] 必须指向 map 出的数据块");
+        assert_eq!(
+            sectors, expected,
+            "triple chain accounts 4 blocks (blocks14={} l2={} l1={} data={})",
+            ino.blocks[14], dbg_l2p, dbg_l1p, dbg_data
+        );
+
+        // 5) clear_inode_block 清空该三重块的数据指针。
+        fs.clear_inode_block(&mut ino, triple_start)
+            .expect("clear triple block");
+        assert_eq!(
+            fs.map_logical_block(&ino, triple_start).expect("map after clear"),
+            0,
+            "cleared triple block maps to sparse 0"
+        );
+
+        // 6) 重写后再 free_inode_blocks：释放整条三重链（含 blocks[14] 表），不泄漏。
+        let n2 = fs
+            .write_inode_data(&mut ino, triple_start as u64 * bs, &payload)
+            .expect("re-write triple block");
+        assert_eq!(n2, bs as usize);
+        let free_before = fs.live_free_blocks().expect("live free before");
+        fs.free_inode_blocks(&ino).expect("free triple chain");
+        let free_after = fs.live_free_blocks().expect("live free after");
+        // 释放了 4 块（数据+L1+L2+blocks[14]表）。
+        assert_eq!(
+            free_after - free_before,
+            4,
+            "free_inode_blocks releases the whole triple chain (data+L1+L2+triple table)"
+        );
+    }
     /// slow symlink 目标跨多块（> 块大小）不再越界 panic，读回一致。
     #[test]
     fn test_slow_symlink_multiblock_target() {
