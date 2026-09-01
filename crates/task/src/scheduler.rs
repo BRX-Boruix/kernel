@@ -1261,9 +1261,11 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
             && (ps.waiting_for == Some(pid) || ps.waiting_for == Some(WAIT_ANY))
         {
             // 交付：退出码即 syscall 成功返回值（pack_ok(code) == code），
-            // 直接写进父的保存帧 rax——父被调度回来 iretq 后用户态即刻拿到。
+            // 直接写进父的保存帧 rax；被收尸子进程 pid 写进保存帧 r10——
+            // 父被调度回来 iretq 后用户态即刻拿到 rax=code、r10=pid。
             ps.waiting_for = None;
             ps.saved.rax = code;
+            ps.saved.r10 = pid as u64;
             ps.proc.set_state(TaskState::Ready);
             true
         } else {
@@ -1329,7 +1331,7 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
 
 /// 收尸（持锁核心）：`child` 必须是 `cur` 的在册直接子进程。
 /// zombie → 取走退出码并释放槽位；仍在运行 → `None`（调用方决定阻塞或报错）。
-fn reap_child_locked(s: &mut Scheduler, cur: usize, child: usize) -> Option<u64> {
+fn reap_child_locked(s: &mut Scheduler, cur: usize, child: usize) -> Option<(usize, u64)> {
     let is_mine = matches!(s.procs.get(child), Some(Some(e)) if e.ppid == cur);
     if !is_mine {
         return None;
@@ -1346,16 +1348,17 @@ fn reap_child_locked(s: &mut Scheduler, cur: usize, child: usize) -> Option<u64>
     if let Some(e) = s.procs[child].take() {
         retire_entry(e);
     }
-    Some(code)
+    Some((child, code))
 }
 
-/// [`waitpid`] 的完成形态（C7.1）。
+/// `waitpid` 的完成形态（C7.1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waited {
-    /// 同步收尸：目标已是 zombie，退出码随值返回。
-    Code(u64),
-    /// 已真阻塞并切换走：退出码由子进程终止路径直接写入调用者保存帧
-    /// `rax`，唤醒后 iretq 即得；CPU 不再回到等待方内核调用点。
+    /// 同步收尸：目标已是 zombie，被收尸子进程的 pid 与退出码随值返回。
+    Reaped { pid: usize, code: u64 },
+    /// 已真阻塞并切换走：退出码写入调用者保存帧 `rax`、pid 写入 `r10`
+    /// （子进程终止路径直接交付），唤醒后 iretq 即得；CPU 不再回到等待方
+    /// 内核调用点。
     Blocked,
 }
 
@@ -1364,9 +1367,10 @@ pub enum Waited {
 /// - 目标不是调用者的在册直接子进程（不存在/非亲生/已被收尸）→
 ///   [`Error::NotFound`]（errno 2；klib 错误表无 ECHILD，取语义最近的
 ///   NotFound，映射决策记录于 ADR-014 实现注记）；
-/// - 子进程已是 zombie → 同步收尸，返回 [`Waited::Code`]；
+/// - 子进程已是 zombie → 同步收尸，返回 [`Waited::Reaped`]（含 pid 与退出码）；
 /// - 子进程仍在运行 → 登记等待后**真阻塞**（`TaskState::Blocked`，不回就绪
-///   队列），切换到下一就绪进程，返回 [`Waited::Blocked`]——入口据此跳过
+///   队列），切换到下一就绪进程，返回 [`Waited::Blocked`]（退出码与 pid 由
+///   子进程终止路径写入保存帧 rax/r10）——入口据此跳过
 ///   rax 回写，保住子进程终止路径交付到保存帧的退出码；
 /// - 无其他**就绪**进程（阻塞后无人能接盘 CPU 唤醒自己）→ 拒绝阻塞，如实
 ///   返回 [`Error::WouldBlock`]（errno 11 EAGAIN），绝不自锁死系统。
@@ -1392,8 +1396,8 @@ fn waitpid_inner(
             if matches!(&s.procs[i], Some(e)
                 if e.ppid == cur && e.proc.state() == TaskState::Exit)
             {
-                let code = reap_child_locked(s, cur, i).expect("zombie confirmed");
-                return Ok(Waited::Code(code));
+                let (pid, code) = reap_child_locked(s, cur, i).expect("zombie confirmed");
+                return Ok(Waited::Reaped { pid, code });
             }
         }
         // 2. 无 zombie：检查是否至少有一个子进程存在。
@@ -1414,8 +1418,8 @@ fn waitpid_inner(
         if !is_mine {
             return Err(Error::NotFound);
         }
-        if let Some(code) = reap_child_locked(s, cur, target_pid) {
-            return Ok(Waited::Code(code)); // zombie 同步收尸
+        if let Some((pid, code)) = reap_child_locked(s, cur, target_pid) {
+            return Ok(Waited::Reaped { pid, code }); // zombie 同步收尸
         }
     }
 
@@ -1883,8 +1887,8 @@ pub mod test_hooks {
     }
 
     /// 非阻塞收尸尝试（真实核心路径）：NotFound=非亲生/不存在/已收尸；
-    /// WouldBlock=子进程仍在运行；Ok(code)=已收尸（槽位已释放）。
-    pub fn try_reap(parent: usize, target: usize) -> Result<u64, Error> {
+    /// WouldBlock=子进程仍在运行；Ok((pid,code))=已收尸（槽位已释放）。
+    pub fn try_reap(parent: usize, target: usize) -> Result<(usize, u64), Error> {
         let mut s = SCHED.lock();
         if !matches!(s.procs.get(target), Some(Some(e)) if e.ppid == parent) {
             return Err(Error::NotFound);

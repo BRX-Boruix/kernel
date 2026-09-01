@@ -40,6 +40,7 @@ pub extern "C" fn soft_interrupt_bridge(frame: &mut InterruptFrame) -> bool {
         a5: frame.r8,
         result: 0,
         switched: false,
+        aux_pid: 0,
         // 不透明句柄：切换路径由调度原语还原为 `&mut InterruptFrame`。
         arch_frame: frame as *mut InterruptFrame as usize,
     };
@@ -48,6 +49,11 @@ pub extern "C" fn soft_interrupt_bridge(frame: &mut InterruptFrame) -> bool {
     if handled && !scf.switched {
         // 正常完成：把结果写回调用进程 rax（Switched 时现场已换，不得回写）。
         frame.rax = scf.result;
+        // waitpid 同步收尸路径把被收尸子进程 pid 经 aux_pid 交付：写进返回帧
+        // r10，用户态 iretq 后取 r10 即得（与阻塞路径 saved.r10=pid 对齐）。
+        if scf.aux_pid != 0 {
+            frame.r10 = scf.aux_pid;
+        }
     }
     handled
 }

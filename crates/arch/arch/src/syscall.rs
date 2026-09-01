@@ -37,6 +37,11 @@ pub struct SyscallFrame {
     pub result: u64,
     /// 是否已切换到另一进程现场。
     pub switched: bool,
+    /// 辅助返回寄存器（r10）值：仅 waitpid 同步收尸路径设置，携带被收尸
+    /// 子进程 pid；其余 syscall 保持 0（r10 不被改写）。架构层在 `rax` 写回
+    /// 的同时把此值写进返回帧 r10，与阻塞路径 `saved.r10=pid` 交付对齐，
+    /// 使 waitpid 在同步/阻塞两条路径都向用户态交付同一对 (rax=code, r10=pid)。
+    pub aux_pid: u64,
     /// 底层架构中断帧不透明句柄（切换路径用；业务层不解释）。
     pub arch_frame: usize,
 }

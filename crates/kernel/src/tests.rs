@@ -3458,6 +3458,7 @@ pub fn test_syscall_munmap() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         }
     }
 
@@ -3596,6 +3597,7 @@ pub fn test_syscall_usercopy_faults() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         }
     }
 
@@ -3818,6 +3820,7 @@ pub fn test_syscall_seq_large_io() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         }
     }
 
@@ -3942,6 +3945,7 @@ pub fn test_syscall_entry_update() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         }
     }
 
@@ -4127,6 +4131,7 @@ pub fn test_syscall_pipe() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         }
     }
     // 管道读写/关闭路径经 sys_read/sys_write 调 arch_frame(frame) 取真实
@@ -4166,6 +4171,7 @@ pub fn test_syscall_pipe() {
         result: 0,
         switched: false,
         arch_frame: (&mut ifr as *mut InterruptFrame) as usize,
+        aux_pid: 0,
     };
     // FLAG_PIPE = bit 6（vfs::file_handle::OpenFlags::pipe）。
     const FLAG_PIPE: u32 = 1 << 6;
@@ -4434,6 +4440,7 @@ pub fn test_syscall_entry_read_json() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         }
     }
 
@@ -4601,6 +4608,7 @@ pub fn test_syscall_entry_create_kind() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         }
     }
     use crate::syscall::{
@@ -4759,6 +4767,7 @@ pub fn test_syscall_driver_query_unregister() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         }
     }
 
@@ -4983,6 +4992,7 @@ pub fn test_syscall_memory_map_shared() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         }
     }
 
@@ -5095,6 +5105,7 @@ pub fn test_syscall_memquery_and_stdin_busy() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         }
     }
 
@@ -5191,6 +5202,7 @@ pub fn test_syscall_memquery_and_stdin_busy() {
         result: 0,
         switched: false,
         arch_frame: &mut rd_arch as *mut _ as usize,
+        aux_pid: 0,
     };
     assert!(crate::syscall::syscall_entry(&mut rd));
     assert_eq!(
@@ -5250,6 +5262,7 @@ pub fn test_syscall_std_stream_close() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         };
         assert!(crate::syscall::syscall_entry(&mut frame));
         assert_eq!(frame.result, expected, "close({fd}) must return ENOTSUP");
@@ -7752,8 +7765,8 @@ pub fn test_waitpid_core() {
     assert_eq!(wf, None, "zombie must not hold wait registration");
     assert_eq!(
         th::try_reap(root, child).ok(),
-        Some(42),
-        "reap returns code"
+        Some((child, 42)),
+        "reap returns (pid, code)"
     );
     assert!(th::probe(child).is_none(), "reaped slot must be freed");
     assert!(
@@ -7938,8 +7951,8 @@ pub fn test_init_contract() {
     // WAIT_ANY 应同步收割 zombie 子进程。
     assert_eq!(
         th::wait_any(root).ok(),
-        Some(task::Waited::Code(42)),
-        "WAIT_ANY must reap zombie child and return its exit code"
+        Some(task::Waited::Reaped { pid: child, code: 42 }),
+        "WAIT_ANY must reap zombie child and return (pid, code)"
     );
     assert!(th::probe(child).is_none(), "WAIT_ANY reaped child must be freed");
     info!("[test-init-contract] 1. WAIT_ANY zombie reap OK");
@@ -8316,9 +8329,9 @@ fn waitpid_child_code(sleep_ns: u64) -> [u8; 96] {
 /// 成功经 stream write 输出 '*'（ASCII 42，退出码逐字节可见）；失败输出 '!'
 /// 后 `exit(7)`。最后 `exit(0)` 停机。
 #[cfg(feature = "kernel-test-waitpid")]
-fn waitpid_parent_code(child_pid: usize) -> [u8; 192] {
+fn waitpid_parent_code(child_pid: usize) -> [u8; 224] {
     use usermode_waitpid::{MSG_ADDR, STACK_TOP};
-    let mut c = [0x90u8; 192];
+    let mut c = [0x90u8; 224];
     let mut i = 0;
     macro_rules! emit {
         ($($b:expr),*) => { $( c[i] = $b; i += 1; )* };
@@ -8355,18 +8368,28 @@ fn waitpid_parent_code(child_pid: usize) -> [u8; 192] {
     imm64!(0xBF, child_pid as u64);
     imm64!(0xBE, 0u64); // rsi = timeout（target!=0 时无意义，显式 0）
     emit!(0xCD, 0x80);
-    // cmp rax, 42
+    // cmp rax, 42（退出码）
     emit!(0x48, 0x81, 0xF8);
     c[i..i + 4].copy_from_slice(&42u32.to_le_bytes());
     i += 4;
     // jne fail（disp8 回填）
     let jne_disp_pos = i + 1;
     emit!(0x75, 0x00);
-    // ---- 成功路径：write('*')（offset 0）→ exit(0) ----
+    // cmp r10, child_pid（被收尸子进程 pid，阻塞路径经 saved.r10 交付）
+    // 用 mov r11, imm64 + cmp r10, r11（cmp r64,imm64 无此编码，imm32 会符号扩展失真）
+    emit!(0x49, 0xBB); // mov r11, imm64
+    c[i..i + 8].copy_from_slice(&(child_pid as u64).to_le_bytes());
+    i += 8;
+    emit!(0x4D, 0x39, 0xDA); // cmp r10, r11
+    // jne fail
+    let jne2_disp_pos = i + 1;
+    emit!(0x75, 0x00);
+    // ---- 成功路径：write('*')（offset 0）→ exit(0） ----
     write_seq!(u64::MAX); // offset = u64::MAX（流式追加语义）
     exit_seq!(0u8);
     emit!(0x0F, 0x0B);
     c[jne_disp_pos] = (i - jne_disp_pos - 1) as u8;
+    c[jne2_disp_pos] = (i - jne2_disp_pos - 1) as u8;
     // ---- 失败路径：write('!')（offset 1）→ exit(0xDEAD) ----
     // 退出码取非常规值：若串口出现 exit(code=57325) 即证明失败路径真实执行，
     // 同时排除陈旧引导介质干扰（旧版此值为 7）。
@@ -8941,6 +8964,7 @@ pub fn test_sync_syscalls() {
             result: 0,
             switched: false,
             arch_frame: 0,
+            aux_pid: 0,
         }
     }
 
@@ -9165,6 +9189,7 @@ pub fn test_perm_system_only() {
             a1, a2, a3,
             a4: 0, a5: 0,
             result: 0, switched: false, arch_frame: 0,
+            aux_pid: 0,
         }
     }
 
@@ -9402,6 +9427,7 @@ pub fn test_flock_syscall() {
             a1, a2, a3,
             a4: 0, a5: 0,
             result: 0, switched: false, arch_frame: 0,
+            aux_pid: 0,
         }
     }
 

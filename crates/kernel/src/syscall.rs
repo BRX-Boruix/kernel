@@ -1645,7 +1645,14 @@ fn sys_task_wait(frame: &mut SyscallFrame) -> DispatchResult {
     }
 
     match task::waitpid(target_pid, arch_frame(frame)) {
-        Ok(task::Waited::Code(code)) => done(pack_ok(code)),
+        Ok(task::Waited::Reaped { pid, code }) => {
+            // 同步收尸：rax 交付退出码（既有语义），r10 经 aux_pid 交付被收尸
+            // 子进程 pid——架构层在写回 rax 的同时把 aux_pid 写进返回帧 r10，
+            // 与阻塞路径 `saved.r10=pid` 交付对齐，waitpid 两条路径一致返回
+            // (rax=code, r10=pid)。
+            frame.aux_pid = pid as u64;
+            done(pack_ok(code))
+        }
         Ok(task::Waited::Blocked) => DispatchResult::Switched,
         Err(e) => done(pack_err(e)),
     }
