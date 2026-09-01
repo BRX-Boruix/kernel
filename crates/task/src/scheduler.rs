@@ -46,7 +46,10 @@ use crate::process::{
     Process, ProcessIdentity, TaskState, clear_current_proc, set_current_proc, user_code_selector,
     user_data_selector, USER_RFLAGS,
 };
-use crate::signals::{SIGKILL, SIGTERM};
+use crate::signal::{DefaultAction, default_disposition};
+use crate::signals::SIGKILL;
+use crate::signal_set::NSIG;
+use crate::process::Privilege;
 
 /// PCB 内保存的进程名上限；与 shell/ELF 路径缓冲无关，超长名在创建时明确拒绝。
 const PROCESS_NAME_MAX: usize = 63;
@@ -263,7 +266,7 @@ pub fn spawn(
     user_stack_top: u64,
     addr_space: UserAddressSpace<X86PageTable>,
 ) -> Result<usize, Error> {
-    spawn_with_ppid_fds(0, name, entry_rip, user_stack_top, addr_space, None, ProcessIdentity::default_user())
+    spawn_with_ppid_fds(0, name, entry_rip, user_stack_top, addr_space, 0, None, ProcessIdentity::default_user())
 }
 
 /// 校验并拷贝程序名进定长 PCB 缓冲。
@@ -290,7 +293,7 @@ pub fn spawn_with_ppid(
     user_stack_top: u64,
     addr_space: UserAddressSpace<X86PageTable>,
 ) -> Result<usize, Error> {
-    spawn_with_ppid_fds(ppid, name, entry_rip, user_stack_top, addr_space, None, ProcessIdentity::default_user())
+    spawn_with_ppid_fds(ppid, name, entry_rip, user_stack_top, addr_space, 0, None, ProcessIdentity::default_user())
 }
 
 /// 带 fd 表继承的 spawn 公开形态（pipe-features 方案 A）。`None` 等价于
@@ -304,6 +307,7 @@ pub fn spawn_with_ppid_fds(
     entry_rip: u64,
     user_stack_top: u64,
     addr_space: UserAddressSpace<X86PageTable>,
+    trampoline: u64,
     inherited_fds: Option<alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>>>,
     identity: ProcessIdentity,
 ) -> Result<usize, Error> {
@@ -326,6 +330,9 @@ pub fn spawn_with_ppid_fds(
     // 分配独立内核栈（16 帧；HHDM 高半区在所有进程页表继承可见）。
     let stack_frame = mm::allocate_frames(KSTACK_ORDER).ok_or(Error::OutOfMemory)?;
     let kstack_top = arch::phys_to_virt(stack_frame.start_paddr()) + KSTACK_SIZE as u64;
+    // ADR-034 PRE-3：exec 路径（spawn_elf_image）已把 restorer 装进用户地址空间
+    // 保留区并传入 `trampoline` 地址；此处仅登记到进程信号状态。test-only 路径
+    // 传 0（无 restorer），保持哑地址空间记账不变。
     let mut proc = Box::new(Process::<X86PageTable>::new(
         pid,
         entry_rip,
@@ -333,6 +340,7 @@ pub fn spawn_with_ppid_fds(
         kstack_top,
         addr_space,
     ));
+    proc.signal_mut().set_trampoline(trampoline);
     // 管道方案 A：注入父进程继承的 fd 表（若提供）。非空才替换（空表保留
     // 默认标准流）。pipe 端引用计数已由 syscall 层在克隆时递增，此处仅挂表。
     if let Some(fds) = inherited_fds {
@@ -389,6 +397,28 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
     // 不在任何将死栈上执行，归还安全。放在时间片判断之前——即使本轮
     // 不切换也照常清队，回收延迟与时间片长度解耦。
     drain_dead_kstacks();
+
+    // S1-8 触发点 1（ADR-034 §2.4）：tick 返回用户态前派发待投递信号。
+    // 放在时间片 RR 切换之前：若当前进程有待投递信号，先投递（可能把帧
+    // 改写进用户 handler），而非抢占切换。`deliver_on_return` 的默认终止
+    // 路径经 exit_current 内部加锁，故此处不持 SCHED 锁调用。
+    {
+        use crate::signal::{DeliveryOutcome, deliver_on_return};
+        if let Some(cur) = crate::process::current_proc_mut() {
+            if !cur.signal().pending().is_empty() {
+                match deliver_on_return(cur, frame) {
+                    DeliveryOutcome::Terminated => return, // 已切走，调度接管
+                    DeliveryOutcome::Continue => {
+                        // 若已进入 handler（in_signal=true），让 handler 先运行，
+                        // 本轮不抢占；否则无实际投递，落回下方 RR 逻辑。
+                        if cur.signal().in_signal() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let n = TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if n % TIMESLICE_TICKS != 0 {
@@ -1602,11 +1632,28 @@ pub fn get_process_snapshot(pid: usize) -> Option<vfs::ProcessSnapshot> {
 ///   孤儿级联/UIO 清理单点），退出码记为信号号；被杀进程若有阻塞 waitpid
 ///   的父进程，父进程同样拿到真实退出码。若其为键盘 waiter，一并清除
 ///   `KBD_WAITER` 避免悬挂唤醒。
+/// PID 1 契约：该信号若投递给 init 是否会**终止** init（从而应被拒绝）。
+/// 依 ADR-034「init 可捕获非致命信号」：仅当默认处置为 Terminate 且 init
+/// 未为该信号设 handler（不可捕获）时才判定为终止 → 拒绝。
+fn init_signal_terminates(s: &klib::sync::irq::IrqSpinLock<Scheduler>, init_pid: usize, sig: u32) -> bool {
+    if default_disposition(sig) != DefaultAction::Terminate {
+        return false;
+    }
+    let g = s.lock();
+    let has_handler = g
+        .procs
+        .get(init_pid)
+        .and_then(|e| e.as_ref())
+        .map(|e| matches!(e.proc.signal().disposition(sig), Some(crate::signal::SigDisposition::Handler(_))))
+        .unwrap_or(false);
+    !has_handler
+}
+
 pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u64, Error> {
-    // task1 KM1：信号号常量化——字面量 9/15 特判已废除，SIGKILL 由
-    // signals 模块单点定义（S13）。
-    if sig != 0 && sig != SIGKILL && sig != SIGTERM {
-        return Err(Error::NotSupported);
+    // S1-9：接受全部信号号——越界 `InvalidParam`（ADR-034 §2.3）。
+    // task1 KM1：信号号常量化——SIGKILL 由 signals 模块单点定义（S13）。
+    if sig >= NSIG {
+        return Err(Error::InvalidParam);
     }
     let current = {
         let s = SCHED.lock();
@@ -1616,21 +1663,30 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
         if sig == 0 {
             return Ok(0); // 对自己探活
         }
-        // PID 1 契约：init 自杀被显式拒绝（exit_current 中会 panic，
-        // 此处先返回错误，避免 panic 对用户态进程的冲击）。
-        if target == init_pid() {
+        // PID 1 契约：init 自杀被显式拒绝（exit_current 中会 panic，此处先返回
+        // 错误避免 panic 冲击）。但 init **可捕获非致命信号**（ADR-034）：仅当
+        // 信号会终止 init（默认 Terminate 且未设 handler）才拒绝。
+        if target == init_pid() && init_signal_terminates(&SCHED, target, sig) {
             return Err(Error::PermissionDenied);
         }
-        // 自杀：走标准退出路径（zombie 化并切换）。exit_current 内部自行加锁，
-        // 故此处不持锁调用。exit_current 会把 `*frame` 改写为下一进程现场；
-        // 调用方（sys_kill）依此返回 Switched，本函数**必须立即返回**——
-        // 落入下方 he-kill 分支会对已死 target 返回 Err(InvalidParam)，
-        // 污染调用方对 frame 的后续处理（S26 回归）。
-        exit_current(frame, sig as u64);
-        return Ok(0); // 不返回不可达：exit_current 是普通返回，切换由 iretq 完成
+        // 自杀：SIGKILL 立即终止（走标准退出路径，zombie 化并切换）；
+        // 其余信号转本进程 pending，由返回用户态时的 deliver_on_return 派发
+        // （可捕获/可屏蔽信号延迟投递，S1-9/S1-8）。exit_current 内部自行加锁，
+        // 故此处不持锁调用；其会把 `*frame` 改写为下一进程现场，调用方（sys_kill）
+        // 依此返回 Switched，本函数必须立即返回（S26）。
+        if sig == SIGKILL {
+            exit_current(frame, sig as u64);
+            return Ok(0);
+        }
+        // 非 SIGKILL 自杀：raise 到 pending，由派发层处理（不再立即终止）。
+        if let Some(slot) = SCHED.lock().procs.get_mut(target).and_then(|e| e.as_mut()) {
+            slot.proc.signal_mut().raise(sig);
+        }
+        return Ok(0);
     }
-    // PID 1 契约：禁止向他杀 init（探活 sig=0 放行）。
-    if target == init_pid() && sig != 0 {
+    // PID 1 契约：禁止向他杀 init（探活 sig=0 放行）。仅拒绝会**终止** init 的
+    // 信号；init 可捕获的非致命信号放行（ADR-034「init 可捕获非致命信号」）。
+    if target == init_pid() && sig != 0 && init_signal_terminates(&SCHED, target, sig) {
         return Err(Error::PermissionDenied);
     }
     // 校验目标存在且非 zombie。
@@ -1641,6 +1697,28 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
     }
     if sig == 0 {
         return Ok(0); // 仅校验存在，不发送
+    }
+    // S1-10：投递权限强制（ADR-034 §2.7，复用 ProcessIdentity）。
+    // User 不可向 System 投递终止类信号（default_disposition==Terminate）→
+    // PermissionDenied；System 可向任意投递。探活 sig==0 已在上方放行。
+    {
+        let sender_priv = current
+            .and_then(|cur| s.procs.get(cur))
+            .and_then(|e| e.as_ref())
+            .map(|e| e.proc.identity().privilege)
+            .unwrap_or(Privilege::System); // 无当前进程（内核/驱动）视为 System
+        let target_priv = s
+            .procs
+            .get(target)
+            .and_then(|e| e.as_ref())
+            .map(|e| e.proc.identity().privilege)
+            .unwrap_or(Privilege::User);
+        if sender_priv == Privilege::User
+            && target_priv == Privilege::System
+            && default_disposition(sig) == DefaultAction::Terminate
+        {
+            return Err(Error::PermissionDenied);
+        }
     }
     // 若是键盘 waiter，清空避免悬挂唤醒。
     if KBD_WAITER.load(core::sync::atomic::Ordering::Acquire) == target as u32 {
@@ -1658,8 +1736,14 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
             klib::time::cancel_timeout(stale);
         }
     }
-    // 统一终止核心：置 Exit、按父子关系交付/保留/回收、孤儿级联、UIO 清理。
-    let _ = terminate_locked(&mut s, target, sig as u64);
+    // 投递：SIGKILL 立即终止（统一终止核心：置 Exit、按父子关系交付/保留/回收、
+    // 孤儿级联、UIO 清理）；其余信号转目标 pending，由目标返回用户态时的
+    // deliver_on_return 派发（S1-9：非终止信号不立即杀）。
+    if sig == SIGKILL {
+        let _ = terminate_locked(&mut s, target, sig as u64);
+    } else if let Some(slot) = s.procs.get_mut(target).and_then(|e| e.as_mut()) {
+        slot.proc.signal_mut().raise(sig);
+    }
     Ok(0)
 }
 
@@ -1767,6 +1851,16 @@ pub mod test_hooks {
                 e.ppid,
             )
         })
+    }
+
+    /// restorer（trampoline）探针（ADR-034 PRE-3 验收用）：返回该进程
+    /// `Process.signal().trampoline()` 地址。
+    pub fn probe_trampoline(pid: usize) -> Option<u64> {
+        let s = SCHED.lock();
+        s.procs
+            .get(pid)
+            .and_then(|p| p.as_ref())
+            .map(|e| e.proc.signal().trampoline())
     }
 
     /// 真实内存记账探针（C1.2 验收用）：返回该进程地址空间 declared_bytes()（MM7：虚拟预留量，非 RSS）。
@@ -1943,6 +2037,51 @@ pub mod test_hooks {
     /// "残值 vs 强零化"语义对后续用例不可观测。测试夹具专用。
     pub fn debug_reset_fpu_template() {
         *FPU_TEMPLATE.lock() = None;
+    }
+
+    /// 以指定身份创建测试进程（S1-9/S1-10 kill 权限验收用）。
+    /// 复用手工 restorer 安装 + `spawn_with_ppid_fds` 真实路径。
+    pub fn spawn_child_with_identity(
+        ppid: usize,
+        name: &str,
+        identity: ProcessIdentity,
+    ) -> Result<usize, Error> {
+        let mut us = UserAddressSpace::<X86PageTable>::new()?;
+        let trampoline = us.install_signal_restorer().map_err(|_| Error::OutOfMemory)?;
+        spawn_with_ppid_fds(ppid, name, 0x1000, 0x5000, us, trampoline, None, identity)
+    }
+
+    /// 把 `pid` 置为"当前运行进程"（`s.current` + `CURRENT_PROC` 同步），
+    /// 供 kill 权限验收（kill_pid 以当前进程身份判定投递权限）。返回是否成功。
+    pub fn set_current(pid: usize) -> bool {
+        let mut s = SCHED.lock();
+        let slot = s.procs.get_mut(pid).and_then(|e| e.as_mut());
+        match slot {
+            Some(slot) => {
+                let ptr = (&mut *slot.proc as *mut Process<X86PageTable>) as usize;
+                s.current = Some(pid);
+                set_current_proc(ptr as *mut Process<X86PageTable>);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 清除"当前运行进程"（与 `set_current` 对称）。
+    pub fn clear_current() {
+        let mut s = SCHED.lock();
+        s.current = None;
+        clear_current_proc();
+    }
+
+    /// 未决信号集探针（S1-9 验收：kill 转 pending 后读回）。
+    pub fn pending_of(pid: usize) -> u64 {
+        let s = SCHED.lock();
+        s.procs
+            .get(pid)
+            .and_then(|e| e.as_ref())
+            .map(|e| e.proc.signal().pending().bits())
+            .unwrap_or(0)
     }
 
     /// 哑地址空间：仅占位映射（测试进程不执行任何用户代码）。

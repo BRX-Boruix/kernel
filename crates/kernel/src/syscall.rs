@@ -75,6 +75,8 @@ pub mod domain {
     pub const VOLUME: u32 = 0x60;
     /// SYNC 域（ADR-032 ACCEPTED）：跨进程同步字对象（通用 futex 等待/唤醒）。
     pub const SYNC: u32 = 0x70;
+    /// SIGNAL 域（ADR-034 PROPOSED）：可编程信号派发（sigaction/sigprocmask/rt_sigreturn）。
+    pub const SIGNAL: u32 = 0x80;
 }
 
 pub mod op {
@@ -189,6 +191,14 @@ pub const SYS_SYNC_WAIT: u32 = nr(domain::SYNC, op::READ); // 0x72
 pub const SYS_SYNC_WAKE: u32 = nr(domain::SYNC, op::WRITE); // 0x73
 /// `sync_delete(sync_id)`：销毁对象；仍有等待者返回 `Busy`。
 pub const SYS_SYNC_DELETE: u32 = nr(domain::SYNC, op::DELETE); // 0x74
+
+// ---------- 8. SIGNAL Domain (0x80, ADR-034 PROPOSED) ----------
+/// `signal_mask(how, set) -> old_set`：查/改屏蔽集（sigprocmask）。
+pub const SYS_SIGNAL_MASK: u32 = nr(domain::SIGNAL, op::READ); // 0x82
+/// `signal_action(sig, handler, flags) -> old_disposition`：查/设处置（sigaction）。
+pub const SYS_SIGNAL_ACTION: u32 = nr(domain::SIGNAL, op::WRITE); // 0x83
+/// `signal_return()`：handler 返回后恢复原帧（rt_sigreturn）。
+pub const SYS_SIGNAL_RETURN: u32 = nr(domain::SIGNAL, op::DELETE); // 0x84
 
 // ---------- ABI 打包（成功 / 错误） ----------
 
@@ -1290,12 +1300,20 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
         Ok(id) => id,
         Err(e) => return pack_err(e),
     };
+    // ADR-034 PRE-3：exec 时把信号 restorer 装进本进程用户地址空间保留区，
+    // 记录 trampoline 地址（handler 返回后经 restorer 调 rt_sigreturn）。
+    // 安装失败如实上抛——不静默缺 restorer 造成 handler 投递时无法恢复现场。
+    let trampoline = match us.install_signal_restorer() {
+        Ok(addr) => addr,
+        Err(_) => return pack_err(Error::OutOfMemory),
+    };
     match task::spawn_with_ppid_fds(
         parent_pid,
         &prog_name,
         loaded.entry,
         loaded.user_stack_top,
         us,
+        trampoline,
         inherited,
         child_identity,
     ) {
@@ -1599,13 +1617,15 @@ fn sys_exit(frame: &mut SyscallFrame) -> u64 {
 fn sys_kill(frame: &mut SyscallFrame) -> DispatchResult {
     let target = frame.a1 as usize;
     let sig = frame.a2 as u32;
-    // 自杀判定：target 即当前进程且是真实信号（非探活 sig=0）。init 自杀
-    // 由 kill_pid 的 PID1 防护拒绝（此处不自行 exit，避免绕过防护）。
-    let is_suicide = {
+    // 自杀判定：仅 SIGKILL 立即终止（exit_current 走标准退出路径并切换帧，
+    // 返回 Switched）。非 SIGKILL 自杀（raise 语义）由 kill_pid 转本进程
+    // pending，返回用户态时经 deliver_on_return 派发（S1-9）。init 自杀由
+    // kill_pid 的 PID1 防护拒绝（此处不自行 exit，避免绕过防护）。
+    let is_suicide_sigkill = {
         let cur = task::current_proc_mut().map(|p| p.pid());
-        cur == Some(target) && sig != 0 && target != task::init_pid()
+        cur == Some(target) && sig == task::signals::SIGKILL && target != task::init_pid()
     };
-    if is_suicide {
+    if is_suicide_sigkill {
         task::exit_current(arch_frame(frame), sig as u64);
         return DispatchResult::Switched;
     }
@@ -1615,6 +1635,166 @@ fn sys_kill(frame: &mut SyscallFrame) -> DispatchResult {
     }
 }
 
+
+/// 旧处置 → ABI 返回值编码（0=Default、1=Ignore、其它为 handler 指针）。
+fn encode_disposition(d: task::signal::SigDisposition) -> u64 {
+    match d {
+        task::signal::SigDisposition::Default => 0,
+        task::signal::SigDisposition::Ignore => 1,
+        task::signal::SigDisposition::Handler(p) => p,
+    }
+}
+
+/// `signal_action(sig, handler, flags) -> 旧处置`（sigaction，ADR-034 §3.2）。
+///
+/// `handler`：0=SIG_DFL、1=SIG_IGN、其余为用户函数指针。返回旧处置（同样编码）。
+/// SIGKILL/SIGSTOP 设非默认 → `InvalidParam`；越界信号号 → `OutOfRange`。
+/// 本调用不触发投递（仅查/设处置，ADR-034 §2.3）。
+fn sys_signal_action(frame: &mut SyscallFrame) -> u64 {
+    use task::signal::SigDisposition;
+    let sig = frame.a1 as u32;
+    let handler = frame.a2;
+    // flags 当前仅 0 接受（S2-1 sigaltstack 预留位）。
+    if frame.a3 != 0 {
+        return pack_err(Error::InvalidParam);
+    }
+    let disp = match handler {
+        0 => SigDisposition::Default,
+        1 => SigDisposition::Ignore,
+        p => SigDisposition::Handler(p),
+    };
+    let cur = match task::current_proc_mut() {
+        Some(p) => p,
+        None => return pack_err(Error::NotSupported),
+    };
+    match cur.signal_mut().set_disposition(sig, disp) {
+        Ok(Some(old)) => pack_ok(encode_disposition(old)),
+        Ok(None) => pack_err(Error::InvalidParam), // 越界（不应达，validate 已拒）
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `signal_return()`（rt_sigreturn，ADR-034 §2.5）：handler 返回后恢复原帧。
+///
+/// 从用户栈读回 SignalFrame（经 task::signal::sigreturn），恢复被打断的现场；
+/// 成功后调用方照常 iretq 回原 RIP。帧损坏/越界 → `InvalidParam`。
+fn sys_signal_return(frame: &mut SyscallFrame) -> u64 {
+    let arch: &mut arch_x86_64::interrupts::InterruptFrame = arch_frame(frame);
+    let cur = task::current_proc_mut();
+    match task::signal::sigreturn(cur, arch) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// 返回用户态前派发待投递信号（ADR-034 §2.4 触发点：syscall 返回）。
+///
+/// 返回 `true` 表示当前进程继续（帧有效，可回写 syscall 结果）；`false` 表示
+/// 进程已被默认动作终止并经 `exit_current` 切换（调度接管，不得回写 result）。
+fn deliver_pending_signal(frame: &mut SyscallFrame) -> bool {
+    // 仅对真实用户态返回帧做派发：kernel-tests 用合成 SyscallFrame（arch_frame 为
+    // 0 或指向局部帧），无真实用户态返回帧可改写，跳过。用 `read_unaligned`
+    // 读取 `cs`（代码段）判断是否用户态（cs & 3 == 3），避免对未对齐帧的
+    // 对齐解引用 panic。
+    if frame.arch_frame == 0 {
+        return true;
+    }
+    // InterruptFrame.cs 偏移：15 个 GP 寄存器(120) + vector(8) + error_code(8)
+    // + rip(8) = 144，cs 恰在 144；152 是 rflags。
+    const CS_OFFSET: usize = 144;
+    let cs: u64 = unsafe { core::ptr::read_unaligned((frame.arch_frame as *const u8).add(CS_OFFSET) as *const u64) };
+    if cs & 3 != 3 {
+        return true; // 非用户态返回帧（内核态/合成测试帧），无用户信号可派发。
+    }
+    // 廉价检查：当前进程有未决信号才触碰 arch_frame。
+    let has_pending = task::current_proc_mut()
+        .map(|p| !p.signal().pending().is_empty())
+        .unwrap_or(false);
+    if !has_pending {
+        return true;
+    }
+    let arch: &mut arch_x86_64::interrupts::InterruptFrame = arch_frame(frame);
+    let Some(cur) = task::current_proc_mut() else {
+        return true; // 无当前进程（内核/idle 上下文），无用户信号可派发。
+    };
+    match task::signal::deliver_on_return(cur, arch) {
+        task::signal::DeliveryOutcome::Continue => true,
+        task::signal::DeliveryOutcome::Terminated => false,
+    }
+}
+
+/// 用户态异常 → 信号投递处理器（S1-11，ADR-034 §2.8）。
+///
+/// 由 `interrupts::register_user_exception_handler` 在引导期注册，取代原先
+/// "用户异常一律终止"的兜底：
+/// - 映射 `sig = signal_for_exception(vector)`；
+/// - 查处置：`Handler` → 携 siginfo（CR2/vector/error_code）投递并 iretq 进 handler；
+///   `Ignore`/`Default` → 等价终止（防异常风暴，S30），`exit_current` 把帧改写为
+///   下一进程现场后 iretq。
+///
+/// 返回 `true` 表示已处置（handler 入口 或 已切换到下一进程），架构层 iretq；
+/// 返回 `false` 表示无法处置（无当前进程等致命情形），架构层停机。
+pub extern "C" fn user_exception_signal_handler(
+    cr2: u64,
+    frame: &mut arch_x86_64::interrupts::InterruptFrame,
+) -> bool {
+    use task::signal::SigDisposition;
+    let sig = task::signals::signal_for_exception(frame.vector);
+    let Some(cur) = task::current_proc_mut() else {
+        // 无当前进程（内核/idle 上下文）：停机。
+        return false;
+    };
+    // SIGKILL/SIGSTOP 等硬信号不会到达 Handler 处置（validate 保证恒 Default）。
+    match cur.signal().disposition(sig) {
+        Some(SigDisposition::Handler(f)) => {
+            let restorer = cur.signal().trampoline();
+            if restorer == 0 {
+                // 无 restorer（PRE-3 未装）：无法安全进 handler，终止兜底。
+                task::exit_current(frame, sig as u64);
+                return true; // exit_current 已改写帧为下一进程，iretq 切走
+            }
+            // SigInfo 字段契约：fault_addr 仅 #PF（vector 14）填 CR2 出错线性地址，
+            // 其余异常 CR2 无意义填 0（见 SigInfo::fault_addr 文档；S4 整改）。
+            let fault_addr = if frame.vector == 14 { cr2 } else { 0 };
+            let siginfo = task::signal::SigInfo {
+                sig,
+                vector: frame.vector as u32,
+                error_code: frame.error_code,
+                fault_addr,
+                pid: cur.pid() as u64,
+            };
+            if task::signal::deliver_handler(cur, frame, sig, f, siginfo, restorer) {
+                return true; // 已改写帧为 handler 入口，iretq 进用户 handler
+            }
+            // 用户栈写帧失败（越界/不可写）：无法安全投递，终止兜底。
+            task::exit_current(frame, sig as u64);
+            return true;
+        }
+        // Ignore → 对同步异常等价 Default 终止（防异常风暴，S30）；
+        // Default → 终止（现状）；越界防御同样终止。
+        _ => {
+            task::exit_current(frame, sig as u64);
+            return true; // exit_current 已改写帧为下一进程，iretq 切走
+        }
+    }
+}
+
+/// `signal_mask(how, set) -> 旧屏蔽集`（sigprocmask，ADR-034 §3.2）。
+///
+/// `how`：0=SET、1=BLOCK、2=UNBLOCK。返回旧屏蔽集（u64 位图）。
+/// SIGKILL 不可屏蔽（强制清位）；SIGSTOP 位保留。越界 how → `InvalidParam`。
+fn sys_signal_mask(frame: &mut SyscallFrame) -> u64 {
+    let how = frame.a1 as u32;
+    let set = task::signal_set::SignalSet(frame.a2);
+    let cur = match task::current_proc_mut() {
+        Some(p) => p,
+        None => return pack_err(Error::NotSupported),
+    };
+    match cur.signal_mut().mask(how, set) {
+        Ok(old) => pack_ok(old.bits()),
+        Err(e) => pack_err(e),
+    }
+}
 /// `driver_register(name_ptr, len) -> uio_id` (M11.1)
 fn sys_driver_register(frame: &mut SyscallFrame) -> u64 {
     let name_ptr = frame.a1 as *const u8;
@@ -2303,6 +2483,11 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_SYNC_WAKE => done(sys_sync_wake(frame)),
         SYS_SYNC_DELETE => done(sys_sync_delete(frame)),
 
+        // SIGNAL Domain (0x80, ADR-034 PROPOSED)
+        SYS_SIGNAL_ACTION => done(sys_signal_action(frame)),
+        SYS_SIGNAL_MASK => done(sys_signal_mask(frame)),
+        SYS_SIGNAL_RETURN => done(sys_signal_return(frame)),
+
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);
             done(pack_err(Error::NotSupported))
@@ -2337,7 +2522,17 @@ pub extern "C" fn syscall_entry(frame: &mut SyscallFrame) -> bool {
         DispatchResult::Done(ret) => {
             #[cfg(feature = "kernel-tests")]
             klib::info!("[syscall] nr={:#x} -> {:#x}", nr, ret);
+            // 非切换路径：返回用户态前派发待投递信号（ADR-034 §2.4 触发点 2）。
+            // S1-8 接线：先回写 syscall 结果，再派发。`deliver_pending_signal` 内部
+            // 用 `read_unaligned` 读 cs 判定是否真实用户态返回帧（合成测试帧的
+            // arch_frame 为 0 或指向未对齐局部帧时安全跳过），避免 misaligned deref。
             frame.result = ret;
+            if !deliver_pending_signal(frame) {
+                // 进程被默认动作终止并已切走：架构层不得再把 result 回写（调度已
+                // 替换帧）。置 switched 由调度语义接管。
+                frame.switched = true;
+                return true;
+            }
         }
         DispatchResult::Switched => {
             #[cfg(feature = "kernel-tests")]

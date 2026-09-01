@@ -207,6 +207,8 @@ pub struct Process<PT: PageTable> {
     /// 进程身份（A1 / ADR-033）：uid + 特权级。权限强制与 flock owner
     /// 识别的事实来源（见 [`ProcessIdentity`]）。
     identity: ProcessIdentity,
+    /// 每进程信号状态（ADR-034 §2.2）：处置/屏蔽/未决/重入守卫/restorer。
+    signal: crate::signal::SignalState,
 }
 
 impl<PT: PageTable> Process<PT> {
@@ -241,6 +243,7 @@ impl<PT: PageTable> Process<PT> {
             fd_table,
             cwd: alloc::string::String::from("/"),
             identity: ProcessIdentity::default_user(),
+            signal: crate::signal::SignalState::new(),
         }
     }
 
@@ -352,6 +355,14 @@ impl<PT: PageTable> Process<PT> {
     /// 设置进程身份（A1 / ADR-033）。
     pub fn set_identity(&mut self, identity: ProcessIdentity) {
         self.identity = identity;
+    }
+    /// 每进程信号状态（ADR-034 §2.2）可变访问（派发/投递/sigaction 用）。
+    pub fn signal_mut(&mut self) -> &mut crate::signal::SignalState {
+        &mut self.signal
+    }
+    /// 每进程信号状态只读访问。
+    pub fn signal(&self) -> &crate::signal::SignalState {
+        &self.signal
     }
     /// 当前工作目录（规范绝对路径）。
     pub fn cwd(&self) -> &str {

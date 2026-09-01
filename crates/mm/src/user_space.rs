@@ -45,6 +45,27 @@ pub const USER_HEAP_BASE: u64 = 0x0000_0001_0000_0000;
 /// 默认用户栈大小（预留区域，按需分页）。
 pub const DEFAULT_STACK_SIZE: u64 = 4 * 1024 * 1024; // 4MiB
 
+/// 信号 restorer（trampoline）保留区虚拟地址（ADR-034 §2.5 / PRE-3）。
+///
+/// 位于低半区高地址、栈（USER_STACK_TOP 向下增长）之上的专页，exec 时安装
+/// restorer 机器码。固定地址便于进程对象 `Process::trampoline` 指向与 S1-6
+/// sigreturn 的地址校验。
+pub const SIGNAL_RESTORER_ADDR: u64 = USER_TOP - 0x1000;
+
+/// restorer 机器码：`mov rax, SYS_SIGNAL_RETURN; int 0x80; ud2`（11 字节）。
+///
+/// - `48 C7 C0 84 00 00 00`：`mov rax, 0x84`（SYS_SIGNAL_RETURN）
+/// - `CD 80`：`int 0x80`（rt_sigreturn 软中断）
+/// - `0F 0B`：`ud2`（帧损坏兜底停机，防落到垃圾）
+///
+/// handler 正常 `ret` 即弹 `SignalFrame.restorer_return` 落到此处，restorer
+/// 调用 rt_sigreturn 恢复被信号打断的现场。
+pub const SIGNAL_RESTORER_CODE: [u8; 11] = [
+    0x48, 0xC7, 0xC0, 0x84, 0x00, 0x00, 0x00, // mov rax, 0x84
+    0xCD, 0x80, // int 0x80
+    0x0F, 0x0B, // ud2
+];
+
 /// 单页属性查询结果（[`UserAddressSpace::query_page`] 返回，SYS_MEMORY_QUERY
 /// 后端）。字段来自页表真值，不做任何推断。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -273,6 +294,34 @@ where
             kind: UserAreaKind::Fixed,
         });
         Ok(())
+    }
+
+    /// 安装信号 restorer（trampoline）到本地址空间保留区（ADR-034 §2.5 / PRE-3）。
+    ///
+    /// 分配一物理帧，写入 SIGNAL_RESTORER_CODE 机器码，映射到 SIGNAL_RESTORER_ADDR
+    /// （用户半区高地址专页，exec 可见且与栈/堆隔离），返回 restorer 起始虚拟地址
+    /// （即 Process::trampoline）。帧归本地址空间所有：销毁时随地址空间回收。
+    pub fn install_signal_restorer(&mut self) -> Result<u64, PT::Error> {
+        let start = VirtAddr::new(SIGNAL_RESTORER_ADDR);
+        let end = VirtAddr::new(SIGNAL_RESTORER_ADDR + 0x1000);
+        // 单点幂等：已在保留区映射过则直接返回既有 trampoline 地址。
+        if self.query_page(SIGNAL_RESTORER_ADDR).is_some() {
+            return Ok(SIGNAL_RESTORER_ADDR);
+        }
+        let frame = allocate_frame().ok_or(Error::OutOfMemory.into())?;
+        // 经 HHDM 直接映射写 restorer 机器码到物理帧。
+        let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                SIGNAL_RESTORER_CODE.as_ptr(),
+                (frame.start_paddr() + off) as *mut u8,
+                SIGNAL_RESTORER_CODE.len(),
+            );
+        }
+        // 用户可执行只读页：restorer 仅被执行，不可被用户改写（S09/S31）。
+        let flags = PageFlags::empty().user().executable();
+        self.map_user(start, end, PageSize::Size4K, flags, &[frame.start_paddr()])?;
+        Ok(SIGNAL_RESTORER_ADDR)
     }
 
     /// 声明一个**按需分页**的预留区域：记录区域但不立即映射（present=0）。

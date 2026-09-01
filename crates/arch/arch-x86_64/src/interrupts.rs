@@ -493,9 +493,13 @@ pub fn register_soft_interrupt_handler(h: SoftInterruptHandler) {
 
 /// 用户态异常（#PF/#GP/#UD 等，CPL=3）处理器。
 ///
-/// 由进程层注册（M3.3）：当用户态进程触发异常时，不再当作内核崩溃停机，
-/// 而是终止/回收该进程。处理器应不返回（停机或恢复调度）；若返回则兜底停机。
-pub type UserExceptionHandler = extern "C" fn(&mut InterruptFrame);
+/// 由进程层注册（M3.3 / ADR-034 PRE-2/S1-11）：当用户态进程触发异常时，不再当作
+/// 内核崩溃停机，而是终止/回收该进程（或投递信号进用户 handler）。
+///
+/// 回调携带 `cr2`（#PF 出错线性地址，ADR-034 §2.8 供 siginfo.fault_addr；
+/// 非 #PF 异常为 0）。返回 `true` 表示已处置且应 **iretq 回用户态**（如已把
+/// 现场改写为 handler 入口）；返回 `false` 表示未恢复（已终止/停机）。
+pub type UserExceptionHandler = extern "C" fn(cr2: u64, frame: &mut InterruptFrame) -> bool;
 static USER_EXCEPTION_HANDLER: spin::Once<UserExceptionHandler> = spin::Once::new();
 
 /// 注册用户态异常处理器（M3.3）。
@@ -674,12 +678,18 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             }
         }
 
-        // M3.3：若异常来自用户态（CS.RPL==3），交给进程层终止该进程，
-        // 而非当作内核崩溃。处理器应不返回（停机/恢复调度）；返回则兜底停机。
+        // M3.3 / ADR-034 PRE-2：若异常来自用户态（CS.RPL==3），交给进程层终止
+        // 该进程或投递信号，而非当作内核崩溃。读取 CR2（#PF 出错地址）传给回调
+        // （非 #PF 异常也读——值为陈旧 CR2，回调按 vector 决定是否采信）。
+        // 处理器应不返回（停机/恢复调度）；返回则兜底停机。
         if frame.cs & 3 == 3 {
             if let Some(h) = USER_EXCEPTION_HANDLER.get() {
-                h(frame);
-                // 处理器返回了：兜底停机
+                let cr2 = crate::mmio::cr2();
+                // 返回 true：已处置（如投递到 handler），iretq 回用户态继续；
+                // 返回 false：未恢复（已终止/停机），兜底停机。
+                if h(cr2, frame) {
+                    return;
+                }
                 crate::halt_forever();
             }
         }

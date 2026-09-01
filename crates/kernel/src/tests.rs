@@ -954,8 +954,8 @@ pub fn test_pmm_bench() {
 /// - 用户栈：`USER_STACK_TOP`（0x7fff_0000_0000，立即映射）。
 /// - magic 地址：`0x0000_0000_9500_0000`（可写，立即映射）。
 ///
-/// 仅 M3.3 使用；随 `kernel-test-m33` feature 编译。
-#[cfg(feature = "kernel-test-m33")]
+/// 供 M3.3（kernel-test-m33）与 ADR-034 PRE-2（kernel-test-pre2）使用。
+#[cfg(any(feature = "kernel-test-m33", feature = "kernel-test-pre2"))]
 mod usermode {
     pub const CODE_ADDR: u64 = 0x0000_0000_9000_0000;
     pub const MAGIC_ADDR: u64 = 0x0000_0000_9500_0000;
@@ -1757,20 +1757,18 @@ fn usermode_fault_code() -> [u8; 26] {
 /// 信号（雏形，`signals::signal_for_exception`），标记"进程因信号终止"，
 /// 单进程场景下停机。
 #[cfg(feature = "kernel-test-m33")]
-extern "C" fn user_fault_handler(frame: &mut arch_x86_64::interrupts::InterruptFrame) {
+extern "C" fn user_fault_handler(cr2: u64, frame: &mut arch_x86_64::interrupts::InterruptFrame) -> bool {
     let sig = task::signals::signal_for_exception(frame.vector);
     klib::info!(
-        "[signal] user process terminated by {} (vector={:#x}) at rip={:#x} cs={:#x}",
+        "[signal] user process terminated by {} (vector={:#x}) at rip={:#x} cs={:#x} cr2={:#x}",
         task::signals::signal_name(sig),
         frame.vector,
         frame.rip,
-        frame.cs
+        frame.cs,
+        cr2
     );
-    // 进程终止：单进程场景下停机（不 panic、不 iretq 回用户态）。
-    arch_x86_64::interrupts::disable();
-    loop {
-        arch_x86_64::interrupts::halt();
-    }
+    // 进程终止：返回 false → 架构层兜底停机（不 iretq 回用户态）。
+    false
 }
 
 /// M3.3：用户态进程触发异常（#UD）时，异常被"进程终止"处理而非内核崩溃。
@@ -1833,6 +1831,424 @@ pub fn test_spawn_user_fault() {
     arch_x86_64::interrupts::register_user_exception_handler(user_fault_handler);
 
     // 进入用户态执行（永不返回；用户态 ud2 异常被终止）。
+    table.get(pid).unwrap().addr_space().activate();
+    table.run(pid);
+}
+
+/// PRE-2 用户态 #PF 代码：`mov rax, 0x55` → `mov [0x1234_0000], rax`（未映射地址）。
+///
+/// `mov [moffs64], rax` 对未映射地址写触发 #PF（vector 14），CR2 = 0x1234_0000。
+/// 用于 ADR-034 PRE-2 验证：异常路径把 CR2 透传进 user_fault_handler。
+#[cfg(feature = "kernel-test-pre2")]
+fn usermode_pf_code() -> [u8; 22] {
+    const PF_ADDR: u64 = 0x0000_0000_1234_0000;
+    let mut c = [0u8; 22];
+    c[0] = 0x48;
+    c[1] = 0xB8; // mov rax, imm64
+    c[2] = 0x55;
+    c[3..10].fill(0); // rax = 0x55
+    c[10] = 0x48;
+    c[11] = 0xA3; // mov [moffs64], rax
+    c[12..20].copy_from_slice(&PF_ADDR.to_le_bytes());
+    c[20] = 0xF4; // hlt（写 #PF 失败后不复返；防落到垃圾）
+    c[21] = 0x90; // nop
+    c
+}
+
+/// PRE-2 用户态异常处理器：断言 #PF 的 CR2 透传正确（ADR-034 PRE-2 验收）。
+#[cfg(feature = "kernel-test-pre2")]
+extern "C" fn pf_cr2_handler(cr2: u64, frame: &mut arch_x86_64::interrupts::InterruptFrame) -> bool {
+    const PF_ADDR: u64 = 0x0000_0000_1234_0000;
+    if cr2 == PF_ADDR {
+        info!(
+            "[pre2-cr2] PASS: #PF cr2={:#x} matches expected, vector={:#x} rip={:#x}",
+            cr2, frame.vector, frame.rip
+        );
+        info!("[pre2-cr2] === ADR-034 PRE-2 通过（CR2 透传正确）===");
+    } else {
+        info!(
+            "[pre2-cr2] FAIL: cr2={:#x} expected={:#x} vector={:#x}",
+            cr2, PF_ADDR, frame.vector
+        );
+    }
+    // 单进程场景：返回 false → 架构层兜底停机（不 iretq 回用户态）。
+    false
+}
+
+/// ADR-034 PRE-2 停机验收：用户态 #PF 时 user_fault_handler 拿到真实 CR2。
+///
+/// 用户代码写未映射地址触发 #PF（CR2=0x1234_0000），处理器断言 CR2 透传。
+/// 跑完即停（不返回主流程）。
+#[cfg(feature = "kernel-test-pre2")]
+pub fn test_pre2_cr2_pass_through() {
+    use mm::user_space::UserAddressSpace;
+    use task::ProcessTable;
+    use usermode::CODE_ADDR;
+
+    info!("[pre2-cr2] === ADR-034 PRE-2: #PF CR2 透传进 user_fault_handler ===");
+
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+    let code_frame = mm::allocate_frame().expect("code frame").start_paddr();
+    let stack_frame = mm::allocate_frame().expect("stack frame").start_paddr();
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let code = usermode_pf_code();
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), (code_frame + off) as *mut u8, code.len());
+    }
+    us.map_user(
+        VirtAddr::new(CODE_ADDR),
+        VirtAddr::new(CODE_ADDR + 0x1000),
+        PageSize::Size4K,
+        PageFlags::empty().writable().executable().user(),
+        &[code_frame],
+    )
+    .expect("map code");
+    let stack_top = 0x4000_0000u64;
+    us.map_user(
+        VirtAddr::new(stack_top - 0x1000),
+        VirtAddr::new(stack_top),
+        PageSize::Size4K,
+        PageFlags::empty().writable().user(),
+        &[stack_frame],
+    )
+    .expect("map stack");
+
+    let mut table = ProcessTable::<X86PageTable>::new();
+    let pid = table
+        .spawn(CODE_ADDR, stack_top, 0xffff_ffff_801b_6910, us)
+        .expect("spawn process");
+    info!(
+        "[pre2-cr2] spawned pid={} (code: write unmapped 0x1234_0000 -> #PF)",
+        pid
+    );
+
+    // 注册 PRE-2 CR2 校验处理器。
+    arch_x86_64::interrupts::register_user_exception_handler(pf_cr2_handler);
+
+    // 进入用户态执行（永不返回；用户态 #PF 被处理器断言 CR2 后停机）。
+    table.get(pid).unwrap().addr_space().activate();
+    table.run(pid);
+}
+
+// ---- ADR-034 S1-13：真实用户态进程捕获信号 → handler → restorer → rt_sigreturn ----
+
+/// S1-13 停机验收：真实用户态进程捕获 SIGUSR1 并 sigreturn 恢复现场。
+///
+/// 用户代码流程（经 SIGNAL_ACTION 注册 handler + pending SIGUSR1 + restorer）：
+///   1. 主流程 write("A") → int 0x80，返回用户态时 deliver_on_return 投递
+///      SIGUSR1 → 进入 handler；
+///   2. handler write("B") → int 0x80（无新 pending，正常返回）→ `ret`
+///      弹 restorer_return 跳到 restorer → rt_sigreturn（0x84）恢复主流程现场；
+///   3. 主流程从被打断处继续，write("C") → int 0x80，然后停机。
+///
+/// 串口日志按序出现 A/B/C 即证明：handler 被调用 + sigreturn 恢复现场
+/// （ADR-034 §3.4 第 6/7 项）。
+#[cfg(feature = "kernel-test-signal-handler")]
+pub fn test_signal_handler_called() {
+    use arch::{PageFlags, PageSize, VirtAddr};
+    use arch_x86_64::paging::X86PageTable;
+    use mm::user_space::UserAddressSpace;
+    use task::ProcessTable;
+    use task::signal::SigDisposition;
+    use task::signals::SIGUSR1;
+
+    info!("[signal-halt] === S1-13: SIGUSR1 handler + sigreturn ===");
+
+    // 布局：主流程与 handler 各占一页，消息页存 A/B/C。
+    const CODE_ADDR: u64 = 0x0000_0000_9000_0000;
+    const HANDLER_ADDR: u64 = 0x0000_0000_9010_0000;
+    const MSG_ADDR: u64 = 0x0000_0000_9500_0000;
+    const STACK_TOP: u64 = 0x0000_0000_4000_0000;
+
+    // 主流程机器码。
+    let mut main = [0x90u8; 96];
+    let mut i = 0;
+    macro_rules! emit { ($($b:expr),*) => { $( main[i] = $b; i += 1; )* } }
+    // write("A")：rax=0x13(WRITE) rdi=1 rsi=MSG_ADDR rdx=2
+    emit!(0xB8, 0x13, 0, 0, 0);                       // mov eax, 0x13
+    emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);              // mov rdi, 1
+    emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&MSG_ADDR.to_le_bytes()); i += 8; // mov rsi, MSG_ADDR
+    emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;     // mov rdx, 2
+    emit!(0xCD, 0x80);                                 // int 0x80 → 投递发生
+    // 恢复现场后从这继续：write("C")。
+    emit!(0xB8, 0x13, 0, 0, 0);
+    emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
+    emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&(MSG_ADDR + 0x20).to_le_bytes()); i += 8;
+    emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;
+    emit!(0xCD, 0x80);
+    emit!(0xEB, 0xFE);                                 // jmp $ 无限循环（避免 hlt 特权指令 #GP）
+
+    // handler 机器码：write("B")，然后 ret → restorer。
+    let mut handler = [0x90u8; 64];
+    let mut j = 0;
+    macro_rules! hem { ($($b:expr),*) => { $( handler[j] = $b; j += 1; )* } }
+    hem!(0xB8, 0x13, 0, 0, 0);
+    hem!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
+    hem!(0x48, 0xBE); handler[j..j+8].copy_from_slice(&(MSG_ADDR + 0x10).to_le_bytes()); j += 8;
+    hem!(0x48, 0xBA); handler[j..j+8].copy_from_slice(&2u64.to_le_bytes()); j += 8;
+    hem!(0xCD, 0x80);
+    hem!(0xC3);                                        // ret → restorer
+    // 消费计数器，抑制 unused_assignments 警告（数组有尾部填充余量）。
+    let _ = (i, j);
+
+    // 物理帧。
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let main_fr = mm::allocate_frame().expect("main frame").start_paddr();
+    let handler_fr = mm::allocate_frame().expect("handler frame").start_paddr();
+    let msg_fr = mm::allocate_frame().expect("msg frame").start_paddr();
+    let stack_fr = mm::allocate_frame().expect("stack frame").start_paddr();
+    unsafe {
+        core::ptr::copy_nonoverlapping(main.as_ptr(), (main_fr + off) as *mut u8, main.len());
+        core::ptr::copy_nonoverlapping(handler.as_ptr(), (handler_fr + off) as *mut u8, handler.len());
+        // 消息页：A/B/C（各 2 字节 'X' + '\n'）。
+        let msgp = (msg_fr + off) as *mut u8;
+        core::ptr::write_volatile(msgp, b'A');
+        core::ptr::write_volatile(msgp.add(1), b'\n');
+        core::ptr::write_volatile(msgp.add(0x10), b'B');
+        core::ptr::write_volatile(msgp.add(0x11), b'\n');
+        core::ptr::write_volatile(msgp.add(0x20), b'C');
+        core::ptr::write_volatile(msgp.add(0x21), b'\n');
+    }
+
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+    us.map_user(VirtAddr::new(CODE_ADDR), VirtAddr::new(CODE_ADDR + 0x1000), PageSize::Size4K,
+        PageFlags::empty().writable().executable().user(), &[main_fr]).expect("map main");
+    us.map_user(VirtAddr::new(HANDLER_ADDR), VirtAddr::new(HANDLER_ADDR + 0x1000), PageSize::Size4K,
+        PageFlags::empty().writable().executable().user(), &[handler_fr]).expect("map handler");
+    us.map_user(VirtAddr::new(MSG_ADDR), VirtAddr::new(MSG_ADDR + 0x1000), PageSize::Size4K,
+        PageFlags::empty().writable().user(), &[msg_fr]).expect("map msg");
+    us.map_user(VirtAddr::new(STACK_TOP - 0x1000), VirtAddr::new(STACK_TOP), PageSize::Size4K,
+        PageFlags::empty().writable().user(), &[stack_fr]).expect("map stack");
+    // 安装 restorer（S1-7）。
+    let trampoline = us.install_signal_restorer().expect("install restorer");
+
+    let mut table = ProcessTable::<X86PageTable>::new();
+    let pid = table.spawn(CODE_ADDR, STACK_TOP, 0xffff_ffff_801b_6910, us).expect("spawn");
+    {
+        let p = table.get_mut(pid).unwrap();
+        p.signal_mut().set_trampoline(trampoline);
+        p.signal_mut()
+            .set_disposition(SIGUSR1, SigDisposition::Handler(HANDLER_ADDR))
+            .expect("set SIGUSR1 handler");
+        p.signal_mut().raise(SIGUSR1);
+    }
+    info!("[signal-halt] spawned pid={} trampoline={:#x} handler={:#x}", pid, trampoline, HANDLER_ADDR);
+    table.get(pid).unwrap().addr_space().activate();
+    table.run(pid);
+}
+
+/// S1-13 停机验收：handler 中再触发信号 → 嵌套投递 + 逐层 sigreturn（ADR-034
+/// §2.6 / 测试清单第 11 项）。
+///
+/// 停机上下文（halt 进程不在全局 SCHED，kill_pid 会 InvalidParam），故不用 kill
+/// syscall 触发嵌套；改为预置 SIGUSR1+SIGUSR2 两个待决信号，靠 `take_unblocked`
+/// 最低号优先（10<12）在逐层 syscall 返回时按序投递：主流程 write("A") 返回投递
+/// SIGUSR1 → 外层 handler write("B") 返回投递 SIGUSR2（嵌套，压第二层 SignalFrame）
+/// → 内层 handler write("C") → `ret`→restorer→rt_sigreturn 恢复外层 → 外层
+/// `ret`→restorer→rt_sigreturn 恢复主流程 → 主流程 write("D")。串口按序 A/B/C/D
+/// 即证明嵌套投递 + 逐层 sigreturn（ADR-034 §3.4 第 9 项）。
+#[cfg(feature = "kernel-test-signal-nested")]
+pub fn test_signal_nested_handler() {
+    use arch::{PageFlags, PageSize, VirtAddr};
+    use arch_x86_64::paging::X86PageTable;
+    use mm::user_space::UserAddressSpace;
+    use task::ProcessTable;
+    use task::signal::SigDisposition;
+    use task::signals::{SIGUSR1, SIGUSR2};
+
+    info!("[signal-nest] === S1-13: 嵌套 handler + 逐层 sigreturn ===");
+
+    const CODE_ADDR: u64 = 0x0000_0000_9000_0000;
+    const H1_ADDR: u64 = 0x0000_0000_9010_0000; // 外层 handler
+    const H2_ADDR: u64 = 0x0000_0000_9020_0000; // 内层 handler
+    const MSG_ADDR: u64 = 0x0000_0000_9500_0000;
+    const STACK_TOP: u64 = 0x0000_0000_4000_0000;
+
+    // 主流程：write("A") → (投递 SIGUSR1，sigreturn 后继续) → write("D") → jmp $。
+    let mut main = [0x90u8; 128];
+    let mut i = 0;
+    macro_rules! emit { ($($b:expr),*) => { $( main[i] = $b; i += 1; )* } }
+    // write(1, MSG_A, 2)
+    emit!(0xB8, 0x13, 0, 0, 0);
+    emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
+    emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&MSG_ADDR.to_le_bytes()); i += 8;
+    emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;
+    emit!(0xCD, 0x80);
+    // sigreturn 后：write(1, MSG_D, 2)
+    emit!(0xB8, 0x13, 0, 0, 0);
+    emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
+    emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&(MSG_ADDR + 0x30).to_le_bytes()); i += 8;
+    emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;
+    emit!(0xCD, 0x80);
+    emit!(0xEB, 0xFE);
+
+    // 外层 handler：write("B") → 返回时投递 SIGUSR2（嵌套）→ ret。
+    let mut h1 = [0x90u8; 96];
+    let mut j = 0;
+    macro_rules! h1em { ($($b:expr),*) => { $( h1[j] = $b; j += 1; )* } }
+    h1em!(0xB8, 0x13, 0, 0, 0); // write(1, MSG_B, 2)
+    h1em!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
+    h1em!(0x48, 0xBE); h1[j..j+8].copy_from_slice(&(MSG_ADDR + 0x10).to_le_bytes()); j += 8;
+    h1em!(0x48, 0xBA); h1[j..j+8].copy_from_slice(&2u64.to_le_bytes()); j += 8;
+    h1em!(0xCD, 0x80);          // 返回时投递 SIGUSR2 → 内层 handler（嵌套）
+    h1em!(0xC3);                // ret -> restorer -> sigreturn to main
+
+    // 内层 handler：write("C") → ret -> restorer -> sigreturn to 外层 handler。
+    let mut h2 = [0x90u8; 64];
+    let mut k = 0;
+    macro_rules! h2em { ($($b:expr),*) => { $( h2[k] = $b; k += 1; )* } }
+    h2em!(0xB8, 0x13, 0, 0, 0);
+    h2em!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
+    h2em!(0x48, 0xBE); h2[k..k+8].copy_from_slice(&(MSG_ADDR + 0x20).to_le_bytes()); k += 8;
+    h2em!(0x48, 0xBA); h2[k..k+8].copy_from_slice(&2u64.to_le_bytes()); k += 8;
+    h2em!(0xCD, 0x80);
+    h2em!(0xC3);
+    let _ = (i, j, k);
+
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let f_main = mm::allocate_frame().expect("main frame").start_paddr();
+    let f_h1 = mm::allocate_frame().expect("h1 frame").start_paddr();
+    let f_h2 = mm::allocate_frame().expect("h2 frame").start_paddr();
+    let f_msg = mm::allocate_frame().expect("msg frame").start_paddr();
+    let f_stack = mm::allocate_frame().expect("stack frame").start_paddr();
+    unsafe {
+        core::ptr::copy_nonoverlapping(main.as_ptr(), (f_main + off) as *mut u8, main.len());
+        core::ptr::copy_nonoverlapping(h1.as_ptr(), (f_h1 + off) as *mut u8, h1.len());
+        core::ptr::copy_nonoverlapping(h2.as_ptr(), (f_h2 + off) as *mut u8, h2.len());
+        let msgp = (f_msg + off) as *mut u8;
+        core::ptr::write_volatile(msgp, b'A');
+        core::ptr::write_volatile(msgp.add(1), b'\n');
+        core::ptr::write_volatile(msgp.add(0x10), b'B');
+        core::ptr::write_volatile(msgp.add(0x11), b'\n');
+        core::ptr::write_volatile(msgp.add(0x20), b'C');
+        core::ptr::write_volatile(msgp.add(0x21), b'\n');
+        core::ptr::write_volatile(msgp.add(0x30), b'D');
+        core::ptr::write_volatile(msgp.add(0x31), b'\n');
+    }
+
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+    us.map_user(VirtAddr::new(CODE_ADDR), VirtAddr::new(CODE_ADDR + 0x1000), PageSize::Size4K,
+        PageFlags::empty().writable().executable().user(), &[f_main]).expect("map main");
+    us.map_user(VirtAddr::new(H1_ADDR), VirtAddr::new(H1_ADDR + 0x1000), PageSize::Size4K,
+        PageFlags::empty().writable().executable().user(), &[f_h1]).expect("map h1");
+    us.map_user(VirtAddr::new(H2_ADDR), VirtAddr::new(H2_ADDR + 0x1000), PageSize::Size4K,
+        PageFlags::empty().writable().executable().user(), &[f_h2]).expect("map h2");
+    us.map_user(VirtAddr::new(MSG_ADDR), VirtAddr::new(MSG_ADDR + 0x1000), PageSize::Size4K,
+        PageFlags::empty().writable().user(), &[f_msg]).expect("map msg");
+    us.map_user(VirtAddr::new(STACK_TOP - 0x1000), VirtAddr::new(STACK_TOP), PageSize::Size4K,
+        PageFlags::empty().writable().user(), &[f_stack]).expect("map stack");
+    let trampoline = us.install_signal_restorer().expect("install restorer");
+
+    let mut table = ProcessTable::<X86PageTable>::new();
+    let pid = table.spawn(CODE_ADDR, STACK_TOP, 0xffff_ffff_801b_6910, us).expect("spawn");
+    {
+        let p = table.get_mut(pid).unwrap();
+        p.signal_mut().set_trampoline(trampoline);
+        p.signal_mut().set_disposition(SIGUSR1, SigDisposition::Handler(H1_ADDR)).expect("set SIGUSR1");
+        p.signal_mut().set_disposition(SIGUSR2, SigDisposition::Handler(H2_ADDR)).expect("set SIGUSR2");
+        // 预置两个待决信号：take_unblocked 最低号优先（SIGUSR1=10 < SIGUSR2=12）。
+        p.signal_mut().raise(SIGUSR1);
+        p.signal_mut().raise(SIGUSR2);
+    }
+    info!("[signal-nest] spawned pid={} trampoline={:#x} h1={:#x} h2={:#x}", pid, trampoline, H1_ADDR, H2_ADDR);
+    table.get(pid).unwrap().addr_space().activate();
+    table.run(pid);
+}
+
+/// S1-13/S1-11 停机验收：用户态异常（`ud2` → #UD → SIGILL）被 S1-11
+/// `user_exception_signal_handler` 投递进用户 SIGILL handler，handler 写标记后
+/// `ret` → restorer → rt_sigreturn 恢复异常现场，主流程继续。
+///
+/// 串口日志按序出现 A/B/C 即证明：异常→信号映射 + siginfo 投递 + sigreturn
+/// 恢复（ADR-034 §2.8 / S1-11 全链路）。
+#[cfg(feature = "kernel-test-signal-fault")]
+pub fn test_signal_fault_to_handler() {
+    use arch::{PageFlags, PageSize, VirtAddr};
+    use arch_x86_64::paging::X86PageTable;
+    use mm::user_space::UserAddressSpace;
+    use task::ProcessTable;
+    use task::signal::SigDisposition;
+    use task::signals::SIGILL;
+
+    info!("[signal-fault] === S1-11/S1-13: #UD -> SIGILL handler + sigreturn ===");
+
+    const CODE_ADDR: u64 = 0x0000_0000_9000_0000;
+    const HANDLER_ADDR: u64 = 0x0000_0000_9010_0000;
+    const MSG_ADDR: u64 = 0x0000_0000_9500_0000;
+    const STACK_TOP: u64 = 0x0000_0000_4000_0000;
+
+    // 主流程：write("A") → ud2(#UD) → 恢复后 write("C") → 死循环。
+    let mut main = [0x90u8; 96];
+    let mut i = 0;
+    macro_rules! emit { ($($b:expr),*) => { $( main[i] = $b; i += 1; )* } }
+    emit!(0xB8, 0x13, 0, 0, 0);
+    emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
+    emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&MSG_ADDR.to_le_bytes()); i += 8;
+    emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;
+    emit!(0xCD, 0x80);                                 // write A
+    emit!(0x0F, 0x0B);                                 // ud2 -> #UD -> SIGILL
+    emit!(0xB8, 0x13, 0, 0, 0);
+    emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
+    emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&(MSG_ADDR + 0x20).to_le_bytes()); i += 8;
+    emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;
+    emit!(0xCD, 0x80);                                 // write C (resumed)
+    emit!(0xEB, 0xFE);
+
+    // handler：先把 SignalFrame.saved.rip += 2（跳过 ud2，避免恢复后重执行
+    // 再次 #UD 死循环），再 write("B")，然后 ret -> restorer -> rt_sigreturn。
+    // saved.rip 偏移 = 16(siginfo 前) + 32(siginfo) + 136(InterruptFrame.rip) = 184。
+    let mut handler = [0x90u8; 96];
+    let mut j = 0;
+    macro_rules! hem { ($($b:expr),*) => { $( handler[j] = $b; j += 1; )* } }
+    hem!(0x48, 0x8B, 0x84, 0x24, 0xB8, 0, 0, 0);       // mov rax, [rsp+0xB8]  (saved.rip)
+    hem!(0x48, 0x83, 0xC0, 2);                          // add rax, 2
+    hem!(0x48, 0x89, 0x84, 0x24, 0xB8, 0, 0, 0);       // mov [rsp+0xB8], rax
+    hem!(0xB8, 0x13, 0, 0, 0);
+    hem!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
+    hem!(0x48, 0xBE); handler[j..j+8].copy_from_slice(&(MSG_ADDR + 0x10).to_le_bytes()); j += 8;
+    hem!(0x48, 0xBA); handler[j..j+8].copy_from_slice(&2u64.to_le_bytes()); j += 8;
+    hem!(0xCD, 0x80);
+    hem!(0xC3);
+    let _ = (i, j);
+
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let main_fr = mm::allocate_frame().expect("main frame").start_paddr();
+    let handler_fr = mm::allocate_frame().expect("handler frame").start_paddr();
+    let msg_fr = mm::allocate_frame().expect("msg frame").start_paddr();
+    let stack_fr = mm::allocate_frame().expect("stack frame").start_paddr();
+    unsafe {
+        core::ptr::copy_nonoverlapping(main.as_ptr(), (main_fr + off) as *mut u8, main.len());
+        core::ptr::copy_nonoverlapping(handler.as_ptr(), (handler_fr + off) as *mut u8, handler.len());
+        let msgp = (msg_fr + off) as *mut u8;
+        core::ptr::write_volatile(msgp, b'A');
+        core::ptr::write_volatile(msgp.add(1), b'\n');
+        core::ptr::write_volatile(msgp.add(0x10), b'B');
+        core::ptr::write_volatile(msgp.add(0x11), b'\n');
+        core::ptr::write_volatile(msgp.add(0x20), b'C');
+        core::ptr::write_volatile(msgp.add(0x21), b'\n');
+    }
+
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+    us.map_user(VirtAddr::new(CODE_ADDR), VirtAddr::new(CODE_ADDR + 0x1000), PageSize::Size4K,
+        PageFlags::empty().writable().executable().user(), &[main_fr]).expect("map main");
+    us.map_user(VirtAddr::new(HANDLER_ADDR), VirtAddr::new(HANDLER_ADDR + 0x1000), PageSize::Size4K,
+        PageFlags::empty().writable().executable().user(), &[handler_fr]).expect("map handler");
+    us.map_user(VirtAddr::new(MSG_ADDR), VirtAddr::new(MSG_ADDR + 0x1000), PageSize::Size4K,
+        PageFlags::empty().writable().user(), &[msg_fr]).expect("map msg");
+    us.map_user(VirtAddr::new(STACK_TOP - 0x1000), VirtAddr::new(STACK_TOP), PageSize::Size4K,
+        PageFlags::empty().writable().user(), &[stack_fr]).expect("map stack");
+    let trampoline = us.install_signal_restorer().expect("install restorer");
+
+    let mut table = ProcessTable::<X86PageTable>::new();
+    let pid = table.spawn(CODE_ADDR, STACK_TOP, 0xffff_ffff_801b_6910, us).expect("spawn");
+    {
+        let p = table.get_mut(pid).unwrap();
+        p.signal_mut().set_trampoline(trampoline);
+        p.signal_mut()
+            .set_disposition(SIGILL, SigDisposition::Handler(HANDLER_ADDR))
+            .expect("set SIGILL handler");
+    }
+    info!("[signal-fault] spawned pid={} trampoline={:#x} handler={:#x}", pid, trampoline, HANDLER_ADDR);
     table.get(pid).unwrap().addr_space().activate();
     table.run(pid);
 }
@@ -6900,23 +7316,25 @@ pub fn test_loader_adversarial() {
 /// 覆盖 ADR-034 §3.4 的宿主单测对应断言（本仓库 task crate 因依赖含 x86_64
 /// 内联汇编的 arch-x86_64 无法宿主 `cargo test`，按 ADR-033 先例改为 QEMU
 /// kernel-tests 实机断言，S06）：
-/// 1. `signal_set_math`：位图 set/clear/union/intersection、SIGKILL 不可清位；
+/// 1. `signal_set_math`：位图 set/clear/union/intersection（纯 bitmask，S3）；
 /// 2. `default_disposition_ok`：每信号默认动作查表正确（含越界兜底终止）；
 /// 3. `sigaction_rejects_kill`：对 SIGKILL 设 handler/ignore → InvalidParam；
-/// 4. `mask_unblock_sigkill_forced`：UNBLOCK 后 SIGKILL/SIGSTOP 仍强制置位；
+/// 4. `sigkill_never_blocked`：SIGKILL 恒不可屏蔽（SET/BLOCK 均强制清除）；
 /// 5. `pending_priority`：同时投递多信号时取最低号（ADR-034 §2.4 决策成文）。
 ///
 /// 纯逻辑、不 spawn 进程、不关中断，返回主流程继续启动。
 pub fn test_signal_foundation() {
-    use task::signal::{DefaultAction, SigDisposition, default_disposition, validate_disposition};
+    use task::signal::{DefaultAction, SigDisposition, SignalState, default_disposition, validate_disposition};
     use task::signal_set::{NSIG, SignalSet};
     use task::signals::{
-        SIGCHLD, SIGCONT, SIGINT, SIGKILL, SIGSEGV, SIGSTOP, SIGTERM, SIGUSR1,
+        SIGCHLD, SIGCONT, SIGINT, SIGKILL, SIGSEGV, SIGSTOP, SIGTERM, SIGUSR1, SIGUSR2,
     };
 
     info!("[test-signal] === ADR-034 前期工作: 信号集 + 默认处置 + 硬信号强制 ===");
 
-    // ---- 1. signal_set_math：set/clear/union/intersection + SIGKILL 不可清位 ----
+    // ---- 1. signal_set_math：纯 bitmask set/clear/union/intersection ----
+    // S3 整改：位图无按信号特判（SIGKILL 可清除），硬信号不可屏蔽由语义层
+    //（mask/validate_disposition）保证，不在此硬编码不变量。
     let mut s = SignalSet::empty();
     assert!(s.is_empty(), "empty set must be empty");
     s.insert(SIGUSR1);
@@ -6934,10 +7352,11 @@ pub fn test_signal_foundation() {
     t.difference(SignalSet::of(SIGTERM));
     assert!(t.contains(SIGUSR1) && !t.contains(SIGTERM));
 
+    // 位图可清除任意位（含 SIGKILL）：硬信号不可屏蔽由 mask 语义层保证。
     let mut k = SignalSet::of(SIGKILL);
     k.remove(SIGKILL);
-    assert!(k.contains(SIGKILL), "SIGKILL bit must be unremovable");
-    info!("[test-signal] 1/5 signal_set_math OK (SIGKILL unremovable)");
+    assert!(!k.contains(SIGKILL), "bitmask SIGKILL clearable (S3 pure bitmask)");
+    info!("[test-signal] 1/5 signal_set_math OK");
 
     // ---- 2. default_disposition_ok：默认处置查表 ----
     assert_eq!(default_disposition(SIGKILL), DefaultAction::Terminate);
@@ -6956,15 +7375,21 @@ pub fn test_signal_foundation() {
     assert!(validate_disposition(SIGUSR1, SigDisposition::Handler(0x1234)).is_ok());
     info!("[test-signal] 3/5 sigaction_rejects_kill OK");
 
-    // ---- 4. mask_unblock_sigkill_forced：UNBLOCK 后硬信号仍强制置位 ----
-    let mut blocked = SignalSet::empty();
-    blocked.insert(SIGUSR1);
-    blocked.remove(SIGUSR1);
-    let forced = blocked.force_hard();
-    assert!(!forced.contains(SIGUSR1));
-    assert!(forced.contains(SIGKILL), "SIGKILL must stay in mask");
-    assert!(forced.contains(SIGSTOP), "SIGSTOP must stay in mask");
-    info!("[test-signal] 4/5 mask_unblock_sigkill_forced OK");
+    // ---- 4. sigkill_never_blocked：SIGKILL 恒不可屏蔽（S3 统一硬信号语义）----
+    // mask SET/BLOCK 即使请求 SIGKILL，屏蔽集也恒清除 SIGKILL 位（始终可投递）。
+    let mut st = SignalState::new();
+    // SET 含 SIGKILL：屏蔽集不得含 SIGKILL。
+    st.mask(0, SignalSet::of(SIGKILL)).expect("SET SIGKILL");
+    assert!(!st.blocked().contains(SIGKILL), "SIGKILL never in blocked (SET)");
+    // BLOCK 含 SIGKILL：同上。
+    st.mask(1, SignalSet::of(SIGKILL)).expect("BLOCK SIGKILL");
+    assert!(!st.blocked().contains(SIGKILL), "SIGKILL never in blocked (BLOCK)");
+    // BLOCK SIGUSR1 保留；UNBLOCK SIGUSR1 正常清除（非硬信号不受影响）。
+    st.mask(1, SignalSet::of(SIGUSR1)).expect("BLOCK SIGUSR1");
+    assert!(st.blocked().contains(SIGUSR1), "SIGUSR1 blockable");
+    st.mask(2, SignalSet::of(SIGUSR1)).expect("UNBLOCK SIGUSR1");
+    assert!(!st.blocked().contains(SIGUSR1), "SIGUSR1 unblocked");
+    info!("[test-signal] 4/5 sigkill_never_blocked OK");
 
     // ---- 5. pending_priority：投递取最低号（ADR-034 §2.4 决策成文）----
     // 取号策略单点定义于 SignalSet::lowest_pending（S13，S3 整改），测试经此验证。
@@ -6980,16 +7405,15 @@ pub fn test_signal_foundation() {
     assert_eq!(SignalSet::empty().lowest_pending(), None, "empty set has no lowest");
     info!("[test-signal] 5/5 pending_priority OK (SignalSet::lowest_pending)");
 
-    // ---- 6. difference 不变量（S2 整改）：SIGKILL 不可清除，但也不伪造置位 ----
+    // ---- 6. difference 纯 bitmask（S3 整改）：无 SIGKILL 特判，仅按位清除 ----
     let mut no_kill = SignalSet::of(SIGUSR1);
     no_kill.difference(SignalSet::of(SIGKILL));
-    assert!(!no_kill.contains(SIGKILL), "difference must NOT force-add SIGKILL (S07/S09)");
-    assert!(no_kill.contains(SIGUSR1), "difference must preserve other bits");
+    assert!(no_kill.contains(SIGUSR1), "difference preserves non-cleared bits");
     let mut with_kill = SignalSet::of(SIGKILL).union(SignalSet::of(SIGUSR1));
     with_kill.difference(SignalSet::of(SIGKILL));
-    assert!(with_kill.contains(SIGKILL), "difference must not clear existing SIGKILL");
+    assert!(!with_kill.contains(SIGKILL), "difference clears SIGKILL (pure bitmask, S3)");
     assert!(with_kill.contains(SIGUSR1), "unrelated bits preserved");
-    info!("[test-signal] 6/6 difference SIGKILL invariant OK");
+    info!("[test-signal] 6/6 difference pure bitmask OK");
 
     // ---- 7. validate_disposition 越界拒绝（S4 整改）：sig >= NSIG -> OutOfRange ----
     assert_eq!(
@@ -7005,7 +7429,258 @@ pub fn test_signal_foundation() {
     assert!(validate_disposition(SIGUSR1, SigDisposition::Default).is_ok());
     info!("[test-signal] 7/7 validate_disposition out-of-range rejection OK");
 
+    // ---- 8. SignalState 处置/屏蔽/未决/重入守卫（S1-2 新增）----
+    let mut st = task::signal::SignalState::new();
+    assert_eq!(st.disposition(SIGUSR1), Some(SigDisposition::Default));
+    assert_eq!(
+        st.set_disposition(SIGUSR1, SigDisposition::Handler(0x4000)),
+        Ok(Some(SigDisposition::Default))
+    );
+    assert_eq!(st.disposition(SIGUSR1), Some(SigDisposition::Handler(0x4000)));
+    assert_eq!(
+        st.set_disposition(SIGKILL, SigDisposition::Handler(0x4000)),
+        Err(klib::error::Error::InvalidParam)
+    );
+    // mask SET
+    let old = st.mask(0, SignalSet::of(SIGUSR1)).unwrap();
+    assert!(old.is_empty());
+    assert!(st.blocked().contains(SIGUSR1));
+    // mask BLOCK 累积
+    let _ = st.mask(1, SignalSet::of(SIGUSR2)).unwrap();
+    assert!(st.blocked().contains(SIGUSR1) && st.blocked().contains(SIGUSR2));
+    // mask UNBLOCK
+    let old2 = st.mask(2, SignalSet::of(SIGUSR1)).unwrap();
+    assert!(old2.contains(SIGUSR1));
+    assert!(!st.blocked().contains(SIGUSR1));
+    assert!(st.blocked().contains(SIGUSR2));
+    // raise + take_unblocked（最低号优先，屏蔽延迟）
+    st.raise(SIGUSR2); // blocked, should defer
+    assert_eq!(st.take_unblocked(), None, "blocked signal deferred");
+    st.raise(SIGTERM);
+    st.raise(SIGINT); // lowest unblocked = SIGINT
+    assert_eq!(st.take_unblocked(), Some(SIGINT));
+    assert_eq!(st.take_unblocked(), Some(SIGTERM));
+    // SIGKILL 即使 blocked 也立即投递（§2.6 最高优先级）
+    st.raise(SIGKILL);
+    st.raise(SIGTERM);
+    assert_eq!(st.take_unblocked(), Some(SIGKILL), "SIGKILL preempts despite block");
+    // 重入守卫
+    assert!(!st.in_signal());
+    st.set_in_signal(true);
+    assert!(st.in_signal());
+    st.set_in_signal(false);
+    info!("[test-signal] 8/8 SignalState ops OK");
+
+    // ---- 9. PRE-3：restorer/trampoline 安装（exec/spawn 路径）----
+    {
+        use arch::VirtAddr;
+        use mm::user_space::{
+            SIGNAL_RESTORER_ADDR, SIGNAL_RESTORER_CODE, UserAddressSpace,
+        };
+        // 9a. install_signal_restorer：映射保留区 + trampoline 地址有效。
+        let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+        let tp = us.install_signal_restorer().expect("install restorer");
+        assert_eq!(tp, SIGNAL_RESTORER_ADDR, "trampoline must be the reserved addr");
+        // 保留区页必须 present + user + executable（S09：restorer 用户态可执行）。
+        let q = us.query_page(SIGNAL_RESTORER_ADDR).expect("restorer mapped");
+        assert!(q.present && q.user, "restorer page must be present+user");
+        // 经页表翻译读回物理帧，断言字节 == SIGNAL_RESTORER_CODE。
+        let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+        let pa = us
+            .translate(VirtAddr::new(SIGNAL_RESTORER_ADDR))
+            .expect("restorer translated")
+            .as_u64();
+        let mut got = [0u8; SIGNAL_RESTORER_CODE.len()];
+        unsafe {
+            core::ptr::copy_nonoverlapping((pa + off) as *const u8, got.as_mut_ptr(), got.len());
+        }
+        assert_eq!(got, SIGNAL_RESTORER_CODE, "restorer machine code must match");
+        info!(
+            "[test-signal] 9a PRE-3 install_signal_restorer OK (tp={:#x}, code={} bytes)",
+            tp,
+            got.len()
+        );
+
+        // 9b. exec 路径（spawn_elf_image 同构）：先装 restorer 得 trampoline，
+        //     再 spawn_with_ppid_fds 传入 → Process.trampoline 已置。
+        let mut spawn_us = UserAddressSpace::<X86PageTable>::new().expect("new spawn user space");
+        let spawn_tp = spawn_us
+            .install_signal_restorer()
+            .expect("install restorer for spawn");
+        let pid = task::spawn_with_ppid_fds(
+            0,
+            "pre3.elf",
+            0x1000,
+            0x4000_0000,
+            spawn_us,
+            spawn_tp,
+            None,
+            task::process::ProcessIdentity::default_user(),
+        )
+        .expect("spawn with restorer");
+        // 经 SCHED 探针读回该进程 trampoline。
+        let tp2 = task::scheduler::test_hooks::probe_trampoline(pid)
+            .expect("spawned process must have trampoline");
+        assert_eq!(tp2, SIGNAL_RESTORER_ADDR, "spawned proc trampoline set");
+        info!("[test-signal] 9b PRE-3 spawn sets trampoline (pid={} tp={:#x})", pid, tp2);
+    }
+
     info!("[test-signal] === ADR-034 前期工作全部通过（返回主流程继续启动）===");
+}
+
+/// S1-13 block_defers / sigkill_uncatchable：屏蔽延迟投递 + SIGKILL 不可屏蔽/不可捕获
+/// （表级验收，返回主流程）。
+///
+/// 覆盖：
+/// - `block_defers`：已屏蔽的信号 `take_unblocked` 不取出（留 pending），解除屏蔽后取出；
+/// - `sigkill_uncatchable`：SIGKILL 恒强制屏蔽（不可解除）、设 handler/ignore 被拒。
+pub fn test_signal_block_defer() {
+    use klib::error::Error;
+    use task::signal::{SigDisposition, validate_disposition};
+    use task::signal_set::SignalSet;
+    use task::signals::{SIGKILL, SIGUSR1, SIGUSR2};
+
+    info!("[test-block] === S1-13: 屏蔽延迟投递 + SIGKILL 不可捕获/屏蔽 ===");
+
+    // 用 task 进程的信号状态做纯逻辑验证（不 spawn、不关中断）。
+    // 借用当前进程的信号状态会污染，故用独立 SignalState 验证核心语义。
+    let mut ss = task::signal::SignalState::new();
+
+    // block_defers：屏蔽 SIGUSR1 后 raise，take_unblocked 不应取出。
+    // how：1=BLOCK、2=UNBLOCK（ADR-034 §3.2）。
+    ss.mask(1, SignalSet::of(SIGUSR1)).expect("block SIGUSR1");
+    ss.raise(SIGUSR1);
+    assert_eq!(ss.pending().contains(SIGUSR1), true, "SIGUSR1 pending");
+    assert_eq!(ss.take_unblocked(), None, "blocked SIGUSR1 must NOT be taken");
+    assert_eq!(ss.pending().contains(SIGUSR1), true, "still pending while blocked");
+    // 解除屏蔽后取出。
+    ss.mask(2, SignalSet::of(SIGUSR1)).expect("unblock SIGUSR1");
+    assert_eq!(ss.take_unblocked(), Some(SIGUSR1), "unblocked SIGUSR1 taken");
+    info!("[test-block] block_defers OK");
+
+    // sigkill_uncatchable：SIGKILL 恒不可屏蔽（mask 强制清除其位）。
+    ss.mask(1, SignalSet::of(SIGUSR2)).expect("block SIGUSR2");
+    // BLOCK SIGKILL：mask 强制清其位（SIGKILL 不可屏蔽），故 blocked 不含 SIGKILL。
+    ss.mask(1, SignalSet::of(SIGKILL)).expect("block SIGKILL (forced no-op)");
+    assert_eq!(ss.blocked().contains(SIGKILL), false, "SIGKILL never in blocked set");
+    // UNBLOCK SIGKILL：同样无效应（恒不在 blocked 中）。
+    ss.mask(2, SignalSet::of(SIGKILL)).expect("unblock SIGKILL no-op");
+    assert_eq!(ss.blocked().contains(SIGKILL), false, "SIGKILL still not blocked");
+    // 对 SIGKILL 设 handler/ignore 被拒（不可捕获）。
+    assert_eq!(
+        validate_disposition(SIGKILL, SigDisposition::Handler(0x1000)),
+        Err(Error::InvalidParam),
+        "SIGKILL handler rejected"
+    );
+    assert_eq!(
+        validate_disposition(SIGKILL, SigDisposition::Ignore),
+        Err(Error::InvalidParam),
+        "SIGKILL ignore rejected"
+    );
+    info!("[test-block] sigkill_uncatchable OK");
+
+    // nesting_limit（S2/ADR-034 §6.1）：嵌套深度上限守卫——enter_handler 递增、
+    // 达上限拒绝、exit_handler 递减。
+    assert_eq!(ss.nesting_depth(), 0, "initial depth 0");
+    let mut entered = 0;
+    while ss.enter_handler() {
+        entered += 1;
+    }
+    assert_eq!(entered, task::signal::MAX_SIGNAL_NESTING as i32,
+        "enter_handler accepts up to MAX_SIGNAL_NESTING");
+    assert_eq!(ss.nesting_depth(), task::signal::MAX_SIGNAL_NESTING, "depth at max");
+    assert!(!ss.enter_handler(), "enter beyond limit rejected");
+    assert!(ss.in_signal(), "in_signal true while depth > 0");
+    ss.exit_handler();
+    assert_eq!(ss.nesting_depth(), task::signal::MAX_SIGNAL_NESTING - 1, "exit decrements");
+    ss.exit_handler();
+    assert!(ss.in_signal(), "still in signal after 2 exits (depth 30)");
+    info!("[test-block] nesting_limit OK");
+
+    info!("[test-block] === S1-13 block/sigkill 通过（返回主流程）===");
+}
+
+/// S1-9/S1-10：kill_pid 多信号扩展 + 权限强制（表级验收，返回主流程）。
+///
+/// 覆盖：
+/// - S1-9：接受全部信号号（不再仅 KILL/TERM）；越界信号号拒绝；非终止信号
+///   转目标 pending（不立即杀）；SIGKILL 仍立即终止；sig=0 探活保留。
+/// - S1-10：User→System 终止类拒绝（PermissionDenied）；System→System 放行；
+///   init 被 SIGKILL 拒绝（探活放行）。
+pub fn test_kill_extension_and_perm() {
+    use klib::error::Error;
+    use task::ProcessIdentity;
+    use task::scheduler::test_hooks as th;
+    use task::signals::{SIGKILL, SIGTERM, SIGUSR1};
+
+    info!("[test-kill] === S1-9/S1-10: kill_pid 多信号 + 权限 ===");
+
+    // ---- S1-9：越界信号号拒绝 ----
+    let p = th::spawn_named_child_of(0, "victim.elf").expect("spawn victim");
+    let r = task::kill_pid(p, 64, &mut dummy_frame());
+    assert!(matches!(r, Err(Error::InvalidParam)), "sig>=NSIG rejected");
+    info!("[test-kill] out-of-range sig -> InvalidParam OK");
+
+    // ---- S1-9：非终止信号转 pending（不立即杀）----
+    let target = th::spawn_named_child_of(0, "pend.elf").expect("spawn pend");
+    let r = task::kill_pid(target, SIGUSR1, &mut dummy_frame());
+    assert!(r.is_ok(), "SIGUSR1 accepted");
+    let pend_bits = th::pending_of(target);
+    assert_ne!(pend_bits & (1u64 << SIGUSR1), 0, "SIGUSR1 routed to pending");
+    assert!(th::probe(target).is_some(), "non-fatal signal did not kill");
+    info!("[test-kill] non-fatal SIGUSR1 -> pending, process alive OK");
+
+    // ---- S1-9：SIGKILL 立即终止（表级 terminate：置 Exit 或已回收槽位）----
+    let doomed = th::spawn_named_child_of(0, "doomed.elf").expect("spawn doomed");
+    let r = task::kill_pid(doomed, SIGKILL, &mut dummy_frame());
+    assert!(r.is_ok(), "SIGKILL accepted");
+    // 无等待父进程的孤儿被 SIGKILL 后可能直接被回收（槽位释放，probe 返回 None），
+    // 也可能暂留为 zombie（Exit）。两者都表示"已终止"，据此断言。
+    let alive = th::probe(doomed)
+        .map(|(st, _, _, _, _)| st != task::TaskState::Exit)
+        .unwrap_or(false);
+    assert!(!alive, "SIGKILL terminates immediately");
+    info!("[test-kill] SIGKILL immediate terminate OK");
+
+    // ---- S1-9：sig=0 探活（不发送、仅存在校验）----
+    let alive = th::spawn_named_child_of(0, "alive.elf").expect("spawn alive");
+    assert!(task::kill_pid(alive, 0, &mut dummy_frame()).is_ok(), "sig=0 probe");
+    assert_eq!(th::pending_of(alive), 0, "probe does not pend");
+    assert!(task::kill_pid(999999, 0, &mut dummy_frame()).is_err(), "probe non-existent");
+    info!("[test-kill] sig=0 probe OK");
+
+    // ---- S1-10：User→System 终止类拒绝 ----
+    // 以普通用户进程为"当前"发送方，向 System 进程投递 SIGTERM（终止类）→ 拒绝。
+    let user = th::spawn_child_with_identity(0, "user.elf", ProcessIdentity::default_user()).expect("spawn user");
+    let sys = th::spawn_child_with_identity(0, "sys.elf", ProcessIdentity::system(1)).expect("spawn sys");
+    assert!(th::set_current(user), "set user as current");
+    let r = task::kill_pid(sys, SIGTERM, &mut dummy_frame());
+    assert!(
+        matches!(r, Err(Error::PermissionDenied)),
+        "User->System terminating rejected, got {:?}",
+        r
+    );
+    info!("[test-kill] User->System SIGTERM -> PermissionDenied OK");
+
+    // ---- S1-10：System→System 放行 ----
+    th::clear_current();
+    let sys2 = th::spawn_child_with_identity(0, "sys2.elf", ProcessIdentity::system(2)).expect("spawn sys2");
+    assert!(th::set_current(sys), "set sys as current");
+    let r = task::kill_pid(sys2, SIGTERM, &mut dummy_frame());
+    assert!(r.is_ok(), "System->System terminating allowed");
+    info!("[test-kill] System->System SIGTERM allowed OK");
+
+    // ---- S1-10：init 被 SIGKILL 拒绝（探活放行）----
+    th::clear_current();
+    let init = th::spawn_child_with_identity(0, "init.elf", ProcessIdentity::system(1)).expect("spawn init");
+    task::set_init_pid(init);
+    assert!(matches!(task::kill_pid(init, SIGKILL, &mut dummy_frame()), Err(Error::PermissionDenied)));
+    assert!(task::kill_pid(init, 0, &mut dummy_frame()).is_ok(), "init probe allowed");
+    info!("[test-kill] init SIGKILL rejected, probe allowed OK");
+
+    th::clear_current();
+    th::reset_all();
+    info!("[test-kill] === S1-9/S1-10 通过 ===");
 }
 
 pub fn test_waitpid_core() {

@@ -236,6 +236,14 @@ unsafe fn kmain_body() -> ! {
     // 尽早注册（IDT 加载后），确保任何用户态/内核态缺页都能被处理。
     arch_x86_64::interrupts::register_page_fault_handler(mm::user_space::page_fault_entry);
 
+    // S1-11：注册用户态异常 → 信号投递处理器（ADR-034 §2.8）。用户态 #PF/#UD/#GP
+    // 若有 handler 则携 siginfo 投递进用户 handler；否则终止进程（不再当内核崩溃）。
+    // 注意：`register_user_exception_handler` 是 spin::Once——独立的停机验收构建
+    // （kernel-test-m33 / kernel-test-pre2）需要注册各自专用处理器（验证终止语义/
+    // CR2 透传），故本生产处理器在这些专用构建里不注册，避免抢占测试处理器。
+    #[cfg(not(any(feature = "kernel-test-m33", feature = "kernel-test-pre2")))]
+    arch_x86_64::interrupts::register_user_exception_handler(crate::syscall::user_exception_signal_handler);
+
     // 注入系统 CPU 数读取器（供 mm 初始化 per-CPU 缓存；必须在 mm::init 前）。
     // 注：mm 自身不声明 Limine SMP 请求，避免与 arch-x86_64 的 SMP_REQUEST 冲突
     // 导致 Limine "Conflict detected for request ID" panic。
@@ -410,6 +418,11 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-test-m33")]
     tests::test_spawn_user_fault();
 
+    // ADR-034 PRE-2：用户态 #PF 时 CR2 透传进 user_fault_handler（停机验收，
+    // 跑完即停、不返回主流程，故单独 feature 门控）。
+    #[cfg(feature = "kernel-test-pre2")]
+    tests::test_pre2_cr2_pass_through();
+
     // M4.1：注册 syscall 软中断入口（用户态 `int 0x80` → 内核 syscall 分发）。
     // 经 ADR-007 的 `arch::SyscallEntry` 抽象接入：x86-64 层把 `int 0x80`
     // 的 `InterruptFrame` 翻译成可移植 `SyscallFrame` 后调用本入口。
@@ -420,6 +433,18 @@ unsafe fn kmain_body() -> ! {
     // 不返回主流程），故单独用 kernel-test-m41 feature 门控。
     #[cfg(feature = "kernel-test-m41")]
     tests::test_syscall();
+
+    // ADR-034 S1-13/S1-11：真实用户态进程捕获信号 → handler → restorer →
+    // rt_sigreturn 恢复现场（停机验收，跑完即停，单独 feature 门控）。
+    // 须在 syscall 入口注册之后执行（用户代码经 int 0x80 触发投递）。
+    // 停机验收互斥：一次 build 只编译并运行一个 halt 测试。由 sdk 的
+    // `--test-signal --signal-halt nested|handler|fault` 选择启用哪个 feature。
+    #[cfg(feature = "kernel-test-signal-handler")]
+    tests::test_signal_handler_called();
+    #[cfg(feature = "kernel-test-signal-fault")]
+    tests::test_signal_fault_to_handler();
+    #[cfg(feature = "kernel-test-signal-nested")]
+    tests::test_signal_nested_handler();
 
     // 注册运行时用户进程的缺页处理函数（处理用户态按需分页与 COW）。
     mm::user_space::set_page_fault_handler(task::process_page_fault_handler);
@@ -569,6 +594,14 @@ unsafe fn kmain_body() -> ! {
     // ADR-034 前期工作：信号集 + 默认处置 + 硬信号强制（纯逻辑，返回主流程）。
     #[cfg(feature = "kernel-tests")]
     tests::test_signal_foundation();
+
+    // ADR-034 S1-13：屏蔽延迟投递 + SIGKILL 不可捕获/屏蔽（表级，返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_signal_block_defer();
+
+    // S1-9/S1-10：kill_pid 多信号扩展 + 权限强制（表级，返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_kill_extension_and_perm();
 
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
@@ -929,8 +962,18 @@ fn start_init() -> ! {
     );
     // A1 / ADR-033 (V1 fix): init 由内核自己拉起，必须显式以 System/uid=1 引导。
     // 不得走默认 User 身份的 task::spawn——否则可信引导进程拿不到 System 特权。
+    // ADR-034 PRE-3：init 也经 exec 语义安装信号 restorer（handler 返回后
+    // 经 restorer 调 rt_sigreturn）。安装失败如实上报，不静默缺 restorer。
+    let trampoline = match us.install_signal_restorer() {
+        Ok(addr) => addr,
+        Err(_) => {
+            error!("[kmain] init: install signal restorer failed");
+            info!("[kmain] reached idle loop");
+            CurrentArch::halt();
+        }
+    };
     let pid = match task::spawn_with_ppid_fds(
-        0, "init.elf", loaded.entry, loaded.user_stack_top, us, None, task::ProcessIdentity::system(1),
+        0, "init.elf", loaded.entry, loaded.user_stack_top, us, trampoline, None, task::ProcessIdentity::system(1),
     ) {
         Ok(p) => p,
         Err(e) => {

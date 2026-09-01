@@ -28,8 +28,12 @@ pub use scheduler::{
 };
 #[cfg(feature = "kernel-tests")]
 pub use scheduler::test_hooks;
-pub use signal::{DefaultAction, SigDisposition, default_disposition, is_hard_signal, validate_disposition};
-pub use signal_set::{FORCED, NSIG, SignalSet};
+pub use signal::{
+    DefaultAction, DeliveryOutcome, SigDisposition, SigInfo, SignalFrame, SignalState,
+    SIGNAL_FRAME_MAGIC, MAX_SIGNAL_NESTING, default_disposition, deliver_on_return,
+    is_hard_signal, sigreturn, validate_disposition,
+};
+pub use signal_set::{NSIG, SignalSet};
 pub use signals::{
     SIGALRM, SIGBUS, SIGCHLD, SIGCONT, SIGFPE, SIGILL, SIGINT, SIGKILL, SIGPIPE, SIGSEGV,
     SIGSTOP, SIGTERM, SIGUSR1, SIGUSR2, signal_for_exception, signal_name,
