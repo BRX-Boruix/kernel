@@ -127,6 +127,56 @@ pub struct DirEntry {
     pub size: u64,
 }
 
+/// stat 系统调用的 ABI 结果结构（内核→用户，经 syscall 整块拷出）。
+///
+/// `#[repr(C)]` 固定布局，与 `libsys` 侧同名镜像结构逐字段一致——这是 syscall
+/// 边界的真实数据契约（S06），任一例改字段必须同步另一侧，否则是静默错位伪数据。
+/// `node_type` 用稳定数字标签（见 [`StatInfo::type_tag`]），与 readdir 的 `type`
+/// 字符串同义但可整块拷贝。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatInfo {
+    /// 节点类型稳定数字标签（[`StatInfo::type_tag`]）。
+    pub node_type: u32,
+    /// 文件字节大小。
+    pub size: u64,
+    /// 权限位（`Permissions::to_bits` 编码：readable=0/writable=1/executable=2/system_only=3）。
+    pub perms: u32,
+    /// 创建时间（Unix 秒；EXT2 rev1 无 crtime 字段时如实 0）。
+    pub created_time: u64,
+    /// 修改时间（Unix 秒）。
+    pub modified_time: u64,
+    /// 变更时间（Unix 秒）。
+    pub changed_time: u64,
+}
+
+impl StatInfo {
+    /// `INodeType` → 稳定数字标签（与 ADR-013 readdir `type` 字符串同义）。
+    pub fn type_tag(t: INodeType) -> u32 {
+        match t {
+            INodeType::RegularFile => 1,
+            INodeType::Directory => 2,
+            INodeType::CharacterDevice => 3,
+            INodeType::BlockDevice => 4,
+            INodeType::Symlink => 5,
+            INodeType::Fifo => 6,
+            INodeType::Socket => 7,
+        }
+    }
+
+    /// 从元数据构造 ABI 结果。
+    pub fn from_metadata(m: &FileMetadata) -> Self {
+        Self {
+            node_type: Self::type_tag(m.node_type),
+            size: m.size,
+            perms: m.permissions.to_bits(),
+            created_time: m.created_time,
+            modified_time: m.modified_time,
+            changed_time: m.changed_time,
+        }
+    }
+}
+
 /// 核心文件节点抽象。
 pub trait INode: Send + Sync {
     /// 读数据（从指定 offset 开始）。
@@ -196,6 +246,15 @@ pub trait INode: Send + Sync {
     /// 删除子项。
     fn unlink(&self, _name: &str) -> Result<(), Error> {
         Err(Error::NotDirectory)
+    }
+
+    /// 设置权限（chmod 原语）。
+    ///
+    /// 覆写节点权限为 `perms`（r/w/x/system_only 四布尔）。默认实现返回
+    /// [`Error::NotSupported`]——只读虚拟文件系统（procfs/sysfs/devfs）如实
+    /// 拒绝；本 crate 内 RamFS 与 EXT2 提供实现。
+    fn set_permissions(&self, _perms: Permissions) -> Result<(), Error> {
+        Err(Error::NotSupported)
     }
 
     /// 在**同一目录内**重命名子项（ADR-014 SYS_ENTRY_UPDATE 0x43 的原语）。

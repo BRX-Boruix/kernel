@@ -356,6 +356,14 @@ impl INode for RamINode {
         }
     }
 
+    /// 设置节点权限（chmod 原语）：写回 meta.permissions 并刷新 changed时间。
+    fn set_permissions(&self, perms: Permissions) -> Result<(), Error> {
+        let mut meta = self.meta.write();
+        meta.permissions = perms;
+        meta.changed_time = now_ms();
+        Ok(())
+    }
+
     fn list_dir(&self) -> Result<Vec<DirEntry>, Error> {
         match &self.data {
             RamNodeData::Directory { children } => {

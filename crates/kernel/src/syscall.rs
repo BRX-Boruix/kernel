@@ -109,6 +109,9 @@ pub const SYS_STREAM_DUP: u32 = nr(domain::STREAM, 0x05); // 0x15
 /// STREAM 域扩展动词：flock 文件锁（ADR-014 / ADR-033 A2-1 R6）。
 /// a1=fd, a2=cmd（0=LOCK_SH, 1=LOCK_EX, 2=UNLOCK）。
 pub const SYS_STREAM_LOCK: u32 = nr(domain::STREAM, 0x06); // 0x16
+/// STREAM 域扩展动词：fstat（按 fd 读元数据，ADR-014 第二原语）。
+/// a1=fd, a2=out_buf_ptr（收 `vfs::inode::StatInfo` 完整定长结构）。
+pub const SYS_STREAM_FSTAT: u32 = nr(domain::STREAM, 0x07); // 0x17
 
 /// STREAM read/write 的顺序 I/O 哨兵值。
 ///
@@ -145,6 +148,19 @@ pub const SYS_ENTRY_DELETE: u32 = nr(domain::VFS, op::DELETE); // 0x44
 pub const SYS_ENTRY_CHDIR: u32 = nr(domain::VFS, 0x05); // 0x45
 /// `getcwd()`：读当前进程工作目录（VFS 域扩展，0x46）。
 pub const SYS_ENTRY_GETCWD: u32 = nr(domain::VFS, 0x06); // 0x46
+
+// ---------- SYS_ENTRY_READ kind 编码（stat 技术报告）----------
+/// readdir 模式（默认）：a4=0，输出 JSON 目录项列表。
+#[allow(dead_code)] // 默认值 0，与 libsys 同名常量保持对齐（读取目录模式隐式）
+pub const ENTRY_READ_READDIR: u64 = 0;
+/// stat 模式：a4=1，解析路径后把节点元数据以 `StatInfo` 定长结构写入用户缓冲（a2）。
+pub const ENTRY_READ_STAT: u64 = 1;
+
+// ---------- SYS_ENTRY_UPDATE 动作编码（a4 区分 rename/chmod）----------
+/// rename（默认）：a4=0，a1=old_path, a2=new_path。
+pub const ENTRY_UPDATE_RENAME: u64 = 0;
+/// chmod：a4=1，a1=path, a2=mode_bits（`Permissions::to_bits` 编码）。
+pub const ENTRY_UPDATE_CHMOD: u64 = 1;
 
 // ---------- SYS_ENTRY_CREATE kind 编码（ADR-014 §4.4，与 INodeType 对齐）----------
 /// 创建普通文件（kind=REG/FILE）。
@@ -607,6 +623,40 @@ fn sys_flock(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
+/// `fstat(fd, out_buf_ptr)`（SYS_STREAM_FSTAT）：按 fd 读元数据。
+///
+/// 从 fd 的文件句柄取 inode，调用 `INode::metadata` 后以
+/// `vfs::inode::StatInfo` 定长结构写入用户缓冲（a2），返回结构
+/// 字节数。只支持文件句柄（OpenHandle::File）；pipe 端如实
+/// NotFound（与 flock 同政策）。
+fn sys_fstat(frame: &mut SyscallFrame) -> u64 {
+    let fd = frame.a1 as usize;
+    let buf_ptr = frame.a2;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let Some(vfs::file_handle::OpenHandle::File(fh)) = proc.get_fd(fd) else {
+        return pack_err(Error::NotFound); // fd 缺失或 pipe 端（fstat 仅文件）
+    };
+    let meta = match fh.inode.metadata() {
+        Ok(m) => m,
+        Err(e) => return pack_err(e),
+    };
+    let info = vfs::inode::StatInfo::from_metadata(&meta);
+    let bytes = core::mem::size_of::<vfs::inode::StatInfo>();
+    if let Err(e) = validate_user_range(buf_ptr, bytes as u64, UserAccess::Write) {
+        return pack_err(e);
+    }
+    unsafe {
+        arch_x86_64::mmio::copy_to_user(
+            buf_ptr,
+            &info as *const vfs::inode::StatInfo as *const u8,
+            bytes,
+        );
+    }
+    pack_ok(bytes as u64)
+}
+
 /// `dup2(old_fd, new_fd)`（SYS_STREAM_DUP，pipe-features 方案 A）。
 ///
 /// 把 `old_fd` 的句柄复制到 `new_fd`：先关 `new_fd` 旧句柄（pipe 端
@@ -720,39 +770,69 @@ fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
-/// `entry_update(path_ptr, new_path_ptr, flags)`：重命名/移动节点（ADR-014 0x43）。
-///
-/// 当前实现为**同目录重命名**：源与目标须在同一父目录（跨目录移动如实
-/// `NotSupported`，宁缺毋假）。`flags` 保留（当前仅 0 接受，非 0 返回
-/// `InvalidParam`）——ADR-014 允许其表达"更新元数据"等扩展，未实现前不静默忽略。
+/// `entry_update(a1, a2, a3, a4)`：按 `a4` 区分两种动作（ADR-014 0x43）。
+/// - `a4=ENTRY_UPDATE_RENAME(0)`：同目录重命名（a1=old_path, a2=new_path, a3=flags=0）。
+///   源与目标须在同一父目录（跨目录移动如实 `NotSupported`）。
+/// - `a4=ENTRY_UPDATE_CHMOD(1)`：设置节点权限（a1=path, a2=mode_bits）。
+/// 非法 `a4` 如实 `InvalidParam`，不静默忽略。
 fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
-    let old_path_ptr = frame.a1;
-    let new_path_ptr = frame.a2;
-    let flags = frame.a3;
-    if flags != 0 {
-        return pack_err(Error::InvalidParam);
-    }
-    let old_path = match copy_path_from_user(old_path_ptr, MAX_USER_PATH_BYTES) {
-        Ok(p) => p,
-        Err(e) => return pack_err(e),
-    };
-    let new_path = match copy_path_from_user(new_path_ptr, MAX_USER_PATH_BYTES) {
-        Ok(p) => p,
-        Err(e) => return pack_err(e),
-    };
-    // 相对路径与进程 cwd 拼接（VFS 只接受绝对路径）。
-    let old_path = match absolute_path(&old_path) {
-        Ok(a) => a,
-        Err(e) => return pack_err(e),
-    };
-    let new_path = match absolute_path(&new_path) {
-        Ok(a) => a,
-        Err(e) => return pack_err(e),
-    };
-    let root = crate::vfs_init::root();
-    match root.rename(&old_path, &new_path) {
-        Ok(()) => pack_ok(0),
-        Err(e) => pack_err(e),
+    let action = frame.a4;
+    match action {
+        // rename：a4=0，a1=old_path, a2=new_path, a3=flags(=0)。
+        ENTRY_UPDATE_RENAME => {
+            let old_path_ptr = frame.a1;
+            let new_path_ptr = frame.a2;
+            let flags = frame.a3;
+            if flags != 0 {
+                return pack_err(Error::InvalidParam);
+            }
+            let old_path = match copy_path_from_user(old_path_ptr, MAX_USER_PATH_BYTES) {
+                Ok(p) => p,
+                Err(e) => return pack_err(e),
+            };
+            let new_path = match copy_path_from_user(new_path_ptr, MAX_USER_PATH_BYTES) {
+                Ok(p) => p,
+                Err(e) => return pack_err(e),
+            };
+            // 相对路径与进程 cwd 拼接（VFS 只接受绝对路径）。
+            let old_path = match absolute_path(&old_path) {
+                Ok(a) => a,
+                Err(e) => return pack_err(e),
+            };
+            let new_path = match absolute_path(&new_path) {
+                Ok(a) => a,
+                Err(e) => return pack_err(e),
+            };
+            let root = crate::vfs_init::root();
+            match root.rename(&old_path, &new_path) {
+                Ok(()) => pack_ok(0),
+                Err(e) => pack_err(e),
+            }
+        }
+        // chmod：a4=1，a1=path, a2=mode_bits（`Permissions::to_bits` 编码）。
+        ENTRY_UPDATE_CHMOD => {
+            let path_ptr = frame.a1;
+            let mode_bits = frame.a2 as u32;
+            let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
+                Ok(p) => p,
+                Err(e) => return pack_err(e),
+            };
+            let path = match absolute_path(&path) {
+                Ok(a) => a,
+                Err(e) => return pack_err(e),
+            };
+            let perm = vfs::inode::Permissions::from_bits(mode_bits);
+            let root = crate::vfs_init::root();
+            let node = match root.resolve(&path, false) {
+                Ok(n) => n,
+                Err(e) => return pack_err(e),
+            };
+            match node.set_permissions(perm) {
+                Ok(()) => pack_ok(0),
+                Err(e) => pack_err(e),
+            }
+        }
+        _ => pack_err(Error::InvalidParam),
     }
 }
 
@@ -779,6 +859,37 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
         Ok(a) => a,
         Err(e) => return pack_err(e),
     };
+
+    // 第二原语：stat 模式（a4 == ENTRY_READ_STAT）。解析路径后把
+    // 节点元数据以 StatInfo 定长结构整块拷入用户缓冲（a2），返回结构字节数。
+    // follow_symlink=true（POSIX stat 跟软链符），与 readdir 同路径解析。
+    if frame.a4 == ENTRY_READ_STAT {
+        let root = crate::vfs_init::root();
+        let node = match root.resolve(&path, true) {
+            Ok(n) => n,
+            Err(e) => return pack_err(e),
+        };
+        let meta = match node.metadata() {
+            Ok(m) => m,
+            Err(e) => return pack_err(e),
+        };
+        let info = vfs::inode::StatInfo::from_metadata(&meta);
+        let bytes = core::mem::size_of::<vfs::inode::StatInfo>();
+        if max_bytes < bytes {
+            return pack_err(Error::InvalidParam); // 缓冲过小，如实拒绝
+        }
+        if let Err(e) = validate_user_range(buf_ptr, bytes as u64, UserAccess::Write) {
+            return pack_err(e);
+        }
+        unsafe {
+            arch_x86_64::mmio::copy_to_user(
+                buf_ptr,
+                &info as *const vfs::inode::StatInfo as *const u8,
+                bytes,
+            );
+        }
+        return pack_ok(bytes as u64);
+    }
 
     let root = crate::vfs_init::root();
     let dir_node = match root.resolve(&path, true) {
@@ -2433,6 +2544,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_STREAM_CLOSE => done(sys_close(frame)),
         SYS_STREAM_DUP => done(sys_dup2(frame)),
         SYS_STREAM_LOCK => done(sys_flock(frame)),
+        SYS_STREAM_FSTAT => done(sys_fstat(frame)),
 
         // MEMORY Domain (0x20)
         SYS_MEMORY_MAP => done(sys_mmap(frame)),

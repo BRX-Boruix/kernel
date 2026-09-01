@@ -72,6 +72,12 @@ pub enum Ext2Error {
     CorruptSuperblock,
     /// 调用方缓冲小于一个完整块（fs1 FM4：内部契约设防，不再切片 panic）。
     BufferTooSmall,
+    /// 目录项不存在（INode::rename/lookup 的 NotFound 语义）。
+    NotFound,
+    /// 目录项已存在（INode::rename 的 AlreadyExists 语义，不静默覆盖）。
+    AlreadyExists,
+    /// 实现不支持（如 EXT2 无 system_only 存储）。
+    NotSupported,
 }
 
 /// 解析后的超级块（只保留只读路径需要的字段）。
@@ -1573,6 +1579,48 @@ impl Ext2Fs {
         self.write_inode(dir)
     }
 
+    /// 同目录内重命名子项（INode::rename 的 EXT2 原语）。
+    ///
+    /// 保留 inode 身份：删旧目录项（不释放块），再以同一 ino 加新项。
+    /// 约定：`old_name` 不存在→NotFound；`new_name` 已存在→AlreadyExists（不静默覆盖）。
+    pub fn rename_in_dir(&self, dir: &mut Inode, old_name: &str, new_name: &str) -> Result<(), Ext2Error> {
+        validate_component_name(new_name)?;
+        let (ino, inode) = self.lookup_in_dir(dir, old_name).map_err(|_| Ext2Error::NotFound)?;
+        // 新名不能与现有项重名（不静默覆盖）。
+        if self.lookup_in_dir(dir, new_name).is_ok() {
+            return Err(Ext2Error::AlreadyExists);
+        }
+        // 删旧项（仅清零目录项，不释放块）。
+        self.remove_dir_entry(dir, old_name)?;
+        let ft = match inode.mode & 0xF000 {
+            0x4000 => 2, // EXT2_FT_DIR
+            0xA000 => 7, // EXT2_FT_SYMLINK
+            _ => 1,      // EXT2_FT_REG_FILE
+        };
+        self.add_dir_entry(dir, ino, new_name, ft)?;
+        // add_dir_entry 已更新 dir 的 mtime/ctime 并写回。
+        Ok(())
+    }
+
+    /// 设置节点权限（INode::set_permissions 的 EXT2 原语）。
+    ///
+    /// mode 字段的 r/w/x 位与 BORUIX Permissions 一一对应：
+    /// readable→0o444，writable→0o222，executable→0o111，保留类型位（0xF000）。
+    /// EXT2 无 system_only 存储：设置它如实`NotSupported`，不伪造。
+    pub fn set_permissions(&self, ino: u32, perms: Permissions) -> Result<(), Ext2Error> {
+        if perms.system_only {
+            return Err(Ext2Error::NotSupported);
+        }
+        let mut inode = self.read_inode(ino)?;
+        let mut mode = inode.mode & 0xF000; // 保留类型位
+        if perms.readable { mode |= 0o444; }
+        if perms.writable { mode |= 0o222; }
+        if perms.executable { mode |= 0o111; }
+        inode.mode = mode;
+        inode.ctime = now_timestamp_secs();
+        self.write_inode(&inode)
+    }
+
     /// 创建软链接（M3.3）：目标 ≤60B 内联（fast），否则走数据块（slow）。
     pub fn symlink(&self, dir: &mut Inode, name: &str, target: &str) -> Result<Inode, Ext2Error> {
         let target_bytes = target.as_bytes();
@@ -1641,6 +1689,9 @@ pub(crate) fn ext2_to_klib(e: Ext2Error) -> Error {
         | Ext2Error::CorruptSuperblock
         | Ext2Error::BlockOutOfRange => Error::Corrupt,
         Ext2Error::UnsupportedFragmentSize | Ext2Error::UnsupportedBlockSize => Error::NotSupported,
+        Ext2Error::NotFound => Error::NotFound,
+        Ext2Error::AlreadyExists => Error::AlreadyExists,
+        Ext2Error::NotSupported => Error::NotSupported,
     }
 }
 
@@ -1807,6 +1858,22 @@ impl INode for Ext2Node {
         }
         let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
         self.fs.unlink(&mut dir, name).map_err(ext2_to_klib)
+    }
+
+    /// 同目录内重命名子项（EXT2 实现）：保留 inode 身份。
+    /// 约定“新名已存在→AlreadyExists，不静默覆盖”与 trait 相同。
+    fn rename(&self, old_name: &str, new_name: &str) -> Result<(), Error> {
+        if !self.inode.is_dir() {
+            return Err(Error::NotDirectory);
+        }
+        let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
+        self.fs.rename_in_dir(&mut dir, old_name, new_name).map_err(ext2_to_klib)
+    }
+
+    /// 设置节点权限（EXT2 实现）：把 Permissions 写回 inode mode 的 r/w/x 位。
+    /// EXT2 无 system_only 存储，设置它如实 NotSupported（不伪造）。
+    fn set_permissions(&self, perms: Permissions) -> Result<(), Error> {
+        self.fs.set_permissions(self.inode.ino, perms).map_err(ext2_to_klib)
     }
 
     /// M3：创建软链接（fast/slow 双形态）。
