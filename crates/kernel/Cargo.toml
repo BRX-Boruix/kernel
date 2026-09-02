@@ -53,7 +53,7 @@ kernel-test-waitpid = ["kernel-tests"]
 [build-dependencies]
 
 [dependencies]
-limine = { version = "0.1", features = ["requests-section"] }
+brxlimine-rs = { path = "../../vendor/brxlimine-rs", features = ["requests-section"] }
 klib = { path = "../klib" }
 driver = { path = "../driver" }
 fs = { path = "../fs" }

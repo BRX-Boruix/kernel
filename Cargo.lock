@@ -15,9 +15,17 @@ name = "arch-x86_64"
 version = "0.1.0"
 dependencies = [
  "arch",
+ "brxlimine-rs",
  "klib",
- "limine",
  "spin",
+]
+
+[[package]]
+name = "brxlimine-rs"
+version = "0.1.12"
+dependencies = [
+ "limine-proc",
+ "uuid",
 ]
 
 [[package]]
@@ -67,11 +75,11 @@ version = "0.1.0"
 dependencies = [
  "arch",
  "arch-x86_64",
+ "brxlimine-rs",
  "driver",
  "fs",
  "ipc",
  "klib",
- "limine",
  "loader",
  "mm",
  "spin",
@@ -85,15 +93,6 @@ name = "klib"
 version = "0.1.0"
 dependencies = [
  "buddy_system_allocator",
-]
-
-[[package]]
-name = "limine"
-version = "0.1.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02034f8f6b3e7bf050f310fbaf6db0018b8e54b75598d0a4c97172054752fede"
-dependencies = [
- "limine-proc",
 ]
 
 [[package]]
@@ -130,8 +129,8 @@ name = "mm"
 version = "0.1.0"
 dependencies = [
  "arch",
+ "brxlimine-rs",
  "klib",
- "limine",
  "spin",
 ]
 
@@ -205,6 +204,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "uuid"
+version = "1.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
 
 [[package]]
 name = "vfs"

@@ -7,4 +7,4 @@ edition.workspace = true
 arch = { path = "../arch" }
 klib = { path = "../../klib" }
 spin = "0.9"
-limine = { version = "0.1", features = ["requests-section"] }
+brxlimine-rs = { path = "../../../vendor/brxlimine-rs", features = ["requests-section"] }

@@ -47,8 +47,8 @@ static KERNEL_FILE_REQUEST: limine::KernelFileRequest = limine::KernelFileReques
 
 /// Limine `File.media_type` 值（`common/protos/limine.c` 的 `get_file`）。
 /// 0=generic（磁盘/可引导分区）、1=optical（ISO/CD）、2=tftp。
-const LIMINE_MEDIA_GENERIC: u64 = 0;
-const LIMINE_MEDIA_OPTICAL: u64 = 1;
+const LIMINE_MEDIA_GENERIC: u32 = 0;
+const LIMINE_MEDIA_OPTICAL: u32 = 1;
 
 /// boot 来源（ADR-029 §决策3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
