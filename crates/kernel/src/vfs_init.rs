@@ -907,37 +907,32 @@ fn init_install(mbr_disk_id: u32, partition_index: u32) -> bool {
 /// 构建默认 RESTful 顶层目录骨架与特殊文件系统挂载（liveCD 与安装模式共用）。
 fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
     // 构建默认顶层骨架（词法规范 v2，ADR-005：集合目录用复数名词，
-    // 域目录用单数物质名词，禁止形容词/缩写）
-    mount_table
-        .mkdir("/programs", Permissions::all())
-        .expect("mkdir /programs");
-    mount_table
-        .mkdir("/config", Permissions::all())
-        .expect("mkdir /config");
-    mount_table
-        .mkdir("/system", Permissions::all())
-        .expect("mkdir /system");
-    mount_table
-        .mkdir("/processes", Permissions::all())
-        .expect("mkdir /processes");
-    mount_table
-        .mkdir("/devices", Permissions::all())
-        .expect("mkdir /devices");
-    mount_table
-        .mkdir("/users", Permissions::all())
-        .expect("mkdir /users");
-    mount_table
-        .mkdir("/scratch", Permissions::all())
-        .expect("mkdir /scratch");
-    mount_table
-        .mkdir("/volumes", Permissions::all())
-        .expect("mkdir /volumes");
+    // 域目录用单数物质名词，禁止形容词/缩写）。
+    // 幂等语义：骨架目录首次安装/启动时创建并持久化到 root；已安装盘再次
+    // 初始化时目录已存在属正常——不可把 AlreadyExists 当故障 panic，否则
+    // SDK 预装的 /programs 等内容会在每次重启被重复创建而冲突。
+    let ensure_dir = |path: &str| match mount_table.mkdir(path, Permissions::all()) {
+        Ok(_) => {}
+        Err(klib::error::Error::AlreadyExists) => {}
+        Err(e) => panic!("mkdir {}: {:?}", path, e),
+    };
+    let ensure_link = || match mount_table.symlink("/scratch", "/tmp") {
+        Ok(_) => {}
+        Err(klib::error::Error::AlreadyExists) => {}
+        Err(e) => panic!("symlink /tmp -> /scratch: {:?}", e),
+    };
+    ensure_dir("/programs");
+    ensure_dir("/config");
+    ensure_dir("/system");
+    ensure_dir("/processes");
+    ensure_dir("/devices");
+    ensure_dir("/users");
+    ensure_dir("/scratch");
+    ensure_dir("/volumes");
 
-    // 词法规范 v2 热路径豁免：官方短别名 `/tmp` → 正名 `/scratch`。
+    // 词法规范 v2 热路径豁免：官方短别名 /tmp  → 正名 /scratch。
     // 符号链接长期稳定存在，但文档与代码主路径一律写正名。
-    mount_table
-        .symlink("/scratch", "/tmp")
-        .expect("symlink /tmp -> /scratch");
+    ensure_link();
 
     // 挂载特殊文件系统
     let procfs = Arc::new(ProcFS::new(Arc::new(KernelProcessProvider)));
@@ -948,9 +943,7 @@ fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
     // `/system` 保持为真实可写 RamFS 域目录（ADR-012 §3 #3：可容纳 swapfile 等
     // 运行时文件）；SysFS 只读 JSON 视图挂载到子目录 `/system/info/`，避免
     // 虚视图遮蔽真实存储归属。
-    mount_table
-        .mkdir("/system/info", Permissions::all())
-        .expect("mkdir /system/info");
+    ensure_dir("/system/info");
     let sysfs = Arc::new(SysFS::new(Arc::new(KernelSystemProvider)));
     mount_table
         .mount("/system/info", sysfs)

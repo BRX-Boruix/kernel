@@ -1508,9 +1508,11 @@ impl Ext2Fs {
         // 名字合法性（统一校验：非空、≤255、无 `/`、无控制字符）。入口即拒，
         // 不把超长名放行进 add_dir_entry 才拦截，杜绝后续 `as u8` 截断路径。
         validate_component_name(name)?;
-        // 重名检查。
+        // 重名检查：目录项已存在 → AlreadyExists（与 rename_in_dir/Ext2Error
+        // 既有语义一致；不得用 CorruptDirEntry 冒充——那是盘上结构损坏，
+        // 会让调用方把"目标已存在"误判为介质损坏。
         if self.lookup_in_dir(dir, name).is_ok() {
-            return Err(Ext2Error::CorruptDirEntry); // AlreadyExists 语义由调用方映射
+            return Err(Ext2Error::AlreadyExists);
         }
         let ino = self.alloc_inode()?;
         let now = now_timestamp_secs();
