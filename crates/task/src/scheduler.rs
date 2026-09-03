@@ -223,8 +223,6 @@ fn my_cpu_slot() -> usize {
 /// run user processes from their own queue. Default off keeps kernel-tests single-core.
 static DISTRIBUTE_ACROSS_CPUS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-static SPAWN_ROUND_ROBIN: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
 /// 是否已有一个 AP 真正启动过用户进程（对称多处理一次打点用；0 = BSP 永不置位）。
 static AP_LAUNCHED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -235,15 +233,22 @@ pub fn set_distribute_across_cpus(on: bool) {
 }
 
 /// Choose the new process's home CPU slot: default = creating core; when SMP
-/// distribution is on and more than one core is online, round-robin over online
-/// cores (so a process lands on an AP queue and that AP schedules it).
-fn spawn_home_cpu() -> usize {
+/// distribution is on and more than one core is online, pick the least-loaded
+/// online core (shortest per-core ready queue + running count) so a process
+/// lands on the most idle AP queue. Called under the SCHED lock, so it reads
+/// the per-core ready lengths safely.
+fn spawn_home_cpu(s: &Scheduler) -> usize {
     if DISTRIBUTE_ACROSS_CPUS.load(core::sync::atomic::Ordering::Acquire) {
         let n = arch_x86_64::smp::total_cpus();
         if n > 1 {
-            let h = SPAWN_ROUND_ROBIN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % n;
-            klib::info!("[sched] spawn distributed home={} (online={})", h, n);
-            return h & (MAX_SCHED_CPUS - 1);
+            let mut best = 0usize;
+            let mut bl = usize::MAX;
+            for c in 0..n {
+                let l = s.ready[c].len() + usize::from(s.current[c].is_some());
+                if l < bl { bl = l; best = c; }
+            }
+            klib::info!("[sched] spawn least-loaded home={} (load={}, online={})", best, bl, n);
+            return best & (MAX_SCHED_CPUS - 1);
         }
     }
     my_cpu_slot()
@@ -416,8 +421,8 @@ pub fn spawn_with_ppid_fds(
     // A1 / ADR-033：注入子进程身份（init 引导特权或父进程继承值）。
     proc.set_identity(identity);
     // 阶段2（M4）：决定本进程 home（常驻）核。缺省 = 创建核；对称多处理使能后
-    // 轮转分配到在线各核，使进程真正落到某 AP 的就绪队列、由该 AP 调度执行。
-    let home_cpu = spawn_home_cpu();
+    // 选当前就绪队列最短（最空闲）的在线核，使进程落到某 AP 队列、由该 AP 调度。
+    let home_cpu = spawn_home_cpu(&s);
     let entry = ProcEntry {
         proc,
         saved: initial_frame(entry_rip, user_stack_top),
