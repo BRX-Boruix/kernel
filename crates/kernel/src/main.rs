@@ -689,6 +689,13 @@ unsafe fn kmain_body() -> ! {
     // 防止它们继续分配/拿锁/交错输出。同样依赖 SMP 完成后的槽位反查。
     panic::set_cross_core_halt(halt_other_cpus_via_ipi);
 
+    // 阶段 0：SMP 冒烟测试——须在 smp::init + wait_all_online + IPI 接线
+    // （mm::ipi_drain_current_cpu 已占向量 0x40 分发槽位）之后运行：测试需
+    // 临时换装 IPI handler 做跨核往返并恢复原位。单核（无 -smp）下仅校验
+    // 映射表自洽后跳过 IPI 往返，不报错。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_smp_smoke();
+
     // 内核全部组件加载完成（测试若开启也已全部通过）：打印版本横幅。
     info!("============================================================");
     info!("BORUIX KERNEL v.{}", env!("CARGO_PKG_VERSION"));

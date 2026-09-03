@@ -561,6 +561,19 @@ pub fn register_ipi_handler(h: IpiHandler) {
     IPI_HANDLER.store(h as usize, Ordering::SeqCst);
 }
 
+/// 读取当前已注册的 IPI 到达回调（供 kernel-tests 保存/恢复现场用）。
+/// 无回调返回 None。IPI 分发是单一槽位，自测临时换装后必须恢复原位，
+/// 否则 mm 的跨核排空在测试期间失效。
+pub fn current_ipi_handler() -> Option<IpiHandler> {
+    let f = IPI_HANDLER.load(Ordering::Acquire);
+    if f == 0 {
+        None
+    } else {
+        // 指针来自 register_ipi_handler 写入的合法 'static 函数地址。
+        Some(unsafe { core::mem::transmute::<usize, IpiHandler>(f) })
+    }
+}
+
 fn dispatch_ipi() {
     let f = IPI_HANDLER.load(Ordering::Acquire);
     if f != 0 {

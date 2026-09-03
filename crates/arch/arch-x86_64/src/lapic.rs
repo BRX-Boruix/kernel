@@ -11,6 +11,7 @@ use crate::interrupts;
 use crate::mmio;
 use crate::port::{inb, outb};
 use crate::serial;
+use crate::smp;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -73,17 +74,42 @@ const LAPIC_ID: usize = 0x20;
 /// `calibrate_bus_freq` 用 PIT 实测，不再依赖此硬编码。
 pub const DEFAULT_BUS_FREQ_HZ: u64 = 1_000_000_000;
 
-/// 全局 tick 计数。
-static TICKS: AtomicU64 = AtomicU64::new(0);
+/// **per-CPU** tick 计数，按紧凑 CPU 槽位（0..n，见 smp.rs）索引。
+///
+/// 阶段 1（多核地基）：LAPIC 定时器是每核一份硬件资源——BSP 与每个 AP 都运行
+/// 自己的周期定时器（100Hz），各自把自己的槽位计数 +1。若所有核共用单一计数，
+/// 各核定时器叠加会让时钟以 N 倍速走（每 10ms 加 N 次）。改为每核一份后：
+/// - [ticks]（读本核槽位）用于观察/测试这一核的 tick 推进；
+/// - [system_ticks]（恒读槽 0 = BSP）作为全局单调时钟的兜底源——只有 BSP
+///   定时器写槽 0，AP 定时器写槽 1..N，故槽 0 计数不被多核叠加，墙钟不加速。
+///
+/// 容量 256 = LAPIC id 全空间（与 smp.rs 的槽位映射表同源）。
+const TICKS_SLOTS: usize = 256;
+static TICKS: [AtomicU64; TICKS_SLOTS] = [const { AtomicU64::new(0) }; TICKS_SLOTS];
 
 /// 读取当前 CPU 的 LAPIC ID（0~255）。
 pub fn current_lapic_id() -> u32 {
     lapic_read(LAPIC_ID) >> 24
 }
 
-/// 当前已运行的 tick 数。
+/// 当前 CPU 的紧凑槽位。LAPIC 未映射或映射缺失时回退 0（BSP 槽）。
+/// 启动早期（BSP 槽映射在 smp::init 写入）槽位表默认值即 0 = BSP，语义不变。
+fn my_slot() -> usize {
+    if !is_mapped() {
+        return 0;
+    }
+    smp::slot_of_lapic(current_lapic_id()) & 0xFF
+}
+
+/// 本核（当前 CPU）已运行的 tick 数。多核下读的是当前核自己的定时器计数。
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
+    TICKS[my_slot()].load(Ordering::Relaxed)
+}
+
+/// 系统单调 tick（恒读 BSP/槽 0）。多核下只有 BSP 定时器写槽 0，故该计数
+/// 不被各 AP 定时器叠加——用作无 HPET 时全局单调时钟的兜底源（不加速、单调）。
+pub fn system_ticks() -> u64 {
+    TICKS[0].load(Ordering::Relaxed)
 }
 
 /// LAPIC 是否已映射（init 成功写入 LAPIC_VIRT 后为 true）。
@@ -168,16 +194,27 @@ pub fn configure_lint0_extint() {
     klib::info!("[lapic] LINT0 configured as ExtINT (8259 source)");
 }
 
-/// IRQ 处理函数（定时器）：递增 tick、驱动软件定时器队列并 EOI。
+/// IRQ 处理函数（定时器）：把本核 tick 计数 +1、驱动软件定时器队列并 EOI。
 ///
-/// `pub`：供共享中断测试（`tests.rs`）引用以调整注册顺序。
+/// IRQ 表是全体核共享的注册表，每个核自己的 LAPIC 定时器（向量 0x20 = IRQ0）
+/// 触发时都会调用本函数。因此：
+/// - tick 计数必须写当前核自己的槽位（TICKS per-CPU），否则多核叠加加倍；
+/// - 软件定时器队列（klib::time::poll_timeouts）阶段 1 只由 BSP（槽 0）喂，
+///   其它核空转不碰队列，避免多核并发驱动同一全局队列造成数据竞争
+///   （队列分核/加锁留待阶段 5）。
+///
+/// pub：供共享中断测试（tests.rs）引用以调整注册顺序。
 pub extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
-    let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if t <= 5 {
-        klib::info!("[lapic] tick");
+    let slot = my_slot();
+    let t = TICKS[slot].fetch_add(1, Ordering::Relaxed) + 1;
+    if t <= 3 {
+        // 前几次 per-core tick 打印，便于启动期确认每个核的定时器都在推进。
+        klib::info!("[lapic] tick cpu_slot={} count={}", slot, t);
     }
-    // 软件定时器队列到期检查（回调在锁外执行，中断上下文安全）。
-    klib::time::poll_timeouts();
+    // 软件定时器队列仅由 BSP（槽 0）驱动；AP 空转不碰（阶段 1 纪律）。
+    if slot == 0 {
+        klib::time::poll_timeouts();
+    }
     end_of_interrupt();
     true
 }
@@ -250,10 +287,20 @@ fn calibrate_bus_freq() -> u64 {
     elapsed * PIT_FREQ / PIT_TICKS as u64
 }
 
-/// 初始化 Local APIC 定时器（周期模式，100Hz）。
+/// 每核 LAPIC 定时器共享的已校准总线频率（Hz）。由 BSP 在 init 校准后写入，
+/// AP 经 init_timer_self 直接继承（AP 不重复校准）。0 = 尚未校准。
+static CALIBRATED_BUS_FREQ: AtomicU64 = AtomicU64::new(0);
+
+/// 初始化 BSP 的 Local APIC 定时器路径（映射 + 使能 + 校准 + 全局接线）。
 ///
-/// 总线频率通过 `calibrate_bus_freq` 用 PIT 实测，仅在失败时回退到
-/// `DEFAULT_BUS_FREQ_HZ`。
+/// **只在 BSP 上调用一次**（kmain，SMP 之前）。职责分两类：
+/// - **全局一次性**：LAPIC MMIO 映射、SVR 使能、校准总线频率并写入
+///   CALIBRATED_BUS_FREQ、注册共享 IRQ0 handler、注入全局单调时钟源、
+///   set_lapic_ready、配置 LINT0；
+/// - **本核定时器启动**：委托 init_timer_self（BSP 也运行自己的定时器）。
+///
+/// AP 不应调用本函数——它们只需 init_timer_self（在 ap_entry 里调），
+/// 不重复映射/校准/注入全局状态。
 pub fn init() {
     // 0. 从 MSR IA32_APIC_BASE 读取真实 LAPIC 物理基址，避免硬编码 0xFEE00000。
     //    若 MSR 报告 LAPIC 已启用（bit 12），使用其基址；否则回退默认值。
@@ -268,7 +315,7 @@ pub fn init() {
     let virt = phys | mmio::DEVICE_MMIO_VIRT_BASE;
     LAPIC_VIRT.store(virt, Ordering::Relaxed);
 
-    // 把 LAPIC 物理地址映射到高半区虚拟地址
+    // 把 LAPIC 物理地址映射到高半区虚拟地址（全局内核页表，全体核共享该映射）
     if !mmio::map_lapic(phys, virt) {
         klib::info!("[lapic] map failed");
         return;
@@ -279,7 +326,7 @@ pub fn init() {
     //    IDT 已在 interrupts::init 填充对应表项——arch1.md AA3）
     lapic_rmw(LAPIC_SVR, SVR_APIC_ENABLE, SVR_APIC_ENABLE | SPURIOUS_VECTOR_SVR);
 
-    // 2. 校准 LAPIC 总线频率（用 PIT 实测，而非硬编码）
+    // 2. 校准 LAPIC 总线频率（用 PIT 实测，而非硬编码），写入共享静态供 AP 继承
     let bus_freq = calibrate_bus_freq();
     let bus_freq = if bus_freq == 0 {
         klib::info!(
@@ -291,38 +338,73 @@ pub fn init() {
         klib::info!("[lapic] calibrated LAPIC bus freq = {} Hz", bus_freq);
         bus_freq
     };
+    CALIBRATED_BUS_FREQ.store(bus_freq, Ordering::Release);
 
-    // 3. 配置定时器分频（divide by 1 → 0x0B）
-    lapic_write(LAPIC_TIMER_DIV, 0x0B);
-
-    // 4. 设置 LVT Timer：周期性，向量 0x20
-    lapic_write(LAPIC_TIMER, TIMER_PERIODIC | TIMER_VECTOR);
-
-    // 5. 设置初始计数：期望 100Hz
-    let target_hz = 100u64;
-    let init_count = bus_freq / target_hz;
-    lapic_write(LAPIC_TIMER_INIT, init_count as u32);
-
-    // 6. 注册 IRQ 处理（vector 0x20 → irq 0）
+    // 3. 注册共享 IRQ handler（vector 0x20 → irq 0）。IRQ 表全局共享，
+    //    每个核自己的定时器中断都会分发到它，AP 无需重复注册。
     interrupts::register_irq(0, lapic_timer_handler);
 
-    // 7. 注入 klib 单调时钟源。**HPET 优先**：纳秒计数（1GHz 时钟源），
-    //    now_nanos 微秒级精度且不受 TCG 下 LAPIC tick 失准影响；LAPIC
-    //    tick 中断仍保留，负责唤醒与 poll_timeouts（软件定时器队列）。
-    //    HPET 不可用时回退 LAPIC tick（100Hz）。
+    // 4. 注入 klib 全局单调时钟源。HPET 优先：纳秒计数（1GHz），不受多核
+    //    叠加影响（HPET 是全局硬件，天然一致）；无 HPET 时回退到 system_ticks
+    //    （BSP 槽 0 计数，同样不被 AP 定时器叠加）。
+    const TARGET_HZ: u64 = 100;
     if crate::hpet::is_ready() {
         klib::time::set_clock_source(crate::hpet::now_nanos, 1_000_000_000);
         klib::info!("[lapic] clock source: HPET (1 GHz ns clock)");
     } else {
-        klib::time::set_clock_source(ticks, target_hz);
-        klib::info!("[lapic] clock source: LAPIC tick ({} Hz)", target_hz);
+        klib::time::set_clock_source(system_ticks, TARGET_HZ);
+        klib::info!("[lapic] clock source: LAPIC tick ({} Hz)", TARGET_HZ);
     }
 
     // 标记 LAPIC 已可用（串口锁依赖 LAPIC id 做多核 owner 判断）
     serial::set_lapic_ready();
 
-    // 配置 LINT0 为 ExtINT 接收 8259 外部中断（键盘等 ISA 设备）。
+    // 5. 配置 LINT0 为 ExtINT 接收 8259 外部中断（键盘等 ISA 设备）。
     configure_lint0_extint();
 
-    klib::info!("[lapic] LAPIC timer initialized");
+    // 6. 启动本核（BSP）自己的周期定时器。
+    init_timer_self();
+
+    klib::info!("[lapic] LAPIC timer initialized (BSP)");
+}
+
+/// 启动当前 CPU 的 LAPIC 周期定时器（100Hz）。
+///
+/// 每核一份硬件资源：BSP 在 init 末尾调用；每个 AP 在 smp::ap_entry 上线后调用。
+/// 本函数只配置本核定时器，不做任何全局/一次性动作——
+/// - 不重新映射 LAPIC（BSP init 已全局映射，AP 继承内核页表映射）；
+/// - 不校准（继承 CALIBRATED_BUS_FREQ，BSP 校准一次即可）；
+/// - 不注册 IRQ handler（共享表已由 BSP 注册）；
+/// - 不注入全局时钟源 / 不 set_lapic_ready / 不配 LINT0（都只该做一次）。
+///
+/// pub：供 smp::ap_entry 调用以启动每个 AP 自己的定时器。
+pub fn init_timer_self() {
+    // 已校准总线频率；未校准（异常时序）时回退默认值并如实告警。
+    let bus_freq = CALIBRATED_BUS_FREQ.load(Ordering::Acquire);
+    let bus_freq = if bus_freq == 0 {
+        klib::warn!(
+            "[lapic] init_timer_self before calibration; using default {} Hz",
+            DEFAULT_BUS_FREQ_HZ
+        );
+        DEFAULT_BUS_FREQ_HZ
+    } else {
+        bus_freq
+    };
+
+    // 使能本核 LAPIC（Limine 通常已使能；此处幂等确保）。
+    lapic_rmw(LAPIC_SVR, SVR_APIC_ENABLE, SVR_APIC_ENABLE | SPURIOUS_VECTOR_SVR);
+
+    // 配置定时器分频（divide by 1 → 0x0B）。
+    lapic_write(LAPIC_TIMER_DIV, 0x0B);
+
+    // 设置 LVT Timer：周期性，向量 0x20。
+    lapic_write(LAPIC_TIMER, TIMER_PERIODIC | TIMER_VECTOR);
+
+    // 设置初始计数：期望 100Hz。本核定时器到期即 IRQ0 → 共享 handler，
+    // handler 把本核槽位 tick +1。
+    const TARGET_HZ: u64 = 100;
+    let init_count = bus_freq / TARGET_HZ;
+    lapic_write(LAPIC_TIMER_INIT, init_count as u32);
+
+    klib::info!("[lapic] per-core timer started (slot {} @ ~{} Hz)", my_slot(), TARGET_HZ);
 }

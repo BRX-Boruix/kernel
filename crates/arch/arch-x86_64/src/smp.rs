@@ -204,6 +204,13 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
     // 开启中断
     crate::interrupts::enable();
 
+    // 阶段 1：启动本核自己的 LAPIC 周期定时器（100Hz）。此前只有 BSP 有定时器，
+    // AP 靠共享 IRQ 表 + BSP 映射的 LAPIC 基址即可配自己的 LVT Timer。启动后本核
+    // 定时器中断（向量 0x20 = IRQ0）会推进**本核槽位**的 tick（lapic_timer_handler
+    // 写 per-CPU TICKS）。不重复校准/注入全局时钟源——CALIBRATED_BUS_FREQ 由 BSP
+    // 校准后 AP 直接继承。须在开中断之后（定时器到期即能进 handler 并 EOI）。
+    crate::lapic::init_timer_self();
+
     // 用 AcqRel 保证计数递增的可见性与顺序（配合 BSP 的 Release 初始化）
     CPU_COUNT.fetch_add(1, Ordering::AcqRel);
 
