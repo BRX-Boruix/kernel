@@ -215,6 +215,9 @@ global_asm!(
     // KA1：跨核停机向量（0x41）。panic 现场广播给其它 CPU，收到即永久停机。
     isr_noerr 65
 
+    // phase2-M5 resched stub
+    isr_noerr 66
+
     // 软件中断 0x80（无错误码）：用户态软中断/系统调用入口（M2.5.4 / M3）。
     isr_noerr 128
 
@@ -543,6 +546,11 @@ pub const IPI_VECTOR: u8 = 0x40;
 /// 与 IPI_VECTOR 同避让纪律。
 pub const IPI_HALT_VECTOR: u8 = 0x41;
 
+/// 跨核重调度向量（阶段2 M5）：目标核处于调度空闲 halt 时收到即醒来、立刻重查
+/// 自己的就绪队列（把跨核唤醒的时延从"等下一 IRQ0 tick (~16ms)"压到即时）。
+/// 目标核若在运行则静默无副作用（处理函数仅 EOI 后返回）。与其它 IPI 向量同避让。
+pub const IPI_RESCHED_VECTOR: u8 = 0x42;
+
 /// x86-64 异常向量号（SDM Vol.3 §6.3.1）：页错误（#PF，有错误码 + CR2）。
 /// 分发路径按此号路由补页回调 / 内核故障检查器 / CR2 打印。
 pub const VECTOR_PAGE_FAULT: u64 = 14;
@@ -583,6 +591,23 @@ fn dispatch_ipi() {
     }
     // Fixed IPI 置位 ISR，必须 EOI，否则后续同向量中断被 LAPIC 挂起。
     crate::lapic::end_of_interrupt();
+}
+
+/// 跨核重调度请求处理（阶段2 M5）：Fixed IPI 置位 ISR，必须 EOI。中断本身已
+/// 把目标核从调度空闲 halt 唤醒；此处仅清挂起位，无其它副作用。
+fn dispatch_resched() {
+    crate::lapic::end_of_interrupt();
+}
+
+/// 向指定 CPU 槽位发送跨核重调度 IPI（阶段2 M5）。用于某核跨核唤醒了一个驻留
+/// 在别核（且该核空闲 halt）的进程后，即时促其醒来重查就绪队列。返回是否成功
+/// 投递（目标槽位失联/尚未上线则 false，调用方可静默忽略——被唤醒核自身 IRQ0
+/// 兜底会在 ~16ms 内重查，IPI 只是即时优化）。
+pub fn send_resched_ipi_to_slot(slot: usize) -> bool {
+    match crate::smp::lapic_id_of_slot(slot) {
+        Some(lapic_id) => crate::lapic::send_fixed_ipi(lapic_id, IPI_RESCHED_VECTOR),
+        None => false,
+    }
 }
 
 /// 跨核停机处理（KA1）：中断门下 IF 已关，hlt 永久睡眠——本核不再参与任何
@@ -669,6 +694,13 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
     if vector == IPI_HALT_VECTOR as u64 {
         // KA1：跨核停机请求——永久停住本核（不返回）。
         dispatch_ipi_halt();
+    }
+
+    if vector == IPI_RESCHED_VECTOR as u64 {
+        // 阶段2（M5）：跨核重调度请求——本核若在调度空闲 halt 则被此中断唤醒，
+        // 返回后重查自己就绪队列；若在运行则仅 EOI 无副作用。无需回调。
+        dispatch_resched();
+        return;
     }
 
     if vector < 32 {
@@ -904,6 +936,9 @@ pub fn init() {
         // 不再恢复执行）。
         let handler = get_isr_addr(IPI_HALT_VECTOR as u16);
         (*idt_ptr).entries[IPI_HALT_VECTOR as usize].set_handler(handler, IDT_FLAG_INTERRUPT, 0);
+        // 阶段2（M5）：跨核重调度向量 0x42。中断门；收到即唤醒调度空闲 halt。
+        let handler = get_isr_addr(IPI_RESCHED_VECTOR as u16);
+        (*idt_ptr).entries[IPI_RESCHED_VECTOR as usize].set_handler(handler, IDT_FLAG_INTERRUPT, 0);
 
         let idtr = build_idtr();
         x86_64_load_idt(&idtr as *const Idtr);
@@ -987,6 +1022,7 @@ fn get_isr_addr(vector: u16) -> u64 {
         fn isr_47();
         fn isr_64();
         fn isr_65();
+        fn isr_66();
         fn isr_255();
     }
 
@@ -1009,6 +1045,10 @@ fn get_isr_addr(vector: u16) -> u64 {
     // KA1：跨核停机向量 0x41（isr_65）。
     if vector == IPI_HALT_VECTOR as u16 {
         return isr_65 as *const () as usize as u64;
+    }
+    // 阶段2（M5）：跨核重调度向量 0x42（isr_66）。
+    if vector == IPI_RESCHED_VECTOR as u16 {
+        return isr_66 as *const () as usize as u64;
     }
     // 伪中断向量 0xFF 同样在固定表之外（isr_255）。
     if vector == SPURIOUS_VECTOR {

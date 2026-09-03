@@ -950,6 +950,21 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
     }
 }
 
+/// 把被唤醒进程 pid 塞入 home 核就绪队列，并在跨核唤醒到空闲核时发一次
+/// reschedule IPI（阶段2 M5）：让驻留进程在别核、而该核此刻调度空闲 halt 等队列
+/// 的场合即时醒来重查，把时延从等目标核下一 IRQ0 tick (~16ms) 压到即时。
+///
+/// 调用方持 SCHED 锁（本函数不改锁状态）。空闲判定 = current[home] 为 None
+/// （该核无进程运行、在 start() 空队 halt）。目标核若在运行则 IPI 仅 EOI 无副作用
+/// （arch 的 dispatch_resched 不碰调度锁，不会与本锁死锁）。发送失败静默——
+/// 目标核自身 IRQ0 兜底会重查，IPI 只是即时优化。
+fn wake_enqueue(s: &mut Scheduler, pid: usize, home: usize) {
+    s.ready[home].push_back(pid);
+    if home != my_cpu_slot() && s.current[home].is_none() {
+        let _ = arch_x86_64::interrupts::send_resched_ipi_to_slot(home);
+    }
+}
+
 /// 键盘有输入时唤醒阻塞的进程（由 arch 键盘 handler 经回调调用）。
 ///
 /// 取出 [`KBD_WAITER`] 登记的 pid，将其置 `Ready` 并入就绪队列。调度器下次调度/// （tick ≤10ms 或 idle 循环立即）切回该进程，使其 `read` 重试取到字符。
@@ -970,7 +985,7 @@ pub fn wake_kbd() {
             _ => None,
         }
     };
-    if let Some(home) = enqueue { s.ready[home].push_back(p as usize); }
+    if let Some(home) = enqueue { wake_enqueue(&mut s, p as usize, home); }
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,7 +1159,7 @@ pub fn wake_event() {
             _ => None,
         }
     };
-    if let Some(home) = enqueue { s.ready[home].push_back(p as usize); }
+    if let Some(home) = enqueue { wake_enqueue(&mut s, p as usize, home); }
 }
 
 /// 事件等待的超时唤醒（`klib::time::set_timeout` 回调，等待端注册）。
@@ -1371,7 +1386,7 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
         Termination::Reclaimed
     } else if deliver {
         let ppid_home = s.procs[ppid].as_ref().map(|e| e.home_cpu).unwrap_or(0);
-        s.ready[ppid_home].push_back(ppid);
+        wake_enqueue(s, ppid, ppid_home);
         driver::uio_on_process_exit(pid);
         ipc::sync_release_process(pid);
         // R6 flock（K3）：进程回收时释放其持有的全部锁，杜绝锁表泄漏。
@@ -1858,7 +1873,7 @@ pub fn wake(pid: usize) {
             _ => None,
         }
     };
-    if let Some(home) = enqueue { s.ready[home].push_back(pid); }
+    if let Some(home) = enqueue { wake_enqueue(&mut s, pid, home); }
 }
 
 /// 唤醒一个阻塞的进程并把其保存帧 `rax` 预置为 `value`（SYNC 域 futex 唤醒）。
@@ -1887,7 +1902,7 @@ pub fn wake_with_value(pid: usize, value: u64) {
             _ => None,
         }
     };
-    if let Some(home) = enqueue { s.ready[home].push_back(pid); }
+    if let Some(home) = enqueue { wake_enqueue(&mut s, pid, home); }
 }
 
 /// 启动调度器（内核 idle 主循环）：取第一个就绪进程，经 `enter_usermode` 进入
