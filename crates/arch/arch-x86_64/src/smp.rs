@@ -10,7 +10,7 @@
 //! 硬件上 LAPIC id 可能稀疏（0,8,16,…）甚至超过槽位上限，直接用会冲突。
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
 use crate::gdt;
@@ -33,6 +33,23 @@ static AP_SELF_HALTED: AtomicUsize = AtomicUsize::new(0);
 /// 读取因防御分支自停的 AP 计数。
 pub fn ap_self_halted() -> usize {
     AP_SELF_HALTED.load(Ordering::Acquire)
+}
+
+/// AP 就绪后切换到 per-CPU 调度器空闲循环的注入（阶段2 对称多处理地基）。
+/// AP 上线后默认纯 halt（内核测试期单核确定性不受扰）；当内核进入生产阶段
+/// （init 即将启动）时经 [`enable_ap_scheduling`] 注入 [`task::start`]，使每个
+/// AP 在本核 IRQ0 的唤醒下运行自己的 per-CPU 就绪队列——"每核 AP 在自己的 tick 上
+/// 调度自己的就绪队列"。arch 不反向依赖 task，经 fn 指针注入（同 keyboard 回调范式）。
+static AP_SCHED_FN: Once<fn() -> !> = Once::new();
+/// AP 调度已启用门（置位后 AP 的空闲循环转入注入的调度函数，永不返回）。
+static AP_SCHED_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 启用 AP 对称调度：把 `f` 注入为每个 AP 的空闲任务（典型为 `task::start`）。
+/// 置位后各 AP 在下一次 IRQ0 唤醒时永久进入 `f`（`-> !`，不再回 halt）。
+/// 须在全部内核测试通过、进入生产（start_init）之前调用，且每内核只应调用一次。
+pub fn enable_ap_scheduling(f: fn() -> !) {
+    let _ = AP_SCHED_FN.call_once(|| f);
+    AP_SCHED_ENABLED.store(true, Ordering::Release);
 }
 
 /// 系统总 CPU 数（由 init 记录）。
@@ -217,8 +234,15 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
     // 一次 write_str 完整打印，避免与其他 CPU 交错
     klib::info!("[smp] AP online, lapic_id={}", lapic_id);
 
-    // AP 空闲循环
+    // AP 空闲循环：默认纯 halt；若 AP 调度已启用（生产阶段），
+    // 下一次 IRQ0 唤醒时永久转入注入的 per-CPU 调度空闲循环（task::start），
+    // 从本核就绪队列取进程进入用户态、由本核 IRQ0 tick 轮转（真正对称多处理）。
     loop {
+        if AP_SCHED_ENABLED.load(Ordering::Acquire) {
+            if let Some(f) = AP_SCHED_FN.get() {
+                f(); // never returns
+            }
+        }
         crate::interrupts::halt();
     }
 }

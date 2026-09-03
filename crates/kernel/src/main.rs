@@ -992,6 +992,12 @@ fn start_init() -> ! {
     info!("[kmain] init: spawned pid={} from init.elf", pid);
     // 登记 init PID（PID 1 契约使用）。
     task::set_init_pid(pid);
+    // 阶段2（对称多处理）：进入生产前把各 AP 切换到 per-CPU 调度空闲循环——
+    // 每个在线 AP 从此刻起运行 task::start()，在本核 IRQ0 上调度本核就绪队列
+    // （当前 init/shell 都留在 BSP 槽，AP 就绪队列为空则只是空闲；进程一旦被
+    // 分配到 AP 队列，该 AP 即真正执行其用户态）。须在 init spawn 后、BSP 进入
+    // 调度器前启用，保证 AP 与 BSP 同步进入调度（AP 空队则空转，不抢 init）。
+    arch_x86_64::smp::enable_ap_scheduling(task::start);
     // 启动调度器（永不返回）：进入 init 用户态，tick 轮转，init 经 syscall 退出。
     task::start();
 }
