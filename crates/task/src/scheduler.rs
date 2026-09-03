@@ -17,8 +17,8 @@
 //!   S18：分配必有释放路径）；
 //! - **每进程独立 FPU 现场**（task1 K2）：eager 全量快照，硬件前提由
 //!   `arch_x86_64::interrupts::enable_fpu` 一次性建立；
-//! - **单核调度**（M4.2）：仅在 BSP 上轮转（tick 回调经 arch 层只在 CPU0 触发），
-//!   多核（AP 用户进程）留待后续；
+//! - **每核调度**（阶段2 对称多处理）：每个核用自己的 IRQ0 tick 驱动 [`tick`]，在
+//!   自己的 per-CPU 就绪队列上 RR 轮转（对称多处理，进程经 [`spawn_home_cpu`] 分发）；
 //! - **首次运行**：进程 `spawn` 时构造"初始帧"（`initial_frame`），故首次调度也走
 //!   "从 saved 恢复"，调度逻辑统一；内核 idle 主循环 [`start`] 经 `enter_usermode`
 //!   进入第一个就绪进程。
@@ -452,7 +452,7 @@ pub fn ready_count() -> usize {
     SCHED.lock().ready[my_cpu_slot()].len()
 }
 
-/// 调度器 tick（注册为 `register_scheduler_tick`，仅 BSP、IRQ0 后调用）。
+/// 调度器 tick（注册为 `register_scheduler_tick`，每个核自己的 IRQ0 后调用，per-CPU）。
 ///
 /// RR 轮转：保存当前进程帧并入队尾，取队头下一个进程；改写中断帧 + 切 CR3 +
 /// 切 TSS.RSP0，使 `interrupt_common_stub` 返回后 iretq 进入目标进程用户态。

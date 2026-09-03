@@ -529,7 +529,8 @@ pub fn register_kernel_fault_inspector(f: KernelFaultInspector) {
 /// `interrupt_common_stub` 返回后 iretq 即进入目标进程用户态。返回 void，
 /// 若调度器未切换（无其他就绪进程），帧保持不变，原进程继续执行。
 ///
-/// 仅在 BSP（CPU0）上调用（M4.2 单核调度模型）。
+/// 每个核自己的 IRQ0 后都会调用（对称多处理：每个 AP 用自己的 LAPIC 定时器
+/// 驱动调度 tick）。
 pub type SchedulerTickHandler = extern "C" fn(&mut InterruptFrame);
 static SCHEDULER_TICK: AtomicUsize = AtomicUsize::new(0);
 
