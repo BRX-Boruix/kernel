@@ -998,6 +998,10 @@ fn start_init() -> ! {
     // 分配到 AP 队列，该 AP 即真正执行其用户态）。须在 init spawn 后、BSP 进入
     // 调度器前启用，保证 AP 与 BSP 同步进入调度（AP 空队则空转，不抢 init）。
     arch_x86_64::smp::enable_ap_scheduling(task::start);
+    // 阶段2（M4）：开启跨核 spawn 轮转——init 已在 BSP（其父=0 于使能前创建），
+    // 其后续子进程（shell 等）将轮转落到在线 AP 队列，由该 AP 真正调度执行，
+    // 以实证"每核 AP 调度自己的就绪队列"的对称多处理。
+    task::set_distribute_across_cpus(true);
     // 启动调度器（永不返回）：进入 init 用户态，tick 轮转，init 经 syscall 退出。
     task::start();
 }

@@ -218,6 +218,37 @@ fn my_cpu_slot() -> usize {
     arch_x86_64::smp::slot_of_lapic(arch_x86_64::lapic::current_lapic_id()) & (MAX_SCHED_CPUS - 1)
 }
 
+/// SMP distribution gate (phase2 M4): once production enables per-AP scheduling,
+/// newly spawned processes round-robin onto online cores' ready queues so APs truly
+/// run user processes from their own queue. Default off keeps kernel-tests single-core.
+static DISTRIBUTE_ACROSS_CPUS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static SPAWN_ROUND_ROBIN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+/// 是否已有一个 AP 真正启动过用户进程（对称多处理一次打点用；0 = BSP 永不置位）。
+static AP_LAUNCHED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable cross-core spawn round-robin (call once production enables AP scheduling).
+pub fn set_distribute_across_cpus(on: bool) {
+    DISTRIBUTE_ACROSS_CPUS.store(on, core::sync::atomic::Ordering::Release);
+}
+
+/// Choose the new process's home CPU slot: default = creating core; when SMP
+/// distribution is on and more than one core is online, round-robin over online
+/// cores (so a process lands on an AP queue and that AP schedules it).
+fn spawn_home_cpu() -> usize {
+    if DISTRIBUTE_ACROSS_CPUS.load(core::sync::atomic::Ordering::Acquire) {
+        let n = arch_x86_64::smp::total_cpus();
+        if n > 1 {
+            let h = SPAWN_ROUND_ROBIN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % n;
+            klib::info!("[sched] spawn distributed home={} (online={})", h, n);
+            return h & (MAX_SCHED_CPUS - 1);
+        }
+    }
+    my_cpu_slot()
+}
+
 /// 调度器：进程池（pid 槽，全局共享）+ 每核就绪队列（RR）+ 每核当前进程。
 ///
 /// 阶段2 地基（单锁多核语义）：保持单一全局锁 SCHED，进程表 procs 全局
@@ -384,6 +415,9 @@ pub fn spawn_with_ppid_fds(
     }
     // A1 / ADR-033：注入子进程身份（init 引导特权或父进程继承值）。
     proc.set_identity(identity);
+    // 阶段2（M4）：决定本进程 home（常驻）核。缺省 = 创建核；对称多处理使能后
+    // 轮转分配到在线各核，使进程真正落到某 AP 的就绪队列、由该 AP 调度执行。
+    let home_cpu = spawn_home_cpu();
     let entry = ProcEntry {
         proc,
         saved: initial_frame(entry_rip, user_stack_top),
@@ -395,8 +429,7 @@ pub fn spawn_with_ppid_fds(
         ppid,
         exit_code: 0,
         waiting_for: None,
-        // 阶段2 地基：记录本进程 home 核（创建核）。本里程碑恒为 BSP 槽 0。
-        home_cpu: my_cpu_slot(),
+        home_cpu,
     };
     if pid < s.procs.len() {
         s.procs[pid] = Some(entry);
@@ -406,8 +439,10 @@ pub fn spawn_with_ppid_fds(
         }
         s.procs.push(Some(entry));
     }
-    // 阶段2 地基：入队创建（home）核的就绪队列。
-    s.ready[my_cpu_slot()].push_back(pid);
+    // 阶段2（M4）：新进程直接入队其 home 核就绪队列——使每核就绪队列真正各自
+    // 承运转到本核的进程（对称多处理），而非一律落在创建核。进程运行中阻塞后再
+    // 唤醒仍回 home 核队列（跨核唤醒），实现按核常驻。
+    s.ready[home_cpu].push_back(pid);
     Ok(pid)
 }
 
@@ -1858,6 +1893,11 @@ pub fn wake_with_value(pid: usize, value: u64) {
 /// 启动调度器（内核 idle 主循环）：取第一个就绪进程，经 `enter_usermode` 进入
 /// 其用户态。进程在用户态被 tick 打断后由 [`tick`] 轮转。永不返回。
 pub fn start() -> ! {
+    // 阶段2（M4）对称多处理：AP 进入本调度空闲循环时打点（只一次，BSP 不打点）。
+    let entry_slot = my_cpu_slot();
+    if entry_slot != 0 {
+        klib::info!("[sched] AP slot {} entered scheduler idle loop", entry_slot);
+    }
     loop {
         // 取一个有效就绪进程启动（跳过已退出残留引用）。
         let mut s = SCHED.lock();
@@ -1887,6 +1927,17 @@ pub fn start() -> ! {
             cr3,
         };
         drop(s);
+        // 阶段2（M4）对称多处理：AP（非 BSP 槽）首次从自己就绪队列取到进程并即将
+        // 进入用户态时打点一次，实证"每核 AP 调度自己的就绪队列"（每核一次，
+        // 避免后续每次唤醒重打点刷屏）。BSP 槽 0 不打点。
+        let diag_cs = my_cpu_slot();
+        if diag_cs != 0
+            && !AP_LAUNCHED
+                .load(core::sync::atomic::Ordering::Acquire)
+        {
+            AP_LAUNCHED.store(true, core::sync::atomic::Ordering::Release);
+            klib::info!("[sched] AP slot {} launched user proc pid={} (SMP active)", diag_cs, pid);
+        }
         arch::task::enter_usermode(&frame); // 永不返回
     }
 }
