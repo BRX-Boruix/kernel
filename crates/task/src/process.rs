@@ -55,18 +55,36 @@ pub const fn user_data_selector() -> u16 {
 /// 进入用户态的初始 RFLAGS：IF=1（开中断）、IOPL=0（禁 I/O）、保留位 1 恒为 1。
 pub const USER_RFLAGS: u64 = 0x0000_0000_0000_0202;
 
-// M4.1：当前运行进程的裸指针（syscall 经它访问进程地址空间/退出）。
-// 采用"进程被 `run` 从表取出并 `Box::leak` 为 `'static`，再记录地址"模型：
+// M4.1/M4.2：当前运行进程的裸指针（syscall/缺页经它访问进程地址空间），
+// per-CPU（按紧凑 CPU 槽位索引，与调度器 `current[cpu_slot]` 同槽同步更新）。
+// 采用“进程被调度器从表取出并 `Box::leak` 为 `'static`，再记录地址”模型：
 // - 运行期间不持有 `PROCESS_TABLE` 锁（避免 syscall 中断重入表锁死锁）；
-// - 进程生命周期 = 内核生命周期（单进程停机模型下泄漏无害，M4.2 调度器再改为正式持有/回收）。
-static CURRENT_PROC: AtomicUsize = AtomicUsize::new(0);
+// - 进程生命周期 = 内核生命周期（阶段2 后由调度器正式持有/回收）。
+// 别名安全不靠生命周期表达，而靠下节纪律维持（task1 KA3）：核心 A 的 syscall/
+// 缺页只读/写核心 A 自己的槽位；`set_current_proc`/`clear_current_proc` 由调度器
+// 在“执行核心”上调用（cpu_switch_locked 用本核槽位），故恒落在调用核自己的槽，
+// 与调度器 `Scheduler::current[slot]` 保持单点对应。
+/// 每核紧凑 CPU 槽位容量上限（与调度器 `MAX_SCHED_CPUS` 同源：LAPIC id 全空间）。
+const MAX_CPUS: usize = 256;
+
+/// 当前执行核的紧凑槽位。LAPIC 未映射（SMP/调度初始化之前）恒回退 0 = BSP 槽——
+/// 此时全系统只在 BSP 上运行进程，语义与既有单核完全一致。镜像 scheduler.rs 的
+/// `my_cpu_slot()`（读本核 LAPIC id → 槽位反查表 → 掩码到数组容量）。
+fn my_cpu_slot() -> usize {
+    if !arch_x86_64::lapic::is_mapped() {
+        return 0;
+    }
+    arch_x86_64::smp::slot_of_lapic(arch_x86_64::lapic::current_lapic_id()) & (MAX_CPUS - 1)
+}
+
+static CURRENT_PROC: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
 /// 进程缺页处理入口：转发给当前运行进程的 UserAddressSpace::handle_page_fault。
 ///
 /// extern "C" ABI 边界（arch 中断链交付裸错误码）；位解读在边界处一次完成——
 /// 包装为 x86_64 的语义视图类型后再进入 mm 策略层（MM6：mm 不手解位编码）。
 pub extern "C" fn process_page_fault_handler(vaddr: u64, error_code: u64) -> bool {
-    let p = CURRENT_PROC.load(Ordering::Acquire);
+    let p = CURRENT_PROC[my_cpu_slot()].load(Ordering::Acquire);
     if p == 0 {
         return false;
     }
@@ -75,23 +93,23 @@ pub extern "C" fn process_page_fault_handler(vaddr: u64, error_code: u64) -> boo
     proc.addr_space_mut().handle_page_fault(vaddr, code)
 }
 
-/// 记录当前运行进程（`run` 进入用户态前设置）。
+/// 记录当前运行进程（调度器 `cpu_switch_locked` 切入前设置；写本核槽位）。
 pub fn set_current_proc(p: *mut Process<X86PageTable>) {
-    CURRENT_PROC.store(p as usize, Ordering::Release);
+    CURRENT_PROC[my_cpu_slot()].store(p as usize, Ordering::Release);
 }
 
-/// 清除当前进程记录（进程退出时）。
+/// 清除当前进程记录（进程退出/阻塞切走时；写本核槽位）。
 pub fn clear_current_proc() {
-    CURRENT_PROC.store(0, Ordering::Release);
+    CURRENT_PROC[my_cpu_slot()].store(0, Ordering::Release);
 }
 
-/// 当前运行进程的可变引用（syscall 在中断上下文访问）。
+/// 当前运行进程的可变引用（syscall 在中断上下文访问；读本核槽位）。
 ///
 /// 签名保留 `&'static mut`：进程对象确为 `'static` 存活（Box::leak 模型或
 /// 调度器槽内稳定地址），该签名描述的是**生命周期事实**；别名安全性不靠
-/// 生命周期表达，而靠下节纪律维持（task1 KA3）。
+/// 生命周期表达，而靠上节纪律维持（task1 KA3）。
 pub fn current_proc_mut() -> Option<&'static mut Process<X86PageTable>> {
-    let p = CURRENT_PROC.load(Ordering::Acquire);
+    let p = CURRENT_PROC[my_cpu_slot()].load(Ordering::Acquire);
     if p == 0 {
         None
     } else {

@@ -115,6 +115,11 @@ struct ProcEntry {
     /// 路径单点完成）。通用 [`wake`]/[`wake_kbd`] 不得触碰此类进程，
     /// 防止提前唤醒导致其带着未填写的 `saved.rax` 返回用户态。
     waiting_for: Option<usize>,
+    /// 本进程的 home（常驻）CPU 槽位（阶段2 地基）：spawn 时记录创建核，
+    /// 唤醒/就绪入队目标 `ready[home_cpu]`。本里程碑全系统只有 BSP（槽 0）
+    /// 做调度，故恒为 0；结构就位供后续跨核唤醒把被唤醒进程放进其 home 核
+    /// 的就绪队列。
+    home_cpu: usize,
 }
 
 /// 已退出进程的内核栈帧延迟回收队列（task1 K3，S18 释放路径的单点实现）。
@@ -177,36 +182,63 @@ fn fpu_template_snapshot() -> FpuArea {
     t.expect("template just initialized")
 }
 
-/// 调度器：进程池（pid 槽）+ 就绪队列（RR）+ 当前进程。
+/// 每核紧凑 CPU 槽位的调度状态数组容量（上限 = LAPIC id 全空间 256，
+/// 与 arch smp.rs 的 LAPIC_TO_SLOT 及 lapic.rs TICKS[256] 同源）。
+/// 仅决策核（BSP）真正使用 0 号槽；AP 槽结构就位但本里程碑不投递调度。
+const MAX_SCHED_CPUS: usize = 256;
+
+/// 全局单调 pid 分配器（M4.2/阶段2：pid 由核无关的原子单点分配，
+/// 保证全系统唯一且单调不复用——ppid=槽位索引不变式不随调度分核而破）。
+/// 初值 1：0 保留给“无父”语义。usize::MAX 个并发进程物理不可达（task1 KM6）。
+static NEXT_PID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
+
+/// 分配下一个全局 pid（fetch_add 单调递增）。
+///
+/// task1 KM6 数值边界论证 + 机器强制：usize::MAX 个并发进程物理不可达——
+/// 每个存活 PCB 至少消耗 16 帧内核栈 + 一页堆 + 独立页表页，128M 物理内存在
+/// pid 空间耗尽前数十亿倍早于枯竭。取到 usize::MAX 属编程错误/不可达，
+/// 受控 panic（ADR-010），绝不静默回绕造成 pid 撞车破坏 ppid=槽位索引不变式。
+fn alloc_pid() -> usize {
+    NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// 当前执行核的紧凑槽位（决定本核调度状态应读写哪一份 per-CPU 状态）。
+///
+/// 阶段2 地基：LAPIC 未映射（SMP/调度初始化之前）时恒回退 0 = BSP 槽——
+/// 此刻全系统只在 BSP 上做调度决策，槽位语义与既有单核一致。镜像 lapic.rs
+/// 的 my_slot()（读本核 LAPIC id，槽位反查表，掩码到数组容量）。
+fn my_cpu_slot() -> usize {
+    if !arch_x86_64::lapic::is_mapped() {
+        return 0;
+    }
+    arch_x86_64::smp::slot_of_lapic(arch_x86_64::lapic::current_lapic_id()) & (MAX_SCHED_CPUS - 1)
+}
+
+/// 调度器：进程池（pid 槽，全局共享）+ 每核就绪队列（RR）+ 每核当前进程。
+///
+/// 阶段2 地基（单锁多核语义）：保持单一全局锁 SCHED，进程表 procs 全局
+/// 共享；就绪队列与当前进程 per-CPU（按紧凑槽位索引）。锁粒度仍是单把锁，
+/// 故 pop_ready 的状态检查-弹出原子性保留，且不引入多把 IrqSpinLock 之间的
+/// 加锁顺序死锁。本里程碑所有调度决策仍发生在 BSP（槽 0），AP 就绪/current 槽
+/// 就位但空闲——把既有单队列操作改为读写 [my_cpu_slot()] 即保持槽 0 语义不变。
 struct Scheduler {
+    /// 进程池（pid 槽，全局共享）：pid 即下标。进程可在任意核被唤醒/终止，
+    /// 其 PCB 只有一份，故跨核以本表为唯一权威（不含就绪性）。
     procs: Vec<Option<ProcEntry>>,
-    ready: VecDeque<usize>,
-    next_pid: usize,
-    current: Option<usize>,
+    /// 每核就绪队列（RR）。索引 = 紧凑 CPU 槽位；[my_cpu_slot] 为当前核槽位。
+    ready: [VecDeque<usize>; MAX_SCHED_CPUS],
+    /// 每核当前运行进程。索引 = 紧凑 CPU 槽位（与 process.rs 的 per-CPU
+    /// CURRENT_PROC 同槽同步更新，保持“调度器 current 与裸指针别名”单点对应）。
+    current: [Option<usize>; MAX_SCHED_CPUS],
 }
 
 impl Scheduler {
     const fn new() -> Self {
         Self {
             procs: Vec::new(),
-            ready: VecDeque::new(),
-            next_pid: 1,
-            current: None,
+            ready: [const { VecDeque::new() }; MAX_SCHED_CPUS],
+            current: [const { None }; MAX_SCHED_CPUS],
         }
-    }
-
-    fn alloc_pid(&mut self) -> usize {
-        // task1 KM6：数值边界论证 + 机器强制。usize::MAX 个并发进程物理不可达
-        // ——每个存活 PCB 至少消耗 16 帧内核栈 + 一页堆 + 独立页表页，128M
-        // 物理内存在 pid 空间耗尽前数十亿倍早于枯竭；checked_add 把"论证过的
-        // 不可达"变成受控 panic（编程错误走 abort，ADR-010），而非静默回绕
-        // 造成 pid 撞车破坏 ppid=槽位索引不变式。
-        let pid = self.next_pid;
-        self.next_pid = self
-            .next_pid
-            .checked_add(1)
-            .expect("pid space exhausted (u64 overflow)");
-        pid
     }
 }
 
@@ -326,7 +358,7 @@ pub fn spawn_with_ppid_fds(
             return Err(Error::NotFound);
         }
     }
-    let pid = s.alloc_pid();
+    let pid = alloc_pid();
     // 分配独立内核栈（16 帧；HHDM 高半区在所有进程页表继承可见）。
     let stack_frame = mm::allocate_frames(KSTACK_ORDER).ok_or(Error::OutOfMemory)?;
     let kstack_top = arch::phys_to_virt(stack_frame.start_paddr()) + KSTACK_SIZE as u64;
@@ -359,6 +391,8 @@ pub fn spawn_with_ppid_fds(
         ppid,
         exit_code: 0,
         waiting_for: None,
+        // 阶段2 地基：记录本进程 home 核（创建核）。本里程碑恒为 BSP 槽 0。
+        home_cpu: my_cpu_slot(),
     };
     if pid < s.procs.len() {
         s.procs[pid] = Some(entry);
@@ -368,14 +402,15 @@ pub fn spawn_with_ppid_fds(
         }
         s.procs.push(Some(entry));
     }
-    s.ready.push_back(pid);
+    // 阶段2 地基：入队创建（home）核的就绪队列。
+    s.ready[my_cpu_slot()].push_back(pid);
     Ok(pid)
 }
 
 /// 当前就绪进程数（诊断）。
 #[allow(dead_code)]
 pub fn ready_count() -> usize {
-    SCHED.lock().ready.len()
+    SCHED.lock().ready[my_cpu_slot()].len()
 }
 
 /// 调度器 tick（注册为 `register_scheduler_tick`，仅 BSP、IRQ0 后调用）。
@@ -426,18 +461,19 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
     }
 
     let mut s = SCHED.lock();
+    let cpu_slot = my_cpu_slot();
 
     // 仅当有用户进程运行（current=Some）时才在 tick 里做 RR 切换。
     // 内核 idle/主线程（current=None）不做切换：此时若切走会丢弃主线程
     // 上下文（M4.2 关键修复——否则主线程在启动过程中被 IRQ0 切到用户进程，
     // 剩余 spawn 永远不执行）。进程由 scheduler::start() 的 idle 循环启动。
-    let Some(cur_pid) = s.current else {
+    let Some(cur_pid) = s.current[cpu_slot] else {
         return;
     };
     // 防御：current 指向已回收槽位（正常路径 exit_current 会清 current；
     // 此守卫兜底测试钩子清理窗口等非常规序列，避免切进悬空槽）。
     if s.procs.get(cur_pid).map_or(true, |p| p.is_none()) {
-        s.current = None;
+        s.current[cpu_slot] = None;
         return;
     }
 
@@ -445,11 +481,11 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
     if let Some(slot) = s.procs[cur_pid].as_mut() {
         slot.saved = *frame;
         slot.proc.set_state(TaskState::Ready);
-        s.ready.push_back(cur_pid);
+        s.ready[cpu_slot].push_back(cur_pid);
     }
 
     // 从就绪队列取下一个。
-    let Some(next_pid) = s.ready.pop_front() else {
+    let Some(next_pid) = s.ready[cpu_slot].pop_front() else {
         return; // 无可调度进程
     };
 
@@ -472,6 +508,7 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
 /// CR3/RSP0/CURRENT 更新。调用方须已持有 `SCHED` 锁、完成 `*frame` 替换与
 /// 状态迁移；`prev` 为被切出进程 pid（槽位必须仍存在），`next` 为切入进程。
 fn cpu_switch_locked(s: &mut Scheduler, prev: Option<usize>, next: usize) {
+    let cpu_slot = my_cpu_slot();
     // FPU eager 全量保存/恢复（K2）：prev 槽位此刻仍在表中（退役路径
     // 先经 retire_entry 才可能消失，而那发生在切出之后）。
     if let Some(pid) = prev {
@@ -484,7 +521,7 @@ fn cpu_switch_locked(s: &mut Scheduler, prev: Option<usize>, next: usize) {
     let cr3 = slot.proc.addr_space_mut().page_table_paddr();
     let ktop = slot.kstack_top;
     let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
-    s.current = Some(next);
+    s.current[cpu_slot] = Some(next);
     arch_x86_64::mmio::write_cr3(cr3);
     gdt::set_rsp0(ktop);
     set_current_proc(proc_ptr);
@@ -514,7 +551,8 @@ pub enum SwitchOutcome {
 /// 用户态 `yield()` 正确返回 0。
 pub fn yield_now(frame: &mut InterruptFrame) -> SwitchOutcome {
     let mut s = SCHED.lock();
-    let Some(cur_pid) = s.current else {
+    let cpu_slot = my_cpu_slot();
+    let Some(cur_pid) = s.current[cpu_slot] else {
         return SwitchOutcome::NotSwitched; // 内核 idle/主线程不参与让出
     };
 
@@ -523,11 +561,11 @@ pub fn yield_now(frame: &mut InterruptFrame) -> SwitchOutcome {
     if let Some(slot) = s.procs[cur_pid].as_mut() {
         slot.saved = *frame;
         slot.proc.set_state(TaskState::Ready);
-        s.ready.push_back(cur_pid);
+        s.ready[cpu_slot].push_back(cur_pid);
     }
 
     // 从就绪队列取下一个。
-    let Some(next_pid) = s.ready.pop_front() else {
+    let Some(next_pid) = s.ready[cpu_slot].pop_front() else {
         return SwitchOutcome::NotSwitched; // 无可调度进程（不应发生）
     };
 
@@ -567,7 +605,8 @@ pub fn yield_now(frame: &mut InterruptFrame) -> SwitchOutcome {
 /// Blocked 项入队，本函数也不会把它切上 CPU。返回第一个有效 pid，
 /// 队列空/仅含死进程时返回 `None`。
 fn pop_ready(s: &mut Scheduler, exclude: usize) -> Option<usize> {
-    while let Some(pid) = s.ready.pop_front() {
+    let cpu_slot = my_cpu_slot();
+    while let Some(pid) = s.ready[cpu_slot].pop_front() {
         if pid == exclude {
             continue;
         }
@@ -588,14 +627,15 @@ fn pop_ready(s: &mut Scheduler, exclude: usize) -> Option<usize> {
 /// 目标者挪回队尾（保持其 Ready 可调度性），直到取到 `target`；不在队列返回
 /// `None`。
 fn extract_from_ready(s: &mut Scheduler, target: usize) -> Option<usize> {
-    let n = s.ready.len();
+    let cpu_slot = my_cpu_slot();
+    let n = s.ready[cpu_slot].len();
     for _ in 0..n {
-        let pid = s.ready.pop_front().expect("len>0 in bounded loop");
+        let pid = s.ready[cpu_slot].pop_front().expect("len>0 in bounded loop");
         if pid == target {
             return Some(pid);
         }
         // 非目标：保持就绪，放回队尾（不破坏其可调度性/公平轮转）。
-        s.ready.push_back(pid);
+        s.ready[cpu_slot].push_back(pid);
     }
     None
 }
@@ -643,7 +683,7 @@ fn schedule_from_block(frame: &mut InterruptFrame, cur_pid: usize) -> BlockResum
     arch_x86_64::interrupts::enable();
     loop {
         let s = SCHED.lock();
-        let nonempty = !s.ready.is_empty();
+        let nonempty = !s.ready[my_cpu_slot()].is_empty();
         drop(s);
         if nonempty {
             break;
@@ -652,7 +692,7 @@ fn schedule_from_block(frame: &mut InterruptFrame, cur_pid: usize) -> BlockResum
     }
     arch_x86_64::interrupts::disable();
     let mut s = SCHED.lock();
-    if s.ready.contains(&cur_pid) {
+    if s.ready[my_cpu_slot()].contains(&cur_pid) {
         // 自己已就绪（被键盘/事件唤醒入队）：专门取出自己，放回其它就绪进程。
         // 队列头可能被并发入队的其它 Ready 进程占据，extract_from_ready 保证
         // 只取 cur_pid 而不误切（O1 竞争面，既有自唤醒纪律）。
@@ -724,7 +764,8 @@ fn block_current_locked(
     frame: &mut InterruptFrame,
     register: &mut dyn FnMut() -> bool,
 ) -> SwitchOutcome {
-    let Some(cur_pid) = s.current else {
+    let cpu_slot = my_cpu_slot();
+    let Some(cur_pid) = s.current[cpu_slot] else {
         return SwitchOutcome::NotSwitched; // 内核 idle/主线程不参与阻塞
     };
     // 取下一个有效就绪进程（跳过已退出残留引用）。无同伴则不登记、不阻塞：
@@ -744,7 +785,7 @@ fn block_current_locked(
         // S26 回归：`next_pid` 已在上方被 `pop_ready` 弹出（仍为 Ready 态），
         // 若直接返回将永久丢失该就绪进程（无人重新入队 → 饿死）。
         // 必须把它放回就绪队列，保证"登记失败零副作用"成立。
-        s.ready.push_back(next_pid);
+        s.ready[cpu_slot].push_back(next_pid);
         return SwitchOutcome::NotSwitched;
     }
     if let Some(slot) = s.procs[cur_pid].as_mut() {
@@ -793,11 +834,12 @@ pub enum BlockKbdOutcome {
 /// 被唤醒后用户态 `read` 重试即可取到字符（消除空转 + 刷屏）。
 pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
     let mut s = SCHED.lock();
+    let cpu_slot = my_cpu_slot(); // 阶段2 地基：本核槽位（BSP=0）。
     // task1 KM4：本 expect 是**编程错误契约**的受控 abort（ADR-010 边界）——
-    // 键盘阻塞只可能由 stdin read 的内核路径发起，"无当前进程时到达此处"
+    // 键盘阻塞只可能由 stdin read 的内核路径发起，“无当前进程时到达此处”
     // 意味着调用方违反了入口约定，属不可恢复的内核 bug；按全项目错误策略
     // 这不是运行期可上抛的错误（区别于有界资源耗尽的 Result 家族）。
-    let cur_pid = s.current.expect("block_for_kbd outside process");
+    let cur_pid = s.current[cpu_slot].expect("block_for_kbd outside process");
     // 审计 B19：pid → u32 截断论证。pid 即进程槽表下标（固定容量，远小于
     // 2^32），恒可无损装入 u32；u32::MAX 是 KBD_WAITER 的"空槽"哨兵，与
     // 任何合法 pid 不相交。断言即哨兵撞车防线——若未来放宽 pid 空间先改
@@ -825,7 +867,7 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
         fpu::save(&mut slot.fpu);
         slot.proc.set_state(TaskState::Blocked);
     }
-    s.current = None;
+    s.current[cpu_slot] = None;
     clear_current_proc();
 
     // 取下一个有效就绪进程切换（跳过已退出残留引用）。
@@ -879,15 +921,17 @@ pub fn wake_kbd() {
         return;
     }
     let mut s = SCHED.lock();
-    if let Some(slot) = s.procs[p as usize].as_mut() {
-        // waiting_for 由 waitpid 机制独占管理（不变式见 ProcEntry），不得被
-        // 键盘路径提前唤醒——否则其带着未填写的 saved.rax 返回用户态。
-        if slot.waiting_for.is_some() {
-            return;
+    let enqueue = {
+        let slot = s.procs[p as usize].as_mut();
+        match slot {
+            Some(slot) if slot.waiting_for.is_none() => {
+                slot.proc.set_state(TaskState::Ready);
+                Some(slot.home_cpu)
+            }
+            _ => None,
         }
-        slot.proc.set_state(TaskState::Ready);
-        s.ready.push_back(p as usize);
-    }
+    };
+    if let Some(home) = enqueue { s.ready[home].push_back(p as usize); }
 }
 
 // ---------------------------------------------------------------------------
@@ -926,7 +970,7 @@ static EVENT_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
     let cur_pid = {
         let s = SCHED.lock();
-        let cur = s.current.expect("block_for_event outside process");
+        let cur = s.current[my_cpu_slot()].expect("block_for_event outside process");
         assert!(
             cur < u32::MAX as usize,
             "pid {} collides with EVENT_WAITER sentinel",
@@ -955,12 +999,13 @@ pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
     // 置 Blocked 并保存现场。浮点现场由 cpu_switch_locked(prev=None) 路径在
     // 唤醒后显式保存（同 block_for_kbd，K2 纪律），此处不重复归档。
     let mut s = SCHED.lock();
+    let cpu_slot = my_cpu_slot();
     if let Some(slot) = s.procs[cur_pid].as_mut() {
         slot.saved = *frame;
         fpu::save(&mut slot.fpu);
         slot.proc.set_state(TaskState::Blocked);
     }
-    s.current = None;
+    s.current[cpu_slot] = None;
     clear_current_proc();
 
     // 取下一个有效就绪进程切换（跳过已退出残留引用）。
@@ -1049,15 +1094,18 @@ pub fn wake_event() {
         klib::time::cancel_timeout(stale);
     }
     let mut s = SCHED.lock();
-    if let Some(slot) = s.procs[p as usize].as_mut() {
-        // waiting_for 由 waitpid 机制独占管理，不得被事件路径提前唤醒；
-        // 非 Blocked（已醒/超时）也不得再置 Ready（避免重入就绪队列）。
-        if slot.waiting_for.is_none() && slot.proc.state() == TaskState::Blocked {
-            slot.saved.rax = EVENT_WAKE_RETRY_SENTINEL;
-            slot.proc.set_state(TaskState::Ready);
-            s.ready.push_back(p as usize);
+    let enqueue = {
+        let slot = s.procs[p as usize].as_mut();
+        match slot {
+            Some(slot) if slot.waiting_for.is_none() && slot.proc.state() == TaskState::Blocked => {
+                slot.saved.rax = EVENT_WAKE_RETRY_SENTINEL;
+                slot.proc.set_state(TaskState::Ready);
+                Some(slot.home_cpu)
+            }
+            _ => None,
         }
-    }
+    };
+    if let Some(home) = enqueue { s.ready[home].push_back(p as usize); }
 }
 
 /// 事件等待的超时唤醒（`klib::time::set_timeout` 回调，等待端注册）。
@@ -1151,13 +1199,13 @@ pub fn debug_release_kbd_waiter() {
 /// 进程槽表之前即返回，pid 无需对应真实槽位。
 #[cfg(feature = "kernel-tests")]
 pub fn debug_set_scheduler_current(pid: usize) {
-    SCHED.lock().current = Some(pid);
+    SCHED.lock().current[my_cpu_slot()] = Some(pid);
 }
 
 /// 清除调度器当前进程（与上者配对的测试收尾）。
 #[cfg(feature = "kernel-tests")]
 pub fn debug_clear_scheduler_current() {
-    SCHED.lock().current = None;
+    SCHED.lock().current[my_cpu_slot()] = None;
 }
 
 /// 预占 EVENT_WAITER（测试钩子，V6）：使 `block_for_event` 的"已有并发等待者"
@@ -1248,7 +1296,7 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
         };
         slot.exit_code = code;
         slot.proc.set_state(TaskState::Exit);
-        s.ready.retain(|&p| p != pid);
+        s.ready[slot.home_cpu].retain(|&p| p != pid);
         slot.ppid
     };
 
@@ -1283,7 +1331,8 @@ fn terminate_locked(s: &mut Scheduler, pid: usize, code: u64) -> Termination {
         }
         Termination::Reclaimed
     } else if deliver {
-        s.ready.push_back(ppid);
+        let ppid_home = s.procs[ppid].as_ref().map(|e| e.home_cpu).unwrap_or(0);
+        s.ready[ppid_home].push_back(ppid);
         driver::uio_on_process_exit(pid);
         ipc::sync_release_process(pid);
         // R6 flock（K3）：进程回收时释放其持有的全部锁，杜绝锁表泄漏。
@@ -1376,7 +1425,7 @@ pub enum Waited {
 ///   返回 [`Error::WouldBlock`]（errno 11 EAGAIN），绝不自锁死系统。
 pub fn waitpid(target_pid: usize, frame: &mut InterruptFrame) -> Result<Waited, Error> {
     let mut s = SCHED.lock();
-    let cur = s.current.ok_or(Error::NotFound)?;
+    let cur = s.current[my_cpu_slot()].ok_or(Error::NotFound)?;
     waitpid_inner(&mut s, cur, target_pid, Some(frame))
 }
 
@@ -1426,7 +1475,8 @@ fn waitpid_inner(
     // 阻塞等待（WAIT_ANY 与单目标共用阻塞逻辑）。
     // 等待目标：WAIT_ANY 或具体 pid。
     let wait_for = if target_pid == WAIT_ANY { WAIT_ANY } else { target_pid };
-    let others_ready = s.ready.iter().any(|&p| {
+    let cpu_slot = my_cpu_slot();
+    let others_ready = s.ready[cpu_slot].iter().any(|&p| {
         p != cur && matches!(s.procs.get(p), Some(Some(e)) if e.proc.state() == TaskState::Ready)
     });
     let revert = |s: &mut Scheduler| -> Error {
@@ -1474,7 +1524,7 @@ fn waitpid_inner(
         if let Some(slot) = s.procs[next_pid].as_mut() {
             slot.proc.set_state(TaskState::Running);
         }
-        s.current = Some(next_pid);
+        s.current[cpu_slot] = Some(next_pid);
     }
     Ok(Waited::Blocked)
 }
@@ -1496,13 +1546,14 @@ fn pop_ready_filtered(s: &mut Scheduler, exclude: usize) -> Option<usize> {
 /// **正常返回**（不 `!`），由中断返回路径完成切换。
 pub fn exit_current(frame: &mut InterruptFrame, code: u64) {
     let mut s = SCHED.lock();
-    let cur_pid = s.current.expect("exit called outside process");
+    let cpu_slot = my_cpu_slot();
+    let cur_pid = s.current[cpu_slot].expect("exit called outside process");
     // PID 1 契约：init 不得退出（自杀即 panic）。
     if cur_pid == init_pid() {
         panic!("attempted to kill init (self-exit pid={})", cur_pid);
     }
     let _ = terminate_locked(&mut s, cur_pid, code);
-    s.current = None;
+    s.current[cpu_slot] = None;
     clear_current_proc();
 
     // 取下一个有效就绪进程（跳过已退出残留引用）。
@@ -1514,7 +1565,7 @@ pub fn exit_current(frame: &mut InterruptFrame, code: u64) {
         arch_x86_64::interrupts::enable();
         loop {
             // 极短持锁检查是否有被唤醒的进程；空则释放锁后 halt（中断可达）。
-            if !SCHED.lock().ready.is_empty() {
+            if !SCHED.lock().ready[my_cpu_slot()].is_empty() {
                 break;
             }
             arch_x86_64::interrupts::halt();
@@ -1661,7 +1712,7 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
     }
     let current = {
         let s = SCHED.lock();
-        s.current
+        s.current[my_cpu_slot()]
     };
     if current == Some(target) {
         if sig == 0 {
@@ -1758,12 +1809,17 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
 /// `saved.rax` 只能由子进程终止路径填写，提前唤醒会让用户态拿到占位值。
 pub fn wake(pid: usize) {
     let mut s = SCHED.lock();
-    if let Some(slot) = s.procs.get_mut(pid).and_then(|p| p.as_mut()) {
-        if slot.proc.state() == TaskState::Blocked && slot.waiting_for.is_none() {
-            slot.proc.set_state(TaskState::Ready);
-            s.ready.push_back(pid);
+    let enqueue = {
+        let slot = s.procs.get_mut(pid).and_then(|p| p.as_mut());
+        match slot {
+            Some(slot) if slot.proc.state() == TaskState::Blocked && slot.waiting_for.is_none() => {
+                slot.proc.set_state(TaskState::Ready);
+                Some(slot.home_cpu)
+            }
+            _ => None,
         }
-    }
+    };
+    if let Some(home) = enqueue { s.ready[home].push_back(pid); }
 }
 
 /// 唤醒一个阻塞的进程并把其保存帧 `rax` 预置为 `value`（SYNC 域 futex 唤醒）。
@@ -1781,13 +1837,18 @@ pub fn wake(pid: usize) {
 /// `saved.rax` 只能由子进程终止路径填写。
 pub fn wake_with_value(pid: usize, value: u64) {
     let mut s = SCHED.lock();
-    if let Some(slot) = s.procs.get_mut(pid).and_then(|p| p.as_mut()) {
-        if slot.proc.state() == TaskState::Blocked && slot.waiting_for.is_none() {
-            slot.saved.rax = value;
-            slot.proc.set_state(TaskState::Ready);
-            s.ready.push_back(pid);
+    let enqueue = {
+        let slot = s.procs.get_mut(pid).and_then(|p| p.as_mut());
+        match slot {
+            Some(slot) if slot.proc.state() == TaskState::Blocked && slot.waiting_for.is_none() => {
+                slot.saved.rax = value;
+                slot.proc.set_state(TaskState::Ready);
+                Some(slot.home_cpu)
+            }
+            _ => None,
         }
-    }
+    };
+    if let Some(home) = enqueue { s.ready[home].push_back(pid); }
 }
 
 /// 启动调度器（内核 idle 主循环）：取第一个就绪进程，经 `enter_usermode` 进入
@@ -1928,8 +1989,13 @@ pub mod test_hooks {
                 n += 1;
             }
         }
-        s.ready.clear();
-        s.current = None;
+        // 阶段2 地基：清空全部核的 ready/current（复位须全核干净；AP 槽此刻空）。
+        for r in s.ready.iter_mut() {
+            r.clear();
+        }
+        for c in s.current.iter_mut() {
+            *c = None;
+        }
         KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
         // 同步复位事件等待全局（S18/S21，V3/V6）：EVENT_WAITER 残留会让后继
         // 用例的 block_for_event 永久 NotSwitched；EVENT_TIMER 残留的 stale id
@@ -1948,14 +2014,17 @@ pub mod test_hooks {
     /// waiting_for 已登记或已退出的进程拒绝操作。
     pub fn simulate_blocked(pid: usize) -> bool {
         let mut s = SCHED.lock();
-        let Some(slot) = s.procs[pid].as_mut() else {
-            return false;
+        let home = {
+            let Some(slot) = s.procs[pid].as_mut() else {
+                return false;
+            };
+            if slot.waiting_for.is_some() || slot.proc.state() == TaskState::Exit {
+                return false;
+            }
+            slot.proc.set_state(TaskState::Blocked);
+            slot.home_cpu
         };
-        if slot.waiting_for.is_some() || slot.proc.state() == TaskState::Exit {
-            return false;
-        }
-        slot.proc.set_state(TaskState::Blocked);
-        s.ready.retain(|&p| p != pid);
+        s.ready[home].retain(|&p| p != pid);
         true
     }
 
@@ -2001,7 +2070,7 @@ pub mod test_hooks {
 
     /// K1 验收探针：读取调度器视角的当前 pid（tick 门控断言用）。
     pub fn debug_current_pid() -> Option<usize> {
-        SCHED.lock().current
+        SCHED.lock().current[my_cpu_slot()]
     }
 
     /// 审计 R5-F1 验收钩子：整体替换就绪队列内容。
@@ -2013,7 +2082,7 @@ pub mod test_hooks {
         for p in pids {
             q.push_back(*p);
         }
-        SCHED.lock().ready = q;
+        SCHED.lock().ready[my_cpu_slot()] = q;
     }
 
     /// S26 回归验收：`block_current_with` 的登记点返回 false 时，已被
@@ -2028,12 +2097,13 @@ pub mod test_hooks {
     /// 返回 true 当且仅当：结果 NotSwitched **且** B 仍在就绪队列。
     pub fn debug_block_register_false_keeps_ready(current: usize, peer: usize) -> bool {
         let mut s = SCHED.lock();
-        s.ready.clear();
-        s.ready.push_back(peer);
-        s.current = Some(current);
+        let c = my_cpu_slot();
+        s.ready[c].clear();
+        s.ready[c].push_back(peer);
+        s.current[c] = Some(current);
         let mut frame = initial_frame(0x400000, 0x7ffefffff000);
         let outcome = block_current_locked(&mut s, &mut frame, &mut || false);
-        outcome == SwitchOutcome::NotSwitched && s.ready.contains(&peer)
+        outcome == SwitchOutcome::NotSwitched && s.ready[my_cpu_slot()].contains(&peer)
     }
 
     /// 审计 R5-F2 验收钩子：丢弃 FPU 模板缓存，令下一次 spawn 重新快照。
@@ -2063,7 +2133,7 @@ pub mod test_hooks {
         match slot {
             Some(slot) => {
                 let ptr = (&mut *slot.proc as *mut Process<X86PageTable>) as usize;
-                s.current = Some(pid);
+                s.current[my_cpu_slot()] = Some(pid);
                 set_current_proc(ptr as *mut Process<X86PageTable>);
                 true
             }
@@ -2074,7 +2144,7 @@ pub mod test_hooks {
     /// 清除"当前运行进程"（与 `set_current` 对称）。
     pub fn clear_current() {
         let mut s = SCHED.lock();
-        s.current = None;
+        s.current[my_cpu_slot()] = None;
         clear_current_proc();
     }
 
