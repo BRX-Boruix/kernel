@@ -218,6 +218,13 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
     // AP 上也开启 SMEP/SMAP（CR4 是 per-CPU），与 BSP 保持一致的隔离策略。
     crate::cpu::enable_smep_smap();
 
+    // 阶段4：AP 上也启用 FPU/SSE（CR0.TS 清除 + CR4.OSFXSR 置位是 per-CPU）。
+    // BSP 在 interrupts::init 一次性 enable_fpu，但 CR0/CR4 是每核寄存器，AP 若不
+    // 补做，本核调度到用浮点/SSE 的用户进程会触发 #NM（TS）或 #UD（OSFXSR 缺）
+    // → 级联 #DF。eager 全量保存由 task 侧 fpu::save/restore 完成，此处只需建
+    // 立硬件前提，不得再置 TS。
+    crate::interrupts::enable_fpu();
+
     // 开启中断
     crate::interrupts::enable();
 

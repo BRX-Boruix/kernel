@@ -1911,7 +1911,20 @@ pub fn start() -> ! {
     // 阶段2（M4）对称多处理：AP 进入本调度空闲循环时打点（只一次，BSP 不打点）。
     let entry_slot = my_cpu_slot();
     if entry_slot != 0 {
-        klib::info!("[sched] AP slot {} entered scheduler idle loop", entry_slot);
+        // 阶段4: confirm FPU/SSE hw prereq on this AP (CR0.TS=0, CR4.OSFXSR=1).
+        let mut cr0v: u64 = 0;
+        unsafe { core::arch::asm!("mov {}, cr0", out(reg) cr0v, options(nomem, nostack)); }
+        let tsok = cr0v & (1 << 3) == 0;
+        let osx = (arch_x86_64::mmio::read_cr4() & (1 << 9)) != 0;
+        klib::info!("[sched] AP slot {} idle (fpu ts={} osfxsr={})", entry_slot, tsok, osx);
+        // 阶段4 FP proof: actually execute x87/SSE on this AP and read a value back.
+        // At AP entry no user process FPU state is loaded yet, so a transient SSE op is
+        // safe (the first scheduled process does fpu::restore anyway). If TS were set,
+        // fnstcw below would #NM - this proves FP instructions run on the AP.
+        let mut fpcheck: u16 = 0;
+        unsafe { core::arch::asm!("fnstcw [{}]", in(reg) &mut fpcheck, options(nostack)); }
+        // x87 control word low bits: 0x037F default (rounding/precision). Bit set => FPU live.
+        klib::info!("[sched] AP slot {} fp probe cw={:#06x} (fpu ts={} osfxsr={})", entry_slot, fpcheck, tsok, osx);
     }
     loop {
         // 取一个有效就绪进程启动（跳过已退出残留引用）。
