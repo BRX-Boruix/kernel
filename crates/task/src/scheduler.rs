@@ -139,7 +139,11 @@ struct ProcEntry {
 /// tick 因 ADR-017 CPL 门控整体早退、跳过 drain——队列滞留至下次 spawn
 /// 兜底归还（或测试 reset_all）。滞留帧数以退出路径数为上界，正确性无损，
 /// 仅回收时机后移。
-static DEAD_KSTACKS: IrqSpinLock<Vec<PhysFrame>> = IrqSpinLock::new(Vec::new());
+
+/// per-CPU delay-reclaim queue (phase2): which core retires pushes to its own slot;
+/// that core's tick/spawn drains it (avoids cross-core borrow). BSP-only today => slot 0.
+static DEAD_KSTACKS: [IrqSpinLock<Vec<PhysFrame>>; MAX_SCHED_CPUS] =
+    [const { IrqSpinLock::new(Vec::new()) }; MAX_SCHED_CPUS];
 
 /// 槽位退役单点：FPU 区随 entry 丢弃，内核栈帧入延迟回收队列，
 /// 其余字段（Box<Process> → addr_space Drop）沿用 M5 用户资源回收语义。
@@ -149,7 +153,7 @@ fn retire_entry(entry: ProcEntry) {
         kstack_frames,
         ..
     } = entry;
-    DEAD_KSTACKS.lock().push(kstack_frames);
+    DEAD_KSTACKS[my_cpu_slot()].lock().push(kstack_frames);
     // proc 在此 drop：UserAddressSpace::destroy 回收用户页表/叶帧（M5）。
     // 该 Drop 只操作 HHDM 映射与空闲池，不触碰本栈，就地安全（既有行为）。
     drop(proc);
@@ -158,7 +162,7 @@ fn retire_entry(entry: ProcEntry) {
 /// 归还延迟队列中的全部内核栈帧（仅限"确定不在将死栈上"的入口调用：
 /// tick 顶部、spawn 入口；测试钩子可对哑进程直接调用）。
 fn drain_dead_kstacks() {
-    let mut q = DEAD_KSTACKS.lock();
+    let mut q = DEAD_KSTACKS[my_cpu_slot()].lock();
     for frame in q.drain(..) {
         // order 记录在分配器帧元数据中，按基址整块归还（16 帧一次到位）。
         mm::deallocate_frame(frame);
