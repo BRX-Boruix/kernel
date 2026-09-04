@@ -115,10 +115,9 @@ struct ProcEntry {
     /// 路径单点完成）。通用 [`wake`]/[`wake_kbd`] 不得触碰此类进程，
     /// 防止提前唤醒导致其带着未填写的 `saved.rax` 返回用户态。
     waiting_for: Option<usize>,
-    /// 本进程的 home（常驻）CPU 槽位（阶段2 地基）：spawn 时记录创建核，
-    /// 唤醒/就绪入队目标 `ready[home_cpu]`。本里程碑全系统只有 BSP（槽 0）
-    /// 做调度，故恒为 0；结构就位供后续跨核唤醒把被唤醒进程放进其 home 核
-    /// 的就绪队列。
+    /// 本进程的 home（常驻）CPU 槽位（阶段2 对称多处理）：spawn 时按 least-loaded
+    /// 选定，唤醒/就绪入队目标固定为 `ready[home_cpu]`；进程只在 home 核被调度。
+    /// （跨核唤醒 = 外来核把 pid 塞进本 home 队列并视情发 resched IPI。）
     home_cpu: usize,
 }
 
@@ -140,8 +139,10 @@ struct ProcEntry {
 /// 兜底归还（或测试 reset_all）。滞留帧数以退出路径数为上界，正确性无损，
 /// 仅回收时机后移。
 
-/// per-CPU delay-reclaim queue (phase2): which core retires pushes to its own slot;
-/// that core's tick/spawn drains it (avoids cross-core borrow). BSP-only today => slot 0.
+/// per-CPU delay-reclaim queue (phase2): the retiring core pushes to its own slot;
+/// that same core's tick/spawn drains it (avoids cross-core borrow). Every online core
+/// (incl. APs) owns its slot under symmetric multiprocessing. This const-array-of-
+/// IrqSpinLock is the per-CPU-lock pattern the per-CPU ready/current split will mirror.
 static DEAD_KSTACKS: [IrqSpinLock<Vec<PhysFrame>>; MAX_SCHED_CPUS] =
     [const { IrqSpinLock::new(Vec::new()) }; MAX_SCHED_CPUS];
 
@@ -188,7 +189,7 @@ fn fpu_template_snapshot() -> FpuArea {
 
 /// 每核紧凑 CPU 槽位的调度状态数组容量（上限 = LAPIC id 全空间 256，
 /// 与 arch smp.rs 的 LAPIC_TO_SLOT 及 lapic.rs TICKS[256] 同源）。
-/// 仅决策核（BSP）真正使用 0 号槽；AP 槽结构就位但本里程碑不投递调度。
+/// 所有在线核（含 AP）都使用自己的槽位运行 per-CPU 调度（阶段2 对称多处理）。
 const MAX_SCHED_CPUS: usize = 256;
 
 /// 全局单调 pid 分配器（M4.2/阶段2：pid 由核无关的原子单点分配，
@@ -256,11 +257,12 @@ fn spawn_home_cpu(s: &Scheduler) -> usize {
 
 /// 调度器：进程池（pid 槽，全局共享）+ 每核就绪队列（RR）+ 每核当前进程。
 ///
-/// 阶段2 地基（单锁多核语义）：保持单一全局锁 SCHED，进程表 procs 全局
-/// 共享；就绪队列与当前进程 per-CPU（按紧凑槽位索引）。锁粒度仍是单把锁，
-/// 故 pop_ready 的状态检查-弹出原子性保留，且不引入多把 IrqSpinLock 之间的
-/// 加锁顺序死锁。本里程碑所有调度决策仍发生在 BSP（槽 0），AP 就绪/current 槽
-/// 就位但空闲——把既有单队列操作改为读写 [my_cpu_slot()] 即保持槽 0 语义不变。
+/// 现状（单锁多核语义）：单一全局锁 SCHED，进程表 procs 全局共享；就绪队列与
+/// 当前进程 per-CPU（按紧凑槽位索引）。锁粒度仍是单把锁——pop_ready 状态检查-
+/// 弹出原子性保留，且不引入多把 IrqSpinLock 之间的加锁顺序死锁。多核对称处理
+/// 下每核 AP 都用自己的槽位在自己的 IRQ0 tick 上调度本核就绪队列（阶段2 M4 后）。
+/// 后续目标（per-pid 拆锁设计，见 docs/DESIGN-per-pid-scheduler-lock.md）：把本
+/// 单把全局 SCHED 拆为每核队列锁 + 每进程 pid 锁，消除多核并发调度竞争。
 struct Scheduler {
     /// 进程池（pid 槽，全局共享）：pid 即下标。进程可在任意核被唤醒/终止，
     /// 其 PCB 只有一份，故跨核以本表为唯一权威（不含就绪性）。
