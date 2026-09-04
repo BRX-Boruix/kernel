@@ -172,8 +172,9 @@ fn drain_dead_kstacks() {
 
 /// "干净浮点上电态"模板（FNINIT 后快照），新 PCB 的初始 FPU 现场。
 ///
-/// 锁序：PROCS（spawn 调用方持有）→ FPU_TEMPLATE（叶子锁，临界区仅一次快照拷贝，
-/// 无反向嵌套）。fpu_template_snapshot 只在持 PROCS 的 spawn 路径调用。
+/// 锁序：FPU_TEMPLATE 是叶子锁（临界区仅一次快照拷贝，无反向嵌套）。spawn 路径
+/// 由 fpu_template_snapshot 短暂取用——此刻既未取新 pid 的 per-pid 锁、也未取
+/// RUN[slot]（快照先于 PROCESSES[pid] 写入完成）。
 static FPU_TEMPLATE: IrqSpinLock<Option<FpuArea>> = IrqSpinLock::new(None);
 
 fn fpu_template_snapshot() -> FpuArea {
@@ -237,10 +238,10 @@ pub fn set_distribute_across_cpus(on: bool) {
 /// Choose the new process's home CPU slot: default = creating core; when SMP
 /// distribution is on and more than one core is online, pick the least-loaded
 /// online core (shortest per-core ready queue + running count) so a process
-/// lands on the most idle AP queue. Called from spawn while the PROCS domain is held
-/// (PROCS-touching, (a)); it reads each per-core ready length safely by transiently
-/// taking RUN[slot] (lock order PROCS → RUN; slots are distinct locks, dropped before
-/// returning, no nested RUN held while returning to the caller).
+/// lands on the most idle AP queue. Called from spawn before the new pid's per-pid
+/// lock is taken; it reads each per-core ready length by transiently taking each
+/// RUN[slot] (slots are distinct locks, dropped before returning, no RUN held on
+/// return to the caller).
 fn spawn_home_cpu() -> usize {
     if DISTRIBUTE_ACROSS_CPUS.load(core::sync::atomic::Ordering::Acquire) {
         let n = arch_x86_64::smp::total_cpus();
@@ -261,16 +262,15 @@ fn spawn_home_cpu() -> usize {
 
 /// 每核运行态：就绪队列（RR）+ 每核当前运行进程。
 ///
-/// 现状（独立双锁域多核语义）：进程表 [PROCS] 全局共享（单 IrqSpinLock）；
-/// 就绪队列与当前进程按紧凑槽拆入本结构，由 [RUN] 按槽各自上锁。调度器不再有
-/// 外层门闩，仅两套独立锁域：PROCS 域与 per-CPU 的 RUN[slot] 域。锁序：凡触碰
-/// 进程表的函数先取 PROCS → RUN[slot]——绝无 RUN 之后再取 PROCS，绝不在同一
-/// 临界区重复锁同域（IrqSpinLock 不可重入）；纯 RUN 函数（只读/写本核 ready/
-/// current，不触碰 PCB）只取 RUN[my_cpu_slot] 即可。多核对称处理下每核 AP 用
-/// 自己的槽位在自己的 IRQ0 tick 上调度本核就绪队列（阶段2 M4 后），跨核只经
-/// PROCS 域 + 目标核 RUN[home]（锁序 PROCS → RUN[home]）协调。后续目标（per-pid
-/// 拆锁设计，见 docs/DESIGN-per-pid-scheduler-lock.md）：把 PROCS 进一步拆为
-/// 每进程 pid 锁，消除多核并发调度竞争。
+/// 现状（per-pid 拆锁 + per-CPU 锁域多核语义，见 docs/DESIGN-per-pid-scheduler-lock.md）：
+/// 进程表已是每 pid 一把独立锁的 PROCESSES 数组（Option<Box<ProcEntry>> 槽，
+/// pid 即下标，逐 pid 分别取锁），**不再有**单一全局进程表门闩；就绪队列与当前
+/// 进程按紧凑槽拆入本结构，由 RUN 按槽各自上锁。锁序：凡触碰进程表的函数先取
+/// 所涉 pid 的 per-pid 锁（多 pid 按 pid 升序）→ RUN[slot]——绝无 RUN 之后再取 pid
+/// 锁，绝不在同一临界区重复锁同域/同 pid（IrqSpinLock 不可重入）；纯 RUN 函数
+/// （只读/写本核 ready/current，不触碰 PCB）只取 RUN[my_cpu_slot] 即可。多核对称
+/// 处理下每核 AP 用自己的槽位在自己的 IRQ0 tick 上调度本核就绪队列（阶段2 M4 后），
+/// 跨核只经目标 pid 锁 + 目标核 RUN[home]（锁序 pid → RUN[home]）协调。
 struct PerCpuRun {
     /// 每核就绪队列（RR）。索引 = 紧凑 CPU 槽位；[my_cpu_slot] 为当前核槽位。
     ready: VecDeque<usize>,
@@ -299,7 +299,7 @@ const MAX_PIDS: usize = 8192;
 /// 槽位固定、pid 即下标，**永不重分配**：`Option<Box<ProcEntry>>` 的入口堆分配
 /// （Box 地址稳定，替代旧 Vec 增长时的元素搬移），None = 槽位空闲。
 ///
-/// 锁域纪律（per-pid 化，承接既有 PROCS→RUN 的相对顺序）：凡触碰进程表的区域改为
+/// 锁域纪律（per-pid 化，pid 锁 → RUN[slot] 的相对顺序）：凡触碰进程表的区域改为
 /// 逐个取所涉 pid 的 per-pid 锁（多 pid 按 **pid 升序** 取，绝不在同一区域重复锁同
 /// pid）；per-CPU 的 [`RUN`] 锁是独立锁集，在 pid 锁**之后**按既有同序取（pid → RUN），
 /// 纯 RUN 路径只取 RUN。跨核唤醒/终止经目标 pid 锁 + 目标 home 核 RUN[home] 协调。
@@ -491,7 +491,7 @@ pub fn spawn_with_ppid_fds(
         home_cpu,
     });
     // per-pid 化：把入口写入固定 pid 槽（堆分配 Box，地址稳定）；pid 锁随即释放
-    // 再入队 home 核（pid → RUN 锁序，与既有 PROCS → RUN 同向）。
+    // 再入队 home 核（pid → RUN 锁序：pid 锁释放后再取 RUN，不同时持有）。
     *PROCESSES[pid].lock() = Some(entry);
     // 阶段2（M4）：新进程直接入队其 home 核就绪队列——使每核就绪队列真正各自
     // 承运转到本核的进程（对称多处理），而非一律落在创建核。进程运行中阻塞后再
@@ -530,7 +530,7 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
     // S1-8 触发点 1（ADR-034 §2.4）：tick 返回用户态前派发待投递信号。
     // 放在时间片 RR 切换之前：若当前进程有待投递信号，先投递（可能把帧
     // 改写进用户 handler），而非抢占切换。`deliver_on_return` 的默认终止
-    // 路径经 exit_current 内部加锁（PROCS 域），故此处不持调度锁调用。
+    // 路径经 exit_current 内部自行取各 per-pid 锁，故此处不持任何调度锁调用。
     {
         use crate::signal::{DeliveryOutcome, deliver_on_return};
         if let Some(cur) = crate::process::current_proc_mut() {
@@ -810,8 +810,9 @@ enum BlockResume {
 /// frame-resume 模型不兼容；正确实现是复用 frame-based `cpu_switch_locked`，
 /// 保证与 tick/yield/block_current/exit_current 的既有切换机制完全一致、可回滚。
 ///
-/// 上下文约定：调用方须已 `drop` PROCS/RUN 域锁并处于中断**已使能**态（None
-/// 分支进入前的现场）。本函数自行管理 PROCS/RUN 域锁获取/释放与
+/// 上下文约定：调用方须已 `drop` 本核 RUN 锁与所持 per-pid 锁并处于中断**已使能**
+/// 态（None 分支进入前的现场）。本函数自行管理 RUN 域与 per-pid 锁的获取/释放
+/// （逐访问点短暂取，多 pid 按升序）与
 /// `enable`/`disable`/`halt` 的节奏，返回时中断处于**已禁用**态（与既有 None 分支
 /// 的返回现场一致，供调用方在 syscall 层 iret 前保持）。
 ///
@@ -892,8 +893,8 @@ pub fn block_current(frame: &mut InterruptFrame) -> SwitchOutcome {
 /// 置 Blocked 之后，wake 正常生效。窗口不存在——与 `block_for_kbd` 的 CAS
 /// 纪律同源。
 ///
-/// 锁序：本函数持 PROCS 期间回调可能取 IPC 表锁（PROCS → IPC 表，单向）；
-/// 唤醒方一律在表锁外调用 wake，反向边不存在。
+/// 锁序：本函数持当前进程的 per-pid 锁期间回调可能取 IPC 表锁（pid → IPC 表，
+/// 单向；唤醒方一律在表锁外调用 wake，反向边不存在）。
 pub fn block_current_with(
     frame: &mut InterruptFrame,
     register: &mut dyn FnMut() -> bool,
@@ -1079,13 +1080,13 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
 /// reschedule IPI（阶段2 M5）：让驻留进程在别核、而该核此刻调度空闲 halt 等队列
 /// 的场合即时醒来重查，把时延从等目标核下一 IRQ0 tick (~16ms) 压到即时。
 ///
-/// 调用方持 PROCS 域（本函数不改锁状态）。空闲判定 = current[home] 为 None
-/// （该核无进程运行、在 start() 空队 halt）。目标核若在运行则 IPI 仅 EOI 无副作用
-/// （arch 的 dispatch_resched 不碰调度锁，不会与本锁死锁）。发送失败静默——
-/// 目标核自身 IRQ0 兜底会重查，IPI 只是即时优化。
-/// 跨核就绪入队 + 空闲核 IPI。本函数自身短暂取 RUN[home] 域（跨核目标为动态
-/// 槽位，无法随参传递单一 guard）；调用方持 PROCS 域即可，**不得**同时持
-/// RUN[home] 域（IrqSpinLock 不可重入）。
+/// 跨核就绪入队 + 空闲核 IPI：本函数自身短暂取 RUN[home] 域（跨核目标为动态
+/// 槽位，无法随参传递单一 guard），不改任何进程表锁状态。调用方须**已释放**所持
+/// 的 per-pid 锁（不得与 RUN[home] 同持——IrqSpinLock 不可重入；各唤醒路径在
+/// 入队前已 drop pid 锁）。空闲判定 = current[home] 为 None（该核无进程运行、在
+/// start() 空队 halt）。目标核若在运行则 IPI 仅 EOI 无副作用（arch 的
+/// dispatch_resched 不碰调度锁，不会与本锁死锁）。发送失败静默——目标核自身
+/// IRQ0 兜底会重查，IPI 只是即时优化。
 fn wake_enqueue(pid: usize, home: usize) {
     let mut run = run_mut(home);
     run.ready.push_back(pid);
@@ -1144,16 +1145,16 @@ static EVENT_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 ///   返回 NotSwitched**——与 block_for_kbd 同构，无就绪进程时走 idle halt 真实
 ///   挂起（绝不忙转，见 None 分支）。
 ///
-/// **lost-wakeup 论证**：登记（CAS 写 EVENT_WAITER）与"事件队列复检 + 置 Blocked"
-/// 都在 PROCS 锁临界区完成；[`wake_event`]/[`wake_event_timeout`] 也持 PROCS
-/// 域锁才改 Ready。故"事件到达（publish_event → wake_event）"与"本进程登记"二者
+/// **lost-wakeup 论证**：登记（CAS 写 EVENT_WAITER）先于 per-pid 临界区；置 Blocked
+/// 在 cur 的 per-pid 锁内完成；[`wake_event`]/[`wake_event_timeout`] 也取目标 pid 锁
+/// 才改 Ready。故"事件到达（publish_event → wake_event）"与"本进程登记"二者
 /// 被锁完全串行——若事件先到，wake_event 见无等待者直接返回，本进程随后复检
 /// 队列**非空** → 不阻塞，返回 NotSwitched 让调用方取事件；若本进程先登记，
 /// wake_event 必在登记后（锁内）读到 pid 并唤醒。不存在"登记后事件到达却无人
 /// 唤醒"的窗口。`publish_event` 先入队再唤醒，保证唤醒者复检时必见事件。
 pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
     let cur_pid = {
-        // 纯 RUN 读取（b）：短暂取本核 RUN 域即可，无需 PROCS。
+        // 纯 RUN 读取（b）：短暂取本核 RUN 域读 current 即可，无需 pid 锁。
         let run = run_mut(my_cpu_slot());
         let cur = run.current.expect("block_for_event outside process");
         assert!(
@@ -1933,8 +1934,8 @@ pub fn get_process_snapshot(pid: usize) -> Option<vfs::ProcessSnapshot> {
 /// PID 1 契约：该信号若投递给 init 是否会**终止** init（从而应被拒绝）。
 /// 依 ADR-034「init 可捕获非致命信号」：仅当默认处置为 Terminate 且 init
 /// 未为该信号设 handler（不可捕获）时才判定为终止 → 拒绝。
-/// 自持锁的判定助手：进程表由 PROCS 域承载，故本函数自行取 PROCS 域读取
-/// init 的信号处置。调用方不得已持 PROCS/RUN 域。
+/// 自持锁的判定助手：本函数自行取 init 的 per-pid 锁读取其信号处置。调用方
+/// 不得已持同 pid 锁或本核 RUN 域。
 fn init_signal_terminates(init_pid: usize, sig: u32) -> bool {
     if default_disposition(sig) != DefaultAction::Terminate {
         return false;
@@ -1953,7 +1954,7 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
     if sig >= NSIG {
         return Err(Error::InvalidParam);
     }
-    // 纯 RUN 读取（b）：取本核当前 pid，无需 PROCS。
+    // 纯 RUN 读取（b）：取本核当前 pid，无需任何 pid 锁。
     let current = {
         run_mut(my_cpu_slot()).current
     };
