@@ -306,6 +306,52 @@ pub struct InterruptFrame {
     pub ss: u64,
 }
 
+// ---------- A2: 从任意内存中恢复一个完整 InterruptFrame 并 iretq 回用户态 ----------
+
+/// 从内存中的 InterruptFrame 恢复全部通用寄存器并 iretq 进入该帧描述的用户态上下文。
+///
+/// 为什么需要：对象式切换 (对 interrupt_common_stub 的帧) 通常由外层 stub 在该帧所在的当前栈上 pop+iretq。
+/// 但 A2 空闲停车路径在把物理 RSP 切到本核 idle 栈后，被放弃的进程栈上不再有可用的外层 stub；
+/// 此时若要恢复下一个就绪进程 (其 saved 是一个在内存 PCB 里的 InterruptFrame)，
+/// 就需要从内存帧直接恢复各寄存器并 iretq，而非依赖弃栈上的 stub。
+/// 帧布局：[0..112] = r15..rax 各 u64，[120]=vector, [128]=error_code,
+/// [136..168] = rip/cs/rflags/rsp/ss (用户 iretq 帧)。
+#[unsafe(naked)]
+pub extern "C" fn resume_interrupt_frame(frame: *const InterruptFrame) -> ! {
+    // naked: rdi = frame。先在当前 (idle) 栈顶剪出空间放 iretq 帧 + rdi 候用值储存。
+    core::arch::naked_asm!(
+        "sub rsp, 48",                       // [0..32]=iretq帧, [40]=rdi候用
+        "mov rax, [rdi + 168]",
+        "mov [rsp + 32], rax",              // ss
+        "mov rax, [rdi + 160]",
+        "mov [rsp + 24], rax",              // 用户 rsp
+        "mov rax, [rdi + 152]",
+        "mov [rsp + 16], rax",              // rflags
+        "mov rax, [rdi + 144]",
+        "mov [rsp + 8], rax",               // cs
+        "mov rax, [rdi + 136]",
+        "mov [rsp], rax",                   // rip
+        "mov rax, [rdi + 72]",              // rdi 恢复值先储到 [rsp+40]（rdi 仍为帧基址）
+        "mov [rsp + 40], rax",
+        "mov r15, [rdi + 0]",
+        "mov r14, [rdi + 8]",
+        "mov r13, [rdi + 16]",
+        "mov r12, [rdi + 24]",
+        "mov r11, [rdi + 32]",
+        "mov r10, [rdi + 40]",
+        "mov r9, [rdi + 48]",
+        "mov r8, [rdi + 56]",
+        "mov rbp, [rdi + 64]",
+        "mov rsi, [rdi + 80]",
+        "mov rdx, [rdi + 88]",
+        "mov rcx, [rdi + 96]",
+        "mov rbx, [rdi + 104]",
+        "mov rax, [rdi + 112]",
+        "mov rdi, [rsp + 40]",
+        "iretq"
+    );
+}
+
 // ---------- 外部中断处理函数表（共享中断） ----------
 
 /// 外部中断处理函数（IRQ）。返回 `true` 表示已处理。

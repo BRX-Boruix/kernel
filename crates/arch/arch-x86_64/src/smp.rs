@@ -210,6 +210,10 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
     record_slot_lapic(slot, lapic_id);
 
     gdt::setup_cpu(gdt_ptr, tss_ptr, kstack_top, df_stack_top);
+    // A2: 登记本 AP 的常驻内核栈顶与实际装载的 TSS。这个 AP_STACK_SIZE
+    // 栈即本 AP 的 idle/中断常驻栈顶（不随进程切换释放）；而不是报任务的
+    // set_rsp0 只写 BSP_TSS，AP 必须写入自己装载的 TSS 帧才能正确改 rsp0。
+    gdt::register_cpu_slot(slot, kstack_top, tss_ptr);
 
     // MA1b：AP 必须自行加载共享 IDT——IDTR 是 per-CPU 寄存器，未加载时
     // 本核任何中断（含 IPI）都查不到向量表直落三重故障。须在开中断前。

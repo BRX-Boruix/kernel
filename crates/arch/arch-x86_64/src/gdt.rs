@@ -8,6 +8,7 @@
 //! 为支持 SMP，每 CPU 拥有独立的 GDT/TSS/内核栈（`PerCpu` 里持有）。
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// GDT 段选择子
 pub const KCODE: u16 = 0x08;
@@ -199,6 +200,13 @@ static mut BSP_KSTACK: PageAlignedStack<KSTACK_SIZE> = PageAlignedStack([0; KSTA
 /// BSP 的 Double Fault 中断栈。
 static mut BSP_DF_STACK: PageAlignedStack<DF_STACK_SIZE> = PageAlignedStack([0; DF_STACK_SIZE]);
 
+// A2: per-CPU idle/boot kernel-stack top + live TSS ptr registry (see full block below)
+static BOOT_KSTACK_TOP: [AtomicUsize; MAX_CPU_SLOTS] = [const { AtomicUsize::new(0) }; MAX_CPU_SLOTS];
+static CPU_TSS_PTR: [AtomicUsize; MAX_CPU_SLOTS] = [const { AtomicUsize::new(0) }; MAX_CPU_SLOTS];
+
+/// 每 CPU 槽位上限（与 smp 紧凑槽位 & 0xFF 对齐；BSP=0, AP=1..n）。
+pub const MAX_CPU_SLOTS: usize = 256;
+
 /// 计算内核栈顶地址：栈起始地址 + 字节长度。
 #[inline]
 pub fn stack_top(addr: *const u8, len: usize) -> u64 {
@@ -236,6 +244,9 @@ pub fn init() {
     let gdt_ptr = core::ptr::addr_of_mut!(BSP_GDT);
     let tss_ptr = core::ptr::addr_of_mut!(BSP_TSS);
     setup_cpu(gdt_ptr, tss_ptr, kstack_top, df_stack_top);
+    // A2: BSP 恒为紧凑槽 0；登记其常驻内核栈顶（BSP_KSTACK 顶）与其 TSS 帧，
+    // 供空闲停车路径把 rsp0/物理 RSP 切回本核安全栈（set_rsp0_for_slot 目标）。
+    register_cpu_slot(0, kstack_top, tss_ptr);
 }
 
 /// 更新 BSP TSS 的 RSP0（ring3→ring0 中断切栈的内核栈顶）。
@@ -246,6 +257,34 @@ pub fn init() {
 pub fn set_rsp0(kstack_top: u64) {
     unsafe {
         BSP_TSS.rsp[0] = kstack_top;
+    }
+}
+
+/// 登记某 CPU 槽位的常驻内核栈顶与 TSS 指针 (gdt::init 对 BSP=槽0、smp::ap_entry 对各 AP 调用，每核启动早期各一次)。
+/// boot_ktop = 该核引导/空闲内核栈顶 (TSS.rsp0 初始值)。tss = 该核实际 ltr 装载的 TSS 帧地址。
+/// A2 空闲停车借这份登记把该核 rsp0/物理 RSP 切回本核安全栈。
+pub fn register_cpu_slot(slot: usize, boot_ktop: u64, tss: *mut Tss) {
+    let s = slot & (MAX_CPU_SLOTS - 1);
+    BOOT_KSTACK_TOP[s].store(boot_ktop as usize, Ordering::Release);
+    CPU_TSS_PTR[s].store(tss as usize, Ordering::Release);
+}
+
+/// 取某槽位核的常驻 (引导/空闲) 内核栈顶；未登记返回 0。
+#[inline]
+pub fn boot_kstack_top(slot: usize) -> u64 {
+    BOOT_KSTACK_TOP[slot & (MAX_CPU_SLOTS - 1)].load(Ordering::Acquire) as u64
+}
+
+/// 写入指定槽位核的 TSS.rsp0。调度器进程切换把 rsp0 指向目标进程内核栈、
+/// 或 A2 空闲路径把 rsp0 指回本核 idle 栈顶时使用；取代只写 BSP_TSS 的 set_rsp0。
+pub fn set_rsp0_for_slot(slot: usize, kstack_top: u64) {
+    let s = slot & (MAX_CPU_SLOTS - 1);
+    let tss = CPU_TSS_PTR[s].load(Ordering::Acquire);
+    if tss != 0 {
+        // SAFETY: CPU_TSS_PTR[s] 由 register_cpu_slot 写入该核真实 TSS 帧地址。
+        unsafe {
+            (*(tss as *mut Tss)).rsp[0] = kstack_top;
+        }
     }
 }
 
