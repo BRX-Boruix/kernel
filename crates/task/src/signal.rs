@@ -90,7 +90,7 @@ pub fn validate_disposition(sig: u32, disp: SigDisposition) -> Result<(), klib::
 ///
 /// 承载每信号的处置（`handlers`）、屏蔽集（`blocked`）、未决集（`pending`）、
 /// 重入守卫（`signal_depth`）与 restorer 地址（`trampoline`）。派发/投递/恢复
-/// 均在调度域锁（PROCS 进程池锁，及其下 per-CPU RUN[my] 当前槽）内串行访问（§2.9，S21）。
+/// 均在调度 per-pid 锁（含其下 per-CPU RUN[my] 当前槽；无全局进程池锁）内串行访问（§2.9，S21）。
 ///
 /// `signal_depth` 记录当前压栈的 handler 层数（嵌套深度），用于 ADR-034 §6.1
 /// 的嵌套上限守卫（S04 防资源耗尽）：进入 handler 递增、sigreturn 递减；

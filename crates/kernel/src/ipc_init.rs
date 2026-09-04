@@ -22,7 +22,7 @@ impl ipc::IpcTaskNotifier for KernelIpcNotifier {
     /// 两侧各自拥有语义枚举、由本适配层一次性映射——bool 可无视的旧形状
     /// 不再跨任何 crate 边界（KA6）。
     ///
-    /// IA2a：`register` 闭包在 task 调度域锁内执行（PROCS → IPC 表锁，单向），
+    /// IA2a：`register` 闭包在 task 调度域锁内执行（per-pid 调度锁 → IPC 表锁，单向，无全局池锁），
     /// 把"登记等待者"与"置 Blocked"合并为对唤醒方原子的一步——经典
     /// lost-wakeup 窗口在协议层不存在。
     fn block_with_registration(

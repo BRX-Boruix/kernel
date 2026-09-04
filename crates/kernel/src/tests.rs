@@ -2052,7 +2052,7 @@ pub fn test_signal_handler_called() {
 /// S1-13 停机验收：handler 中再触发信号 → 嵌套投递 + 逐层 sigreturn（ADR-034
 /// §2.6 / 测试清单第 11 项）。
 ///
-/// 停机上下文（halt 进程不在调度器进程池 PROCS / 任何就绪队列中，kill_pid 会
+/// 停机上下文（halt 进程不在任何调度器进程池/就绪队列中，kill_pid 会
 /// InvalidParam），故不用 kill syscall 触发嵌套；改为预置 SIGUSR1+SIGUSR2 两个
 /// 待决信号，靠 `take_unblocked` 最低号优先（10<12）在逐层 syscall 返回时按序
 /// 投递：主流程 write("A") 返回投递

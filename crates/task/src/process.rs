@@ -604,11 +604,11 @@ impl ProcessTable<X86PageTable> {
 // 2. **写者收敛**：对该进程的内核态可变访问只发生在两类上下文——
 //    a) 当前进程自己的 syscall 处理路径（经 `current_proc_mut()` 即取即用，
 //       借用不跨越任何可能改写 CURRENT_PROC 的调度调用）；
-//    b) 调度器持 PROCS 进程池锁（含其下 per-CPU RUN[my] 当前槽）的切换/终止决策点。
+//    b) 调度器持 per-pid 锁（含其下 per-CPU RUN[my] 当前槽；无全局进程池锁）的切换/终止决策点。
 //    两类上下文在单核上不可能并发（中断上下文 vs 被打断路径互斥于 IF/
 //    锁序），故不存在两个活跃 `&mut` 同时解引用的窗口。
-// 3. **生命周期**：指针目标要么 Box::leak（停机模型），要么活在 PROCS 进程池
-//    槽位中且槽位置 None（terminate/reap/reset）与清 CURRENT_PROC 在同一
+// 3. **生命周期**：指针目标要么 Box::leak（停机模型），要么活在 PROCESSES
+//    per-pid 槽位中且槽位置 None（terminate/reap/reset）与清 CURRENT_PROC 在同一
 //    持锁临界区内完成——悬空窗口不存在于可观察路径。
 // 4. **无跨抢占缓存**（ADR-017 后的强化不变式）：禁止把 `current_proc_mut()`
 //    返回值存进任何存活超过"当前 syscall 处理"的结构或寄存器级变量。
