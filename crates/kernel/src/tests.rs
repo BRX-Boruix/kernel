@@ -2052,9 +2052,10 @@ pub fn test_signal_handler_called() {
 /// S1-13 停机验收：handler 中再触发信号 → 嵌套投递 + 逐层 sigreturn（ADR-034
 /// §2.6 / 测试清单第 11 项）。
 ///
-/// 停机上下文（halt 进程不在全局 SCHED，kill_pid 会 InvalidParam），故不用 kill
-/// syscall 触发嵌套；改为预置 SIGUSR1+SIGUSR2 两个待决信号，靠 `take_unblocked`
-/// 最低号优先（10<12）在逐层 syscall 返回时按序投递：主流程 write("A") 返回投递
+/// 停机上下文（halt 进程不在调度器进程池 PROCS / 任何就绪队列中，kill_pid 会
+/// InvalidParam），故不用 kill syscall 触发嵌套；改为预置 SIGUSR1+SIGUSR2 两个
+/// 待决信号，靠 `take_unblocked` 最低号优先（10<12）在逐层 syscall 返回时按序
+/// 投递：主流程 write("A") 返回投递
 /// SIGUSR1 → 外层 handler write("B") 返回投递 SIGUSR2（嵌套，压第二层 SignalFrame）
 /// → 内层 handler write("C") → `ret`→restorer→rt_sigreturn 恢复外层 → 外层
 /// `ret`→restorer→rt_sigreturn 恢复主流程 → 主流程 write("D")。串口按序 A/B/C/D
@@ -7543,7 +7544,7 @@ pub fn test_signal_foundation() {
             task::process::ProcessIdentity::default_user(),
         )
         .expect("spawn with restorer");
-        // 经 SCHED 探针读回该进程 trampoline。
+        // 经调度器 test_hooks 探针读回该进程 trampoline。
         let tp2 = task::scheduler::test_hooks::probe_trampoline(pid)
             .expect("spawned process must have trampoline");
         assert_eq!(tp2, SIGNAL_RESTORER_ADDR, "spawned proc trampoline set");
@@ -8808,7 +8809,7 @@ pub fn test_event_wait_mechanism() {
         driver::pending_event_count() > 0,
         "pre-published event must be visible"
     );
-    // 需要一个真实进程充当当前（block_for_event 从 SCHED.current 取等待者 pid）。
+    // 需要一个真实进程充当当前（block_for_event 从本核 RUN[my].current 取等待者 pid）。
     let waiter = th::spawn_named_child_of(0, "evt-waiter.elf").expect("spawn waiter");
     task::scheduler::debug_set_scheduler_current(waiter);
     let mut frame = arch_x86_64::interrupts::InterruptFrame {
@@ -8981,7 +8982,7 @@ pub fn test_sync_syscalls() {
     }
 
     // 阻塞路径的 `arch_frame` 需要真实（非空）InterruptFrame 指针（`arch_frame`
-    // 解引用 frame.arch_frame）。本测试的阻塞调用在 `SCHED.current == None` 时
+    // 解引用 frame.arch_frame）。本测试的阻塞调用在本核 `RUN[my].current == None` 时
     // 经 `block_current_with` 立即 NotSwitched、不读写 frame 内容，故传入一个栈上
     // 哑帧即可满足非空要求。纯 Done 路径（非阻塞）不触 arch_frame，填 0 无害。
     fn dummy_interrupt_frame() -> arch_x86_64::interrupts::InterruptFrame {

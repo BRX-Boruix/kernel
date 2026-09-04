@@ -1690,7 +1690,7 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
         return done(pack_err(Error::NotFound));
     };
     // 注册一次性定时器，到期以 `task::wake(cur_pid)` 唤醒本进程。
-    // 回调在 tick 中断的 `poll_timeouts`（锁外）执行，拿 SCHED 锁安全。
+    // 回调在 tick 中断的 `poll_timeouts`（锁外）执行，取调度域锁（PROCS）安全。
     if klib::time::set_timeout(timeout_ns, task::wake, cur_pid).is_none() {
         // 定时器表满（klib time.rs：有界静态槽位，MAX_TIMERS）：退化忙等，
         // 不丢 sleep 语义。

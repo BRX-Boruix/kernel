@@ -22,8 +22,8 @@
 //! ready 通道、本方不入册直接重试。因此唤醒方的 "消费 + drain + wake" 无论
 //! 发生在本方循环检查之前还是之后，都不可能造成信号丢失：发生在前 ⇒ 复检
 //! 看见条件为真；发生在后 ⇒ 本方已在册且 Blocked，wake 正常生效。经典
-//! lost-wakeup 窗口不存在。唤醒侧先收集后 wake，PIPE→SCHED 反向锁边已根除。
-//! 锁序全局单向：NOTIFIER → SCHED → PIPE_TABLE。
+//! lost-wakeup 窗口不存在。唤醒侧先收集后 wake，PIPE→调度域锁(PROCS) 反向锁边已根除。
+//! 锁序全局单向：NOTIFIER → PROCS(调度进程池锁) → PIPE_TABLE。
 //!
 //! ## shm 映射记账契约（ipc1 IA1 / ADR-019）
 //!

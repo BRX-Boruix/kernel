@@ -55,9 +55,9 @@ pub struct SyncObject {
     pub owner: usize,
 }
 
-/// 同步字对象表 + id 分配。锁序为 `SCHED → SYNC_TABLE`（等待者登记在 SCHED 内
-/// 持表锁；唤醒先取表锁收集等待者、释放后再经 SCHED 唤醒——无 SYNC_TABLE 持锁
-/// 再取 SCHED 的反向边，故与 shm/pipe 同为无环单向序）。
+/// 同步字对象表 + id 分配。锁序为 `PROCS(调度进程池锁) → SYNC_TABLE`（等待者
+/// 登记在调度域锁 PROCS 内持表锁；唤醒先取表锁收集等待者、释放后再经调度唤醒
+/// ——无 SYNC_TABLE 持锁再取调度域锁的反向边，故与 shm/pipe 同为无环单向序）。
 static SYNC_TABLE: IrqSpinLock<BTreeMap<u64, SyncObject>> = IrqSpinLock::new(BTreeMap::new());
 /// id 从 1 起：0 预留给"无效句柄"哨兵语义（同 ipc NEXT_SHM/NEXT_PIPE）。
 /// u64 回绕不可达论证同 ipc（每次分配伴随至少一次堆分配与一次表插入）。

@@ -90,7 +90,7 @@ pub fn validate_disposition(sig: u32, disp: SigDisposition) -> Result<(), klib::
 ///
 /// 承载每信号的处置（`handlers`）、屏蔽集（`blocked`）、未决集（`pending`）、
 /// 重入守卫（`signal_depth`）与 restorer 地址（`trampoline`）。派发/投递/恢复
-/// 均在 `SCHED` 锁内串行访问（§2.9，单核协作调度，S21）。
+/// 均在调度域锁（PROCS 进程池锁，及其下 per-CPU RUN[my] 当前槽）内串行访问（§2.9，S21）。
 ///
 /// `signal_depth` 记录当前压栈的 handler 层数（嵌套深度），用于 ADR-034 §6.1
 /// 的嵌套上限守卫（S04 防资源耗尽）：进入 handler 递增、sigreturn 递减；
@@ -386,7 +386,7 @@ pub fn deliver_handler<PT: arch::PageTable>(
 }
 /// 派发：返回用户态前检查并投递当前进程的可投递信号（ADR-034 §2.4，心脏）。
 ///
-/// 由三处触发点（syscall 返回 / 调度 tick / 异常返回）在**未持 SCHED 锁**时调用
+/// 由三处触发点（syscall 返回 / 调度 tick / 异常返回）在**未持调度域锁**时调用
 /// （因默认动作 Terminate 经 [`crate::scheduler::exit_current`] 会内部加锁）。
 /// 循环直到无可投递信号：
 /// - `Ignore` → 跳过；

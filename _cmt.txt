@@ -1,0 +1,18 @@
+docs: purge stale references to the removed global SCHED gate across modules
+
+After the scheduler migration (merge 7d85039) removed the single global
+SCHED:IrqSpinLock gate in favour of per-CPU RUN[slot] + single PROCS domain
+locks, comments in other crates still named the old lock. Update doc/comment
+wording to the current domain locks (PROCS process-pool lock; per-CPU RUN[my]
+current slot) so lock-order prose matches the code (comments only, no code change):
+
+- ipc/src/sync.rs, ipc/src/lib.rs, kernel/src/ipc_init.rs: NOTIFIER->PROCS->IPC-table
+  single-direction order; no reverse IPC-table->scheduler edge.
+- driver/src/event.rs: waiters register under PROCS + per-CPU RUN[my].
+- kernel/src/syscall.rs: poll_timeouts wake callback takes PROCS.
+- kernel/src/tests.rs (x4): halt context not in PROCS/ready queues; probe via
+  test_hooks; block_for_event reads RUN[my].current.
+- task/src/signal.rs (x2), task/src/process.rs (x3): serial access under scheduler
+  domain locks; s.current -> RUN[my].current; SCHED pool -> PROCS pool.
+
+Verified: compiles (kernel-tests). No behavioural change.
