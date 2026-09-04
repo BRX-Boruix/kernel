@@ -146,15 +146,25 @@ struct ProcEntry {
 static DEAD_KSTACKS: [IrqSpinLock<Vec<PhysFrame>>; MAX_SCHED_CPUS] =
     [const { IrqSpinLock::new(Vec::new()) }; MAX_SCHED_CPUS];
 
-/// 槽位退役单点：FPU 区随 entry 丢弃，内核栈帧入延迟回收队列，
+/// 槽位退役单点：FPU 区随 entry 丢弃，内核栈帧入**本进程 home 核**的延迟回收队列，
 /// 其余字段（Box<Process> → addr_space Drop）沿用 M5 用户资源回收语义。
-fn retire_entry(entry: Box<ProcEntry>) {
+///
+/// 归属论证（跨核收尸修复）：内核栈只有在"使用它的核已不再运行其上"才能释放。
+/// 将死/被收尸进程可能仍物理运行在它的 home 核上（跨核 SIGKILL 后 home 核的
+/// deschedule tick 尚未跑到即被父核 waitpid 收尸）。因此栈必须交给 **home 核** 的
+/// DEAD_KSTACKS[home] 队列，由 home 核在**确定自己已切下该栈**的时机（A3 go_idle
+/// 停车到本核 idle 栈后、或切换到新的存活 current）再 drain 释放——绝不能进
+/// 收尸核（可能 != home）的队列被其提前释放成 UAF。同核终止时 home==本核，
+/// 语义与旧 `my_cpu_slot()` 一致。
+fn retire_entry(entry: Box<ProcEntry>, home_cpu: usize) {
     let ProcEntry {
         proc,
         kstack_frames,
         ..
     } = *entry;
-    DEAD_KSTACKS[my_cpu_slot()].lock().push(kstack_frames);
+    DEAD_KSTACKS[home_cpu & (MAX_SCHED_CPUS - 1)]
+        .lock()
+        .push(kstack_frames);
     // proc 在此 drop：UserAddressSpace::destroy 回收用户页表/叶帧（M5）。
     // 该 Drop 只操作 HHDM 映射与空闲池，不触碰本栈，就地安全（既有行为）。
     drop(proc);
@@ -522,10 +532,9 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
     if frame.cs & 3 != 3 {
         return;
     }
-    // 延迟回收点之一（task1 K3）：本函数运行在当前存活进程的中断栈上，
-    // 不在任何将死栈上执行，归还安全。放在时间片判断之前——即使本轮
-    // 不切换也照常清队，回收延迟与时间片长度解耦。
-    drain_dead_kstacks();
+    // 延迟回收已移出 tick 顶部：跨核收尸后进程栈入 home 核 DEAD_KSTACKS，
+    // 本核此刻可能仍运行在当前(被收尸)进程栈上，顶部 drain 会释放本核当前栈→UAF。
+    // 改在确定已切下所有将死栈的时机回收：idle_loop_body 与 RR 切换成功后。
 
     // S1-8 触发点 1（ADR-034 §2.4）：tick 返回用户态前派发待投递信号。
     // 放在时间片 RR 切换之前：若当前进程有待投递信号，先投递（可能把帧
@@ -568,14 +577,36 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
     };
     // 防御：current 指向已回收槽位（正常路径 exit_current 会清 current；
     // 此守卫兜底测试钩子清理窗口等非常规序列，避免切进悬空槽）。
+    //
+    // A3 修复（跨核 reap/deschedule 竞态）：当前进程若被**他核**跨核 SIGKILL
+    // 后、本核 fix-A 脱机 tick 尚未跑到就被父核 waitpid 收尸（reap_child_locked
+    // 把槽 take 成 None 并把其内核栈 retire 进收尸核 DEAD_KSTACKS），本核此刻
+    // 仍物理运行在该进程的（已被 retire、待 drain 释放的）内核栈上。绝不能只
+    // 清 current 就 return——否则本核 RSP 落在已回收栈上，round-1 drain 释放它
+    // 后本核在已释放/复用栈上执行 → UAF → 全核冻结。必须先 drop(run) 再
+    // go_idle_on_own_stack()（本函数即为此设计：在将死/已收尸进程栈上把本核
+    // RSP0+RSP 切到本核 idle 栈），永不让渡回已回收栈。
     if proc_try(cur_pid).map_or(true, |g| g.is_none()) {
-        run.current = None;
-        return;
+        drop(run);
+        go_idle_on_own_stack()
     }
 
     // 保存当前运行进程（短暂取 cur per-pid 锁；saved/state 写入后释放再入队）。
+    // 修复 A：在 cur 的 per-pid 锁内先判 Exit——若当前进程已被**跨核** SIGKILL
+    // （terminate_locked 已置 Exit 但本核尚未把它切下 CPU），绝不能把它置
+    // Ready/重新入队复活（旧代码把 Exit 覆写成 Ready/Running，使该进程永不成为
+    // 可收尸 zombie → init 的 waitpid 永久等待、整系统冻结）。持锁判态与
+    // terminate_locked 原子互斥（它置 Exit 也须取同一把 cur 锁），锁内判定 Exit
+    // 即 terminate 已完整跑完、不会与本分支并发。改为脱机：释放锁与 RUN 后走
+    // [`deschedule_exit_current`]（幂等 terminate + 切走/空闲）。
     {
         let mut g = PROCESSES[cur_pid].lock();
+        if g.as_ref().is_some_and(|s| s.proc.state() == TaskState::Exit) {
+            drop(g);
+            drop(run);
+            deschedule_exit_current(frame, cur_pid);
+            return; // *frame 已改/已走空闲，由中断返回路径切换，绝不复活 Exit 进程
+        }
         if let Some(slot) = g.as_mut() {
             slot.saved = *frame;
             slot.proc.set_state(TaskState::Ready);
@@ -820,6 +851,9 @@ enum BlockResume {
 /// `fpu::save`（PRE-1），切走时 `cpu_switch_locked(None, _)` 不重复归档。
 fn schedule_from_block(frame: &mut InterruptFrame, cur_pid: usize) -> BlockResume {
     // 等就绪队列出现任一进程（自己或其它）。每次 halt 直到中断到达（绝不忙转）。
+    // A4：等待期间本核可能被跨核 SIGKILL+收尸 cur_pid（Blocked 中自杀式场景），
+    // 故停车等队列前先切 CR3 到内核根，避免本核 CR3 悬在可能被回收的进程表上。
+    arch_x86_64::paging::switch_to_kernel_root();
     arch_x86_64::interrupts::enable();
     loop {
         // 纯 RUN 探测：短暂取本核 RUN 域（IrqSpinLock ⇒ 检查瞬间 IF 屏蔽）。
@@ -879,6 +913,16 @@ fn schedule_from_block(frame: &mut InterruptFrame, cur_pid: usize) -> BlockResum
 pub fn block_current(frame: &mut InterruptFrame) -> SwitchOutcome {
     // per-pid（a）：只取本核 RUN 域；PID 槽访问经 block_current_locked 内逐 pid 锁。
     let mut run = run_mut(my_cpu_slot());
+    // 修复 B：若当前进程已 Exit（跨核 SIGKILL 后仍在内核阻塞路径上，尚未被切下
+    // CPU），不得把它登记/置 Blocked（会覆写 Exit → 被 sleep-timer wake 复活、
+    // 永不成为可收尸 zombie）。持有本核 RUN（owned guard）时先释放再脱机。
+    if let Some(cur_pid) = run.current {
+        if current_is_exit(cur_pid) {
+            drop(run);
+            deschedule_exit_current(frame, cur_pid);
+            return SwitchOutcome::Switched;
+        }
+    }
     block_current_locked(&mut run, frame, &mut || true)
 }
 
@@ -902,6 +946,14 @@ pub fn block_current_with(
     // per-pid（a）：只取本核 RUN 域；本函数持当前进程 pid 锁期间回调可能取 IPC
     // 表锁（pid → IPC 表，单向；唤醒方在表锁外调 wake，反向边不存在）。
     let mut run = run_mut(my_cpu_slot());
+    // 修复 B：Exit 当前进程不得登记/阻塞（同 block_current），先释放本核 RUN 再脱机。
+    if let Some(cur_pid) = run.current {
+        if current_is_exit(cur_pid) {
+            drop(run);
+            deschedule_exit_current(frame, cur_pid);
+            return SwitchOutcome::Switched;
+        }
+    }
     block_current_locked(&mut run, frame, register)
 }
 
@@ -935,6 +987,23 @@ fn block_current_locked(
     // cur 的 per-pid 锁执行 register + 置 Blocked；失败即整体放弃，现场未动。
     {
         let mut gcur = PROCESSES[cur_pid].lock();
+        // 修复 B（锁内兜底）：公共入口检查之后、置 Blocked 之前，本进程仍可能被
+        // 跨核 SIGKILL（terminate_locked 只取 cur 锁即置 Exit，不依赖本核 RUN）。
+        // 持 cur 锁在此原子判 Exit：若已 Exit，绝不登记/置 Blocked，改为把已弹出的
+        // 同伴 next_pid 切上 CPU、自身脱机（prev=None；Exit 进程不得 stay Running）。
+        if gcur.as_ref().is_some_and(|s| s.proc.state() == TaskState::Exit) {
+            drop(gcur); // 释放 cur 锁后再 cpu_switch_locked（其内部须取 next 锁）
+            run.current = None;
+            clear_current_proc();
+            {
+                let mut g = PROCESSES[next_pid].lock();
+                let slot = g.as_mut().expect("ready proc exists");
+                slot.proc.set_state(TaskState::Running);
+                *frame = slot.saved;
+            }
+            cpu_switch_locked(run, None, next_pid);
+            return SwitchOutcome::Switched;
+        }
         if !register() {
             // S26 回归：`next_pid` 已在上方被 `pop_ready` 弹出（仍为 Ready 态），
             // 若直接返回将永久丢失该就绪进程（无人重新入队 → 饿死）。
@@ -1500,7 +1569,20 @@ fn terminate_locked(pid: usize, code: u64) -> Termination {
     };
     // 将死进程移出 home 核就绪队列：pid 锁已释放，短暂取 RUN[home]
     // 域（pid → RUN 同向；home 可能非本核，跨核 retain 原子）。
-    run_mut(home).ready.retain(|&p| p != pid);
+    // 修复 C：若被杀 pid 正是 home 核上**当前正在运行**的进程（跨核 SIGKILL 的
+    // RUN.current 情形），其仍未脱机——terminate 只置 Exit，未清 RUN[home].current。
+    // 给 home 核发一次 resched IPI，让它在下一个 IRQ0 tick 尽快走进 tick 的 Exit
+    // 脱机分支（修复 A），把时延从 ~16ms 降到即时；否则该已死进程会继续在本核
+    // 运行直到下一自然 tick。守卫与 wake_enqueue 同源：仅当 home 非本核才发
+    // （本核情形 caller 已在 RUN 临界区内，自发 IPI 无意义）；arch 的
+    // dispatch_resched 只 EOI、不碰任何调度锁，跨核发送安全。
+    {
+        let mut hrun = run_mut(home);
+        hrun.ready.retain(|&p| p != pid);
+        if home != my_cpu_slot() && hrun.current == Some(pid) {
+            let _ = arch_x86_64::interrupts::send_resched_ipi_to_slot(home);
+        }
+    }
 
     // 父进程判定与交付动作：reapable 自持 ppid 锁判态；若交付则在 ppid 锁内
     // 完成（写入父 waiting_for/保存帧/置 Ready 并读回父 home 供唤醒入队）。
@@ -1534,7 +1616,7 @@ fn terminate_locked(pid: usize, code: u64) -> Termination {
         // R6 flock（K3）：进程回收时释放其持有的全部锁，杜绝锁表泄漏。
         if let Some(e) = PROCESSES[pid].lock().take() {
             vfs::flock::flock_release_all_for_owner(e.proc.identity().uid);
-            retire_entry(e);
+            retire_entry(e, home);
         }
         Termination::Reclaimed
     } else if deliver {
@@ -1545,7 +1627,7 @@ fn terminate_locked(pid: usize, code: u64) -> Termination {
         // R6 flock（K3）：进程回收时释放其持有的全部锁，杜绝锁表泄漏。
         if let Some(e) = PROCESSES[pid].lock().take() {
             vfs::flock::flock_release_all_for_owner(e.proc.identity().uid);
-            retire_entry(e);
+            retire_entry(e, home);
         }
         Termination::DeliveredToParent
     } else {
@@ -1565,8 +1647,9 @@ fn terminate_locked(pid: usize, code: u64) -> Termination {
             ipc::sync_release_process(i);
             // R6 flock（K3）：孤儿 zombie 回收时释放其持有的全部锁。
             if let Some(e) = PROCESSES[i].lock().take() {
+                let oh = e.home_cpu;
                 vfs::flock::flock_release_all_for_owner(e.proc.identity().uid);
-                retire_entry(e);
+                retire_entry(e, oh);
             }
         }
     }
@@ -1605,7 +1688,8 @@ fn reap_child_locked(cur: usize, child: usize) -> Option<(usize, u64)> {
     driver::uio_on_process_exit(child);
     ipc::sync_release_process(child);
     if let Some(e) = gc.take() {
-        retire_entry(e);
+        let e_home_from_reap = e.home_cpu;
+        retire_entry(e, e_home_from_reap);
     }
     Some((child, code))
 }
@@ -1763,6 +1847,141 @@ fn pop_ready_filtered(run: &mut PerCpuRun, exclude: usize) -> Option<usize> {
     pop_ready(run, exclude)
 }
 
+/// 当前 pid 槽是否处于 `Exit` 态（逐 pid 锁短暂探测）。
+fn current_is_exit(pid: usize) -> bool {
+    PROCESSES[pid]
+        .lock()
+        .as_ref()
+        .is_some_and(|s| s.proc.state() == TaskState::Exit)
+}
+
+/// 把一个已在 `Exit` 态、但仍 `RUN.current` 运行在本核的进程脱机（修复 A/B）。
+///
+/// 产生这种状态的唯一途径是**跨核 SIGKILL**：killer 核的 [`terminate_locked`]
+/// 已把本进程置 `Exit`（记录退出码、移出就绪队列、置 ZombieKept/交付/回收），
+/// 但本核当时正在运行它（用户态忙转 / 内核阻塞 syscall 中），尚未把它切下 CPU。
+///
+/// 本函数（幂等）：
+/// 1. 重跑一次 [`terminate_locked`]——它是幂等的：槽已是 `Exit`、父活且未等则
+///    维持 ZombieKept；若父自上次终止后**转为 Blocked 等待本 pid/ANY** 则交付并
+///    回收；若槽已被 waitpid 收尸（None）则 `Reclaimed` 空操作。重跑顺带消化
+///    上一轮 kill 与本次脱机之间父进程状态翻转的交付窗口；
+/// 2. 清本核 `RUN.current` 与 `CURRENT_PROC`，切到下一就绪进程或进空闲 halt，
+///    与 [`exit_current`] 尾部完全同构。
+///
+/// 锁序约束：调用方必须先释放本核 RUN 域与一切 per-pid 锁再调用（本函数在
+/// 无锁现场重跑 terminate_locked，其自取 pid 锁 + RUN[home]）；本函数不得在
+/// Exit 进程自身的槽上再写 Ready/Running（复活）。`retire_entry` 经 `DEAD_KSTACKS`
+/// 延迟归还将死进程内核栈，本函数可能物理运行在该栈上（tick 的 TSS.RSP0 / 阻塞
+/// syscall），切走后经 `gdt::set_rsp0` 脱离，不就地释放——安全前提同 [`exit_current`]。
+fn deschedule_exit_current(frame: &mut InterruptFrame, cur_pid: usize) {
+    // 读当前退出码（逐 pid 锁短暂取；槽已收尸则退 0，重跑 terminate 无副作用）。
+    let exit_code = PROCESSES[cur_pid]
+        .lock()
+        .as_ref()
+        .map(|s| s.exit_code)
+        .unwrap_or(0);
+    // 此刻无任何调度锁：terminate_locked 自取 pid 锁 + RUN[home==本核]。
+    let _ = terminate_locked(cur_pid, exit_code);
+    let cpu_slot = my_cpu_slot();
+    let mut run = run_mut(cpu_slot);
+    run.current = None;
+    clear_current_proc();
+    // 切到下一有效就绪进程（prev=None：Exit 槽已退役，浮点现场随 terminate 消亡，
+    // 无需保存）；无就绪则进空闲 halt，被外部唤醒后切回。与 exit_current 尾部同构。
+    let Some(next_pid) = pop_ready(&mut run, usize::MAX) else {
+        drop(run);
+        // A2 修复：本函数此刻物理运行在将死 (被 SIGKILL 后脱机) 进程栈上；
+        // 空队停车必须切到本核 idle 栈，绝不在将死栈上 halt（reaper 可回收之）。
+        go_idle_on_own_stack()
+    };
+    {
+        let mut g = PROCESSES[next_pid].lock();
+        let slot = g.as_mut().expect("ready proc exists");
+        slot.proc.set_state(TaskState::Running);
+        *frame = slot.saved;
+    }
+    cpu_switch_locked(&mut run, None, next_pid);
+}
+
+// ---------- A2: 核 idle 停车在本核常驻栈，不在将死进程栈上 ----------
+
+/// 将本核物理 RSP 切到本核自己的 idle (常驻引导) 内核栈，并在该栈上等待本核 RUN 就绪队非空。
+///
+/// 为什么必须：下方路径在将死进程脱机后无就绪可切，若直接在将死栈上 halt 等待，
+/// 另一核 (父/reaper) 可收尸并经 DEAD_KSTACKS drain 释放该栈 → 本核的活 RSP 落在已释放内存上 (UAF)。
+/// 这里在切栈后把本核 TSS.rsp0 也指回 idle 栈顶，使 idle 期间的中断也落在安全栈上。
+/// 调用前必须已释放本核 RUN 与一切 per-pid 锁（同旧路径 drop run 后停车一致）。永不返回。
+fn go_idle_on_own_stack() -> ! {
+    let cpu_slot = my_cpu_slot();
+    // 本核常驻内核栈顶：BSP=BSP_KSTACK，AP=AP_STACK_SIZE 栈（均在 gdt::register_cpu_slot 登记）。
+    let idle_top = arch_x86_64::gdt::boot_kstack_top(cpu_slot);
+    debug_assert!(idle_top != 0, "go_idle: 本核 idle 栈未登记");
+    // 切栈前先关中断，避免切换途中中断落在将弃进程栈上。
+    arch_x86_64::interrupts::disable();
+    // rsp0 → idle 栈顶：idle 期间 IRQ0 醒睡时切到本核自己的栈，而非被放弃的进程栈。
+    arch_x86_64::gdt::set_rsp0_for_slot(cpu_slot, idle_top);
+    // 物理 RSP 切到 idle 栈后进入 idle循环（不回到旧进程栈）。
+    unsafe { idle_stack_switch(idle_top) }
+}
+
+/// 切换 RSP 到 idle 栈顶附近并跳入 idle循环上下文，永不返回旧栈。
+#[unsafe(naked)]
+unsafe extern "C" fn idle_stack_switch(idle_top: u64) -> ! {
+    // naked: rdi = idle_top。设 RSP = idle_top - 预留帧高度（用户中断从 rsp0=idle_top 向下压帧，
+    // 预留充足余量使其不与 idle循环框架碰撞），再 16字节对齐后跳入常规函数。
+    // jmp 进入 idle_loop_body；把 rsp 置为 8 mod 16 (标准 C ABI 入口对齐)。
+    // idle_loop_body 为 `-> !` 永不返回，故无需返回地址。
+    core::arch::naked_asm!(
+        "mov rsp, rdi",
+        "sub rsp, 4104",   // 4096 栈高余量 + 8 → 入口 rsp%16==8
+        "jmp {body}",
+        body = sym idle_loop_body,
+    );
+}
+
+/// idle循环主体（运行在 idle 栈上）：关中断条件下 halt 等本核 RUN 就绪队非空，
+/// 然后弹出一个就绪进程并经全量 InterruptFrame iretq 恢复到用户态。
+unsafe extern "C" fn idle_loop_body() -> ! {
+    let cpu_slot = my_cpu_slot();
+    // 本核已停车在**自己的 idle 栈**上，确定不在任何进程栈上执行：
+    // 在此 drain 本核 DEAD_KSTACKS 安全——跨核收尸入队的、本核曾运行进程的
+    // 栈（经 A3 go_idle 后本核已切下它们）在此归还，杜绝"收尸核提前释放他核在用栈"。
+    drain_dead_kstacks();
+    // A4 修复：本核刚切下某个将死进程并停车。必须把 CR3 切回**内核根页表**，
+    // 否则 CR3 仍指向该将死进程的用户页表；父核随后收尸 drop 其 UserAddressSpace
+    // 会释放该顶层表帧，而本核停车的 CR3 仍指向它 → 唤醒/中断时经已释放/复用的
+    // 页表翻译 → 全系统内存损坏。内核根表高半区映射与本核一致，切换对运行中
+    // 内核透明；后续 cpu_switch_locked 切到新进程时会再写回其表。
+    arch_x86_64::paging::switch_to_kernel_root();
+    // 开中断后 halt：与旧 idle halt 一致。spawn 不发 IPI，依赖下一次 IRQ0 醒睡後重检（同 start()）。
+    arch_x86_64::interrupts::enable();
+    loop {
+        let nonempty = {
+            let r = run(cpu_slot);
+            !r.ready.is_empty()
+        };
+        if nonempty {
+            break;
+        }
+        arch_x86_64::interrupts::halt();
+    }
+    // 有就绪进程了：切到它并经完整帧回用户态。
+    let mut run = run_mut(cpu_slot);
+    let next = pop_ready(&mut run, usize::MAX).expect("woken process after idle");
+    let saved = {
+        let mut g = PROCESSES[next].lock();
+        let slot = g.as_mut().expect("woken proc exists");
+        slot.proc.set_state(TaskState::Running);
+        slot.saved
+    };
+    // prev=None：将死进程槽已随 terminate 退役，此处只做切入方恢复（不保存 FPU）。
+    cpu_switch_locked(&mut run, None, next);
+    drop(run);
+    // 本核已在 idle 栈上，无外层 stub 可 iretq；直接从内存帧恢复并 iretq 到用户态。
+    arch_x86_64::interrupts::resume_interrupt_frame(&saved)
+}
+
 /// 终止当前进程（`exit` syscall）：zombie 化并按父子关系分发退出码后切换。
 ///
 /// 当前进程经 [`terminate_locked`] 统一处理：有活父且父在等待则交付退出码
@@ -1791,35 +2010,11 @@ pub fn exit_current(frame: &mut InterruptFrame, code: u64) {
     // 取下一个有效就绪进程（跳过已退出残留引用）。
     let Some(next_pid) = pop_ready(&mut run, usize::MAX) else {
         drop(run);
-        // 无 Ready 进程：可能有 Blocked 进程（如 shell 等键盘输入）。进入 idle
-        // 等待，被外部中断（键盘 → `wake_kbd` 把其入就绪队列）唤醒后切回，
-        // 而非永久停机——否则 shell 收不到输入、系统假死。
-        arch_x86_64::interrupts::enable();
-        loop {
-            // 极短持锁检查是否有被唤醒的进程；空则释放 RUN 后 halt（中断可达）。
-            // 纯 RUN（b）：只探测本核 RUN 域就绪队列。
-            let nonempty = !run_mut(my_cpu_slot()).ready.is_empty();
-            if nonempty {
-                break;
-            }
-            arch_x86_64::interrupts::halt();
-        }
-        arch_x86_64::interrupts::disable();
-        // 重新取本核 RUN 切到被唤醒进程。
-        let mut run = run_mut(my_cpu_slot());
-        let next = pop_ready(&mut run, usize::MAX).expect("woken process after idle");
-        {
-            let mut g = PROCESSES[next].lock();
-            let slot = g.as_mut().expect("woken proc exists");
-            slot.proc.set_state(TaskState::Running);
-            *frame = slot.saved;
-        }
-        // prev=None：将死进程的槽位已随 terminate 退役（其 FPU 现场随之消亡，
-        // 无需保存），此处只做切入方恢复。本函数此刻仍物理运行在将死栈上，
-        // 但 cpu_switch_locked 只把帧归还入队（DEAD_KSTACKS），不就地释放——
-        // 栈内存直到下一次 tick/spawn 才真正还池，iretq 前无被复用窗口。
-        cpu_switch_locked(&mut run, None, next);
-        return; // frame 已改，由 syscall_entry iret 切换
+        // A2 修复：本函数此刻物理运行在将死进程的内核栈上。若在此栈上 halt
+        // 等待，父/收尸核可回收并 drain 释放它 → 本核在已释放栈上空转 (UAF)。
+        // 必须切到本核自己的 idle 栈再停车；go_idle_on_own_stack 永不让渡回此
+        // 将死栈（后续唤醒的进程由其完整帧在 idle 栈上 iretq 恢复）。
+        go_idle_on_own_stack()
     };
     {
         let mut g = PROCESSES[next_pid].lock();
