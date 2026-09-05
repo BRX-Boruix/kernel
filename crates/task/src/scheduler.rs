@@ -1,4 +1,4 @@
-//! 调度器（M4.2）：多进程 RR 轮转。
+﻿//! 调度器（M4.2）：多进程 RR 轮转。
 //!
 //! 进程在**用户态**被 LAPIC 定时器中断（IRQ0，100Hz）周期性打断，进入内核后
 //! 由 [`tick`] 做时间片切换（ADR-017：内核态被打断的 tick 直接忽略，被动抢占
@@ -585,6 +585,52 @@ pub fn spawn_thread_with(
     Ok(pid)
 }
 
+// ---------- T1-2 线程组成员关系查询（ADR-035 D2 / threads.md T1-2） ----------
+
+/// 组内遍历：返回线程组 `tgid`（组长 pid）的全部成员 pid（含组长自身）。
+///
+/// 成员判定：`ProcEntry.proc.tgid() == tgid`。组长自身 `tgid == 其 pid`，故组长
+/// 也落入本集合——组与组长 pid 一一对应，组的全量成员 = 进程表内所有 tgid 等于组长
+/// pid 的调度单元。供 T1-3 组退出（整组终止/收继）与 T1-2 组关系统计用。
+///
+/// 锁纪律（S21）：逐桶持锁**仅收集**成员 pid 后随即释放，返回 pid 集合；调用方在
+/// 无桶锁现场按需逐 pid 处理（与孤儿级联 collect-then-act 同款）。
+pub fn group_members(tgid: usize) -> Vec<usize> {
+    let mut members = Vec::new();
+    for bucket in PROCESSES.iter() {
+        let gi = bucket.lock();
+        for (p, e) in gi.iter() {
+            if e.proc.tgid() == tgid {
+                members.push(*p);
+            }
+        }
+    }
+    members
+}
+
+/// 线程组 `tgid` 的存活（非 Exit）成员数（含组长自身）。
+///
+/// T1-3 组长退出整组终止前用：组长 exit 须等组内其余线程也已终止，组才算全退；
+/// 存活成员数为 0（组长为唯一成员或组已空）即整组已可回收。
+pub fn group_live_count(tgid: usize) -> usize {
+    group_members(tgid)
+        .into_iter()
+        .filter(|&m| {
+            proc_bucket_lock(m).get(&m).map(|e| e.proc.state() != TaskState::Exit).unwrap_or(false)
+        })
+        .count()
+}
+
+/// 组是否全退：线程组 `tgid` 无任何存活成员（含组长自身）。空组按已全退处理。
+pub fn group_all_exited(tgid: usize) -> bool {
+    group_live_count(tgid) == 0
+}
+
+/// 是否组长：pid 的 tgid 等于其自身 pid（组长 = 组的创建者/代表）。
+pub fn is_group_leader(pid: usize) -> bool {
+    let b = proc_bucket_lock(pid);
+    b.get(&pid).map(|e| e.proc.tgid() == pid).unwrap_or(false)
+}
 /// 当前就绪进程数（诊断）。
 #[allow(dead_code)]
 pub fn ready_count() -> usize {
@@ -2828,6 +2874,52 @@ pub mod test_hooks {
         true
     }
 
+    /// T1-2 组关系统计验收（kernel::tests 直接调用）：派生组长 A + 两个组员线程
+    /// ta/tb + 一个对照独立组长 B，验证组内遍历 `group_members`、存活计数、组长识别
+    /// 都正确，且对照组独立不混组。不动调度切换（T1-8）。返回是否全部通过。
+    pub fn verify_group_membership() -> bool {
+        reset_all();
+        let (Ok(spa), Ok(spb)) = (dummy_space(), dummy_space()) else {
+            return false;
+        };
+        let Ok(la) = spawn_with_ppid(0, "t2-leader-a", 0x1000, 0x5000, spa) else {
+            return false;
+        };
+        let Ok(lb) = spawn_with_ppid(0, "t2-leader-b", 0x1000, 0x5000, spb) else {
+            return false;
+        };
+        // A 组内派生两个组员线程。
+        let (Ok(ta), Ok(tb)) = (spawn_thread_of(la, "t2-thread-a"), spawn_thread_of(la, "t2-thread-b")) else {
+            return false;
+        };
+        // 1) 组内遍历：A 组恰含 la/ta/tb 三者；B 组恰含 lb（不混组）。
+        let mut ma = super::group_members(la);
+        ma.sort_unstable();
+        let mut expect = alloc::vec![la, ta, tb];
+        expect.sort_unstable();
+        if ma != expect {
+            return false;
+        }
+        let mb = super::group_members(lb);
+        if mb != alloc::vec![lb] {
+            return false;
+        }
+        // 2) 存活成员数：A 组 3、B 组 1。
+        if super::group_live_count(la) != 3 || super::group_live_count(lb) != 1 {
+            return false;
+        }
+        // 3) 组长识别：la/lb 是组长，ta/tb 不是。
+        if !super::is_group_leader(la) || !super::is_group_leader(lb)
+            || super::is_group_leader(ta) || super::is_group_leader(tb) {
+            return false;
+        }
+        // 4) 组未全退（A/B 都有存活成员）。
+        if super::group_all_exited(la) || super::group_all_exited(lb) {
+            return false;
+        }
+        reset_all();
+        true
+    }
     /// 哑地址空间：仅占位映射（测试进程不执行任何用户代码）。
     fn dummy_space() -> Result<UserAddressSpace<X86PageTable>, Error> {
         use arch::PageSize;

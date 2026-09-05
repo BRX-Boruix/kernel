@@ -1,4 +1,4 @@
-//! 进程管理与调度系统（Task & Scheduler Subsystem，独立 Crate）。
+﻿//! 进程管理与调度系统（Task & Scheduler Subsystem，独立 Crate）。
 //!
 //! 包含：
 //! - `process`：进程控制块（PCB/Process）、进程表与地址空间绑定；
@@ -23,6 +23,7 @@ pub use scheduler::{
     SwitchOutcome, Waited, block_current, block_current_with, block_for_event, block_for_kbd,
     exit_current, get_process_snapshot, init_pid, kill_pid, process_snapshots, ps_snapshot,
     set_init_pid, spawn, spawn_thread_with, spawn_with_ppid, spawn_with_ppid_fds, start, tick,
+    group_members, group_live_count, group_all_exited, is_group_leader,
     waitpid, wake, wake_event, wake_event_timeout, wake_kbd, wake_with_value, set_event_timeout_timer,
     clear_event_timeout_timer, clear_event_waiter_if, yield_now, set_distribute_across_cpus,
 };

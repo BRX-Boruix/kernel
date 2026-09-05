@@ -1,4 +1,4 @@
-//! 内核启动自检测试。
+﻿//! 内核启动自检测试。
 //!
 //! 这些测试在内核初始化流程的特定阶段被调用，验证物理页帧分配器、
 //! 虚拟内存页表、堆分配器与 LAPIC 时钟中断是否正确工作。
@@ -9674,6 +9674,21 @@ pub fn test_thread_derive() {
         "[test-t1-1] thread-derive structural checks failed"
     );
     info!("[test-t1-1] PASS (independent pid/kstack/tgid + shared ThreadGroup)");
+}
+
+/// T1-2 线程组成员关系查询（ADR-035 D2 / threads.md T1-2）：单核结构验收。
+///
+/// 派生组长 A + 组内两个线程 ta/tb + 对照独立组长 B；断言 `group_members`/
+/// `group_live_count`/`is_group_leader`/`group_all_exited` 对 A 组返回正确集合
+/// （恰含 la/ta/tb、活 3、la 是组长）且 B 组独立不混组。返回主流程。
+pub fn test_t1_2_group() {
+    use task::scheduler::test_hooks as th;
+    info!("[test-t1-2] === T1-2 thread-group membership queries ====");
+    assert!(
+        th::verify_group_membership(),
+        "[test-t1-2] group-membership checks failed"
+    );
+    info!("[test-t1-2] PASS (group_members/count/leader/all-exited correct)");
 }
 
 

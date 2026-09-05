@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 #![no_main]
 
 extern crate alloc;
@@ -630,6 +630,10 @@ unsafe fn kmain_body() -> ! {
     // 独立 pid/kstack/tgid 单核检查（表级，返回主流程；调度切换留 T1-8）。
     #[cfg(feature = "kernel-tests")]
     tests::test_thread_derive();
+
+    // T1-2 线程组成员关系查询（ADR-035 D2 / threads.md T1-2）：组内遍历 + 组长识别。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_t1_2_group();
 
     // S26 回归：block_current_with 登记点失败时已弹出的就绪进程必须重新入队。
     // KS1: 必须放在 test_task_kstack_reclaim 之后，否则该测试的帧计数
