@@ -203,19 +203,44 @@ fn shm_hooks_notify_released(ids: &[u64]) {
 }
 
 /// 用户地址空间：持有独立页表 `PT`，管理用户区。
+///
+/// 自 ADR-035 D4 / PRE-2（T1-4 第一阶段）起，本类型改为**可经 Arc 跨线程共享**：
+/// - 页表 `pt`、mmap 游标 `next_mmap`、堆断点 `heap_break`、析构守卫
+///   `destroyed` 归入 `core`，由一把内部粗锁 `IrqSpinLock` 保护——所有改动
+///   页表结构 / 游标 / 断点 / 析构状态的互操作方法在 `core` 锁内串行执行；
+/// - 公开互操作由 `&mut self` 改为 `&self`（内部自锁），从而多个线程可各自持有
+///   `Arc<UserAddressSpace>` 并发调用；同一 `Arc` 上的互操作被粗锁互斥。
+/// - 集合（`areas`/`cow_pages`/`shm_maps`）保留各自 `spin::Mutex`：纯只读
+///   快照方法（统计/配额预检，见下）不触碰 `core`，并发安全依赖自身锁；
+///   一切**写者**（改动页表或集合）统一先取 `core` 锁，再在此临界区内完成对
+///   集合的成套修改，从而保证 "pt 结构 + next_mmap/heap_break + 三集合一致性"
+///   跨操作原子成立（S21 锁语义的显式标注）。
+///
+/// `IrqSpinLock` 为**不可重入**锁（关中断自旋）；纪律：持有 `core` 锁的方法
+/// 内部只准调用本对象 `_locked`/同临界区私有体，禁止再走会重新取 `core` 锁的
+/// 公开包装（否则同一 CPU 自旋死锁）。
 pub struct UserAddressSpace<PT: PageTable> {
-    /// 独立页表（继承内核映射 + 独立用户区）。
-    pt: PT,
+    /// 由粗锁保护的核心可变状态：页表 + 分配游标/断点 + 析构守卫。
+    core: IrqSpinLock<AddrCore<PT>>,
     /// 已声明的用户区域。
     areas: spin::Mutex<Vec<UserArea>>,
-    /// 下一次 `mmap` 分配的候选虚拟地址（hint，单调向上增长）。
-    next_mmap: u64,
-    /// 当前堆断点（`brk` 管理；初始为 `USER_HEAP_BASE`）。
-    heap_break: u64,
     /// 写时复制共享页记账（M5 COW）。
     cow_pages: spin::Mutex<Vec<CowPage>>,
     /// 共享内存映射记账（M5 IPC）。
     shm_maps: spin::Mutex<Vec<ShmMap>>,
+}
+
+/// 地址空间粗锁保护的核心状态（ADR-035 D4）。
+///
+/// 见 `[UserAddressSpace]` 的锁语义注释：`pt` 结构变更、`next_mmap`/
+/// `heap_break` 游标与断点、`destroyed` 析构守卫恒在该锁临界区内读写。
+struct AddrCore<PT: PageTable> {
+    /// 独立页表（继承内核映射 + 独立用户区）。
+    pt: PT,
+    /// 下一次 `mmap` 分配的候选虚拟地址（hint，单调向上增长）。
+    next_mmap: u64,
+    /// 当前堆断点（`brk` 管理；初始为 `USER_HEAP_BASE`）。
+    heap_break: u64,
     /// 资源是否已回收（防 `Drop` 与显式 `destroy` 重复释放）。
     destroyed: bool,
 }
@@ -229,14 +254,16 @@ where
     pub fn new() -> Result<Self, PT::Error> {
         let pt = PT::new()?;
         Ok(Self {
-            pt,
+            core: IrqSpinLock::new(AddrCore {
+                pt,
+                // mmap hint 从堆区上方的低地址开始增长（避开栈/堆的固定区）
+                next_mmap: USER_HEAP_BASE + 16 * 1024 * 1024,
+                heap_break: USER_HEAP_BASE,
+                destroyed: false,
+            }),
             areas: spin::Mutex::new(Vec::new()),
-            // mmap hint 从堆区上方的低地址开始增长（避开栈/堆的固定区）
-            next_mmap: USER_HEAP_BASE + 16 * 1024 * 1024,
-            heap_break: USER_HEAP_BASE,
             cow_pages: spin::Mutex::new(Vec::new()),
             shm_maps: spin::Mutex::new(Vec::new()),
-            destroyed: false,
         })
     }
 
@@ -244,8 +271,30 @@ where
     ///
     /// `start`/`end` 必须在用户半区（`USER_BASE..USER_TOP`），否则返回错误。
     /// `phys_frames` 提供每页物理地址，长度需覆盖 `end-start` 的页数。
+    /// 公开互操作入口：ADR-035 D4 起由 `&mut self` 改为 `&self`（内部自锁）。
+    ///
+    /// 获取 `core` 粗锁后把真实工作交给 `[Self::map_user_locked]`。外部调用方
+    /// （syscall / loader / 内核直接映射用户区）经本方法进入，受粗锁互斥。
     pub fn map_user(
-        &mut self,
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+        size: PageSize,
+        flags: PageFlags,
+        phys_frames: &[u64],
+    ) -> Result<(), PT::Error> {
+        // ADR-035 D4：粗锁临界区起点——pt 结构变更 + areas 一致性在此锁内成套完成。
+        let mut core = self.core.lock();
+        self.map_user_locked(&mut core, start, end, size, flags, phys_frames)
+    }
+
+    /// `map_user` 的锁内实现（`_locked` 私有体）。
+    ///
+    /// 调用方必须已持有 `core` 粗锁（本对象公开包装或同一临界区内互相调用），
+    /// 禁止再取本锁的公开包装（IrqSpinLock 不可重入，否则死锁——S21 纪律）。
+    fn map_user_locked(
+        &self,
+        core: &mut AddrCore<PT>,
         start: VirtAddr,
         end: VirtAddr,
         size: PageSize,
@@ -271,14 +320,14 @@ where
         // 区域，调用方无从回收，泄漏页表项与页映射。失败时逆序解映射
         // 已建页后再上抛，与 loader 段帧退款纪律一致。
         for &phys in phys_frames.iter().take(count as usize) {
-            if let Err(err) = self
+            if let Err(err) = core
                 .pt
                 .map(VirtAddr::new(vaddr), PhysAddr::new(phys), size, uflags)
             {
                 // 逆序解映射已成功建立的页，恢复映射前的页表状态。
                 let mut rollback = s;
                 while rollback < vaddr {
-                    let _ = self.pt.unmap(VirtAddr::new(rollback));
+                    let _ = core.pt.unmap(VirtAddr::new(rollback));
                     rollback += page;
                 }
                 return Err(err);
@@ -301,11 +350,18 @@ where
     /// 分配一物理帧，写入 SIGNAL_RESTORER_CODE 机器码，映射到 SIGNAL_RESTORER_ADDR
     /// （用户半区高地址专页，exec 可见且与栈/堆隔离），返回 restorer 起始虚拟地址
     /// （即 Process::trampoline）。帧归本地址空间所有：销毁时随地址空间回收。
-    pub fn install_signal_restorer(&mut self) -> Result<u64, PT::Error> {
+    /// 公开互操作入口（内部自锁，ADR-035 D4）。
+    ///
+    /// 在整个安装过程（幂等检查 → 分配帧 → 写入机器码 → 映射）持有 `core` 粗锁，
+    /// 保证并发安装的幂等原子性；内部映射走 `[Self::map_user_locked]`（同临界区，
+    /// 禁止再取 `map_user` 公开包装，IrqSpinLock 不可重入）。
+    pub fn install_signal_restorer(&self) -> Result<u64, PT::Error> {
         let start = VirtAddr::new(SIGNAL_RESTORER_ADDR);
         let end = VirtAddr::new(SIGNAL_RESTORER_ADDR + 0x1000);
+        let mut core = self.core.lock();
         // 单点幂等：已在保留区映射过则直接返回既有 trampoline 地址。
-        if self.query_page(SIGNAL_RESTORER_ADDR).is_some() {
+        // 幂等检查走 core.pt 真值（同临界区，不重入 query_page 的锁）。
+        if core.pt.translate_with_flags(VirtAddr::new(SIGNAL_RESTORER_ADDR)).is_some() {
             return Ok(SIGNAL_RESTORER_ADDR);
         }
         let frame = allocate_frame().ok_or(Error::OutOfMemory.into())?;
@@ -320,7 +376,7 @@ where
         }
         // 用户可执行只读页：restorer 仅被执行，不可被用户改写（S09/S31）。
         let flags = PageFlags::empty().user().executable();
-        self.map_user(start, end, PageSize::Size4K, flags, &[frame.start_paddr()])?;
+        self.map_user_locked(&mut core, start, end, PageSize::Size4K, flags, &[frame.start_paddr()])?;
         Ok(SIGNAL_RESTORER_ADDR)
     }
 
@@ -328,8 +384,10 @@ where
     ///
     /// 用户态访问该区域时触发 #PF，由 `handle_page_fault` 按需补页。
     /// `start`/`end` 必须在用户半区且页对齐。
+    /// 声明一个按需分页预留区（只写 areas 记账，不触碰 pt——纯集合方法，无需 `core`
+    /// 粗锁；自身 `areas` 锁即可）。由公开互操作 / 本对象 `_locked` 体内部调用。
     pub fn reserve_user(
-        &mut self,
+        &self,
         start: VirtAddr,
         end: VirtAddr,
         size: PageSize,
@@ -340,7 +398,7 @@ where
 
     /// 声明按需分页区，并在区域记录中写入唯一的所有权策略。
     fn reserve_user_with_kind(
-        &mut self,
+        &self,
         start: VirtAddr,
         end: VirtAddr,
         size: PageSize,
@@ -366,31 +424,41 @@ where
     }
 
     /// 解除用户空间某虚拟地址的映射，返回被解映射的物理地址。
-    pub fn unmap_user(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, PT::Error> {
-        self.pt.unmap(vaddr)
+    ///
+    /// 解映射改 pt 结构 → 取 `core` 粗锁后执行（ADR-035 D4 内部自锁）。
+    pub fn unmap_user(&self, vaddr: VirtAddr) -> Result<PhysAddr, PT::Error> {
+        let mut core = self.core.lock();
+        core.pt.unmap(vaddr)
     }
 
     /// 翻译用户空间虚拟地址 → 物理地址。
+    ///
+    /// 页表遍历需与并发改页表（同锁内）互斥 → 取 `core` 粗锁（内部自锁，
+    /// ADR-035 D4）；否则 reader 可能读到写者半成品页表页/条目。
     pub fn translate(&self, vaddr: VirtAddr) -> Option<PhysAddr> {
-        self.pt.translate(vaddr)
+        let core = self.core.lock();
+        core.pt.translate(vaddr)
     }
 
     /// 翻译用户空间虚拟地址 → （物理地址，叶层权限标志）。
     ///
-    /// 供内核侧验证映射真实性/属性（如 K2 设备窗口的 PCD 断言）。
+    /// 供内核侧验证映射真实性/属性（如 K2 设备窗口的 PCD 断言）。取 `core` 锁
+    /// 保证读到与写者一致的页表状态。
     pub fn translate_with_flags(&self, vaddr: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
-        self.pt.translate_with_flags(vaddr)
+        let core = self.core.lock();
+        core.pt.translate_with_flags(vaddr)
     }
 
     /// 单页属性查询（KM2：SYS_MEMORY_QUERY 的内核后端）。
     ///
     /// 返回该 4KB 页的页表真值属性；未映射（含 demand 区未触碰）返回 `None`。
-    /// 只读页表，不触发补页。
+    /// 只读页表，不触发补页。读 pt 真值 → 取 `core` 锁（见 `translate`）。
     pub fn query_page(&self, vaddr: u64) -> Option<PageQuery> {
         /// 4KB 页对齐掩码。
         const PAGE_MASK: u64 = !0xFFF;
         let page = VirtAddr::new(vaddr & PAGE_MASK);
-        let (_, flags) = self.pt.translate_with_flags(page)?;
+        let core = self.core.lock();
+        let (_, flags) = core.pt.translate_with_flags(page)?;
         Some(PageQuery {
             present: true,
             user: flags.is_user(),
@@ -424,8 +492,10 @@ where
             return false;
         }
         let mut page = start & !(PAGE_SIZE - 1);
+        // 逐页遍历改由 `core` 锁保护（与并发改页表互斥，ADR-035 D4）。
+        let core = self.core.lock();
         while page < end {
-            match self.pt.translate_with_flags(VirtAddr::new(page)) {
+            match core.pt.translate_with_flags(VirtAddr::new(page)) {
                 Some((_, flags)) => {
                     if !flags.is_user() {
                         return false;
@@ -442,18 +512,25 @@ where
     }
 
     /// 把本用户地址空间切换为活动页表（装入 CR3）。需 `PT: ActivePageTable`。
+    ///
+    /// 装载/遍历页表与并发改页表互斥 → 取 `core` 锁。注意这是**瞬时**装载：
+    /// 装载期间持锁；恢复 IF 由 IrqSpinLock 保证，避免切表中被中断读到半成品。
     pub fn activate(&self)
     where
         PT: ActivePageTable,
     {
-        self.pt.activate();
+        let core = self.core.lock();
+        core.pt.activate();
     }
 
     /// 顶层页表物理基址（= 装载到 CR3 的值）。
     ///
-    /// 供进程进入用户态（`TrapFrame::cr3`）与调度切换时使用。
+    /// 供进程进入用户态（`TrapFrame::cr3`）与调度切换时使用。读 pt 顶层物理
+    /// 地址——顶层表页地址在空间生命周期内不变（仅内容变），仍取 `core` 锁
+    /// 以与写者互斥读取（简单一致，阶段一地基阶段不做读偏载）。
     pub fn page_table_paddr(&self) -> u64 {
-        self.pt.paddr()
+        let core = self.core.lock();
+        core.pt.paddr()
     }
 
     /// 已声明用户虚拟区域的总字节数（O(区域数)）。
@@ -487,7 +564,11 @@ where
     /// 对**只读**预留区域会被拒绝，防止对不可写页反复补页导致的物理帧泄漏。
     ///
     /// 非法访问（未预留 / 越界 / 越权）返回 `false`，由上层终止进程。
-    pub fn handle_page_fault<PC: arch::PageFaultCode>(&mut self, vaddr: u64, code: PC) -> bool {
+    pub fn handle_page_fault<PC: arch::PageFaultCode>(&self, vaddr: u64, code: PC) -> bool {
+        // ADR-035 D4：补页全程取 core 粗锁——补页会改 pt 结构，必须与并发
+        // 互操作（mmap/brk/munmap/destroy 等）互斥；锁内对 areas/cow_pages 的
+        // 读写经其各自 spin::Mutex 仍成立（core 与集合为并列字段借用，见 S21）。
+        let mut core = self.core.lock();
         // COW 写故障（优先于按需分页）：命中共享页记账且本次为写访问 → 写时复制。
         if code.is_write() {
             let hit = self
@@ -496,7 +577,7 @@ where
                 .iter()
                 .position(|c| vaddr >= c.vaddr && vaddr < c.vaddr + 0x1000);
             if let Some(idx) = hit {
-                return self.cow_fault(idx);
+                return self.cow_fault_locked(&mut core, idx);
             }
         }
         let areas = self.areas.lock();
@@ -535,7 +616,7 @@ where
                 let phys = frame.start_paddr();
                 let page_virt = phys_to_virt(phys) as *mut u8;
                 unsafe { core::ptr::write_bytes(page_virt, 0, area.size.bytes() as usize) };
-                if self
+                if core
                     .pt
                     .map(
                         VirtAddr::new(aligned),
@@ -565,7 +646,7 @@ where
                 break;
             }
             // 若该虚拟页已映射（可能被之前的操作建立过），跳过
-            if self.pt.translate(VirtAddr::new(cur_v)).is_some() {
+            if core.pt.translate(VirtAddr::new(cur_v)).is_some() {
                 continue;
             }
 
@@ -576,7 +657,7 @@ where
             let page_virt = phys_to_virt(phys) as *mut u8;
             unsafe { core::ptr::write_bytes(page_virt, 0, 4096) };
 
-            if self
+            if core
                 .pt
                 .map(
                     VirtAddr::new(cur_v),
@@ -603,11 +684,16 @@ where
     /// 残留"只读→旧帧"条目导致重试仍 #PF、反复复制泄漏）→ 分配新帧并拷贝旧帧
     /// 内容 → 按完整权限（含可写位）重映射为独立页 → 释放对旧共享帧的引用
     /// （refcount 决定是否真正归还，因父子可能仍共享）→ 从 COW 记账移除本页。
-    fn cow_fault(&mut self, idx: usize) -> bool {
+    /// `cow_fault` 的锁内实现（`_locked` 私有体）。
+    ///
+    /// 调用方必须已持有 `core` 粗锁（handle_page_fault 的公开入口已自锁；本对象
+    /// 同临界区互相调用禁止再取公开包装——IrqSpinLock 不可重入）。COW 复制会改
+    /// pt 结构（unmap/map）并移出记账，故在 core 锁 + cow_pages 锁内成套完成。
+    fn cow_fault_locked(&self, core: &mut AddrCore<PT>, idx: usize) -> bool {
         let cow = self.cow_pages.lock()[idx];
         let vaddr = VirtAddr::new(cow.vaddr);
         // unmap 清 PTE + flush TLB，返回当前共享物理帧。
-        let old_phys = match self.pt.unmap(vaddr) {
+        let old_phys = match core.pt.unmap(vaddr) {
             Ok(p) => p.as_u64(),
             Err(_) => return false,
         };
@@ -618,7 +704,7 @@ where
             // 为可写，父子进程获得同一物理帧的双写窗口，COW 语义整体击穿
             // （mm1.md MM1）。恢复本身失败必须告警：那会留下无解释缺页洞
             // （正是本回滚要防的事态，审计 B6），绝不静默。
-            if self
+            if core
                 .pt
                 .map(
                     vaddr,
@@ -645,7 +731,7 @@ where
             );
         }
         // 按完整权限（含可写）重映射为独立页。
-        if self
+        if core
             .pt
             .map(vaddr, PhysAddr::new(new_phys), PageSize::Size4K, cow.flags)
             .is_err()
@@ -654,7 +740,7 @@ where
             // 会在 refcount≥2 时打开双写窗口，见 mm1.md MM1）。恢复失败告警
             // 同 B6——静默即无解释缺页洞。
             deallocate_frame(frame);
-            if self
+            if core
                 .pt
                 .map(
                     vaddr,
@@ -691,7 +777,14 @@ where
     /// - 仅 **4KB 叶数据帧**被共享，引用计数在 [`crate::frame_allocator`] 统一管理，
     ///   保证任一方解映射不会令另一方悬空；
     /// - 调用后父进程对应用户页变为只读（后续写由父侧 COW 复制）。
-    pub fn clone_cow(&mut self) -> Result<UserAddressSpace<PT>, PT::Error> {
+    /// 公开互操作入口（ADR-035 D4 内部自锁）。
+    ///
+    /// COW 派生需读父页表真值 + 改父 PTE 为只读 + 读三集合 —— 整个派生过程在
+    /// 父 `core` 粗锁临界区内完成，防止派生期间父侧并发 mmap/brk/munmap 使
+    /// "收集叶页 → 改只读"的两段式失去一致性。子对象 `child` 是新建未共享
+    /// 对象，构造期间经其自身 `child.core` 锁访问（与父锁互不冲突）。
+    pub fn clone_cow(&self) -> Result<UserAddressSpace<PT>, PT::Error> {
+        let mut core = self.core.lock();
         // 1. 收集父所有已映射用户叶页 (vaddr, phys, 完整 flags)。
         //
         // 审计 #8：**排除 DeviceMmap**——设备物理帧不是 RAM，COW 化它意味着
@@ -711,7 +804,7 @@ where
                 }
                 let mut v = a.start.as_u64();
                 while v < a.end.as_u64() {
-                    if let Some(phys) = self.pt.translate(VirtAddr::new(v)) {
+                    if let Some(phys) = core.pt.translate(VirtAddr::new(v)) {
                         shares.push((v, phys.as_u64(), a.flags));
                     }
                     v += COW_STEP;
@@ -719,9 +812,14 @@ where
             }
         }
         // 2. 新建子地址空间（继承内核半区，用户区空），复制布局状态。
-        let mut child = UserAddressSpace::<PT>::new()?;
-        child.next_mmap = self.next_mmap;
-        child.heap_break = self.heap_break;
+        //    child 尚未共享：直接经其 core 锁读写；next_mmap/heap_break 取父
+        //    锁内一致快照（两游标已在 core 中，同一临界区读到一致值）。
+        let child = UserAddressSpace::<PT>::new()?;
+        {
+            let mut ccore = child.core.lock();
+            ccore.next_mmap = core.next_mmap;
+            ccore.heap_break = core.heap_break;
+        }
         *child.areas.lock() = self.areas.lock().clone();
         // 3. 逐页 COW：父改只读 + 子映射共享帧只读 + 共享帧 incref + 双方记账。
         //    失败回滚纪律（mm1.md MM3）：父页一旦被 unmap，任何后续失败都必须
@@ -731,14 +829,14 @@ where
         for (v, phys, flags) in shares {
             let ro = readonly_flags(flags);
             // 父 PTE 改只读（unmap 清 TLB + 重建只读，保留共享物理帧）。
-            if self.pt.unmap(VirtAddr::new(v)).is_err() {
+            if core.pt.unmap(VirtAddr::new(v)).is_err() {
                 continue;
             }
-            if let Err(e) = self.pt.map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)
+            if let Err(e) = core.pt.map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)
             {
                 // 父只读重建失败：恢复父页原映射（原权限），保持父空间完整。
                 // 恢复失败必须告警（B6：静默即无解释缺页洞）。
-                if self
+                if core
                     .pt
                     .map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, flags)
                     .is_err()
@@ -751,24 +849,28 @@ where
                 }
                 return Err(e);
             }
-            if let Err(e) = child
-                .pt
-                .map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)
             {
-                // 子映射失败：撤销本页的 COW 改动——恢复父页原映射（原权限），
-                // 引用计数未增无需回退，父空间不留洞。恢复失败告警（B6 同款）。
-                if self
+                // 子映射共享帧只读（child 独立 core 锁）。
+                let mut ccore = child.core.lock();
+                if let Err(e) = ccore
                     .pt
-                    .map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, flags)
-                    .is_err()
+                    .map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)
                 {
-                    klib::warn!(
-                        "[cow] clone rollback remap failed v={:#x} phys={:#x}; page stays faulting",
-                        v,
-                        phys
-                    );
+                    // 子映射失败：撤销本页的 COW 改动——恢复父页原映射（原权限），
+                    // 引用计数未增无需回退，父空间不留洞。恢复失败告警（B6 同款）。
+                    if core
+                        .pt
+                        .map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, flags)
+                        .is_err()
+                    {
+                        klib::warn!(
+                            "[cow] clone rollback remap failed v={:#x} phys={:#x}; page stays faulting",
+                            v,
+                            phys
+                        );
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
             // 共享帧引用计数 +1（父 + 子各持一份引用）。
             crate::frame_allocator::frame_incref(phys);
@@ -794,19 +896,22 @@ where
         // 改为失败路径子表恒空：destroy 零释放，与未发生的 acquire 天然对称；
         // 已重映射的残余 PTE 随子页表顶层整体销毁，无需逐条清理。
         let inherited: alloc::vec::Vec<ShmMap> = self.shm_maps.lock().clone();
-        for m in inherited.iter() {
-            let npages = ((m.end - m.vaddr) / 0x1000) as usize;
-            for i in 0..npages {
-                if let Some(phys) = self
-                    .pt
-                    .translate(VirtAddr::new(m.vaddr + (i as u64) * 0x1000))
-                {
-                    child.pt.map(
-                        VirtAddr::new(m.vaddr + (i as u64) * 0x1000),
-                        phys,
-                        PageSize::Size4K,
-                        PageFlags::empty().writable().user(),
-                    )?;
+        {
+            let mut ccore = child.core.lock();
+            for m in inherited.iter() {
+                let npages = ((m.end - m.vaddr) / 0x1000) as usize;
+                for i in 0..npages {
+                    if let Some(phys) = core
+                        .pt
+                        .translate(VirtAddr::new(m.vaddr + (i as u64) * 0x1000))
+                    {
+                        ccore.pt.map(
+                            VirtAddr::new(m.vaddr + (i as u64) * 0x1000),
+                            phys,
+                            PageSize::Size4K,
+                            PageFlags::empty().writable().user(),
+                        )?;
+                    }
                 }
             }
         }
@@ -819,7 +924,9 @@ where
 
     /// 释放某个按需分页区域已映射的物理页（供进程退出/区域删除时回收）。
     /// 仅回收当前已映射的页，未映射部分不动。
-    pub fn unmap_area_pages(&mut self, area_idx: usize) {
+    /// 公开互操作入口（ADR-035 D4 内部自锁）：改 pt 结构 → 取 `core` 锁执行。
+    pub fn unmap_area_pages(&self, area_idx: usize) {
+        let mut core = self.core.lock();
         let areas = self.areas.lock();
         let Some(&area) = areas.get(area_idx) else {
             return;
@@ -832,8 +939,8 @@ where
         let page = area.size.bytes();
         let mut v = area.start.as_u64();
         while v < area.end.as_u64() {
-            if let Some(phys) = self.pt.translate(VirtAddr::new(v)) {
-                if let Err(_) = self.pt.unmap(VirtAddr::new(v)) {
+            if let Some(phys) = core.pt.translate(VirtAddr::new(v)) {
+                if let Err(_) = core.pt.unmap(VirtAddr::new(v)) {
                     break;
                 }
                 deallocate_frame(PhysFrame::from_paddr_raw(phys.as_u64()));
@@ -856,11 +963,22 @@ where
     /// 顶层表页自身（帧），不触碰其指向的内核中间表，避免破坏其它进程内核映射。
     ///
     /// 幂等：`destroyed` 守卫避免 `Drop` 与显式 `destroy` 重复释放。
-    pub fn destroy(&mut self) {
-        if self.destroyed {
+    /// 公开互操作入口（ADR-035 D4 内部自锁）。
+    ///
+    /// 整段回收（叶帧 + shm PTE 清理 + 顶层表页归还）在同一 `core` 临界区内
+    /// 串行执行，避免与并发互操作交错读到半销毁状态。`destroyed` 守卫移入
+    /// `core`：显式 `destroy` 与 `Drop` 都可能触发，靠锁内标志幂等。
+    ///
+    /// **A4 CR3 时序边界（PRE-2，注释成文、本步不做实现）**：`top == current_paddr`
+    /// 的单 owner 判定在当前仍成立；当 T1-1/T1-3 组退出路径引入"等组内线程切下"
+    /// 的跨核不变式后，`destroy` 还需在归还顶层表页前确认组内其它线程已切离
+    /// 本页表——该跨核等待不在本阶段（结构改造）内实现，后续 T 任务落位。
+    pub fn destroy(&self) {
+        let mut core = self.core.lock();
+        if core.destroyed {
             return;
         }
-        self.destroyed = true;
+        core.destroyed = true;
 
         // 1. 用户区叶帧 + 中间页表页（unmap 递归释放已空中间层）。
         //    DeviceMmap 区例外：帧属设备，只清 PTE、绝不归还（与 shm 同纪律）。
@@ -869,8 +987,8 @@ where
             let page = a.size.bytes();
             let mut v = a.start.as_u64();
             while v < a.end.as_u64() {
-                if let Some(phys) = self.pt.translate(VirtAddr::new(v)) {
-                    let _ = self.pt.unmap(VirtAddr::new(v));
+                if let Some(phys) = core.pt.translate(VirtAddr::new(v)) {
+                    let _ = core.pt.unmap(VirtAddr::new(v));
                     if a.kind != UserAreaKind::DeviceMmap {
                         deallocate_frame(PhysFrame::from_paddr_raw(phys.as_u64()));
                     }
@@ -886,7 +1004,7 @@ where
         for m in shms.iter() {
             let mut v = m.vaddr;
             while v < m.end {
-                let _ = self.pt.unmap(VirtAddr::new(v));
+                let _ = core.pt.unmap(VirtAddr::new(v));
                 v += 0x1000;
             }
         }
@@ -900,7 +1018,7 @@ where
         //    运行中的内核代码透明），随后顶层表页即可安全归还；架构未提供
         //    快照（理论不可达：kmain 必先快照）时保留旧的保守路径并显式 warn，
         //    绝不静默。
-        let top = self.pt.paddr();
+        let top = core.pt.paddr();
         let cur = PT::current_paddr();
         if top == cur {
             if PT::switch_to_kernel_root() {
@@ -920,7 +1038,10 @@ where
     ///
     /// 供 `brk` 收缩等场景回收已映射内存。`lo`/`hi` 须页对齐。
     /// 步进大小取自覆盖该区间的区域页大小（缺省 4KB）。
-    fn unmap_range(&mut self, lo: u64, hi: u64) {
+    /// `unmap_range` 的锁内实现（`_locked` 私有体）。调用方（brk 收缩）已持有
+    /// `core` 粗锁；本体经 `core` 解映射（同临界区，禁止再取公开包装）。页大小
+    /// 取自覆盖区间的区域声明（areas 自身锁），缺省 4KB。
+    fn unmap_range_locked(&self, core: &mut AddrCore<PT>, lo: u64, hi: u64) {
         if lo >= hi {
             return;
         }
@@ -938,8 +1059,8 @@ where
             .unwrap_or(4096);
         let mut v = lo;
         while v < hi {
-            if let Some(phys) = self.pt.translate(VirtAddr::new(v)) {
-                if self.pt.unmap(VirtAddr::new(v)).is_ok() {
+            if let Some(phys) = core.pt.translate(VirtAddr::new(v)) {
+                if core.pt.unmap(VirtAddr::new(v)).is_ok() {
                     deallocate_frame(PhysFrame::from_paddr_raw(phys.as_u64()));
                 }
             }
@@ -966,12 +1087,18 @@ where
     /// 只要存在足够大的空隙就一定能找到，不会像翻倍步进那样跳过大段空闲区间
     /// 而误报"no free mmap region"。扫描区间数即已声明区域数，规模很小（远小于
     /// 虚拟页数），不会退化死循环。
-    pub fn mmap_user(&mut self, size: u64, flags: PageFlags) -> Result<u64, PT::Error> {
+    /// 公开互操作入口（ADR-035 D4 内部自锁）。
+    ///
+    /// 空闲区间扫描以 `core.next_mmap` 为起点、与并发写者（同锁）互斥，故先取
+    /// `core` 锁；记账走 `reserve_user_with_kind`（纯 areas 写，不重入 core）。
+    pub fn mmap_user(&self, size: u64, flags: PageFlags) -> Result<u64, PT::Error> {
         let size = align_up_checked(size, 4096).ok_or(Error::InvalidParam)?;
         if size == 0 {
             return Err(Error::InvalidParam.into());
         }
-        let gap_start = self.find_free_region(size).ok_or(Error::NoSpace)?;
+        let mut core = self.core.lock();
+        // 把扫描起点（游标）传入；find_free_region 本身只读 areas/shm 集合（不重入 core）。
+        let gap_start = self.find_free_region(core.next_mmap, size).ok_or(Error::NoSpace)?;
         let end = gap_start + size;
         self.reserve_user_with_kind(
             VirtAddr::new(gap_start),
@@ -980,7 +1107,7 @@ where
             flags,
             UserAreaKind::AnonymousMmap,
         )?;
-        self.next_mmap = end;
+        core.next_mmap = end;
         Ok(gap_start)
     }
 
@@ -1035,7 +1162,12 @@ where
     ///   不归还帧**（帧属设备，非本地址空间）。
     /// - 中途任一页映射失败即整体回滚（已映射页清 PTE 不还帧 + 撤销区域
     ///   记账），如实上抛首个错误。
-    pub fn map_mmio_user(&mut self, phys: u64, size: u64) -> Result<u64, PT::Error> {
+    /// 公开互操作入口（ADR-035 D4 内部自锁）。
+    ///
+    /// 真实映射改 pt 结构 → 取 `core` 锁全程；空闲扫描传游标入 `find_free_region`
+    /// （不重入 core），记账走 `reserve_user_with_kind`。保持原语义：本路径**不**
+    /// 推进 mmap 游标（DeviceMmap 记账入 areas，后续扫描靠区域声明避让即可）。
+    pub fn map_mmio_user(&self, phys: u64, size: u64) -> Result<u64, PT::Error> {
         const PAGE: u64 = 4096;
         if size == 0 || phys % PAGE != 0 {
             return Err(Error::InvalidParam.into());
@@ -1049,7 +1181,8 @@ where
         if phys.checked_add(len).is_none() {
             return Err(Error::InvalidParam.into());
         }
-        let va = self.find_free_region(len).ok_or(Error::NoSpace)?;
+        let mut core = self.core.lock();
+        let va = self.find_free_region(core.next_mmap, len).ok_or(Error::NoSpace)?;
         let flags = PageFlags::empty().writable().user().device_memory();
         self.reserve_user_with_kind(
             VirtAddr::new(va),
@@ -1061,14 +1194,14 @@ where
         // 逐页真实映射；失败回滚已映射部分（只 unmap，不还帧），撤销记账。
         let npages = (len / PAGE) as usize;
         for i in 0..npages {
-            if let Err(e) = self.pt.map(
+            if let Err(e) = core.pt.map(
                 VirtAddr::new(va + (i as u64) * PAGE),
                 PhysAddr::new(phys + (i as u64) * PAGE),
                 PageSize::Size4K,
                 flags,
             ) {
                 for j in 0..i {
-                    let _ = self.pt.unmap(VirtAddr::new(va + (j as u64) * PAGE));
+                    let _ = core.pt.unmap(VirtAddr::new(va + (j as u64) * PAGE));
                 }
                 self.areas.lock().retain(|a| a.start.as_u64() != va);
                 return Err(e);
@@ -1086,7 +1219,11 @@ where
     /// 已按需补页的叶 PTE 会真实解除并将帧交还给 frame allocator；尚未补页的
     /// 页面没有帧，只从区域记账中删除。完成后地址不再属于 demand-paging 区域，
     /// 因此随后的访问会被 #PF 路径拒绝而非重新分配。
-    pub fn munmap_anonymous(&mut self, start: u64, len: u64) -> Result<(), PT::Error> {
+    /// 公开互操作入口（ADR-035 D4 内部自锁）。
+    ///
+    /// 解除映射改 pt 结构 + 同步删 cow/areas 记账 + 回退游标 → 全程持 `core` 锁，
+    /// 保证 PTE 解除与记账移除对并发读者原子一致。游标（core.next_mmap）在锁内改。
+    pub fn munmap_anonymous(&self, start: u64, len: u64) -> Result<(), PT::Error> {
         const PAGE_SIZE: u64 = 4096;
         if len == 0 || start % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
             return Err(Error::InvalidParam.into());
@@ -1095,6 +1232,7 @@ where
         if start < USER_BASE || end > USER_TOP || end <= start {
             return Err(Error::InvalidParam.into());
         }
+        let mut core = self.core.lock();
 
         // 先完整验证所有权和边界，任何非法请求均在修改页表/记账前失败。
         let (area_idx, area) = {
@@ -1114,8 +1252,8 @@ where
         // 预留页；它没有任何资源可回收，但仍必须从区域范围中移除。
         let mut vaddr = start;
         while vaddr < end {
-            if let Some(phys) = self.pt.translate(VirtAddr::new(vaddr)) {
-                self.pt.unmap(VirtAddr::new(vaddr))?;
+            if let Some(phys) = core.pt.translate(VirtAddr::new(vaddr)) {
+                core.pt.unmap(VirtAddr::new(vaddr))?;
                 deallocate_frame(PhysFrame::from_paddr_raw(phys.as_u64()));
             }
             vaddr += PAGE_SIZE;
@@ -1149,8 +1287,8 @@ where
         // 扫描只向游标上方找空隙，不回退则刚释放的地址带永远不可复用（虚拟
         // 区间单向往上泄漏）。回退是安全的：find_free_region 仍会避开全部
         // 已声明区域，且紧邻释放点的复用正是期望行为。
-        if start < self.next_mmap {
-            self.next_mmap = start;
+        if start < core.next_mmap {
+            core.next_mmap = start;
         }
         Ok(())
     }
@@ -1164,7 +1302,11 @@ where
     ///
     /// 返回区间起始地址（页对齐），仅供调用方决定（`mmap_user` 记账为按需分页
     /// 预留区；`map_shm` 记账为共享内存映射）。
-    fn find_free_region(&self, size: u64) -> Option<u64> {
+    /// 空闲扫描辅助：只读 areas/shm 集合，**不触碰 `core` 锁**（避免与已持锁的
+    /// 调用方重入死锁）。扫描起点游标 `cursor`（即 `core.next_mmap`）由持锁调用方
+    /// （mmap_user / map_mmio_user / map_shm）传入——游标属 core 锁保护状态，调用方
+    /// 须在锁内取值传入。
+    fn find_free_region(&self, cursor: u64, size: u64) -> Option<u64> {
         if size == 0 {
             return None;
         }
@@ -1181,7 +1323,7 @@ where
         regions.sort_unstable();
 
         let top_limit = USER_STACK_TOP - 8 * 1024 * 1024;
-        let candidate = align_up(self.next_mmap, 4096);
+        let candidate = align_up(cursor, 4096);
         let mut prev_end = candidate;
         for (rs, re) in regions.iter() {
             let rs = align_up(*rs, 4096);
@@ -1209,25 +1351,28 @@ where
     /// 分配一段空闲虚拟区间，把 `frames` 逐页映射（带 user/可写）。**不**把该
     /// 区间记入 `areas`（帧归 shm 对象所有，多进程共享，解映射时不能释放），
     /// 而记入独立的 `shm_maps`。返回映射起始虚拟地址。
-    pub fn map_shm(&mut self, id: u64, frames: &[u64], size: u64) -> Result<u64, PT::Error> {
+    /// 公开互操作入口（ADR-035 D4 内部自锁）。映射改 pt 结构 + 更新游标 + shm 记账
+    /// 成套在 `core` 锁内完成；空闲扫描以游标传入 `find_free_region`（不重入 core）。
+    pub fn map_shm(&self, id: u64, frames: &[u64], size: u64) -> Result<u64, PT::Error> {
         // B4：size 经 IPC 路径最终源自用户，对齐前 checked。
         let size = align_up_checked(size, 4096).ok_or(Error::InvalidParam)?;
         let npages = (size / 0x1000) as usize;
         if npages == 0 || frames.len() < npages {
             return Err(Error::InvalidParam.into());
         }
-        let gap_start = self.find_free_region(size).ok_or(Error::NoSpace)?;
+        let mut core = self.core.lock();
+        let gap_start = self.find_free_region(core.next_mmap, size).ok_or(Error::NoSpace)?;
         let flags = PageFlags::empty().writable().user();
         self.check_area_quota(size)?;
         for i in 0..npages {
-            self.pt.map(
+            core.pt.map(
                 VirtAddr::new(gap_start + (i as u64) * 0x1000),
                 PhysAddr::new(frames[i]),
                 PageSize::Size4K,
                 flags,
             )?;
         }
-        self.next_mmap = gap_start + size;
+        core.next_mmap = gap_start + size;
         self.shm_maps.lock().push(ShmMap {
             id,
             vaddr: gap_start,
@@ -1240,7 +1385,10 @@ where
     ///
     /// 找到该 id 的映射区间，逐页 `unmap`（返回物理帧但交给 shm 对象管理），
     /// 并从 `shm_maps` 记账移除。返回被解映射的区间起始地址。
-    pub fn unmap_shm(&mut self, id: u64) -> Result<u64, PT::Error> {
+    /// 公开互操作入口（ADR-035 D4 内部自锁）：逐页清 pt PTE + 移除记账在 core 锁内
+    /// 成套完成（帧不释放，归 shm 对象）。
+    pub fn unmap_shm(&self, id: u64) -> Result<u64, PT::Error> {
+        let mut core = self.core.lock();
         let mut maps = self.shm_maps.lock();
         let Some(idx) = maps.iter().position(|m| m.id == id) else {
             return Err(Error::NotFound.into());
@@ -1249,7 +1397,7 @@ where
         let mut v = m.vaddr;
         while v < m.end {
             // 忽略解映射结果（帧不在此释放，交由 shm 对象 / 最后一次 unmap 时释放）。
-            let _ = self.pt.unmap(VirtAddr::new(v));
+            let _ = core.pt.unmap(VirtAddr::new(v));
             v += 0x1000;
         }
         maps.remove(idx);
@@ -1271,7 +1419,12 @@ where
     /// 在固定栈顶下方预留用户栈区（向下增长，按需分页）。
     ///
     /// 返回栈顶虚拟地址（高地址端）。栈区起点 = 栈顶 - 栈大小。
-    pub fn setup_stack(&mut self, size: u64) -> Result<u64, PT::Error> {
+    /// 公开互操作入口（ADR-035 D4 内部自锁）。
+    ///
+    /// 栈预留不直接改 pt/游标，但为与并发写者（mmap_user/map_shm/map_mmio_user 等
+    /// 同锁）就地址空间虚拟布局保持一致，取 `core` 锁做互斥；重叠检查/记账走
+    /// areas 自身锁的辅助（`overlaps`/`reserve_user`，不重入 core）。
+    pub fn setup_stack(&self, size: u64) -> Result<u64, PT::Error> {
         // S19：size 是外部（可能用户可控）参数——用 align_up_checked 防
         // `size+4095` 在 size 接近 u64::MAX 时回绕成小值、算出错误栈区间。
         // 溢出如实译 OutOfRange，绝不静默绕过大栈限制。
@@ -1281,6 +1434,7 @@ where
         if bottom < USER_BASE {
             return Err(Error::OutOfRange.into());
         }
+        let _core = self.core.lock();
         if self.overlaps(bottom, top) {
             return Err(Error::AlreadyExists.into());
         }
@@ -1300,15 +1454,22 @@ where
     /// - 扩展：记录新断点，访问新堆区由 `handle_page_fault` 按需补页。
     /// - 收缩：收窄堆区域的 `end`，并解映射/释放 `[new_break, 旧断点)` 内已补页，
     ///   保证进程无法访问"已归还"的堆内存。
-    pub fn brk(&mut self, new_break: u64) -> Result<u64, PT::Error> {
+    /// 公开互操作入口（ADR-035 D4 内部自锁）。
+    ///
+    /// 堆断点读写与收缩/扩展记账（areas）+ 收缩解映射（unmap_range）成套在
+    /// `core` 锁内完成：断点（core.heap_break）与 pt/areas 一致性对并发读者原子。
+    /// 收缩内部经 `unmap_range_locked`（同临界区），禁止再取公开包装（不可重入）。
+    pub fn brk(&self, new_break: u64) -> Result<u64, PT::Error> {
+        let mut core = self.core.lock();
         if new_break == 0 {
-            return Ok(self.heap_break);
+            return Ok(core.heap_break);
         }
         if new_break < USER_HEAP_BASE || new_break >= USER_STACK_TOP {
             return Err(Error::OutOfRange.into());
         }
         let new_break = align_up(new_break, 4096);
-        if new_break < self.heap_break {
+        let old_break = core.heap_break;
+        if new_break < old_break {
             // 收缩：收窄堆区域的 end，并解映射/释放 [new_break, heap_break) 内已补页，
             // 避免进程访问"已归还"的堆内存（越权读写/信息泄露）。
             let mut areas = self.areas.lock();
@@ -1319,12 +1480,12 @@ where
                 a.end = VirtAddr::new(new_break);
             }
             drop(areas);
-            self.unmap_range(new_break, self.heap_break);
-        } else if new_break > self.heap_break {
+            self.unmap_range_locked(&mut core, new_break, old_break);
+        } else if new_break > old_break {
             // 扩展：把 [heap_base, new_break) 声明为按需分页区。
             //
             // 配额先于一切变更（RLIMIT_AS：增长量计入区域总量）。
-            self.check_area_quota(new_break - self.heap_break)?;
+            self.check_area_quota(new_break - core.heap_break)?;
             //
             // 先校验目标区间与既有**非堆**区域及共享内存映射无重叠。堆区自身
             // （start == USER_HEAP_BASE）是被扩展对象，豁免。若放行重叠，
@@ -1362,13 +1523,14 @@ where
                 )?;
             }
         }
-        self.heap_break = new_break;
-        Ok(self.heap_break)
+        core.heap_break = new_break;
+        Ok(core.heap_break)
     }
 
-    /// 当前堆断点。
+    /// 当前堆断点。断点在 core 锁内（heap_break 归入粗锁）→ 取锁读一致快照。
     pub fn heap_break(&self) -> u64 {
-        self.heap_break
+        let core = self.core.lock();
+        core.heap_break
     }
 }
 
@@ -1378,6 +1540,10 @@ where
 {
     /// 地址空间析构即回收全部物理资源（进程退出 / 调度器 `terminate` 丢弃 `Process`
     /// 时自动触发），保证"进程退出后页表/帧不泄漏"。
+    ///
+    /// Arc 共享下本 Drop 仅在**最后一次引用**释放时运行。此时对象正析构、核心字段
+    /// `core` 尚存活；`destroy` 在内部取 `core` 锁是**首次获取**（非重入），不会
+    /// 自锁死锁——锁内 `destroyed` 守卫保证与显式 `destroy` 竞争时的幂等。
     fn drop(&mut self) {
         self.destroy();
     }

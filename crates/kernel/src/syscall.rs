@@ -1480,7 +1480,7 @@ fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
     // SYS_SHM_CREATE 合并）。二者返回起始虚拟地址。均经 `ipc::shm_*` 路径，
     // 不再把 shared_id 静默忽略成匿名映射。
     if shared_id != 0 {
-        let addr_space = proc.addr_space_mut();
+        let addr_space = proc.addr_space();
         return match ipc::shm_map::<arch_x86_64::paging::X86PageTable>(shared_id, addr_space) {
             Ok(vaddr) => pack_ok(vaddr),
             Err(e) => {
@@ -1496,7 +1496,7 @@ fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
             Ok(id) => id,
             Err(e) => return pack_err(e),
         };
-        let addr_space = proc.addr_space_mut();
+        let addr_space = proc.addr_space();
         return match ipc::shm_map::<arch_x86_64::paging::X86PageTable>(new_id, addr_space) {
             Ok(vaddr) => pack_ok(vaddr),
             Err(e) => {
@@ -1508,7 +1508,7 @@ fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
         };
     }
     let pf = PageFlags::empty().writable().user();
-    match proc.addr_space_mut().mmap_user(size, pf) {
+    match proc.addr_space().mmap_user(size, pf) {
         Ok(addr) => pack_ok(addr),
         Err(e) => pack_err(e),
     }
@@ -1533,7 +1533,7 @@ fn sys_munmap(frame: &mut SyscallFrame) -> u64 {
         .find(|m| m.vaddr == addr)
         .map(|m| m.id);
     if let Some(id) = shared_id {
-        return match ipc::shm_unmap::<arch_x86_64::paging::X86PageTable>(id, proc.addr_space_mut()) {
+        return match ipc::shm_unmap::<arch_x86_64::paging::X86PageTable>(id, proc.addr_space()) {
             Ok(_) => {
                 klib::info!("[munmap] shm_unmap id={} at {:#x}", id, addr);
                 pack_ok(0)
@@ -1541,7 +1541,7 @@ fn sys_munmap(frame: &mut SyscallFrame) -> u64 {
             Err(_) => pack_err(Error::NotFound),
         };
     }
-    match proc.addr_space_mut().munmap_anonymous(addr, size) {
+    match proc.addr_space().munmap_anonymous(addr, size) {
         Ok(()) => pack_ok(0),
         Err(e) => pack_err(e),
     }
@@ -1602,7 +1602,7 @@ fn sys_brk(frame: &mut SyscallFrame) -> u64 {
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
-    match proc.addr_space_mut().brk(new) {
+    match proc.addr_space().brk(new) {
         Ok(b) => pack_ok(b),
         Err(e) => pack_err(e),
     }
@@ -1977,7 +1977,7 @@ fn sys_driver_claim(frame: &mut SyscallFrame) -> u64 {
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
-    match proc.addr_space_mut().map_mmio_user(phys, len) {
+    match proc.addr_space().map_mmio_user(phys, len) {
         Ok(vaddr) => {
             klib::info!(
                 "[uio] claim mapped: pid={} uio_id={} phys={:#x} len={:#x} -> user {:#x}",

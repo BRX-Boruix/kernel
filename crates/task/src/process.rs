@@ -26,6 +26,7 @@
 //! `CURRENT_PROC` 裸指针别名模型的安全论证见模块尾部
 //! "CURRENT_PROC 别名纪律"一节（task1 KA3）。
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -90,7 +91,7 @@ pub extern "C" fn process_page_fault_handler(vaddr: u64, error_code: u64) -> boo
     }
     let proc = unsafe { &mut *(p as *mut Process<X86PageTable>) };
     let code = arch_x86_64::paging::PageFaultCode::new(error_code);
-    proc.addr_space_mut().handle_page_fault(vaddr, code)
+    proc.addr_space().handle_page_fault(vaddr, code)
 }
 
 /// 记录当前运行进程（调度器 `cpu_switch_locked` 切入前设置；写本核槽位）。
@@ -208,7 +209,12 @@ pub struct Process<PT: PageTable> {
     /// 上下文切换所需的 CPU 状态（M4 调度用；首次运行经 `iretq` 进用户态）。
     context: TaskContext,
     /// 独立用户地址空间（含页表、用户区管理）。
-    addr_space: UserAddressSpace<PT>,
+    ///
+    /// ADR-035 D4 / PRE-2（T1-4 第一阶段）：改为 `Arc` 共享。地址空间内部经粗锁
+    /// 自锁，本 PCB 只持有一份 `Arc` 引用；多进程/线程共享同一地址空间时各持
+    /// 一份 `Arc`（Clone），互操作方法在锁内串行。本阶段（地基）仍一进程一
+    /// `Arc`（内部锁未争用），组级共享派生留给 T1。
+    addr_space: Arc<UserAddressSpace<PT>>,
     /// 内核栈顶（用户态中断/系统调用切回内核时的栈；单核可共用全局栈）。
     kernel_stack_top: u64,
     /// 用户态入口 RIP（首次 `iretq` 的目标）。
@@ -234,12 +240,15 @@ impl<PT: PageTable> Process<PT> {
     ///
     /// `kernel_stack_top` 为该进程**独立内核栈**顶（TSS.RSP0 切换用；
     /// 用户态中断/软中断进入内核时切到此栈）。
+    /// `addr_space` 现为 `Arc` 共享句柄（ADR-035 D4）：签名接收 `Arc`，由调用方
+    /// （ProcessTable::spawn / Scheduler::spawn*）负责 `Arc::new(...)` 包装。本阶段
+    /// 每 PCB 一份独立 `Arc`；后续 T1 组共享时调用方传同一 `Arc` 的 clone 即可。
     pub fn new(
         pid: usize,
         entry_rip: u64,
         user_stack_top: u64,
         kernel_stack_top: u64,
-        addr_space: UserAddressSpace<PT>,
+        addr_space: Arc<UserAddressSpace<PT>>,
     ) -> Self {
         // KM1：三条标准流是**真实的表内句柄**（0=stdin 键盘源、1=stdout、
         // 2=stderr，均由 vfs::stdio 提供）——syscall 层不再有 fd 号特判，
@@ -414,13 +423,14 @@ impl<PT: PageTable> Process<PT> {
     pub fn context_mut(&mut self) -> &mut TaskContext {
         &mut self.context
     }
-    /// 只读访问用户地址空间（快照/统计等只读路径使用）。
+    /// 访问用户地址空间（ADR-035 D4）。
+    ///
+    /// 地址空间改为 `Arc` + 内部粗锁后，不再有 `&mut UserAddressSpace` 的公开
+    /// 形态——所有互操作方法已改 `&self` 内部自锁。本访问器解引用 `Arc` 返回
+    /// `&UserAddressSpace`，调用方直接调用（内部锁保证互斥）。原 `addr_space_mut`
+    /// 已删除：语义收敛到本方法（同一锁在方法内保证独占）。
     pub fn addr_space(&self) -> &UserAddressSpace<PT> {
         &self.addr_space
-    }
-    /// 可变访问用户地址空间。
-    pub fn addr_space_mut(&mut self) -> &mut UserAddressSpace<PT> {
-        &mut self.addr_space
     }
 
     /// 启动进程：设置状态为 Running，并从内核 `iretq` 进入用户态。
@@ -443,7 +453,8 @@ impl<PT: PageTable> Process<PT> {
         use arch::task::TrapFrame;
         self.state = TaskState::Running;
         // 进程页表物理基址：装载到 CR3，使 iretq 在进程自己的地址空间运行
-        let cr3 = self.addr_space.page_table_paddr();
+        // addr_space 为 Arc 共享（内部锁已保护读一致）；取 CR3 装载值。
+        let cr3 = self.addr_space().page_table_paddr();
         let frame = TrapFrame {
             rip: self.entry_rip,
             cs: user_code_selector() as u64,
@@ -511,7 +522,15 @@ impl<PT: PageTable> ProcessTable<PT> {
         addr_space: UserAddressSpace<PT>,
     ) -> Result<usize, klib::error::Error> {
         let pid = self.alloc_pid();
-        let proc = Process::new(pid, entry_rip, user_stack_top, kernel_stack_top, addr_space);
+        // ADR-035 D4：进程内部持 Arc；此处把进程专属空间包成唯一 Arc（地基阶段
+        // 一进程一份，共享派生留给 T1）。
+        let proc = Process::new(
+            pid,
+            entry_rip,
+            user_stack_top,
+            kernel_stack_top,
+            Arc::new(addr_space),
+        );
         // 若 pid 复用空闲槽，直接覆盖；否则追加（可能中间有 None 空洞）。
         if pid < self.processes.len() {
             self.processes[pid] = Some(proc);

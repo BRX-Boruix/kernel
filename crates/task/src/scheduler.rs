@@ -31,6 +31,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use arch::task::TrapFrame;
@@ -467,12 +468,14 @@ pub fn spawn_with_ppid_fds(
     // ADR-034 PRE-3：exec 路径（spawn_elf_image）已把 restorer 装进用户地址空间
     // 保留区并传入 `trampoline` 地址；此处仅登记到进程信号状态。test-only 路径
     // 传 0（无 restorer），保持哑地址空间记账不变。
+    // ADR-035 D4：PCB 内部经 Arc 持地址空间；此处把 spawn 传入的空间包成唯一 Arc
+    // （地基阶段一进程一份；组共享派生留给 T1，届时传同一 Arc 的 clone）。
     let mut proc = Box::new(Process::<X86PageTable>::new(
         pid,
         entry_rip,
         user_stack_top,
         kstack_top,
-        addr_space,
+        Arc::new(addr_space),
     ));
     proc.signal_mut().set_trampoline(trampoline);
     // 管道方案 A：注入父进程继承的 fd 表（若提供）。非空才替换（空表保留
@@ -647,7 +650,7 @@ fn switch_apply_next(
 ) {
     let slot = gnext.get_mut(&next).expect("switch target exists");
     fpu::restore(&slot.fpu);
-    let cr3 = slot.proc.addr_space_mut().page_table_paddr();
+    let cr3 = slot.proc.addr_space().page_table_paddr();
     let ktop = slot.kstack_top;
     let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
     run.current = Some(next);
@@ -2636,7 +2639,7 @@ pub mod test_hooks {
         name: &str,
         identity: ProcessIdentity,
     ) -> Result<usize, Error> {
-        let mut us = UserAddressSpace::<X86PageTable>::new()?;
+        let us = UserAddressSpace::<X86PageTable>::new()?;
         let trampoline = us.install_signal_restorer().map_err(|_| Error::OutOfMemory)?;
         spawn_with_ppid_fds(ppid, name, 0x1000, 0x5000, us, trampoline, None, identity)
     }
@@ -2679,7 +2682,7 @@ pub mod test_hooks {
         use arch::PageSize;
         use arch::VirtAddr;
         let frame = mm::allocate_frame().ok_or(Error::OutOfMemory)?;
-        let mut us = UserAddressSpace::<X86PageTable>::new()?;
+        let us = UserAddressSpace::<X86PageTable>::new()?;
         us.map_user(
             VirtAddr::new(0x1000),
             VirtAddr::new(0x2000),

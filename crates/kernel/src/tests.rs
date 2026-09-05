@@ -120,7 +120,7 @@ pub fn test_user_address_space() {
     use mm::user_space::UserAddressSpace;
 
     info!("[test-user-space] creating user address space...");
-    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+    let us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
 
     // 映射 2 个用户页
     let f1 = mm::allocate_frame().expect("f1").start_paddr();
@@ -194,7 +194,7 @@ pub fn test_user_addr_quota() {
     const FIRST_BYTES: u64 = 48 * 1024 * 1024;
     const SECOND_BYTES: u64 = 32 * 1024 * 1024;
 
-    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+    let us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
 
     // 第一笔：贴用户半区底部，48MiB，应成功。
     let a0 = USER_BASE;
@@ -1115,7 +1115,7 @@ pub fn test_syscall() {
     info!("[syscall-test] spawned pid={}", pid);
     // 激活用户页表并进入用户态（永不返回：`run` 从表取出进程 leak 到
     // CURRENT_PROC 后 launch；用户代码调 exit 停机）。
-    table.get_mut(pid).unwrap().addr_space_mut().activate();
+    table.get_mut(pid).unwrap().addr_space().activate();
     table.run(pid);
 }
 
@@ -1316,7 +1316,7 @@ pub fn test_process_table() {
         assert_eq!(pm.pid(), pid2, "pid() matches slot");
         assert_eq!(pm.state(), TaskState::Ready);
         pm.context_mut(); // 上下文访问器（M4 调度用）
-        pm.addr_space_mut(); // 地址空间可变访问器（用户映射用）
+        pm.addr_space(); // 地址空间可变访问器（用户映射用）
     }
 
     // 3. terminate 回收 pid，再 spawn 复用
@@ -3387,7 +3387,7 @@ pub fn test_vfs_m62() {
         .expect("create file");
 
     let us = UserAddressSpace::<X86PageTable>::new().expect("user space");
-    let mut proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, us);
+    let mut proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, alloc::sync::Arc::new(us));
 
     let handle1 = FileHandle::new(file.clone(), OpenFlags::READ_WRITE)
         .expect("ramfs handle metadata is infallible");
@@ -3477,7 +3477,7 @@ pub fn test_syscall_munmap() {
 
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
 
@@ -3491,15 +3491,15 @@ pub fn test_syscall_munmap() {
 
     // 按需补页会建立真实 PTE；解除映射后 translate 必须不再命中。
     let proc = task::current_proc_mut().expect("test process installed");
-    assert!(proc.addr_space_mut().handle_page_fault(mapped, arch_x86_64::paging::PageFaultCode::new(0)));
+    assert!(proc.addr_space().handle_page_fault(mapped, arch_x86_64::paging::PageFaultCode::new(0)));
     assert!(
-        proc.addr_space_mut()
+        proc.addr_space()
             .translate(VirtAddr::new(mapped))
             .is_some(),
         "faulted mmap page must have a real PTE before munmap"
     );
     assert!(
-        proc.addr_space_mut()
+        proc.addr_space()
             .translate(VirtAddr::new(mapped + 0x1000))
             .is_some(),
         "fault-ahead second page must have a real PTE before partial munmap"
@@ -3510,17 +3510,17 @@ pub fn test_syscall_munmap() {
     assert_eq!(unmap_first.result, 0, "first partial munmap must succeed");
     let proc = task::current_proc_mut().expect("test process retained");
     assert!(
-        proc.addr_space_mut()
+        proc.addr_space()
             .translate(VirtAddr::new(mapped))
             .is_none(),
         "munmap must clear the first page PTE"
     );
     assert!(
-        !proc.addr_space_mut().handle_page_fault(mapped, arch_x86_64::paging::PageFaultCode::new(0)),
+        !proc.addr_space().handle_page_fault(mapped, arch_x86_64::paging::PageFaultCode::new(0)),
         "a fault on a munmap address must be rejected, not demand-mapped again"
     );
     assert!(
-        proc.addr_space_mut()
+        proc.addr_space()
             .translate(VirtAddr::new(mapped + 0x1000))
             .is_some(),
         "partial munmap must preserve its adjacent mapping"
@@ -3620,7 +3620,7 @@ pub fn test_syscall_usercopy_faults() {
 
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
 
@@ -3662,17 +3662,17 @@ pub fn test_syscall_usercopy_faults() {
     //   "无新映射"语义，不是失败。）
     {
         let p = task::current_proc_mut().expect("test proc installed");
-        assert!(p.addr_space_mut().handle_page_fault(page_a, arch_x86_64::paging::PageFaultCode::new(0)));
+        assert!(p.addr_space().handle_page_fault(page_a, arch_x86_64::paging::PageFaultCode::new(0)));
         let p = task::current_proc_mut().expect("test proc installed");
         assert!(
-            p.addr_space_mut()
+            p.addr_space()
                 .translate(arch::VirtAddr::new(page_a))
                 .is_some(),
             "page A must be resident after explicit fault"
         );
         let p = task::current_proc_mut().expect("test proc installed");
         assert!(
-            p.addr_space_mut()
+            p.addr_space()
                 .translate(arch::VirtAddr::new(page_b))
                 .is_some(),
             "page B must be resident via fault-ahead prefetch"
@@ -3722,7 +3722,7 @@ pub fn test_syscall_usercopy_faults() {
     let ro_phys = mm::allocate_frame().expect("ro frame").start_paddr();
     {
         let p = task::current_proc_mut().expect("proc");
-        p.addr_space_mut()
+        p.addr_space()
             .map_user(
                 arch::VirtAddr::new(RO_ADDR),
                 arch::VirtAddr::new(RO_ADDR + 0x1000),
@@ -3840,7 +3840,7 @@ pub fn test_syscall_seq_large_io() {
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
     let saved_cr3 = arch_x86_64::mmio::cr3();
@@ -3865,7 +3865,7 @@ pub fn test_syscall_seq_large_io() {
         let p = task::current_proc_mut().expect("test proc");
         let mut a = buf;
         while a < buf + WRITE_LEN {
-            p.addr_space_mut()
+            p.addr_space()
                 .handle_page_fault(a, arch_x86_64::paging::PageFaultCode::new(0));
             a += 0x1000;
         }
@@ -3965,7 +3965,7 @@ pub fn test_syscall_entry_update() {
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
     let saved_cr3 = arch_x86_64::mmio::cr3();
@@ -3982,7 +3982,7 @@ pub fn test_syscall_entry_update() {
     let buf = map.result;
     {
         let p = task::current_proc_mut().expect("test proc");
-        p.addr_space_mut()
+        p.addr_space()
             .handle_page_fault(buf, arch_x86_64::paging::PageFaultCode::new(0));
     }
     let old_s = b"/scratch/entry_old.txt\0";
@@ -4193,7 +4193,7 @@ pub fn test_syscall_pipe() {
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
     let saved_cr3 = arch_x86_64::mmio::cr3();
@@ -4210,9 +4210,9 @@ pub fn test_syscall_pipe() {
     let base = map.result;
     {
         let p = task::current_proc_mut().expect("test proc");
-        p.addr_space_mut()
+        p.addr_space()
             .handle_page_fault(base, arch_x86_64::paging::PageFaultCode::new(0));
-        p.addr_space_mut().handle_page_fault(
+        p.addr_space().handle_page_fault(
             base + 0x1000,
             arch_x86_64::paging::PageFaultCode::new(0),
         );
@@ -4473,7 +4473,7 @@ pub fn test_syscall_entry_read_json() {
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
     let saved_cr3 = arch_x86_64::mmio::cr3();
@@ -4489,17 +4489,17 @@ pub fn test_syscall_entry_read_json() {
     let base = map.result;
     {
         let p = task::current_proc_mut().expect("test proc");
-        p.addr_space_mut()
+        p.addr_space()
             .handle_page_fault(base, arch_x86_64::paging::PageFaultCode::new(0));
-        p.addr_space_mut().handle_page_fault(
+        p.addr_space().handle_page_fault(
             base + 0x1000,
             arch_x86_64::paging::PageFaultCode::new(0),
         );
-        p.addr_space_mut().handle_page_fault(
+        p.addr_space().handle_page_fault(
             base + 0x2000,
             arch_x86_64::paging::PageFaultCode::new(0),
         );
-        p.addr_space_mut().handle_page_fault(
+        p.addr_space().handle_page_fault(
             base + 0x3000,
             arch_x86_64::paging::PageFaultCode::new(0),
         );
@@ -4632,7 +4632,7 @@ pub fn test_syscall_entry_create_kind() {
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
     let saved_cr3 = arch_x86_64::mmio::cr3();
@@ -4649,7 +4649,7 @@ pub fn test_syscall_entry_create_kind() {
     {
         let p = task::current_proc_mut().expect("test proc");
         for pg in 0..3u64 {
-            p.addr_space_mut().handle_page_fault(
+            p.addr_space().handle_page_fault(
                 base + pg * 0x1000,
                 arch_x86_64::paging::PageFaultCode::new(0),
             );
@@ -4796,7 +4796,7 @@ pub fn test_syscall_driver_query_unregister() {
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
     let saved_cr3 = arch_x86_64::mmio::cr3();
@@ -4813,7 +4813,7 @@ pub fn test_syscall_driver_query_unregister() {
     {
         let p = task::current_proc_mut().expect("test proc");
         for pg in 0..3u64 {
-            p.addr_space_mut().handle_page_fault(
+            p.addr_space().handle_page_fault(
                 base + pg * 0x1000,
                 arch_x86_64::paging::PageFaultCode::new(0),
             );
@@ -5012,7 +5012,7 @@ pub fn test_syscall_memory_map_shared() {
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
     let saved_cr3 = arch_x86_64::mmio::cr3();
@@ -5125,7 +5125,7 @@ pub fn test_syscall_memquery_and_stdin_busy() {
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
     let saved_cr3 = arch_x86_64::mmio::cr3();
@@ -5140,7 +5140,7 @@ pub fn test_syscall_memquery_and_stdin_busy() {
     let page_a = map.result;
     {
         let p = task::current_proc_mut().expect("test proc");
-        assert!(p.addr_space_mut().handle_page_fault(
+        assert!(p.addr_space().handle_page_fault(
             page_a,
             arch_x86_64::paging::PageFaultCode::new(0)
         ));
@@ -5951,7 +5951,6 @@ pub fn test_bench_ds32() {
 /// R4-4 淘汰与一致性：evict 归还物理大页、写穿作废受影响大页、失效后不串读。
 pub fn test_huge_page_direct_r4() {
     use crate::vfs_init;
-    use alloc::vec::Vec;
     use arch::phys_to_virt;
     use arch::ActivePageTable;
     use arch::VirtAddr;
@@ -6736,7 +6735,7 @@ pub fn test_driver_hub_m72() {
     // 真实性判据：VA→PA 必须命中登记窗口的首帧（匿名内存占位符做不到），
     // 且叶层 PCD 置位（设备内存不可缓存语义）。
     if let Some((wphys, wlen)) = driver::uio_device_window_of(uio_id) {
-        let mut us = mm::user_space::UserAddressSpace::<arch_x86_64::paging::X86PageTable>::new()
+        let us = mm::user_space::UserAddressSpace::<arch_x86_64::paging::X86PageTable>::new()
             .expect("UIO claim test needs an address space");
         let va = us
             .map_mmio_user(wphys, wlen)
@@ -7504,7 +7503,7 @@ pub fn test_signal_foundation() {
             SIGNAL_RESTORER_ADDR, SIGNAL_RESTORER_CODE, UserAddressSpace,
         };
         // 9a. install_signal_restorer：映射保留区 + trampoline 地址有效。
-        let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+        let us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
         let tp = us.install_signal_restorer().expect("install restorer");
         assert_eq!(tp, SIGNAL_RESTORER_ADDR, "trampoline must be the reserved addr");
         // 保留区页必须 present + user + executable（S09：restorer 用户态可执行）。
@@ -7529,7 +7528,7 @@ pub fn test_signal_foundation() {
 
         // 9b. exec 路径（spawn_elf_image 同构）：先装 restorer 得 trampoline，
         //     再 spawn_with_ppid_fds 传入 → Process.trampoline 已置。
-        let mut spawn_us = UserAddressSpace::<X86PageTable>::new().expect("new spawn user space");
+        let spawn_us = UserAddressSpace::<X86PageTable>::new().expect("new spawn user space");
         let spawn_tp = spawn_us
             .install_signal_restorer()
             .expect("install restorer for spawn");
@@ -8962,7 +8961,7 @@ pub fn test_sync_syscalls() {
     use task::Process;
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
 
@@ -9132,7 +9131,7 @@ pub fn test_identity_inherit() {
 
     // 1. 默认身份：Process::new 后为 User/uid=0。
     let us = UserAddressSpace::<X86PageTable>::new().expect("new addr space");
-    let mut proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, us);
+    let mut proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, alloc::sync::Arc::new(us));
     assert_eq!(
         proc.identity(),
         ProcessIdentity::default_user(),
@@ -9209,7 +9208,7 @@ pub fn test_perm_system_only() {
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
     let saved_cr3 = arch_x86_64::mmio::cr3();
@@ -9232,8 +9231,8 @@ pub fn test_perm_system_only() {
     let base = map.result;
     {
         let p = task::current_proc_mut().expect("test proc");
-        p.addr_space_mut().handle_page_fault(base, arch_x86_64::paging::PageFaultCode::new(0));
-        p.addr_space_mut().handle_page_fault(base + 0x1000, arch_x86_64::paging::PageFaultCode::new(0));
+        p.addr_space().handle_page_fault(base, arch_x86_64::paging::PageFaultCode::new(0));
+        p.addr_space().handle_page_fault(base + 0x1000, arch_x86_64::paging::PageFaultCode::new(0));
     }
     let sysonly_path = b"/scratch/perm_sysonly.txt\x00";
     let normal_path = b"/scratch/perm_normal.txt\x00";
@@ -9402,7 +9401,7 @@ pub fn test_flock_close_release() {
 
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = UserAddressSpace::<X86PageTable>::new().expect("addr space");
-    let mut proc = Process::new(999, 0, 0, 0, addr_space);
+    let mut proc = Process::new(999, 0, 0, 0, alloc::sync::Arc::new(addr_space));
     proc.set_identity(ProcessIdentity { uid: UID_LOCKER, privilege: Privilege::User });
 
     let fh = FileHandle::new(inode.clone(), OpenFlags::READ_ONLY).expect("open handle");
@@ -9456,7 +9455,7 @@ pub fn test_flock_syscall() {
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("create test user address space");
-    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, addr_space));
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
     let proc_raw = Box::into_raw(proc);
     task::set_current_proc(proc_raw);
     let saved_cr3 = arch_x86_64::mmio::cr3();
@@ -9474,8 +9473,8 @@ pub fn test_flock_syscall() {
     let base = map.result;
     {
         let p = task::current_proc_mut().expect("test proc");
-        p.addr_space_mut().handle_page_fault(base, arch_x86_64::paging::PageFaultCode::new(0));
-        p.addr_space_mut().handle_page_fault(base + 0x1000, arch_x86_64::paging::PageFaultCode::new(0));
+        p.addr_space().handle_page_fault(base, arch_x86_64::paging::PageFaultCode::new(0));
+        p.addr_space().handle_page_fault(base + 0x1000, arch_x86_64::paging::PageFaultCode::new(0));
     }
     let path = b"/scratch/flock_sys.txt\x00";
     let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);

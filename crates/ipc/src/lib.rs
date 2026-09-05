@@ -314,7 +314,8 @@ pub fn debug_shm_exists(id: u64) -> bool {
 /// 泛型 `PT`（ipc1 IM3 可泛化半）：逻辑层不绑定具体架构页表实现。
 pub fn shm_map<PT: arch::PageTable>(
     id: u64,
-    addr_space: &mut mm::user_space::UserAddressSpace<PT>,
+    // ADR-035 D4：地址空间互操作已改 &self 内部自锁，故此处收敛为共享引用。
+    addr_space: &mm::user_space::UserAddressSpace<PT>,
 ) -> Result<u64, PT::Error> {
     let mut table = SHM_TABLE.lock();
     let obj = table.get_mut(&id).ok_or(Error::NotFound)?;
@@ -338,7 +339,8 @@ pub fn shm_map<PT: arch::PageTable>(
 /// `shm_unmap` 互斥（同一地址空间不会同时销毁与 unmap），成文记录。
 pub fn shm_unmap<PT: arch::PageTable>(
     id: u64,
-    addr_space: &mut mm::user_space::UserAddressSpace<PT>,
+    // ADR-035 D4：地址空间互操作已改 &self 内部自锁，故此处收敛为共享引用。
+    addr_space: &mm::user_space::UserAddressSpace<PT>,
 ) -> Result<(), PT::Error> {
     // 统一锁序：先 SHM_TABLE，后 mm。
     let mut table = SHM_TABLE.lock();
