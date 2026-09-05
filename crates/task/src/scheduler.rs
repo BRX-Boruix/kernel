@@ -121,6 +121,11 @@ struct ProcEntry {
     /// 选定，唤醒/就绪入队目标固定为 `ready[home_cpu]`；进程只在 home 核被调度。
     /// （跨核唤醒 = 外来核把 pid 塞进本 home 队列并视情发 resched IPI。）
     home_cpu: usize,
+    /// 每单元用户态 FS 段基址（IA32_FS_BASE，threads.md T2-0/T2-1，ADR-035 D6）。
+    /// 线程 = 指向其用户态 TCB（errno 槽 / TLS 区）；普通单线程进程恒 0（从不写）。
+    /// 切出点 rdmsr 归档、切入点 wrmsr 恢复（镜像 FPU eager save/restore 点）——
+    /// 保证线程切换后 CPU FS base 恒指向当前单元的 TCB（防旧线程 base 泄漏给无 FS 程序）。
+    fs_base: u64,
 }
 
 /// 已退出进程的内核栈帧延迟回收队列（task1 K3，S18 释放路径的单点实现）。
@@ -362,7 +367,9 @@ pub fn init_pid() -> usize {
 }
 
 /// 构造"初始中断帧"（模拟进程首次被调度前的中断保存点，供首次从 saved 恢复）。
-fn initial_frame(entry_rip: u64, user_stack_top: u64) -> InterruptFrame {
+/// `initial_rdi` 为新单元首跑时 `rdi` 初值（T2-0：线程经 a3 传 starter/TCB 引导指针；
+/// 普通 spawn 传 0，保持现状"其余 GPR=0"）。
+fn initial_frame(entry_rip: u64, user_stack_top: u64, initial_rdi: u64) -> InterruptFrame {
     InterruptFrame {
         r15: 0,
         r14: 0,
@@ -373,7 +380,7 @@ fn initial_frame(entry_rip: u64, user_stack_top: u64) -> InterruptFrame {
         r9: 0,
         r8: 0,
         rbp: 0,
-        rdi: 0,
+        rdi: initial_rdi,
         rsi: 0,
         rdx: 0,
         rcx: 0,
@@ -490,7 +497,7 @@ pub fn spawn_with_ppid_fds(
     let home_cpu = spawn_home_cpu();
     let entry = Box::new(ProcEntry {
         proc,
-        saved: initial_frame(entry_rip, user_stack_top),
+        saved: initial_frame(entry_rip, user_stack_top, 0),
         kstack_frames: stack_frame,
         kstack_top,
         fpu: fpu_template_snapshot(),
@@ -500,6 +507,7 @@ pub fn spawn_with_ppid_fds(
         exit_code: 0,
         waiting_for: None,
         home_cpu,
+        fs_base: 0,
     });
     // 分桶化：把入口按 pid 写入其所在桶（堆分配 Box，地址稳定）；桶锁随即释放
     // 再入队 home 核（pid 桶 → RUN 锁序：桶锁释放后再取 RUN，不同时持有）。
@@ -532,6 +540,7 @@ pub fn spawn_thread_with(
     name: &str,
     entry_rip: u64,
     user_stack_top: u64,
+    starter: u64,
 ) -> Result<usize, Error> {
     drain_dead_kstacks();
     let (name_buf, name_len) = store_name(name)?;
@@ -569,7 +578,7 @@ pub fn spawn_thread_with(
     let home_cpu = spawn_home_cpu();
     let entry = Box::new(ProcEntry {
         proc,
-        saved: initial_frame(entry_rip, user_stack_top),
+        saved: initial_frame(entry_rip, user_stack_top, starter),
         kstack_frames: stack_frame,
         kstack_top,
         fpu: fpu_template_snapshot(),
@@ -579,6 +588,7 @@ pub fn spawn_thread_with(
         exit_code: 0,
         waiting_for: None,
         home_cpu,
+        fs_base: 0,
     });
     proc_bucket_lock(pid).insert(pid, entry);
     run_mut(home_cpu).ready.push_back(pid);
@@ -771,6 +781,9 @@ fn switch_apply_next(
 ) {
     let slot = gnext.get_mut(&next).expect("switch target exists");
     fpu::restore(&slot.fpu);
+    // T2-0: 恢复切入单元的用户态 FS 基址(镜像 FPU restore;保证切回后 FS base 恒指向
+    // 当前单元 TCB——普通单线程进程 fs_base=0，防旧线程 base 泄漏)。
+    gdt::write_fs_base(slot.fs_base);
     let cr3 = slot.proc.addr_space().page_table_paddr();
     let ktop = slot.kstack_top;
     let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
@@ -841,7 +854,10 @@ fn commit_next(
         Some(pid) if pid_bucket(pid) == pid_bucket(next) => {
             let mut g = proc_bucket_lock(next);
             if !next_is_runnable(&g, next) { return CommitNext::Invalid; }
-            if let Some(ps) = g.get_mut(&pid) { fpu::save(&mut ps.fpu); }
+            if let Some(ps) = g.get_mut(&pid) {
+                fpu::save(&mut ps.fpu);
+                ps.fs_base = gdt::read_fs_base();
+            }
             commit_same_lock(run, frame, next, &mut g);
             CommitNext::Done
         }
@@ -850,7 +866,10 @@ fn commit_next(
             let mut gprev = proc_bucket_lock(pid);
             let mut gnext = proc_bucket_lock(next);
             if !next_is_runnable(&gnext, next) { return CommitNext::Invalid; }
-            if let Some(ps) = gprev.get_mut(&pid) { fpu::save(&mut ps.fpu); }
+            if let Some(ps) = gprev.get_mut(&pid) {
+                fpu::save(&mut ps.fpu);
+                ps.fs_base = gdt::read_fs_base();
+            }
             commit_same_lock(run, frame, next, &mut gnext);
             CommitNext::Done
         }
@@ -859,7 +878,10 @@ fn commit_next(
             let mut gnext = proc_bucket_lock(next);
             let mut gprev = proc_bucket_lock(pid);
             if !next_is_runnable(&gnext, next) { return CommitNext::Invalid; }
-            if let Some(ps) = gprev.get_mut(&pid) { fpu::save(&mut ps.fpu); }
+            if let Some(ps) = gprev.get_mut(&pid) {
+                fpu::save(&mut ps.fpu);
+                ps.fs_base = gdt::read_fs_base();
+            }
             commit_same_lock(run, frame, next, &mut gnext);
             CommitNext::Done
         }
@@ -1321,6 +1343,8 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
             // K2：等待者此刻仍持有 CPU 的浮点现场，必须在切走前快照进自己的
             // PCB（Blocked 进程的 FPU 区在唤醒后由恢复路径如实还原）。
             fpu::save(&mut slot.fpu);
+            // T2-0：同步归档当前单元用户态 FS 基址（镜像 FPU 归档；唤醒恢复时回写）。
+            slot.fs_base = gdt::read_fs_base();
             slot.proc.set_state(TaskState::Blocked);
         }
     }
@@ -1473,6 +1497,7 @@ pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
         if let Some(slot) = g.get_mut(&cur_pid) {
             slot.saved = *frame;
             fpu::save(&mut slot.fpu);
+            slot.fs_base = gdt::read_fs_base();
             slot.proc.set_state(TaskState::Blocked);
         }
     }
@@ -2956,7 +2981,7 @@ pub mod test_hooks {
         run.ready.clear();
         run.ready.push_back(peer);
         run.current = Some(current);
-        let mut frame = initial_frame(0x400000, 0x7ffefffff000);
+        let mut frame = initial_frame(0x400000, 0x7ffefffff000, 0);
         let outcome = block_current_locked(&mut run, &mut frame, &mut || false);
         outcome == SwitchOutcome::NotSwitched && run.ready.contains(&peer)
     }
@@ -3017,7 +3042,7 @@ pub mod test_hooks {
     /// 永不被调度执行——就绪队列项在 verify/reset 前不会被消费，因内核主线程不跑
     /// scheduler::start）。复用真实 `spawn_thread_with` 路径。
     pub fn spawn_thread_of(leader_pid: usize, name: &str) -> Result<usize, Error> {
-        spawn_thread_with(leader_pid, name, 0x2000, 0x6000)
+        spawn_thread_with(leader_pid, name, 0x2000, 0x6000, 0)
     }
 
     /// 线程结构探针（T1-1）：返回 (state, tgid, kernel_stack_top)。供 kernel::tests

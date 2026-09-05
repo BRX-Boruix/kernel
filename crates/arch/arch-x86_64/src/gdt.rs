@@ -301,3 +301,44 @@ pub fn load_and_reload(gdt: &Gdt) {
         x86_64_load_tss();
     }
 }
+
+/// IA32_FS_BASE MSR：x86-64 用户可写的 FS 段基址（threads.md T2-1/T2-0，ADR-035 D6）。
+/// CPL>=0 均可读(rdmsr)写(wrmsr)；本内核从不经 GDT 设用户 FS 段（长模式 FS.base 只来自此 MSR）。
+const MSR_FS_BASE: u32 = 0xC000_0100;
+
+/// 读当前 CPU 的 FS 段基址(IA32_FS_BASE)。用于把正在运行单元的 FS 基址归档进其 PCB。
+#[inline]
+pub fn read_fs_base() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") MSR_FS_BASE,
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// 写当前 CPU 的 FS 段基址(IA32_FS_BASE)为 base。
+///
+/// 每线程 FS base = 指向其用户态 TCB(T2-1 errno 槽 / T2-2 TLS 区)；调度器在切出归档、
+/// 切入恢复(镜像 FPU eager save/restore 点)。内核本身不依赖 FS base，故可在返回用户态
+/// 前的切换点提前设置(与 fpu::restore 同款时机)，无害。
+#[inline]
+pub fn write_fs_base(base: u64) {
+    let lo = base as u32;
+    let hi = (base >> 32) as u32;
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") MSR_FS_BASE,
+            in("eax") lo,
+            in("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}

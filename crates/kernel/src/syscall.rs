@@ -1671,18 +1671,23 @@ fn sys_task_wait(frame: &mut SyscallFrame) -> DispatchResult {
 /// 派生一个同组新调度单元（线程）。以调用方自身进程的 tgid（组长 pid）为组长调
 /// `task::spawn_thread_with`，复用其 Arc 地址空间/组容器。参数为裸 u64（PRE-6）：
 /// - `a1` = 线程入口 RIP；
-/// - `a2` = 线程用户栈顶（用户态已 mmap 的独立栈区）。
+/// - `a2` = 线程用户栈顶（用户态已 mmap 的独立栈区）；
+/// - `a3` = （可选，T2-0/ADR-035 D6）初始 rdi（starter 指针）：供 libc/libpthread 线程引导
+///   经 `initial_frame` 把 starter 块地址置入新线程首跑 `rdi`，据此定位其 TCB/参数。
+///   默认 0（兼容 T1 无引导调用：现有 threaddemo 等不传 a3 → 首跑 rdi=0）。
 /// name 固定传字面量 `"thread"`（经 `store_name` 拷入 PCB 定长缓冲，无 copyin/无越界）。
 /// 返回组员 pid（rax）；不阻塞（永不 Switched）。组长不存在/已退 → NotFound，分配失败 → OutOfMemory。
 /// 借用在进入 `task::*` 前释放（task1 KA3：先取 tgid 值再调 spawn_thread_with）。
 fn sys_thread_spawn(frame: &mut SyscallFrame) -> u64 {
     let entry = frame.a1;
     let user_stack_top = frame.a2;
+    // T2-0：a3 = 初始 rdi（starter/TCB 引导指针），经 initial_frame 置入新线程首跑 rdi。
+    let starter = frame.a3;
     // 先取 tgid（借用立即结束），随后释放借用再调 spawn_thread_with（KA3：借用不跨越调度调用）。
     let Some(tgid) = current_proc_mut().map(|p| p.tgid()) else {
         return pack_err(Error::NotFound);
     };
-    match task::spawn_thread_with(tgid, "thread", entry, user_stack_top) {
+    match task::spawn_thread_with(tgid, "thread", entry, user_stack_top, starter) {
         Ok(tid) => {
             klib::info!(
                 "[syscall] thread_spawn leader={} -> tid={} entry={:#x} stack={:#x}",

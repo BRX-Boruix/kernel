@@ -6,8 +6,9 @@
 /crates/kernel/volumed.elf
 /crates/kernel/synce2e.elf
 /crates/kernel/fpcheck.elf
+/crates/kernel/spinburn.elf
+/crates/kernel/threaddemo.elf
 # 内核符号表生成文件（SDK 二次编译生成，不提交）
 /crates/kernel/src/symbols_generated.rs
 # liveCD 内置用户程序 payload（SDK 构建生成，不提交）
 /crates/kernel/src/binaries_payload.rs
-/crates/kernel/spinburn.elf
