@@ -1,4 +1,4 @@
-﻿//! 内核启动自检测试。
+//! 内核启动自检测试。
 //!
 //! 这些测试在内核初始化流程的特定阶段被调用，验证物理页帧分配器、
 //! 虚拟内存页表、堆分配器与 LAPIC 时钟中断是否正确工作。
@@ -7897,6 +7897,67 @@ pub fn test_waitpid_core() {
     );
     arch_x86_64::interrupts::enable();
     info!("[test-waitpid-core] PASS");
+}
+
+/// 跨核收尸竞态（DESIGN §3.2/§5/§9）：就绪进程在"被选中后、提交切换前"被**另一核**
+/// 收尸（槽置 None）或置 Exit，切换路径必须丢弃该候选重选——绝不 `.expect panic`
+/// （旧 SMP 间歇冻结根因）、绝不把已回收/将死进程置 Running、绝不切进已回收槽(UAF)。
+///
+/// 表级驱动 [`scheduler::test_hooks::debug_commit_switch_table`]（prev=None 选择形态
+/// 的镜像：pop → `next_is_runnable` 闸门 → 置 Running）。单核夹具不跑物理 CR3/FPU 切换
+///（会破坏内核主线程上下文），物理链路由 SMP storm/QEMU 覆盖。
+/// 全程关中断（同 test_waitpid_core 纪律）。
+pub fn test_cross_core_reap_safety() {
+    use task::TaskState;
+    use task::scheduler::test_hooks as th;
+    info!("[test-reap-race] === cross-core reap of a ready pid must not panic / not schedule it ===");
+    arch_x86_64::interrupts::disable();
+    th::reset_all();
+
+    // ---- 1. 收尸到 None 的候选（最坏竞态）：槽已 freed，切换必须丢弃而非 .expect ----
+    // 模型：此核上一刻 pop_ready 选中 c（弹出、仍 Ready），下一刻另一核 terminate+reap
+    // 把 c 槽回收为 None。旧实现持槽锁 .expect("ready proc exists") → panic。
+    let p1 = th::spawn_named_child_of(0, "p1.elf").expect("spawn p1");
+    let c1 = th::spawn_named_child_of(p1, "c1.elf").expect("spawn c1");
+    assert_eq!(th::terminate(c1, 7), "zombie", "exit to zombie");
+    assert_eq!(th::try_reap(p1, c1).ok(), Some((c1, 7)), "reap frees slot");
+    assert!(th::probe(c1).is_none(), "reaped slot must be None");
+    // 把已回收 pid 放进就绪队列（跨核收尸残留的陈旧队首），驱动表级提交：
+    assert!(
+        th::debug_commit_switch_table(&[c1]).is_none(),
+        "reaped-to-None candidate must be skipped -> Empty, not panic"
+    );
+    assert!(th::probe(c1).is_none(), "freed slot stays freed (never resurrected)");
+    info!("[test-reap-race] reaped->None candidate skipped, no panic OK");
+
+    // ---- 2. 置 Exit 但尚未收尸的候选：切换不得把它置 Running（复活将死进程）----
+    let p2 = th::spawn_named_child_of(0, "p2.elf").expect("spawn p2");
+    let c2 = th::spawn_named_child_of(p2, "c2.elf").expect("spawn c2");
+    assert_eq!(th::terminate(c2, 42), "zombie", "exit to zombie");
+    // 陈旧队首 = 已 Exit 的 c2：必须丢弃（next_is_runnable 判 Exit 不通过）。
+    assert!(
+        th::debug_commit_switch_table(&[c2]).is_none(),
+        "Exit candidate must be skipped -> Empty, not scheduled"
+    );
+    let (st, _, _, _, _) = th::probe(c2).expect("Exit zombie still in slot");
+    assert_eq!(st, TaskState::Exit, "Exit zombie must stay Exit, not be set Running");
+    info!("[test-reap-race] Exit candidate skipped, state preserved OK");
+
+    // ---- 3. 正控 + 混合队列：跳过死候选后切到健康进程；死候选永不被置 Running ----
+    let h1 = th::spawn_named_child_of(0, "h1.elf").expect("spawn healthy h1");
+    let committed = th::debug_commit_switch_table(&[c2, h1]).expect("healthy proc must be picked");
+    assert_eq!(committed, h1, "must skip Exit zombie and commit the healthy proc");
+    let (st_h, _, _, _, _) = th::probe(h1).expect("h1 probed");
+    assert_eq!(st_h, TaskState::Running, "picked healthy proc must be Running");
+    let (st_c, _, _, _, _) = th::probe(c2).expect("c2 still in slot");
+    assert_eq!(st_c, TaskState::Exit, "skipped Exit zombie must never be set Running");
+    info!("[test-reap-race] mixed queue: dead skipped, healthy committed OK");
+
+    // ---- 清场 ----
+    let cleared = th::reset_all();
+    info!("[test-reap-race] cleanup: cleared {} test procs", cleared);
+    arch_x86_64::interrupts::enable();
+    info!("[test-reap-race] PASS");
 }
 
 /// S26 回归：`block_current_with` 登记点失败不得丢失已弹出的就绪进程。

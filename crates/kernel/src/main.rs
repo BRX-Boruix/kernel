@@ -1,4 +1,4 @@
-﻿#![no_std]
+#![no_std]
 #![no_main]
 
 extern crate alloc;
@@ -606,6 +606,11 @@ unsafe fn kmain_body() -> ! {
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();
+
+    // 跨核收尸竞态（DESIGN §3.2/§9）：就绪进程被选中后被另一核收尸/置 Exit，
+    // 切换路径丢弃重选不 panic（纯表级，返回主流程继续启动）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_cross_core_reap_safety();
 
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]

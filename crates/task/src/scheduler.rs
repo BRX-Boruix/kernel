@@ -1,4 +1,4 @@
-﻿//! 调度器（M4.2）：多进程 RR 轮转。
+//! 调度器（M4.2）：多进程 RR 轮转。
 //!
 //! 进程在**用户态**被 LAPIC 定时器中断（IRQ0，100Hz）周期性打断，进入内核后
 //! 由 [`tick`] 做时间片切换（ADR-017：内核态被打断的 tick 直接忽略，被动抢占
@@ -734,34 +734,36 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
     }
     run.ready.push_back(cur_pid);
 
-    // 从就绪队列取下一个。
-    let Some(next_pid) = run.ready.pop_front() else {
-        return; // 无可调度进程
-    };
-
-    if cur_pid == next_pid {
-        // 仅当前进程自身：不切换，恢复 Running 继续。
-        {
-            let mut g = proc_bucket_lock(next_pid);
-            if let Some(slot) = g.get_mut(&next_pid) {
+    // 统一"选 next + 原子提交切换"原语：从就绪队列弹候选、持 next 桶锁判存在+Ready 后
+    // 原子置 Running+*frame=saved 并物理切入（FPU/CR3/RSP0/CURRENT 单点收口）。跨核收尸
+    // 竞态修复：候选在被 reap(槽 None)/置 Exit 时被丢弃重选，绝不 .expect panic；next 桶锁
+    // 贯穿切换结束，杜绝窗口 B（提交与 cpu 切换之间再被 reap/置 Exit 的二次 .expect :770）。
+    // prev=Some(cur)、exclude=MAX：cur 刚被入队(735)，弹回自身(仅剩 cur)即 NothingSelf。
+    match pop_and_commit_switch(&mut run, frame, Some(cur_pid), usize::MAX) {
+        NextCommit::Switched => return, // *frame 已改，由中断返回路径 iret 切入 next
+        NextCommit::NothingSelf => {
+            // 弹回自身(仅当前进程)：不切换，恢复 Running 继续。与旧 cur==next 分支等价。
+            let mut g = proc_bucket_lock(cur_pid);
+            if let Some(slot) = g.get_mut(&cur_pid) {
                 slot.proc.set_state(TaskState::Running);
             }
+            return;
         }
-        return;
+        // Empty 理论不可达(cur 已入队 735，非 exclude，必先被弹回为 NothingSelf)；仅当 cur
+        // 中途也被跨核 reap(顶部 :709/:724 守卫已先行处理)才可能到达——防御性返回即可
+        // (cur 若已消失已由守卫 go_idle/deschedule 接管；此处 cur 仍在队则留待下轮 tick)。
+        NextCommit::Empty => return,
     }
-
-    // 切换到 next 进程（FPU 现场 + CR3/RSP0/CURRENT 单点收口）。
-    {
-        let mut g = proc_bucket_lock(next_pid);
-        let slot = g.get_mut(&next_pid).expect("ready proc exists");
-        slot.proc.set_state(TaskState::Running);
-        *frame = slot.saved;
-    }
-    cpu_switch_locked(&mut run, Some(cur_pid), next_pid);
 }
 
 /// 切入 next 进程的共享收口：以已持有的 next per-pid 锁完成 FPU 恢复、CR3/RSP0
-/// 切换与 CURRENT/current 更新。仅由 [`cpu_switch_locked`] 调用（此时 `next` 锁已持）。
+/// 切换与 CURRENT/current 更新。调用方（[`commit_same_lock`]）须已持 next 所在桶锁，
+/// 并已在该锁内完成"校验存在+Ready、置 Running、*frame=saved"——本函数只做物理切换。
+///
+/// 跨核收尸竞态修复（DESIGN-cross-core-reap-switch-race §3.3）：本函数在整个切换期间
+/// 持续持有 next 桶锁（gnext），与 terminate(置 Exit)/reap(take None) 对 next 的桶锁互斥，
+/// 故此处 `.expect` 恒真（锁内槽必在、必非被 reap/置 Exit）。不再有旧实现里
+/// "提交 expect 释放桶锁 -> cpu_switch_locked 二次取 next 桶锁"的窗口 B。
 fn switch_apply_next(
     next: usize,
     gnext: &mut IrqSpinLockGuard<'static, BTreeMap<usize, Box<ProcEntry>>>,
@@ -778,38 +780,121 @@ fn switch_apply_next(
     set_current_proc(proc_ptr);
 }
 
-/// 锁内完整 CPU 现场切换单点（task1 K2 收口）：FPU 保存/恢复 +
-/// CR3/RSP0/CURRENT 更新。调用方须已持有本核 RUN 域（传入 reborrow）并完成
-/// `*frame` 替换与状态迁移；`prev` 为被切出进程 pid（槽位必须仍存在），
-/// `next` 为切入进程。per-pid 化：本函数自行取 `prev`/`next` 的 per-pid 锁
-/// （两 pid 同持时按 **pid 升序** 取，绝不同时反向持锁），切换期间不释放。
-fn cpu_switch_locked(run: &mut PerCpuRun, prev: Option<usize>, next: usize) {
-    // FPU eager 全量保存/恢复（K2）。per-pid 化：`prev` 与 `next` 两个 pid 的锁在本
-    // 区域同时持有，且按 **pid 升序** 获取（绝不同时持低 pid 锁去等更高被占锁；
-    // prev == next 不会到达本函数——各切换点早已处理“仅当前进程自身”分支返回）。
-    // prev 的 FPU 保存必须发生在 restore(next) 之前，故两锁同持后先存 prev 再切 next。
+/// 单候选提交结果（[`commit_next`]）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CommitNext {
+    /// 已把 next 完整切入（*frame 已整体改写为 next.saved；next 桶锁贯穿到切换结束）。
+    Done,
+    /// next 候选在持锁校验时已不存在（被跨核 reap，槽 None）或已 Exit——不可切；
+    /// 本候选被丢弃（不重放）。prev 的 FPU 从未被 save，回滚无副作用。
+    Invalid,
+}
+
+/// [`commit_next`] 使用的"单候选有效"判定：next 槽存在且 state==Ready（可切入的唯一合法态）。
+fn next_is_runnable(g: &BTreeMap<usize, Box<ProcEntry>>, next: usize) -> bool {
+    g.get(&next).is_some_and(|s| s.proc.state() == TaskState::Ready)
+}
+
+/// 在**已持 next 桶锁 g** 下完成"置 Running + *frame=saved + switch_apply_next"。
+/// 调用方保证 next 存在+Ready（已在 [`commit_next`] 校验），故此处 get_mut 恒真。
+/// g 贯穿到物理切换结束，杜绝窗口 B（提交与切换之间再被 reap/置 Exit）。
+fn commit_same_lock(
+    run: &mut PerCpuRun,
+    frame: &mut InterruptFrame,
+    next: usize,
+    g: &mut IrqSpinLockGuard<'static, BTreeMap<usize, Box<ProcEntry>>>,
+) {
+    let slot = g.get_mut(&next).expect("next just validated");
+    slot.proc.set_state(TaskState::Running);
+    *frame = slot.saved;
+    switch_apply_next(next, g, run);
+}
+
+/// 把单个候选 next"校验存在+Ready -> (切走方 prev 的 FPU 归档，若存在) -> next 置 Running
+/// -> *frame=saved -> FPU/CR3/RSP0/CURRENT 切换"在同一把/两把 per-pid 桶锁临界区内原子完成。
+///
+/// 跨核收尸竞态修复（DESIGN §3.3）：判 next 状态与 terminate(置 Exit)/reap(take None) 对
+/// next 的桶锁原子互斥——锁内看到的 next 状态稳定、不会在他核翻转。next 桶锁**贯穿到物理
+/// 切换结束**（经 [`commit_same_lock`]/[`switch_apply_next`]），绝不在"置 Running+读 saved"
+/// 与 CPU 切换之间释放重取（消除窗口 B 及 :770 的二次 .expect 竞争）。
+///
+/// 锁序（防 ABBA）：prev==None 只持 next 桶；prev==Some 且与 next 同桶只持一桶；不同桶则按
+/// **pid 升序**两桶同持（先 pid 小者）。校验失败（Invalid）时 prev 的 FPU **从未被 save**——
+/// 不产生陈旧 FPU 快照；调用方丢弃该候选重选，无残留锁。prev 的 FPU 只在确认"本次确实切走"
+/// 后归档（旧 `cpu_switch_locked` 的语义并入本函数）。
+fn commit_next(
+    run: &mut PerCpuRun,
+    frame: &mut InterruptFrame,
+    prev: Option<usize>,
+    next: usize,
+) -> CommitNext {
     match prev {
+        // prev=None：切走方已脱机/已置 Blocked（其浮点现场由阻塞/退出路径显式归档），
+        // 无 prev 桶锁。只持 next 桶完成校验+提交+切换。
         None => {
-            let mut gnext = proc_bucket_lock(next);
-            switch_apply_next(next, &mut gnext, run);
-        }
-        Some(pid) if pid_bucket(pid) == pid_bucket(next) => {
-            // prev/next 同桶：只需一把桶锁，先存 prev 的 FPU 再恢复 next。
             let mut g = proc_bucket_lock(next);
-            if let Some(slot) = g.get_mut(&pid) { fpu::save(&mut slot.fpu); }
-            switch_apply_next(next, &mut g, run);
+            if !next_is_runnable(&g, next) { return CommitNext::Invalid; }
+            commit_same_lock(run, frame, next, &mut g);
+            CommitNext::Done
         }
+        // prev/next 同桶：单桶锁。先校验 next，再归档 prev FPU，再切入。
+        Some(pid) if pid_bucket(pid) == pid_bucket(next) => {
+            let mut g = proc_bucket_lock(next);
+            if !next_is_runnable(&g, next) { return CommitNext::Invalid; }
+            if let Some(ps) = g.get_mut(&pid) { fpu::save(&mut ps.fpu); }
+            commit_same_lock(run, frame, next, &mut g);
+            CommitNext::Done
+        }
+        // prev 桶号更小：按 pid 升序先取 prev 桶、再取 next 桶。
         Some(pid) if pid_bucket(pid) < pid_bucket(next) => {
             let mut gprev = proc_bucket_lock(pid);
             let mut gnext = proc_bucket_lock(next);
-            if let Some(slot) = gprev.get_mut(&pid) { fpu::save(&mut slot.fpu); }
-            switch_apply_next(next, &mut gnext, run);
+            if !next_is_runnable(&gnext, next) { return CommitNext::Invalid; }
+            if let Some(ps) = gprev.get_mut(&pid) { fpu::save(&mut ps.fpu); }
+            commit_same_lock(run, frame, next, &mut gnext);
+            CommitNext::Done
         }
+        // prev 桶号更大：按 pid 升序先取 next 桶、再取 prev 桶（next 桶仍贯穿切换）。
         Some(pid) => {
             let mut gnext = proc_bucket_lock(next);
             let mut gprev = proc_bucket_lock(pid);
-            if let Some(slot) = gprev.get_mut(&pid) { fpu::save(&mut slot.fpu); }
-            switch_apply_next(next, &mut gnext, run);
+            if !next_is_runnable(&gnext, next) { return CommitNext::Invalid; }
+            if let Some(ps) = gprev.get_mut(&pid) { fpu::save(&mut ps.fpu); }
+            commit_same_lock(run, frame, next, &mut gnext);
+            CommitNext::Done
+        }
+    }
+}
+
+/// 统一"选 next + 原子提交切换"原语（DESIGN §3.2）：从本核就绪队列依次弹出候选，
+/// 跳过 exclude，对每个候选经 [`commit_next`] 做存在+Ready 校验并原子切入；无效(被跨核
+/// reap/置 Exit)候选被**丢弃不重放**（I1），继续弹下一候选，队列耗尽返回 Empty。
+///
+/// 调用方持本核 RUN 域（reborrow 传入）。`prev` = 被切出进程 pid（prev=None 表示切走方
+/// 已脱机/置 Blocked/Exit，本核已在安全栈）；`exclude` = 需跳过的自身 pid（如 waitpid）。
+/// 返回 Switched 表示已真切入某 next（*frame 已整体改写，调用方不得再触碰）；返回 Empty
+/// 表示就绪队列无可提交候选（原"空队列/无可切"语义，调用方按其各自收尾处理）；返回
+/// NothingSelf 表示弹出的是 prev(cur 自身)（仅 tick/yield 等把 cur 入队的场景可达），调用方
+/// 恢复 cur Running 并走"仅剩自身"收尾，避免 CPU 自切空转。
+enum NextCommit { Switched, Empty, NothingSelf }
+
+fn pop_and_commit_switch(
+    run: &mut PerCpuRun,
+    frame: &mut InterruptFrame,
+    prev: Option<usize>,
+    exclude: usize,
+) -> NextCommit {
+    loop {
+        let Some(next) = run.ready.pop_front() else { return NextCommit::Empty };
+        if next == exclude { continue; }
+        if prev == Some(next) {
+            // 弹回被切出进程自身（cur，仅当其被重新入队如 tick/yield 才会发生）：不切换。
+            // 调用方据此把 cur 恢复 Running 并回 NotSwitched/自恢复；*frame 未被改写。
+            return NextCommit::NothingSelf;
+        }
+        match commit_next(run, frame, prev, next) {
+            CommitNext::Done    => return NextCommit::Switched, // 已切入，桶锁已释放
+            CommitNext::Invalid => { /* 无效丢弃，不重放；prev 未 save，可安全重选 */ }
         }
     }
 }
@@ -855,31 +940,22 @@ pub fn yield_now(frame: &mut InterruptFrame) -> SwitchOutcome {
     }
     run.ready.push_back(cur_pid);
 
-    // 从就绪队列取下一个。
-    let Some(next_pid) = run.ready.pop_front() else {
-        return SwitchOutcome::NotSwitched; // 无可调度进程（不应发生）
-    };
-
-    if cur_pid == next_pid {
-        // 仅当前进程自身：无可让出，恢复 Running 继续。
-        {
-            let mut g = proc_bucket_lock(next_pid);
-            if let Some(slot) = g.get_mut(&next_pid) {
+    // 统一"选 next + 原子提交切换"原语（同 tick）。跨核收尸竞态修复：候选被 reap/置 Exit
+    // 时丢弃重选，绝不 .expect panic；next 桶锁贯穿切换结束，杜绝窗口 B。
+    // prev=Some(cur)、exclude=MAX：cur 刚入队，弹回自身(仅剩 cur)即 NothingSelf -> 无可让出。
+    match pop_and_commit_switch(&mut run, frame, Some(cur_pid), usize::MAX) {
+        NextCommit::Switched => SwitchOutcome::Switched, // *frame 已改，调用方须按已切换收尾
+        NextCommit::NothingSelf => {
+            // 仅当前进程自身：无可让出，恢复 Running 继续（与旧 cur==next 分支等价）。
+            let mut g = proc_bucket_lock(cur_pid);
+            if let Some(slot) = g.get_mut(&cur_pid) {
                 slot.proc.set_state(TaskState::Running);
             }
+            SwitchOutcome::NotSwitched
         }
-        return SwitchOutcome::NotSwitched;
+        // Empty 理论不可达(cur 已入队 940，非 exclude)；防御性 NotSwitched（同旧空队分支）。
+        NextCommit::Empty => SwitchOutcome::NotSwitched,
     }
-
-    // 切换到 next 进程（与 tick 相同的切换逻辑）。
-    {
-        let mut g = proc_bucket_lock(next_pid);
-        let slot = g.get_mut(&next_pid).expect("ready proc exists");
-        slot.proc.set_state(TaskState::Running);
-        *frame = slot.saved;
-    }
-    cpu_switch_locked(&mut run, Some(cur_pid), next_pid);
-    SwitchOutcome::Switched
 }
 
 /// 阻塞当前进程（IPC 等待用）：保存帧并置 `Blocked`，切换到下一个就绪进程。
@@ -954,7 +1030,7 @@ enum BlockResume {
 /// `block_for_kbd` / `block_for_event` 的"无就绪进程可切"分支（`pop_ready` 返回
 /// None）不再"halt 只等自己"（旧实现仅检查 `ready.contains(&cur_pid)`），而是：
 /// **当就绪队列出现任一进程（自己或其它）时，用 frame-based 切换让出 CPU**——
-/// 与既有 `Some(next)` 分支完全同构（`cpu_switch_locked(None, next)` + iret），
+/// 与既有 `Some(next)` 分支完全同构（`pop_and_commit_switch(None, _)` + iret），
 /// 自己保持 Blocked + 等待者登记。只有就绪队列确实为空才 `halt`（此时无任何
 /// 可调度进程，halt 合理，绝无忙转）。
 ///
@@ -964,7 +1040,7 @@ enum BlockResume {
 /// 生产路径恒为空（`process.rs` `TaskContext::empty()`），`arch::task::switch_to`
 /// 当前仅内核自测使用。因此 ADR-031 原拟的 `switch_to` 版 `schedule_from_block`
 /// （切到**用户态就绪进程**的内核 `TaskContext`）会跳到空上下文崩溃，与现有
-/// frame-resume 模型不兼容；正确实现是复用 frame-based `cpu_switch_locked`，
+/// frame-resume 模型不兼容；正确实现是复用 frame-based 切换原语（`commit_next`/`pop_and_commit_switch`），
 /// 保证与 tick/yield/block_current/exit_current 的既有切换机制完全一致、可回滚。
 ///
 /// 上下文约定：调用方须已 `drop` 本核 RUN 锁与所持 per-pid 锁并处于中断**已使能**
@@ -974,53 +1050,42 @@ enum BlockResume {
 /// 的返回现场一致，供调用方在 syscall 层 iret 前保持）。
 ///
 /// `prev=None` 纪律：cur_pid 是等待者，其浮点现场已在置 Blocked 前由调用方显式
-/// `fpu::save`（PRE-1），切走时 `cpu_switch_locked(None, _)` 不重复归档。
+/// `fpu::save`（PRE-1），切走时 `commit_next(None, _)` 不重复归档。
 fn schedule_from_block(frame: &mut InterruptFrame, cur_pid: usize) -> BlockResume {
-    // 等就绪队列出现任一进程（自己或其它）。每次 halt 直到中断到达（绝不忙转）。
     // A4：等待期间本核可能被跨核 SIGKILL+收尸 cur_pid（Blocked 中自杀式场景），
     // 故停车等队列前先切 CR3 到内核根，避免本核 CR3 悬在可能被回收的进程表上。
     arch_x86_64::paging::switch_to_kernel_root();
-    arch_x86_64::interrupts::enable();
     loop {
-        // 纯 RUN 探测：短暂取本核 RUN 域（IrqSpinLock ⇒ 检查瞬间 IF 屏蔽）。
-        let nonempty = !run(my_cpu_slot()).ready.is_empty();
-        if nonempty {
-            break;
+        // 等就绪队列出现任一进程（自己或其它）。每次 halt 直到中断到达（绝不忙转）。
+        arch_x86_64::interrupts::enable();
+        loop {
+            // 纯 RUN 探测：短暂取本核 RUN 域（IrqSpinLock ⇒ 检查瞬间 IF 屏蔽）。
+            let nonempty = !run(my_cpu_slot()).ready.is_empty();
+            if nonempty { break; }
+            arch_x86_64::interrupts::halt();
         }
-        arch_x86_64::interrupts::halt();
-    }
-    arch_x86_64::interrupts::disable();
-    // per-pid（a）：只取 next 的 per-pid 锁 + 本核 RUN 域，无全局 PROCS。
-    let mut run = run_mut(my_cpu_slot());
-    if run.ready.contains(&cur_pid) {
-        // 自己已就绪（被键盘/事件唤醒入队）：专门取出自己，放回其它就绪进程。
-        // 队列头可能被并发入队的其它 Ready 进程占据，extract_from_ready 保证
-        // 只取 cur_pid 而不误切（O1 竞争面，既有自唤醒纪律）。
-        let next = extract_from_ready(&mut run, cur_pid).expect("woken waiter in ready");
-        {
-            let mut g = proc_bucket_lock(next);
-            let slot = g.get_mut(&next).expect("woken proc exists");
-            slot.proc.set_state(TaskState::Running);
-            *frame = slot.saved;
+        arch_x86_64::interrupts::disable();
+        // per-pid（a）：只取本核 RUN 域；逐候选经统一 commit 提交切换。
+        let mut run = run_mut(my_cpu_slot());
+        // SwitchedSelf 主路径：cur_pid 已被唤醒入队，先尝试切回自身。持 RUN 下
+        // contains/extract 连续（reap 移出就绪也须本核 RUN，被本锁阻断），故 cur 必被取出。
+        if run.ready.contains(&cur_pid) {
+            let c = extract_from_ready(&mut run, cur_pid).expect("woken waiter in ready");
+            // 跨核收尸竞态修复：cur(被唤醒等待者)在提取后仍可能被收尸(reap 只取 cur 桶锁
+            // 不依赖 RUN)——commit_next 在持 cur 桶锁下重判存在+Ready；无效(cur 槽 None/置
+            // Exit)则丢弃(其 KBD/EVENT 登记已被 kill_pid 清理 :2500-2514)，落空后切其它或
+            // 重启等待(等同 SwitchedOther 语义)，绝不 .expect panic / 切进已回收槽。
+            if commit_next(&mut run, frame, None, c) == CommitNext::Done {
+                drop(run);
+                return BlockResume::SwitchedSelf; // 中断保持已禁用(返回现场契约)
+            }
         }
-        cpu_switch_locked(&mut run, None, next);
-        drop(run);
-        BlockResume::SwitchedSelf
-    } else {
-        // 就绪队列非空但自己不在其中：是**另一个**就绪进程（如被 tick/超时/事件
-        // 并发唤醒的其它等待者）。切到它，自己保持 Blocked + 等待者登记不变。
-        // 既然队列非空且不含 cur_pid，必存在有效 Ready 项（wake_kbd/wake_event
-        // 只入队有效进程）；pop_ready 返回的即是队头有效进程。
-        let next = pop_ready(&mut run, usize::MAX).expect("ready non-empty");
-        {
-            let mut g = proc_bucket_lock(next);
-            let slot = g.get_mut(&next).expect("ready proc exists");
-            slot.proc.set_state(TaskState::Running);
-            *frame = slot.saved;
+        // SwitchedOther：切任一剩余有效进程；自己(cur)保持 Blocked+登记不变(若 cur 尚存活)
+        // 或已被收尸(登记已清)。无效候选被 commit 丢弃重选；队列又空/无可切则回外层等待。
+        match pop_and_commit_switch(&mut run, frame, None, usize::MAX) {
+            NextCommit::Switched => { drop(run); return BlockResume::SwitchedOther; }
+            _ => { drop(run); continue; } // Empty/NothingSelf：无可切，重新 enable+halt 等待
         }
-        cpu_switch_locked(&mut run, None, next);
-        drop(run);
-        BlockResume::SwitchedOther
     }
 }
 
@@ -1049,7 +1114,19 @@ pub fn block_current(frame: &mut InterruptFrame) -> SwitchOutcome {
             return SwitchOutcome::Switched;
         }
     }
-    block_current_locked(&mut run, frame, &mut || true)
+    let out = block_current_locked(&mut run, frame, &mut || true);
+    // 二次兜底：block_current_locked 内 cur 才被跨核 SIGKILL 成 Exit（A3 竞态）时返回
+    // NotSwitched；此处持有 owned RUN，重查后经 deschedule_exit_current 正确脱机。
+    if out == SwitchOutcome::NotSwitched {
+        if let Some(cp) = run.current {
+            if current_is_exit(cp) {
+                drop(run);
+                deschedule_exit_current(frame, cp);
+                return SwitchOutcome::Switched;
+            }
+        }
+    }
+    out
 }
 
 /// 原子阻塞变体（ipc1 IA2a / 审计 R6-F2）：与 [`block_current`] 相同的阻塞
@@ -1080,11 +1157,23 @@ pub fn block_current_with(
             return SwitchOutcome::Switched;
         }
     }
-    block_current_locked(&mut run, frame, register)
+    let out = block_current_locked(&mut run, frame, register);
+    // 二次兜底：block_current_locked 内 cur 才被跨核 SIGKILL 成 Exit（A3 竞态）时返回
+    // NotSwitched；此处持有 owned RUN，重查后经 deschedule_exit_current 正确脱机。
+    if out == SwitchOutcome::NotSwitched {
+        if let Some(cp) = run.current {
+            if current_is_exit(cp) {
+                drop(run);
+                deschedule_exit_current(frame, cp);
+                return SwitchOutcome::Switched;
+            }
+        }
+    }
+    out
 }
 
 /// 共享阻塞主体：`s` 必须已锁；`register` 在确认存在可切换目标后、置
-/// Blocked 前执行。prev=Some(cur) 交由 cpu_switch_locked 归档浮点现场
+/// Blocked 前执行。prev=Some(cur) 的浮点现场归档由 commit_next 单点完成
 /// （审计 R5-F1 纪律在阻塞路径的原生形态）。
 fn block_current_locked(
     run: &mut PerCpuRun,
@@ -1094,66 +1183,77 @@ fn block_current_locked(
     let Some(cur_pid) = run.current else {
         return SwitchOutcome::NotSwitched; // 内核 idle/主线程不参与阻塞
     };
-    // 取下一个有效就绪进程（跳过已退出残留引用）。无同伴则不登记、不阻塞：
-    // 强行阻塞将无人唤醒（自锁），调用方应返回 WouldBlock。
-    let Some(next_pid) = pop_ready(run, usize::MAX) else {
-        return SwitchOutcome::NotSwitched;
-    };
-    if cur_pid == next_pid {
-        // 仅当前进程自身：不阻塞（保持 Running 继续）。
-        {
-            let mut g = proc_bucket_lock(next_pid);
-            if let Some(slot) = g.get_mut(&next_pid) {
-                slot.proc.set_state(TaskState::Running);
-            }
+    // 预检：须存在至少一个非 cur 的就绪候选才可能阻塞（无同伴则调用方 WouldBlock，
+    // 绝不置 Blocked 后无人接盘 CPU 而自锁）。pop_ready 已滤 Exit/None 并返回首个有效项；
+    // 按其桶锁再确认存在+Ready（§6d 预检，缩小"register 后 peer 才失效"的回滚面）。
+    let mut peer = loop {
+        let Some(p) = pop_ready(run, usize::MAX) else {
+            return SwitchOutcome::NotSwitched;
+        };
+        if proc_bucket_lock(p).get(&p).is_some_and(|s| s.proc.state() == TaskState::Ready) {
+            break p;
         }
-        return SwitchOutcome::NotSwitched;
-    }
+        // p 已 Exit/被 reap：pop_ready 弹出但随即失效，丢弃重选（I1，不重放）。
+    };
     // 登记点必须与唤醒方（wake/wake_with_value 持目标 pid 锁）原子互斥，故持
     // cur 的 per-pid 锁执行 register + 置 Blocked；失败即整体放弃，现场未动。
     {
         let mut gcur = proc_bucket_lock(cur_pid);
         // 修复 B（锁内兜底）：公共入口检查之后、置 Blocked 之前，本进程仍可能被
         // 跨核 SIGKILL（terminate_locked 只取 cur 锁即置 Exit，不依赖本核 RUN）。
-        // 持 cur 锁在此原子判 Exit：若已 Exit，绝不登记/置 Blocked，改为把已弹出的
-        // 同伴 next_pid 切上 CPU、自身脱机（prev=None；Exit 进程不得 stay Running）。
+        // 持 cur 锁在此原子判 Exit：若已 Exit，绝不登记/置 Blocked（会覆写 Exit → 复活、
+        // 永不成为可收尸 zombie）。把预检弹出的同伴 peer 放回就绪队列(不饿死它)，返回
+        // NotSwitched 由调用方(wrapper)在收到 NotSwitched 后重查 cur Exit，命中则 drop
+        // owned RUN 经 deschedule_exit_current 正确脱机(其 owns run、空队 go_idle_on_own_stack
+        // 语义正确)——本函数只持 reborrow，不能在此 go_idle(会留下 caller 的 RUN 未释放)。
         if gcur.get(&cur_pid).is_some_and(|s| s.proc.state() == TaskState::Exit) {
-            drop(gcur); // 释放 cur 锁后再 cpu_switch_locked（其内部须取 next 锁）
-            run.current = None;
-            clear_current_proc();
-            {
-                let mut g = proc_bucket_lock(next_pid);
-                let slot = g.get_mut(&next_pid).expect("ready proc exists");
-                slot.proc.set_state(TaskState::Running);
-                *frame = slot.saved;
-            }
-            cpu_switch_locked(run, None, next_pid);
-            return SwitchOutcome::Switched;
+            drop(gcur);
+            run.ready.push_back(peer);
+            return SwitchOutcome::NotSwitched;
         }
         if !register() {
-            // S26 回归：`next_pid` 已在上方被 `pop_ready` 弹出（仍为 Ready 态），
+            // S26 回归：`peer` 已在上方被 `pop_ready` 弹出（仍为 Ready 态），
             // 若直接返回将永久丢失该就绪进程（无人重新入队 → 饿死）。
             // 必须把它放回就绪队列，保证"登记失败零副作用"成立。
-            run.ready.push_back(next_pid);
+            run.ready.push_back(peer);
             return SwitchOutcome::NotSwitched;
         }
         if let Some(slot) = gcur.get_mut(&cur_pid) {
             slot.saved = *frame;
             slot.proc.set_state(TaskState::Blocked);
-            // 浮点归档不在此处执行：cpu_switch_locked(prev=Some) 是唯一的 prev
-            // 现场快照点（审计 R6-F3 附带消除双重 fxsave 冗余——两次 save 之间
-            // 虽无内核代码触碰 XMM（sdk/check-no-sse.py 已证），但冗余写会让
-            // "哪一次是权威归档"变得不可辨认）。
+            // 浮点归档不在此处执行：commit_next(prev=Some) 是唯一的 prev 现场快照点
+            //（审计 R6-F3 附带消除双重 fxsave 冗余——两次 save 之间虽无内核代码触碰 XMM
+            //（sdk/check-no-sse.py 已证），但冗余写会让"哪一次是权威归档"不可辨认）。
         }
     }
-    {
-        let mut g = proc_bucket_lock(next_pid);
-        let slot = g.get_mut(&next_pid).expect("ready proc exists");
-        slot.proc.set_state(TaskState::Running);
-        *frame = slot.saved;
+    // 已置 cur Blocked（register 可能已登记等待者，必有待决唤醒）。切到 peer(prev=Some(cur))：
+    // commit_next 在持 peer 桶锁下重判存在+Ready——若 peer 被跨核 reap/置 Exit 则丢弃重选其它
+    // 就绪进程（不 .expect panic、不切进已回收槽）。
+    loop {
+        match commit_next(run, frame, Some(cur_pid), peer) {
+            CommitNext::Done => return SwitchOutcome::Switched,
+            CommitNext::Invalid => {
+                match pop_ready(run, usize::MAX) {
+                    Some(p) => peer = p,
+                    None => break, // 队列耗尽：见下方极端收尾
+                }
+            }
+        }
     }
-    cpu_switch_locked(run, Some(cur_pid), next_pid);
-    SwitchOutcome::Switched
+    // 极端竞态：register 已返回 true、cur 已置 Blocked 后，唯一同伴竟被跨核 reap 且就绪
+    // 队列耗尽（SMP 下极窄）。绝不让已 Blocked 的 cur 滞留 CPU 上假装阻塞（否则 saved/状态
+    // 与真实运行不一致），也不可进 idle(cur 非 KBD/EVENT waiter，其唤醒由 register 登记的
+    // IPC/timer 侧负责，但本核 CPU 须即刻交给其它进程——此处并无其它就绪进程，只能回滚
+    // cur 为 Running 交调用方处置(WouldBlock/Refused)）。注意：register 若已登记 opaque 等待者
+    // 则此回滚无法撤销其登记——对 sleep(定时器 wake(Running) 被忽略，无害)无碍；对 IPC 等待者
+    // 是"已登记但进程仍运行"的已知残留(见报告裁定项)。等价 waitpid revert，撤销 Blocked。
+    {
+        let mut gcur = proc_bucket_lock(cur_pid);
+        if let Some(slot) = gcur.get_mut(&cur_pid) {
+            slot.proc.set_state(TaskState::Running);
+        }
+    }
+    SwitchOutcome::NotSwitched
 }
 
 /// 阻塞等待键盘输入的进程 pid（`u32::MAX` 表示无）。`block_for_kbd` 以 CAS
@@ -1227,29 +1327,15 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
     run.current = None;
     clear_current_proc();
 
-    // 取下一个有效就绪进程切换（跳过已退出残留引用）。
-    match pop_ready(&mut run, usize::MAX) {
-        Some(next) => {
-            {
-                let mut g = proc_bucket_lock(next);
-                let slot = g.get_mut(&next).expect("ready proc exists");
-                slot.proc.set_state(TaskState::Running);
-                *frame = slot.saved;
-            }
-            cpu_switch_locked(&mut run, None, next);
-            BlockKbdOutcome::Switched // frame 已改，由 syscall_entry iret 切换
-        }
-        None => {
+    // 统一"选 next + 原子提交切换"原语（DESIGN §3.2）：cur 已 Blocked+脱机(prev=None、
+    // current=None、浮点现场已在上方显式 save)。候选被跨核 reap(槽 None)/置 Exit 时被丢弃
+    // 重选，绝不 .expect panic、不切进已回收槽；next 桶锁贯穿切换结束(杜绝窗口 B)。
+    // 队列耗尽(无就绪可切)则 drop RUN 走 schedule_from_block——park 本核等任一就绪进程
+    // (cur 被键盘唤醒即 resume)，只有就绪队列确实为空才 halt(ADR-031，绝无忙转)。
+    match pop_and_commit_switch(&mut run, frame, None, usize::MAX) {
+        NextCommit::Switched => BlockKbdOutcome::Switched, // frame 已改，由 syscall_entry iret 切换
+        NextCommit::Empty | NextCommit::NothingSelf => {
             drop(run);
-            // 无就绪进程可切（`pop_ready` 空）：不再"halt 只等自己"，改用
-            // `schedule_from_block`——当就绪队列出现**任一**进程（自己或其它）
-            // 时 frame-based 让出 CPU，自己保持 Blocked + KBD_WAITER 登记；
-            // 只有就绪队列确实为空才 halt（ADR-031，PRE-1 交接矩阵）。
-            //
-            // 审计 B17 单核不变式（S21 显式化）：本路径假设**全系统只有本核
-            // 执行调度决策**——KBD_WAITER 唯一等待者 + 调度仅 BSP tick/block
-            // 路径驱动（见 smp.rs AP 入口无 scheduler 接线）；若未来引入 AP
-            // 调度，本段必须先改造为跨核唤醒协议，否则切错进程 = 永久阻塞。
             match schedule_from_block(frame, cur_pid) {
                 // 切到其它就绪进程：自己仍 Blocked + KBD_WAITER 登记不变。
                 // 不清理登记——键盘尚未到达，后续 wake_kbd 仍需借登记唤醒本进程。
@@ -1377,7 +1463,7 @@ pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
         EVENT_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
         return SwitchOutcome::NotSwitched;
     }
-    // 置 Blocked 并保存现场。浮点现场由 cpu_switch_locked(prev=None) 路径在
+    // 置 Blocked 并保存现场。浮点现场由 commit_next(prev=None) 路径在
     // 唤醒后显式保存（同 block_for_kbd，K2 纪律），此处不重复归档。
     let cpu_slot = my_cpu_slot();
     // per-pid（a）：只取本核 RUN 域；cur 槽访问逐 pid 锁。
@@ -1393,54 +1479,33 @@ pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
     run.current = None;
     clear_current_proc();
 
-    // 取下一个有效就绪进程切换（跳过已退出残留引用）。
-    match pop_ready(&mut run, usize::MAX) {
-        Some(next) => {
-            {
-                let mut g = proc_bucket_lock(next);
-                let slot = g.get_mut(&next).expect("ready proc exists");
-                slot.proc.set_state(TaskState::Running);
-                *frame = slot.saved;
-            }
-            cpu_switch_locked(&mut run, None, next);
-            // NOTE：**此处不再 CAS 清除 EVENT_WAITER**。cpu_switch_locked 只更新
-            // 调度元数据（current/CR3/RSP0），不真正切换执行流——本分支在**切走时**
-            // 立即执行，若此时清 EVENT_WAITER 会抹掉本进程已登记的等待者身份，
-            // 导致后续事件发布时 wake_event 读到 MAX、无法唤醒本进程（ADR-030
-            // 热插拔端到端暴露：volumed 置 Blocked 后登记被误清，departed 滞留
-            // 无人消费，volumed 永久卡死）。EVENT_WAITER 的清除由唤醒方负责：
-            // 事件唤醒经 wake_event 的 swap；超时唤醒后由 event_wait_blocking 在
-            // 重新登记前显式清理残留（见该函数）。本处保持登记不变，事件才能到达。
+    // 统一"选 next + 原子提交切换"原语（DESIGN §3.2）：cur 已 Blocked+脱机(prev=None、
+    // current=None、浮点现场已显式 save)。候选被跨核 reap/置 Exit 时被丢弃重选，绝不
+    // .expect panic、不切进已回收槽；next 桶锁贯穿切换结束(杜绝窗口 B)。
+    // 队列耗尽(无就绪可切)则 drop RUN 走 schedule_from_block——park 本核等任一就绪进程
+    // (cur 被事件/超时唤醒即 resume)，只有就绪队列确实为空才 halt(ADR-031，绝无忙转)。
+    match pop_and_commit_switch(&mut run, frame, None, usize::MAX) {
+        NextCommit::Switched => {
+            // NOTE：**此处不再 CAS 清除 EVENT_WAITER**。切换只更新调度元数据
+            // (current/CR3/RSP0)，不真正改执行流——本分支在切走时立即执行，若此时清
+            // EVENT_WAITER 会抹掉本进程已登记的等待者身份，导致后续事件发布时 wake_event
+            // 读到 MAX、无法唤醒本进程(ADR-030 热插拔端到端暴露)。EVENT_WAITER 的清除由
+            // 唤醒方负责(事件唤醒经 wake_event 的 swap；超时唤醒后由 event_wait_blocking
+            // 重新登记前清理残留)。本处保持登记不变，事件才能到达。
             SwitchOutcome::Switched
         }
-        None => {
+        NextCommit::Empty | NextCommit::NothingSelf => {
             drop(run);
-            // 无就绪进程可切（`pop_ready` 空）：不再"halt 只等自己"，改用
-            // `schedule_from_block`——当就绪队列出现**任一**进程（自己或其它）
-            // 时 frame-based 让出 CPU，自己保持 Blocked + EVENT_WAITER 登记；
-            // 只有就绪队列确实为空才 halt（ADR-031，PRE-1 交接矩阵）。
-            //
-            // O1 竞争面（低，继承 B17 单核不变式但已消除）：事件路径有**事件 +
-            // 定时器两个唤醒源**，且全系统可能并存被键盘中断唤醒的键盘等待者
-            // （都在同一就绪队列）。`schedule_from_block` 在队列非空时经
-            // `extract_from_ready`（自己就绪时）或 `pop_ready`（其它进程就绪时）
-            // 精确切到目标，不会弹错队头切到无关进程。
-            //
-            // 审计 B17 单核不变式（S21 显式化）：调度仅 BSP tick/block 路径驱动
-            // （见 smp.rs AP 入口无 scheduler 接线）；若未来引入 AP 调度，
-            // 本段必须先改造为跨核唤醒协议。
             match schedule_from_block(frame, cur_pid) {
                 // 切到其它就绪进程：自己仍 Blocked + EVENT_WAITER 登记不变。
-                // **不清理登记**（与 Some 分支同一条纪律）：EVENT_WAITER 的清除
-                // 由唤醒方负责（事件唤醒经 wake_event 的 swap；超时唤醒后由
-                // event_wait_blocking 重新登记前清理残留）。此处若清掉登记，
-                // 后续事件发布时 wake_event 读到 MAX、无法唤醒本进程（ADR-030
-                // 热插拔端到端暴露的教训）。
+                // **不清理登记**(同 Switched 分支纪律)：EVENT_WAITER 的清除由唤醒方
+                // 负责。此处若清掉登记，后续事件发布时 wake_event 读到 MAX、无法唤醒
+                // 本进程(ADR-030 热插拔端到端暴露的教训)。
                 BlockResume::SwitchedOther => SwitchOutcome::Switched,
-                // 自己被事件/超时唤醒入队：切回自身。清理登记：事件唤醒已 swap
-                // 走 EVENT_WAITER（本 pid 不在），CAS 无效；超时唤醒走
-                // wake_event_timeout（EVENT_WAITER 仍指向本 pid），此 CAS 清除之，
-                // 保证后继新等待者不被"占位"拒之门外。
+                // 自己被事件/超时唤醒入队：切回自身。清理登记：事件唤醒已 swap 走
+                // EVENT_WAITER(本 pid 不在)，CAS 无效；超时唤醒走 wake_event_timeout
+                //(EVENT_WAITER 仍指向本 pid)，此 CAS 清除之，保证后继新等待者不被
+                // "占位"拒之门外。
                 BlockResume::SwitchedSelf => {
                     let _ = EVENT_WAITER.compare_exchange(
                         cur_pid as u32,
@@ -2082,38 +2147,46 @@ fn waitpid_inner(
             slot.saved = *f;
         }
     }
-    let Some(next_pid) = pop_ready_filtered(run, cur) else {
-        // 极小窗口防御：就绪项全失效（如全部 Exit 残留）。撤销阻塞如实报错。
-        return Err(revert(cur));
-    };
-    if next_pid == cur {
-        return Err(revert(cur));
-    }
-    if frame.is_some() {
-        // 物理切换（FPU + CR3/RSP0/CURRENT 单点）；仅真实 syscall 形态执行。
-        // 先置 Running、改写 *frame 为下一进程保存帧，再切 CR3（与 yield_now
-        //  同构）。缺失 *frame 替换会导致 iretq 以当前进程帧返回用户态（当前已
-        //  Blocked），cr3 已是下一进程页表 → 在错配的 RIP 下执行下一进程代码。
-        {
-            let mut g = proc_bucket_lock(next_pid);
-            let slot = g.get_mut(&next_pid).expect("ready proc exists");
-            slot.proc.set_state(TaskState::Running);
-            if let Some(f) = frame.as_deref_mut() {
-                *f = slot.saved;
-            }
+    // cur 已 Blocked+waiting_for 登记。切换到任一非 cur 就绪进程。
+    if let Some(f) = frame.as_deref_mut() {
+        // 物理切换形态（真实 syscall）：统一"选 next + 原子提交切换"原语（DESIGN §3.2）。
+        // exclude=cur：绝不切回自身(waitpid 语义，cur 在等子进程)；候选被跨核 reap/置 Exit
+        // 时被丢弃重选，绝不 .expect panic、不切进已回收槽；next 桶锁贯穿切换(杜绝窗口 B)。
+        // 队列耗尽(无其它就绪，仅剩已 Blocked 的 cur)——撤销阻塞(清 waiting_for、恢复
+        // Running)如实报 WouldBlock(与 waitpid_inner 既有 revert 语义一致)。
+        match pop_and_commit_switch(run, f, Some(cur), cur) {
+            NextCommit::Switched => Ok(Waited::Blocked),
+            // NothingSelf 不可达(cur 已被 exclude 排除)；Empty=无其它可切 -> revert。
+            NextCommit::Empty | NextCommit::NothingSelf => Err(revert(cur)),
         }
-        cpu_switch_locked(run, Some(cur), next_pid);
     } else {
-        // 测试形态：目标进程标记 Running 以维持表级一致性（不切 CR3/RSP0）。
-        {
-            let mut g = proc_bucket_lock(next_pid);
-            if let Some(slot) = g.get_mut(&next_pid) {
-                slot.proc.set_state(TaskState::Running);
+        // 测试形态(frame=None)：只做表级状态迁移，不做物理 CPU 切换。仍须跳过被跨核
+        // reap/置 Exit 的候选(槽 None/Exit 不置 Running、不成为 current)，保持表级一致。
+        loop {
+            let Some(p) = pop_ready_filtered(run, cur) else {
+                // 极小窗口防御：就绪项全失效/已耗尽。撤销阻塞如实报错。
+                return Err(revert(cur));
+            };
+            if p == cur {
+                return Err(revert(cur));
+            }
+            let committed = {
+                let mut g = proc_bucket_lock(p);
+                if g.get(&p).is_some_and(|s| s.proc.state() == TaskState::Ready) {
+                    if let Some(slot) = g.get_mut(&p) {
+                        slot.proc.set_state(TaskState::Running);
+                    }
+                    true
+                } else {
+                    false // p 已被 reap/置 Exit：丢弃重选(I1)
+                }
+            };
+            if committed {
+                run.current = Some(p);
+                return Ok(Waited::Blocked);
             }
         }
-        run.current = Some(next_pid);
     }
-    Ok(Waited::Blocked)
 }
 
 /// 从就绪队列取下一个有效进程，额外跳过 `exclude`（waitpid 场景排除自身）。
@@ -2161,21 +2234,20 @@ fn deschedule_exit_current(frame: &mut InterruptFrame, cur_pid: usize) {
     let mut run = run_mut(cpu_slot);
     run.current = None;
     clear_current_proc();
-    // 切到下一有效就绪进程（prev=None：Exit 槽已退役，浮点现场随 terminate 消亡，
-    // 无需保存）；无就绪则进空闲 halt，被外部唤醒后切回。与 exit_current 尾部同构。
-    let Some(next_pid) = pop_ready(&mut run, usize::MAX) else {
-        drop(run);
-        // A2 修复：本函数此刻物理运行在将死 (被 SIGKILL 后脱机) 进程栈上；
-        // 空队停车必须切到本核 idle 栈，绝不在将死栈上 halt（reaper 可回收之）。
-        go_idle_on_own_stack()
-    };
-    {
-        let mut g = proc_bucket_lock(next_pid);
-        let slot = g.get_mut(&next_pid).expect("ready proc exists");
-        slot.proc.set_state(TaskState::Running);
-        *frame = slot.saved;
+    // 统一"选 next + 原子提交切换"原语（DESIGN §3.2/§4 #9）：prev=None(cur 已 Exit、槽随
+    // terminate 退役，浮点现场随其消亡无需保存)。候选被跨核 reap/置 Exit 则丢弃重选，绝不
+    // .expect panic、不切进已回收槽；next 桶锁贯穿切换(杜绝窗口 B)。
+    // 无有效候选时本核物理运行在将死 cur 栈上：空队停车必须切到本核 idle 栈
+    // (go_idle_on_own_stack)，绝不在将死栈上 halt(父核可 reap+drain 释放之 → UAF)。
+    match pop_and_commit_switch(&mut run, frame, None, usize::MAX) {
+        NextCommit::Switched => {} // 已切入 next，frame 已改
+        NextCommit::Empty | NextCommit::NothingSelf => {
+            drop(run);
+            // A2 修复：本函数此刻物理运行在将死(被 SIGKILL 后脱机)进程栈上；
+            // 空队停车必须切到本核 idle 栈，绝不在将死栈上 halt(reaper 可回收之)。
+            go_idle_on_own_stack()
+        }
     }
-    cpu_switch_locked(&mut run, None, next_pid);
 }
 
 // ---------- A2: 核 idle 停车在本核常驻栈，不在将死进程栈上 ----------
@@ -2226,34 +2298,45 @@ unsafe extern "C" fn idle_loop_body() -> ! {
     // 否则 CR3 仍指向该将死进程的用户页表；父核随后收尸 drop 其 UserAddressSpace
     // 会释放该顶层表帧，而本核停车的 CR3 仍指向它 → 唤醒/中断时经已释放/复用的
     // 页表翻译 → 全系统内存损坏。内核根表高半区映射与本核一致，切换对运行中
-    // 内核透明；后续 cpu_switch_locked 切到新进程时会再写回其表。
+    // 内核透明；后续 switch_apply_next 切到新进程时会再写回其表。
     arch_x86_64::paging::switch_to_kernel_root();
     // 开中断后 halt：与旧 idle halt 一致。spawn 不发 IPI，依赖下一次 IRQ0 醒睡後重检（同 start()）。
     arch_x86_64::interrupts::enable();
     loop {
-        let nonempty = {
-            let r = run(cpu_slot);
-            !r.ready.is_empty()
-        };
-        if nonempty {
-            break;
+        // 等就绪队非空（每次 halt 直到中断到达，绝不忙转）。
+        loop {
+            let nonempty = {
+                let r = run(cpu_slot);
+                !r.ready.is_empty()
+            };
+            if nonempty { break; }
+            arch_x86_64::interrupts::halt();
         }
-        arch_x86_64::interrupts::halt();
+        // 有就绪进程了：逐候选在持 next 桶锁下校验存在+Ready，原子置 Running+捕获 saved+
+        // 物理切入(prev=None：本核在 idle 栈，只做切入方恢复，不保存 FPU)。
+        // 跨核收尸竞态修复：候选被 reap(槽 None)/置 Exit 则丢弃重选，绝不 .expect panic、
+        // 不切进已回收槽；next 桶锁贯穿切换(杜绝窗口 B)。
+        let mut run = run_mut(cpu_slot);
+        while let Some(next) = pop_ready(&mut run, usize::MAX) {
+            let mut g = proc_bucket_lock(next);
+            if !next_is_runnable(&g, next) {
+                continue; // 无效候选：丢弃重选(I1)；g 随迭代结束释放
+            }
+            let saved = {
+                let slot = g.get_mut(&next).expect("next just validated");
+                slot.proc.set_state(TaskState::Running);
+                slot.saved
+            };
+            switch_apply_next(next, &mut g, &mut run);
+            drop(g);
+            drop(run);
+            // 本核已在 idle 栈上，无外层 stub 可 iretq；直接从内存帧恢复并 iretq 到用户态
+            // (resume_interrupt_frame -> !，永不返回)。
+            arch_x86_64::interrupts::resume_interrupt_frame(&saved)
+        }
+        // while 耗尽(队列中候选全被跨核 reap/置 Exit)：回到外层等队非空。
+        drop(run);
     }
-    // 有就绪进程了：切到它并经完整帧回用户态。
-    let mut run = run_mut(cpu_slot);
-    let next = pop_ready(&mut run, usize::MAX).expect("woken process after idle");
-    let saved = {
-        let mut g = proc_bucket_lock(next);
-        let slot = g.get_mut(&next).expect("woken proc exists");
-        slot.proc.set_state(TaskState::Running);
-        slot.saved
-    };
-    // prev=None：将死进程槽已随 terminate 退役，此处只做切入方恢复（不保存 FPU）。
-    cpu_switch_locked(&mut run, None, next);
-    drop(run);
-    // 本核已在 idle 栈上，无外层 stub 可 iretq；直接从内存帧恢复并 iretq 到用户态。
-    arch_x86_64::interrupts::resume_interrupt_frame(&saved)
 }
 
 /// 终止当前进程（`exit` syscall）：zombie 化并按父子关系分发退出码后切换。
@@ -2281,22 +2364,22 @@ pub fn exit_current(frame: &mut InterruptFrame, code: u64) {
     run.current = None;
     clear_current_proc();
 
-    // 取下一个有效就绪进程（跳过已退出残留引用）。
-    let Some(next_pid) = pop_ready(&mut run, usize::MAX) else {
-        drop(run);
-        // A2 修复：本函数此刻物理运行在将死进程的内核栈上。若在此栈上 halt
-        // 等待，父/收尸核可回收并 drain 释放它 → 本核在已释放栈上空转 (UAF)。
-        // 必须切到本核自己的 idle 栈再停车；go_idle_on_own_stack 永不让渡回此
-        // 将死栈（后续唤醒的进程由其完整帧在 idle 栈上 iretq 恢复）。
-        go_idle_on_own_stack()
-    };
-    {
-        let mut g = proc_bucket_lock(next_pid);
-        let slot = g.get_mut(&next_pid).expect("ready proc exists");
-        slot.proc.set_state(TaskState::Running);
-        *frame = slot.saved;
+    // 统一"选 next + 原子提交切换"原语（DESIGN §3.2/§4 #10）：prev=None(cur 已 Exit、槽随
+    // terminate 退役)。候选被跨核 reap/置 Exit 则丢弃重选，绝不 .expect panic、不切进已回收
+    // 槽；next 桶锁贯穿切换(杜绝窗口 B)。
+    // 无有效候选时本核物理运行在将死进程的内核栈上：空队停车必须切到本核 idle 栈
+    // (go_idle_on_own_stack，永不让渡回将死栈)，绝不在将死栈上 halt(reaper 可回收+drain 之)。
+    match pop_and_commit_switch(&mut run, frame, None, usize::MAX) {
+        NextCommit::Switched => {} // 已切入 next，frame 已改
+        NextCommit::Empty | NextCommit::NothingSelf => {
+            drop(run);
+            // A2 修复：本函数此刻物理运行在将死进程的内核栈上。若在此栈上 halt
+            // 等待，父/收尸核可回收并 drain 释放它 → 本核在已释放栈上空转 (UAF)。
+            // 必须切到本核自己的 idle 栈再停车；go_idle_on_own_stack 永不让渡回此
+            // 将死栈（后续唤醒的进程由其完整帧在 idle 栈上 iretq 恢复）。
+            go_idle_on_own_stack()
+        }
     }
-    cpu_switch_locked(&mut run, None, next_pid);
 }
 
 /// 枚举全部存活进程，向用户态缓冲写入快照条目。
@@ -2597,48 +2680,53 @@ pub fn start() -> ! {
         klib::info!("[sched] AP slot {} fp probe cw={:#06x} (fpu ts={} osfxsr={})", entry_slot, fpcheck, tsok, osx);
     }
     loop {
-        // 取一个有效就绪进程启动（跳过已退出残留引用）。
-        // per-pid（a）：只取本核 RUN 域；pid 槽访问逐 pid 锁。
+        // 逐候选"选 next + 原子提交"（DESIGN §3.2/§4 #11）：持 pid 桶锁判存在+Ready 后，
+        // 原子置 Running+读 entry/cr3+物理切入(prev=None：冷启动/唤醒，无当前帧)。
+        // 跨核收尸竞态修复：候选被 reap(槽 None)/置 Exit 则丢弃重选，绝不 .expect panic、
+        // 不切进已回收槽；pid 桶锁贯穿切换(杜绝窗口 B)。entry/cr3 在**锁内**读——避免
+        // 提交后、读 entry 前再被 reap(槽 None 读 entry/cr3 崩溃)。空队 halt 等待。
         let mut run = run_mut(my_cpu_slot());
-        let Some(pid) = pop_ready(&mut run, usize::MAX) else {
-            drop(run);
-            arch_x86_64::interrupts::halt(); // 无进程：停机等待中断
-            continue;
-        };
-        let (entry_rip, user_stack_top, cr3) = {
+        while let Some(pid) = pop_ready(&mut run, usize::MAX) {
             let mut g = proc_bucket_lock(pid);
-            let slot = g.get_mut(&pid).expect("ready proc exists");
-            slot.proc.set_state(TaskState::Running);
-            (
-                slot.proc.entry_rip(),
-                slot.proc.user_stack_top(),
-                slot.proc.addr_space().page_table_paddr(),
-            )
-        };
-        // K2：首个进程切入前从其 PCB 恢复 FNINIT 模板现场，
-        // 使"首次运行也走恢复路径"与后续调度完全一致。
-        cpu_switch_locked(&mut run, None, pid);
-        let frame = TrapFrame {
-            rip: entry_rip,
-            cs: user_code_selector() as u64,
-            rflags: USER_RFLAGS,
-            rsp: user_stack_top,
-            ss: user_data_selector() as u64,
-            cr3,
-        };
-        drop(run);
-        // 阶段2（M4）对称多处理：AP（非 BSP 槽）首次从自己就绪队列取到进程并即将
-        // 进入用户态时打点一次，实证"每核 AP 调度自己的就绪队列"（每核一次，
-        // 避免后续每次唤醒重打点刷屏）。BSP 槽 0 不打点。
-        let diag_cs = my_cpu_slot();
-        if diag_cs != 0
-            && !AP_LAUNCHED
-                .load(core::sync::atomic::Ordering::Acquire)
-        {
-            AP_LAUNCHED.store(true, core::sync::atomic::Ordering::Release);
-            klib::info!("[sched] AP slot {} launched user proc pid={} (SMP active)", diag_cs, pid);
+            if !next_is_runnable(&g, pid) {
+                continue; // 无效候选：丢弃重选(I1)；g 随迭代释放
+            }
+            let (entry_rip, user_stack_top, cr3) = {
+                let slot = g.get_mut(&pid).expect("next just validated");
+                slot.proc.set_state(TaskState::Running);
+                (
+                    slot.proc.entry_rip(),
+                    slot.proc.user_stack_top(),
+                    slot.proc.addr_space().page_table_paddr(),
+                )
+            };
+            // K2：首个进程切入前从其 PCB 恢复 FNINIT 模板现场，使"首次运行也走恢复路径"
+            // 与后续调度完全一致。切换在持 pid 桶锁内完成(prev=None)。
+            switch_apply_next(pid, &mut g, &mut run);
+            drop(g);
+            let frame = TrapFrame {
+                rip: entry_rip,
+                cs: user_code_selector() as u64,
+                rflags: USER_RFLAGS,
+                rsp: user_stack_top,
+                ss: user_data_selector() as u64,
+                cr3,
+            };
+            drop(run);
+            // 阶段2（M4）对称多处理：AP（非 BSP 槽）首次从自己就绪队列取到进程并即将
+            // 进入用户态时打点一次。BSP 槽 0 不打点。
+            let diag_cs = my_cpu_slot();
+            if diag_cs != 0
+                && !AP_LAUNCHED
+                    .load(core::sync::atomic::Ordering::Acquire)
+            {
+                AP_LAUNCHED.store(true, core::sync::atomic::Ordering::Release);
+                klib::info!("[sched] AP slot {} launched user proc pid={} (SMP active)", diag_cs, pid);
+            }
+            arch::task::enter_usermode(&frame); // 永不返回
         }
-        arch::task::enter_usermode(&frame); // 永不返回
+        drop(run);
+        arch_x86_64::interrupts::halt(); // 无进程可启动：停机等待中断
     }
 }
 
@@ -3145,6 +3233,39 @@ pub mod test_hooks {
         }
         true
     }
+    /// 跨核收尸竞态验收钩子（DESIGN §9 / §3.2）：表级驱动 **prev=None** 的统一"选 next
+    /// + 原子提交"选择逻辑（即 idle_loop_body / deschedule_exit_current / exit_current /
+    /// start 共用的 [`pop_and_commit_switch`] 形态）。`ready` 为预置就绪队列。
+    ///
+    /// 竞态模型：某进程被上一核 `pop_ready` 选中（弹出、仍 Ready）后，在提交前被**另一
+    /// 核**收尸——槽被 `reap_child_locked` 置 None（先经 terminate 置 Exit）。旧实现持该
+    /// 槽锁 `.expect("ready proc exists")` 直接 panic(SMP 间歇冻结)或切进已回收槽(UAF)。
+    /// 本钩子与生产路径同一把 `next_is_runnable`(槽存在 && state==Ready)闸门：None/Exit 槽
+    /// 一律丢弃重选，绝不置 Running、绝不 panic。
+    ///
+    /// 因表级测试不可做物理 CR3/FPU 切换(会破坏内核主线程上下文)，此处镜像 pop_and_commit_switch
+    /// 的**选择+校验+置 Running** 段(即 commit_same_lock 的置 Running 前段，不含 switch_apply_next)。
+    /// 返回被提交(置 Running 并成为表级 current)的 pid；就绪项全为 None/Exit/空 → None(Empty)。
+    pub fn debug_commit_switch_table(ready: &[usize]) -> Option<usize> {
+        let mut run = run_mut(my_cpu_slot());
+        run.ready.clear();
+        for p in ready {
+            run.ready.push_back(*p);
+        }
+        run.current = None;
+        while let Some(p) = pop_ready(&mut run, usize::MAX) {
+            let mut g = proc_bucket_lock(p);
+            if !next_is_runnable(&g, p) {
+                continue; // None/Exit 槽：跨核收尸残留，丢弃重选(I1)，不 panic、不置 Running
+            }
+            let slot = g.get_mut(&p).expect("slot present+Ready just validated");
+            slot.proc.set_state(TaskState::Running);
+            run.current = Some(p);
+            return Some(p);
+        }
+        None // 全无有效候选(Empty)：表级等价于空队回滚/go_idle 的判定前置
+    }
+
     /// 哑地址空间：仅占位映射（测试进程不执行任何用户代码）。
     fn dummy_space() -> Result<UserAddressSpace<X86PageTable>, Error> {
         use arch::PageSize;
