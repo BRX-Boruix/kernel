@@ -153,7 +153,16 @@ pub const SYS_TASK_THREAD_JOIN: u32 = nr(domain::TASK, 0x06); // 0x36
 /// `nr.rs::SYS_TASK_SET_FS_BASE` 同值、注释互指。
 pub const SYS_TASK_SET_FS_BASE: u32 = nr(domain::TASK, 0x07); // 0x37
 
-// ---------- 4. VFS Domain (0x40) ----------
+/// `gettid() -> tid`：返回调用线程自己的 pid（= 线程 id，threads.md T2-6）。在 BORUIX 中每线程
+/// = 一个 ProcEntry/pid；组长 pid == tgid、组员 pid == 其线程 id。POSIX 线程要经 gettid 查本线程 id；
+/// 组长/组员都可用。TASK 域扩展动词 0x08；双侧镜像（S13）：与 libsys `nr.rs::SYS_TASK_GETTID` 同值。
+pub const SYS_TASK_GETTID: u32 = nr(domain::TASK, 0x08); // 0x38
+
+/// `getpid() -> pid`：返回调用线程所在进程（线程组）的组长 pid（= POSIX 进程 id / tgid）。
+/// BORUIX 每进程一个组长（leader）；所有线程共享同一 tgid。替代 libc 读 `/processes/list` 扫
+/// Running 进程的脆弱启发（SMP/多线程下会挑错成员）。TASK 域扩展动词 0x09；双侧镜像（S13）：
+/// 与 libsys `nr.rs::SYS_TASK_GETPID` 同值。
+pub const SYS_TASK_GETPID: u32 = nr(domain::TASK, 0x09); // 0x39
 pub const SYS_ENTRY_CREATE: u32 = nr(domain::VFS, op::CREATE); // 0x41
 pub const SYS_ENTRY_READ: u32 = nr(domain::VFS, op::READ); // 0x42
 pub const SYS_ENTRY_UPDATE: u32 = nr(domain::VFS, op::WRITE); // 0x43
@@ -1723,6 +1732,21 @@ fn sys_set_fs_base(frame: &mut SyscallFrame) -> u64 {
     pack_ok(0)
 }
 
+/// `gettid` 处理器（T2-6 / SYS_TASK_GETTID / 0x38）：返回调用线程自己的 pid（线程 id）。
+/// 每线程 = 一 ProcEntry/pid；组长 pid==tgid、组员 pid==线程 id。取当前线程的 pid 即可，
+/// 无副作用、永不 Switched。
+fn sys_gettid(_frame: &mut SyscallFrame) -> u64 {
+    let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+    pack_ok(pid as u64)
+}
+
+/// `getpid` 处理器（T2-6 / SYS_TASK_GETPID / 0x39）：返回调用线程所在进程（线程组）的组长
+/// pid（POSIX 进程 id / tgid）。每线程共享同一 tgid。
+fn sys_getpid(_frame: &mut SyscallFrame) -> u64 {
+    let tgid = current_proc_mut().map(|p| p.tgid()).unwrap_or(0);
+    pack_ok(tgid as u64)
+}
+
 /// thread_join 处理器（T1-7 / SYS_TASK_THREAD_JOIN / 0x36）：等价组长对**具体组员
 /// pid** 的 waitpid 收尸取退出码（T1-3 单目标 join 交付）。薄委托 `task::waitpid`，
 /// 与 `sys_task_wait` 单目标分支同构：
@@ -2661,6 +2685,9 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_TASK_THREAD_JOIN => sys_thread_join(frame),
         // set_fs_base：非阻塞，wrmsr 当前线程 FS base（T2-1 / 0x37）。
         SYS_TASK_SET_FS_BASE => done(sys_set_fs_base(frame)),
+        // gettid/getpid：非阻塞，返回本线程 pid / 组长 tgid（T2-6 / 0x38/0x39）。
+        SYS_TASK_GETTID => done(sys_gettid(frame)),
+        SYS_TASK_GETPID => done(sys_getpid(frame)),
 
         // VFS Domain (0x40)
         SYS_ENTRY_CREATE => done(sys_entry_create(frame)),
