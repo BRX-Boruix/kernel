@@ -309,8 +309,13 @@ pub fn entropy_u64() -> Option<u64> {
 pub fn enable_smep_smap() {
     const SMEP: u64 = 1 << 20;
     const SMAP: u64 = 1 << 21;
+    const FSGSBASE: u64 = 1 << 16;
     let smep_ok = has_feature(CpuFeature::Smep);
     let smap_ok = has_feature(CpuFeature::Smap);
+    // FSGSBASE（用户态 RDFSBASE/WRFSBASE 等）支持位：CPUID.7.0:EBX[9]。
+    // 使每线程 TLS/errno（threads.md T2-1）可在用户态经 RDFSBASE 读 FS base；
+    // 不扩展共享 CpuFeature 枚举（避免跨架构 trait 同步），仅本 x86 直查。
+    let fsgsbase_ok = max_basic_leaf() >= 7 && cpuid(7, 0).ebx & (1 << 9) != 0;
 
     let mut cr4 = mmio::read_cr4();
     if smep_ok {
@@ -320,12 +325,16 @@ pub fn enable_smep_smap() {
         cr4 |= SMAP;
         mmio::set_smap_active(true);
     }
+    if fsgsbase_ok {
+        cr4 |= FSGSBASE;
+    }
     mmio::write_cr4(cr4);
 
     klib::info!(
-        "[cpu] SMEP={} SMAP={} enabled (CR4={:#x})",
+        "[cpu] SMEP={} SMAP={} FSGSBASE={} enabled (CR4={:#x})",
         smep_ok,
         smap_ok,
+        fsgsbase_ok,
         cr4
     );
 }

@@ -143,6 +143,15 @@ pub const SYS_TASK_THREAD_SPAWN: u32 = nr(domain::TASK, 0x05); // 0x35
 /// （T1-3 单目标 join 交付）。TASK 域扩展动词 0x06；双侧镜像（S13）：与 libsys
 /// `nr.rs::SYS_TASK_THREAD_JOIN` 同值、注释互指。
 pub const SYS_TASK_THREAD_JOIN: u32 = nr(domain::TASK, 0x06); // 0x36
+/// `set_fs_base(base) -> 0`：把调用线程的 `IA32_FS_BASE`（x86-64 MSR 0xC0000100）设为 `base`
+/// （threads.md T2-1 / ADR-035 D6）。RDMSR/WRMSR 是 CPL0 特权指令，用户态直写会 #GP，故写侧
+/// 走本内核 syscall（内核在 CPL0 经 wrmsr）。读侧用户态用 `fs:[0]` 段相对寻址（免 MSR）。
+/// 内核已在切换点保存/恢复每线程 FS base（T2-0，4f0b724）：本 syscall 仅写当前运行线程的
+/// 活动 FS base；下次切出时内核 rdmsr 自动归档进 `ProcEntry.fs_base`，故无需在此写 slot。
+/// 典型用途：线程引导装配其 `Tcb`（errno/TLS 段基址）。参数 `a1`=新 FS base（用户虚拟地址，
+/// 通常是本线程 mmap 的 `Tcb`）。返回 0。TASK 域扩展动词 0x07；双侧镜像（S13）：与 libsys
+/// `nr.rs::SYS_TASK_SET_FS_BASE` 同值、注释互指。
+pub const SYS_TASK_SET_FS_BASE: u32 = nr(domain::TASK, 0x07); // 0x37
 
 // ---------- 4. VFS Domain (0x40) ----------
 pub const SYS_ENTRY_CREATE: u32 = nr(domain::VFS, op::CREATE); // 0x41
@@ -1702,6 +1711,18 @@ fn sys_thread_spawn(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
+/// `set_fs_base` 处理器（T2-1 / SYS_TASK_SET_FS_BASE / 0x37）：把当前运行线程的 `IA32_FS_BASE`
+/// 设为 `a1`。仅写活动 FS base（wrmsr，CPL0）；每线程跨切换保存/恢复已由 T2-0 在切换点
+/// rdmsr/wrmsr 负责，故下一次切出即自动归档进 `ProcEntry.fs_base`。用户传入的 `base` 是其自有
+/// `Tcb` 的地址（用户虚拟地址），属线程自有的每线程控制块，内核不校验有效性（写坏只影响调用
+/// 线程自身，与用户任选栈顶/堆地址同级，非安全边界）。返回 0。永不 Switched。
+fn sys_set_fs_base(frame: &mut SyscallFrame) -> u64 {
+    let base = frame.a1;
+    // 内核 CPL0 写当前 CPU 的 FS base（wrmsr）；当前即运行本 syscall 的线程。
+    arch_x86_64::gdt::write_fs_base(base);
+    pack_ok(0)
+}
+
 /// thread_join 处理器（T1-7 / SYS_TASK_THREAD_JOIN / 0x36）：等价组长对**具体组员
 /// pid** 的 waitpid 收尸取退出码（T1-3 单目标 join 交付）。薄委托 `task::waitpid`，
 /// 与 `sys_task_wait` 单目标分支同构：
@@ -2638,6 +2659,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_TASK_THREAD_SPAWN => done(sys_thread_spawn(frame)),
         // thread_join 可能阻塞切换（组长阻塞 waitpid 组员），自带 DispatchResult 语义。
         SYS_TASK_THREAD_JOIN => sys_thread_join(frame),
+        // set_fs_base：非阻塞，wrmsr 当前线程 FS base（T2-1 / 0x37）。
+        SYS_TASK_SET_FS_BASE => done(sys_set_fs_base(frame)),
 
         // VFS Domain (0x40)
         SYS_ENTRY_CREATE => done(sys_entry_create(frame)),
