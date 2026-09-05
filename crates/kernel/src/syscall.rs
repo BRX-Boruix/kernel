@@ -134,6 +134,15 @@ pub const SYS_TASK_SPAWN: u32 = nr(domain::TASK, op::CREATE); // 0x31
 pub const SYS_TASK_WAIT: u32 = nr(domain::TASK, op::READ); // 0x32
 pub const SYS_TASK_SIGNAL: u32 = nr(domain::TASK, op::WRITE); // 0x33
 pub const SYS_TASK_EXIT: u32 = nr(domain::TASK, op::DELETE); // 0x34
+/// `thread_spawn(entry, user_stack_top) -> tid`：在调用方线程组（组长 = 调用方
+/// 自身进程）内派生一个**同组新调度单元**（T1-7 / ADR-035 D1 / PRE-6）。共享组长
+/// 地址空间/fd/cwd/identity，装配各自 entry + user_stack。TASK 域扩展动词 0x05；
+/// 双侧镜像（S13）：与 libsys `nr.rs::SYS_TASK_THREAD_SPAWN` 同值、注释互指。
+pub const SYS_TASK_THREAD_SPAWN: u32 = nr(domain::TASK, 0x05); // 0x35
+/// `thread_join(tid) -> code`：等价组长对**具体组员 pid** 的 waitpid 收尸取退出码
+/// （T1-3 单目标 join 交付）。TASK 域扩展动词 0x06；双侧镜像（S13）：与 libsys
+/// `nr.rs::SYS_TASK_THREAD_JOIN` 同值、注释互指。
+pub const SYS_TASK_THREAD_JOIN: u32 = nr(domain::TASK, 0x06); // 0x36
 
 // ---------- 4. VFS Domain (0x40) ----------
 pub const SYS_ENTRY_CREATE: u32 = nr(domain::VFS, op::CREATE); // 0x41
@@ -1658,6 +1667,57 @@ fn sys_task_wait(frame: &mut SyscallFrame) -> DispatchResult {
     }
 }
 
+/// thread_spawn 处理器（T1-7 / SYS_TASK_THREAD_SPAWN / 0x35）：在调用方线程组内
+/// 派生一个同组新调度单元（线程）。以调用方自身进程的 tgid（组长 pid）为组长调
+/// `task::spawn_thread_with`，复用其 Arc 地址空间/组容器。参数为裸 u64（PRE-6）：
+/// - `a1` = 线程入口 RIP；
+/// - `a2` = 线程用户栈顶（用户态已 mmap 的独立栈区）。
+/// name 固定传字面量 `"thread"`（经 `store_name` 拷入 PCB 定长缓冲，无 copyin/无越界）。
+/// 返回组员 pid（rax）；不阻塞（永不 Switched）。组长不存在/已退 → NotFound，分配失败 → OutOfMemory。
+/// 借用在进入 `task::*` 前释放（task1 KA3：先取 tgid 值再调 spawn_thread_with）。
+fn sys_thread_spawn(frame: &mut SyscallFrame) -> u64 {
+    let entry = frame.a1;
+    let user_stack_top = frame.a2;
+    // 先取 tgid（借用立即结束），随后释放借用再调 spawn_thread_with（KA3：借用不跨越调度调用）。
+    let Some(tgid) = current_proc_mut().map(|p| p.tgid()) else {
+        return pack_err(Error::NotFound);
+    };
+    match task::spawn_thread_with(tgid, "thread", entry, user_stack_top) {
+        Ok(tid) => {
+            klib::info!(
+                "[syscall] thread_spawn leader={} -> tid={} entry={:#x} stack={:#x}",
+                tgid,
+                tid,
+                entry,
+                user_stack_top
+            );
+            pack_ok(tid as u64)
+        }
+        Err(e) => pack_err(e),
+    }
+}
+
+/// thread_join 处理器（T1-7 / SYS_TASK_THREAD_JOIN / 0x36）：等价组长对**具体组员
+/// pid** 的 waitpid 收尸取退出码（T1-3 单目标 join 交付）。薄委托 `task::waitpid`，
+/// 与 `sys_task_wait` 单目标分支同构：
+/// - 组员已 zombie → 同步收尸，rax 交付退出码、r10 经 aux_pid 交付组员 pid；
+/// - 组员仍在运行 → 真阻塞切换（DispatchResult::Switched，禁写 rax——退出码由组员
+///   终止路径写入本进程保存帧 rax/r10，唤醒后 iretq 即得）；
+/// - 目标非亲生/不存在/已收尸（组员 ppid = 组长，故仅组长可 join 其组员；非组长调
+///   目标自然 NotFound）→ NotFound。
+fn sys_thread_join(frame: &mut SyscallFrame) -> DispatchResult {
+    let tid = frame.a1 as usize;
+    match task::waitpid(tid, arch_frame(frame)) {
+        Ok(task::Waited::Reaped { pid, code }) => {
+            // 同步收尸：与 sys_task_wait 同款——rax=code、r10 经 aux_pid 交付组员 pid。
+            frame.aux_pid = pid as u64;
+            done(pack_ok(code))
+        }
+        Ok(task::Waited::Blocked) => DispatchResult::Switched,
+        Err(e) => done(pack_err(e)),
+    }
+}
+
 /// 精准时钟挂起睡眠（ADR-014 §4.3 `SYS_TASK_WAIT(0, timeout)`）：注册定时器
 /// 到期唤醒 + 调度器显式阻塞原语挂起本进程，取代内核态忙等。
 ///
@@ -2569,6 +2629,10 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
             sys_exit(frame);
             DispatchResult::Switched
         }
+        // thread_spawn：非阻塞，返回组员 pid。
+        SYS_TASK_THREAD_SPAWN => done(sys_thread_spawn(frame)),
+        // thread_join 可能阻塞切换（组长阻塞 waitpid 组员），自带 DispatchResult 语义。
+        SYS_TASK_THREAD_JOIN => sys_thread_join(frame),
 
         // VFS Domain (0x40)
         SYS_ENTRY_CREATE => done(sys_entry_create(frame)),
