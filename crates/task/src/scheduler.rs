@@ -511,6 +511,79 @@ pub fn spawn_with_ppid_fds(
     run_mut(home_cpu).ready.push_back(pid);
     Ok(pid)
 }
+/// 线程派生（T1-1 / ADR-035 D1/D2 / threads.md T1-1）：在组长 `tgid` 所在的线程组内
+/// 派生一个**新的同组调度单元**（线程）。
+///
+/// **组长与组员语义**：组长 = 该地址空间首建进程（tgid == 其 pid）。本函数以组长的
+/// 组容器 clone（`Arc::clone`）共享 fd_table/cwd/identity/addr_space，为组员装配
+/// **各自独立**的 pid/kstack/saved/FPU/entry/user_stack/state/context/signal，再登记
+/// 入分桶进程表并入队 home 核就绪队列。组员 tgid = 组长 pid；组员 ppid = 组长 pid
+/// （线程是组长的"成员"关系，非 waitpid 亲子关系；组长/组员共享地址空间即一组）。
+///
+/// 与 `spawn_with_ppid_fds`/spawn_elf_image 的分工：后两者是**新地址空间 + load ELF**
+/// 的组长 spawn（自建独立组）；线程派生**不建新地址空间、不 load ELF**，只 reuse
+/// 组长地址空间并 clone 其组容器。真正的 syscall 出口留 T1-7；本步提供 task 层可测
+/// 原语 + kernel-tests 直接调用验证。
+///
+/// `name` 为线程可执行名（PCB 定长缓冲）；`entry_rip`/`user_stack_top` 为该线程
+/// 各自的首跑入口与用户栈顶。返回新线程 pid。
+pub fn spawn_thread_with(
+    tgid: usize,
+    name: &str,
+    entry_rip: u64,
+    user_stack_top: u64,
+) -> Result<usize, Error> {
+    drain_dead_kstacks();
+    let (name_buf, name_len) = store_name(name)?;
+    // 组长必须真实在册且非 zombie（零伪数据：找不到组长/组长已退出则拒绝派生）。
+    // 锁序：仅短暂持组长所在桶锁快照其组容器 Arc 与信号 restorer 地址，随即释放；
+    // 之后不持组长锁再取新 pid 锁（与 spawn_with_ppid_fds 同款 pid 桶 → RUN 锁序）。
+    let (group, trampoline) = {
+        let g = proc_bucket_lock(tgid);
+        let Some(leader) = g.get(&tgid) else {
+            return Err(Error::NotFound);
+        };
+        if leader.proc.state() == TaskState::Exit {
+            return Err(Error::NotFound);
+        }
+        // clone 组长组容器 Arc（共享 fd/cwd/identity/addr_space 的核心动作）。
+        (leader.proc.thread_group_arc(), leader.proc.signal().trampoline())
+    };
+    let pid = alloc_pid();
+    // 分配组员独立内核栈（16 帧，同组长；HHDM 高半区共享页表可见）。
+    let stack_frame = mm::allocate_frames(KSTACK_ORDER).ok_or(Error::OutOfMemory)?;
+    let kstack_top = arch::phys_to_virt(stack_frame.start_paddr()) + KSTACK_SIZE as u64;
+    let mut proc = Box::new(Process::<X86PageTable>::with_group(
+        pid,
+        tgid,
+        entry_rip,
+        user_stack_top,
+        kstack_top,
+        group,
+    ));
+    // PRE-5：signal 每进程独立；组员继承组长已装进共享地址空间保留区的 restorer 地址
+    //（SignalState 各持一份，地址同，指向共享地址空间的 restorer 区）。
+    proc.signal_mut().set_trampoline(trampoline);
+    // 线程不与 spawn 子进程共享 waitpid 亲子语义；ppid 置组长 pid 使"线程属于组长"
+    // 关系可追溯（T1-3 组退出时再按组批量终止，本步不在此改动 signal/终止语义）。
+    let home_cpu = spawn_home_cpu();
+    let entry = Box::new(ProcEntry {
+        proc,
+        saved: initial_frame(entry_rip, user_stack_top),
+        kstack_frames: stack_frame,
+        kstack_top,
+        fpu: fpu_template_snapshot(),
+        name: name_buf,
+        name_len,
+        ppid: tgid,
+        exit_code: 0,
+        waiting_for: None,
+        home_cpu,
+    });
+    proc_bucket_lock(pid).insert(pid, entry);
+    run_mut(home_cpu).ready.push_back(pid);
+    Ok(pid)
+}
 
 /// 当前就绪进程数（诊断）。
 #[allow(dead_code)]
@@ -2675,6 +2748,84 @@ pub mod test_hooks {
             .get(&pid)
             .map(|e| e.proc.signal().pending().bits())
             .unwrap_or(0)
+    }
+
+    /// 线程派生包装（T1-1）：在组长 `leader_pid` 的线程组内派生一个线程（哑入口/栈，
+    /// 永不被调度执行——就绪队列项在 verify/reset 前不会被消费，因内核主线程不跑
+    /// scheduler::start）。复用真实 `spawn_thread_with` 路径。
+    pub fn spawn_thread_of(leader_pid: usize, name: &str) -> Result<usize, Error> {
+        spawn_thread_with(leader_pid, name, 0x2000, 0x6000)
+    }
+
+    /// 线程结构探针（T1-1）：返回 (state, tgid, kernel_stack_top)。供 kernel::tests
+    /// 断言组员与组长各自独立 pid/kstack、同组共享、状态 Ready。
+    pub fn thread_probe(pid: usize) -> Option<(TaskState, usize, u64)> {
+        // 分桶化：pid 在册则持其所在桶读探针。
+        let g = proc_bucket_lock(pid);
+        g.get(&pid).map(|e| (e.proc.state(), e.proc.tgid(), e.kstack_top))
+    }
+
+    /// 两 pid 是否共享同一 ThreadGroup 容器（Arc::ptr_eq，T1-1 结构断言）。
+    /// 同组 ⟺ 共享同一组容器对象（fd/cwd/identity/addr_space 同源）。
+    pub fn same_thread_group(a: usize, b: usize) -> bool {
+        // 分别短暂持各自桶锁 clone 出组 Arc 再比对（两 pid 可能同桶，不能同时持锁）。
+        let ga = proc_bucket_lock(a).get(&a).map(|e| e.proc.thread_group_arc());
+        let gb = proc_bucket_lock(b).get(&b).map(|e| e.proc.thread_group_arc());
+        match (ga, gb) {
+            (Some(x), Some(y)) => Arc::ptr_eq(&x, &y),
+            _ => false,
+        }
+    }
+
+    /// T1-1 单核结构验收（kernel::tests 直接调用）：派生一个组长 + 一个同组线程，
+    /// 验证两调度单元：独立 pid、独立内核栈、均 Ready、tgid == 组长 pid、共享同一
+    /// ThreadGroup 容器；并构造第二个独立组长作对照：其 tgid/组容器与第一组不同。
+    /// 不动调度切换（那是 T1-8 验证）。返回是否全部通过。
+    pub fn verify_thread_derive() -> bool {
+        reset_all();
+        // 哑地址空间装配失败即验收失败（测试夹具内存不足属真失败）。
+        let (Ok(spa), Ok(spb)) = (dummy_space(), dummy_space()) else {
+            return false;
+        };
+        // 组长 A：独立组（leader）。
+        let Ok(la) = spawn_with_ppid(0, "t1-leader-a", 0x1000, 0x5000, spa) else {
+            return false;
+        };
+        // 组长 B：对照独立组（另一个地址空间/组）。
+        let Ok(lb) = spawn_with_ppid(0, "t1-leader-b", 0x1000, 0x5000, spb) else {
+            return false;
+        };
+        // 在 A 组内派生线程 ta。
+        let Ok(ta) = spawn_thread_of(la, "t1-thread-a") else {
+            return false;
+        };
+        // 1) 独立 pid：线程 != 组长，也 != 对照组组长。
+        if ta == la || ta == lb || la == lb {
+            return false;
+        }
+        // 2) 结构探针：三者均在册且 Ready。
+        let (Some((s_la, tg_la, ks_la)), Some((s_ta, tg_ta, ks_ta)), Some((s_lb, tg_lb, _ks_lb))) =
+            (thread_probe(la), thread_probe(ta), thread_probe(lb))
+        else {
+            return false;
+        };
+        if s_la != TaskState::Ready || s_ta != TaskState::Ready || s_lb != TaskState::Ready {
+            return false;
+        }
+        // 3) tgid：组长 A tgid==自身 pid；线程 ta tgid==组长 A pid；组长 B tgid==自身 pid。
+        if tg_la != la || tg_ta != la || tg_lb != lb {
+            return false;
+        }
+        // 4) 独立内核栈：线程 ta 与组长 A 的 kstack_top 不同（各自独立栈帧）。
+        if ks_la == ks_ta {
+            return false;
+        }
+        // 5) 共享同一 ThreadGroup 容器：ta 与 la 同组；对照组 lb 与 la 异组。
+        if !same_thread_group(la, ta) || same_thread_group(la, lb) {
+            return false;
+        }
+        reset_all();
+        true
     }
 
     /// 哑地址空间：仅占位映射（测试进程不执行任何用户代码）。

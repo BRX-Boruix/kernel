@@ -3,8 +3,11 @@
 //! 本模块提供：
 //! - `TaskState`：进程状态（就绪/运行/阻塞/退出）——含展示名与数值编码的
 //!   **单点映射**（[`TaskState::label`] / [`TaskState::as_u8`]，task1 KM3）；
-//! - `Process<PT>`：进程控制块——pid、状态、上下文、独立用户地址空间、内核栈、
-//!   用户态入口与用户栈顶、标准流句柄表；
+//! - `ThreadGroup<PT>`：**线程组共享容器**（T1-1 / ADR-035 D1/D2）——组内所有
+//!   成员（组长 + 组员线程）经共享 `Arc` 持同一 fd_table/cwd/identity/addr_space；
+//!   S21 缺口（首期 fd/cwd 未加内部锁）成文于该类型文档；
+//! - `Process<PT>`：进程控制块——pid/tgid/状态/上下文/每线程内核栈、用户态入口
+//!   与用户栈顶、每进程 signal，以及指向其 `ThreadGroup` 的 `Arc`（共享态落在组）；
 //! - `ProcessTable<PT>`：进程表——pid 分配/回收 + 进程存储。
 //!
 //! 架构抽象（ADR-007）：`PT: PageTable` 泛型使进程逻辑不绑定具体架构。
@@ -200,49 +203,117 @@ pub enum Privilege {
     System,
 }
 
+/// 线程组共享容器（T1-1 / ADR-035 D1/D2 / threads.md T1-1）。
+///
+/// 线程派生把"进程间可共享态"从 PCB 提入本**组级容器**：组内所有成员（组长 +
+/// 组员线程）各自持一份 `Arc<ThreadGroup>` 指向同一容器，经 `Arc` 共享
+/// `fd_table` / `cwd` / `identity` / `addr_space`。组长 = 该地址空间首个创建的
+/// 进程（现有 `spawn*` 即组长，spawn 时构造一个组并自身持有其 `Arc`）；组员
+/// 线程派生时 `Arc::clone` 组长的组容器，不重建。每进程的
+/// `pid`/`state`/`context`/`kernel_stack_top`/`entry_rip`/`user_stack_top`/`signal`
+/// 仍留在 [`Process`]（线程 = 独立调度单元，各有自己的栈/帧/FPU/状态）。
+///
+/// # S21 缺口（成文，T1-1 首期暂缓加锁）
+///
+/// 真并发多线程（T1-8 后不同核同时运行组内两个线程的 `ProcEntry`，各自持有
+/// **不同** pid 的 per-pid 锁，却共享本容器）会同时触碰组内 `fd_table`/`cwd`，
+/// 而它们当前是**无内部锁的普通字段**。T1-1 首期线程仅处于 `Ready`、不被并发
+/// 调度执行（真并发切换留 T1-8），且**没有任何代码路径会在组已被多成员共享后
+/// 再对其可变**——所有可变访问都发生在组长的独占期（spawn 装配期，refcount==1，
+/// 经 [`Process::group_mut`] 的 `Arc::get_mut` 取 `&mut`，多成员共享后可变即
+/// `expect` 显式失败而非静默破坏）。因此本阶段不引入 fd 内部锁，代价是：
+/// - **可变语义约束**：多成员组一旦存在，任何成员再 `alloc_fd`/`set_fd`/
+///   `close_fd`/`clone_fd_table`/`set_inherited_fd_table`/`set_cwd`/`set_identity`
+///   会 `expect` 失败——T1-1 可达路径都满足该约束（首期无线程运行/无线程 fd
+///   操作），但**在 T1-7 线程 syscall / T1-8 真并发落地前**必须在组内为
+///   `fd_table`/`cwd` 加一把内部锁（参照 T1-4
+///   [`mm::user_space::UserAddressSpace`] 的 Arc+内部粗锁模式）；
+/// - **借用形态约束**：[`Process::get_fd`] / [`Process::cwd`] 返回跨锁借用，无法
+///   在持内部锁期间安全返回——加锁时须把它们改为不跨锁持有 guard 的形态
+///   （值拷贝返回或 lock-回调式访问），调用点随之收敛。此缺口与可变语义约束
+///   一并留待 T1-8 闭合。
+///
+/// `identity` 是 `Copy` 只读值、`addr_space` 已是 `Arc`（内部粗锁，T1-4），二者
+/// 天然无需再锁，故组内不加保护。
+pub(crate) struct ThreadGroup<PT: PageTable> {
+    /// 组共享文件描述符表（S21 缺口：真并发前需加内部锁，见类型文档）。
+    fd_table: Vec<Option<vfs::file_handle::OpenHandle>>,
+    /// 组共享当前工作目录（S21 缺口：真并发前需加内部锁，见类型文档）。
+    cwd: alloc::string::String,
+    /// 组共享进程身份（`Copy` 只读，无需锁）。
+    identity: ProcessIdentity,
+    /// 组共享用户地址空间（`Arc` 共享 + 内部粗锁，T1-4；不重复包装）。
+    addr_space: Arc<UserAddressSpace<PT>>,
+}
+
+impl<PT: PageTable> ThreadGroup<PT> {
+    /// 构造一个独立组（组长独占）：默认标准流 fd 表 + `/` cwd + 默认身份 +
+    /// 传入的地址空间 `Arc`。组长进程在其 PCB 构造时经此自建并持有本组。
+    fn new(addr_space: Arc<UserAddressSpace<PT>>) -> Self {
+        Self {
+            fd_table: default_stdio_table(),
+            cwd: alloc::string::String::from("/"),
+            identity: ProcessIdentity::default_user(),
+            addr_space,
+        }
+    }
+
+}
+
+/// 进程表与 PCB 初始化的默认标准流表（0=stdin 键盘源、1=stdout、2=stderr）。
+/// 独立组（组长 spawn）与测试直构 [`Process`] 共用此单点，避免跨处复制。
+fn default_stdio_table() -> Vec<Option<vfs::file_handle::OpenHandle>> {
+    alloc::vec![
+        Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stdin_handle())),
+        Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stdout_handle())),
+        Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stderr_handle())),
+    ]
+}
+
 /// 进程控制块（PCB）。
 pub struct Process<PT: PageTable> {
-    /// 进程标识。
+    /// 进程标识（线程与组长一样有独立 pid；pid 即调度身份，进程表无额外每线程字段）。
     pid: usize,
     /// 当前状态。
     state: TaskState,
     /// 上下文切换所需的 CPU 状态（M4 调度用；首次运行经 `iretq` 进用户态）。
     context: TaskContext,
-    /// 独立用户地址空间（含页表、用户区管理）。
-    ///
-    /// ADR-035 D4 / PRE-2（T1-4 第一阶段）：改为 `Arc` 共享。地址空间内部经粗锁
-    /// 自锁，本 PCB 只持有一份 `Arc` 引用；多进程/线程共享同一地址空间时各持
-    /// 一份 `Arc`（Clone），互操作方法在锁内串行。本阶段（地基）仍一进程一
-    /// `Arc`（内部锁未争用），组级共享派生留给 T1。
-    addr_space: Arc<UserAddressSpace<PT>>,
     /// 内核栈顶（用户态中断/系统调用切回内核时的栈；单核可共用全局栈）。
     kernel_stack_top: u64,
     /// 用户态入口 RIP（首次 `iretq` 的目标）。
     entry_rip: u64,
     /// 用户栈顶 RSP。
     user_stack_top: u64,
-    /// 文件描述符表（FD Table，M6.2）。槽位可持有文件句柄或匿名管道端
-    /// （ADR-014 §4.1 FLAG_PIPE）。
-    fd_table: Vec<Option<vfs::file_handle::OpenHandle>>,
-    /// 当前工作目录（cwd，Unix chdir/getcwd 语义）。恒为规范绝对路径（`/` 或
-    /// 无尾斜杠）。syscall 层把相对路径与它拼接成绝对路径再交给 VFS（VFS 层
-    /// 只接受绝对路径，ADR-011 M1 契约不变）。
-    cwd: alloc::string::String,
-    /// 进程身份（A1 / ADR-033）：uid + 特权级。权限强制与 flock owner
-    /// 识别的事实来源（见 [`ProcessIdentity`]）。
-    identity: ProcessIdentity,
+    /// 线程组归属（T1-1 / threads.md）：组长 pid。组长进程自身 tgid == 本 pid；
+    /// 组员线程 tgid == 组长 pid（即共享的同一 [`ThreadGroup`] 的创建者）。独立
+    /// pid 是调度身份，tgid 是把调度单元归到某个组/地址空间的身份；两进程同组
+    /// ⟺ tgid 相等（组与组长 pid 一一对应）。T1-2 组表示查询据此。
+    tgid: usize,
+    /// 组共享容器句柄（T1-1 / ADR-035 D1/D2）：组内所有进程（组长 + 组员线程）
+    /// 各持一份 clone 指向同一 [`ThreadGroup`]，经它访问共享的 fd_table/cwd/
+    /// identity/addr_space。组长 spawn 时自建组并持有；组员线程派生时 clone。
+    group: Arc<ThreadGroup<PT>>,
     /// 每进程信号状态（ADR-034 §2.2）：处置/屏蔽/未决/重入守卫/restorer。
+    ///
+    /// PRE-5（T1-1 阶段）：**信号保持每进程独立**，不随组共享——逐线程信号全套
+    /// 留 libpthread；致命信号整组终止是 T1-3 的事。本阶段不动 signal 语义。
     signal: crate::signal::SignalState,
 }
 
 impl<PT: PageTable> Process<PT> {
-    /// 构造一个初始为 `Ready` 的进程（M4.2 调度器直接使用）。
+    /// 构造一个**组长**（独立组）进程（M4.2 调度器直接使用）。
+    ///
+    /// 组长语义（T1-1 / ADR-035 D1/D2）：本构造把传入的地址空间 `Arc` 包成一份
+    /// **全新独立组**（[`ThreadGroup`]：默认标准流 fd 表 + `/` cwd + 默认身份 +
+    /// 该地址空间）并自持其 `Arc`；tgid = 本 pid。这是每个新地址空间首建进程
+    /// 的标准入口（ProcessTable::spawn / Scheduler::spawn* / spawn_elf_image 路径），
+    /// 与既有"一进程一地址空间"语义完全等价——只是共享态现在落在组容器而非 PCB。
     ///
     /// `kernel_stack_top` 为该进程**独立内核栈**顶（TSS.RSP0 切换用；
     /// 用户态中断/软中断进入内核时切到此栈）。
-    /// `addr_space` 现为 `Arc` 共享句柄（ADR-035 D4）：签名接收 `Arc`，由调用方
-    /// （ProcessTable::spawn / Scheduler::spawn*）负责 `Arc::new(...)` 包装。本阶段
-    /// 每 PCB 一份独立 `Arc`；后续 T1 组共享时调用方传同一 `Arc` 的 clone 即可。
+    ///
+    /// 线程派生**不走本入口**（那是新地址空间 + load ELF）；组员线程复用组长组容器
+    /// 应走 [`Self::with_group`]（见 scheduler::spawn_thread_with）。
     pub fn new(
         pid: usize,
         entry_rip: u64,
@@ -250,28 +321,60 @@ impl<PT: PageTable> Process<PT> {
         kernel_stack_top: u64,
         addr_space: Arc<UserAddressSpace<PT>>,
     ) -> Self {
-        // KM1：三条标准流是**真实的表内句柄**（0=stdin 键盘源、1=stdout、
-        // 2=stderr，均由 vfs::stdio 提供）——syscall 层不再有 fd 号特判，
-        // "保留 0/1/2"从跨 crate 心照不宣变为结构事实。close 保护仍是
-        // syscall 层显式策略：无 dup/redirect 机制前关闭标准流不可恢复。
-        let fd_table = alloc::vec![
-            Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stdin_handle())),
-            Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stdout_handle())),
-            Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stderr_handle())),
-        ];
+        // 组长自建独立组（KM1 标准流表单点在 ThreadGroup::new 内构造）。
+        Self::with_group(pid, pid, entry_rip, user_stack_top, kernel_stack_top,
+            Arc::new(ThreadGroup::new(addr_space)),
+        )
+    }
+
+    /// 以**既有线程组容器**构造一个 PCB（T1-1：线程派生的核心装配）。
+    ///
+    /// `pid` 为本调度单元（组长/组员线程）的独立 pid；`tgid` 为组长 pid（组长
+    /// 传自身 pid，组员线程传组长 pid）。`group` 为组长已持有的 `Arc<ThreadGroup>`，
+    /// 此处直接 clone/move 进来，**不重建**组内共享态（fd_table/cwd/identity/addr_space）
+    /// ——共享经 Arc 成立。每线程的 `signal` 仍独立新建（PRE-5）。调用方负责配
+    /// 好本 PCB 的独立 `kernel_stack_top`/`entry_rip`/`user_stack_top`（线程各自）。
+    ///
+    /// crate 可见：线程派生只在 task crate 内部（scheduler::spawn_thread_with），且参数
+    /// 含 `Arc<ThreadGroup>`（该容器类型本阶段保持 crate 私有），故本构造也不外露。
+    pub(crate) fn with_group(
+        pid: usize,
+        tgid: usize,
+        entry_rip: u64,
+        user_stack_top: u64,
+        kernel_stack_top: u64,
+        group: Arc<ThreadGroup<PT>>,
+    ) -> Self {
         Process {
             pid,
             state: TaskState::Ready,
             context: TaskContext::empty(),
-            addr_space,
             kernel_stack_top,
             entry_rip,
             user_stack_top,
-            fd_table,
-            cwd: alloc::string::String::from("/"),
-            identity: ProcessIdentity::default_user(),
+            tgid,
+            group,
             signal: crate::signal::SignalState::new(),
         }
+    }
+
+    /// 组共享态的可变访问（S21 缺口配套）。
+    ///
+    /// T1-1 首期没有代码路径会在组已多成员共享后对其可变（所有可变访问都发生在
+    /// 组长 spawn 装配期，refcount==1），故经 `Arc::get_mut` 取 `&mut ThreadGroup`；
+    /// 若此不变式被打破（多成员组上出现可变操作）则显式 `expect` 失败而非静默
+    /// 破坏——这正是 S21 文档要求补齐内部锁的确切触发点（见 [`ThreadGroup`]）。
+    #[inline]
+    fn group_mut(&mut self) -> &mut ThreadGroup<PT> {
+        Arc::get_mut(&mut self.group).expect(
+            "S21/T1-1: cannot mutably access a multi-member ThreadGroup; add the group internal lock before true concurrent thread execution (T1-8)",
+        )
+    }
+
+    /// 组共享态的只读句柄 clone（crate 可见：线程派生/test_hooks 同 crate 用；
+    /// 外部经公开 accessor 访问，不把 `ThreadGroup` 具体类型暴露到 crate 边界）。
+    pub(crate) fn thread_group_arc(&self) -> Arc<ThreadGroup<PT>> {
+        Arc::clone(&self.group)
     }
 
     /// 每进程文件描述符上限（KA7/S33 量化：POSIX NOFILE 传统量级）。
@@ -291,34 +394,37 @@ impl<PT: PageTable> Process<PT> {
         &mut self,
         handle: vfs::file_handle::OpenHandle,
     ) -> Result<usize, klib::error::Error> {
-        for (fd, slot) in self.fd_table.iter_mut().enumerate() {
+        // T1-1：fd 表在组容器（多成员共享后可变即 expect，见 ThreadGroup S21 缺口）。
+        let g = self.group_mut();
+        for (fd, slot) in g.fd_table.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(handle);
                 return Ok(fd);
             }
         }
-        if self.fd_table.len() >= Self::MAX_FDS {
+        if g.fd_table.len() >= Self::MAX_FDS {
             return Err(klib::error::Error::NoSpace);
         }
-        let fd = self.fd_table.len();
-        self.fd_table.push(Some(handle));
+        let fd = g.fd_table.len();
+        g.fd_table.push(Some(handle));
         Ok(fd)
     }
 
     /// 获取指定 fd 句柄的只读引用。
     pub fn get_fd(&self, fd: usize) -> Option<&vfs::file_handle::OpenHandle> {
-        self.fd_table.get(fd)?.as_ref()
+        // T1-1：fd 表在组容器（只读经 Arc 共享借用；真并发前须加锁，见 ThreadGroup S21）。
+        self.group.fd_table.get(fd)?.as_ref()
     }
 
     /// 关闭并移除指定 fd 句柄。
     pub fn close_fd(&mut self, fd: usize) -> Option<vfs::file_handle::OpenHandle> {
-        if fd < self.fd_table.len() {
-            let handle = self.fd_table[fd].take();
+        // T1-1：uid 取组共享身份（Copy，先取避免与 group_mut 借用冲突）。
+        let uid = self.group.identity.uid;
+        let g = self.group_mut();
+        if fd < g.fd_table.len() {
+            let handle = g.fd_table[fd].take();
             if let Some(vfs::file_handle::OpenHandle::File(fh)) = &handle {
-                vfs::flock::flock_unlock(
-                    &fh.inode,
-                    vfs::flock::LockOwner { uid: self.identity.uid },
-                );
+                vfs::flock::flock_unlock(&fh.inode, vfs::flock::LockOwner { uid });
             }
             handle
         } else {
@@ -341,10 +447,11 @@ impl<PT: PageTable> Process<PT> {
         if fd >= Self::MAX_FDS {
             return Err(klib::error::Error::NoSpace);
         }
-        if fd >= self.fd_table.len() {
-            self.fd_table.resize(fd + 1, None);
+        let g = self.group_mut();
+        if fd >= g.fd_table.len() {
+            g.fd_table.resize(fd + 1, None);
         }
-        self.fd_table[fd] = Some(handle);
+        g.fd_table[fd] = Some(handle);
         Ok(())
     }
 
@@ -354,7 +461,8 @@ impl<PT: PageTable> Process<PT> {
     /// 本方法内**——由 kernel syscall 层在克隆后对每个 `Pipe { id }` 调
     /// `ipc::pipe_ref_inc(id)`，保证子进程继承的 pipe 端也持有一个 ref。
     pub fn clone_fd_table(&self) -> alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>> {
-        self.fd_table.clone()
+        // T1-1：fd 表在组容器（只读克隆）。
+        self.group.fd_table.clone()
     }
 
     /// 以父进程继承的 fd 表替换本进程的默认标准流表（spawn 时注入）。
@@ -366,22 +474,33 @@ impl<PT: PageTable> Process<PT> {
         &mut self,
         inherited: alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>>,
     ) {
+        // T1-1：替换的是组容器共享 fd 表（组长 spawn 装配期独享，见 ThreadGroup S21）。
         if !inherited.is_empty() {
-            self.fd_table = inherited;
+            self.group_mut().fd_table = inherited;
         }
     }
 
-    /// 进程 id。
+    /// 进程 id（本调度单元的独立 pid）。
     pub fn pid(&self) -> usize {
         self.pid
     }
-    /// 进程身份（A1 / ADR-033）。
-    pub fn identity(&self) -> ProcessIdentity {
-        self.identity
+    /// 线程组归属（T1-1）：组长 pid。组长自身 tgid == pid；组员线程 tgid == 组长 pid。
+    /// 两进程同组 ⟺ tgid 相等（组与组长 pid 一一对应）。T1-2 组表示查询据此。
+    pub fn tgid(&self) -> usize {
+        self.tgid
     }
-    /// 设置进程身份（A1 / ADR-033）。
+    /// 是否与另一进程共享同一 `ThreadGroup`（T1-1 结构断言：`Arc::ptr_eq` 判
+    /// 同一组容器对象，而非仅 tgid 相等——同一组必然共享同一对象）。
+    pub fn same_thread_group(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.group, &other.group)
+    }
+    /// 进程身份（A1 / ADR-033）。T1-1：身份在组容器（组内共享，`Copy` 只读）。
+    pub fn identity(&self) -> ProcessIdentity {
+        self.group.identity
+    }
+    /// 设置进程身份（A1 / ADR-033）。T1-1：写组共享身份（组长 spawn 装配期独享）。
     pub fn set_identity(&mut self, identity: ProcessIdentity) {
-        self.identity = identity;
+        self.group_mut().identity = identity;
     }
     /// 每进程信号状态（ADR-034 §2.2）可变访问（派发/投递/sigaction 用）。
     pub fn signal_mut(&mut self) -> &mut crate::signal::SignalState {
@@ -391,13 +510,15 @@ impl<PT: PageTable> Process<PT> {
     pub fn signal(&self) -> &crate::signal::SignalState {
         &self.signal
     }
-    /// 当前工作目录（规范绝对路径）。
+    /// 当前工作目录（规范绝对路径）。T1-1：cwd 在组容器共享（只读借用；
+    /// 真并发前须加锁，见 ThreadGroup S21）。
     pub fn cwd(&self) -> &str {
-        &self.cwd
+        &self.group.cwd
     }
-    /// 设置当前工作目录（调用方保证为规范绝对路径）。
+    /// 设置当前工作目录（调用方保证为规范绝对路径）。T1-1：写组共享 cwd
+    /// （组长 spawn/系统调用期独享，见 ThreadGroup S21）。
     pub fn set_cwd(&mut self, cwd: alloc::string::String) {
-        self.cwd = cwd;
+        self.group_mut().cwd = cwd;
     }
     /// 当前状态。
     pub fn state(&self) -> TaskState {
@@ -423,14 +544,15 @@ impl<PT: PageTable> Process<PT> {
     pub fn context_mut(&mut self) -> &mut TaskContext {
         &mut self.context
     }
-    /// 访问用户地址空间（ADR-035 D4）。
+    /// 访问用户地址空间（T1-1 / ADR-035 D4）。
     ///
-    /// 地址空间改为 `Arc` + 内部粗锁后，不再有 `&mut UserAddressSpace` 的公开
-    /// 形态——所有互操作方法已改 `&self` 内部自锁。本访问器解引用 `Arc` 返回
-    /// `&UserAddressSpace`，调用方直接调用（内部锁保证互斥）。原 `addr_space_mut`
-    /// 已删除：语义收敛到本方法（同一锁在方法内保证独占）。
+    /// 地址空间在**组容器**里以 `Arc` + 内部粗锁共享（T1-4）；不再有
+    /// `&mut UserAddressSpace` 的公开形态——所有互操作方法已改 `&self` 内部自锁。
+    /// 本访问器经组容器解引用返回 `&UserAddressSpace`，调用方直接调用（内部锁
+    /// 保证互斥）。原 `addr_space_mut` 已删除：语义收敛到本方法。组内所有成员
+    /// 经各自 `Process` 的同一访问器看到同一个共享地址空间对象。
     pub fn addr_space(&self) -> &UserAddressSpace<PT> {
-        &self.addr_space
+        &self.group.addr_space
     }
 
     /// 启动进程：设置状态为 Running，并从内核 `iretq` 进入用户态。

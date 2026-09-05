@@ -626,6 +626,11 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_ipc1_semantics();
 
+    // T1-1 线程派生结构验收（ADR-035 D1/D2 / threads.md T1-1）：组共享容器 +
+    // 独立 pid/kstack/tgid 单核检查（表级，返回主流程；调度切换留 T1-8）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_thread_derive();
+
     // S26 回归：block_current_with 登记点失败时已弹出的就绪进程必须重新入队。
     // KS1: 必须放在 test_task_kstack_reclaim 之后，否则该测试的帧计数
     // 对前序 spawn 敏感（顺序依赖）。

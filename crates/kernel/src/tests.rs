@@ -9660,6 +9660,20 @@ pub fn test_smp_smoke() {
     info!("[test-smp] PASS");
 }
 
-
+/// T1-1 线程派生（ADR-035 D1/D2 / threads.md T1-1）：单核结构验收。
+///
+/// 派生一个组长 + 一个同组线程 + 一个对照独立组长，验证线程派生的核心结构步：
+/// 组员独立 pid/kstack、均 Ready、tgid == 组长 pid、共享同一 ThreadGroup 容器，
+/// 而独立组长与 A 组不同组。断言失败即停机（表级自检，返回主流程）。
+/// 调度切换留 T1-8，本测试不切。
+pub fn test_thread_derive() {
+    use task::scheduler::test_hooks as th;
+    info!("[test-t1-1] === T1-1 thread derive (shared-group primitive) ====");
+    assert!(
+        th::verify_thread_derive(),
+        "[test-t1-1] thread-derive structural checks failed"
+    );
+    info!("[test-t1-1] PASS (independent pid/kstack/tgid + shared ThreadGroup)");
+}
 
 
