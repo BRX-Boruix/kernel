@@ -1682,6 +1682,130 @@ pub enum Termination {
 /// 逐槽升序取锁），调用方无需持任何调度锁；对不存在的 pid 返回
 /// [`Termination::Reclaimed`]（幂等防御，正常路径不会发生）。
 fn terminate_locked(pid: usize, code: u64) -> Termination {
+    // ---- T1-3（ADR-035 D3 / threads.md T1-3）组长/组员分流（C0/C1/C2）----
+    // 先短暂持 pid 桶锁读出 tgid 判身份，随即释放（组长身份 = tgid==pid；组长可能是
+    // 别人的子进程，其 ppid=父进程，但组长身份**不看 ppid**，只看 tgid 与 pid 是否相等，
+    // 见 C0）。判定后各步逐 pid 各自取桶锁，不跨桶同持多锁。
+    let is_member = {
+        let g = proc_bucket_lock(pid);
+        match g.get(&pid) {
+            Some(e) => e.proc.tgid() != pid,
+            None => return Termination::Reclaimed, // 幂等（1694 destroyed 守卫同源）
+        }
+    };
+    // C1：组员 exit/SIGKILL/terminate 短路为**单体保留 zombie**——不算进程退出，
+    // 不进父 waitpid/WAIT_ANY 视野（R1），不做孤儿级联/过继（组员不是独立进程的父）。
+    if is_member {
+        return terminate_member_locked(pid, code);
+    }
+    // C2：组长退（含 SIGKILL 自杀/他杀）→ 整组随退。在组长**置 Exit 前**先整组展开
+    // （collect-then-act，S21），把组内全部非组长组员先按单体 terminate 终止；随后组长
+    // 自身走既有完整终止路径。组长退时组内已无存活组员线程，无孤儿线程组（C7）。
+    terminate_whole_group_locked(pid, code);
+    // 组长自身走完整终止路径（父交付 notify 父 / zombie 保留 / 回收 / 孤儿级联/过继），
+    // zombie/exit_code 落点不变（C3）。
+    terminate_process_locked(pid, code)
+}
+
+/// T1-3 C2：组长终止时的整组展开——终止组内除组长外全部组员线程。
+///
+/// 锁纪律（S21）：group_members 已 collect-then-act（逐桶短持锁仅收集后释放）；
+/// 本函数在**无桶锁现场**逐 pid 调用 terminate_member_locked（逐 pid 取各自桶锁的独立
+/// 操作，与既有孤儿级联逐 pid 回收同款），绝不同时跨桶持多把锁；组长与某组员同桶也
+/// 不得同持两把锁（collect 已释放）。幂等：组员可能已先行退出（zombie）或已被收尸，
+/// terminate_member_locked 幂等安全。
+fn terminate_whole_group_locked(leader: usize, code: u64) {
+    for m in group_members(leader) {
+        if m != leader {
+            let _ = terminate_member_locked(m, code);
+        }
+    }
+}
+
+/// T1-3 C1：组员（tgid != pid）的终止**短路**——单体保留 zombie。
+///
+/// 组员退出不算进程退出：仅置 Exit + 记退出码 + 移出就绪 + 跨核脱机 resched，然后
+/// **保留为 zombie**（收尸人 = 组长显式 join / 组长退时随整组清理，R3）。与既有完整
+/// 路径的三点差异：
+///  1. 不做父交付：组员 ppid=组长，但组员**不是**组长可经 WAIT_ANY 收取的进程子（R1）；
+///     显式 waitpid(具体组员 pid)（组长 join，C4）仍经 reap_child_locked 收尸，无需交付。
+///  2. 不做孤儿级联/过继：组员不是独立进程的父（线程不另立进程子）。
+///  3. 保留 zombie 而非回收：组员 zombie 生命周期（R3）= 组长 join 或组长退时随组清理。
+///
+/// 幂等（与既有 destroyed/state 守卫同源）：槽已 Exit 或已收尸（None）则无副作用。
+/// UAF（R2）：跨核时若组员正 RUN.current 在其它核，仅置 Exit + 发 resched IPI（同既有
+/// 移出就绪+脱机路径），由该核 tick 的 Exit 脱机分支（deschedule_exit_current，其会重跑
+/// 本函数，幂等）切下后本槽才可被收尸/随组清理；本函数**绝不在组员未脱机时同步 remove**
+/// 其 ProcEntry。
+fn terminate_member_locked(pid: usize, code: u64) -> Termination {
+    // per-pid：先取 pid 锁置 Exit、记退出码、读 home + leader(ppid)（单 pid 区域，随后释放）。
+    // UAF(R2)守卫：绝不在此 remove 未脱机的 ProcEntry——先置 Exit 发 resched，脱机后由
+    // deschedule_exit_current 重跑本函数(幂等)再收尸/交付。
+    let (ppid, home) = {
+        let mut g = proc_bucket_lock(pid);
+        match g.get_mut(&pid) {
+            Some(slot) => {
+                slot.exit_code = code;
+                slot.proc.set_state(TaskState::Exit);
+                (slot.ppid, slot.home_cpu)
+            }
+            None => return Termination::Reclaimed, // 幂等：组员已被收尸/不存在
+        }
+    };
+    // 移出 home 核就绪队列；跨核且正运行则发 resched IPI（与既有 terminate 移出就绪
+    // + 脱机同款）。
+    let mut hrun = run_mut(home);
+    hrun.ready.retain(|&p| p != pid);
+    let cross_core_running = home != my_cpu_slot() && hrun.current == Some(pid);
+    if cross_core_running {
+        let _ = arch_x86_64::interrupts::send_resched_ipi_to_slot(home);
+    }
+    drop(hrun);
+    // 单目标 join 交付：组长(ppid)若正阻塞在 waitpid(本组员 pid)上——显式 join 本线程——
+    // 则交付退出码并唤醒（等同子进程退出对"显式等待该 pid"父的交付）。**仅限
+    // waiting_for == Some(pid)**，绝不服务 WAIT_ANY（R1：组员不产生 waitpid/WAIT_ANY 可见的
+    // 进程退出）。交付即收尸（join 回收 zombie）：组员已置 Exit、非跨核正运行时可安全
+    // remove + retire；跨核未脱机时保留 zombie 由脱机后重跑本函数交付（幂等）。
+    let leader_deliver = if !cross_core_running {
+        let mut gp = proc_bucket_lock(ppid);
+        let wake = gp.get_mut(&ppid).is_some_and(|ps| {
+            ps.proc.state() == TaskState::Blocked && ps.waiting_for == Some(pid)
+        });
+        if wake {
+            // 交付：退出码落组长 saved.rax、组员 pid 落 r10（与进程父交付同款）；组长 Ready。
+            let ps = gp.get_mut(&ppid).unwrap();
+            ps.waiting_for = None;
+            ps.saved.rax = code;
+            ps.saved.r10 = pid as u64;
+            ps.proc.set_state(TaskState::Ready);
+            Some(ps.home_cpu)
+        } else {
+            None
+        }
+    } else {
+        None // 跨核正运行：保留 zombie，脱机后 deschedule_exit_current 重跑交付（幂等）。
+    };
+    if let Some(leader_home) = leader_deliver {
+        wake_enqueue(ppid, leader_home);
+        // join 收尸：移除组员 zombie（本核现场，安全；UAF 由 cross_core_running 守卫）。
+        if let Some(e) = proc_bucket_lock(pid).remove(&pid) {
+            let oh = e.home_cpu;
+            vfs::flock::flock_release_all_for_owner(e.proc.identity().uid);
+            retire_entry(e, oh);
+        }
+        Termination::DeliveredToParent
+    } else {
+        Termination::ZombieKept
+    }
+}
+
+/// 组长/独立进程的完整终止路径（原 terminate_locked 主体）：置 Exit、移出就绪、
+/// 按父状态三分支（无父→回收 / 父阻塞等待本 pid→交付退出码并唤醒 / 否则保留
+/// zombie）、孤儿级联 + 孤儿过继。组长自身必须是**组长**（tgid==pid）且组内组员已
+/// 由 terminate_whole_group_locked 先行终止，故此处不再感知组——组员不产生
+/// waitpid/WAIT_ANY 可见的进程退出；组长 zombie 归父进程 waitpid 收尸、组员 zombie 归
+/// 组长显式 join，各自落点互不混淆（C9）。由 terminate_locked 调用。
+fn terminate_process_locked(pid: usize, code: u64) -> Termination {
     // per-pid：先取 pid 锁读 ppid/home 并置 Exit（单个 pid 区域，随后释放）。
     let (ppid, home) = {
         let mut g = proc_bucket_lock(pid);
@@ -1874,7 +1998,10 @@ fn waitpid_inner(
         for bucket in PROCESSES.iter() {
             let gi = bucket.lock();
             for (p, e) in gi.iter() {
-                if e.ppid == cur && e.proc.state() == TaskState::Exit {
+                // R1：排除组员——组员 ppid==组长（可被组长显式 join / C4），但**不是**
+                // 组长可经 WAIT_ANY 收取的进程子。真正的进程子 tgid == 自身 pid（自己的
+                // 组长/独立进程）；组员 tgid != 自身 pid，跳过，不得误报给组长。
+                if e.proc.tgid() == *p && e.ppid == cur && e.proc.state() == TaskState::Exit {
                     first_zombie_child = Some(*p);
                     break;
                 }
@@ -1892,7 +2019,9 @@ fn waitpid_inner(
             let mut found = false;
             for bucket in PROCESSES.iter() {
                 let gi = bucket.lock();
-                if gi.iter().any(|(_, e)| e.ppid == cur) {
+                // R1：has_children 同样排除组员（组员不是 WAIT_ANY 可等的进程子；否则组长
+                // 仅有组员时会被误判"有子进程"而走进永久阻塞路径）。
+                if gi.iter().any(|(p, e)| e.proc.tgid() == *p && e.ppid == cur) {
                     found = true;
                     break;
                 }
@@ -2918,6 +3047,102 @@ pub mod test_hooks {
             return false;
         }
         reset_all();
+        true
+    }
+
+    /// T1-3 组退出语义验收（ADR-035 D3/P1 / threads.md T1-3）：单核"置 Exit 不入调度"
+    /// 夹具下驱动真实 terminate_locked / waitpid_inner 表级核心，验证 C1/C2/C4/R1/R3：
+    ///   (a) 组员单独 exit → 组长仍活、组员 zombie 保留在表；组长显式 waitpid(组员 pid)
+    ///       （join）可收尸取码；组长 WAIT_ANY 不被该组员误报（R1）；正控：组长对真实
+    ///       进程子的 WAIT_ANY 收尸仍正常。
+    ///   (b) 组长 exit（非自杀 SIGKILL，表级 terminate 驱动）→ 整组（含活组员）随退全
+    ///       Exit、组长 notify 父（父阻塞 waitpid(组长) 被交付唤醒取码）、组员随组清理。
+    ///   (c) 组长 SIGKILL（自杀语义经 terminate_locked 的组分流）→ 整组退、无残留。
+    /// 跨核脱机（组员 RUN.current 在其它核时经 resched IPI + tick Exit 脱机）需真调度，
+    /// 单核夹具不构造，留给 T1-8/SMP storm 回归验证。返回是否全部通过。
+    pub fn verify_group_exit() -> bool {
+        // 场景 (a)：组员单独 exit 不算进程退出（C1/R1/C4）。
+        {
+            reset_all();
+            let Ok(l) = spawn_named_child_of(0, "a-leader") else { return false; };
+            let Ok(m) = spawn_thread_of(l, "a-thread") else { return false; };
+            // 组长/组员身份：l 是组长（tgid==pid），m 不是（tgid==l）。
+            if !super::is_group_leader(l) || super::is_group_leader(m) { return false; }
+            // 组员单独 exit：短路为单体保留 zombie，组长不受影响。
+            if terminate(m, 7) != "zombie" { return false; }
+            if super::group_live_count(l) != 1 { return false; } // 组长仍在（组员已退）
+            let (s_l, _, _, _, _) = probe(l).expect("leader alive");
+            if s_l == TaskState::Exit { return false; } // 组长不得随组员退出
+            let (s_m, _, _, _, ppid_m) = probe(m).expect("member zombie in table");
+            if s_m != TaskState::Exit || ppid_m != l { return false; } // zombie 保留且属组长
+            // R1：组长 WAIT_ANY 不得把组员当进程子收走（此时组长无真实进程子 → NotFound）。
+            if !matches!(wait_any(l), Err(super::Error::NotFound)) { return false; }
+            if probe(m).is_none() { return false; } // WAIT_ANY 后组员仍须在表（未被误收）
+            // C4：组长显式 waitpid(组员 pid)（join）可收尸取码。
+            match block_on_child(l, m) {
+                Ok(Waited::Reaped { pid, code }) if pid == m && code == 7 => {}
+                _ => return false,
+            }
+            if probe(m).is_some() { return false; } // 收尸后槽位释放
+            // 正控：WAIT_ANY 对真实进程子仍正常收尸（排除组员不影响进程子）。
+            let Ok(rc) = spawn_named_child_of(l, "a-real-child") else { return false; };
+            if terminate(rc, 3) != "zombie" { return false; }
+            match wait_any(l) {
+                Ok(Waited::Reaped { pid, code }) if pid == rc && code == 3 => {}
+                _ => return false,
+            }
+            reset_all();
+        }
+        // 场景 (b)：组长 exit（非自杀 SIGKILL）→ 整组随退 + notify 父。
+        {
+            reset_all();
+            let Ok(p) = spawn_named_child_of(0, "b-parent") else { return false; };
+            let Ok(l) = spawn_named_child_of(p, "b-leader") else { return false; };
+            let Ok(m1) = spawn_thread_of(l, "b-t1") else { return false; };
+            let Ok(m2) = spawn_thread_of(l, "b-t2") else { return false; };
+            if super::group_live_count(l) != 3 { return false; } // 组长+m1+m2
+            // 父阻塞 waitpid(组长)：组退出时组长须 notify 父（交付唤醒）。
+            if !matches!(block_on_child(p, l), Ok(Waited::Blocked)) { return false; }
+            if terminate(l, 42) != "delivered" { return false; }
+            // 整组（含活组员）全退：组长交付即收尸，组员随组清理（R3）。
+            if probe(l).is_some() || probe(m1).is_some() || probe(m2).is_some() { return false; }
+            if super::group_live_count(l) != 0 { return false; } // 整组无存活成员
+            // 父被 notify：唤醒、拿到组长退出码、waiting_for 清空。
+            let (s_p, _, wf_p, rax_p, _) = probe(p).expect("parent notified");
+            if s_p != TaskState::Ready || wf_p != None || rax_p != 42 { return false; }
+            reset_all();
+        }
+        // 场景 (c)：组长 SIGKILL 自杀（terminate_locked 的组分流）→ 整组退。
+        {
+            reset_all();
+            let Ok(l) = spawn_named_child_of(0, "c-leader") else { return false; };
+            let Ok(m1) = spawn_thread_of(l, "c-t1") else { return false; };
+            let Ok(m2) = spawn_thread_of(l, "c-t2") else { return false; };
+            // 自杀 SIGKILL 最终经 exit_current → terminate_locked(L, SIGKILL)。单核夹具不
+            // 跑物理切换，直接驱动 terminate_locked 的组长分支（与自杀同组展开语义）。
+            if terminate(l, 9) != "reclaimed" { return false; } // 无父组长 → 回收
+            if probe(l).is_some() || probe(m1).is_some() || probe(m2).is_some() { return false; }
+            if !super::group_all_exited(l) { return false; }
+            reset_all();
+        }
+        // 场景 (d)：组长**阻塞在 waitpid(组员)**（pthread_join 语义）时组员退出 → 单目标
+        // 交付唤醒组长并收尸（terminate_member_locked 的 join 交付路径，非 WAIT_ANY）。
+        {
+            reset_all();
+            let Ok(l) = spawn_named_child_of(0, "d-leader") else { return false; };
+            let Ok(m) = spawn_thread_of(l, "d-thread") else { return false; };
+            // 组长阻塞登记在显式 waitpid(组员 m)——组员仍存活，故返回 Blocked（表级登记）。
+            if !matches!(block_on_child(l, m), Ok(Waited::Blocked)) { return false; }
+            if !matches!(probe(l), Some((TaskState::Blocked, _, Some(wf), _, _)) if wf == m) {
+                return false;
+            }
+            // 组员此时退出(7)：须唤醒阻塞中的组长并交付退出码，且收尸组员 zombie。
+            if terminate(m, 7) != "delivered" { return false; }
+            // 组长被唤醒 Ready、waiting_for 清空、saved.rax==7；组员已收尸(槽位释放)。
+            if !matches!(probe(l), Some((TaskState::Ready, _, None, 7, _))) { return false; }
+            if probe(m).is_some() { return false; }
+            reset_all();
+        }
         true
     }
     /// 哑地址空间：仅占位映射（测试进程不执行任何用户代码）。

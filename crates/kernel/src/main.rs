@@ -635,6 +635,11 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_t1_2_group();
 
+    // T1-3 组退出语义（ADR-035 D3/P1 / threads.md T1-3）：组员单体 exit + 组长退整组
+    // 随退并 notify 父。单核表级验收（表级自检，返回主流程；跨核脱机留 T1-8/SMP）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_t1_3();
+
     // S26 回归：block_current_with 登记点失败时已弹出的就绪进程必须重新入队。
     // KS1: 必须放在 test_task_kstack_reclaim 之后，否则该测试的帧计数
     // 对前序 spawn 敏感（顺序依赖）。

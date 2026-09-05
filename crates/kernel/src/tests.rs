@@ -9691,4 +9691,21 @@ pub fn test_t1_2_group() {
     info!("[test-t1-2] PASS (group_members/count/leader/all-exited correct)");
 }
 
+/// T1-3 组退出语义（ADR-035 D3/P1 / threads.md T1-3）：单核表级验收。
+///
+/// 全程关中断（同 test_waitpid_core 纪律）——verify_group_exit 会经 block_on_child 把
+/// 表级 current 切到哑入口测试进程，若 LAPIC tick 到来会把这些永不执行用户代码的
+/// 哑进程 iretq 进哑地址 → Page Fault。断言失败即停机（表级自检，返回主流程）。
+/// 跨核脱机路径（组员 RUN.current 在其它核时经 resched IPI 脱机）留 T1-8/SMP storm。
+pub fn test_t1_3() {
+    use task::scheduler::test_hooks as th;
+    arch_x86_64::interrupts::disable();
+    info!("[test-t1-3] === T1-3 group-exit semantics (member/leader/SIGKILL) ====");
+    assert!(
+        th::verify_group_exit(),
+        "[test-t1-3] group-exit semantics checks failed"
+    );
+    info!("[test-t1-3] PASS (member-exit zombie/join; leader-exit group+notify; leader-SIGKILL)");
+}
+
 
