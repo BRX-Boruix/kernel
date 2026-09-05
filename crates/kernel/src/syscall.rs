@@ -685,7 +685,7 @@ fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
             return pack_err(Error::NotFound);
         };
         match proc.get_fd(old_fd) {
-            Some(h) => h.clone(),
+            Some(h) => h,
             None => return pack_err(Error::NotFound),
         }
     };
@@ -1010,7 +1010,7 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
     // ADR-014 FLAG_PIPE：管道端直接经 ipc::pipe_write 路由（环形缓冲 +
     // 内部阻塞/唤醒）。管道不可定位，非顺序写哨兵如实 ESPIPE。
     let pipe_id = match proc.get_fd(fd as usize) {
-        Some(vfs::file_handle::OpenHandle::Pipe { id }) => Some(*id),
+        Some(vfs::file_handle::OpenHandle::Pipe { id }) => Some(id),
         Some(vfs::file_handle::OpenHandle::File(_)) => None,
         None => return pack_err(Error::InvalidParam),
     };
@@ -1134,7 +1134,7 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
     // 非顺序读哨兵如实 ESPIPE。pipe_read 内部阻塞/唤醒（进程回归后本帧即
     // 当前进程现场），完成后可安全回写 result。
     let pipe_id = match proc.get_fd(fd as usize) {
-        Some(vfs::file_handle::OpenHandle::Pipe { id }) => Some(*id),
+        Some(vfs::file_handle::OpenHandle::Pipe { id }) => Some(id),
         Some(vfs::file_handle::OpenHandle::File(_)) => None,
         None => return done(pack_err(Error::InvalidParam)),
     };

@@ -5,7 +5,7 @@
 //!   **单点映射**（[`TaskState::label`] / [`TaskState::as_u8`]，task1 KM3）；
 //! - `ThreadGroup<PT>`：**线程组共享容器**（T1-1 / ADR-035 D1/D2）——组内所有
 //!   成员（组长 + 组员线程）经共享 `Arc` 持同一 fd_table/cwd/identity/addr_space；
-//!   S21 缺口（首期 fd/cwd 未加内部锁）成文于该类型文档；
+//!   fd_table/cwd/identity 已加组内粗锁（S21 缺口闭合，见该类型文档，T1-8）；
 //! - `Process<PT>`：进程控制块——pid/tgid/状态/上下文/每线程内核栈、用户态入口
 //!   与用户栈顶、每进程 signal，以及指向其 `ThreadGroup` 的 `Arc`（共享态落在组）；
 //! - `ProcessTable<PT>`：进程表——pid 分配/回收 + 进程存储。
@@ -213,35 +213,36 @@ pub enum Privilege {
 /// `pid`/`state`/`context`/`kernel_stack_top`/`entry_rip`/`user_stack_top`/`signal`
 /// 仍留在 [`Process`]（线程 = 独立调度单元，各有自己的栈/帧/FPU/状态）。
 ///
-/// # S21 缺口（成文，T1-1 首期暂缓加锁）
+/// # S21 并发锁闭合（T1-8 / threads.md T1-8 范围 A）
 ///
-/// 真并发多线程（T1-8 后不同核同时运行组内两个线程的 `ProcEntry`，各自持有
-/// **不同** pid 的 per-pid 锁，却共享本容器）会同时触碰组内 `fd_table`/`cwd`，
-/// 而它们当前是**无内部锁的普通字段**。T1-1 首期线程仅处于 `Ready`、不被并发
-/// 调度执行（真并发切换留 T1-8），且**没有任何代码路径会在组已被多成员共享后
-/// 再对其可变**——所有可变访问都发生在组长的独占期（spawn 装配期，refcount==1，
-/// 经 [`Process::group_mut`] 的 `Arc::get_mut` 取 `&mut`，多成员共享后可变即
-/// `expect` 显式失败而非静默破坏）。因此本阶段不引入 fd 内部锁，代价是：
-/// - **可变语义约束**：多成员组一旦存在，任何成员再 `alloc_fd`/`set_fd`/
-///   `close_fd`/`clone_fd_table`/`set_inherited_fd_table`/`set_cwd`/`set_identity`
-///   会 `expect` 失败——T1-1 可达路径都满足该约束（首期无线程运行/无线程 fd
-///   操作），但**在 T1-7 线程 syscall / T1-8 真并发落地前**必须在组内为
-///   `fd_table`/`cwd` 加一把内部锁（参照 T1-4
-///   [`mm::user_space::UserAddressSpace`] 的 Arc+内部粗锁模式）；
-/// - **借用形态约束**：[`Process::get_fd`] / [`Process::cwd`] 返回跨锁借用，无法
-///   在持内部锁期间安全返回——加锁时须把它们改为不跨锁持有 guard 的形态
-///   （值拷贝返回或 lock-回调式访问），调用点随之收敛。此缺口与可变语义约束
-///   一并留待 T1-8 闭合。
+/// 真并发多线程落地前，本容器内 `fd_table`/`cwd`/`identity` 已从无锁普通字段升级为
+/// **内部粗锁**（参照 T1-4 [`mm::user_space::UserAddressSpace`] 的 Arc+内部粗锁模式）：
+/// 不同核同时运行组内两个线程（各自持**不同** pid 的 per-pid 锁、共享本容器）时，
+/// 对 `fd_table`/`cwd`/`identity` 的并发访问由此内部锁串行化。由此闭合 T1-1 声明的
+/// S21 缺口（旧 `Process::group_mut` 的 `Arc::get_mut().expect` 独占可变已删除——
+/// 所有可变访问改为锁内读写，多成员组共享后不再受独占限制）。
 ///
-/// `identity` 是 `Copy` 只读值、`addr_space` 已是 `Arc`（内部粗锁，T1-4），二者
-/// 天然无需再锁，故组内不加保护。
+/// **锁粒度与锁序纪律**：
+/// - `fd_table`/`cwd`/`identity` 是组内**最内层短锁**，只在"读写槽位/字段"临界区持有，
+///   **绝不在持其期间调用 vfs 阻塞操作或取其它会阻塞的锁**——需要做 vfs 工作的值
+///   （`OpenHandle` clone / `String` clone / `ProcessIdentity` copy）一律先 clone 出
+///   临界区到无锁现场用（[`Process::get_fd`]/[`Process::cwd`] 改为值语义返回即为此）。
+/// - 与 per-pid 锁的锁序为 per-pid → 组内锁，不反向：持 per-pid 锁的代码（spawn
+///   装配 / terminate）取组内锁为合法内层；持组内锁**绝不**反向取 per-pid 锁。
+/// - 中断安全：这些访问只发生在 syscall / 调度装配上下文，临界区不关中断亦不会被
+///   同核中断重入（组内锁**不在**任何中断处理器路径内取用），故取纯自旋
+///   `klib::sync::spin::SpinMutex` 即可（语义同 T1-4 user_space，属 klib 在架原语，
+///   不引外部 crate 依赖）。
+///
+/// `addr_space` 已是 `Arc`（内部粗锁，T1-4），不在此重复包装。
 pub(crate) struct ThreadGroup<PT: PageTable> {
-    /// 组共享文件描述符表（S21 缺口：真并发前需加内部锁，见类型文档）。
-    fd_table: Vec<Option<vfs::file_handle::OpenHandle>>,
-    /// 组共享当前工作目录（S21 缺口：真并发前需加内部锁，见类型文档）。
-    cwd: alloc::string::String,
-    /// 组共享进程身份（`Copy` 只读，无需锁）。
-    identity: ProcessIdentity,
+    /// 组共享文件描述符表（S21 闭合：内部短锁保护，见类型文档）。
+    fd_table: klib::sync::spin::SpinMutex<alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>>>,
+    /// 组共享当前工作目录（S21 闭合：内部短锁保护，见类型文档）。
+    cwd: klib::sync::spin::SpinMutex<alloc::string::String>,
+    /// 组共享进程身份（S21 闭合：内部短锁保护——`ProcessIdentity` 虽 `Copy`，但组长
+    /// exec 换身份与组员并发读若为普通字段即成数据竞争，故亦加锁，见类型文档裁定）。
+    identity: klib::sync::spin::SpinMutex<ProcessIdentity>,
     /// 组共享用户地址空间（`Arc` 共享 + 内部粗锁，T1-4；不重复包装）。
     addr_space: Arc<UserAddressSpace<PT>>,
 }
@@ -251,13 +252,12 @@ impl<PT: PageTable> ThreadGroup<PT> {
     /// 传入的地址空间 `Arc`。组长进程在其 PCB 构造时经此自建并持有本组。
     fn new(addr_space: Arc<UserAddressSpace<PT>>) -> Self {
         Self {
-            fd_table: default_stdio_table(),
-            cwd: alloc::string::String::from("/"),
-            identity: ProcessIdentity::default_user(),
+            fd_table: klib::sync::spin::SpinMutex::new(default_stdio_table()),
+            cwd: klib::sync::spin::SpinMutex::new(alloc::string::String::from("/")),
+            identity: klib::sync::spin::SpinMutex::new(ProcessIdentity::default_user()),
             addr_space,
         }
     }
-
 }
 
 /// 进程表与 PCB 初始化的默认标准流表（0=stdin 键盘源、1=stdout、2=stderr）。
@@ -358,19 +358,6 @@ impl<PT: PageTable> Process<PT> {
         }
     }
 
-    /// 组共享态的可变访问（S21 缺口配套）。
-    ///
-    /// T1-1 首期没有代码路径会在组已多成员共享后对其可变（所有可变访问都发生在
-    /// 组长 spawn 装配期，refcount==1），故经 `Arc::get_mut` 取 `&mut ThreadGroup`；
-    /// 若此不变式被打破（多成员组上出现可变操作）则显式 `expect` 失败而非静默
-    /// 破坏——这正是 S21 文档要求补齐内部锁的确切触发点（见 [`ThreadGroup`]）。
-    #[inline]
-    fn group_mut(&mut self) -> &mut ThreadGroup<PT> {
-        Arc::get_mut(&mut self.group).expect(
-            "S21/T1-1: cannot mutably access a multi-member ThreadGroup; add the group internal lock before true concurrent thread execution (T1-8)",
-        )
-    }
-
     /// 组共享态的只读句柄 clone（crate 可见：线程派生/test_hooks 同 crate 用；
     /// 外部经公开 accessor 访问，不把 `ThreadGroup` 具体类型暴露到 crate 边界）。
     pub(crate) fn thread_group_arc(&self) -> Arc<ThreadGroup<PT>> {
@@ -390,46 +377,59 @@ impl<PT: PageTable> Process<PT> {
     /// 占用槽——不再需要 `fd >= 3` 魔法数字条件。
     /// KA7：无空槽且表长已达 [`Self::MAX_FDS`] 时如实上抛
     /// [`Error::NoSpace`]，绝不无界增长；已关闭槽位的复用不受上限挤压。
+    ///
+    /// S21 闭合（T1-8）：方法改 `&self`，在组内 `fd_table` 锁内找空槽/扩表
+    /// （短持锁，仅槽位读写，不做 vfs 工作），不再依赖 `group_mut` 独占可变。
     pub fn alloc_fd(
-        &mut self,
+        &self,
         handle: vfs::file_handle::OpenHandle,
     ) -> Result<usize, klib::error::Error> {
-        // T1-1：fd 表在组容器（多成员共享后可变即 expect，见 ThreadGroup S21 缺口）。
-        let g = self.group_mut();
-        for (fd, slot) in g.fd_table.iter_mut().enumerate() {
+        let mut table = self.group.fd_table.lock();
+        for (fd, slot) in table.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(handle);
                 return Ok(fd);
             }
         }
-        if g.fd_table.len() >= Self::MAX_FDS {
+        if table.len() >= Self::MAX_FDS {
             return Err(klib::error::Error::NoSpace);
         }
-        let fd = g.fd_table.len();
-        g.fd_table.push(Some(handle));
+        let fd = table.len();
+        table.push(Some(handle));
         Ok(fd)
     }
 
-    /// 获取指定 fd 句柄的只读引用。
-    pub fn get_fd(&self, fd: usize) -> Option<&vfs::file_handle::OpenHandle> {
-        // T1-1：fd 表在组容器（只读经 Arc 共享借用；真并发前须加锁，见 ThreadGroup S21）。
-        self.group.fd_table.get(fd)?.as_ref()
+    /// 获取指定 fd 句柄的**副本**（值语义返回）。
+    ///
+    /// S21 闭合（T1-8）：返回槽位 `OpenHandle` 的 clone（`File` 结构性浅拷贝，与
+    /// 槽位共享同一 inode+offset 的 `Arc`；`Pipe` 仅复制 id）。锁内短持、clone 出
+    /// 临界区即释放 fd 锁，调用方在**无锁现场**对 owned 句柄做 vfs 工作，语义与原
+    /// 跨锁借用等价（见实核结论：clone 后对 File 共享 Arc、offset 共享，无 UAF）。
+    pub fn get_fd(&self, fd: usize) -> Option<vfs::file_handle::OpenHandle> {
+        self.group.fd_table.lock().get(fd)?.clone()
     }
 
-    /// 关闭并移除指定 fd 句柄。
-    pub fn close_fd(&mut self, fd: usize) -> Option<vfs::file_handle::OpenHandle> {
-        // T1-1：uid 取组共享身份（Copy，先取避免与 group_mut 借用冲突）。
-        let uid = self.group.identity.uid;
-        let g = self.group_mut();
-        if fd < g.fd_table.len() {
-            let handle = g.fd_table[fd].take();
-            if let Some(vfs::file_handle::OpenHandle::File(fh)) = &handle {
-                vfs::flock::flock_unlock(&fh.inode, vfs::flock::LockOwner { uid });
+    /// 关闭并移除指定 fd 句柄（返回被移除的 owned 句柄）。
+    ///
+    /// S21 闭合（T1-8）：方法改 `&self`。先短持 `fd_table` 锁 `take` 出槽位值并释放
+    /// 锁，再在无锁现场对已 take 出的 handle 做 `flock_unlock`（取 vfs 锁的动作移出
+    /// fd 锁，满足"fd 锁内不做 vfs 阻塞操作"的锁序纪律）。close 只 take 槽位，不影响
+    /// 其它线程已 clone 出的句柄（并发语义改善，无 UAF）。
+    pub fn close_fd(&self, fd: usize) -> Option<vfs::file_handle::OpenHandle> {
+        let handle = {
+            let mut table = self.group.fd_table.lock();
+            if fd < table.len() {
+                table[fd].take()
+            } else {
+                None
             }
-            handle
-        } else {
-            None
+        };
+        // flock owner 用组共享身份的 uid（`Copy` 值，先读出自锁现场再用于解锁）。
+        let uid = self.group.identity.lock().uid;
+        if let Some(vfs::file_handle::OpenHandle::File(fh)) = &handle {
+            vfs::flock::flock_unlock(&fh.inode, vfs::flock::LockOwner { uid });
         }
+        handle
     }
 
     /// 把句柄安装到指定 fd 槽位（`dup2` 目标）。原槽位若已有句柄则**被覆盖
@@ -439,19 +439,21 @@ impl<PT: PageTable> Process<PT> {
     ///
     /// 用于 `dup2(old, new)` 的"复制到指定编号"，与 [`Self::alloc_fd`]（找
     /// 最低空闲槽）互补。
+    ///
+    /// S21 闭合（T1-8）：方法改 `&self`，组内 `fd_table` 锁内短持读写槽位。
     pub fn set_fd(
-        &mut self,
+        &self,
         fd: usize,
         handle: vfs::file_handle::OpenHandle,
     ) -> Result<(), klib::error::Error> {
         if fd >= Self::MAX_FDS {
             return Err(klib::error::Error::NoSpace);
         }
-        let g = self.group_mut();
-        if fd >= g.fd_table.len() {
-            g.fd_table.resize(fd + 1, None);
+        let mut table = self.group.fd_table.lock();
+        if fd >= table.len() {
+            table.resize(fd + 1, None);
         }
-        g.fd_table[fd] = Some(handle);
+        table[fd] = Some(handle);
         Ok(())
     }
 
@@ -460,9 +462,10 @@ impl<PT: PageTable> Process<PT> {
     /// 仅做结构性克隆（`OpenHandle` 的 `Clone`）。**pipe 端引用计数递增不在
     /// 本方法内**——由 kernel syscall 层在克隆后对每个 `Pipe { id }` 调
     /// `ipc::pipe_ref_inc(id)`，保证子进程继承的 pipe 端也持有一个 ref。
+    ///
+    /// S21 闭合（T1-8）：组内 `fd_table` 锁内整体 clone 出临界区（短持锁，无 vfs）。
     pub fn clone_fd_table(&self) -> alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>> {
-        // T1-1：fd 表在组容器（只读克隆）。
-        self.group.fd_table.clone()
+        self.group.fd_table.lock().clone()
     }
 
     /// 以父进程继承的 fd 表替换本进程的默认标准流表（spawn 时注入）。
@@ -470,13 +473,14 @@ impl<PT: PageTable> Process<PT> {
     /// 仅当继承表**非空**时替换：默认标准流表（0/1/2）由 [`Self::new`] 已装好，
     /// 空表保留默认（等价于无继承、新进程有独立标准流）。pipe 端引用计数由
     /// 调用方（syscall 层）在替换后对每个 `Pipe { id }` 调 `ipc::pipe_ref_inc`。
+    ///
+    /// S21 闭合（T1-8）：方法改 `&self`，组内 `fd_table` 锁内整体替换（短持锁）。
     pub fn set_inherited_fd_table(
-        &mut self,
+        &self,
         inherited: alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>>,
     ) {
-        // T1-1：替换的是组容器共享 fd 表（组长 spawn 装配期独享，见 ThreadGroup S21）。
         if !inherited.is_empty() {
-            self.group_mut().fd_table = inherited;
+            *self.group.fd_table.lock() = inherited;
         }
     }
 
@@ -494,13 +498,17 @@ impl<PT: PageTable> Process<PT> {
     pub fn same_thread_group(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.group, &other.group)
     }
-    /// 进程身份（A1 / ADR-033）。T1-1：身份在组容器（组内共享，`Copy` 只读）。
+    /// 进程身份（A1 / ADR-033）。
+    ///
+    /// S21 闭合（T1-8）身份锁裁定：`ProcessIdentity` 是 `Copy` 小结构（uid/privilege），
+    /// 但组长 exec 换身份与组员并发读若为普通字段即成数据竞争，故亦改
+    /// `spin::Mutex<ProcessIdentity>`，本访问器锁内 `Copy` 返回（短持锁，值语义）。
     pub fn identity(&self) -> ProcessIdentity {
-        self.group.identity
+        *self.group.identity.lock()
     }
-    /// 设置进程身份（A1 / ADR-033）。T1-1：写组共享身份（组长 spawn 装配期独享）。
-    pub fn set_identity(&mut self, identity: ProcessIdentity) {
-        self.group_mut().identity = identity;
+    /// 设置进程身份（A1 / ADR-033）。S21 闭合（T1-8）：方法改 `&self`，身份锁内写入。
+    pub fn set_identity(&self, identity: ProcessIdentity) {
+        *self.group.identity.lock() = identity;
     }
     /// 每进程信号状态（ADR-034 §2.2）可变访问（派发/投递/sigaction 用）。
     pub fn signal_mut(&mut self) -> &mut crate::signal::SignalState {
@@ -510,15 +518,18 @@ impl<PT: PageTable> Process<PT> {
     pub fn signal(&self) -> &crate::signal::SignalState {
         &self.signal
     }
-    /// 当前工作目录（规范绝对路径）。T1-1：cwd 在组容器共享（只读借用；
-    /// 真并发前须加锁，见 ThreadGroup S21）。
-    pub fn cwd(&self) -> &str {
-        &self.group.cwd
+    /// 当前工作目录（规范绝对路径），返回 owned `String`。
+    ///
+    /// S21 闭合（T1-8）：原返回跨锁借用 `&str`；加锁后无法跨锁返回借用，改为组内
+    /// `cwd` 锁内 clone 出 owned `String`（短持锁、值语义），调用点据此适配。
+    pub fn cwd(&self) -> alloc::string::String {
+        self.group.cwd.lock().clone()
     }
-    /// 设置当前工作目录（调用方保证为规范绝对路径）。T1-1：写组共享 cwd
-    /// （组长 spawn/系统调用期独享，见 ThreadGroup S21）。
-    pub fn set_cwd(&mut self, cwd: alloc::string::String) {
-        self.group_mut().cwd = cwd;
+    /// 设置当前工作目录（调用方保证为规范绝对路径）。
+    ///
+    /// S21 闭合（T1-8）：方法改 `&self`，组内 `cwd` 锁内整体替换（短持锁）。
+    pub fn set_cwd(&self, cwd: alloc::string::String) {
+        *self.group.cwd.lock() = cwd;
     }
     /// 当前状态。
     pub fn state(&self) -> TaskState {

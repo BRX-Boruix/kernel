@@ -3387,7 +3387,7 @@ pub fn test_vfs_m62() {
         .expect("create file");
 
     let us = UserAddressSpace::<X86PageTable>::new().expect("user space");
-    let mut proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, alloc::sync::Arc::new(us));
+    let proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, alloc::sync::Arc::new(us));
 
     let handle1 = FileHandle::new(file.clone(), OpenFlags::READ_WRITE)
         .expect("ramfs handle metadata is infallible");
@@ -9131,7 +9131,7 @@ pub fn test_identity_inherit() {
 
     // 1. 默认身份：Process::new 后为 User/uid=0。
     let us = UserAddressSpace::<X86PageTable>::new().expect("new addr space");
-    let mut proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, alloc::sync::Arc::new(us));
+    let proc = Process::new(10, 0x400000, 0x7fff00000000, 0xffffffff80100000, alloc::sync::Arc::new(us));
     assert_eq!(
         proc.identity(),
         ProcessIdentity::default_user(),
@@ -9401,7 +9401,7 @@ pub fn test_flock_close_release() {
 
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = UserAddressSpace::<X86PageTable>::new().expect("addr space");
-    let mut proc = Process::new(999, 0, 0, 0, alloc::sync::Arc::new(addr_space));
+    let proc = Process::new(999, 0, 0, 0, alloc::sync::Arc::new(addr_space));
     proc.set_identity(ProcessIdentity { uid: UID_LOCKER, privilege: Privilege::User });
 
     let fh = FileHandle::new(inode.clone(), OpenFlags::READ_ONLY).expect("open handle");
