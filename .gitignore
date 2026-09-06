@@ -15,3 +15,4 @@
 /crates/kernel/src/symbols_generated.rs
 # liveCD 内置用户程序 payload（SDK 构建生成，不提交）
 /crates/kernel/src/binaries_payload.rs
+/crates/kernel/pthread_bench.elf
