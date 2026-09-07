@@ -230,11 +230,152 @@ pub fn parse_hpet(buf: &[u8]) -> Option<Hpet> {
     })
 }
 
+// ---------- S5 (soft-off) sleep state ----------
+
+/// S5 (soft-off) sleep-state package info, decoded from the DSDT `_S5` object.
+/// Per ACPI, writing SLP_TYPa into the PM1x_CNT SLP_TYP field with SLP_EN set
+/// transitions the machine to S5 (power off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S5 {
+    /// SLP_TYPa value for PM1a control block.
+    pub slp_typa: u8,
+    /// SLP_TYPb value for PM1b control block.
+    pub slp_typb: u8,
+}
+
+/// AML NameOp opcode.
+pub const AML_NAME_OP: u8 = 0x08;
+/// AML PackageOp opcode.
+pub const AML_PACKAGE_OP: u8 = 0x12;
+/// AML Zero constant.
+pub const AML_ZERO_OP: u8 = 0x00;
+/// AML One constant.
+pub const AML_ONE_OP: u8 = 0x01;
+/// AML Ones constant.
+pub const AML_ONES_OP: u8 = 0xff;
+/// AML BytePrefix opcode (followed by 1 raw byte).
+pub const AML_BYTE_PREFIX: u8 = 0x0a;
+/// AML WordPrefix opcode (followed by 2 raw bytes, LE).
+pub const AML_WORD_PREFIX: u8 = 0x0b;
+/// AML DWordPrefix opcode (followed by 4 raw bytes, LE).
+pub const AML_DWORD_PREFIX: u8 = 0x0c;
+/// The ACPI NameSeg for `_S5` (4-char name with trailing pad `_`).
+pub const S5_NAMESEG: [u8; 4] = [0x5f, 0x53, 0x35, 0x5f]; // '_' 'S' '5' '_'
+
+/// Decode a single-byte/multi-byte AML PkgLength starting at `pos`.
+/// Returns `(length, bytes_consumed)`. Bounds-guarded against untrusted input.
+fn parse_pkg_length(buf: &[u8], pos: usize) -> Option<(u32, usize)> {
+    let lead = *buf.get(pos)?;
+    match lead & 0xC0 {
+        0x00 => Some(((lead & 0x3F) as u32, 1)),
+        0x40 => {
+            let n = *buf.get(pos + 1)?;
+            Some((((lead & 0x3F) as u32) | ((n as u32) << 6), 2))
+        }
+        0x80 => {
+            let n1 = *buf.get(pos + 1)?;
+            let n2 = *buf.get(pos + 2)?;
+            Some((((lead & 0x3F) as u32) | ((n1 as u32) << 6) | ((n2 as u32) << 12), 3))
+        }
+        _ => {
+            let n1 = *buf.get(pos + 1)?;
+            let n2 = *buf.get(pos + 2)?;
+            let n3 = *buf.get(pos + 3)?;
+            Some((((lead & 0x3F) as u32) | ((n1 as u32) << 6) | ((n2 as u32) << 12) | ((n3 as u32) << 18), 4))
+        }
+    }
+}
+
+/// Decode an AML integer literal at `pos` (Zero/One/Ones/Byte/Word/DWord).
+/// Returns `(value, next_pos)`. Bounds-guarded.
+fn parse_aml_const_int(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
+    let b = *buf.get(pos)?;
+    match b {
+        AML_ZERO_OP => Some((0, pos + 1)),
+        AML_ONE_OP => Some((1, pos + 1)),
+        AML_ONES_OP => Some((u64::MAX, pos + 1)),
+        AML_BYTE_PREFIX => Some((*buf.get(pos + 1)? as u64, pos + 2)),
+        AML_WORD_PREFIX => {
+            let lo = *buf.get(pos + 1)? as u64;
+            let hi = *buf.get(pos + 2)? as u64;
+            Some((lo | (hi << 8), pos + 3))
+        }
+        AML_DWORD_PREFIX => {
+            let mut v: u64 = 0;
+            for k in 0..4 { v |= (*buf.get(pos + 1 + k)? as u64) << (8 * k); }
+            Some((v, pos + 5))
+        }
+        _ => None, // not a plain integer literal (method call, package, etc.)
+    }
+}
+
+/// Scan the DSDT AML body for the `_S5` Name object and decode its S5 package.
+///
+/// QEMU (and common firmware) emit `Name(_S5, Package(N){ slp_typa, slp_typb, ... })`.
+/// We locate the NameOp `_S5_` seg then interpret the object as a PackageOp whose
+/// first two integer elements are SLP_TYPa / SLP_TYPb. Returns None on any ambiguity
+/// or unsupported encoding (never fabricates a value).
+pub fn parse_s5(dsdt: &[u8]) -> Option<S5> {
+    // Skip the 36-byte SDT header; the AML body begins after it.
+    let mut i = SDT_HEADER_LEN;
+    while i + 4 < dsdt.len() {
+        if dsdt[i] == AML_NAME_OP && dsdt[i + 1..].starts_with(&S5_NAMESEG) {
+            if let Some(s5) = decode_s5_object(dsdt, i + 1 + 4) {
+                return Some(s5);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Decode a PackageOp element count at `pos`. ACPI CA emits the element count
+/// as a raw small byte (2..=255); some firmware prefix it with BytePrefix (0x0a).
+/// Handle the raw-byte form and the prefixed form; anything else returns None.
+fn decode_count(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
+    let b = *buf.get(pos)?;
+    if b == AML_BYTE_PREFIX {
+        return Some((*buf.get(pos + 1)? as u64, pos + 2));
+    }
+    // Raw small byte count (ACPI CA emits Package(N) count as a bare byte).
+    // Also covers the const forms Zero(0x00)/One(0x01) for empty/single packages.
+    Some((b as u64, pos + 1))
+}
+
+/// Decode the object following `_S5_` (starting at `obj_pos`) into an S5.
+fn decode_s5_object(dsdt: &[u8], obj_pos: usize) -> Option<S5> {
+    if dsdt.get(obj_pos)? != &AML_PACKAGE_OP {
+        // Firmware may express _S5 via a Method/Return; not handled -> refuse.
+        return None;
+    }
+    let (len, len_bytes) = parse_pkg_length(dsdt, obj_pos + 1)?;
+    let content_start = obj_pos + 1 + len_bytes;
+    let content_end = content_start.checked_add(len as usize)?;
+    if content_end > dsdt.len() { return None; }
+    // First field is the element count. ACPI CA emits the count as a raw small
+    // byte (e.g. Package(4) -> 0x04); some compilers use a prefixed integer.
+    // Handle both: raw byte in [2,255], or an AML integer literal.
+    let (count, mut p) = decode_count(dsdt, content_start)?;
+    if count == 0 || count > 256 { return None; }
+    let mut slp_typa: Option<u64> = None;
+    let mut slp_typb: Option<u64> = None;
+    for _ in 0..count {
+        if p >= content_end { return None; }
+        let (v, np) = parse_aml_const_int(dsdt, p)?;
+        if slp_typa.is_none() { slp_typa = Some(v); }
+        else if slp_typb.is_none() { slp_typb = Some(v); break; }
+        p = np;
+    }
+    Some(S5 { slp_typa: slp_typa? as u8, slp_typb: slp_typb? as u8 })
+}
+
 // ---------- 单元测试 ----------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
+    use std::vec::Vec;
 
     /// 构造校验和正确的表（把 checksum 字节设为使总和为 0 的值）。
     fn with_valid_checksum(data: &mut [u8]) {
@@ -428,4 +569,64 @@ mod tests {
             "S07: ACPI 3.0+ with address_space!=0 must return None, not fake base from period field"
         );
     }
+
+    // Build a DSDT-sized buffer with the given AML body starting right after the
+    // 36-byte SDT header, then call parse_s5.
+    fn dsdt_with_body(body: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 36];
+        b[0..4].copy_from_slice(b"DSDT");
+        b[4..8].copy_from_slice(&((36 + body.len()) as u32).to_le_bytes());
+        b.extend_from_slice(body);
+        b
+    }
+
+    #[test]
+    fn s5_parse_canonical_name_package() {
+        // Name(_S5, Package(4){0x05, 0x05, Zero, Zero}), placed past the SDT header.
+        let mut full: Vec<u8> = vec![0u8; 36];
+        full[0..4].copy_from_slice(b"DSDT");
+        full.extend_from_slice(&[0x08, 0x5f, 0x53, 0x35, 0x5f, 0x12, 0x07, 0x04, 0x0a, 0x05, 0x0a, 0x05, 0x00, 0x00]);
+        let len = full.len();
+        full[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+        let s5 = parse_s5(&full).expect("canonical _S5 package should decode");
+        assert_eq!(s5.slp_typa, 5);
+        assert_eq!(s5.slp_typb, 5);
+    }
+
+    #[test]
+    fn s5_parse_qemu_observed_layout() {
+        // Bytes captured from the real QEMU DSDT around the _S5_ name:
+        //   NameOp(08) _S5_  PackageOp(12) len(06) count(04) 00 00 00 00 ...
+        // (element count emitted as a raw byte; elements are Zero).
+        let mut full: Vec<u8> = vec![0u8; 36];
+        full[0..4].copy_from_slice(b"DSDT");
+        full.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leading unrelated bytes
+            0x08, 0x5f, 0x53, 0x35, 0x5f, // NameOp _S5_
+            0x12, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x10, 0x3b,
+        ]);
+        let len = full.len();
+        full[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+        let s5 = parse_s5(&full).expect("QEMU observed _S5 layout should decode");
+        assert_eq!(s5.slp_typa, 0);
+        assert_eq!(s5.slp_typb, 0);
+    }
+
+    #[test]
+    fn s5_rejects_non_package_or_truncated() {
+        // _S5 defined as something other than a Package -> None (no fabrication).
+        let mut full: Vec<u8> = vec![0u8; 36];
+        full[0..4].copy_from_slice(b"DSDT");
+        full.extend_from_slice(&[0x08, 0x5f, 0x53, 0x35, 0x5f, 0x14, 0x06]); // MethodOp 0x14
+        let len = full.len();
+        full[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+        assert!(parse_s5(&full).is_none());
+        // No _S5_ present at all -> None.
+        let mut full2 = vec![0u8; 36];
+        full2[0..4].copy_from_slice(b"DSDT");
+        full2[4..8].copy_from_slice(&(40u32).to_le_bytes());
+        full2.extend_from_slice(&[0x08, 0x5f, 0x53, 0x33, 0x5f]); // _S3_ not _S5_
+        assert!(parse_s5(&full2).is_none());
+    }
 }
+

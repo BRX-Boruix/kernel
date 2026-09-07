@@ -77,6 +77,8 @@ pub mod domain {
     pub const SYNC: u32 = 0x70;
     /// SIGNAL 域（ADR-034 PROPOSED）：可编程信号派发（sigaction/sigprocmask/rt_sigreturn）。
     pub const SIGNAL: u32 = 0x80;
+    /// POWER 域（ADR-036）：系统电源管理（S5 软关机 / 重启）。
+    pub const POWER: u32 = 0x90;
 }
 
 pub mod op {
@@ -242,6 +244,14 @@ pub const SYS_SIGNAL_MASK: u32 = nr(domain::SIGNAL, op::READ); // 0x82
 pub const SYS_SIGNAL_ACTION: u32 = nr(domain::SIGNAL, op::WRITE); // 0x83
 /// `signal_return()`：handler 返回后恢复原帧（rt_sigreturn）。
 pub const SYS_SIGNAL_RETURN: u32 = nr(domain::SIGNAL, op::DELETE); // 0x84
+
+// ---------- 9. POWER Domain (0x90, ADR-036) ----------
+/// `power_off()`：请求 ACPI S5 软关机（断电）。双侧镜像（S13）：与 libsys
+/// `nr.rs::SYS_POWER_OFF` 同值、注释互指。
+pub const SYS_POWER_OFF: u32 = nr(domain::POWER, 0x01); // 0x91
+/// `reboot()`：请求系统重启（ACPI reset / 8042）。双侧镜像（S13）：与 libsys
+/// `nr.rs::SYS_POWER_REBOOT` 同值、注释互指。
+pub const SYS_POWER_REBOOT: u32 = nr(domain::POWER, 0x02); // 0x92
 
 // ---------- ABI 打包（成功 / 错误） ----------
 
@@ -1835,6 +1845,64 @@ fn sys_exit(frame: &mut SyscallFrame) -> u64 {
     0
 }
 
+/// POWER 域（ADR-036）公共停机动原：本 CPU 关中断 + 广播停机其它核。
+///
+/// 仿 panic 的 KA1 纪律（先关本核中断再停其它核），随后交给架构层做真正的
+/// 断电/复位。调用后本 CPU 处于关中断且其它核已停的状态——只能走**终结**
+/// 路径（断电/复位/永久停机），不可再返回调度。
+fn power_prepare_terminal() {
+    arch_x86_64::interrupts::disable();
+    crate::halt_other_cpus_via_ipi();
+}
+
+/// `power_off()`（POWER 0x91）：请求 ACPI S5 软关机（整机断电）。
+///
+/// 属**特权**操作：仅 `Privilege::System` 进程可发起，否则 `PermissionDenied`。
+/// S5 电源关停信息未就绪（无 PM1a / DSDT 无 `_S5`）时返回 `NotSupported`——
+/// 我们**绝不**在无凭据下猜测 SLP_TYP 写端口（宁缺毋假）。
+///
+/// 就绪后为终结路径：停其它核 → 写 PM1 触发断电（`power_off` 永不返回，
+/// 断电后 CPU 停止）。故本条从不带现场回到调用进程。
+fn sys_power_off(_frame: &mut SyscallFrame) -> DispatchResult {
+    let priv_ok = current_proc_mut()
+        .map(|p| p.identity().privilege == Privilege::System)
+        .unwrap_or(false);
+    if !priv_ok {
+        return done(pack_err(Error::PermissionDenied));
+    }
+    if !arch_x86_64::acpi::s5_ready() {
+        klib::warn!("[syscall] power_off refused: S5 not ready");
+        return done(pack_err(Error::NotSupported));
+    }
+    let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+    klib::info!("[syscall] power_off by pid {}: halting CPUs then S5", pid);
+    power_prepare_terminal();
+    // power_off 写 PM1 后永久空转等待断电；不会正常返回。
+    let _ = arch_x86_64::acpi::power_off();
+    // 不可达：S5 写入后固件应断电。若固件异常未断电（理论上不会），在此停死。
+    unreachable!("power_off returned without powering off");
+}
+
+/// `reboot()`（POWER 0x92）：请求系统复位重启。
+///
+/// 属**特权**操作：仅 `Privilege::System` 进程可发起，否则 `PermissionDenied`。
+/// 走 ACPI reset 寄存器（若固件提供，QEMU 通常无）或 8042 快速复位（0x64←0xFE，
+/// QEMU/SeaBIOS 均支持）。终结路径：停其它核 → 触发复位（`reboot` 永不返回）。
+fn sys_reboot(_frame: &mut SyscallFrame) -> DispatchResult {
+    let priv_ok = current_proc_mut()
+        .map(|p| p.identity().privilege == Privilege::System)
+        .unwrap_or(false);
+    if !priv_ok {
+        return done(pack_err(Error::PermissionDenied));
+    }
+    let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+    klib::info!("[syscall] reboot by pid {}: halting CPUs then reset", pid);
+    power_prepare_terminal();
+    arch_x86_64::acpi::reboot();
+    // 不可达：复位后 CPU 重启。
+    unreachable!("reboot returned without resetting");
+}
+
 /// `kill(pid, sig) -> 0`：向进程发送信号（终止 / 校验存在）。
 ///
 /// **自杀必须返回 [`DispatchResult::Switched`] 而非 `Done`**（S26 回归）：
@@ -2725,6 +2793,10 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_SIGNAL_ACTION => done(sys_signal_action(frame)),
         SYS_SIGNAL_MASK => done(sys_signal_mask(frame)),
         SYS_SIGNAL_RETURN => done(sys_signal_return(frame)),
+
+        // POWER Domain (0x90, ADR-036): 终结路径（断电/复位后 CPU 不再返回用户态）
+        SYS_POWER_OFF => sys_power_off(frame),
+        SYS_POWER_REBOOT => sys_reboot(frame),
 
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);

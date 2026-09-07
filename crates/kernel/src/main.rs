@@ -802,7 +802,7 @@ fn remote_drain_via_ipi(slot: usize) -> bool {
 
 // KA1：panic 跨核停机——向除本核外的全部已上线槽位广播停机 IPI（0x41）。
 // 发送失败（目标失联）静默跳过：panic 路径上无法恢复，诊断照常输出。
-fn halt_other_cpus_via_ipi() {
+pub(crate) fn halt_other_cpus_via_ipi() {
     let me = arch_x86_64::lapic::current_lapic_id();
     let count = arch_x86_64::smp::cpu_count();
     for slot in 0..count {
