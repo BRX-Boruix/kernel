@@ -9,6 +9,7 @@
 /crates/kernel/spinburn.elf
 /crates/kernel/threaddemo.elf
 /crates/kernel/userdrv.elf
+/crates/kernel/driverd.elf
 /crates/kernel/chelldemo.elf
 /crates/kernel/pthreaddemo.elf
 /crates/kernel/pthread_syncdemo.elf
