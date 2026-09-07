@@ -3015,6 +3015,7 @@ pub fn test_vfs_m61() {
         "/users",
         "/scratch",
         "/volumes",
+        "/modules",
     ] {
         let node = root.resolve(dir, true).expect("resolve skeleton dir");
         assert_eq!(
@@ -3274,6 +3275,7 @@ pub fn test_vfs_lexicon() {
         ("devices", true),
         ("users", true),
         ("volumes", true),
+        ("modules", true),
         ("config", false),
         ("system", false),
         ("scratch", false),

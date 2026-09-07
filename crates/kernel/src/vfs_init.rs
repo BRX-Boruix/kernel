@@ -929,6 +929,9 @@ fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
     ensure_dir("/users");
     ensure_dir("/scratch");
     ensure_dir("/volumes");
+    // 运行时安装的用户态驱动 ELF 集合目录（与 /programs 系统内置分离；
+    // 词法规范 v2 登记于 test_vfs_lexicon LEXICON，ADR-038）。
+    ensure_dir("/modules");
 
     // 词法规范 v2 热路径豁免：官方短别名 /tmp  → 正名 /scratch。
     // 符号链接长期稳定存在，但文档与代码主路径一律写正名。
