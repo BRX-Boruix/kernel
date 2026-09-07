@@ -559,6 +559,9 @@ unsafe fn kmain_body() -> ! {
     tests::test_identity_inherit();
     #[cfg(feature = "kernel-tests")]
     tests::test_perm_system_only();
+    // PRE-1 / ADR-037 决策 5：UIO driver_register/driver_claim 特权门禁（System-only）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_driver_uio_privilege_gate();
     // R6 flock：冲突矩阵 + close 自动释放（ADR-014 承诺）。
     #[cfg(feature = "kernel-tests")]
     tests::test_flock_matrix();

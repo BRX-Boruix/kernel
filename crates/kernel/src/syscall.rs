@@ -2091,8 +2091,23 @@ fn sys_signal_mask(frame: &mut SyscallFrame) -> u64 {
         Err(e) => pack_err(e),
     }
 }
+/// UIO/DEVICE 特权门禁（ADR-037 决策 5）：当前进程是否 `Privilege::System`。
+///
+/// `driver_register`/`driver_claim` 直接授予设备认领与 MMIO 映射（内核级权限），
+/// 非 System 一律 `PermissionDenied`。单点判定，供本族特权 syscall 复用（S13：
+/// 权限语义成文、不重复硬编码）。`driver_query`(读) / `driver_unregister`(释放自身
+/// 持有) 不授予 MMIO，故不在门禁内。
+fn current_is_system() -> bool {
+    current_proc_mut()
+        .map(|p| p.identity().privilege == Privilege::System)
+        .unwrap_or(false)
+}
+
 /// `driver_register(name_ptr, len) -> uio_id` (M11.1)
 fn sys_driver_register(frame: &mut SyscallFrame) -> u64 {
+    if !current_is_system() {
+        return pack_err(Error::PermissionDenied);
+    }
     let name_ptr = frame.a1 as *const u8;
     let len = frame.a2 as usize;
     if len == 0 || len > 32 {
@@ -2129,6 +2144,9 @@ fn sys_driver_register(frame: &mut SyscallFrame) -> u64 {
 /// 设备未发布窗口（如无 MMIO BAR 的设备）→ NotSupported；窗口映射失败按
 /// mm 错误如实上抛。绝不以匿名内存伪装映射成功。
 fn sys_driver_claim(frame: &mut SyscallFrame) -> u64 {
+    if !current_is_system() {
+        return pack_err(Error::PermissionDenied);
+    }
     let uio_id = frame.a1 as usize;
     let _mmio_base = frame.a2;
     let _size = frame.a3;

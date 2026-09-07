@@ -4767,7 +4767,7 @@ pub fn test_syscall_entry_create_kind() {
 pub fn test_syscall_driver_query_unregister() {
     use alloc::boxed::Box;
     use arch::syscall::SyscallFrame;
-    use task::Process;
+    use task::{Process, ProcessIdentity};
 
     info!("[test-syscall-driver-query] === ADR-014: DRIVER 0x52/0x54 ===");
 
@@ -4847,6 +4847,12 @@ pub fn test_syscall_driver_query_unregister() {
         core::ptr::copy_nonoverlapping(ghost_name.as_ptr(), (pa2 + off) as *mut u8, ghost_name.len());
     }
 
+    // PRE-1/ADR-037：driver_register 现为 System-only。本测试经 syscall 真实注册驱动，
+    // 故在 register 前把进程提为 System（query/unregister 不受门禁，仅 register 需特权）。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity::system(1));
+    }
     // 1. driver_register(0x51) → uio_id。
     let mut reg = frame(
         crate::syscall::SYS_DRIVER_REGISTER,
@@ -9375,6 +9381,91 @@ pub fn test_perm_system_only() {
     unsafe { drop(Box::from_raw(proc_raw)) };
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-perm-system-only] PASS");
+}
+/// PRE-1 / ADR-037 决策 5：UIO 特权门禁——driver_register/driver_claim 仅
+/// `Privilege::System` 可调用，非 System 一律 `PermissionDenied`（EACCES/13）。
+///
+/// 与 test_perm_system_only 同构：真实 syscall 入口（syscall_entry）+ 伪当前进程。
+/// 门禁在 syscall 层，短路径在触碰任何用户内存前即拒绝——User 身份不必提供合法
+/// 设备名/指针即可证拒绝；System 身份则应越过门禁、落到下一步（野指针 →
+/// BadAddress，而非 PermissionDenied），证门禁对 System 放行。
+pub fn test_driver_uio_privilege_gate() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Process, ProcessIdentity};
+
+    info!("[test-driver-uio-gate] === PRE-1/ADR-037: UIO privilege gate ====");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3,
+            a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0,
+            aux_pid: 0,
+        }
+    }
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // PermissionDenied -> EACCES(13)，同 klib 映射（syscall.rs:450 注释），负 errno 编码。
+    const EACCES_U64: u64 = (-13i64) as u64;
+
+    // 1. User 身份调 driver_register -> PermissionDenied（门禁短路径，无需合法指针）。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        assert_eq!(p.identity(), ProcessIdentity::default_user(), "default is User");
+    }
+    let mut r1 = frame(crate::syscall::SYS_DRIVER_REGISTER, 0x1, 0, 0); // name_ptr=0x1 野指针
+    assert!(crate::syscall::syscall_entry(&mut r1));
+    assert_eq!(r1.result, EACCES_U64, "User driver_register must be PermissionDenied, got {:#x}", r1.result);
+    info!("[test-driver-uio-gate] User driver_register -> PermissionDenied OK");
+
+    // 2. User 身份调 driver_claim -> PermissionDenied。
+    let mut r2 = frame(crate::syscall::SYS_DRIVER_CLAIM, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut r2));
+    assert_eq!(r2.result, EACCES_U64, "User driver_claim must be PermissionDenied, got {:#x}", r2.result);
+    info!("[test-driver-uio-gate] User driver_claim -> PermissionDenied OK");
+
+    // 3. System 身份调 driver_register：门禁放行 → 落到后续校验（len=0 → InvalidParam），
+    //    证 System 不被门禁拦（结果非 PermissionDenied）。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity::system(1));
+    }
+    let mut r3 = frame(crate::syscall::SYS_DRIVER_REGISTER, 0x1, 0, 0); // name_ptr 野指针, len=0
+    assert!(crate::syscall::syscall_entry(&mut r3));
+    assert_ne!(r3.result, EACCES_U64, "System driver_register must NOT be PermissionDenied at the gate");
+    // len=0 → sys_driver_register 的 InvalidParam 校验（2113），而非门禁拒绝。
+    const EINVAL_U64: u64 = (-(klib::error::Error::InvalidParam.to_errno() as i64)) as u64;
+    assert_eq!(r3.result, EINVAL_U64, "System gate opens then len=0 -> InvalidParam, got {:#x}", r3.result);
+    info!("[test-driver-uio-gate] System driver_register passes gate (then InvalidParam on len=0) OK");
+
+    // 4. 回到 User：driver_register 复被拒（身份切回后门禁恢复生效）。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity::default_user());
+    }
+    let mut r4 = frame(crate::syscall::SYS_DRIVER_REGISTER, 0x1, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut r4));
+    assert_eq!(r4.result, EACCES_U64, "User driver_register denied again, got {:#x}", r4.result);
+    info!("[test-driver-uio-gate] identity flip back to User re-denies OK");
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-driver-uio-gate] PASS");
 }
 /// R6 flock 冲突矩阵（ADR-014 承诺 / todo.md D-VFS1-R6）。
 pub fn test_flock_matrix() {
