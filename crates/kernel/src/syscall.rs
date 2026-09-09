@@ -223,6 +223,17 @@ pub const SYS_DEVICE_PROBE: u32 = nr(domain::DEVICE, 0x08); // 0x58
 /// 的 IRQ 已触发（驱动应读设备状态寄存器服务）；0 = 超时。用户态驱动借此
 /// 中断驱动而非轮询（阶段一：PCI IRQ → 认领它的用户驱动）。
 pub const SYS_DRIVER_IRQ_WAIT: u32 = nr(domain::DEVICE, 0x09); // 0x59
+/// `driver_dma_alloc(bytes) -> vaddr`（DEVICE 域 0x0A → 0x5A，阶段二）：分配一块
+/// 物理连续、以不可缓存(PCD)映射到调用进程的 DMA 一致性缓冲并返回其用户起始
+/// 虚拟地址；驱动写满后用 [`SYS_DRIVER_DMA_PHYS`] 取物理地址编程设备、服务完用
+/// [`SYS_DRIVER_DMA_FREE`] 释放。仅 System 进程。缓冲随进程退出自动回收。
+pub const SYS_DRIVER_DMA_ALLOC: u32 = nr(domain::DEVICE, 0x0A); // 0x5A
+/// `driver_dma_phys(vaddr) -> phys`（DEVICE 域 0x0C → 0x5C，阶段二）：返回某块
+/// DMA 缓冲（vaddr 为其起始）的基物理地址，供驱动编程设备 DMA 描述符。
+pub const SYS_DRIVER_DMA_PHYS: u32 = nr(domain::DEVICE, 0x0C); // 0x5C
+/// `driver_dma_free(vaddr) -> ()`（DEVICE 域 0x0B → 0x5B，阶段二）：释放一块 DMA
+/// 一致性缓冲（unmap + 归还物理帧）。非 DMA 缓冲区如实 NotFound。
+pub const SYS_DRIVER_DMA_FREE: u32 = nr(domain::DEVICE, 0x0B); // 0x5B
 
 // ---------- 6. VOLUME Domain (0x60, ADR-030) ----------
 pub const SYS_VOLUME_MOUNT: u32 = nr(domain::VOLUME, op::CREATE); // 0x61
@@ -2585,6 +2596,66 @@ fn irq_wait_blocking(frame: &mut SyscallFrame, pid: usize, irq: u8, timeout_ns: 
     }
 }
 
+/// `driver_dma_alloc(bytes) -> vaddr`（DEVICE 0x5A，阶段二）：分配用户态驱动 DMA
+/// 一致性缓冲并返回其用户起始虚拟地址。
+///
+/// 仅 System 进程。缓冲 = 物理连续 RAM（不可缓存 PCD 映射，CPU 写对设备 DMA
+/// 可见），登记在调用进程地址空间，随进程退出/崩溃自动回收（0 panic）。字节数
+/// 0 或超 64MiB → InvalidParam；物理帧分配失败 → OutOfMemory（如实）；虚拟区/
+/// 额度不足 → NoSpace。返回 vaddr；驱动经 SYS_DRIVER_DMA_PHYS 取物理地址。
+fn sys_driver_dma_alloc(frame: &mut SyscallFrame) -> u64 {
+    if !current_is_system() {
+        return pack_err(Error::PermissionDenied);
+    }
+    let bytes = frame.a1;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    match proc.addr_space().alloc_dma_user(bytes) {
+        Ok((vaddr, phys)) => {
+            klib::info!("[dma] alloc pid={} bytes={} -> vaddr={:#x} phys={:#x}",
+                proc.pid(), bytes, vaddr, phys);
+            pack_ok(vaddr)
+        }
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `driver_dma_phys(vaddr) -> phys`（DEVICE 0x5C，阶段二）：返回 DMA 缓冲基物理地址。
+/// vaddr 须为该进程某块 DMA 缓冲的起始；否则如实 NotFound（不泄露任意物理地址）。
+fn sys_driver_dma_phys(frame: &mut SyscallFrame) -> u64 {
+    if !current_is_system() {
+        return pack_err(Error::PermissionDenied);
+    }
+    let vaddr = frame.a1;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    match proc.addr_space().dma_base_phys(vaddr) {
+        Some(phys) => pack_ok(phys),
+        None => pack_err(Error::NotFound),
+    }
+}
+
+/// `driver_dma_free(vaddr) -> ()`（DEVICE 0x5B，阶段二）：释放一块 DMA 一致性缓冲。
+/// vaddr 须为该进程某块 DMA 缓冲的起始；非 DMA 区起点 → NotFound。
+fn sys_driver_dma_free(frame: &mut SyscallFrame) -> u64 {
+    if !current_is_system() {
+        return pack_err(Error::PermissionDenied);
+    }
+    let vaddr = frame.a1;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    match proc.addr_space().munmap_dma(vaddr) {
+        Ok(()) => {
+            klib::info!("[dma] free pid={} vaddr={:#x}", proc.pid(), vaddr);
+            pack_ok(0)
+        }
+        Err(e) => pack_err(e),
+    }
+}
+
 // ---------- VOLUME Domain (0x60, ADR-030) ----------
 
 /// `volume_mount(dev_name_ptr, out_path_ptr, out_cap) -> len`（M4.2，0x61）。
@@ -2888,6 +2959,9 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_DEVICE_PROBE => done(sys_device_probe(frame)),
         // driver_irq_wait 可能阻塞切换（设备中断定向唤醒），自带 DispatchResult 语义。
         SYS_DRIVER_IRQ_WAIT => sys_driver_irq_wait(frame),
+        SYS_DRIVER_DMA_ALLOC => done(sys_driver_dma_alloc(frame)),
+        SYS_DRIVER_DMA_PHYS => done(sys_driver_dma_phys(frame)),
+        SYS_DRIVER_DMA_FREE => done(sys_driver_dma_free(frame)),
 
         // VOLUME Domain (0x60, ADR-030)
         SYS_VOLUME_MOUNT => done(sys_volume_mount(frame)),

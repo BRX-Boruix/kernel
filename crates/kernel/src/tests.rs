@@ -6926,6 +6926,126 @@ pub fn test_driver_irq_owner() {
     info!("[test-driver-irq] PASS");
 }
 
+/// 阶段二自检：用户态驱动 DMA 一致性物理缓冲（alloc/phys/free 原语）。
+///
+/// 复用 privilege-gate 的测试形态（独立 UserAddressSpace + 安装为 current 进程 +
+/// 切 CR3 + 经 syscall_entry 真调 syscall 路径），验证：
+/// 1. User 身份 DMA alloc -> PermissionDenied（门禁）；
+/// 2. System alloc(bytes) -> vaddr 落用户半区、非零、页对齐；
+/// 3. DMA_PHYS(vaddr) -> phys 页对齐且在 RAM（经 phys_to_virt 写魔数读回 = 真 RAM）；
+/// 4. 物理连续：跨多页偏移写读均通过；
+/// 5. 二次 alloc 返回不同 vaddr（不重叠）；
+/// 6. alloc(0) / alloc(超64MiB) -> InvalidParam（诚实拒绝）；
+/// 7. DMA_FREE(vaddr) 后 translate 不再映射（帧已还）；free 非 DMA 区 -> NotFound；
+/// 8. 收尾还原（CR3 / current proc）。
+pub fn test_driver_dma_buf() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Process, ProcessIdentity};
+
+    info!("[test-dma] === Stage-2: user-driver DMA coherent buffer ===");
+    fn frame(nr: u32, a1: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2: 0, a3: 0, a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0, aux_pid: 0,
+        }
+    }
+    const EACCES_U64: u64 = (-13i64) as u64; // PermissionDenied errno
+    let errno = |e: klib::error::Error| (-(e.to_errno() as i64)) as u64;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // 1. User 身份 -> PermissionDenied。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        assert_eq!(p.identity(), ProcessIdentity::default_user());
+        p.set_identity(ProcessIdentity::default_user());
+    }
+    let mut r = frame(crate::syscall::SYS_DRIVER_DMA_ALLOC, 0x2000);
+    assert!(crate::syscall::syscall_entry(&mut r));
+    assert_eq!(r.result, EACCES_U64, "User DMA alloc must be PermissionDenied, got {:#x}", r.result);
+    info!("[test-dma] User driver_dma_alloc -> PermissionDenied OK");
+
+    // 2-4. System 身份 alloc -> vaddr；DMA_PHYS -> phys；写魔数读回（真 RAM，物理连续）。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity::system(1));
+    }
+    let size = 0x3000u64; // 3 页，测跨页物理连续
+    let mut ra = frame(crate::syscall::SYS_DRIVER_DMA_ALLOC, size);
+    assert!(crate::syscall::syscall_entry(&mut ra), "alloc syscall handled");
+    let vaddr = ra.result;
+    assert!(vaddr != 0 && vaddr % 0x1000 == 0, "vaddr page-aligned nonzero: {:#x}", vaddr);
+    assert!(
+        vaddr >= mm::user_space::USER_BASE && vaddr < mm::user_space::USER_TOP,
+        "vaddr in user half: {:#x}",
+        vaddr
+    );
+    // phys 查询。
+    let mut rp = frame(crate::syscall::SYS_DRIVER_DMA_PHYS, vaddr);
+    assert!(crate::syscall::syscall_entry(&mut rp));
+    let phys = rp.result;
+    assert!(phys != 0 && phys % 0x1000 == 0, "phys page-aligned nonzero: {:#x}", phys);
+    // 跨页写魔数（经内核直接映射 phys_to_virt）并读回，验证是真实可写 RAM 且连续。
+    for off in [0u64, 0x1000, 0x2000] {
+        let dst = arch::phys_to_virt(phys + off) as *mut u32;
+        unsafe { core::ptr::write_volatile(dst, 0xC0FFEEu32 ^ (off as u32)) };
+        let back = unsafe { core::ptr::read_volatile(dst as *const u32) };
+        assert_eq!(back, 0xC0FFEEu32 ^ (off as u32), "DMA RAM write/read at phys+{:#x}", off);
+    }
+    info!(
+        "[test-dma] System alloc {}B -> vaddr={:#x} phys={:#x} (RAM writable, phys-contiguous across 3 pages) OK",
+        size, vaddr, phys
+    );
+
+    // 5. 二次 alloc 返回不同 vaddr。
+    let mut rb = frame(crate::syscall::SYS_DRIVER_DMA_ALLOC, 0x1000);
+    assert!(crate::syscall::syscall_entry(&mut rb));
+    let vaddr2 = rb.result;
+    assert!(vaddr2 != 0 && vaddr2 != vaddr, "distinct second alloc: {:#x} vs {:#x}", vaddr2, vaddr);
+
+    // 6. alloc(0) / alloc(超 64MiB) -> InvalidParam。
+    let mut rz = frame(crate::syscall::SYS_DRIVER_DMA_ALLOC, 0);
+    assert!(crate::syscall::syscall_entry(&mut rz));
+    assert_eq!(rz.result, errno(klib::error::Error::InvalidParam), "alloc(0) -> InvalidParam");
+    let mut ro = frame(crate::syscall::SYS_DRIVER_DMA_ALLOC, (64 * 1024 * 1024) + 1);
+    assert!(crate::syscall::syscall_entry(&mut ro));
+    assert_eq!(ro.result, errno(klib::error::Error::InvalidParam), "alloc(>64MiB) -> InvalidParam");
+
+    // 7. free(vaddr2) 后该地址不再映射；free 非 DMA 区 -> NotFound。
+    let as2 = task::current_proc_mut().unwrap().addr_space();
+    assert!(as2.translate(arch::VirtAddr::new(vaddr2)).is_some(), "second buf mapped before free");
+    let mut rf = frame(crate::syscall::SYS_DRIVER_DMA_FREE, vaddr2);
+    assert!(crate::syscall::syscall_entry(&mut rf));
+    assert_eq!(rf.result, 0, "free second buf OK, got {:#x}", rf.result);
+    assert!(as2.translate(arch::VirtAddr::new(vaddr2)).is_none(), "second buf unmapped after free");
+    // free 一个非 DMA 的页对齐地址 -> NotFound。
+    let mut rx = frame(crate::syscall::SYS_DRIVER_DMA_FREE, 0x1000);
+    assert!(crate::syscall::syscall_entry(&mut rx));
+    assert_eq!(rx.result, errno(klib::error::Error::NotFound), "free non-DMA -> NotFound, got {:#x}", rx.result);
+    info!("[test-dma] DMA free + non-DMA NotFound OK");
+
+    // 收尾：释放首个缓冲（还帧），还原 CR3 / current。
+    let mut rf2 = frame(crate::syscall::SYS_DRIVER_DMA_FREE, vaddr);
+    let _ = crate::syscall::syscall_entry(&mut rf2);
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-dma] PASS");
+}
+
 // ---- C7.1/#7：waitpid 真实现验收 ----
 
 /// 末端 LBA 读诊断探针（kernel-tests 专用，调查 QEMU IDE 尾扇区读返回 0）。

@@ -102,6 +102,12 @@ pub enum UserAreaKind {
     /// 帧不归本地址空间所有——销毁/回收只清 PTE，绝不 `deallocate_frame`
     /// （与 shm 同一所有权纪律）。
     DeviceMmap,
+    /// 用户态驱动 DMA 一致性缓冲（阶段二 `alloc_dma_user`）：页**真实映射**
+    /// 由本内核分配的 RAM 物理帧（`allocate_frames`），以不可缓存(PCD)呈现，
+    /// 保证 CPU 写对总线 DMA 可见（x86 一致性 DMA 语义）。**帧归本地址空间
+    /// 所有**——与 DeviceMmap 相反，销毁/回收时 unmap + `deallocate_frame`
+    /// （与匿名区同归还纪律）。
+    DmaBuffer,
 }
 
 /// 用户区映射记录（按需分页 / 统计用）。
@@ -791,6 +797,9 @@ where
         // frame_incref(设备地址)=帧元数据野写、写故障触发真实设备寄存器读
         // 副作用、拷贝出的 RAM 帧因 destroy 的 kind 豁免永不归还（确定性
         // 泄漏）。设备窗口随进程语义本就应只读共享/随进程消亡。
+        // 阶段二：**同排 DmaBuffer**——DMA 缓冲是驱动私有、随进程消亡的物理
+        // RAM 帧（不可缓存设备缓冲），COW 共享给子进程会使父侧变只读打断
+        // 驱动写音频，且语义上不该让 fork 出的进程共享某驱动的 DMA 缓冲。
         // 审计 B5：**固定 4K 步进**而非按声明粒度——大页拆分（KA3）后同一
         // 区域可混有 2M 叶与 4K 叶，按声明粒度步进会跳过区内的 4K 页令
         // fork 后父子静默分歧；逐 4K translate 对任意叶粒度都取到正确帧。
@@ -799,7 +808,7 @@ where
         {
             let areas = self.areas.lock();
             for a in areas.iter() {
-                if a.kind == UserAreaKind::DeviceMmap {
+                if a.kind == UserAreaKind::DeviceMmap || a.kind == UserAreaKind::DmaBuffer {
                     continue;
                 }
                 let mut v = a.start.as_u64();
@@ -1208,6 +1217,132 @@ where
             }
         }
         Ok(va)
+    }
+
+    /// 用户态驱动 DMA 一致性缓冲分配（阶段二）。
+    ///
+    /// 分配 bytes 字节物理连续 RAM（allocate_frames，向上取整到 2 的幂页数），真实
+    /// 映射进本用户半区并以不可缓存(PCD, device_memory)呈现——CPU 写直达 RAM、对总线
+    /// DMA 可见，即 x86 dma_alloc_coherent 的一致性语义（无 IOMMU 下由 PCD 承担
+    /// cache-coherent）。页真实映射并登记为 UserAreaKind::DmaBuffer：帧归本地址空间
+    /// 所有，进程退出 destroy()/unmap_area_pages 时 unmap + deallocate_frame 自动回收
+    /// （与 DeviceMmap 的 帧属设备不归还 相反）。
+    ///
+    /// 返回 (user_vaddr, base_phys)：驱动经 vaddr 填充缓冲、把 base_phys 编程进其
+    /// 认领设备的 DMA 描述符。
+    ///
+    /// 失败如实：bytes==0/超上限 → InvalidParam；帧分配失败 → OutOfMemory；虚拟区/
+    /// 额度不足 → NoSpace；中途页映射失败整体回滚并归还已分配帧。
+    pub fn alloc_dma_user(&self, bytes: u64) -> Result<(u64, u64), PT::Error> {
+        const PAGE: u64 = 4096;
+        const MAX_DMA_BUF_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB，同窗口级上限
+        if bytes == 0 || bytes > MAX_DMA_BUF_BYTES {
+            return Err(Error::InvalidParam.into());
+        }
+        let len = align_up_checked(bytes, PAGE).ok_or(Error::InvalidParam)?;
+        let npages = (len / PAGE) as usize;
+        // 需 2^order 页覆盖 npages：最小满足 order。
+        let order = (usize::BITS as usize) - ((npages - 1).leading_zeros() as usize);
+        // 物理连续分配：失败 = 无足够连续物理帧，如实 OutOfMemory。
+        let frame = crate::allocate_frames(order).ok_or(Error::OutOfMemory)?;
+        let phys = frame.start_paddr();
+        if phys.checked_add(len).is_none() {
+            crate::deallocate_frame(frame);
+            return Err(Error::InvalidParam.into());
+        }
+        let mut core = self.core.lock();
+        let va = self.find_free_region(core.next_mmap, len).ok_or_else(|| {
+            crate::deallocate_frame(frame);
+            Error::NoSpace
+        })?;
+        let flags = PageFlags::empty().writable().user().device_memory();
+        if let Err(e) = self.reserve_user_with_kind(
+            VirtAddr::new(va),
+            VirtAddr::new(va + len),
+            PageSize::Size4K,
+            flags,
+            UserAreaKind::DmaBuffer,
+        ) {
+            crate::deallocate_frame(frame);
+            return Err(e);
+        }
+        // 逐页真实映射；失败回滚已映射页(unmap+还帧)+撤销记账+还整块。
+        for i in 0..npages {
+            if let Err(e) = core.pt.map(
+                VirtAddr::new(va + (i as u64) * PAGE),
+                PhysAddr::new(phys + (i as u64) * PAGE),
+                PageSize::Size4K,
+                flags,
+            ) {
+                for j in 0..i {
+                    let _ = core.pt.unmap(VirtAddr::new(va + (j as u64) * PAGE));
+                }
+                self.areas.lock().retain(|a| a.start.as_u64() != va);
+                crate::deallocate_frame(frame);
+                return Err(e);
+            }
+        }
+        Ok((va, phys))
+    }
+
+    /// 释放一整块 DMA 一致性缓冲（阶段二 alloc_dma_user 的逆操作）。
+    ///
+    /// vaddr 必须是先前 alloc_dma_user 返回的缓冲起始地址：验证其落在某块
+    /// UserAreaKind::DmaBuffer 区的起始且该区完整覆盖，逐页 unmap + deallocate_frame
+    /// 还帧，移除区域记账并回退 mmap 游标。非 DmaBuffer 区/非整块起点 → NotFound/
+    /// InvalidParam 如实拒绝（不误伤其它映射）。
+    pub fn munmap_dma(&self, vaddr: u64) -> Result<(), PT::Error> {
+        const PAGE: u64 = 4096;
+        if vaddr % PAGE != 0 || vaddr < USER_BASE || vaddr >= USER_TOP {
+            return Err(Error::InvalidParam.into());
+        }
+        let mut core = self.core.lock();
+        let (area_idx, area) = {
+            let areas = self.areas.lock();
+            let Some((idx, area)) = areas.iter().copied().enumerate().find(|(_, a)| {
+                a.kind == UserAreaKind::DmaBuffer && a.start.as_u64() == vaddr
+            }) else {
+                return Err(Error::NotFound.into());
+            };
+            (idx, area)
+        };
+        // 整块释放：unmap + 还帧。
+        let end = area.end.as_u64();
+        let mut v = vaddr;
+        while v < end {
+            if let Some(phys) = core.pt.translate(VirtAddr::new(v)) {
+                let _ = core.pt.unmap(VirtAddr::new(v));
+                deallocate_frame(PhysFrame::from_paddr_raw(phys.as_u64()));
+            }
+            v += PAGE;
+        }
+        self.cow_pages
+            .lock()
+            .retain(|cow| cow.vaddr < vaddr || cow.vaddr >= end);
+        self.areas.lock().remove(area_idx);
+        if vaddr < core.next_mmap {
+            core.next_mmap = vaddr;
+        }
+        Ok(())
+    }
+
+    /// 返回某块 DMA 一致性缓冲的起始物理地址（阶段二）。
+    ///
+    /// vaddr 须是先前 alloc_dma_user 返回的缓冲起始（某块 UserAreaKind::DmaBuffer 区
+    /// 的起点）；返回其基物理地址供驱动编程设备 DMA 描述符。非 DmaBuffer 区起点 →
+    /// None（不泄露任意地址空间的物理地址给调用者）。
+    pub fn dma_base_phys(&self, vaddr: u64) -> Option<u64> {
+        const PAGE: u64 = 4096;
+        if vaddr % PAGE != 0 {
+            return None;
+        }
+        let areas = self.areas.lock();
+        let area = areas
+            .iter()
+            .find(|a| a.kind == UserAreaKind::DmaBuffer && a.start.as_u64() == vaddr)?;
+        let core = self.core.lock();
+        core.pt.translate(VirtAddr::new(area.start.as_u64()))
+            .map(|p| p.as_u64())
     }
 
     /// 解除匿名 `mmap` 区间 `[start, start + len)`。

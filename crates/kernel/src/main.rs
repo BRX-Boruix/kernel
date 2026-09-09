@@ -594,6 +594,9 @@ unsafe fn kmain_body() -> ! {
     // 阶段一：设备中断投递基础设施（IRQ 归属表/闩锁/冲突/PCI irq_line 捕获）。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_irq_owner();
+    // 阶段二：用户态驱动 DMA 一致性物理缓冲原语。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_driver_dma_buf();
     #[cfg(feature = "kernel-tests")]
     tests::test_ata_tail_probe();
 
