@@ -19,6 +19,7 @@ pub mod driver;
 pub mod drivers;
 pub mod event;
 pub mod hub;
+pub mod irq_owner;
 pub mod uio;
 
 // 向上提供对 PCI 深度自省等功能的导出
@@ -37,6 +38,13 @@ pub use event::{
 pub use hub::{DriverHub, ProbeStatus};
 pub use uio::{
     UioDriverEntry, device_mmio_window, publish_device_window, uio_claim_device,
-    uio_device_window_of, uio_is_device_claimed, uio_on_process_exit, uio_register_driver,
-    uio_unregister_driver,
+    uio_claimed_device_irq, uio_device_window_of, uio_is_device_claimed, uio_on_process_exit,
+    uio_register_driver, uio_unregister_driver,
 };
+pub use irq_owner::{
+    claim_device_irq, irq_handler_count_of, irq_owner_of, irq_pending_consume,
+    irq_pending_peek, release_device_irq, set_irq_wake_callback,
+    irq_timer_arm, irq_timer_armed, irq_timer_cancel, irq_timer_clear,
+};
+#[cfg(feature = "kernel-tests")]
+pub use irq_owner::debug_simulate_irq;

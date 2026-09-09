@@ -1,4 +1,4 @@
-﻿//! 进程管理与调度系统（Task & Scheduler Subsystem，独立 Crate）。
+//! 进程管理与调度系统（Task & Scheduler Subsystem，独立 Crate）。
 //!
 //! 包含：
 //! - `process`：进程控制块（PCB/Process）、进程表与地址空间绑定；
@@ -26,6 +26,7 @@ pub use scheduler::{
     group_members, group_live_count, group_all_exited, is_group_leader,
     waitpid, wake, wake_event, wake_event_timeout, wake_kbd, wake_with_value, set_event_timeout_timer,
     clear_event_timeout_timer, clear_event_waiter_if, yield_now, set_distribute_across_cpus,
+    block_for_irq, wake_irq_timeout,
 };
 #[cfg(feature = "kernel-tests")]
 pub use scheduler::test_hooks;

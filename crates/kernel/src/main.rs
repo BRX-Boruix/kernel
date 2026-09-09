@@ -591,6 +591,9 @@ unsafe fn kmain_body() -> ! {
     tests::test_bench_ds32(); // D-S32: cycle-counter + page-cache hit-rate/throughput benchmark
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_hub_m72();
+    // 阶段一：设备中断投递基础设施（IRQ 归属表/闩锁/冲突/PCI irq_line 捕获）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_driver_irq_owner();
     #[cfg(feature = "kernel-tests")]
     tests::test_ata_tail_probe();
 
@@ -756,6 +759,10 @@ unsafe fn kmain_body() -> ! {
     // 发布硬件拓扑事件时唤醒阻塞在事件等待的进程（volumed 的 SYS_DRIVER_EVENT_NEXT
     // 阻塞态）。driver 不反向依赖 task，经函数指针解耦（指向 `task::wake_event`）。
     driver::event::set_event_wake_callback(task::wake_event);
+    // 注册设备中断定向唤醒回调（阶段一：PCI IRQ → 认领它的用户驱动）：
+    // 某设备 IRQ 触发且其归属驱动阻塞在 driver_irq_wait 时，把该驱动进程唤醒
+    // 并预置返回值 1（有中断待服务）。driver 不反向依赖 task，经函数指针解耦。
+    driver::irq_owner::set_irq_wake_callback(kernel_irq_wake_pid);
 
     // C7.1/#7：waitpid 真实父子链停机验收（kernel-test-waitpid 显式启用；
     // 验收后停机、不返回主流程，故必须放在 start_init 之前）。
@@ -765,6 +772,15 @@ unsafe fn kmain_body() -> ! {
     // 生产化：进入用户态 init（PID 1），而非内核 idle 停机。加载 init.elf →
     // spawn → `scheduler::start` 永不返回；init 经 syscall 与内核交互、退出。
     start_init();
+}
+
+/// 设备中断定向唤醒回调（注入 `driver::irq_owner::set_irq_wake_callback`）。
+///
+/// 设备 IRQ 触发且归属驱动阻塞在 `driver_irq_wait` 时被调用：把该 pid 唤醒
+/// 并把其保存帧 rax 预置为 1（= 有中断待服务）。driver 不反向依赖 task，经
+/// 本回调解耦（与 `driver::event` → `task::wake_event` 同款函数指针模式）。
+fn kernel_irq_wake_pid(pid: usize) {
+    task::wake_with_value(pid, 1);
 }
 
 /// 尽早启动 framebuffer 终端显示（显示前置要素就绪后立即调用，早于一切测试）。

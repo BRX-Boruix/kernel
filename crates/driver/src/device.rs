@@ -221,6 +221,9 @@ pub struct DeviceInfo {
     /// 持久化的真实硬件介质（如 ATA 硬盘、电池供电 CMOS）才允许 `false`。
     /// 无法证明持久化的设备必须保守上报 `true`，禁止默认伪装为持久存储。
     pub volatile: bool,
+    /// PCI 中断线（配置空间 0x3C 的 Interrupt Line）。非 PCI / 无中断设备为 0。
+    /// 供设备中断投递（IRQ→认领它的用户驱动）归属判定使用；0 = 无中断线。
+    pub irq_line: u8,
 }
 
 impl DeviceInfo {
@@ -237,6 +240,8 @@ impl DeviceInfo {
             prog_if: 0,
             // 空描述符不承载任何持久性证据，按易失披露（保守方向）。
             volatile: true,
+            // 空描述符无中断线。
+            irq_line: 0,
         }
     }
 }

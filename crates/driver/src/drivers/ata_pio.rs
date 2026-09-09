@@ -656,6 +656,8 @@ fn register_device(dev: &'static AtaPioDevice, name: &'static str, volatile: boo
             subclass: 0x01,
             prog_if: 0x8A,
             volatile,
+            // ATA PIO 为平台通道，此处不关联 PCI 中断线（走同步 PIO 忙等）。
+            irq_line: 0,
         },
         Some(dev),
         Some("ata_pio"),

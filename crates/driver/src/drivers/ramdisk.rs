@@ -116,6 +116,8 @@ pub fn init_ramdisk(_hub: &DriverHub) {
             prog_if: 0,
             // DMYGH C15.1：Ramdisk 后端是进程地址空间外的静态内存，重启即失。
             volatile: true,
+            // 纯虚拟块设备无中断线。
+            irq_line: 0,
         },
         Some(&RAMDISK_DEV),
         Some("ramdisk"),

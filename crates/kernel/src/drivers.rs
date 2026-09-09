@@ -115,6 +115,8 @@ fn init_framebuffer(_hub: &DriverHub) {
             prog_if: 0x00,
             // C15.1：帧缓冲是易失显示面，内容不持久。
             volatile: true,
+            // 虚拟显示设备无 PCI 中断线。
+            irq_line: 0,
         },
         // KM7/ADR-008：注册真实 DisplayDevice 实例——显示能力经 `as_display()`
         // 观测，不冒充字节流通道（`as_io()` 恒 None）。

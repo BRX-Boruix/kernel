@@ -79,6 +79,8 @@ pub fn init_cmos(_hub: &DriverHub) {
             prog_if: 0x00,
             // C15.1：CMOS RTC 由主板电池供电，时钟状态在断电后依然持久。
             volatile: false,
+            // CMOS 为平台 PIO 设备（0x70），无 PCI 中断线。
+            irq_line: 0,
         },
         Some(&CMOS_DEV),
         Some("cmos"),

@@ -76,6 +76,8 @@ pub fn init_keyboard(_hub: &DriverHub) {
             prog_if: 0x00,
             // C15.1：按键是瞬时输入事件，不持久化任何数据。
             volatile: true,
+            // 键盘为 IRQ1 平台设备；PCI 中断线字段置 0（不参与设备中断投递）。
+            irq_line: 0,
         },
         Some(&KEYBOARD_DEV),
         Some("keyboard"),

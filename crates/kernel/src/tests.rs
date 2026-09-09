@@ -6473,6 +6473,7 @@ pub fn test_driver_hub_m72() {
         subclass: 0x00,
         prog_if: 0x00,
         volatile: true, // 非海量存储类 PCI 设备，按 C15.1 规则披露为易失
+        irq_line: 0,
     };
     DriverHub::register_device_info(hotplug_net_dev, None, None)
         .expect("hotplug device registration must succeed below capacity");
@@ -6781,6 +6782,148 @@ pub fn test_driver_hub_m72() {
     info!("[test-driver-hub-m72] UIO zero-panic crash isolation OK");
 
     info!("[test-driver-hub-m72] PASS");
+}
+
+// ---- 阶段一：设备中断投递基础设施（IRQ 归属/闩锁/冲突/PCI irq_line 捕获）----
+
+/// 阶段一自检：验证"PCI 设备中断 → 认领它的用户驱动"归属基础设施的
+/// 纯逻辑不变量（不依赖真实硬件中断投递）。
+///
+/// 覆盖（ADR-022 诚实纪律 + 阶段一新契约）：
+///   1. PCI 设备从配置空间捕获 irq_line；平台/虚拟设备为 0（真实 QEMU 集成观测）。
+///   2. claim_device_irq 归属登记 + 重复登记幂等 + 他人冲突 AlreadyExists。
+///   3. irq 0（无中断线）/非设备 IRQ 范围被如实拒绝。
+///   4. release_device_irq 仅按属主 pid 清除（非属主释放无副作用）。
+///   5. 闩锁：初始清零；debug_simulate_irq 置闩锁（无归属时不置）；consume 一次性读取。
+pub fn test_driver_irq_owner() {
+    info!("[test-driver-irq] === Stage-1: device IRQ -> claiming user driver ===");
+
+    // ---- 1. PCI irq_line 捕获（真实 QEMU 集成观测，非模拟）----
+    // 平台/虚拟设备必须 irq_line==0；PCI 设备应已从 0x3C 捕获（QEMU 下多为某条
+    // 空闲 PIC IRQ，值在 0..15；0 表示该设备未分配中断线，亦合法）。这里只断言
+    // "字段被如实填充、无越界"，并把观测值记录进日志——不臆断具体 IRQ 号。
+    let mut pci_seen = 0;
+    let mut pci_with_irq = 0;
+    let mut nonpci_with_irq = 0;
+    let count = driver::DriverHub::device_count();
+    for i in 0..count {
+        let Some(info) = driver::DriverHub::device_info_at(i) else { continue };
+        if info.bus == driver::BusType::Pci {
+            pci_seen += 1;
+            if info.irq_line != 0 {
+                pci_with_irq += 1;
+                assert!(
+                    (info.irq_line as usize) < driver::irq_owner::PIC_IRQ_COUNT,
+                    "PCI irq_line {} must be within PIC range",
+                    info.irq_line
+                );
+            }
+        } else if info.irq_line != 0 {
+            nonpci_with_irq += 1;
+        }
+    }
+    info!(
+        "[test-driver-irq] PCI captured: seen={} with_irq_line={} (non-PCI with irq={} must be 0)",
+        pci_seen, pci_with_irq, nonpci_with_irq
+    );
+    assert!(
+        nonpci_with_irq == 0,
+        "non-PCI devices must not carry a PCI interrupt line"
+    );
+
+    // ---- 2/3/4. 归属登记/幂等/冲突/释放（用空闲 IRQ 槽 15 模拟，不触碰真实设备）----
+    const TEST_IRQ: u8 = 15;
+    // 先清理可能残留的归属（测试可重复运行）。
+    driver::irq_owner::release_device_irq(TEST_IRQ, usize::MAX);
+    assert_eq!(driver::irq_owner::irq_owner_of(TEST_IRQ), None, "clean start");
+
+    // 登记归属 pid=1001。
+    let owner_pid = 1001usize;
+    let r1 = driver::irq_owner::claim_device_irq(TEST_IRQ, owner_pid);
+    assert_eq!(r1, Ok(TEST_IRQ), "first claim must succeed");
+    assert_eq!(
+        driver::irq_owner::irq_owner_of(TEST_IRQ),
+        Some(owner_pid),
+        "owner must be recorded"
+    );
+    // 同 pid 重复登记 → 幂等成功。
+    assert_eq!(
+        driver::irq_owner::claim_device_irq(TEST_IRQ, owner_pid),
+        Ok(TEST_IRQ),
+        "same-pid re-claim must be idempotent"
+    );
+    // 其它 pid 争抢同一 IRQ → AlreadyExists，不覆盖。
+    let other = 2002usize;
+    assert_eq!(
+        driver::irq_owner::claim_device_irq(TEST_IRQ, other),
+        Err(klib::error::Error::AlreadyExists),
+        "another pid must not steal the irq"
+    );
+    assert_eq!(
+        driver::irq_owner::irq_owner_of(TEST_IRQ),
+        Some(owner_pid),
+        "owner unchanged after rejected steal"
+    );
+    // irq 0（无中断线）→ 无中断可登记，返回 Ok(0)（静默跳过，非错误）。
+    assert_eq!(driver::irq_owner::claim_device_irq(0, owner_pid), Ok(0));
+    // 非设备 IRQ 范围（如 IRQ 1 = 键盘占用）→ 如实 InvalidParam。
+    assert_eq!(
+        driver::irq_owner::claim_device_irq(1, owner_pid),
+        Err(klib::error::Error::InvalidParam),
+        "system-occupied IRQ must be rejected"
+    );
+    // 非属主释放 → 无副作用，归属仍在。
+    driver::irq_owner::release_device_irq(TEST_IRQ, other);
+    assert_eq!(
+        driver::irq_owner::irq_owner_of(TEST_IRQ),
+        Some(owner_pid),
+        "non-owner release must not clear"
+    );
+    // 属主释放 → 清除。
+    driver::irq_owner::release_device_irq(TEST_IRQ, owner_pid);
+    assert_eq!(
+        driver::irq_owner::irq_owner_of(TEST_IRQ),
+        None,
+        "owner release must clear"
+    );
+
+    // ---- 5. 闩锁语义（debug_simulate_irq，无真实中断路径）----
+    // 无归属时触发 → 不置闩锁（真实 handler 返回 false 未处理）。
+    assert!(!driver::irq_owner::irq_pending_peek(TEST_IRQ), "clean latch");
+    assert!(!driver::debug_simulate_irq(TEST_IRQ), "no owner -> not handled");
+    assert!(!driver::irq_owner::irq_pending_peek(TEST_IRQ), "no owner -> latch stays clean");
+    // 归属后触发 → 置闩锁。
+    let _ = driver::irq_owner::claim_device_irq(TEST_IRQ, owner_pid);
+    assert!(driver::debug_simulate_irq(TEST_IRQ), "owner -> handled");
+    assert!(driver::irq_owner::irq_pending_peek(TEST_IRQ), "latch set after fire");
+    // consume 一次性读取并清零。
+    assert!(driver::irq_owner::irq_pending_consume(TEST_IRQ), "consume returns fired");
+    assert!(!driver::irq_owner::irq_pending_peek(TEST_IRQ), "latch cleared after consume");
+    // 清场：释放归属。
+    driver::irq_owner::release_device_irq(TEST_IRQ, owner_pid);
+    assert_eq!(driver::irq_owner::irq_owner_of(TEST_IRQ), None, "cleanup");
+
+    // ---- 6. 超时定时器槽（复查 FINDING-1：IRQ 触发须取消登记的阻塞段定时器，
+    //       杜绝其残留到下一次等待伪造超时）----
+    // 先登记归属，arm 一个伪定时器 id 到该 IRQ 槽。
+    let _ = driver::irq_owner::claim_device_irq(TEST_IRQ, owner_pid);
+    driver::irq_owner::irq_timer_arm(TEST_IRQ, 12345);
+    assert!(driver::irq_owner::irq_timer_armed(TEST_IRQ), "armed slot visible");
+    // 模拟该 IRQ 触发归属驱动：真实 handler 会在此刻 irq_timer_cancel 取消定时器。
+    assert!(driver::debug_simulate_irq(TEST_IRQ), "owner -> handled");
+    assert!(
+        !driver::irq_owner::irq_timer_armed(TEST_IRQ),
+        "IRQ-fired wake must cancel/clear the armed timeout (FINDING-1)"
+    );
+    // 未 arm 时 cancel/clear 幂等无副作用。
+    driver::irq_owner::irq_timer_cancel(TEST_IRQ);
+    assert!(!driver::irq_owner::irq_timer_armed(TEST_IRQ), "cancel idempotent");
+    // 清场：释放归属。
+    driver::irq_owner::release_device_irq(TEST_IRQ, owner_pid);
+    assert_eq!(driver::irq_owner::irq_owner_of(TEST_IRQ), None, "cleanup");
+
+    info!("[test-driver-irq] Stage-1 device IRQ ownership/latch/PCI-irq_line invariants OK");
+    info!("[test-driver-irq] PASS");
 }
 
 // ---- C7.1/#7：waitpid 真实现验收 ----
@@ -8587,10 +8730,9 @@ pub fn test_waitpid_e2e() {
 /// drv1 整改自检（ADR-022）：注册表契约、候选呈现、事件丢弃账目与
 /// sectors_touched 溢出纪律。
 ///
-/// **必须位于测试序列末位**：DM1 验证需要把驱动表填满，而驱动没有移除
-/// 通道——填满后的表不可逆；本测试之后的任何驱动注册都会得到如实的
-/// `Err(NoSpace)`（这正是新契约的行为）。设备表经 swap-remove 全量清理，
-/// 状态完全恢复。
+/// **保持在测试序列末位**：动态表改造后驱动注册无 NoSpace 顶，但驱动仍无
+/// 移除通道——本测试额外注册的驱动不可逆地常驻；保持在末位避免污染其后
+/// 对 driver_count 的观测。设备表经 swap-remove 全量清理，状态完全恢复。
 pub fn test_drv1_remediation() {
     use driver::drivers::ata_pio::LBA28_MAX_SECTORS;
     use driver::{sectors_touched, DeviceEvent, DeviceInfo};
@@ -8631,27 +8773,25 @@ pub fn test_drv1_remediation() {
     );
     info!("[test-drv1] DD1 sectors_touched saturation matrix OK");
 
-    // ---- 2. DA4 + DM1（设备侧）：稠密枚举契约 + 表满如实报错 ----
+    // ---- 2. DA4 + DA/DYN（设备侧）：稠密枚举契约 + 动态自动扩容（无表满）----
+    // 动态表改造后设备表不再有 MAX_DEVICES=64 硬顶：注册数量可越过旧上限而
+    // 不报错（自动扩容）。此处填 DYNAMIC_FILL 台 > 旧 64 顶，逐一必须 Ok，
+    // 验证扩容 + 计数无谎言（len() 即真值）。
     let base_count = driver::DriverHub::device_count();
-    let max_devices = 64usize; // driver::hub MAX_DEVICES（pub 常量经 DriverHub 容量语义验证）
+    const DYNAMIC_FILL: usize = 70; // 越过旧 MAX_DEVICES=64，证明不再有槽位顶
     let mut filled = 0usize;
-    let mut first_overflow = false;
-    for i in 0..max_devices {
+    for i in 0..DYNAMIC_FILL {
         let name: &'static str = leak_name(format_args!("drv1-fill-dev-{}", i));
         let info = fill_dev_info(name);
-        match driver::DriverHub::register_device_info(info, None, None) {
-            Ok(()) => filled += 1,
-            Err(e) => {
-                first_overflow = true;
-                info!(
-                    "[test-drv1] device table full at fill #{}: {:?} (DM1 honest rejection)",
-                    i, e
-                );
-                break;
-            }
-        }
+        driver::DriverHub::register_device_info(info, None, None)
+            .expect("dynamic device table must accept registrations past the old 64 cap");
+        filled += 1;
     }
-    assert!(first_overflow, "device table must eventually reject with NoSpace");
+    assert!(
+        driver::DriverHub::device_count() > 64usize,
+        "device table must auto-grow past the former MAX_DEVICES=64 (got {})",
+        driver::DriverHub::device_count()
+    );
     assert_eq!(
         driver::DriverHub::device_count(),
         base_count + filled,
@@ -8687,7 +8827,7 @@ pub fn test_drv1_remediation() {
     assert_eq!(driver::DriverHub::device_count(), after + 1);
 
     // 清理全部填充设备，注册表恢复基线（swap-remove 保证计数回落）。
-    for i in 0..filled {
+    for i in 0..DYNAMIC_FILL {
         let _ = driver::DriverHub::unregister_device_by_name(leak_name(format_args!("drv1-fill-dev-{}", i)));
     }
     let _ = driver::DriverHub::unregister_device_by_name("drv1-fill-dev-reuse");
@@ -8696,32 +8836,30 @@ pub fn test_drv1_remediation() {
         base_count,
         "cleanup must restore baseline device count"
     );
-    info!("[test-drv1] DA4+DM1 dense registry contract OK");
+    info!("[test-drv1] DA4 + dynamic-growth dense registry contract OK");
 
-    // ---- 3. DM1（驱动侧）：驱动表填满 → 精确 NoSpace，计数无谎言 ----
-    // （不可逆状态：本测试因此固定在序列末位。）
-    while driver::DriverHub::driver_count() < 32 {
+    // ---- 3. DA/DYN（驱动侧）：驱动表动态自动扩容（无表满）----
+    // 驱动表不再有 MAX_DRIVERS=32 硬顶：填到越过旧 32 顶仍必须全部 Ok，
+    // 验证扩容 + 计数无谎言。（驱动无移除通道，扩容不可逆 → 本测试保持在
+    // 序列末位，与旧版同约束。）
+    let drv_base = driver::DriverHub::driver_count();
+    const DRIVER_FILL: usize = 40; // 越过旧 MAX_DRIVERS=32，证明不再有槽位顶
+    for _ in 0..DRIVER_FILL {
         let name: &'static str = leak_name(format_args!("drv1-fill-drv-{}", driver::DriverHub::driver_count()));
         driver::DriverHub::register_driver(name, driver::DriverStage::Late, |_| {})
-            .expect("driver registration below capacity must succeed");
+            .expect("dynamic driver table must accept registrations past the old 32 cap");
     }
-    assert_eq!(driver::DriverHub::driver_count(), 32);
-    let overflow = driver::DriverHub::register_driver(
-        "drv1-overflow-drv",
-        driver::DriverStage::Late,
-        |_| {},
-    );
     assert!(
-        matches!(overflow, Err(klib::error::Error::NoSpace)),
-        "overflowing driver registration must report NoSpace, got {:?}",
-        overflow
+        driver::DriverHub::driver_count() > 32usize,
+        "driver table must auto-grow past the former MAX_DRIVERS=32 (got {})",
+        driver::DriverHub::driver_count()
     );
     assert_eq!(
         driver::DriverHub::driver_count(),
-        32,
-        "failed registration must not bump the counter"
+        drv_base + DRIVER_FILL,
+        "counter must equal live entries (no phantom increments)"
     );
-    info!("[test-drv1] DM1 driver-table honest capacity boundary OK");
+    info!("[test-drv1] driver-table dynamic growth OK (no capacity ceiling)");
 
     // ---- 4. DR1a：DevFS 候选呈现 ----
     let root = crate::vfs_init::root();
@@ -9000,6 +9138,7 @@ fn fill_dev_info(name: &'static str) -> driver::DeviceInfo {
         subclass: 0,
         prog_if: 0,
         volatile: true,
+        irq_line: 0,
     }
 }
 

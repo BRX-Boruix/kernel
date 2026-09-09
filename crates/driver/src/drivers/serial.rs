@@ -65,6 +65,8 @@ pub fn init_serial(_hub: &DriverHub) {
             prog_if: 0x02,
             // C15.1：串口是流式通道，不持久化任何数据。
             volatile: true,
+            // 串口为平台 PIO 设备，无 PCI 中断线。
+            irq_line: 0,
         },
         Some(&SERIAL_DEV),
         Some("serial"),

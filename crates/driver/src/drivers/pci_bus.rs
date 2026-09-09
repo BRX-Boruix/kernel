@@ -251,11 +251,9 @@ struct BarCacheEntry {
     bars: [PciBar; 6],
 }
 
-/// 缓存容量与 DriverHub 设备表一致：每个成功注册的 PCI 设备至多一条，
-/// 不存在溢出路径；越界即内核缺陷信号，warn 留痕后放弃缓存该条目。
-const MAX_BAR_CACHE: usize = 64;
-static BAR_CACHE: Mutex<[Option<BarCacheEntry>; MAX_BAR_CACHE]> =
-    Mutex::new([const { None }; MAX_BAR_CACHE]);
+/// 动态表：每个成功注册的 PCI 设备至多一条，按需扩容（无 MAX_BAR_CACHE=64
+/// 硬顶），与 DriverHub 动态设备表同量级；唯一失败路径是堆分配失败。
+static BAR_CACHE: Mutex<alloc::vec::Vec<BarCacheEntry>> = Mutex::new(alloc::vec::Vec::new());
 
 /// 查询设备扫描期缓存的 BAR 解析结果（只读，零配置空间访问）。
 ///
@@ -264,11 +262,7 @@ static BAR_CACHE: Mutex<[Option<BarCacheEntry>; MAX_BAR_CACHE]> =
 /// 禁止现场补探测或编造空结果。
 pub fn cached_pci_bars(dev_name: &str) -> Option<[PciBar; 6]> {
     let cache = BAR_CACHE.lock();
-    cache.iter().find_map(|slot| {
-        slot.as_ref()
-            .filter(|e| e.name == dev_name)
-            .map(|e| e.bars)
-    })
+    cache.iter().find(|e| e.name == dev_name).map(|e| e.bars)
 }
 
 /// 把 PCI (class_code, subclass) 映射为 [`DeviceKind`]。
@@ -345,6 +339,9 @@ pub fn scan_pci_bus() -> usize {
                 // C15.1：只有海量存储类硬件背后存在可持久化介质；其余类别
                 // 的设备一律保守披露为易失，禁止伪装持久存储。
                 let is_mass_storage = class_code == PCI_CLASS_MASS_STORAGE;
+                // PCI 中断线（配置空间 0x3C, Interrupt Line）。QEMU 下 PCI 声卡/网卡
+                // 常经 PIC 共享某条 IRQ 线；0 表示未分配/无中断。
+                let irq_line = read_config_u8(bus, device, function, 0x3C);
 
                 if DriverHub::register_device_info(
                     DeviceInfo {
@@ -358,6 +355,7 @@ pub fn scan_pci_bus() -> usize {
                         subclass,
                         prog_if,
                         volatile: !is_mass_storage,
+                        irq_line,
                     },
                     None,
                     None,
@@ -379,12 +377,13 @@ pub fn scan_pci_bus() -> usize {
                 let bars = inspect_pci_bars(bus, device, function);
                 {
                     let mut cache = BAR_CACHE.lock();
-                    match cache.iter_mut().find(|s| s.is_none()) {
-                        Some(slot) => *slot = Some(BarCacheEntry { name, bars }),
-                        None => warn!(
-                            "[pci] BAR cache full; probe result for {} not cached (kernel defect signal)",
+                    if cache.try_reserve(1).is_err() {
+                        warn!(
+                            "[pci] OOM: BAR cache cannot grow for {}; probe result not cached",
                             name
-                        ),
+                        );
+                    } else {
+                        cache.push(BarCacheEntry { name, bars });
                     }
                 }
                 let window = bars.iter().find_map(|bar| match *bar {

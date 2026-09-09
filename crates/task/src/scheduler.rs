@@ -1641,6 +1641,40 @@ pub fn clear_event_waiter_if(pid: usize) {
     );
 }
 
+/// driver_irq_wait 的等待端：阻塞当前进程直到其认领设备的 IRQ 触发或超时。
+///
+/// 复用 [`block_current_with`] 的 per-pid 锁内 register 复检消除 lost-wakeup：
+/// - 某 IRQ 已触发（闩锁置位）→ register 复检到即返回 false（不入睡），调用方
+///   立即以"已触发"交付，现场未动、零副作用。
+/// - 闩锁清零且可切走 → 置 Blocked 入睡；设备 IRQ 触发时 `driver::irq_owner`
+///   的 handler 置闩锁并调用注入回调 `wake_with_value(pid, 1)` 唤醒，或超时经
+///   [`wake_irq_timeout`]（置 0）唤醒。
+///
+/// `register` 与唤醒方（`wake_with_value` 持目标 pid 锁）同锁互斥，故闩锁在
+/// 置 Blocked 前/后任一时刻的触发都能被准确捕获：先触发则 register 拒睡，后
+/// 触发则唤醒生效——无窗口。
+pub fn block_for_irq(frame: &mut InterruptFrame, irq: u8) -> SwitchOutcome {
+    // register 返回 false = 条件已满足（闩锁置位），不阻塞。
+    block_current_with(frame, &mut || !driver::irq_owner::irq_pending_peek(irq))
+}
+
+/// driver_irq_wait 的超时唤醒（`klib::time::set_timeout` 回调，等待端注册）。
+///
+/// 与 [`wake_event_timeout`] 同款语义：把保存帧 rax 预置 `0`（超时无中断）并
+/// 唤醒。与设备中断唤醒（`wake_with_value(pid, 1)`）对 `saved.rax` 的竞争由
+/// `state == Blocked` 检查保证先到者胜（已置 Ready 则后到不覆盖，IRQ 优先）。
+pub fn wake_irq_timeout(pid: usize) {
+    {
+        let mut g = proc_bucket_lock(pid);
+        if let Some(slot) = g.get_mut(&pid) {
+            if slot.proc.state() == TaskState::Blocked {
+                slot.saved.rax = 0;
+            }
+        }
+    }
+    wake(pid);
+}
+
 /// 事件等待超时定时器 id 槽（`u64::MAX` = 无）。
 static EVENT_TIMER: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);

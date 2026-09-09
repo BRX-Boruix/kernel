@@ -218,6 +218,11 @@ pub const SYS_DRIVER_EVENT_NEXT: u32 = nr(domain::DEVICE, op::EVENT); // 0x57
 /// 用它兜底发现"拔除但无事件"的空闲卷。返回 `ProbeStatus`（alive=0/gone=1/
 /// notfound=2/notio=3）。
 pub const SYS_DEVICE_PROBE: u32 = nr(domain::DEVICE, 0x08); // 0x58
+/// `driver_irq_wait(uio_id, timeout_ns) -> 1/0`（DEVICE 域 0x09 → 0x59）：阻塞
+/// 等待当前进程认领设备的中断触发（有中断待服务）或超时。返回 1 = 该设备
+/// 的 IRQ 已触发（驱动应读设备状态寄存器服务）；0 = 超时。用户态驱动借此
+/// 中断驱动而非轮询（阶段一：PCI IRQ → 认领它的用户驱动）。
+pub const SYS_DRIVER_IRQ_WAIT: u32 = nr(domain::DEVICE, 0x09); // 0x59
 
 // ---------- 6. VOLUME Domain (0x60, ADR-030) ----------
 pub const SYS_VOLUME_MOUNT: u32 = nr(domain::VOLUME, op::CREATE); // 0x61
@@ -2491,6 +2496,95 @@ fn sys_driver_unregister(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
+/// `driver_irq_wait(uio_id, timeout_ns) -> 1/0`（DEVICE 域 0x59，阶段一）。
+///
+/// 阻塞当前进程直到其认领的设备中断触发或超时，使用户态驱动**中断驱动**而非
+/// 轮询。归属校验同 claim（id 存在 + 调用者是该认领者）。
+///
+/// 返回：1 = 该设备 IRQ 已触发（驱动应读设备状态寄存器服务）；0 = 超时无中断。
+/// 设备无 PCI 中断线（irq_line==0）→ NotSupported（本函数对无中断设备无意义）。
+///
+/// 语义（含闩锁防丢边沿）：设备 IRQ 触发时 driver::irq_owner 的 handler 置
+/// "待服务"闩锁并定向唤醒本 pid（`wake_with_value(pid,1)`）。若闩锁已在阻塞前
+/// 置位（驱动忙于服务时又有中断），本函数立即返回 1 不入睡——绝不丢"有活
+/// 要干"的信号。驱动通过读设备状态寄存器完成真实服务。
+///
+/// 时钟未就绪/超时注册失败：如实退化（见下）。
+fn sys_driver_irq_wait(frame: &mut SyscallFrame) -> DispatchResult {
+    const MAX_WAIT_TIMEOUT_NS: u64 = 3_600_000_000_000; // 1h，同事件等待口径
+    if !current_is_system() {
+        return done(pack_err(Error::PermissionDenied));
+    }
+    let uio_id = frame.a1 as usize;
+    let timeout_ns = frame.a2;
+    if timeout_ns > MAX_WAIT_TIMEOUT_NS {
+        return done(pack_err(Error::InvalidParam));
+    }
+    let Some(pid) = current_proc_mut().map(|p| p.pid()) else {
+        return done(pack_err(Error::NotFound));
+    };
+    // 归属校验 + 取该认领设备的中断线。
+    let irq = match driver::uio_claimed_device_irq(uio_id, pid) {
+        Ok(irq) => irq,
+        Err(e) => return done(pack_err(e)),
+    };
+    if irq == 0 {
+        // 设备无 PCI 中断线：中断驱动等待对它无意义，如实拒绝。
+        return done(pack_err(Error::NotSupported));
+    }
+    // 闩锁已置（有中断待服务，含驱动忙于服务期间到达的边沿）：立即交付。
+    if driver::irq_owner::irq_pending_consume(irq) {
+        return done(pack_ok(1));
+    }
+    if timeout_ns == 0 {
+        // 非阻塞且无待服务中断：返回 0（空），调用方稍后重试。
+        return done(pack_ok(0));
+    }
+    // 阻塞等待：挂起直到设备中断或超时。
+    irq_wait_blocking(frame, pid, irq, timeout_ns)
+}
+
+/// driver_irq_wait 的阻塞段（等待端）。
+///
+/// 与 event_wait_blocking 同构：注册一次性超时定时器（到期经 [`task::wake_irq_timeout`]
+/// 置 rax=0 唤醒），再经 [`task::block_for_irq`] 挂起。设备中断触发时 irq_owner
+/// handler 置闩锁并定向唤醒本 pid（置 rax=1）；`block_for_irq` 的 per-pid 锁内
+/// 复检（闩锁置位即拒睡）闭合 lost-wakeup。
+fn irq_wait_blocking(frame: &mut SyscallFrame, pid: usize, irq: u8, timeout_ns: u64) -> DispatchResult {
+    if !klib::time::clock_ready() {
+        // 时钟未就绪：如实退化非阻塞（返回 0）。
+        return done(pack_ok(0));
+    }
+    // 注册超时定时器：到期唤醒置 rax=0（超时）。表满则静默退化——中断到达仍能
+    // 唤醒，超时仅是对活性的兜底（同 event_wait_blocking 纪律）。
+    let registered_timer = klib::time::set_timeout(timeout_ns, task::wake_irq_timeout, pid);
+    // 把定时器登记进该 IRQ 的槽（绑定到满足等待的那个 IRQ）：本 IRQ 触发时
+    // device_irq_handler 据槽取消并清，杜绝定时器残留到下一次等待伪造超时
+    // （复查 FINDING-1）。
+    if let Some(tid) = registered_timer {
+        driver::irq_owner::irq_timer_arm(irq, tid);
+    }
+    // 取消本等待的超时定时器并清 IRQ 槽（仅"已确定交付/返回"的路径调用；
+    // Switched 阻塞路径不清，交由 IRQ handler 在唤醒时 irq_timer_cancel，或
+    // 到期自然触发——两条路径都收敛到槽=MAX，不留 stale）。
+    let cancel_timer = |registered: Option<u64>| {
+        if let Some(tid) = registered {
+            klib::time::cancel_timeout(tid);
+        }
+        driver::irq_owner::irq_timer_clear(irq);
+    };
+    match task::block_for_irq(arch_frame(frame), irq) {
+        task::SwitchOutcome::Switched => DispatchResult::Switched,
+        task::SwitchOutcome::NotSwitched => {
+            // 未入睡（闩锁已置 / 无同伴可切）：交付结果。若闩锁置位 → 1；否则
+            // （无可切同伴的退化）返回 0。取消超时定时器并清 IRQ 槽。
+            let fired = driver::irq_owner::irq_pending_consume(irq);
+            cancel_timer(registered_timer);
+            done(if fired { pack_ok(1) } else { pack_ok(0) })
+        }
+    }
+}
+
 // ---------- VOLUME Domain (0x60, ADR-030) ----------
 
 /// `volume_mount(dev_name_ptr, out_path_ptr, out_cap) -> len`（M4.2，0x61）。
@@ -2792,6 +2886,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_DRIVER_EVENT_NEXT => sys_driver_event_next(frame),
         // 块设备缓存穿透探测读（volumed 低频对账）。
         SYS_DEVICE_PROBE => done(sys_device_probe(frame)),
+        // driver_irq_wait 可能阻塞切换（设备中断定向唤醒），自带 DispatchResult 语义。
+        SYS_DRIVER_IRQ_WAIT => sys_driver_irq_wait(frame),
 
         // VOLUME Domain (0x60, ADR-030)
         SYS_VOLUME_MOUNT => done(sys_volume_mount(frame)),

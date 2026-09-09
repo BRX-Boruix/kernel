@@ -43,6 +43,8 @@ pub fn init() {
                     prog_if: 0,
                     // C15.1：固件表登记属控制面，不承载数据持久语义，保守披露。
                     volatile: true,
+                    // ACPI 平台设备无 PCI 中断线。
+                    irq_line: 0,
                 },
                 None,
                 Some("acpi"),
@@ -69,6 +71,8 @@ pub fn init() {
                         prog_if: 0,
                         // C15.1：HPET 计数器重启归零，状态不持久。
                         volatile: true,
+                        // HPET 平台设备无 PCI 中断线（其中断走 LAPIC 定时器路径）。
+                        irq_line: 0,
                     },
                     None,
                     Some("hpet"),

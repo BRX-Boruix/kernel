@@ -19,12 +19,16 @@
 //!   `NotSupported`，绝不以匿名内存伪装映射成功。
 
 use crate::hub::DriverHub;
+use alloc::vec::Vec;
 use klib::error::Error;
 use klib::info;
 use klib::warn;
 use spin::Mutex;
 
-pub const MAX_UIO_DRIVERS: usize = 16;
+// 用户态驱动认领表 / 设备窗口登记表改为动态 Vec，废除原编译期上限
+// （MAX_UIO_DRIVERS=16 / MAX_DEVICE_WINDOWS=32）：注册/发布按需扩容，不再有
+// 槽位硬顶。唯一诚实失败路径是堆分配失败（OutOfMemory）。注销/崩溃隔离仍
+// 走 is_alive=false 原位复用（uio_id = 槽位索引，永不移位，保持 id 稳定）。
 
 /// 设备名字段容量（含结尾 NUL 余量；超长名字在注册入口被拒）。
 pub const UIO_DEV_NAME_MAX: usize = 32;
@@ -47,8 +51,7 @@ impl UioDriverEntry {
     };
 }
 
-static UIO_DRIVERS: Mutex<[UioDriverEntry; MAX_UIO_DRIVERS]> =
-    Mutex::new([UioDriverEntry::EMPTY; MAX_UIO_DRIVERS]);
+static UIO_DRIVERS: Mutex<Vec<UioDriverEntry>> = Mutex::new(Vec::new());
 
 /// 设备 MMIO 窗口登记表（K2：设备物理资源是**内核登记事实**）。
 ///
@@ -62,18 +65,14 @@ pub struct DeviceMmioWindow {
     pub len: u64,
 }
 
-/// 窗口容量：PCI 扫描的每个设备至多发布一个主 MMIO 窗口，上限与
-/// DriverHub 设备量级一致。
-const MAX_DEVICE_WINDOWS: usize = 32;
-/// 单窗口字节上限（KA7 限额纪律）。
+/// 单窗口字节上限（KA7 限额纪律：单窗口最大长度，与"窗口数量"无关）。
 const MAX_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 设备窗口物理基址对齐要求（字节）。与 mm `map_mmio_user` 的页对齐一致：
 /// 4KiB 是 x86-64 页粒度，未按页对齐的窗口无法逐页建立 PCD 映射。
 const WINDOW_ALIGN_BYTES: u64 = 0x1000;
 
-static DEVICE_WINDOWS: Mutex<[Option<DeviceMmioWindow>; MAX_DEVICE_WINDOWS]> =
-    Mutex::new([const { None }; MAX_DEVICE_WINDOWS]);
+static DEVICE_WINDOWS: Mutex<Vec<DeviceMmioWindow>> = Mutex::new(Vec::new());
 
 /// 发布设备的 MMIO 物理窗口（PCI 枚举路径调用，每设备至多一次）。
 ///
@@ -88,16 +87,16 @@ pub fn publish_device_window(name: &'static str, phys: u64, len: u64) -> Result<
         return Err(Error::InvalidParam);
     }
     let mut windows = DEVICE_WINDOWS.lock();
-    if windows
-        .iter()
-        .any(|w| matches!(w, Some(w) if w.name == name))
-    {
+    if windows.iter().any(|w| w.name == name) {
         return Err(Error::AlreadyExists);
     }
-    let Some(slot) = windows.iter_mut().find(|w| w.is_none()) else {
-        return Err(Error::NoSpace);
-    };
-    *slot = Some(DeviceMmioWindow { name, phys, len });
+    // 动态表：按需扩容；堆分配失败如实 OutOfMemory（不静默、不借用 NoSpace）。
+    if windows.try_reserve(1).is_err() {
+        drop(windows);
+        warn!("[uio] OOM: cannot grow device window table for '{}'", name);
+        return Err(Error::OutOfMemory);
+    }
+    windows.push(DeviceMmioWindow { name, phys, len });
     info!(
         "[uio] device window published: {} phys={:#x} len={:#x}",
         name, phys, len
@@ -108,11 +107,10 @@ pub fn publish_device_window(name: &'static str, phys: u64, len: u64) -> Result<
 /// 查询设备的已登记 MMIO 窗口。
 pub fn device_mmio_window(name: &str) -> Option<(u64, u64)> {
     let windows = DEVICE_WINDOWS.lock();
-    windows.iter().find_map(|w| {
-        w.as_ref()
-            .filter(|w| w.name == name)
-            .map(|w| (w.phys, w.len))
-    })
+    windows
+        .iter()
+        .find(|w| w.name == name)
+        .map(|w| (w.phys, w.len))
 }
 
 /// claim 映射半程（K2）：按 `uio_id` 取其认领设备的已登记 MMIO 窗口。
@@ -129,8 +127,31 @@ pub fn uio_device_window_of(uio_id: usize) -> Option<(u64, u64)> {
     device_mmio_window(name)
 }
 
+/// 按 `uio_id` + 调用者 pid 取认领设备的中断线（driver_irq_wait 用）。
+///
+/// 返回 Ok(irq)：irq 为 0 表示该设备无 PCI 中断线（无中断可等待）；非 0 为该
+/// 设备的中断线。归属校验同 [`uio_claim_device`]（id 存在 + 调用者是该认领者），
+/// 不满足返回对应错误（NotFound / PermissionDenied），绝不把他人认领的设备中断
+/// 交给非属主进程等待。
+pub fn uio_claimed_device_irq(uio_id: usize, caller_pid: usize) -> Result<u8, Error> {
+    let list = UIO_DRIVERS.lock();
+    let Some(entry) = list.get(uio_id) else {
+        return Err(Error::NotFound);
+    };
+    if !entry.is_alive {
+        return Err(Error::NotFound);
+    }
+    if entry.pid != caller_pid {
+        return Err(Error::PermissionDenied);
+    }
+    let Some(name) = core::str::from_utf8(&entry.claimed_device[..entry.claimed_len]).ok() else {
+        return Err(Error::InvalidParam);
+    };
+    Ok(crate::hub::DriverHub::device_irq_of(name))
+}
+
 /// 查询某设备名当前是否已有**活跃**认领。
-fn slot_of_live_claim(list: &[UioDriverEntry; MAX_UIO_DRIVERS], dev_name: &str) -> Option<usize> {
+fn slot_of_live_claim(list: &[UioDriverEntry], dev_name: &str) -> Option<usize> {
     list.iter().position(|e| {
         e.is_alive
             && core::str::from_utf8(&e.claimed_device[..e.claimed_len]).is_ok_and(|n| n == dev_name)
@@ -140,8 +161,8 @@ fn slot_of_live_claim(list: &[UioDriverEntry; MAX_UIO_DRIVERS], dev_name: &str) 
 /// 用户态进程注册为驱动实例并声明对某设备的认领（UIO Register，M11.1）。
 ///
 /// 同一设备的活跃认领全局唯一；重复注册返回 [`Error::AlreadyExists`]。
-/// 表满返回 [`Error::NoSpace`]（KA7 语义：上限内资源如实报满，不再借用
-/// OutOfMemory）。
+/// 动态表（无槽位硬顶）：优先复用空槽，无空槽则按需扩容；唯一失败路径是
+/// 堆分配失败 Error::OutOfMemory。
 pub fn uio_register_driver(pid: usize, dev_name: &str) -> Result<usize, Error> {
     if dev_name.is_empty() || dev_name.len() >= UIO_DEV_NAME_MAX {
         return Err(Error::InvalidParam);
@@ -152,25 +173,43 @@ pub fn uio_register_driver(pid: usize, dev_name: &str) -> Result<usize, Error> {
         return Err(Error::NotFound);
     }
     let mut list = UIO_DRIVERS.lock();
-    if slot_of_live_claim(&list, dev_name).is_some() {
+    if slot_of_live_claim(list.as_slice(), dev_name).is_some() {
         return Err(Error::AlreadyExists);
     }
-    let Some(free_idx) = list.iter().position(|e| !e.is_alive) else {
-        return Err(Error::NoSpace);
-    };
+    // 动态表：优先复用 is_alive=false 的空槽（保持 uio_id=槽位索引稳定），
+    // 无空槽则按需扩容 append——不再有 MAX_UIO_DRIVERS=16 的硬顶。
     let mut name_buf = [0u8; UIO_DEV_NAME_MAX];
     name_buf[..dev_name.len()].copy_from_slice(dev_name.as_bytes());
-    list[free_idx] = UioDriverEntry {
-        pid,
-        claimed_device: name_buf,
-        claimed_len: dev_name.len(),
-        is_alive: true,
+    let idx = match list.iter().position(|e| !e.is_alive) {
+        Some(i) => {
+            list[i] = UioDriverEntry {
+                pid,
+                claimed_device: name_buf,
+                claimed_len: dev_name.len(),
+                is_alive: true,
+            };
+            i
+        }
+        None => {
+            if list.try_reserve(1).is_err() {
+                drop(list);
+                warn!("[uio] OOM: cannot grow driver table for '{}'", dev_name);
+                return Err(Error::OutOfMemory);
+            }
+            list.push(UioDriverEntry {
+                pid,
+                claimed_device: name_buf,
+                claimed_len: dev_name.len(),
+                is_alive: true,
+            });
+            list.len() - 1
+        }
     };
     info!(
         "[uio] driver registered: pid={} claiming dev={}",
         pid, dev_name
     );
-    Ok(free_idx)
+    Ok(idx)
 }
 
 /// 认领校验（UIO Claim 授权半程，KA4）：以 `uio_id` 精确定位记录并验证
@@ -197,6 +236,26 @@ pub fn uio_claim_device(uio_id: usize, caller_pid: usize) -> Result<(), Error> {
         "[uio] claim authorized: pid={} uio_id={} dev={}",
         caller_pid, uio_id, dev_str
     );
+    // 设备中断投递：认领即登记该设备 IRQ 归属给本 pid（若设备有中断线）。
+    // 归属失败（IRQ 已被他人占有等）不使 MMIO claim 失败——驱动仍可映射/轮询，
+    // 只是收不到该 IRQ 的中断；如实记录以便诊断，不静默。
+    let irq = DriverHub::device_irq_of(dev_str);
+    if irq != 0 {
+        match crate::irq_owner::claim_device_irq(irq, caller_pid) {
+            Ok(0) | Ok(_) => {
+                klib::info!(
+                    "[uio] device irq owner set: pid={} dev={} irq={}",
+                    caller_pid, dev_str, irq
+                );
+            }
+            Err(e) => {
+                klib::warn!(
+                    "[uio] device irq owner NOT set: pid={} dev={} irq={} err={:?} (MMIO claim unaffected)",
+                    caller_pid, dev_str, irq, e
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -210,6 +269,11 @@ pub fn uio_on_process_exit(pid: usize) -> bool {
             found = true;
             let dev_str = core::str::from_utf8(&entry.claimed_device[..entry.claimed_len])
                 .unwrap_or("unknown");
+            // 释放该设备的中断归属（仅当归属确为本 pid 才清除）。
+            let irq = DriverHub::device_irq_of(dev_str);
+            if irq != 0 {
+                crate::irq_owner::release_device_irq(irq, pid);
+            }
             info!(
                 "[uio] isolated crashed driver: pid={} claimed_dev={} (kernel protected, 0 Panic)",
                 pid, dev_str
@@ -225,7 +289,7 @@ pub fn uio_on_process_exit(pid: usize) -> bool {
 /// 本函数——claim 路径的 id+pid 校验见 [`uio_claim_device`]。
 pub fn uio_is_device_claimed(dev_name: &str) -> bool {
     let list = UIO_DRIVERS.lock();
-    slot_of_live_claim(&list, dev_name).is_some()
+    slot_of_live_claim(list.as_slice(), dev_name).is_some()
 }
 
 /// 注销驱动（UIO Unregister，ADR-014 0x54）：释放注册槽位并解绑其设备。
@@ -248,6 +312,11 @@ pub fn uio_unregister_driver(uio_id: usize, caller_pid: usize) -> Result<(), Err
     let dev_str = core::str::from_utf8(&entry.claimed_device[..entry.claimed_len])
         .unwrap_or("unknown");
     entry.is_alive = false;
+    // 注销释放设备中断归属（仅当归属确为本 pid 才清除）。
+    let irq = DriverHub::device_irq_of(dev_str);
+    if irq != 0 {
+        crate::irq_owner::release_device_irq(irq, caller_pid);
+    }
     info!(
         "[uio] driver unregistered: pid={} uio_id={} released dev={}",
         caller_pid, uio_id, dev_str
