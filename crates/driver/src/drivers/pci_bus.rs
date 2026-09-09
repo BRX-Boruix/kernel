@@ -34,6 +34,8 @@ const PCI_CLASS_DISPLAY: u8 = 0x03;
 const PCI_CLASS_BRIDGE: u8 = 0x06;
 /// PCI 配置空间类代码：简单通信控制器（串口等）。
 const PCI_CLASS_SIMPLE_COMM: u8 = 0x07;
+/// PCI 配置空间类代码：多媒体控制器（音频/HDA 等）。
+const PCI_CLASS_MULTIMEDIA: u8 = 0x04;
 
 /// 海量存储子类（offset 0x0A）：IDE 控制器。
 const PCI_SUBCLASS_IDE: u8 = 0x01;
@@ -43,6 +45,8 @@ const PCI_SUBCLASS_SATA: u8 = 0x06;
 const PCI_SUBCLASS_ETHERNET: u8 = 0x00;
 /// 显示子类：VGA 兼容控制器。
 const PCI_SUBCLASS_VGA: u8 = 0x00;
+/// 多媒体子类：HD Audio 控制器（Intel HDA/ICH6+）。
+const PCI_SUBCLASS_HDA: u8 = 0x03;
 /// 桥接子类：Host bridge。
 const PCI_SUBCLASS_HOST_BRIDGE: u8 = 0x00;
 /// 桥接子类：ISA bridge。
@@ -296,6 +300,9 @@ pub fn name_for_device(class_code: u8, subclass: u8) -> &'static str {
         (PCI_CLASS_NETWORK, _) => "pci-network",
         (PCI_CLASS_DISPLAY, PCI_SUBCLASS_VGA) => "pci-vga-display",
         (PCI_CLASS_DISPLAY, _) => "pci-display",
+        // 多媒体 04:03 = HD Audio 控制器（Intel HDA/ICH6）。给它稳定语义名,使用户态
+        // 声卡驱动能绑到可识别设备而非落入 pci-device 通配。
+        (PCI_CLASS_MULTIMEDIA, PCI_SUBCLASS_HDA) => "pci-hda",
         (PCI_CLASS_BRIDGE, PCI_SUBCLASS_HOST_BRIDGE) => "pci-host-bridge",
         (PCI_CLASS_BRIDGE, PCI_SUBCLASS_ISA_BRIDGE) => "pci-isa-bridge",
         (PCI_CLASS_BRIDGE, _) => "pci-bridge",
