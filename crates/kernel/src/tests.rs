@@ -10128,6 +10128,47 @@ pub fn test_hda_device_dma_probe() {
     // 1. 建用户地址空间并把 HDA MMIO 窗口真实映射进去（同 driver_claim 路径），
     //    内核 HHDM 只覆盖 RAM、不覆盖 PCI MMIO 洞（裸 phys_to_virt 会 #PF，已实测）。
     info!("[test-hda-dma] enter probe");
+
+    // 【关键顺序】DMA 帧的分配与 BDL/PCM 写入必须在**内核原始地址空间**完成！
+    // 实测：X86PageTable::new() 建出的新地址空间里 HHDM 别名不成立
+    // （phys_to_virt(P) 并不映射到 QEMU phys P），若在切 CR3 后写 DMA 帧，
+    // 数据会落到别处、QEMU 设备 DMA 自然读到 0——那是探针自身的坑，不是 QEMU 的。
+    let bdl_frame = mm::allocate_frame().expect("bdl frame");
+    let base_phys = bdl_frame.start_paddr();
+    let pcm_frame = mm::allocate_frame().expect("pcm frame");
+    let pcm_phys = pcm_frame.start_paddr();
+    {
+        let pcm_v = arch::phys_to_virt(pcm_phys) as *mut u16;
+        for i in 0..128usize {
+            let s: i16 = if (i & 1) == 0 { 0x4000 } else { -0x4000 };
+            unsafe { core::ptr::write_volatile(pcm_v.add(i), s as u16) };
+        }
+        let bdl_v = arch::phys_to_virt(base_phys) as *mut u8;
+        unsafe {
+            core::ptr::write_volatile(bdl_v as *mut u64, pcm_phys);
+            core::ptr::write_volatile((bdl_v as *mut u32).add(2), 256u32);
+            core::ptr::write_volatile((bdl_v as *mut u32).add(3), 0u32);
+            core::arch::x86_64::_mm_sfence();
+        }
+        let b0 = unsafe { core::ptr::read_volatile(bdl_v as *const u64) };
+        let b1 = unsafe { core::ptr::read_volatile((bdl_v as *const u32).add(2)) };
+        let mv = arch::phys_to_virt(base_phys) as *mut u8;
+        unsafe { core::ptr::write_volatile(mv.add(0x100) as *mut u64, 0x0042_4f52_5549_58BBu64) };
+        info!("[test-hda-dma] [KERN-SPACE] bdl_phys={:#x} pcm_phys={:#x} wrote addr={:#x} len={} magic@+0x100=0x00424f52554958bb", base_phys, pcm_phys, b0, b1);
+    }
+
+    // 【最干净的前置验证】在**内核原始地址空间**（未切 CR3）下：
+    // 分配一帧，经 HHDM 写唯一 magic，并记录 phys。随后用 QEMU monitor
+    // `xp <phys>` 验证该 magic 是否真的落在该 QEMU 物理地址。
+    {
+        let f = mm::allocate_frame().expect("alias test frame");
+        let p = f.start_paddr();
+        let va = arch::phys_to_virt(p);
+        const MAG: u64 = 0x0042_4f52_5549_58AAu64; // "BORUIX\xAA"
+        unsafe { core::ptr::write_volatile(va as *mut u64, MAG) };
+        let back = unsafe { core::ptr::read_volatile(va as *const u64) };
+        info!("[test-hda-dma] [ALIAS-KERNEL] phys={:#x} hhdm_va={:#x} magic={:#018x} readback={:#018x}", p, va, MAG, back);
+    }
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
         .expect("hda probe addr space");
     info!("[test-hda-dma] addr space created");
@@ -10171,28 +10212,11 @@ pub fn test_hda_device_dma_probe() {
     for _ in 0..100_000 { core::hint::spin_loop(); }
     info!("[test-hda-dma] GCTL={:#x} STATESTS={:#x}", rd32(0x08), rd16(0x0e));
 
-    // 3. 内核帧分配器取两帧：BDL 页 + PCM 页，经 HHDM 直写（内核来源的 DMA 页内容）。
-    let bdl_frame = mm::allocate_frame().expect("bdl frame");
-    let base_phys = bdl_frame.start_paddr();
-    let pcm_frame = mm::allocate_frame().expect("pcm frame");
-    let pcm_phys = pcm_frame.start_paddr();
-    info!("[test-hda-dma] bdl_phys={:#x} pcm_phys={:#x}", base_phys, pcm_phys);
+    // 3. DMA 帧已在**内核地址空间**写好（见函数开头）；此处只记录。
+    info!("[test-hda-dma] using kernel-space-written frames: bdl_phys={:#x} pcm_phys={:#x}", base_phys, pcm_phys);
 
-    let pcm_v = arch::phys_to_virt(pcm_phys) as *mut u16;
-    for i in 0..128usize {
-        let s: i16 = if (i & 1) == 0 { 0x4000 } else { -0x4000 };
-        unsafe { core::ptr::write_volatile(pcm_v.add(i), s as u16) };
-    }
-    let bdl_v = arch::phys_to_virt(base_phys) as *mut u8;
-    unsafe {
-        core::ptr::write_volatile(bdl_v as *mut u64, pcm_phys);
-        core::ptr::write_volatile((bdl_v as *mut u32).add(2), 256u32);
-        core::ptr::write_volatile((bdl_v as *mut u32).add(3), 0u32);
-        core::arch::x86_64::_mm_sfence();
-    }
-    let b0 = unsafe { core::ptr::read_volatile(bdl_v as *const u64) };
-    let b1 = unsafe { core::ptr::read_volatile((bdl_v as *const u32).add(2)) };
-    info!("[test-hda-dma] BDL@phys={:#x} wrote addr={:#x} len={} (HHDM readback)", base_phys, b0, b1);
+    // （原 MAGIC/ALIAS 诊断已移除：它在本地址空间内写，受下文所述 HHDM 别名缺陷影响，
+    //  结论不可靠。真正的判据是内核地址空间写入 + QEMU monitor 读同物理地址。）
 
     // 4. codec cad0 node2 绑流 tag1 + 格式 0x11（立即命令 IC）。
     let ic = |verb: u32, payload: u16| -> u32 {
@@ -10227,9 +10251,20 @@ pub fn test_hda_device_dma_probe() {
     info!("[test-hda-dma] after spin: LPIB={} (0 => QEMU 未取到数据)", rd32(BASE + 0x04));
     info!("[test-hda-dma] DONE (kernel-written BDL; 看 QEMU debug 的 bdl/0 行)");
 
+    // 【HMP 窗口】释放帧前，用**内核地址空间 HHDM** 重新确认 BDL 内容，并长停 ~20s
+    // 让外部 QEMU monitor 有机会 `xp <bdl_phys>` 对照（帧此时仍归本地址空间占有）。
+    {
+        let bv = arch::phys_to_virt(base_phys) as *const u8;
+        let a0 = unsafe { core::ptr::read_volatile(bv as *const u64) };
+        let a1 = unsafe { core::ptr::read_volatile((bv as *const u32).add(2)) };
+        let mg = unsafe { core::ptr::read_volatile(bv.add(0x100) as *const u64) };
+        info!("[test-hda-dma] [HOLD] bdl_phys={:#x} pcm_phys={:#x} hhdm_readback addr={:#x} len={} magic@+0x100={:#018x}", base_phys, pcm_phys, a0, a1, mg);
+        info!("[test-hda-dma] [SPIN] 保持帧不释放约 20s，可 `xp {:#x}` 对照", base_phys);
+        for _ in 0..400_000_000u64 { core::hint::spin_loop(); }
+        info!("[test-hda-dma] [SPIN-DONE]");
+    }
+
     wr32(BASE + 0x00, 0);
-    mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(base_phys));
-    mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(pcm_phys));
 
     arch_x86_64::mmio::write_cr3(saved_cr3);
     task::clear_current_proc();
