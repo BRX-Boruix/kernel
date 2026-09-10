@@ -12,6 +12,8 @@ real-hw = ["task/real-hw"]
 # 透传 ipc/kernel-tests：启用 shm 记账探针（ipc1 IA1 验收）。
 # 透传 driver/kernel-tests：启用 DriverHub 槽位残留诊断访问器。
 kernel-tests = ["task/kernel-tests", "ipc/kernel-tests", "driver/kernel-tests"]
+# 临时诊断：HDA 设备 DMA 前端探针（隔离用，默认关闭）。
+hda-probe = ["kernel-tests"]
 # M3.3 用户态异常停机验收：进程在用户态触发 #UD 后由"进程终止"处理器
 # 接管并停机（验收后停，不返回主流程）。因会卡住后续启动，默认关闭；
 # SDK 的 `--test-m3.3` 显式启用。隐含 kernel-tests。

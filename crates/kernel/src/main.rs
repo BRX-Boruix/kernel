@@ -562,7 +562,12 @@ unsafe fn kmain_body() -> ! {
     // PRE-1 / ADR-037 决策 5：UIO driver_register/driver_claim 特权门禁（System-only）。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_uio_privilege_gate();
+    // 设备 DMA 前端探针：内核态写 BDL/PCM 起 HDA 流，隔离用户态变量。
+    #[cfg(all(feature = "kernel-tests", feature = "hda-probe"))]
+    tests::test_hda_device_dma_probe();
     // R6 flock：冲突矩阵 + close 自动释放（ADR-014 承诺）。
+    #[cfg(feature = "kernel-tests")]
+    klib::info!("[boot] before test_flock_matrix");
     #[cfg(feature = "kernel-tests")]
     tests::test_flock_matrix();
     #[cfg(feature = "kernel-tests")]

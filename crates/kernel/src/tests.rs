@@ -10121,4 +10121,121 @@ pub fn test_t1_3() {
     info!("[test-t1-3] PASS (member-exit zombie/join; leader-exit group+notify; leader-SIGKILL)");
 }
 
+pub fn test_hda_device_dma_probe() {
+    use alloc::boxed::Box;
+    use task::Process;
+
+    // 1. 建用户地址空间并把 HDA MMIO 窗口真实映射进去（同 driver_claim 路径），
+    //    内核 HHDM 只覆盖 RAM、不覆盖 PCI MMIO 洞（裸 phys_to_virt 会 #PF，已实测）。
+    info!("[test-hda-dma] enter probe");
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("hda probe addr space");
+    info!("[test-hda-dma] addr space created");
+    const HDA_MMIO_PHYS: u64 = 0xfebf_0000;
+    const HDA_MMIO_LEN: u64 = 0x4000;
+    let mmio = addr_space
+        .map_mmio_user(HDA_MMIO_PHYS, HDA_MMIO_LEN)
+        .expect("map_mmio_user HDA window");
+    info!("[test-hda-dma] mmio mapped at va={:#x}", mmio);
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    let rd32 = |off: u64| -> u32 { unsafe { core::ptr::read_volatile((mmio + off) as *const u32) } };
+    let rd16 = |off: u64| -> u16 { unsafe { core::ptr::read_volatile((mmio + off) as *const u16) } };
+    let wr32 = |off: u64, v: u32| unsafe { core::ptr::write_volatile((mmio + off) as *mut u32, v) };
+    let wr16 = |off: u64, v: u16| unsafe { core::ptr::write_volatile((mmio + off) as *mut u16, v) };
+
+    let gcap = rd16(0x00);
+    info!("[test-hda-dma] HDA MMIO phys={:#x} -> va={:#x}, GCAP={:#06x}", HDA_MMIO_PHYS, mmio, gcap);
+    if gcap != 0x4401 {
+        info!("[test-hda-dma] GCAP != 0x4401 (no intel-hda here); skip");
+        arch_x86_64::mmio::write_cr3(saved_cr3);
+        task::clear_current_proc();
+        unsafe { drop(Box::from_raw(proc_raw)) };
+        arch_x86_64::interrupts::irq_restore(irq_flags);
+        return;
+    }
+
+    // 2. 控制器复位（GCTL.CRST 1->0）。
+    wr32(0x08, 1);
+    for _ in 0..100_000 { core::hint::spin_loop(); }
+    wr32(0x08, 0);
+    for _ in 0..100_000 { core::hint::spin_loop(); }
+    info!("[test-hda-dma] GCTL={:#x} STATESTS={:#x}", rd32(0x08), rd16(0x0e));
+
+    // 3. 内核帧分配器取两帧：BDL 页 + PCM 页，经 HHDM 直写（内核来源的 DMA 页内容）。
+    let bdl_frame = mm::allocate_frame().expect("bdl frame");
+    let base_phys = bdl_frame.start_paddr();
+    let pcm_frame = mm::allocate_frame().expect("pcm frame");
+    let pcm_phys = pcm_frame.start_paddr();
+    info!("[test-hda-dma] bdl_phys={:#x} pcm_phys={:#x}", base_phys, pcm_phys);
+
+    let pcm_v = arch::phys_to_virt(pcm_phys) as *mut u16;
+    for i in 0..128usize {
+        let s: i16 = if (i & 1) == 0 { 0x4000 } else { -0x4000 };
+        unsafe { core::ptr::write_volatile(pcm_v.add(i), s as u16) };
+    }
+    let bdl_v = arch::phys_to_virt(base_phys) as *mut u8;
+    unsafe {
+        core::ptr::write_volatile(bdl_v as *mut u64, pcm_phys);
+        core::ptr::write_volatile((bdl_v as *mut u32).add(2), 256u32);
+        core::ptr::write_volatile((bdl_v as *mut u32).add(3), 0u32);
+        core::arch::x86_64::_mm_sfence();
+    }
+    let b0 = unsafe { core::ptr::read_volatile(bdl_v as *const u64) };
+    let b1 = unsafe { core::ptr::read_volatile((bdl_v as *const u32).add(2)) };
+    info!("[test-hda-dma] BDL@phys={:#x} wrote addr={:#x} len={} (HHDM readback)", base_phys, b0, b1);
+
+    // 4. codec cad0 node2 绑流 tag1 + 格式 0x11（立即命令 IC）。
+    let ic = |verb: u32, payload: u16| -> u32 {
+        let cmd: u32 = (0u32 << 28) | (2u32 << 20) | ((verb & 0xfff) << 8) | ((payload as u32 >> 8) & 0xff);
+        wr32(0x60, cmd);
+        for _ in 0..100_000 {
+            if (rd16(0x64) & 0x2) != 0 { break; }
+            core::hint::spin_loop();
+        }
+        rd32(0x64)
+    };
+    let _ = ic(0x706, 1u16 << 4);
+    let _ = ic(0x200, 0x0011);
+
+    // 5. OUT 流 SDO0 (base 0x100)：SRST -> 编程 -> 清 SRST -> RUN。
+    const BASE: u64 = 0x100;
+    wr32(BASE + 0x00, 1);
+    for _ in 0..100_000 { core::hint::spin_loop(); }
+    wr32(BASE + 0x08, 256);
+    wr16(BASE + 0x0c, 0);
+    wr16(BASE + 0x12, 0x0011);
+    wr32(BASE + 0x18, (base_phys & 0xffff_ffff) as u32);
+    wr32(BASE + 0x1c, (base_phys >> 32) as u32);
+    wr32(BASE + 0x00, 0);
+    info!("[test-hda-dma] pre-RUN BDLPL={:#010x}", rd32(BASE + 0x18));
+    for _ in 0..1000 { core::hint::spin_loop(); }
+    wr32(BASE + 0x00, (1u32 << 20) | 0x2);
+    info!("[test-hda-dma] RUN written; ctl={:#010x}", rd32(BASE + 0x00));
+
+    // 6. 停留让 codec 拉取，读 LPIB。
+    for _ in 0..3_000_000 { core::hint::spin_loop(); }
+    info!("[test-hda-dma] after spin: LPIB={} (0 => QEMU 未取到数据)", rd32(BASE + 0x04));
+    info!("[test-hda-dma] DONE (kernel-written BDL; 看 QEMU debug 的 bdl/0 行)");
+
+    wr32(BASE + 0x00, 0);
+    mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(base_phys));
+    mm::deallocate_frame(arch::PhysFrame::from_paddr_raw(pcm_phys));
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+}
+
+
 
