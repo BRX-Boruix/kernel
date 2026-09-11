@@ -1163,7 +1163,7 @@ mod tests {
         // 未附加 → 如实失败。
         assert_eq!(node.write_at(0, &[0xABu8; 64]), Err(Error::NotSupported));
         // 附加 → 写入必须成功且落进 ring。
-        node.ring().set_attached(true);
+        assert_eq!(node.ring().attach(4242), Ok(()));
         let pcm = [0xABu8; 64];
         assert_eq!(node.write_at(0, &pcm), Ok(64));
         assert_eq!(node.ring().used(), 64);
@@ -1199,7 +1199,7 @@ mod tests {
     #[test]
     fn test_audio_dsp_backpressure() {
         let node = DspNode::with_capacity(8);
-        node.ring().set_attached(true);
+        assert_eq!(node.ring().attach(4242), Ok(()));
         assert_eq!(node.write_at(0, &[1u8; 8]), Ok(8));
         assert_eq!(node.ring().free(), 0);
         assert_eq!(
@@ -1239,7 +1239,7 @@ mod tests {
         assert_eq!(buf, [0u8; 16]);
 
         // 附加后：同样的空读必须计入欠载。
-        node.ring().set_attached(true);
+        assert_eq!(node.ring().attach(4242), Ok(()));
         assert_eq!(node.read_at(0, &mut buf), Err(Error::WouldBlock));
         assert_eq!(node.read_at(0, &mut buf), Err(Error::WouldBlock));
         assert_eq!(node.ring().underruns(), 2);
@@ -1249,4 +1249,98 @@ mod tests {
         assert_eq!(node.read_at(0, &mut buf), Ok(4));
         assert_eq!(node.ring().underruns(), 2, "successful read is not an underrun");
     }
+
+    /// A2 消费者注册表：独占attach + 属主校验 + 退出清理（TDD 先行）。
+    ///
+    /// **S21 并发语义**：注册表是**独占单槽**——同一时刻只允许一个音频
+    /// 驱动消费 PCM（plan §3.6）。并发第二个 attach 得到 `Busy`（EBUSY：
+    /// 结构性占用，重试不会成功），而不是把第一个顶掉。
+    #[test]
+    fn test_audio_consumer_registry() {
+        let ring = AudioRing::with_capacity(64);
+
+        // 初始无消费者。
+        assert_eq!(ring.consumer(), None);
+        assert!(!ring.is_attached());
+
+        // 首次 attach 成功，且立刻反映为已附加。
+        assert_eq!(ring.attach(7), Ok(()));
+        assert_eq!(ring.consumer(), Some(7));
+        assert!(ring.is_attached());
+
+        // 独占：同一 pid 重复 attach 亦被拒（幂等不是这里的语义）。
+        assert_eq!(ring.attach(7), Err(Error::Busy));
+        // 独占：另一个 pid attach 被拒，绝不抢占。
+        assert_eq!(ring.attach(8), Err(Error::Busy));
+        // 二者都未改变属主。
+        assert_eq!(ring.consumer(), Some(7));
+
+        // 属主校验：非属主 detach 被如实拒绝。
+        assert_eq!(ring.detach(8), Err(Error::PermissionDenied));
+        assert_eq!(ring.consumer(), Some(7), "failed detach must not clear owner");
+
+        // 属主 detach 成功，槽位释放。
+        assert_eq!(ring.detach(7), Ok(()));
+        assert_eq!(ring.consumer(), None);
+        assert!(!ring.is_attached());
+
+        // 释放后新消费者可以 attach。
+        assert_eq!(ring.attach(8), Ok(()));
+        assert_eq!(ring.consumer(), Some(8));
+
+        // 退出清理：detach_any 幂等，非属主调用不报错（进程正在死亡）。
+        ring.detach_any(999);
+        assert_eq!(ring.consumer(), Some(8), "detach_any by non-owner must be a no-op");
+        ring.detach_any(8);
+        assert_eq!(ring.consumer(), None);
+        ring.detach_any(8);
+        assert_eq!(ring.consumer(), None, "detach_any must be idempotent");
+    }
+
+    /// A2 attach/detach 必须与 `is_attached` 的写路径门禁**同源**。
+    ///
+    /// 即：注册表状态就是写门禁依据——不存在"注册表说没人、写门禁说有人"
+    /// 的分裂（S15 单点定义；历史上分裂的两份状态是伪数据的温床）。
+    #[test]
+    fn test_audio_attach_gates_write_path() {
+        let node = DspNode::with_capacity(64);
+        // 未 attach：写入如实失败。
+        assert_eq!(node.write_at(0, &[1u8; 8]), Err(Error::NotSupported));
+        // attach 后：写入成功。
+        assert_eq!(node.ring().attach(42), Ok(()));
+        assert_eq!(node.write_at(0, &[1u8; 8]), Ok(8));
+        // detach 后：写入重新失败（证明门禁读的是注册表本身）。
+        assert_eq!(node.ring().detach(42), Ok(()));
+        assert_eq!(node.write_at(0, &[1u8; 8]), Err(Error::NotSupported));
+        // 数据未因 detach 被丢弃（buf 里的 8 字节仍在 ring，水位不变）。
+        assert_eq!(node.ring().used(), 8);
+    }
+
+    /// A2 status 的 consumer 字段必须是**真实**属主，且随 attach/detach 变化。
+    #[test]
+    fn test_audio_status_consumer_field() {
+        let node = DspNode::with_capacity(64);
+        let mut buf = [0u8; 512];
+        let read_status = |n: &DspNode, b: &mut [u8; 512]| -> alloc::string::String {
+            let st = n.lookup("status").unwrap();
+            let k = st.read_at(0, b).unwrap();
+            alloc::string::String::from(core::str::from_utf8(&b[..k]).unwrap())
+        };
+        // 无消费者 → JSON null（不是 0，不是 -1：0 是合法 pid）。
+        let s0 = read_status(&node, &mut buf);
+        assert!(s0.contains(r#""consumer":null"#), "no consumer must be null: {s0}");
+        assert!(s0.contains(r#""attached":false"#), "{s0}");
+
+        // 有消费者 → 真实 pid。
+        assert_eq!(node.ring().attach(1234), Ok(()));
+        let s1 = read_status(&node, &mut buf);
+        assert!(s1.contains(r#""consumer":1234"#), "must disclose real owner pid: {s1}");
+        assert!(s1.contains(r#""attached":true"#), "{s1}");
+
+        // detach 后回到 null。
+        assert_eq!(node.ring().detach(1234), Ok(()));
+        let s2 = read_status(&node, &mut buf);
+        assert!(s2.contains(r#""consumer":null"#), "{s2}");
+    }
 }
+

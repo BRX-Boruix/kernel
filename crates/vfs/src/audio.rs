@@ -19,7 +19,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU32, AtomicUsize, Ordering};
 use klib::error::Error;
 use klib::json::{JsonWriter, VecTarget};
 
@@ -40,6 +40,12 @@ pub const AUDIO_CHANNELS_STEREO: &str = "2";
 /// 支持的采样率文本（Hz）。
 pub const AUDIO_RATE_48000: &str = "48000";
 
+/// 消费者注册槽的空值哨兵（无消费者）。
+///
+/// **S19 论证**：pid 是进程槽表下标，容量远小于 2^32，恒可无损装入 u32；
+/// `u32::MAX` 与任何合法 pid 不相交（同 `KBD_WAITER`/`EVENT_WAITER` 的哨兵
+/// 约定，`scheduler.rs:1284`/`:1439`）。
+pub const NO_CONSUMER: u32 = u32::MAX;
 /// 单生产者单消费者（SPSC）环形字节缓冲。
 ///
 /// **S21 并发显式化**：
@@ -56,8 +62,12 @@ pub struct AudioRing {
     capacity: usize,
     write_pos: AtomicUsize,
     read_pos: AtomicUsize,
-    /// 是否已有消费者附加。
-    attached: AtomicBool,
+    /// 消费者注册槽：持有 pid，`NO_CONSUMER` 表示空闲。
+    ///
+    /// **S15 单点定义**：这是"谁在消费"的**唯一**真相来源——写路径门禁
+    /// （`is_attached`）、`status` 字段、syscall 层权限校验全部读它，
+    /// 不存在第二份状态可与之分裂。
+    consumer: AtomicU32,
     /// 欠载计数（消费者取不到数据即 +1；如实披露，不隐藏）。
     underruns: AtomicU64,
 }
@@ -78,7 +88,7 @@ impl AudioRing {
             capacity,
             write_pos: AtomicUsize::new(0),
             read_pos: AtomicUsize::new(0),
-            attached: AtomicBool::new(false),
+            consumer: AtomicU32::new(NO_CONSUMER),
             underruns: AtomicU64::new(0),
         }
     }
@@ -99,12 +109,74 @@ impl AudioRing {
         self.capacity
     }
 
-    pub fn is_attached(&self) -> bool {
-        self.attached.load(Ordering::Acquire)
+    /// 当前消费者 pid；无消费者返回 `None`。
+    pub fn consumer(&self) -> Option<usize> {
+        match self.consumer.load(Ordering::Acquire) {
+            NO_CONSUMER => None,
+            pid => Some(pid as usize),
+        }
     }
 
-    pub fn set_attached(&self, v: bool) {
-        self.attached.store(v, Ordering::Release);
+    /// 是否已有消费者附加。写路径门禁与 `status` 均以此为准（S15 单点）。
+    pub fn is_attached(&self) -> bool {
+        self.consumer.load(Ordering::Acquire) != NO_CONSUMER
+    }
+
+    /// 注册为消费者（**独占**，plan §3.6）。
+    ///
+    /// **S21 并发论证**：CAS 从 `NO_CONSUMER` 到 `pid` 是原子的，故两个并发
+    /// attach **必有且仅有一个**成功，失败方得到 `Busy`——不存在"都以为自己是
+    /// 消费者"的窗口，也不存在把已注册者静默顶掉的可能。
+    ///
+    /// 语义选择（S17 理由）：同一 pid 重复 attach **也返回 `Busy`**，不做幂等。
+    /// 理由：重复 attach 意味着调用方状态机有误（已持有却再申请），静默成功会
+    /// 掩盖该错误；`Busy` 让问题在调用点可见。
+    pub fn attach(&self, pid: usize) -> Result<(), Error> {
+        // S19：pid 必须能无损装入 u32，且不得撞上哨兵。
+        if pid >= NO_CONSUMER as usize {
+            return Err(Error::InvalidParam);
+        }
+        self.consumer
+            .compare_exchange(
+                NO_CONSUMER,
+                pid as u32,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| Error::Busy)
+    }
+
+    /// 注销消费者，**仅属主可注销**。
+    ///
+    /// **S21**：CAS 只在槽内仍是 `pid` 时清空，故非属主调用无法清除他人注册
+    /// （返回 `PermissionDenied` 且槽位不变）。
+    pub fn detach(&self, pid: usize) -> Result<(), Error> {
+        if pid >= NO_CONSUMER as usize {
+            return Err(Error::InvalidParam);
+        }
+        self.consumer
+            .compare_exchange(pid as u32, NO_CONSUMER, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| Error::PermissionDenied)
+    }
+
+    /// 进程退出时的无条件清理：若槽内正是 `pid` 则清空，否则**静默不动**。
+    ///
+    /// **S18 资源释放**：进程死亡必须释放其占用的消费者槽，否则音频节点会被
+    /// 一个不存在的进程永久独占（拒绝所有后续驱动）。
+    /// **幂等**：可重复调用；对非属主调用是无操作而非错误——进程正在消亡，
+    /// 此时报错没有可交付的接收方。
+    pub fn detach_any(&self, pid: usize) {
+        if pid >= NO_CONSUMER as usize {
+            return;
+        }
+        let _ = self.consumer.compare_exchange(
+            pid as u32,
+            NO_CONSUMER,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     pub fn underruns(&self) -> u64 {
@@ -279,6 +351,16 @@ impl DspNode {
             let mut w = JsonWriter::new(&mut target);
             if let Ok(mut obj) = w.start_object() {
                 let _ = obj.field_bool("attached", ring.is_attached());
+                // A2：consumer 现在是**真实**数据（A1 时无消费者身份概念，
+                // 故当时如实省略而非编造占位值；见 unittodo9 A1.4）。
+                match ring.consumer() {
+                    Some(pid) => {
+                        let _ = obj.field_u64("consumer", pid as u64);
+                    }
+                    None => {
+                        let _ = obj.field_null("consumer");
+                    }
+                }
                 let _ = obj.field_u64("capacity", ring.capacity() as u64);
                 let _ = obj.field_u64("used", ring.used() as u64);
                 let _ = obj.field_u64("free", ring.free() as u64);
