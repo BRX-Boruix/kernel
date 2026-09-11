@@ -6171,6 +6171,127 @@ pub fn test_huge_page_bench_r43() {
 
 
 /// M7.2 & M8.1：验证 Platform 平台基础驱动接入与 DriverHub 智能竞标打分（Early 串口、PS/2 键盘、CMOS RTC、伪设备、PCI Bidding）。
+
+// ---------- A2: 音频管道 syscall 集成测试（plan_audio_vfs.md 批次二）----------
+
+/// A2 出口条件：AUDIO 域四动词全链路 + 节点自述 + 退出清理。
+///
+/// **S29**：这不是"函数能编译"级别的检查——每一步都经真实挂载表解析、
+/// 真实 ring 状态、真实节点 trait 方法，与生产路径同源。
+///
+/// 覆盖（unittodo9 A2.6）：attach 独占性、detach 属主校验、commit 越界、
+/// blocks_when_empty 节点自述、退出清理（S18）、无消费者时的诚实性红线。
+pub fn test_audio_pipe_a2() {
+    use vfs::inode::INode;
+    info!("[test-audio-a2] === A2: audio pipe syscall domain ===");
+
+    // ---- 1. 节点经真实挂载表可达，且如实自述为音频节点 ----
+    let root = crate::vfs_init::root();
+    let node = root
+        .resolve("/devices/audio/dsp", true)
+        .expect("audio dsp node must be reachable via the real mount table");
+    info!("[test-audio-a2] node resolved, type={:?}", node.node_type());
+    let ring = node
+        .as_audio_ring()
+        .expect("dsp node must declare its audio ring (S15)");
+    info!(
+        "[test-audio-a2] ring capacity={} used={} free={}",
+        ring.capacity(),
+        ring.used(),
+        ring.free()
+    );
+    assert_eq!(ring.capacity(), vfs::audio::AUDIO_RING_CAPACITY);
+
+    // ---- 2. 无消费者：写入必须如实失败（S06/S09 红线）----
+    assert_eq!(ring.consumer(), None, "fresh boot: no consumer attached");
+    assert_eq!(
+        node.write_at(0, &[0u8; 32]),
+        Err(klib::error::Error::NotSupported),
+        "RED LINE: write with no consumer must fail, never be silently dropped"
+    );
+    assert!(
+        !node.blocks_when_empty(),
+        "no consumer: empty read is nobody-will-produce, must not sleep"
+    );
+
+    // ---- 3. attach：独占性 + 属主语义（S21）----
+    let other = 4093usize;
+    assert!(ring.attach(other).is_ok(), "first attach must succeed");
+    assert_eq!(ring.consumer(), Some(other));
+    info!("[test-audio-a2] attached pid={}", other);
+
+    assert_eq!(
+        ring.attach(other + 1),
+        Err(klib::error::Error::Busy),
+        "second consumer must get EBUSY, never steal the slot"
+    );
+    assert_eq!(
+        ring.consumer(),
+        Some(other),
+        "failed attach must not disturb the existing owner"
+    );
+
+    // ---- 4. 有消费者：写入真正落进 ring，空读语义翻转 ----
+    assert!(
+        node.blocks_when_empty(),
+        "with a consumer attached, empty read IS data-is-coming: must sleep"
+    );
+    let pcm: [u8; 64] = core::array::from_fn(|i| (i as u8).wrapping_mul(7));
+    let wrote = node
+        .write_at(0, &pcm)
+        .expect("write with an attached consumer must succeed");
+    assert_eq!(wrote, 64);
+    assert_eq!(ring.used(), 64, "written PCM must actually land in the ring");
+    info!("[test-audio-a2] wrote {} bytes, ring used={}", wrote, ring.used());
+
+    // ---- 5. 两阶段取数：peek 不推进，commit 才推进（plan 3.2）----
+    let mut out = [0u8; 64];
+    let got = node.read_at(0, &mut out).expect("read must return written PCM");
+    assert_eq!(got, 64);
+    assert_eq!(out, pcm, "read-back must be byte-identical");
+    assert_eq!(ring.used(), 64, "read must NOT advance the read pointer");
+    assert_eq!(ring.commit(64), Ok(()));
+    assert_eq!(ring.used(), 0);
+    info!("[test-audio-a2] two-phase verified: peek kept data, commit released it");
+
+    // ---- 6. commit 越界如实拒绝（S19），绝不静默截断 ----
+    assert_eq!(
+        ring.commit(1),
+        Err(klib::error::Error::InvalidParam),
+        "committing more than buffered must fail loudly, never truncate silently"
+    );
+
+    // ---- 7. detach 属主校验：非属主被拒且槽位不变 ----
+    assert_eq!(
+        ring.detach(other + 1),
+        Err(klib::error::Error::PermissionDenied),
+        "non-owner detach must be refused"
+    );
+    assert_eq!(ring.consumer(), Some(other), "refused detach must not clear owner");
+
+    // ---- 8. 退出清理（S18）：死进程不得永久独占音频节点 ----
+    vfs::audio::audio_on_process_exit(other);
+    assert_eq!(
+        ring.consumer(),
+        None,
+        "process exit MUST release the slot, else the node is owned by a dead pid"
+    );
+    assert!(ring.attach(other).is_ok(), "slot must be reusable after cleanup");
+    info!("[test-audio-a2] exit cleanup released the slot and it is reusable");
+
+    // ---- 9. 对非属主的退出清理是幂等无操作 ----
+    vfs::audio::audio_on_process_exit(other + 99);
+    assert_eq!(
+        ring.consumer(),
+        Some(other),
+        "exit cleanup for a non-owner must be a no-op, not a wipe"
+    );
+    vfs::audio::audio_on_process_exit(other);
+    vfs::audio::audio_on_process_exit(other);
+    assert_eq!(ring.consumer(), None);
+
+    info!("[test-audio-a2] PASS: slot semantics, two-phase IO, exit cleanup verified");
+}
 pub fn test_driver_hub_m72() {
     use driver::DriverHub;
 

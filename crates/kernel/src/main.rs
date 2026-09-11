@@ -596,6 +596,9 @@ unsafe fn kmain_body() -> ! {
     tests::test_bench_ds32(); // D-S32: cycle-counter + page-cache hit-rate/throughput benchmark
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_hub_m72();
+    // A2：音频管道 syscall 域（消费者注册表/两阶段 IO/退出清理）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_audio_pipe_a2();
     // 阶段一：设备中断投递基础设施（IRQ 归属表/闩锁/冲突/PCI irq_line 捕获）。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_irq_owner();
