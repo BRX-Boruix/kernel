@@ -9847,6 +9847,138 @@ pub fn test_driver_uio_privilege_gate() {
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-driver-uio-gate] PASS");
 }
+
+/// `AUDIO_ATTACH` 特权门禁（批次三补上）：仅 `Privilege::System` 可 attach。
+///
+/// **为何需要独立的用户态测试**：内核启动期测试运行在 init 线程上，而 init 由
+/// 内核以 `ProcessIdentity::system(1)` 引导（main.rs），故启动期**天然是 System**——
+/// 「非 System 被拒」这条路径在启动期永远不会被走到。若只做启动期测试，门禁
+/// 写了等于没验证（S29 生产路径验证）。本测试通过 `set_identity` 显式构造
+/// User 身份，才真正覆盖拒绝分支。
+///
+/// 与 `test_driver_uio_privilege_gate` 同构：真实 syscall 入口 + 伪当前进程。
+/// 门禁在 syscall 层、解析节点与内存之前即拒绝，故 User 身份无需合法设备即可证拒绝；
+/// System 身份应越过门禁、落到后续逻辑（此处结果为「已 attach」或 `Busy`，
+/// 总之**不是** `PermissionDenied`）。
+pub fn test_audio_attach_privilege_gate() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Process, ProcessIdentity};
+
+    info!("[test-audio-attach-gate] === A3: AUDIO_ATTACH privilege gate ====");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3,
+            a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0,
+            aux_pid: 0,
+        }
+    }
+
+    // PermissionDenied -> EACCES(13)，同 klib 映射，负 errno 编码。
+    const EACCES_U64: u64 = (-13i64) as u64;
+
+    // 前置断言：本测试依赖「默认身份是 User」这一事实。若将来默认值改了，
+    // 下面的「拒绝」断言会变成假阳性，故在此显式钉死前提（S19 边界）。
+    assert_eq!(
+        ProcessIdentity::default_user().privilege,
+        task::Privilege::User,
+        "test premise: default identity must be User"
+    );
+
+    // 伪当前进程：构造方式与 driver 门禁测试一致，但**pid 必须合法**。
+    //
+    // 【实现期踩坑，留档】初版照抄了别处 `Process::new(usize::MAX, ..)` 的写法，
+    // 结果步骤 3（System 放行）以 `InvalidParam` 失败。原因**不在门禁**：
+    // `AudioRing::attach` 会拒绝 `pid >= NO_CONSUMER`(u32::MAX)，因为该哨兵
+    // 代表"无消费者"、与任何合法 pid 不相交（audio.rs 的 S19 论证）。
+    // `usize::MAX` 恰好 `>= u32::MAX`，于是被 ring 合法拒掉。
+    // 其它测试用 pid 只做内存/调度断言，不校验 pid 值域，故不受影响；
+    // 本测试会把它注册进 ring，必须用一个**真实合法**的 pid。
+    // 取 999（同 test_perm_system_only 惯例）：合法且不撞真实进程槽。
+    const TEST_PID: usize = 999;
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(TEST_PID, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    // 钉死前提：pid 合法（否则步骤 3 测的就变成 pid 值域校验，而非权限门禁）。
+    assert_eq!(
+        task::current_proc_mut().expect("proc").pid(),
+        TEST_PID,
+        "test premise: fake process must carry a valid (non-sentinel) pid"
+    );
+
+    // 1. User 身份 attach -> PermissionDenied（门禁短路径，不触碰设备/内存）。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity::default_user());
+    }
+    let mut r1 = frame(crate::syscall::SYS_AUDIO_ATTACH, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut r1));
+    assert_eq!(
+        r1.result, EACCES_U64,
+        "User AUDIO_ATTACH must be PermissionDenied, got {:#x}", r1.result
+    );
+    info!("[test-audio-attach-gate] User AUDIO_ATTACH -> PermissionDenied OK");
+
+    // 2. 关键：User 被拒后**槽位必须仍是空的**。
+    //    只断言返回码不够——若实现写成了「先占槽再检查权限」，返回码同样是
+    //    EACCES，但槽位已被污染，真正的驱动会拿到 EBUSY。故直接查真实状态。
+    // 经**真实挂载表**解析（与 syscall 层 audio_dsp_node 同一路径，S15 单一
+    // 事实源），再走 vfs 的显式下行转换——不做类型臆测。
+    let ring = {
+        let node = crate::vfs_init::root()
+            .resolve("/devices/audio/dsp", true)
+            .expect("audio dsp node must exist");
+        vfs::audio::as_audio_node(&node).expect("dsp node must be an audio node")
+    };
+    assert!(
+        ring.consumer().is_none(),
+        "denied attach must NOT occupy the consumer slot (got {:?})",
+        ring.consumer()
+    );
+    info!("[test-audio-attach-gate] denied attach left the consumer slot free OK");
+
+    // 3. System 身份 attach：越过门禁，真实占用槽位。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity::system(1));
+    }
+    let mut r2 = frame(crate::syscall::SYS_AUDIO_ATTACH, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut r2));
+    assert_ne!(
+        r2.result, EACCES_U64,
+        "System AUDIO_ATTACH must pass the gate, got {:#x}", r2.result
+    );
+    assert_eq!(r2.result, 0, "System AUDIO_ATTACH should succeed, got {:#x}", r2.result);
+    let claimed = ring.consumer();
+    assert!(claimed.is_some(), "System attach must actually claim the slot");
+    info!("[test-audio-attach-gate] System AUDIO_ATTACH claimed slot for pid {:?} OK", claimed);
+
+    // 4. 清理：释放槽位，避免污染后续测试（单槽是全局资源）。
+    let _ = ring.detach(claimed.expect("consumer pid"));
+    assert!(ring.consumer().is_none(), "cleanup must release the slot");
+
+    // 5. 复位身份并拆掉伪当前进程。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity::default_user());
+    }
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-audio-attach-gate] PASS");
+}
 /// R6 flock 冲突矩阵（ADR-014 承诺 / todo.md D-VFS1-R6）。
 pub fn test_flock_matrix() {
     use vfs::flock::{flock_lock, flock_release_all_for_owner, flock_unlock};

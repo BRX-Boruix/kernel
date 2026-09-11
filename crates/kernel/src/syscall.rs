@@ -1382,8 +1382,34 @@ fn audio_dsp_node() -> Result<alloc::sync::Arc<dyn vfs::inode::INode>, Error> {
 /// 而非调用方传入的 id——不提供"替别人 attach"的能力（S12：不开特权后门）。
 ///
 /// 已有消费者 → `Busy`(EBUSY)：结构性占用，重试不会成功（区别于 EAGAIN）。
+///
+/// **特权门禁（本批次补上，与 `driver_register`/`driver_claim` 同口径）**：
+///
+/// `ATTACH` 是 AUDIO 域里**唯一授予独占权**的动词——`FETCH`/`COMMIT` 都先要求
+/// `is_attached()`，即"先拿到这个槽"才谈得上其它。没有门禁时，任意普通进程
+/// 都能：
+///   1. attach 后**永不 fetch** → DMA 断粮、音乐停摆；
+///   2. 因槽位独占而**挡住真正的驱动**（`EBUSY`）——拒绝服务；
+///   3. `detach` 是属主限定，故它会一直占着槽直到自己退出。
+/// 这三条都不是"理论风险"，而是单消费者语义的**直接推论**。
+///
+/// 与 `driver_register`/`driver_claim` 同用 [`current_is_system`]：二者都授予
+/// 对硬件资源的独占控制，权限语义应当一致，不应一个有一个没有（S13 单点）。
+///
+/// **不破坏现有调用方**：`intel-hda` / `audioe2e` 均由 init 经 `exec_path` 派生，
+/// 而 `exec_path` 走 `compute_child_identity` 的**继承分支**（原样继承调用者身份），
+/// init 本身由内核以 `ProcessIdentity::system(1)` 引导，故二者同为 `System`。
+/// 「非 System 被拒」这条路径由单测 `test_audio_attach_privilege_gate` 覆盖
+/// （内核启动期测试以 init 线程身份运行，天然是 System，无法自证拒绝分支）。
 fn sys_audio_attach(frame: &mut SyscallFrame) -> u64 {
     let _ = frame;
+    // 先做权限判定再解析节点：避免把"无权限"与"设备不存在"混为一谈，
+    // 也避免让非特权调用者从返回码差异**探测**设备是否存在（信息泄露）。
+    if !current_is_system() {
+        let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+        klib::info!("[audio] pid={} AUDIO_ATTACH denied (not Privilege::System)", pid);
+        return pack_err(Error::PermissionDenied);
+    }
     let node = match audio_dsp_node() {
         Ok(n) => n,
         Err(e) => return pack_err(e),

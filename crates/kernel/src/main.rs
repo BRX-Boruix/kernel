@@ -562,6 +562,11 @@ unsafe fn kmain_body() -> ! {
     // PRE-1 / ADR-037 决策 5：UIO driver_register/driver_claim 特权门禁（System-only）。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_uio_privilege_gate();
+    // 批次三：AUDIO_ATTACH 特权门禁（System-only，与 UIO 门禁同口径）。
+    // 必须**单独**测：启动期测试跑在 init 线程上，而 init 是 System 身份，
+    // 天然无法覆盖「非 System 被拒」这条路径（S29）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_audio_attach_privilege_gate();
     // 设备 DMA 前端探针：内核态写 BDL/PCM 起 HDA 流，隔离用户态变量。
     #[cfg(all(feature = "kernel-tests", feature = "hda-probe"))]
     tests::test_hda_device_dma_probe();
