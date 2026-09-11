@@ -524,8 +524,37 @@ impl INode for DspNode {
     ///
     /// 读指针由 [`AudioRing::commit`] 推进，以支持"取走 → 喂硬件 → 播完 →
     /// 提交"的两阶段语义（plan_audio_vfs.md §3.2 AUDIO_FETCH/AUDIO_COMMIT）。
+    /// **两种模式，与写入门的区分同源**（见 [`WriteGate`]）：
+    ///
+    /// - 输出端 `dsp`（[`WriteGate::RequireConsumer`]）：`peek` + 由 AUDIO_COMMIT
+    ///   推进读指针。这是 A2/A3 已验收的**两阶段**语义，必须保持——取走的数据
+    ///   要**先喂给硬件、播完**再提交，中途崩溃才不会把没播的音频静默丢掉。
+    ///
+    /// - 输入端 `stream/N`（[`WriteGate::Open`]）：读走即取走（peek + commit）。
+    ///   它是混音器的输入缓冲，没有硬件、没有"播完"的概念，两阶段毫无意义。
+    ///
+    /// **本条修的是一个真实缺陷（批次四 M2 发现）**：此前 `read_at` 对两者
+    /// 一律 `peek`，而推进读指针的 `commit` 只经 AUDIO_COMMIT 抵达，该路径
+    /// **硬编码 `/devices/audio/dsp`**（syscall.rs `AUDIO_DSP_PATH`）——
+    /// 于是 `stream/N` **根本没有任何途径**推进读指针。
+    ///
+    /// 后果隐蔽而严重：audiod 每轮读到的是**同一批**数据，输出成了"一段缓冲
+    /// 无限重复"，不是流式音频；却因为重复得连续而听不出异常。M1 的逐字节
+    /// 校验**照样通过**（peek 返回的正是写进去的那些字节），直到 M2 引入
+    /// 第二路与断开场景，`live_inputs` 始终不下降才把它暴露出来。
+    ///
+    /// 教训已固化为测试：`test_audio_stream_read_consumes_data` 断言读后
+    /// `used()==0`，`test_audio_dsp_read_still_peeks_until_commit` 防反向
+    /// 回归（把所有读都改成消费会破坏驱动契约）。
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         let n = self.ring.peek(buf);
+        if n > 0 && self.gate == WriteGate::Open {
+            // 输入端：读走即取走。commit 在 peek **之后**、返回之前完成，
+            // 故调用方拿到的就是被消费掉的那一段（原子性对调用方可见）。
+            // commit 失败属内部不变量破裂：如实上抛，不假装读成功。
+            self.ring.commit(n)?;
+            return Ok(n);
+        }
         if n == 0 {
             // S20：无数据即如实 WouldBlock，由 syscall 层决定是否阻塞。
             //

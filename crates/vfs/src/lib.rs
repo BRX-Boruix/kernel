@@ -1244,7 +1244,80 @@ mod tests {
         assert_eq!(stream.read_at(0, &mut out), Ok(16));
         assert_eq!(out, [0x11u8; 16], "rejected write must not overwrite ring data");
     }
-    fn test_audio_dsp_backpressure() {
+    
+    /// The read path of an INPUT stream must CONSUME, not just peek.
+    ///
+    /// Regression test for a defect found while validating batch-4 M2. `read_at`
+    /// originally called `ring.peek` unconditionally, which never advances the read
+    /// pointer. The consumer of a dsp node commits explicitly through the AUDIO
+    /// syscall, so peek is correct there -- but that path is hardcoded to
+    /// /devices/audio/dsp, leaving stream/N with no way to commit at all.
+    ///
+    /// The consequence was severe and nearly invisible: audiod read the SAME bytes
+    /// every round, so its output was one frozen buffer repeated forever rather than
+    /// streaming audio. It still sounded continuous, and the M1 byte-for-byte check
+    /// passed precisely because a peek returns the very bytes written. Only the
+    /// two-stream scenario exposed it, as `live_inputs` never dropped.
+    ///
+    /// Marked with the same WriteGate that governs writes: the input end consumes on
+    /// read, the output end keeps its two-phase peek/commit contract.
+    #[test]
+    fn test_audio_stream_read_consumes_data() {
+        let stream = DspNode::stream_with_capacity(256);
+        let mut wbuf = [0u8; 64];
+        for (i, b) in wbuf.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        stream.write_at(0, &wbuf).expect("write must be accepted");
+        assert_eq!(stream.as_audio_ring().unwrap().used(), 64);
+
+        // First read gets the data...
+        let mut rbuf = [0u8; 64];
+        let n = stream.read_at(0, &mut rbuf).expect("first read");
+        assert_eq!(n, 64);
+        assert_eq!(rbuf, wbuf, "first read must return what was written");
+
+        // ...and must have CONSUMED it: the ring is now empty.
+        assert_eq!(
+            stream.as_audio_ring().unwrap().used(),
+            0,
+            "read on an input stream must advance the read pointer (consume)"
+        );
+
+        // A second read therefore finds nothing, rather than replaying the same
+        // bytes forever. This is the assertion that would have caught the defect.
+        assert!(
+            stream.read_at(0, &mut rbuf).is_err(),
+            "second read must find an empty ring, not replay stale data"
+        );
+    }
+
+    /// The OUTPUT end must keep its two-phase peek/commit semantics (A2/A3).
+    ///
+    /// This is the control for the test above: making every read consume would break
+    /// the driver contract, where fetched data must be delivered to hardware BEFORE
+    /// being committed, so a crash mid-transfer does not silently discard audio.
+    #[test]
+    fn test_audio_dsp_read_still_peeks_until_commit() {
+        let dsp = DspNode::with_capacity(256);
+        dsp.as_audio_ring().unwrap().attach(7).unwrap();
+        let wbuf = [0x5au8; 32];
+        dsp.write_at(0, &wbuf).expect("attached write must be accepted");
+
+        let mut rbuf = [0u8; 32];
+        assert_eq!(dsp.read_at(0, &mut rbuf).unwrap(), 32);
+        // Still present: the output end requires an explicit commit.
+        assert_eq!(
+            dsp.as_audio_ring().unwrap().used(),
+            32,
+            "dsp read must NOT consume; two-phase contract requires commit"
+        );
+
+        // After an explicit commit the data is gone.
+        dsp.as_audio_ring().unwrap().commit(32).unwrap();
+        assert_eq!(dsp.as_audio_ring().unwrap().used(), 0);
+    }
+fn test_audio_dsp_backpressure() {
         let node = DspNode::with_capacity(8);
         assert_eq!(node.ring().attach(4242), Ok(()));
         assert_eq!(node.write_at(0, &[1u8; 8]), Ok(8));
