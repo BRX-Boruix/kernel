@@ -91,6 +91,35 @@ pub fn audio_on_process_exit(pid: usize) {
     }
 }
 
+
+/// 数据到达回调槽（`Once`：系统只有一个音频节点）。
+///
+/// **为何用回调而非直接调 `task::wake_audio`**：vfs 是 task 的**下游**
+/// （task 依赖 vfs，见 task/Cargo.toml），vfs 反向调用 task 会形成循环依赖。
+/// 回调把"什么时候唤醒"（vfs 知道：数据刚落进 ring）与"怎么唤醒"
+/// （task 知道：置 Ready 入就绪队列）解耦——两侧各自掌握自己那份知识。
+///
+/// **未安装时的行为**：静默不唤醒。这不丢数据（数据已在 ring 里），只是读者
+/// 要等自己的有限超时。内核启动时必然安装（vfs_init），故生产路径上恒有。
+static AUDIO_WAKE_HOOK: Once<fn()> = Once::new();
+
+/// 安装数据到达回调（由内核启动期调用一次）。
+///
+/// `call_once`：重复安装不覆盖（与 AUDIO_RING_SLOT 同规约）。
+pub fn set_wake_hook(hook: fn()) {
+    AUDIO_WAKE_HOOK.call_once(|| hook);
+}
+
+/// 通知"PCM 已到达"，唤醒可能正在等待的读者。
+///
+/// **必须在数据**真正进入 ring **之后**调用**——顺序颠倒会让被唤醒的读者
+/// 复检时仍见空 ring，于是再次入睡（本次唤醒白费，且若写者不再写就永久挂起）。
+fn notify_data_ready() {
+    if let Some(hook) = AUDIO_WAKE_HOOK.get() {
+        hook();
+    }
+}
+
 /// 单生产者单消费者（SPSC）环形字节缓冲。
 ///
 /// **S21 并发显式化**：
@@ -468,6 +497,12 @@ impl INode for DspNode {
             // 分支 3：ring 满 → WouldBlock（EAGAIN 语义），绝不静默丢弃。
             return Err(Error::WouldBlock);
         }
+        // 数据**已**进入 ring，此刻才通知等待者醒来取数（顺序不可颠倒：若先
+        // 唤醒再入队，被唤醒的读者复检时仍见空 ring，会再次入睡而白等一场）。
+        //
+        // 这一行是 audio 阻塞往返的**闭环点**——没有它，block_for_audio 的读者
+        // 永远等不到唤醒（本缺陷由 A2 e2e 设计阶段自查发现，非测试捕获）。
+        notify_data_ready();
         Ok(n)
     }
 

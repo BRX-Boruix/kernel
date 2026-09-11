@@ -1331,11 +1331,22 @@ fn audio_fetch_blocking(frame: &mut SyscallFrame, inode: &alloc::sync::Arc<dyn v
     // clear_audio_waiter_if），否则本次 CAS 失败且 wake_audio 会误读本 pid。
     task::clear_audio_waiter_if(pid);
     let probe = inode.clone();
+    // 诊断日志刻意保留两条（"进入阻塞"与"真的切走"）：音频阻塞是本批次唯一
+    // 无法在启动期测试中覆盖的路径，留下运行期可见痕迹使 e2e 能区分
+    // "确实入睡后被唤醒"与"根本没走到阻塞"——二者在结果上都是"拿到数据"，
+    // 但只有前者验证了阻塞原语。日志量：每次空读两行，稳态下不在热路径。
+    klib::info!("[audio] pid={} fetch blocking on empty ring", pid);
     match task::block_for_audio(arch_frame(frame), move || !audio_ring_empty(&probe)) {
-        task::SwitchOutcome::Switched => DispatchResult::Switched,
+        task::SwitchOutcome::Switched => {
+            klib::info!("[audio] pid={} switched out (asleep)", pid);
+            DispatchResult::Switched
+        }
         // 未入睡（数据已到 / 已有并发等待者）：如实返回 WouldBlock 让用户态
         // 重试。绝不在此伪造数据。
-        task::SwitchOutcome::NotSwitched => done(pack_err(Error::WouldBlock)),
+        task::SwitchOutcome::NotSwitched => {
+            // 数据已在复检时就绪 / 已有并发等待者 → 如实 EAGAIN 让调用方重试。
+            done(pack_err(Error::WouldBlock))
+        }
     }
 }
 

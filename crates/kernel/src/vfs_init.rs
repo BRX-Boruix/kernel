@@ -962,6 +962,11 @@ fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
     // 挂载表做一次端到端断言，把"节点的确可达且语义正确"变成启动期
     // 的可见证据，而非依赖人工 shell 验证。
     audio_boot_selfcheck(mount_table);
+
+    // A2：安装音频数据到达回调——把"数据落进 ring"（vfs 知道）与"唤醒等待者"
+    // （task 知道）接起来。vfs 是 task 的下游，不能反向调用，故用回调解耦。
+    // 不装则阻塞的读者永远等不到唤醒（只剩有限超时兜底）。
+    vfs::audio::set_wake_hook(task::wake_audio);
 }
 
 /// A1 启动自检：断言 `/devices/audio/dsp` 在真实挂载表中可达且语义正确。
