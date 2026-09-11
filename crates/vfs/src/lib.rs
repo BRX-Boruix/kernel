@@ -1099,6 +1099,41 @@ mod tests {
         assert!(s.contains(r#""underruns":0"#), "must disclose underrun count: {s}");
     }
 
+
+    /// 批次五 M5：`stream/N` 接受混音器支持的输入采样率，`dsp` 仍然只接受 48000。
+    ///
+    /// 两者**必须不同**，这是本测试的重点：输入端可以带自己的采样率（audiod 会
+    /// 重采样），输出端直通 codec 且 codec 固定 48000 —— 在那里接受 44100 等于
+    /// 承诺一件内核做不到的事，而链路上不会有任何一处报错。
+    #[test]
+    fn test_audio_stream_accepts_input_rates_but_dsp_does_not() {
+        let mt = MountTable::new(Arc::new(RamFS::new()));
+        mt.mkdir("/devices", Permissions::all()).unwrap();
+        let devfs = Arc::new(DevFS::new(Arc::new(MockDeviceProvider {
+            baud: core::sync::atomic::AtomicU32::new(115200),
+        })));
+        mt.mount("/devices", devfs).unwrap();
+
+        let stream = mt.resolve("/devices/audio/stream/0/rate", true).unwrap();
+        let dsp = mt.resolve("/devices/audio/dsp/rate", true).unwrap();
+
+        // 输入端：集合中的每一项都必须被接受（否则生产者配不出该速率）。
+        for r in crate::audio::AUDIO_INPUT_RATES {
+            assert_eq!(
+                stream.write_at(0, r.as_bytes()),
+                Ok(r.len()),
+                "stream must accept supported input rate {r}"
+            );
+        }
+        // 集合之外仍然如实拒绝，而不是接受后按错误速度播。
+        assert_eq!(stream.write_at(0, b"96000"), Err(Error::NotSupported));
+        // 非法输入与不受支持是两种语义，不得含混。
+        assert_eq!(stream.write_at(0, b"abc"), Err(Error::InvalidParam));
+
+        // 输出端：仅 48000。44100 在这里必须被拒 —— 硬件无法兑现。
+        assert_eq!(dsp.write_at(0, b"48000"), Ok(5));
+        assert_eq!(dsp.write_at(0, b"44100"), Err(Error::NotSupported));
+    }
     /// A1 对抗测试（S30/S31）：ring 边界、回绕、溢出、拒绝路径。
     #[test]
     fn test_audio_ring_adversarial() {

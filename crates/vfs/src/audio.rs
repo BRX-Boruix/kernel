@@ -50,6 +50,15 @@ pub const AUDIO_CHANNELS_STEREO: &str = "2";
 /// 支持的采样率文本（Hz）。
 pub const AUDIO_RATE_48000: &str = "48000";
 
+/// 输入端 `stream/N` 可接受的采样率（文本形式，与属性文件一致）。
+///
+/// 必须与用户态 `audiod` 的 `SUPPORTED_INPUT_RATES` 保持同一集合。两者不一致
+/// 时生产者会收到 `NotSupported` —— 一个**可见的**拒绝，而不是被静默按错误
+/// 速度播放。这条约束是有意保留的：宁可写失败，也不要听不出原因的走音。
+///
+/// 输出端 `dsp` **不**使用本表：它直通硬件，codec 固定 48000。
+pub const AUDIO_INPUT_RATES: &[&str] = &["48000", "44100", "32000", "22050", "16000"];
+
 /// 消费者注册槽的空值哨兵（无消费者）。
 ///
 /// **S19 论证**：pid 是进程槽表下标，容量远小于 2^32，恒可无损装入 u32；
@@ -449,18 +458,35 @@ impl DspNode {
         // ---- rate 属性 ----
         // 非数字输入如实 InvalidParam（输入非法），数字但不受支持则
         // NotSupported（输入合法、实现不支持）——两者语义不同，不得含混。
+        // 可接受的采样率集合由**门禁模式**决定，而不是全局写死一个：
+        //
+        // - 输出端 `dsp`（RequireConsumer）：数据直通硬件，codec 固定 48000。
+        //   允许别的 rate 等于写下一个**内核无法兑现的承诺** —— 说 44100 实际
+        //   按 48000 播，声音变快，而链路上没有任何一处会报错。故只接受 48000。
+        //
+        // - 输入端 `stream/N`（Open）：这是混音器的**输入**，可以带自己的采样率。
+        //   批次五 M5 让 audiod 按 rate 属性重采样到总线速率，所以这里放开是
+        //   **有实现支撑**的，不是放空。集合必须与 audiod 的 `SUPPORTED_INPUT_RATES`
+        //   一致；不一致时生产者的写会被拒（而不是被静默按错误速度播放），
+        //   故不一致是**可见的**失败，不是隐性错误。
+        let allowed_rates: &[&str] = match gate {
+            WriteGate::RequireConsumer => &[AUDIO_RATE_48000],
+            WriteGate::Open => AUDIO_INPUT_RATES,
+        };
         let rate_node = DynamicFileNode::read_write(
             || {
                 let mut v = String::from(AUDIO_RATE_48000).into_bytes();
                 v.push(b'\n');
                 v
             },
-            |buf| {
+            move |buf| {
                 let s = core::str::from_utf8(buf).map_err(|_| Error::InvalidParam)?;
                 let t = s.trim();
                 // S19：解析为 u32 失败即 InvalidParam，不做 default 兜底。
                 let _n: u32 = t.parse().map_err(|_| Error::InvalidParam)?;
-                if t == AUDIO_RATE_48000 {
+                // 字符串比较而非数值比较：属性本身是文本，这样 "48000 " 与
+                // "048000" 之类的写法既不会绕过也不会被误判为合法。
+                if allowed_rates.contains(&t) {
                     Ok(buf.len())
                 } else {
                     Err(Error::NotSupported)
