@@ -1038,11 +1038,26 @@ fn audio_stream_boot_selfcheck(mount_table: &Arc<vfs::mount::MountTable>) {
                 return;
             }
         }
-        // 经 ring 的 commit 复位（DspNode 的 commit 由 syscall 层驱动，
-        // 自检直接走 vfs API 以保持内核内零 syscall 依赖）。
+        // 复位：**只有读回后仍有未提交数据时才需要显式 commit**。
+        //
+        // 这里不复位会让这 16 字节一直占着 ring，混音器随后读到一段非预期的
+        // 静音，污染后续播放。故必须复位，但复位方式取决于读语义：
+        //   - `stream/N` 用 `WriteGate::Open`（消费语义）：`read_at` 内部**已经
+        //     commit**，读回后 ring 即为空，再 commit 一次是二次提交，会被
+        //     正确拒绝（这曾让本自检误报 FAIL——是自检过时，不是内核缺陷）；
+        //   - `dsp` 用 `RequireConsumer`（peek 语义）：读回不推进读指针，
+        //     必须显式 commit 才复位。
+        //
+        // 与其在自检里**猜测模式**（会随实现变化而失效），不如直接问 ring
+        // 自己：若仍有未提交字节才提交。这对两种模式同时成立，且不依赖
+        // 任何关于内部语义的假设。
         if let Some(ring) = node.as_audio_ring() {
-            if ring.commit(16).is_err() {
-                klib::error!("[audio] stream selfcheck FAIL: {} ring reset failed", path);
+            let pending = ring.used();
+            if pending > 0 && ring.commit(pending).is_err() {
+                klib::error!(
+                    "[audio] stream selfcheck FAIL: {} ring reset failed ({} pending)",
+                    path, pending
+                );
                 return;
             }
         }
