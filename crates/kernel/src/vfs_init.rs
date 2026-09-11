@@ -963,12 +963,96 @@ fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
     // 的可见证据，而非依赖人工 shell 验证。
     audio_boot_selfcheck(mount_table);
 
+    // ---- M1 音频输入端启动自检（批次四）----
+    //
+    // 同上：证明 `stream/N` 不只是"被构建了"，而是真的挂进了活体挂载表，
+    // 且**写入门禁与 dsp 相反**（输入端接受无人接收的写入）。门禁写错时
+    // 节点仍可解析、属性仍可读，M1 链路会**静默不成立**——故必须启动期可见。
+    audio_stream_boot_selfcheck(mount_table);
+
     // A2：安装音频数据到达回调——把"数据落进 ring"（vfs 知道）与"唤醒等待者"
     // （task 知道）接起来。vfs 是 task 的下游，不能反向调用，故用回调解耦。
     // 不装则阻塞的读者永远等不到唤醒（只剩有限超时兜底）。
     vfs::audio::set_wake_hook(task::wake_audio);
 }
 
+/// M1 启动自检：断言 `/devices/audio/stream/N` 在**真实挂载表**中可达且语义正确。
+///
+/// **S29**：与 A1 的 dsp 自检同级别——经 MountTable 真链路解析、真读属性、
+/// 真写入并观察**接受**（而非仅编译通过）。单元测试只证明 `DspNode` 逻辑对，
+/// 不能证明它被正确挂进了真实挂载表；本自检补上这一段。
+///
+/// **为何必须验证"写入被接受"**：`stream/N` 是混音器输入端，其全部存在意义就是
+/// 让生产者写进去。若门禁写错（误用 `dsp` 的策略），节点仍可解析、属性仍可读，
+/// 但 M1 链路**静默不成立**——这正是最需要在启动期就暴露的失败模式（S20）。
+fn audio_stream_boot_selfcheck(mount_table: &Arc<vfs::mount::MountTable>) {
+    let mut checked = 0usize;
+    for i in 0..vfs::AUDIO_STREAM_COUNT {
+        let path = alloc::format!("/devices/audio/stream/{}", i);
+        let node = match mount_table.resolve(path.as_str(), true) {
+            Ok(n) => n,
+            Err(e) => {
+                klib::error!("[audio] stream selfcheck FAIL: {} unreachable: {:?}", path, e);
+                return;
+            }
+        };
+        // 类型：与 dsp 同为字符设备（它是 PCM 字节流，不是普通文件）。
+        if !matches!(node.node_type(), Ok(vfs::inode::INodeType::CharacterDevice)) {
+            klib::error!("[audio] stream selfcheck FAIL: {} wrong node type", path);
+            return;
+        }
+        // 属性子文件必须齐全可读（M1 与 dsp 同一套：format/channels/rate/status）。
+        //
+        // **不含 `volume`**：它属 M4。此刻断言它存在等于测试一个**尚未实现**的
+        // 能力——那会让自检变成为未来写的空头承诺，且一旦 M4 改名就误报。
+        // M4 落地时在此列表加 `"volume"` 并同步更新下方 PASS 文案的计数。
+        let mut buf = [0u8; 256];
+        for name in ["format", "channels", "rate", "status"] {
+            match node.lookup(name).and_then(|n| n.read_at(0, &mut buf)) {
+                Ok(n) if n > 0 => {}
+                other => {
+                    klib::error!("[audio] stream selfcheck FAIL: {}/{} unreadable: {:?}", path, name, other);
+                    return;
+                }
+            }
+        }
+        // **关键差异**：无消费者时写入必须**被接受**（输入端语义）。
+        // 若这里返回 Err，说明门禁策略没生效，M1 链路不成立。
+        match node.write_at(0, &[0u8; 16]) {
+            Ok(n) if n == 16 => {}
+            other => {
+                klib::error!(
+                    "[audio] stream selfcheck FAIL: {} rejected a writer while unattached: {:?} (must be accepted — input end)",
+                    path, other
+                );
+                return;
+            }
+        }
+        // 写完即读回并**提交**，把 ring 复位，避免自检污染后续测试/播放。
+        // （否则这 16 字节会一直占着，混音器读到一段非预期的静音数据。）
+        let mut out = [0u8; 16];
+        match node.read_at(0, &mut out) {
+            Ok(n) if n == 16 => {}
+            other => {
+                klib::error!("[audio] stream selfcheck FAIL: {} read-back failed: {:?}", path, other);
+                return;
+            }
+        }
+        // 经 ring 的 commit 复位（DspNode 的 commit 由 syscall 层驱动，
+        // 自检直接走 vfs API 以保持内核内零 syscall 依赖）。
+        if let Some(ring) = node.as_audio_ring() {
+            if ring.commit(16).is_err() {
+                klib::error!("[audio] stream selfcheck FAIL: {} ring reset failed", path);
+                return;
+            }
+        }
+        checked += 1;
+    }
+    klib::info!(
+        "[audio] stream selfcheck PASS: {} input stream(s) reachable, 4 attrs each, unattached write ACCEPTED (input-end semantics)",
+        checked
+    );
+}
 /// A1 启动自检：断言 `/devices/audio/dsp` 在真实挂载表中可达且语义正确。
 ///
 /// **S29**：这不是"编译通过"级别的检查，而是对生产路径的实际调用——

@@ -34,6 +34,15 @@ use crate::inode::{DirEntry, FileMetadata, INode, INodeType, Permissions};
 /// 上限约束：过大则"写完到出声"的延迟不可接受。341 ms 是两者的工程折中。
 pub const AUDIO_RING_CAPACITY: usize = 64 * 1024;
 
+/// 混音器输入路数（`/devices/audio/stream/0..N-1`）。
+///
+/// **取值理由**：4 路足以覆盖"多路并发混音"的验证需求（M2 至少要 2 路才能
+/// 证明相加语义），同时每路 64 KiB 的 ring 共 256 KiB，相对本项目的内核内存
+/// 预算很小。路数是**编译期常量**而非运行时配置——M1/M2 还没有"动态增删输入"
+/// 的需求，提前做成可配置只会引入未经验证的分支（S39 反对装饰性灵活性）。
+/// 将来真需要时，改这一处即可（挂载循环已按本常量驱动）。
+pub const AUDIO_STREAM_COUNT: usize = 4;
+
 /// 支持的采样格式（S13：业务语义常量集中定义，避免散落漂移）。
 pub const AUDIO_FORMAT_S16LE: &str = "s16le";
 /// 支持的声道数文本。
@@ -342,6 +351,31 @@ pub struct DspNode {
     /// 用裸指针自引用是脆弱的（S18/S26 自审否决），裸 Arc 克隆才是正道。
     ring: Arc<AudioRing>,
     children: DynamicDirNode,
+    /// 写入门禁策略（见 [`WriteGate`]）。显式构造参数，**不是**运行时按路径猜。
+    gate: WriteGate,
+}
+
+/// 写入路径的门禁策略。
+///
+/// **为何需要两种模式（不是权宜之计，而是两类节点的本质差异）**：
+///
+/// - [`WriteGate::RequireConsumer`] — **输出端** `dsp`。数据一旦写入就交给硬件、
+///   出系统了。若无消费者，写入等于"把数据扔进虚空"：写者以为播了，实际没人取。
+///   A1 故如实拒绝（`NotSupported`），这是**诚实性红线**（S06/S07/S09）。
+///
+/// - [`WriteGate::Open`] — **输入端** `stream/N`（批次四 M1）。它是混音器的输入
+///   缓冲，数据留在 ring 里等 `audiod` 来取。它**没有**"消费者"概念，也不需要：
+///   写入的意义不依赖是否有人正在读。若照搬 `dsp` 的门禁，生产者将**永远写不进去**。
+///
+/// **放宽的只是"要不要消费者"，不是"满了怎么办"**：两种模式下 ring 满都如实
+/// `WouldBlock` 背压，绝不静默丢弃或覆盖（A1 红线在 `stream` 上延续）。
+/// 该区分由 `test_audio_stream_backpressure_when_full` 单独钉死。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteGate {
+    /// 无消费者附加时拒绝写入（`dsp`：输出端）。
+    RequireConsumer,
+    /// 无需消费者，接受写入；满则背压（`stream/N`：输入端）。
+    Open,
 }
 
 impl DspNode {
@@ -349,8 +383,27 @@ impl DspNode {
         Self::with_capacity(AUDIO_RING_CAPACITY)
     }
 
+    /// 构造一路混音器**输入**节点（`stream/N`，批次四 M1）。
+    ///
+    /// 与 [`DspNode::new`] 的唯一差别是 [`WriteGate::Open`]——见该枚举的论证。
+    /// 容量刻意与 `dsp` 一致（`AUDIO_RING_CAPACITY`）：二者都是 PCM 缓冲，
+    /// 没有理由让输入端比输出端小，那只会更早触发背压（S17 默认值需有理由）。
+    pub fn stream() -> Self {
+        Self::stream_with_capacity(AUDIO_RING_CAPACITY)
+    }
+
+    /// 以指定容量的**输入**节点构造（测试用小容量以便快速触达背压边界）。
+    pub fn stream_with_capacity(capacity: usize) -> Self {
+        Self::build(capacity, WriteGate::Open)
+    }
+
     /// 以指定容量构造（测试用小容量以便快速触达边界）。
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::build(capacity, WriteGate::RequireConsumer)
+    }
+
+    /// 实际构造函数：容量 + 门禁策略（S15 单点——两种模式共用全部逻辑）。
+    fn build(capacity: usize, gate: WriteGate) -> Self {
         let children = DynamicDirNode::new();
         let ring = Arc::new(AudioRing::with_capacity(capacity));
 
@@ -453,7 +506,11 @@ impl DspNode {
         let registered = ring.clone();
         AUDIO_RING_SLOT.call_once(|| registered);
 
-        Self { ring, children }
+        Self {
+            ring,
+            children,
+            gate,
+        }
     }
 
     /// 供 syscall 层（批次二）访问底层 ring。
@@ -485,10 +542,14 @@ impl INode for DspNode {
     }
 
     /// 写：背压语义三分支（plan_audio_vfs.md §3.4）。
+    ///
+    /// 分支 1 依 [`WriteGate`] 而定——输出端要求消费者，输入端不要求。
+    /// **无论哪种模式**，分支 2/3（落盘或背压）完全一致：门禁处理的是"要不要
+    /// 有人接收"，不是"满了怎么办"。
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, Error> {
-        // 分支 1（诚实性红线 S06/S07/S09）：无消费者附加 → 如实失败。
+        // 分支 1（诚实性红线 S06/S07/S09）：输出端无消费者附加 → 如实失败。
         // "接受后丢弃"会让写者以为播放成功，是最典型的伪链路。
-        if !self.ring.is_attached() {
+        if self.gate == WriteGate::RequireConsumer && !self.ring.is_attached() {
             return Err(Error::NotSupported);
         }
         // 分支 2：有空间 → 拷入，返回实写量。

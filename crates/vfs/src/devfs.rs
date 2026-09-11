@@ -428,6 +428,22 @@ impl DevFS {
         let audio_dir = Arc::new(DynamicDirNode::new());
         let dsp_node = Arc::new(crate::audio::DspNode::new());
         audio_dir.add_child("dsp", dsp_node);
+        // 4.6.1 /devices/audio/stream/0..N-1（批次四 M1）
+        //
+        // 混音器的**输入**端：每个 `stream/N` 是独立的 PCM ring，由生产者
+        // （播放器/测试程序）写入，由用户态 `audiod` 读走后混音并写入 `dsp`。
+        //
+        // **为何走普通 VFS 而非 AUDIO syscall 域**：AUDIO 域表达的是"独占消费者
+        // 流控"（attach/fetch/commit），而 `stream/N` 的写入者可以有多个、且不需要
+        // attach——它就是输入缓冲。故这里只需 open/read/write，内核不加新 syscall。
+        let streams_dir = Arc::new(DynamicDirNode::new());
+        for i in 0..crate::audio::AUDIO_STREAM_COUNT {
+            // 名字用 `alloc::format!` 生成（非硬编码字符串表）：路数是常量，
+            // 增删只需改常量一处（S13/S15）。
+            let name: alloc::string::String = alloc::format!("{}", i);
+            streams_dir.add_child(name.as_str(), Arc::new(crate::audio::DspNode::stream()));
+        }
+        audio_dir.add_child("stream", streams_dir);
         root.add_child("audio", audio_dir);
 
         // 5. /devices/pci (M10.1 PCI 深度自省目录)

@@ -24,7 +24,7 @@ pub mod ramfs;
 pub mod stdio;
 pub mod sysfs;
 
-pub use audio::{AudioRing, DspNode, AUDIO_RING_CAPACITY};
+pub use audio::{AudioRing, DspNode, WriteGate, AUDIO_RING_CAPACITY, AUDIO_STREAM_COUNT};
 pub use devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
 pub use dynamic::{DynamicDirNode, DynamicFileNode};
 pub use file_handle::{
@@ -1197,6 +1197,53 @@ mod tests {
 
     /// A1 满 ring 背压：必须如实 WouldBlock，绝不静默丢弃。
     #[test]
+    /// M1：`stream/N` 是混音器**输入端**，写入门禁必须与 `dsp` 不同。
+    ///
+    /// **为何必须有这条测试**：`dsp` 的语义是"无消费者即拒绝写入"（A1 红线，
+    /// 防止"接受后丢弃"的伪链路）。但 `stream/N` 根本没有消费者概念——它就是
+    /// 一个输入缓冲，等混音器来取。若照搬 dsp 的门禁，生产者将**永远写不进去**，
+    /// M1 链路直接不成立。
+    ///
+    /// 本测试钉死两者的差异是**条件性**的（S19 边界 / S26 自审）：
+    /// 同一份 ring 代码，因门禁策略不同而行为不同。
+    #[test]
+    fn test_audio_stream_accepts_write_without_consumer() {
+        let stream = DspNode::stream_with_capacity(256);
+        // 无任何消费者 attach —— dsp 会 NotSupported，stream 必须接受。
+        assert!(
+            !stream.ring().is_attached(),
+            "premise: stream test must start unattached"
+        );
+        let pcm = [0x5Au8; 64];
+        assert_eq!(
+            stream.write_at(0, &pcm),
+            Ok(64),
+            "stream/N must accept writes with no consumer attached"
+        );
+        assert_eq!(stream.ring().used(), 64, "data must actually land in the ring");
+
+        // 对照组：同一容量、dsp 门禁下必须拒绝。两者不同才证明策略真的生效。
+        let dsp = DspNode::with_capacity(256);
+        assert_eq!(dsp.write_at(0, &pcm), Err(Error::NotSupported));
+        assert_eq!(dsp.ring().used(), 0, "rejected write must not land");
+    }
+
+    /// M1：`stream/N` 满时仍须**如实背压**，不得静默丢弃或覆盖。
+    ///
+    /// 这是 A1"绝不静默丢弃"红线在 stream 上的**延续**：门禁放宽的是"要不要
+    /// 消费者"，**不是**"满了怎么办"。两类语义容易被混为一谈，故单列测试。
+    #[test]
+    fn test_audio_stream_backpressure_when_full() {
+        let stream = DspNode::stream_with_capacity(16);
+        assert_eq!(stream.write_at(0, &[0x11u8; 16]), Ok(16));
+        assert_eq!(stream.ring().used(), 16);
+        // 满 → 如实 WouldBlock（EAGAIN），而不是静默成功或覆盖旧数据。
+        assert_eq!(stream.write_at(0, &[0x22u8; 8]), Err(Error::WouldBlock));
+        // 关键：被拒的写入**不得**污染 ring 内容。
+        let mut out = [0u8; 16];
+        assert_eq!(stream.read_at(0, &mut out), Ok(16));
+        assert_eq!(out, [0x11u8; 16], "rejected write must not overwrite ring data");
+    }
     fn test_audio_dsp_backpressure() {
         let node = DspNode::with_capacity(8);
         assert_eq!(node.ring().attach(4242), Ok(()));
