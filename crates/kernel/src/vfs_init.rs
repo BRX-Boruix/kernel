@@ -954,6 +954,64 @@ fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
 
     let devfs = Arc::new(DevFS::new(Arc::new(KernelDeviceProvider)));
     mount_table.mount("/devices", devfs).expect("mount devfs");
+
+    // ---- A1 音频节点启动自检（plan_audio_vfs.md 批次一）----
+    //
+    // 单元测试证明 DspNode 逻辑正确，但**不能**证明它被正确挂进真实
+    // 挂载表——历史上有"实现了却没接上"的先例（S28）。此处对**活体**
+    // 挂载表做一次端到端断言，把"节点的确可达且语义正确"变成启动期
+    // 的可见证据，而非依赖人工 shell 验证。
+    audio_boot_selfcheck(mount_table);
+}
+
+/// A1 启动自检：断言 `/devices/audio/dsp` 在真实挂载表中可达且语义正确。
+///
+/// **S29**：这不是"编译通过"级别的检查，而是对生产路径的实际调用——
+/// 解析路径、读属性、写入并观察拒绝行为，全部经 MountTable 真链路。
+fn audio_boot_selfcheck(mount_table: &Arc<vfs::mount::MountTable>) {
+    // 1. 节点必须可经完整路径解析到。
+    let dsp = match mount_table.resolve("/devices/audio/dsp", true) {
+        Ok(n) => n,
+        Err(e) => {
+            klib::error!("[audio] selfcheck FAIL: /devices/audio/dsp unreachable: {:?}", e);
+            return;
+        }
+    };
+    // 2. 类型必须是字符设备。
+    match dsp.node_type() {
+        Ok(vfs::inode::INodeType::CharacterDevice) => {}
+        Ok(other) => {
+            klib::error!("[audio] selfcheck FAIL: wrong node type {:?}", other);
+            return;
+        }
+        Err(e) => {
+            klib::error!("[audio] selfcheck FAIL: node_type error {:?}", e);
+            return;
+        }
+    }
+    // 3. 属性子文件必须可读且内容真实。
+    let mut buf = [0u8; 256];
+    let mut attrs_ok = true;
+    for name in ["format", "channels", "rate", "status"] {
+        match dsp.lookup(name).and_then(|n| n.read_at(0, &mut buf)) {
+            Ok(n) if n > 0 => {}
+            other => {
+                klib::error!("[audio] selfcheck FAIL: attr {} unreadable: {:?}", name, other);
+                attrs_ok = false;
+            }
+        }
+    }
+    // 4. 诚实性红线：无消费者时写入必须被拒绝（不得静默接受）。
+    let write_rejected = matches!(dsp.write_at(0, &[0u8; 16]), Err(_));
+    if !write_rejected {
+        klib::error!("[audio] selfcheck FAIL: unattached write was accepted (must be refused)");
+        return;
+    }
+    if attrs_ok {
+        klib::info!(
+            "[audio] selfcheck PASS: /devices/audio/dsp reachable, CharacterDevice, 4 attrs readable, unattached write refused"
+        );
+    }
 }
 
 /// liveCD 基线：把构建期嵌入的用户程序 payload（SDK 生成 `binaries_payload.rs`）

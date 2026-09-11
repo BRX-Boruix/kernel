@@ -9,6 +9,7 @@ extern crate std;
 
 extern crate alloc;
 
+pub mod audio;
 pub mod devfs;
 pub mod dynamic;
 pub mod file_handle;
@@ -23,6 +24,7 @@ pub mod ramfs;
 pub mod stdio;
 pub mod sysfs;
 
+pub use audio::{AudioRing, DspNode, AUDIO_RING_CAPACITY};
 pub use devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
 pub use dynamic::{DynamicDirNode, DynamicFileNode};
 pub use file_handle::{
@@ -1018,5 +1020,233 @@ mod tests {
             w.join().unwrap();
         }
         assert_eq!(node.metadata().unwrap().size, 64);
+    }
+
+    /// A1 音频哑管道测试（plan_audio_vfs.md 批次一）。
+    ///
+    /// 覆盖 §3.4 背压语义三分支与 §3.3 属性子文件。
+    #[test]
+    fn test_audio_dsp_pipe() {
+        let mt = MountTable::new(Arc::new(RamFS::new()));
+        mt.mkdir("/devices", Permissions::all()).unwrap();
+        let devfs = Arc::new(DevFS::new(Arc::new(MockDeviceProvider {
+            baud: core::sync::atomic::AtomicU32::new(115200),
+        })));
+        mt.mount("/devices", devfs).unwrap();
+
+        // --- 节点存在性与类型 ---
+        let dsp = mt.resolve("/devices/audio/dsp", true).unwrap();
+        assert_eq!(dsp.node_type().unwrap(), INodeType::CharacterDevice);
+        // 字符流不可定位（KM17）。
+        assert!(!dsp.is_seekable(), "dsp is a character stream, must not be seekable");
+        // 截断语义不存在，如实 NotSupported（M17 纪律）。
+        assert_eq!(dsp.truncate(0), Err(Error::NotSupported));
+
+        // --- S06/S09 红线：无消费者时写入必须失败可见，绝不接受后丢弃 ---
+        assert_eq!(
+            dsp.write_at(0, b"\x01\x02\x03\x04"),
+            Err(Error::NotSupported),
+            "writing PCM with no attached consumer must fail loudly, never be silently dropped"
+        );
+
+        // --- 属性子目录必须可枚举 ---
+        let entries = dsp.list_dir().unwrap();
+        let names: alloc::vec::Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        for want in ["format", "channels", "rate", "status"] {
+            assert!(names.contains(&want), "missing attribute sub-file: {want}");
+        }
+    }
+
+    /// A1 属性子文件：合法值往返 + 非法值如实拒绝（不静默 clamp/转换）。
+    #[test]
+    fn test_audio_dsp_attrs() {
+        let mt = MountTable::new(Arc::new(RamFS::new()));
+        mt.mkdir("/devices", Permissions::all()).unwrap();
+        let devfs = Arc::new(DevFS::new(Arc::new(MockDeviceProvider {
+            baud: core::sync::atomic::AtomicU32::new(115200),
+        })));
+        mt.mount("/devices", devfs).unwrap();
+        let mut buf = [0u8; 512];
+
+        // format：仅支持 s16le；其它格式如实 NotSupported（不静默转换）。
+        let fmt = mt.resolve("/devices/audio/dsp/format", true).unwrap();
+        let n = fmt.read_at(0, &mut buf).unwrap();
+        assert_eq!(core::str::from_utf8(&buf[..n]).unwrap().trim(), "s16le");
+        assert_eq!(fmt.write_at(0, b"f32le"), Err(Error::NotSupported));
+        assert_eq!(fmt.write_at(0, b"s16le"), Ok(5));
+
+        // channels：仅支持 2。
+        let ch = mt.resolve("/devices/audio/dsp/channels", true).unwrap();
+        let n2 = ch.read_at(0, &mut buf).unwrap();
+        assert_eq!(core::str::from_utf8(&buf[..n2]).unwrap().trim(), "2");
+        assert_eq!(ch.write_at(0, b"1"), Err(Error::NotSupported));
+
+        // rate：非数字如实 InvalidParam（输入非法）；数字但不受支持 NotSupported
+        // （输入合法、实现不支持）——两者语义不同，不得含混。
+        let rate = mt.resolve("/devices/audio/dsp/rate", true).unwrap();
+        let n3 = rate.read_at(0, &mut buf).unwrap();
+        assert_eq!(core::str::from_utf8(&buf[..n3]).unwrap().trim(), "48000");
+        assert_eq!(rate.write_at(0, b"44100"), Err(Error::NotSupported));
+        assert_eq!(rate.write_at(0, b"abc"), Err(Error::InvalidParam));
+        assert_eq!(rate.write_at(0, b""), Err(Error::InvalidParam));
+
+        // status：必须是真实运行态，不得编造。
+        let st = mt.resolve("/devices/audio/dsp/status", true).unwrap();
+        let n4 = st.read_at(0, &mut buf).unwrap();
+        let s = core::str::from_utf8(&buf[..n4]).unwrap();
+        assert!(s.contains(r#""attached":false"#), "no consumer yet: {s}");
+        assert!(s.contains(r#""capacity":65536"#), "must disclose real capacity: {s}");
+        assert!(s.contains(r#""underruns":0"#), "must disclose underrun count: {s}");
+    }
+
+    /// A1 对抗测试（S30/S31）：ring 边界、回绕、溢出、拒绝路径。
+    #[test]
+    fn test_audio_ring_adversarial() {
+        let ring = AudioRing::with_capacity(16);
+        assert_eq!(ring.used(), 0);
+        assert_eq!(ring.free(), 16);
+        let mut dst = [0u8; 4];
+        assert_eq!(ring.peek(&mut dst), 0, "empty ring yields nothing, no fake data");
+
+        // 精确填满不溢出；满了再写返回 0（不覆盖、不丢弃）。
+        let data = [7u8; 16];
+        assert_eq!(ring.push(&data), 16);
+        assert_eq!(ring.used(), 16);
+        assert_eq!(ring.free(), 0);
+        assert_eq!(ring.push(b"x"), 0);
+
+        let mut out = [0u8; 16];
+        assert_eq!(ring.peek(&mut out), 16);
+        assert_eq!(out, data);
+
+        // S19：commit 越界必须如实拒绝，绝不静默截断。
+        assert_eq!(ring.commit(17), Err(Error::InvalidParam));
+        assert_eq!(ring.commit(16), Ok(()));
+        assert_eq!(ring.used(), 0);
+
+        // 回绕：跨缓冲末尾写入，验证环形两段拷贝保持字节序。
+        assert_eq!(ring.push(&[1u8; 12]), 12);
+        let mut tmp = [0u8; 12];
+        assert_eq!(ring.peek(&mut tmp), 12);
+        assert_eq!(ring.commit(12), Ok(()));
+        assert_eq!(ring.push(&[2u8; 8]), 8);
+        let mut out2 = [0u8; 8];
+        assert_eq!(ring.peek(&mut out2), 8);
+        assert_eq!(out2, [2u8; 8], "wrap-around must preserve byte order");
+        assert_eq!(ring.commit(8), Ok(()));
+
+        // 部分读取：dst 小于可用量时只取 dst.len()。
+        assert_eq!(ring.push(&[3u8; 10]), 10);
+        let mut small = [0u8; 4];
+        assert_eq!(ring.peek(&mut small), 4);
+        assert_eq!(small, [3u8; 4]);
+        assert_eq!(ring.used(), 10, "peek must not advance read_pos");
+        assert_eq!(ring.commit(10), Ok(()));
+
+        // 超大输入：短写为容量值，不 panic。
+        let huge = alloc::vec![9u8; 1000];
+        assert_eq!(ring.push(&huge), 16, "push must short-write, not panic");
+        assert_eq!(ring.commit(16), Ok(()));
+
+        // 空输入：无副作用。
+        assert_eq!(ring.push(&[]), 0);
+        assert_eq!(ring.used(), 0);
+    }
+
+    /// A1 诚实性红线正向测试：附加消费者后，写入必须真正落进 ring。
+    ///
+    /// 与 `test_audio_dsp_pipe` 的"无消费者必须失败"构成一对——
+    /// 证明 NotSupported 是**条件性**的，而非恒返回的错误。
+    #[test]
+    fn test_audio_dsp_attached_write_lands() {
+        let node = DspNode::with_capacity(256);
+        // 未附加 → 如实失败。
+        assert_eq!(node.write_at(0, &[0xABu8; 64]), Err(Error::NotSupported));
+        // 附加 → 写入必须成功且落进 ring。
+        node.ring().set_attached(true);
+        let pcm = [0xABu8; 64];
+        assert_eq!(node.write_at(0, &pcm), Ok(64));
+        assert_eq!(node.ring().used(), 64);
+
+        // 读回一致（peek 不推进指针）。
+        let mut out = [0u8; 64];
+        assert_eq!(node.read_at(0, &mut out), Ok(64));
+        assert_eq!(out, pcm);
+        assert_eq!(node.ring().used(), 64, "peek must not advance read_pos");
+
+        // 提交后才释放空间（两阶段语义）。
+        assert_eq!(node.ring().commit(64), Ok(()));
+        assert_eq!(node.ring().used(), 0);
+
+        // status 必须如实反映本实例的真实状态（非常量）。
+        let st = node.lookup("status").unwrap();
+        let mut buf = [0u8; 512];
+        let n = st.read_at(0, &mut buf).unwrap();
+        let s = alloc::string::String::from(core::str::from_utf8(&buf[..n]).unwrap());
+        assert!(s.contains(r#""attached":true"#), "must reflect real attach: {s}");
+        assert!(s.contains(r#""capacity":256"#), "must reflect real capacity: {s}");
+
+        // 未附加的另一实例必须报 false——两者不同即证明字段来自真实状态。
+        let other = DspNode::with_capacity(256);
+        let st2 = other.lookup("status").unwrap();
+        let n2 = st2.read_at(0, &mut buf).unwrap();
+        let s2 = alloc::string::String::from(core::str::from_utf8(&buf[..n2]).unwrap());
+        assert!(s2.contains(r#""attached":false"#), "unattached must report false: {s2}");
+        assert_ne!(s, s2, "status must be per-instance real state, not a constant");
+    }
+
+    /// A1 满 ring 背压：必须如实 WouldBlock，绝不静默丢弃。
+    #[test]
+    fn test_audio_dsp_backpressure() {
+        let node = DspNode::with_capacity(8);
+        node.ring().set_attached(true);
+        assert_eq!(node.write_at(0, &[1u8; 8]), Ok(8));
+        assert_eq!(node.ring().free(), 0);
+        assert_eq!(
+            node.write_at(0, b"\xAA"),
+            Err(Error::WouldBlock),
+            "full ring must report WouldBlock, never silently drop PCM"
+        );
+        // 空间未变——证明数据确实没被吞掉。
+        assert_eq!(node.ring().used(), 8);
+        assert_eq!(node.ring().free(), 0);
+
+        // 消费后空间释放，写入重新成功。
+        let mut out = [0u8; 8];
+        assert_eq!(node.read_at(0, &mut out), Ok(8));
+        assert_eq!(node.ring().commit(8), Ok(()));
+        assert_eq!(node.write_at(0, b"\xBB\xCC"), Ok(2));
+        assert_eq!(node.ring().used(), 2);
+    }
+
+    /// A1 空读：如实 WouldBlock，且不写入任何伪造数据（S09）。
+    ///
+    /// 欠载计数的语义边界（S26 自审修正）：只统计**已附加消费者**取不到
+    /// 数据的情形——否则任意进程读一次本节点就污染该指标，使之失去意义。
+    #[test]
+    fn test_audio_dsp_empty_read_and_underrun_semantics() {
+        let node = DspNode::with_capacity(32);
+        let mut buf = [0u8; 16];
+
+        // 未附加：空读如实 WouldBlock，但**不计**欠载。
+        assert_eq!(node.read_at(0, &mut buf), Err(Error::WouldBlock));
+        assert_eq!(
+            node.ring().underruns(),
+            0,
+            "empty read without an attached consumer is not an underrun"
+        );
+        // buf 未被写入任何数据（S09：绝不返回伪数据）。
+        assert_eq!(buf, [0u8; 16]);
+
+        // 附加后：同样的空读必须计入欠载。
+        node.ring().set_attached(true);
+        assert_eq!(node.read_at(0, &mut buf), Err(Error::WouldBlock));
+        assert_eq!(node.read_at(0, &mut buf), Err(Error::WouldBlock));
+        assert_eq!(node.ring().underruns(), 2);
+
+        // 有数据时正常消费，不计数。
+        assert_eq!(node.write_at(0, &[1u8; 4]), Ok(4));
+        assert_eq!(node.read_at(0, &mut buf), Ok(4));
+        assert_eq!(node.ring().underruns(), 2, "successful read is not an underrun");
     }
 }

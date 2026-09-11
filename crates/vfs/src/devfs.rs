@@ -421,6 +421,15 @@ impl DevFS {
         let random_node = Arc::new(RandomDeviceNode::new(provider.clone()));
         root.add_child("random", random_node);
 
+        // 4.6 /devices/audio/dsp（plan_audio_vfs.md 批次一 A1）
+        // 音频 PCM 哑管道：内核对音频零知识，只搬字节。写者与音频驱动
+        // 通过本节点耦合，互不认识。无消费者附加时写入如实失败
+        // （NotSupported），绝不接受后丢弃。
+        let audio_dir = Arc::new(DynamicDirNode::new());
+        let dsp_node = Arc::new(crate::audio::DspNode::new());
+        audio_dir.add_child("dsp", dsp_node);
+        root.add_child("audio", audio_dir);
+
         // 5. /devices/pci (M10.1 PCI 深度自省目录)
         // C5.1/#5：按设备名参数化 BAR 查询。为每个已注册 PCI 设备创建
         // `{name}/bars` 子目录；查不到的设备返回错误 JSON，不回退到固定设备。

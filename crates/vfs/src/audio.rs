@@ -1,0 +1,388 @@
+//! 音频哑管道（plan_audio_vfs.md 批次一 A1）。
+//!
+//! ## 设计定位
+//!
+//! 内核**不懂音频**。本模块只搬字节，不认识采样率、格式、声道的物理含义——
+//! 那些是用户态驱动的事（intel-hda）。`/devices/audio/dsp` 是一条
+//! **单向 PCM 管道**：写者写入，音频驱动取走。
+//!
+//! ## 诚实性红线（S06/S07/S09）
+//!
+//! **没有消费者附加时，写入必须失败可见（`NotSupported`），绝不接受后丢弃。**
+//! "接受数据然后扔掉"会让写者以为播放成功，是最典型的伪链路。
+//!
+//! ## 并发模型（S21）
+//!
+//! 单生产者单消费者：生产者是写者进程，消费者是音频驱动进程。
+//! 两端各只写自己的指针、只读对方的指针，故无锁、无自旋、无死锁风险。
+
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use klib::error::Error;
+use klib::json::{JsonWriter, VecTarget};
+
+use crate::dynamic::{DynamicDirNode, DynamicFileNode};
+use crate::inode::{DirEntry, FileMetadata, INode, INodeType, Permissions};
+
+/// PCM ring 缓冲容量（字节）。
+///
+/// **S17 默认值理由**：48kHz/2ch/16bit = 192000 B/s，64 KiB 约合 341 ms。
+/// 下限约束：必须显著大于一次典型 write 的块大小，否则写者每轮都要阻塞；
+/// 上限约束：过大则"写完到出声"的延迟不可接受。341 ms 是两者的工程折中。
+pub const AUDIO_RING_CAPACITY: usize = 64 * 1024;
+
+/// 支持的采样格式（S13：业务语义常量集中定义，避免散落漂移）。
+pub const AUDIO_FORMAT_S16LE: &str = "s16le";
+/// 支持的声道数文本。
+pub const AUDIO_CHANNELS_STEREO: &str = "2";
+/// 支持的采样率文本（Hz）。
+pub const AUDIO_RATE_48000: &str = "48000";
+
+/// 单生产者单消费者（SPSC）环形字节缓冲。
+///
+/// **S21 并发显式化**：
+/// - 生产者 = 写者进程（VFS `write_at`），只推进 `write_pos`；
+/// - 消费者 = 音频驱动（`AUDIO_FETCH`/`AUDIO_COMMIT`），只推进 `read_pos`；
+/// - 两端各只写自己的指针、只读对方指针——**无锁、无自旋、无等待环**；
+/// - 因为只有两个原子量而没有锁，**不存在锁获取顺序与死锁风险**；
+/// - 内存序：写指针用 `Release`，读指针用 `Acquire`，构成 SPSC 标准配对；
+/// - 数据区经 `UnsafeCell` 共享，但可达区间由两个指针隔离：生产者只写
+///   `[write_pos, write_pos+n)`，消费者只读 `[read_pos, read_pos+m)`，
+///   且 `n + m <= capacity`，故两端永不触碰同一字节。
+pub struct AudioRing {
+    buf: core::cell::UnsafeCell<Vec<u8>>,
+    capacity: usize,
+    write_pos: AtomicUsize,
+    read_pos: AtomicUsize,
+    /// 是否已有消费者附加。
+    attached: AtomicBool,
+    /// 欠载计数（消费者取不到数据即 +1；如实披露，不隐藏）。
+    underruns: AtomicU64,
+}
+
+// SAFETY（S18/S21）：共享状态全部由原子量协调，SPSC 语义保证两端永不
+// 并发触碰同一字节。底层 Vec 一经构造长度即固定（capacity），全程不做
+// realloc——故裸数据指针在实例生命周期内稳定。
+unsafe impl Send for AudioRing {}
+unsafe impl Sync for AudioRing {}
+
+impl AudioRing {
+    /// 构造容量为 `capacity` 的清零 ring。
+    pub fn with_capacity(capacity: usize) -> Self {
+        let mut v = Vec::new();
+        v.resize(capacity, 0u8);
+        Self {
+            buf: core::cell::UnsafeCell::new(v),
+            capacity,
+            write_pos: AtomicUsize::new(0),
+            read_pos: AtomicUsize::new(0),
+            attached: AtomicBool::new(false),
+            underruns: AtomicU64::new(0),
+        }
+    }
+
+    /// 已占用字节数（写入但消费者尚未提交的部分）。
+    pub fn used(&self) -> usize {
+        let w = self.write_pos.load(Ordering::Acquire);
+        let r = self.read_pos.load(Ordering::Acquire);
+        w.wrapping_sub(r)
+    }
+
+    /// 剩余可写空间（字节）。
+    pub fn free(&self) -> usize {
+        self.capacity - self.used()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.attached.load(Ordering::Acquire)
+    }
+
+    pub fn set_attached(&self, v: bool) {
+        self.attached.store(v, Ordering::Release);
+    }
+
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Acquire)
+    }
+
+    pub fn note_underrun(&self) {
+        self.underruns.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 生产：把 `src` 拷入空闲区，返回实际写入字节数（可能短写）。
+    ///
+    /// **S20 失败模式优先**：返回 0 表示当前无空间。本函数**自身不阻塞**，
+    /// 是否等待由调用方（syscall 层）决定。
+    pub fn push(&self, src: &[u8]) -> usize {
+        let n = core::cmp::min(src.len(), self.free());
+        if n == 0 {
+            return 0;
+        }
+        let w = self.write_pos.load(Ordering::Acquire);
+        let cap = self.capacity;
+        // S19：`buf.get()` 得到的是 `*mut Vec<u8>`（**Vec 头部地址**），必须
+        // 先解引用再取 `as_mut_ptr()`——直接 `as *mut u8` 会指向 Vec 的
+        // ptr/len/cap 字段本身，写入即破坏堆（实测 STATUS_HEAP_CORRUPTION）。
+        let base = unsafe { (*self.buf.get()).as_mut_ptr() };
+        let start = w % cap;
+        let first = core::cmp::min(n, cap - start);
+        // SAFETY：start + first <= cap；该区间不在消费者可达范围内（见类型文档）。
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), base.add(start), first);
+            if n > first {
+                core::ptr::copy_nonoverlapping(src.as_ptr().add(first), base, n - first);
+            }
+        }
+        // Release：保证数据写入对消费者的 Acquire 读取可见。
+        self.write_pos.store(w + n, Ordering::Release);
+        n
+    }
+
+    /// 消费：取出至多 `dst.len()` 字节，**不推进读指针**。
+    ///
+    /// 读指针由 [`AudioRing::commit`] 推进，以支持"取走 → 喂硬件 →
+    /// 播完 → 提交"的两阶段语义（plan_audio_vfs.md §3.2）。
+    pub fn peek(&self, dst: &mut [u8]) -> usize {
+        let r = self.read_pos.load(Ordering::Acquire);
+        let w = self.write_pos.load(Ordering::Acquire);
+        let avail = w.wrapping_sub(r);
+        let n = core::cmp::min(dst.len(), avail);
+        if n == 0 {
+            return 0;
+        }
+        let cap = self.capacity;
+        // S19：同 push——先解引用 Vec 再取数据指针，否则读到的是 Vec 头部。
+        let base = unsafe { (*self.buf.get()).as_ptr() };
+        let start = r % cap;
+        let first = core::cmp::min(n, cap - start);
+        // SAFETY：读区与生产者写区不相交（同上）。
+        unsafe {
+            core::ptr::copy_nonoverlapping(base.add(start), dst.as_mut_ptr(), first);
+            if n > first {
+                core::ptr::copy_nonoverlapping(base, dst.as_mut_ptr().add(first), n - first);
+            }
+        }
+        n
+    }
+
+    /// 提交：推进读指针 `n` 字节，把空间交还生产者。
+    ///
+    /// **S19 边界论证**：`n` 超过"已取未提交"量时**如实拒绝**，绝不静默
+    /// 截断——静默截断会让读指针越过写指针，`used()` 回绕成巨额数值，
+    /// 进而把 ring 永久堵死。
+    pub fn commit(&self, n: usize) -> Result<(), Error> {
+        let r = self.read_pos.load(Ordering::Acquire);
+        let w = self.write_pos.load(Ordering::Acquire);
+        if n > w.wrapping_sub(r) {
+            return Err(Error::InvalidParam);
+        }
+        self.read_pos.store(r + n, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// `/devices/audio/dsp` 节点：PCM 哑管道 + 属性子目录。
+///
+/// 结构照 `SerialDeviceNode`（devfs.rs）：主数据流 + `DynamicDirNode` 承载
+/// 属性子文件。区别在于数据流是**内核内 ring**而非硬件透传。
+pub struct DspNode {
+    /// ring 以 `Arc` 持有：`status` 属性回调需要共享同一实例，
+    /// 用裸指针自引用是脆弱的（S18/S26 自审否决），裸 Arc 克隆才是正道。
+    ring: Arc<AudioRing>,
+    children: DynamicDirNode,
+}
+
+impl DspNode {
+    pub fn new() -> Self {
+        Self::with_capacity(AUDIO_RING_CAPACITY)
+    }
+
+    /// 以指定容量构造（测试用小容量以便快速触达边界）。
+    pub fn with_capacity(capacity: usize) -> Self {
+        let children = DynamicDirNode::new();
+        let ring = Arc::new(AudioRing::with_capacity(capacity));
+
+        // ---- format 属性：读写，第一版仅 s16le ----
+        // S16：当前无"自动协商"，格式由写者显式声明；不被支持的格式
+        // 如实 NotSupported，绝不静默转换为支持格式（那会伪造音质）。
+        let fmt_node = DynamicFileNode::read_write(
+            || {
+                let mut v = String::from(AUDIO_FORMAT_S16LE).into_bytes();
+                v.push(b'\n');
+                v
+            },
+            |buf| {
+                let s = core::str::from_utf8(buf).map_err(|_| Error::InvalidParam)?;
+                if s.trim() == AUDIO_FORMAT_S16LE {
+                    Ok(buf.len())
+                } else {
+                    // 语义：格式合法但本实现不支持 → NotSupported。
+                    Err(Error::NotSupported)
+                }
+            },
+        );
+        children.add_child("format", Arc::new(fmt_node));
+
+        // ---- channels 属性 ----
+        let ch_node = DynamicFileNode::read_write(
+            || {
+                let mut v = String::from(AUDIO_CHANNELS_STEREO).into_bytes();
+                v.push(b'\n');
+                v
+            },
+            |buf| {
+                let s = core::str::from_utf8(buf).map_err(|_| Error::InvalidParam)?;
+                if s.trim() == AUDIO_CHANNELS_STEREO {
+                    Ok(buf.len())
+                } else {
+                    Err(Error::NotSupported)
+                }
+            },
+        );
+        children.add_child("channels", Arc::new(ch_node));
+
+        // ---- rate 属性 ----
+        // 非数字输入如实 InvalidParam（输入非法），数字但不受支持则
+        // NotSupported（输入合法、实现不支持）——两者语义不同，不得含混。
+        let rate_node = DynamicFileNode::read_write(
+            || {
+                let mut v = String::from(AUDIO_RATE_48000).into_bytes();
+                v.push(b'\n');
+                v
+            },
+            |buf| {
+                let s = core::str::from_utf8(buf).map_err(|_| Error::InvalidParam)?;
+                let t = s.trim();
+                // S19：解析为 u32 失败即 InvalidParam，不做 default 兜底。
+                let _n: u32 = t.parse().map_err(|_| Error::InvalidParam)?;
+                if t == AUDIO_RATE_48000 {
+                    Ok(buf.len())
+                } else {
+                    Err(Error::NotSupported)
+                }
+            },
+        );
+        children.add_child("rate", Arc::new(rate_node));
+
+        // ---- status 属性：只读 JSON，如实披露真实运行态 ----
+        // S10：全部字段取自 ring 的实际原子量，无一处编造。
+        let ring_for_status = ring.clone();
+        let st_node = DynamicFileNode::read_only(move || {
+            let ring = &*ring_for_status;
+            let mut target = VecTarget::new();
+            let mut w = JsonWriter::new(&mut target);
+            if let Ok(mut obj) = w.start_object() {
+                let _ = obj.field_bool("attached", ring.is_attached());
+                let _ = obj.field_u64("capacity", ring.capacity() as u64);
+                let _ = obj.field_u64("used", ring.used() as u64);
+                let _ = obj.field_u64("free", ring.free() as u64);
+                let _ = obj.field_u64("underruns", ring.underruns());
+                let _ = obj.end();
+            }
+            let mut bytes = target.into_bytes();
+            bytes.push(b'\n');
+            bytes
+        });
+        children.add_child("status", Arc::new(st_node));
+
+        Self { ring, children }
+    }
+
+    /// 供 syscall 层（批次二）访问底层 ring。
+    pub fn ring(&self) -> Arc<AudioRing> {
+        self.ring.clone()
+    }
+}
+
+impl INode for DspNode {
+    /// 读：从 ring 取走数据（两阶段之一：取走但**不**提交）。
+    ///
+    /// 读指针由 [`AudioRing::commit`] 推进，以支持"取走 → 喂硬件 → 播完 →
+    /// 提交"的两阶段语义（plan_audio_vfs.md §3.2 AUDIO_FETCH/AUDIO_COMMIT）。
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        let n = self.ring.peek(buf);
+        if n == 0 {
+            // S20：无数据即如实 WouldBlock，由 syscall 层决定是否阻塞。
+            //
+            // 欠载计数的语义边界（S26 自审修正）：`underruns` 表示
+            // **已附加的消费者取不到数据**——即"有人正在等这份数据却等不到"。
+            // 未附加时的空读只是"当前无数据"，不是欠载；若不加区分，
+            // 任意进程读一次本节点就会污染该计数，使之失去意义。
+            if self.ring.is_attached() {
+                self.ring.note_underrun();
+            }
+            return Err(Error::WouldBlock);
+        }
+        Ok(n)
+    }
+
+    /// 写：背压语义三分支（plan_audio_vfs.md §3.4）。
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, Error> {
+        // 分支 1（诚实性红线 S06/S07/S09）：无消费者附加 → 如实失败。
+        // "接受后丢弃"会让写者以为播放成功，是最典型的伪链路。
+        if !self.ring.is_attached() {
+            return Err(Error::NotSupported);
+        }
+        // 分支 2：有空间 → 拷入，返回实写量。
+        let n = self.ring.push(buf);
+        if n == 0 {
+            // 分支 3：ring 满 → WouldBlock（EAGAIN 语义），绝不静默丢弃。
+            return Err(Error::WouldBlock);
+        }
+        Ok(n)
+    }
+
+    fn metadata(&self) -> Result<FileMetadata, Error> {
+        Ok(FileMetadata {
+            size: 0,
+            node_type: INodeType::CharacterDevice,
+            permissions: Permissions::read_write(),
+            created_time: 0,
+            modified_time: 0,
+            changed_time: 0,
+        })
+    }
+
+    /// A5：字符设备判型零成本。
+    fn node_type(&self) -> Result<INodeType, Error> {
+        Ok(INodeType::CharacterDevice)
+    }
+
+    /// KM17/KM1：字符流不可定位。syscall 层据此对非顺序偏移如实报
+    /// `IllegalSeek`，而不是靠 fd 号魔法数字判断。
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    /// M17（ADR-023 §6）：字符流截断语义不存在——返回成功码会掩盖
+    /// "什么都没发生"，如实 NotSupported。
+    fn truncate(&self, _size: u64) -> Result<(), Error> {
+        Err(Error::NotSupported)
+    }
+
+    fn lookup(&self, name: &str) -> Result<Arc<dyn INode>, Error> {
+        self.children.lookup(name)
+    }
+
+    fn create(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+        Err(Error::PermissionDenied)
+    }
+
+    fn mkdir(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+        Err(Error::PermissionDenied)
+    }
+
+    fn unlink(&self, _name: &str) -> Result<(), Error> {
+        Err(Error::PermissionDenied)
+    }
+
+    fn list_dir(&self) -> Result<Vec<DirEntry>, Error> {
+        self.children.list_dir()
+    }
+}
