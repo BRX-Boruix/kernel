@@ -19,7 +19,8 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use spin::Once;
 use klib::error::Error;
 use klib::json::{JsonWriter, VecTarget};
 
@@ -46,6 +47,50 @@ pub const AUDIO_RATE_48000: &str = "48000";
 /// `u32::MAX` 与任何合法 pid 不相交（同 `KBD_WAITER`/`EVENT_WAITER` 的哨兵
 /// 约定，`scheduler.rs:1284`/`:1439`）。
 pub const NO_CONSUMER: u32 = u32::MAX;
+
+/// 经 `INode::as_audio_ring` 取回节点的音频 ring（非音频节点返回 `None`）。
+///
+/// **S15 单点定义**：`INode::as_audio_ring` 是"这个节点有没有音频 ring"的
+/// **唯一**判定处。syscall 层不比对路径字符串、也不臆测"字符设备即音频"——
+/// 那两种做法都会在接入第二个字符设备时静默错认节点（把别人的 ring 当音频）。
+///
+/// **为何不用 `Arc::downcast`**：那要求 `INode: Any`，会给一个被十余种节点
+/// 实现的 trait 增加全局约束（牵动 ramfs/procfs/sysfs/stdio 等无关类型）。
+/// 显式访问器保持 trait object-safe，且把"暴露音频 ring"变成**被声明的能力**
+/// 而非运行时类型试探——后者在类型不匹配时只能返回 None，无法区分"不是音频
+/// 节点"与"是音频节点但暂不可用"。
+pub fn as_audio_node(node: &Arc<dyn INode>) -> Option<Arc<AudioRing>> {
+    node.as_audio_ring()
+}
+
+
+/// 全局音频 ring 登记槽（`Once`：系统只有一个音频节点）。
+///
+/// **S15 单点定义 + S18 可达性**：进程退出清理路径（调度器）必须能**不依赖**
+/// 挂载表就找到音频 ring——挂载表在 kernel crate，而调度器不应反向依赖它。
+/// 故由音频节点在构造时把自己登记于此，退出路径直接读该槽。
+///
+/// **为何不用挂载表查找**：退出路径上做路径解析会引入一个"解析失败怎么办"
+/// 的失败分支——而清理**必须**成功（否则死进程永久独占节点）。无失败分支的
+/// 设计在这里是正确性优势，不是简化。
+static AUDIO_RING_SLOT: Once<Arc<AudioRing>> = Once::new();
+
+/// 进程退出时的音频资源回收入口（S18）。
+///
+/// 由调度器在进程回收路径调用（与 `flock_release_all_for_owner` 同点）。
+/// 释放该 pid 占用的音频消费者槽——**必须**做，否则进程死亡后音频节点会被
+/// 一个不存在的进程永久独占，所有后续驱动 attach 都得到 Busy，且现象沉默
+/// （没有任何错误指向"死进程仍持有"），极难排查。
+///
+/// 幂等：可重复调用；对本进程未持有槽的情况是无操作。
+pub fn audio_on_process_exit(pid: usize) {
+    match AUDIO_RING_SLOT.get() {
+        Some(ring) => ring.detach_any(pid),
+        // 音频节点从未构造（未启用）：无可回收，正确且无副作用。
+        None => {}
+    }
+}
+
 /// 单生产者单消费者（SPSC）环形字节缓冲。
 ///
 /// **S21 并发显式化**：
@@ -373,6 +418,12 @@ impl DspNode {
         });
         children.add_child("status", Arc::new(st_node));
 
+        // S15/S18：登记自身供进程退出清理路径 O(1) 可达（见 AUDIO_RING_SLOT）。
+        // `call_once`：测试中会多次构造（各自独立 ring），首个登记的即系统节点，
+        // 后续不覆盖——退出清理是全局唯一资源回收，语义上只应有一个目标。
+        let registered = ring.clone();
+        AUDIO_RING_SLOT.call_once(|| registered);
+
         Self { ring, children }
     }
 
@@ -440,6 +491,22 @@ impl INode for DspNode {
     /// `IllegalSeek`，而不是靠 fd 号魔法数字判断。
     fn is_seekable(&self) -> bool {
         false
+    }
+
+    /// A2：空读时应当阻塞等待（等待源是 PCM 数据到达，非键盘）。
+    ///
+    /// **诚实性（S06/S09）**：仅当**确有消费者**时才声明可阻塞。无消费者时
+    /// `read_at` 的 `WouldBlock` 不是"稍后会有"而是"没人会产生"——此时声明
+    /// 可阻塞会让调用者永久睡眠等待一个永远不会到来的数据源。这正是
+    /// `blocks_when_empty` 语义归节点所有的价值：只有节点自己知道它此刻是否
+    /// 真的会有数据。
+    fn blocks_when_empty(&self) -> bool {
+        self.ring.is_attached()
+    }
+
+    /// A2：本节点确实暴露音频 ring——如实声明（这使 syscall 层无需类型试探）。
+    fn as_audio_ring(&self) -> Option<Arc<AudioRing>> {
+        Some(self.ring.clone())
     }
 
     /// M17（ADR-023 §6）：字符流截断语义不存在——返回成功码会掩盖

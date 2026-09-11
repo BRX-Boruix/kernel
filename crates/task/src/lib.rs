@@ -27,6 +27,9 @@ pub use scheduler::{
     waitpid, wake, wake_event, wake_event_timeout, wake_kbd, wake_with_value, set_event_timeout_timer,
     clear_event_timeout_timer, clear_event_waiter_if, yield_now, set_distribute_across_cpus,
     block_for_irq, wake_irq_timeout,
+    // A2：音频等待者（plan_audio_vfs.md 批次二）。
+    block_for_audio, wake_audio, wake_audio_timeout, set_audio_timeout_timer,
+    clear_audio_timeout_timer, clear_audio_waiter_if,
 };
 #[cfg(feature = "kernel-tests")]
 pub use scheduler::test_hooks;

@@ -79,6 +79,13 @@ pub mod domain {
     pub const SIGNAL: u32 = 0x80;
     /// POWER 域（ADR-036）：系统电源管理（S5 软关机 / 重启）。
     pub const POWER: u32 = 0x90;
+    /// AUDIO 域（plan_audio_vfs.md 批次二）：音频管道消费者动词。
+    ///
+    /// 与 VFS 域的分工：读写 PCM **走 VFS 路径**（`open(/devices/audio/dsp)`
+    /// + `read`/`write`），不在此域重复造读写。本域只提供 VFS 无法表达的**流控**
+    /// 动词——附加/注销消费者、提交消费、主动取帧。这样"数据通路"与"控制通路"
+    /// 各归其位，也避免同一份 PCM 有两条语义不同的入口（S15）。
+    pub const AUDIO: u32 = 0xA0;
 }
 
 pub mod op {
@@ -223,6 +230,18 @@ pub const SYS_DEVICE_PROBE: u32 = nr(domain::DEVICE, 0x08); // 0x58
 /// 的 IRQ 已触发（驱动应读设备状态寄存器服务）；0 = 超时。用户态驱动借此
 /// 中断驱动而非轮询（阶段一：PCI IRQ → 认领它的用户驱动）。
 pub const SYS_DRIVER_IRQ_WAIT: u32 = nr(domain::DEVICE, 0x09); // 0x59
+
+// ---------- 6b. AUDIO Domain (0xA0，plan_audio_vfs.md 批次二) ----------
+/// 附加为音频管道消费者（独占）。`a1 = timeout_ns`（预留）。
+/// 已有消费者 → `Busy`（EBUSY，结构性占用，重试不会成功）。
+pub const SYS_AUDIO_ATTACH: u32 = nr(domain::AUDIO, 0x01); // 0xA1
+/// 注销消费者（仅属主）。非属主 → `PermissionDenied`。
+pub const SYS_AUDIO_DETACH: u32 = nr(domain::AUDIO, 0x02); // 0xA2
+/// 取 PCM 数据。`a1 = buf_ptr`、`a2 = len`。无数据且已附加 → 阻塞等待
+/// （有限超时）；无消费者 → `NotSupported`（诚实性红线）。
+pub const SYS_AUDIO_FETCH: u32 = nr(domain::AUDIO, 0x03); // 0xA3
+/// 提交已消费的 n 字节（推进读指针）。`a1 = n`。越界 → `InvalidParam`。
+pub const SYS_AUDIO_COMMIT: u32 = nr(domain::AUDIO, 0x04); // 0xA4
 /// `driver_dma_alloc(bytes) -> vaddr`（DEVICE 域 0x0A → 0x5A，阶段二）：分配一块
 /// 物理连续、以不可缓存(PCD)映射到调用进程的 DMA 一致性缓冲并返回其用户起始
 /// 虚拟地址；驱动写满后用 [`SYS_DRIVER_DMA_PHYS`] 取物理地址编程设备、服务完用
@@ -1269,6 +1288,21 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
                         task::scheduler::BlockKbdOutcome::Busy => done(pack_err(Error::WouldBlock)),
                     };
                 }
+                // A2：音频 dsp 节点的空读（Waiting 源是 PCM 数据到达，非键盘）。
+                // 与上一分支**互斥**：`interactive_input` 仅 stdin 为真，本分支
+                // 再要求非 interactive，故两条路径不可能同时成立——stdin 的既有
+                // 行为逐位不变（回归零风险）。
+                //
+                // 节点自述取代硬编码特判（A2.5）：`blocks_when_empty` 由 DspNode
+                // 实现，且**仅在确有消费者时**为真——无消费者时空读是"没人会产生",
+                // 不是"稍后会有"，不睡。
+                if total == 0
+                    && e == Error::WouldBlock
+                    && !handle.inode.interactive_input()
+                    && handle.inode.blocks_when_empty()
+                {
+                    return audio_fetch_blocking(frame, &handle.inode);
+                }
                 if total == 0 {
                     return done(pack_err(e));
                 }
@@ -1277,6 +1311,232 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
         }
     }
     done(pack_ok(total))
+}
+
+/// `AUDIO_FETCH` 的无数据阻塞路径（A2，plan §3.4）。
+///
+/// 与 [`event_wait_blocking`] 同构：登记 AUDIO_WAITER → 复检就绪 → 入睡。
+/// 数据到达时内核在 PCM 写入后调 `task::wake_audio()` 唤醒本进程。
+///
+/// 超时采用**有限**值（非无限）：音频管道前端若无消费者推进（驱动崩溃、
+/// 进程被挂起），无限等待会让调用者永久挂死。有限超时保证调用者必定返回，
+/// 由用户态决定重试策略——与 `driver_irq_wait` 同口径。
+///
+/// `has_data` 探针直接读 ring 水位（S15：就绪条件单点定义为"ring 非空"）。
+fn audio_fetch_blocking(frame: &mut SyscallFrame, inode: &alloc::sync::Arc<dyn vfs::inode::INode>) -> DispatchResult {
+    let Some(pid) = current_proc_mut().map(|p| p.pid()) else {
+        return done(pack_err(Error::WouldBlock));
+    };
+    // 重新登记前清理本进程残留的音频等待者身份（超时唤醒路径不清，见
+    // clear_audio_waiter_if），否则本次 CAS 失败且 wake_audio 会误读本 pid。
+    task::clear_audio_waiter_if(pid);
+    let probe = inode.clone();
+    match task::block_for_audio(arch_frame(frame), move || !audio_ring_empty(&probe)) {
+        task::SwitchOutcome::Switched => DispatchResult::Switched,
+        // 未入睡（数据已到 / 已有并发等待者）：如实返回 WouldBlock 让用户态
+        // 重试。绝不在此伪造数据。
+        task::SwitchOutcome::NotSwitched => done(pack_err(Error::WouldBlock)),
+    }
+}
+
+/// 就绪探针：该节点当前是否已有可取数据。
+///
+/// 经 `read_at` 的实际语义判定而非旁路读 ring——保证"探针说有"与"读得到"
+/// 同源（S15 单点）。用 1 字节零长探查：不消费数据、不推进读指针。
+fn audio_ring_empty(inode: &alloc::sync::Arc<dyn vfs::inode::INode>) -> bool {
+    // `is_seekable()==false` 且非交互的字符节点，其 read_at 在无数据时如实
+    // WouldBlock、有数据时返回 >0——用元数据大小无法判定，故实际探一次。
+    // peek 语义保证不消费（vfs::audio::DspNode::read_at 不推进读指针）。
+    let mut one = [0u8; 1];
+    !matches!(inode.read_at(0, &mut one), Ok(n) if n > 0)
+}
+
+
+// ---------- A2：音频管道 syscall（plan_audio_vfs.md 批次二）----------
+
+/// 音频 dsp 节点的规范路径（S13：单点定义，不散落字面量）。
+const AUDIO_DSP_PATH: &str = "/devices/audio/dsp";
+
+/// 解析音频 dsp 节点。节点不存在（DevFS 未挂载/未构建）→ `NotFound`。
+///
+/// 每次调用都经真实挂载表解析，**不缓存**节点引用：缓存会把"节点被换掉"
+/// 变成静默使用陈旧对象（S15：单一事实源是挂载表，不是模块内的影子指针）。
+fn audio_dsp_node() -> Result<alloc::sync::Arc<dyn vfs::inode::INode>, Error> {
+    crate::vfs_init::root().resolve(AUDIO_DSP_PATH, true)
+}
+
+/// `AUDIO_ATTACH()` → 0 / -errno（AUDIO 域 0xA1）。
+///
+/// 把**当前进程**注册为该音频节点的独占消费者。所有权校验用当前 pid，
+/// 而非调用方传入的 id——不提供"替别人 attach"的能力（S12：不开特权后门）。
+///
+/// 已有消费者 → `Busy`(EBUSY)：结构性占用，重试不会成功（区别于 EAGAIN）。
+fn sys_audio_attach(frame: &mut SyscallFrame) -> u64 {
+    let _ = frame;
+    let node = match audio_dsp_node() {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    let Some(pid) = current_proc_mut().map(|p| p.pid()) else {
+        return pack_err(Error::InvalidParam);
+    };
+    let ring = match audio_ring_of(&node) {
+        Some(r) => r,
+        None => return pack_err(Error::NotSupported),
+    };
+    match ring.attach(pid) {
+        Ok(()) => {
+            klib::info!("[audio] pid={} attached as PCM consumer", pid);
+            pack_ok(0)
+        }
+        Err(e) => {
+            klib::info!("[audio] pid={} attach denied: {:?}", pid, e);
+            pack_err(e)
+        }
+    }
+}
+
+/// `AUDIO_DETACH()` → 0 / -errno（AUDIO 域 0xA2）。
+///
+/// 非属主调用 → `PermissionDenied` 且**槽位不变**（见 `AudioRing::detach` 的 CAS）。
+fn sys_audio_detach(frame: &mut SyscallFrame) -> u64 {
+    let _ = frame;
+    let node = match audio_dsp_node() {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    let Some(pid) = current_proc_mut().map(|p| p.pid()) else {
+        return pack_err(Error::InvalidParam);
+    };
+    let ring = match audio_ring_of(&node) {
+        Some(r) => r,
+        None => return pack_err(Error::NotSupported),
+    };
+    match ring.detach(pid) {
+        Ok(()) => {
+            klib::info!("[audio] pid={} detached; ring released", pid);
+            pack_ok(0)
+        }
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `AUDIO_COMMIT(n)` → 0 / -errno（AUDIO 域 0xA4）。
+///
+/// 推进读指针 n 字节，释放环形空间供写者继续。**仅属主可提交**（非属主
+/// `PermissionDenied`）——否则任意进程都能"消费"掉别人的数据。
+/// 越界（n > 当前水位）→ `InvalidParam`，绝不静默截断（S19）。
+fn sys_audio_commit(frame: &mut SyscallFrame) -> u64 {
+    let n = frame.a1;
+    let node = match audio_dsp_node() {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    let Some(pid) = current_proc_mut().map(|p| p.pid()) else {
+        return pack_err(Error::InvalidParam);
+    };
+    let ring = match audio_ring_of(&node) {
+        Some(r) => r,
+        None => return pack_err(Error::NotSupported),
+    };
+    // 属主门禁：与 detach 同源（consumer 槽即真相），不引入第二份状态。
+    if ring.consumer() != Some(pid) {
+        return pack_err(Error::PermissionDenied);
+    }
+    // S19：n 是用户可控 u64，窄化到 usize 前必须检查（32 位目标上两者不同宽）。
+    let Ok(adv) = usize::try_from(n) else {
+        return pack_err(Error::InvalidParam);
+    };
+    match ring.commit(adv) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `AUDIO_FETCH(buf_ptr, len)` → 实取字节数 / -errno（AUDIO 域 0xA3）。
+///
+/// **诚实性红线（S06/S09）**：无消费者 → `NotSupported`，绝不接受后丢弃；
+/// 无数据且已附加 → 阻塞等待（有限超时），唤醒后用户态重试。
+///
+/// 与 `read(/devices/audio/dsp)` 的分工：`read` 是非阻塞取数（无数据即
+/// `WouldBlock` 并自动进入阻塞等待），本动词是**显式**取数并允许调用方
+/// 自控超时。两者最终都走 ring 的 peek/commit 两阶段语义，不产生第二条数据通路。
+fn sys_audio_fetch(frame: &mut SyscallFrame) -> DispatchResult {
+    let buf_ptr = frame.a1;
+    let len = frame.a2;
+    let node = match audio_dsp_node() {
+        Ok(n) => n,
+        Err(e) => return done(pack_err(e)),
+    };
+    let ring = match audio_ring_of(&node) {
+        Some(r) => r,
+        None => return done(pack_err(Error::NotSupported)),
+    };
+    // 无消费者：如实拒绝（不睡、不丢数据）。
+    if !ring.is_attached() {
+        return done(pack_err(Error::NotSupported));
+    }
+    let want = match usize::try_from(len) {
+        Ok(v) => v,
+        Err(_) => return done(pack_err(Error::InvalidParam)),
+    };
+    if want == 0 {
+        return done(pack_ok(0));
+    }
+    // 取一帧到内核缓冲（peek 语义：不推进读指针，等用户态 COMMIT 才推进）。
+    let n = match audio_peek_into(&node, want) {
+        Ok(v) => v,
+        Err(e) => return done(pack_err(e)),
+    };
+    if n == 0 {
+        // 无数据：阻塞等待（复用 read 路径的同一条阻塞实现，单一语义源）。
+        return audio_fetch_blocking(frame, &node);
+    }
+    // 有数据：拷回用户态。拷贝失败（野指针）如实报 Fault，不谎报已取。
+    let mut kbuf = alloc::vec::Vec::new();
+    if kbuf.try_reserve_exact(n).is_err() {
+        return done(pack_err(Error::OutOfMemory));
+    }
+    kbuf.resize(n, 0);
+    if let Err(e) = audio_peek_into_buf(&node, &mut kbuf) {
+        return done(pack_err(e));
+    }
+    // 用户缓冲预校验（与 read/write 路径同一把门）：野指针在此如实拒绝，
+    // 绝不放进 STAC 拷贝（内核态 #PF = 整机死机）。
+    if let Err(e) = validate_user_range(buf_ptr, n as u64, UserAccess::Write) {
+        return done(pack_err(e));
+    }
+    // SAFETY：上一步已逐页确认 [buf_ptr, buf_ptr+n) 已映射且可写；kbuf 长度
+    // 为 n，二者等长，copy_to_user 内部走 STAC 短窗口。
+    unsafe { arch_x86_64::mmio::copy_to_user(buf_ptr, kbuf.as_ptr(), n) };
+    done(pack_ok(n as u64))
+}
+
+/// 从任意 `INode` 取回其音频 ring（若该节点是音频节点）。
+///
+/// 经 vfs 提供的**显式**下行转换取得，不做"凡是字符设备就假定是音频"的
+/// 类型臆测（那会在将来接入第二个字符设备时静默错认节点）。
+fn audio_ring_of(node: &alloc::sync::Arc<dyn vfs::inode::INode>) -> Option<alloc::sync::Arc<vfs::audio::AudioRing>> {
+    vfs::audio::as_audio_node(node)
+}
+
+/// 探取（不消费）至多 `want` 字节。返回实际可用字节数（可为 0）。
+fn audio_peek_into(node: &alloc::sync::Arc<dyn vfs::inode::INode>, want: usize) -> Result<usize, Error> {
+    match vfs::audio::as_audio_node(node) {
+        Some(r) => Ok(core::cmp::min(want, r.used())),
+        None => Err(Error::NotSupported),
+    }
+}
+
+/// 把至多 `dst.len()` 字节从 ring 探取到 `dst`（不推进读指针）。
+fn audio_peek_into_buf(node: &alloc::sync::Arc<dyn vfs::inode::INode>, dst: &mut [u8]) -> Result<(), Error> {
+    match vfs::audio::as_audio_node(node) {
+        Some(r) => {
+            let n = r.peek(dst);
+            if n == dst.len() { Ok(()) } else { Err(Error::WouldBlock) }
+        }
+        None => Err(Error::NotSupported),
+    }
 }
 
 /// `exec(prog, cmd)`：加载程序（VFS 路径字符串指针，或内建索引）为新进程并运行。
@@ -2985,6 +3245,13 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         // POWER Domain (0x90, ADR-036): 终结路径（断电/复位后 CPU 不再返回用户态）
         SYS_POWER_OFF => sys_power_off(frame),
         SYS_POWER_REBOOT => sys_reboot(frame),
+
+        // AUDIO Domain (0xA0, plan_audio_vfs.md 批次二)：音频管道消费者动词。
+        // 读/写 PCM 走 VFS 路径，本域只管流控（附加/注销/提交/显式取帧）。
+        SYS_AUDIO_ATTACH => done(sys_audio_attach(frame)),
+        SYS_AUDIO_DETACH => done(sys_audio_detach(frame)),
+        SYS_AUDIO_FETCH => sys_audio_fetch(frame),
+        SYS_AUDIO_COMMIT => done(sys_audio_commit(frame)),
 
         _ => {
             klib::info!("[syscall] unknown nr={:#x}", nr);

@@ -118,6 +118,13 @@ impl INode for StdinNode {
     fn interactive_input(&self) -> bool {
         true
     }
+
+    /// A2：stdin 的空读同样满足"应当睡眠"的通用语义（等待源为 PS/2 键盘中断）。
+    /// 两个方法都返回 true 是**如实**的：语义确有重叠，但来源不同——
+    /// `interactive_input` 描述"是谁"，`blocks_when_empty` 描述"怎么办"。
+    fn blocks_when_empty(&self) -> bool {
+        true
+    }
 }
 
 /// 标准输出 / 标准错误：console 字节流的只写端（K5 完全体：字节透明）。

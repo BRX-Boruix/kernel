@@ -198,8 +198,44 @@ pub trait INode: Send + Sync {
     /// 空读时是否应阻塞等待键盘输入（KM1/K1a）：仅标准输入为 `true`。
     /// syscall 层把该类句柄的 `WouldBlock` 翻译为登记等待者并切换进程，
     /// 其余句柄的 `WouldBlock` 如实上抛。
+    ///
+    /// **A2 说明**：本方法与 [`Self::blocks_when_empty`] 是**不同**的语义——
+    /// 前者专指"键盘输入"（等待源是 PS/2 中断），后者泛指"空读应当睡眠"。
+    /// 保留本方法是为了让 stdin 的既有路径逐位不变（回归零风险）；新增节点
+    /// 应当覆写 `blocks_when_empty` 而非本方法。
     fn interactive_input(&self) -> bool {
         false
+    }
+
+    /// 空读时是否应阻塞等待（A2，plan §3.5）：节点自述其 `WouldBlock` 是否
+    /// 表示"稍后会有数据"而非"永久不可读"。
+    ///
+    /// **为何需要**：syscall 层此前以 `interactive_input()` 硬编码判定唯一的
+    /// 阻塞场景（stdin）。音频 `dsp` 节点同样需要空读阻塞，但它不是键盘输入，
+    /// 复用 `interactive_input` 会让 stdio.rs 的注释与实现凭空多出一个它不负责
+    /// 的语义。本方法把"要不要睡"从**调用方的硬编码特判**变成**节点的自我描述**
+    /// （S15 单点定义：语义归节点所有，syscall 层只做转发）。
+    ///
+    /// **默认 `false`**（S17 理由）：绝大多数节点（ramfs/procfs/sysfs/块设备）
+    /// 的空读是真实的 EOF 或永久不可读，睡眠没有意义且会挂死调用者。默认不阻塞
+    /// 是安全侧——需要阻塞的节点明确覆写，漏写只会导致"如实 WouldBlock"，
+    /// 不会导致"莫名其妙挂起"。
+    fn blocks_when_empty(&self) -> bool {
+        false
+    }
+
+    /// 若本节点暴露音频 PCM ring，返回其共享句柄；否则 `None`（A2）。
+    ///
+    /// **为何是 trait 方法而非 downcast**：`Arc::downcast` 要求 `INode: Any`，
+    /// 会给一个被十余种节点实现的 trait 加全局约束（牵动 ramfs/procfs/sysfs/
+    /// stdio 等无关类型）。显式访问器保持 object-safe，并把"暴露音频 ring"变成
+    /// **被声明的能力**（S15）而非运行时类型试探——后者类型不匹配时只能返回
+    /// `None`，无法区分"不是音频节点"与"是音频节点但暂不可用"。
+    ///
+    /// **默认 `None`**（S17 理由）：音频 ring 是本计划专有的新概念，其余节点
+    /// 一律没有；默认安全侧，漏写只会导致如实 `NotSupported`，不会错认节点。
+    fn as_audio_ring(&self) -> Option<alloc::sync::Arc<crate::audio::AudioRing>> {
+        None
     }
 
     /// 获取元数据。

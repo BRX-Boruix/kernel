@@ -1679,6 +1679,214 @@ pub fn wake_irq_timeout(pid: usize) {
 static EVENT_TIMER: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
 
+// ---------- A2：音频等待者（plan_audio_vfs.md 批次二 A2.4）----------
+
+/// 音频消费者的唯一等待者槽（`u32::MAX` = 空闲）。
+///
+/// **S21 并发显式化**：与 `KBD_WAITER`/`EVENT_WAITER` 同构的**单槽**设计。
+/// 音频管道的消费者是**独占**的（同一时刻至多一个驱动在 `AUDIO_FETCH`），
+/// 故单槽语义与业务模型天然吻合：并发第二个等待者本就该被拒绝（`AUDIO_ATTACH`
+/// 已先行拒绝第二个消费者），此处单槽是**防御性冗余**而非能力限制。
+///
+/// 为何不抽通用 `WaitQueue`：当前全系统只有 3 个等待者，泛化收益不足以抵消
+/// 调度器回归面扩大（plan §3.5）。三份同构代码是可接受的重复——若将来出现
+/// 第 4、5 个，那才是明确的抽取信号。
+static AUDIO_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// 音频等待超时定时器 id 槽（`u64::MAX` = 无）。
+static AUDIO_TIMER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// 音频唤醒预置到保存帧 rax 的"曾阻塞、请重试"哨兵（`-EAGAIN`）。
+///
+/// **S13**：errno 取自集中定义 [`Error::WouldBlock`]，不内联裸字面量——
+/// 与 `EVENT_WAKE_RETRY_SENTINEL` 同口径，改码一处即同步。
+const AUDIO_WAKE_RETRY_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as u64;
+
+
+/// 数据到达时唤醒阻塞的音频消费者（由内核在 PCM 写入后调用）。
+///
+/// 取出 [`AUDIO_WAITER`] 登记的 pid 置 `Ready` 并入就绪队列，同时取消等待端
+/// 注册的未到期超时定时器（防 stale 定时器在数据唤醒后继续触发、占满定时器表）。
+///
+/// **S21 顺序纪律**（照 `wake_event`）：`p == u32::MAX`（无等待者）时**绝不触碰**
+/// `AUDIO_TIMER`。否则会误取消"刚注册了定时器、尚未登记等待者"的窗口期内那个
+/// 定时器，导致其超时唤醒失效、永久卡死。只有真正取到一个等待者才取消其定时器。
+///
+/// 仅在等待者仍处 `Blocked` 且未在 waitpid 时才写哨兵与唤醒——已因超时等其它
+/// 途径醒来的进程，其状态已非 Blocked，此处不覆盖（事件优先/超时优先由状态判定
+/// 裁决，不用登记槽状态判定——那会在超时路径漏写哨兵）。
+pub fn wake_audio() {
+    let p = AUDIO_WAITER.swap(u32::MAX, core::sync::atomic::Ordering::AcqRel);
+    if p == u32::MAX {
+        return;
+    }
+    let stale = AUDIO_TIMER.swap(u64::MAX, core::sync::atomic::Ordering::AcqRel);
+    if stale != u64::MAX {
+        klib::time::cancel_timeout(stale);
+    }
+    let enqueue = {
+        let mut g = proc_bucket_lock(p as usize);
+        match g.get_mut(&(p as usize)) {
+            Some(slot) if slot.waiting_for.is_none() && slot.proc.state() == TaskState::Blocked => {
+                // 预置"曾阻塞、请重试"哨兵：用户态封装据此重试 FETCH 取数据。
+                slot.saved.rax = AUDIO_WAKE_RETRY_SENTINEL;
+                slot.proc.set_state(TaskState::Ready);
+                Some(slot.home_cpu)
+            }
+            _ => None,
+        }
+    };
+    if let Some(home) = enqueue {
+        wake_enqueue(p as usize, home);
+    }
+}
+
+/// 音频等待的超时唤醒（`klib::time::set_timeout` 回调，等待端注册）。
+///
+/// 与 [`wake_audio`] 的差异：把保存帧 rax 预置为 `0`（超时），用户态封装识别为
+/// "超时无数据"，与"有数据请重试"（`-EAGAIN`）区分开——不把超时误当数据到达。
+/// 超时触发即说明定时器已到期，无需再 cancel。
+///
+/// **S21 竞争消解**（与 `wake_event_timeout` 同构）：`if state == Blocked` 检查保证
+/// **数据优先**——wake_audio 已把等待者置 Ready 时，本回调不覆盖其哨兵；仅当等待者
+/// 仍处 Blocked（数据尚未接管，超时是实际唤醒源）才写入 0。
+pub fn wake_audio_timeout(pid: usize) {
+    AUDIO_TIMER.store(u64::MAX, core::sync::atomic::Ordering::Release);
+    {
+        let mut g = proc_bucket_lock(pid);
+        if let Some(slot) = g.get_mut(&pid) {
+            if slot.proc.state() == TaskState::Blocked {
+                slot.saved.rax = 0;
+            }
+        }
+    }
+    wake(pid);
+}
+
+/// 记录音频等待注册的超时定时器 id，供 [`wake_audio`] 在数据唤醒时取消。
+pub fn set_audio_timeout_timer(id: u64) {
+    AUDIO_TIMER.store(id, core::sync::atomic::Ordering::Release);
+}
+
+/// 清空音频超时定时器 id 槽。在等待的**提前返回**路径调用，配合
+/// `klib::time::cancel_timeout` 防止 stale 定时器泄漏与级联污染新等待（S18/S21）。
+pub fn clear_audio_timeout_timer() {
+    AUDIO_TIMER.store(u64::MAX, core::sync::atomic::Ordering::Release);
+}
+
+/// 若 [`AUDIO_WAITER`] 仍残留 `pid`（超时唤醒后登记未清），CAS 清为 MAX。
+///
+/// 由等待端在每次 `block_for_audio` **重新登记前**调用：超时唤醒路径不清登记
+/// （数据唤醒才经 swap 清），残留会让本次 CAS 失败（NotSwitched）且让 wake_audio
+/// 误读本 pid。只在仍指向 `pid` 时清除，绝不误伤并发等待者。
+pub fn clear_audio_waiter_if(pid: usize) {
+    let _ = AUDIO_WAITER.compare_exchange(
+        pid as u32,
+        u32::MAX,
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Acquire,
+    );
+}
+
+/// 阻塞当前进程等待音频数据可读（`AUDIO_FETCH` 无数据时调用）。
+///
+/// 返回 [`SwitchOutcome`]：语义与 [`block_for_event`] 逐条对应。
+/// - `Switched`：已置 Blocked 切走；唤醒后经 tick 回归用户态，`saved.rax` 由
+///   唤醒方预置（数据到达置 `-EAGAIN` 重试哨兵；超时置 `0`）。调用方须以
+///   `DispatchResult::Switched` 收尾。
+/// - `NotSwitched`：**数据已在登记复检时就绪**（调用方应立即取数据），或已有
+///   并发等待者。现场未动、无副作用。
+///
+/// `has_data` 是调用方提供的就绪探针（读 ring 水位）。把它作为参数而非在本函数
+/// 内硬编码读 ring，是为了让 task crate **不依赖 vfs**（S12/S14：不制造反向依赖，
+/// 也不为调度器开特权旁路）。
+///
+/// **lost-wakeup 论证**（与 `block_for_event` 同构）：登记（CAS 写 AUDIO_WAITER）
+/// 先于 per-pid 临界区；置 Blocked 在 cur 的 per-pid 锁内完成；[`wake_audio`]
+/// 也取目标 pid 锁才改 Ready。故"数据到达 → wake_audio"与"本进程登记"被锁完全
+/// 串行：若数据先到，wake_audio 见无等待者直接返回，本进程随后复检 `has_data()`
+/// **为真** → 不阻塞，返回 NotSwitched 让调用方取数；若本进程先登记，wake_audio
+/// 必在登记后（锁内）读到 pid 并唤醒。不存在"登记后数据到达却无人唤醒"的窗口。
+///
+/// `has_data` 的调用时机关键：**在 CAS 登记之后、置 Blocked 之前**。这是闭合
+/// lost-wakeup 的复检点——顺序颠倒则数据可在"复检通过"与"置 Blocked"之间到达，
+/// 此时 wake_audio 读到已登记的 pid 却因尚未 Blocked 而不唤醒（见 wake_audio 的
+/// `state == Blocked` 判据），进程随后入睡且无人再唤醒 = 永久挂起。
+pub fn block_for_audio<F>(frame: &mut InterruptFrame, has_data: F) -> SwitchOutcome
+where
+    F: Fn() -> bool,
+{
+    let cur_pid = {
+        let run = run_mut(my_cpu_slot());
+        let cur = run.current.expect("block_for_audio outside process");
+        assert!(
+            cur < u32::MAX as usize,
+            "pid {} collides with AUDIO_WAITER sentinel",
+            cur
+        );
+        cur
+    };
+    if AUDIO_WAITER
+        .compare_exchange(
+            u32::MAX,
+            cur_pid as u32,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // 已有并发等待者：不阻塞，调用方按"无数据"处理（如实 WouldBlock）。
+        return SwitchOutcome::NotSwitched;
+    }
+    // 登记后复检就绪条件：若数据已到，撤销登记、不阻塞（调用方立即取数）。
+    // 这是 lost-wakeup 的关键防线——数据先到则此处直接返回，绝不错过。
+    if has_data() {
+        AUDIO_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+        return SwitchOutcome::NotSwitched;
+    }
+    let cpu_slot = my_cpu_slot();
+    let mut run = run_mut(cpu_slot);
+    {
+        let mut g = proc_bucket_lock(cur_pid);
+        if let Some(slot) = g.get_mut(&cur_pid) {
+            slot.saved = *frame;
+            fpu::save(&mut slot.fpu);
+            slot.fs_base = gdt::read_fs_base();
+            slot.proc.set_state(TaskState::Blocked);
+        }
+    }
+    run.current = None;
+    clear_current_proc();
+
+    match pop_and_commit_switch(&mut run, frame, None, usize::MAX) {
+        NextCommit::Switched => {
+            // 同 block_for_event：**不在此清 AUDIO_WAITER**。切换只更新调度元数据，
+            // 此处清除会抹掉已登记的等待者身份，导致数据到达时 wake_audio 读到 MAX、
+            // 无法唤醒本进程。清除由唤醒方负责。
+            SwitchOutcome::Switched
+        }
+        NextCommit::Empty | NextCommit::NothingSelf => {
+            drop(run);
+            match schedule_from_block(frame, cur_pid) {
+                // 切到其它就绪进程：自己仍 Blocked + 登记不变。
+                BlockResume::SwitchedOther => SwitchOutcome::Switched,
+                // 自己被唤醒入队：切回自身。对称的条件清理（仅当登记仍指向本 pid）——
+                // 数据唤醒已 swap 走登记（CAS 无效），超时唤醒则由此清除。
+                BlockResume::SwitchedSelf => {
+                    let _ = AUDIO_WAITER.compare_exchange(
+                        cur_pid as u32,
+                        u32::MAX,
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                    );
+                    SwitchOutcome::Switched
+                }
+            }
+        }
+    }
+}
+
+
 /// 事件唤醒预置到保存帧 rax 的"曾阻塞、请重试"哨兵（`-EAGAIN`）。
 /// 用户态封装看到 `-EAGAIN` 即重试；`0` 表示超时无事件（见 [`wake_event_timeout`]）。
 ///
@@ -1915,6 +2123,10 @@ fn terminate_member_locked(pid: usize, code: u64) -> Termination {
         if let Some(e) = proc_bucket_lock(pid).remove(&pid) {
             let oh = e.home_cpu;
             vfs::flock::flock_release_all_for_owner(e.proc.identity().uid);
+            // A2（S18）：进程回收时释放其占用的音频消费者槽，否则音频节点会被
+            // 一个不存在的进程永久独占，拒绝所有后续驱动（静默且难排查）。
+            // 与 flock 释放同点：都是"该进程持有的全局资源"归还处。
+            vfs::audio::audio_on_process_exit(pid);
             retire_entry(e, oh);
         }
         Termination::DeliveredToParent
@@ -1991,6 +2203,10 @@ fn terminate_process_locked(pid: usize, code: u64) -> Termination {
         // R6 flock（K3）：进程回收时释放其持有的全部锁，杜绝锁表泄漏。
         if let Some(e) = proc_bucket_lock(pid).remove(&pid) {
             vfs::flock::flock_release_all_for_owner(e.proc.identity().uid);
+            // A2（S18）：进程回收时释放其占用的音频消费者槽，否则音频节点会被
+            // 一个不存在的进程永久独占，拒绝所有后续驱动（静默且难排查）。
+            // 与 flock 释放同点：都是"该进程持有的全局资源"归还处。
+            vfs::audio::audio_on_process_exit(pid);
             retire_entry(e, home);
         }
         Termination::Reclaimed
@@ -2002,6 +2218,10 @@ fn terminate_process_locked(pid: usize, code: u64) -> Termination {
         // R6 flock（K3）：进程回收时释放其持有的全部锁，杜绝锁表泄漏。
         if let Some(e) = proc_bucket_lock(pid).remove(&pid) {
             vfs::flock::flock_release_all_for_owner(e.proc.identity().uid);
+            // A2（S18）：进程回收时释放其占用的音频消费者槽，否则音频节点会被
+            // 一个不存在的进程永久独占，拒绝所有后续驱动（静默且难排查）。
+            // 与 flock 释放同点：都是"该进程持有的全局资源"归还处。
+            vfs::audio::audio_on_process_exit(pid);
             retire_entry(e, home);
         }
         Termination::DeliveredToParent
@@ -2028,6 +2248,10 @@ fn terminate_process_locked(pid: usize, code: u64) -> Termination {
             if let Some(e) = proc_bucket_lock(v).remove(&v) {
                 let oh = e.home_cpu;
                 vfs::flock::flock_release_all_for_owner(e.proc.identity().uid);
+            // A2（S18）：进程回收时释放其占用的音频消费者槽，否则音频节点会被
+            // 一个不存在的进程永久独占，拒绝所有后续驱动（静默且难排查）。
+            // 与 flock 释放同点：都是"该进程持有的全局资源"归还处。
+            vfs::audio::audio_on_process_exit(pid);
                 retire_entry(e, oh);
             }
         }
