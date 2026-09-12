@@ -90,10 +90,22 @@ pub(crate) mod raw {
     /// 正是越界读 panic 的入口（红阶段实测：len=136、index=4232）。
     pub(crate) fn parse_header(elf: &[u8]) -> Result<ElfHeader, Error> {
         if elf.len() < EHDR_SIZE {
-            return Err(Error::InvalidParam);
+            // LD3：连 ELF 头都装不下 —— 同样属于「这不是 ELF」（ENOEXEC），
+            // 而非「是 ELF 但某字段非法」。空文件、被截断的文件、随便一个
+            // 短文本文件都会走到这里，它们与"内核不支持这个 ELF"无关。
+            return Err(Error::ExecFormat);
         }
         if elf[0..4] != ELF_MAGIC {
-            return Err(Error::InvalidParam);
+            // LD3：**不是 ELF** 与「ELF 头里某字段非法」是两类不同的失败。
+            // 前者是「这不是一份可执行镜像」（ENOEXEC），后者是
+            // 「是 ELF 但这处参数不合法」（EINVAL）。
+            //
+            // 此前两者都报 InvalidParam，用户态无法区分「文件坏了」与
+            // 「内核不支持」。`Error::ExecFormat` 的文档已写明它表达
+            // 「这份镜像本身不合法」，但代码里从未在 magic 处使用，
+            // 使该变体在 sys_exec 路径装载上形同虚设。
+            // 实测（QEMU）：执行纯文本文件得到 errno=22 而非 8，正是该缺陷。
+            return Err(Error::ExecFormat);
         }
         if elf[4] != ELFCLASS64 {
             return Err(Error::NotSupported);
@@ -300,12 +312,21 @@ pub(crate) mod raw {
 
         #[test]
         fn parse_rejects_structural_garbage() {
-            assert_eq!(parse_header(&[]), Err(Error::InvalidParam));
-            assert_eq!(parse_header(&[0x7f]), Err(Error::InvalidParam));
 
+            // LD3：magic 不对 = **不是 ELF**，必须是 ExecFormat（ENOEXEC），
+            // 不能与「ELF 头字段非法」（InvalidParam/EINVAL）混为一谈。
             let mut magic = build_elf(0, 64, 56, 1);
             magic[0] = 0;
-            assert_eq!(parse_header(&magic), Err(Error::InvalidParam));
+            assert_eq!(parse_header(&magic), Err(Error::ExecFormat));
+            // 同一条纪律：空文件 / 短于 ELF 头同样是「不是 ELF」。
+            assert_eq!(parse_header(&[]), Err(Error::ExecFormat));
+            assert_eq!(parse_header(&[0x7f]), Err(Error::ExecFormat));
+            // 纯文本文件（长度足够但 magic 不对）—— 这正是用户在 shell 里
+            // 敲一个非 ELF 文件时走的路径，实测曾错误地得到 EINVAL(22)。
+            assert_eq!(
+                parse_header(b"this is plain text, not an ELF image\n"),
+                Err(Error::ExecFormat)
+            );
 
             let mut class = build_elf(0, 64, 56, 1);
             class[4] = 1; // ELFCLASS32
