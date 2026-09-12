@@ -829,7 +829,14 @@ fn init_livecd() {
 }
 
 /// 安装模式：把启动盘分区（mbr_disk_id + partition_index）的 EXT2 挂为根，
-/// `/programs` 是池内普通目录（**不**做内置 payload 兜底，ADR-029 §决策4）。
+/// `/programs` 是池内普通目录，**内容来自安装侧写入的磁盘本身**
+/// （SDK `build --systemdisk` 把全部用户程序 ELF 写进 `systemdisk.img`），
+/// 运行期不做内置 payload 兜底（ADR-029 §决策4）。
+///
+/// **「不兜底」的准确含义**：不把内核内嵌的那份 payload 覆盖/遮蔽到盘上的
+/// `/programs` 上（那正是 ADR-028 要拆掉的「双源」）。
+/// 它**不表示**安装模式下 `/programs` 是空的或缺程序——
+/// 盘里装了什么就是什么，盘里没有才是真的没有。
 ///
 /// 返回 true 表示成功建立安装模式根；false 表示找不到匹配盘（调用方退化
 /// liveCD）。骨架目录（/programs /config /system /volumes ...）直接在池上
@@ -889,7 +896,8 @@ fn init_install(mbr_disk_id: u32, partition_index: u32) -> bool {
         let mount_table = Arc::new(MountTable::new(Arc::new(ext2)));
         build_skeleton(&mount_table);
         // ADR-029 §决策4：安装模式 /programs 是池内普通目录，不做内置
-        // payload 兜底——盘里没有就是没有。
+        // payload 兜底——即**不遮蔽盘上的内容**，而非「盘上没有内容」。
+        // 盘上的 ELF 由 SDK build --systemdisk 写入（见 init_install 文档）。
         klib::info!(
             "[boot] install mode root = '{}' partition lba={} (EXT2), /programs = pool directory (no built-in fallback)",
             info.name,
