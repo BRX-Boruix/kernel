@@ -7391,10 +7391,20 @@ pub fn test_loader_adversarial() {
     const FILE_LEN: usize = 64 + 56 + 16;
 
     // -- 1. 畸形头 --
-    expect_loader_reject(&[0x7f, b'E', b'L', b'F'], &[], Error::InvalidParam, "truncated image");
+    //
+    // LD3：以下两例的语义都是「**这不是一份可执行镜像**」，故必须是
+    // ExecFormat（ENOEXEC=8），而不是「是 ELF 但某字段非法」的 InvalidParam。
+    //
+    // 为何要区分：用户从 shell 执行一个非 ELF 文件（打错路径、文本文件、
+    // 被截断的文件）时，EINVAL 会把排查方向指向「内核参数校验」，
+    // 而真实原因是「这个文件不是程序」。实测（QEMU）执行纯文本文件曾得到
+    // errno=22，修正后为 8。
+    //
+    // 注意：这不是「放宽校验」——拒绝强度不变，只是错误语义更准确。
+    expect_loader_reject(&[0x7f, b'E', b'L', b'F'], &[], Error::ExecFormat, "truncated image");
     let mut magic = build_loader_elf(&LoaderElfSpec::BASE);
     magic[0] = 0x00;
-    expect_loader_reject(&magic, &[], Error::InvalidParam, "bad magic");
+    expect_loader_reject(&magic, &[], Error::ExecFormat, "bad magic");
     let mut class = build_loader_elf(&LoaderElfSpec::BASE);
     class[4] = 1; // ELFCLASS32
     expect_loader_reject(&class, &[], Error::NotSupported, "wrong EI_CLASS");
