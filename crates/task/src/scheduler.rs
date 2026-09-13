@@ -150,8 +150,32 @@ struct ProcEntry {
 /// that same core's tick/spawn drains it (avoids cross-core borrow). Every online core
 /// (incl. APs) owns its slot under symmetric multiprocessing. This const-array-of-
 /// IrqSpinLock is the per-CPU-lock pattern the per-CPU ready/current split will mirror.
-static DEAD_KSTACKS: [IrqSpinLock<Vec<PhysFrame>>; MAX_SCHED_CPUS] =
+static DEAD_KSTACKS: [IrqSpinLock<Vec<DeadRetire>>; MAX_SCHED_CPUS] =
     [const { IrqSpinLock::new(Vec::new()) }; MAX_SCHED_CPUS];
+
+/// 一个等待归还的退役单元：内核栈帧 + 独立用户地址空间。
+///
+/// **为什么地址空间也要延迟回收**（与内核栈同源，且更致命）：
+///
+/// `drop(proc)` 会走 [`UserAddressSpace::destroy`]，其中会释放该进程的**顶层
+/// 页表帧**。其判定是 `if top == PT::current_paddr()` —— 只保证**销毁核**不在
+/// 用该表。但 CR3 是**每核独立**的：销毁核（收尸的父核）的 CR3 不等于 top，
+/// **不代表 home 核的 CR3 也不等于 top**。
+///
+/// `kill_pid` 跨核终止只是远程置 Exit + 发 IPI；home 核在到达调度点之前，
+/// CR3 仍悬在该进程的用户页表上。若父核此刻收尸并立即 drop，顶层表帧被还给
+/// buddy（随即被复用/清零），home 核再执行内核代码时高半区映射即失真 ——
+/// 实测表现为 `CR2 == RIP` 的**取指缺页**（e.code=0x18：P=1 保护违例 + I/D=1
+/// 取指），最终 #PF → #DF → **三重故障重启**（QEMU `-d int` 记录 `Triple fault`）。
+///
+/// 故地址空间与内核栈必须**同一时机**归还：交给 home 核，在 [`idle_loop_body`]
+/// （本核已停在 idle 栈、且已 `switch_to_kernel_root`）统一 drop。
+struct DeadRetire {
+    /// 该进程的内核栈帧（order 记录在分配器元数据中，按基址整块归还）。
+    kstack: PhysFrame,
+    /// 该进程的 PCB（持有 `Arc<UserAddressSpace>`；drop 即回收页表与叶帧）。
+    proc: Option<Box<Process<X86PageTable>>>,
+}
 
 /// 槽位退役单点：FPU 区随 entry 丢弃，内核栈帧入**本进程 home 核**的延迟回收队列，
 /// 其余字段（Box<Process> → addr_space Drop）沿用 M5 用户资源回收语义。
@@ -169,21 +193,43 @@ fn retire_entry(entry: Box<ProcEntry>, home_cpu: usize) {
         kstack_frames,
         ..
     } = *entry;
+    // **栈与地址空间一起延迟归还，交给 home 核。**
+    //
+    // 原实现只延迟栈、就地 `drop(proc)`，理由是"该 Drop 只操作 HHDM 映射与
+    // 空闲池，不触碰本栈"。该论证只覆盖了**栈**，漏了**页表**：`drop(proc)`
+    // 会释放顶层页表帧，而 home 核的 CR3 可能仍悬在该表上（跨核 kill 后
+    // home 核尚未到达调度点）。表帧一旦被复用，home 核执行内核代码即取指
+    // 缺页 → #DF → 三重故障重启。详见 [`DeadRetire`]。
     DEAD_KSTACKS[home_cpu & (MAX_SCHED_CPUS - 1)]
         .lock()
-        .push(kstack_frames);
-    // proc 在此 drop：UserAddressSpace::destroy 回收用户页表/叶帧（M5）。
-    // 该 Drop 只操作 HHDM 映射与空闲池，不触碰本栈，就地安全（既有行为）。
-    drop(proc);
+        .push(DeadRetire {
+            kstack: kstack_frames,
+            proc: Some(proc),
+        });
 }
 
-/// 归还延迟队列中的全部内核栈帧（仅限"确定不在将死栈上"的入口调用：
-/// tick 顶部、spawn 入口；测试钩子可对哑进程直接调用）。
+/// 归还延迟队列中的全部内核栈帧。
+///
+/// **只允许在"本核确定已切下所有将死栈"的入口调用**——当前唯一生产入口是
+/// [`idle_loop_body`]（本核已停在 idle 栈上）。测试钩子可对哑进程直接调用。
+///
+/// **tick 顶部与 spawn 入口都曾调用本函数，都因 UAF 被移除**：
+/// 跨核收尸后，将死进程的栈帧进入其 **home 核** 的队列，但 home 核此刻可能
+/// **仍运行在那个栈上**（`kill_pid` 只是远程置 Exit + 发 IPI，目标要等本核
+/// 调度点才真正切下）。此时若"碰巧也在该核"的调用者（tick 中断或 spawn 的
+/// 父进程）drain，就会把本核正在使用的栈还给 buddy，随后 `allocate_frames`
+/// 又把它分给新进程 —— 两块逻辑上不同的内核栈叠在同一物理帧上，表现为
+/// 随机栈损坏，最终 `raw_serial_fmt` 压栈越界 → #PF → #DF → **三重故障重启**
+/// （实测：SIGKILL 风暴 round 1→2 之间平台间歇复位，QEMU `-d int` 记录 Triple fault）。
 fn drain_dead_kstacks() {
     let mut q = DEAD_KSTACKS[my_cpu_slot()].lock();
-    for frame in q.drain(..) {
+    for entry in q.drain(..) {
+        // 先 drop PCB（内含 UserAddressSpace::destroy：释放顶层页表与叶帧），
+        // 再归还内核栈帧。顺序有意为之：本核此刻已停在 idle 栈上并已由调用方
+        // 切回内核根页表，故销毁页表不会波及正在执行的翻译。
+        drop(entry.proc);
         // order 记录在分配器帧元数据中，按基址整块归还（16 帧一次到位）。
-        mm::deallocate_frame(frame);
+        mm::deallocate_frame(entry.kstack);
     }
 }
 
@@ -453,9 +499,17 @@ pub fn spawn_with_ppid_fds(
     inherited_fds: Option<alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>>>,
     identity: ProcessIdentity,
 ) -> Result<usize, Error> {
-    // 延迟回收先于新分配执行（task1 K3）：把已退出进程的内核栈帧还池，
-    // 提高 spawn 在内存压力下的成功率。
-    drain_dead_kstacks();
+    // **此处不得 drain 内核栈**（task1 K3 的"延迟回收先于新分配"已被推翻）。
+    //
+    // 原意图是提高 spawn 在内存压力下的成功率，但前提是错的：本函数运行在
+    // **调用者（父进程）的内核栈**上，而队列里的栈属于被杀进程的 **home 核**。
+    // 父核与 home 核相同时（风暴里 init 的多次 spawn 正是如此），drain 会把
+    // **本核可能仍在使用的**栈帧还池，紧接着下方 `allocate_frames(KSTACK_ORDER)`
+    // 又把它分给新进程 → 两栈叠帧 → 栈损坏 → 三重故障重启。
+    //
+    // `kill_pid` 只是远程置 Exit + 发 IPI，目标进程要等其 home 核到达调度点
+    // 才真正切下；故"进程已 Exit"**不等于**"其栈已可回收"。回收统一交给
+    // [`idle_loop_body`]（本核停在 idle 栈时，确定已切下一切）。
     let (name_buf, name_len) = store_name(name)?;
     // 父必须真实存在且非 zombie，否则拒绝建立虚假父子关系（零伪数据）。
     // 分桶化：父须实际在册（map 中存在）且非 zombie；否则视同无父/不存在。
@@ -542,7 +596,10 @@ pub fn spawn_thread_with(
     user_stack_top: u64,
     starter: u64,
 ) -> Result<usize, Error> {
-    drain_dead_kstacks();
+    // 同 `spawn_with_ppid_fds`：此处**不得** drain 内核栈。本函数运行在调用
+    // 者的内核栈上，而队列中的栈属于被收尸进程的 home 核；两者同核时会把
+    // 本核仍在使用的栈还池，紧接着的栈分配即与其叠帧 → 栈损坏 → 三重故障重启。
+    // 回收统一交给 `idle_loop_body`（本核停在 idle 栈时，确定已切下一切）。
     let (name_buf, name_len) = store_name(name)?;
     // 组长必须真实在册且非 zombie（零伪数据：找不到组长/组长已退出则拒绝派生）。
     // 锁序：仅短暂持组长所在桶锁快照其组容器 Arc 与信号 restorer 地址，随即释放；
@@ -2573,16 +2630,21 @@ unsafe extern "C" fn idle_stack_switch(idle_top: u64) -> ! {
 /// 然后弹出一个就绪进程并经全量 InterruptFrame iretq 恢复到用户态。
 unsafe extern "C" fn idle_loop_body() -> ! {
     let cpu_slot = my_cpu_slot();
-    // 本核已停车在**自己的 idle 栈**上，确定不在任何进程栈上执行：
-    // 在此 drain 本核 DEAD_KSTACKS 安全——跨核收尸入队的、本核曾运行进程的
-    // 栈（经 A3 go_idle 后本核已切下它们）在此归还，杜绝"收尸核提前释放他核在用栈"。
-    drain_dead_kstacks();
-    // A4 修复：本核刚切下某个将死进程并停车。必须把 CR3 切回**内核根页表**，
-    // 否则 CR3 仍指向该将死进程的用户页表；父核随后收尸 drop 其 UserAddressSpace
-    // 会释放该顶层表帧，而本核停车的 CR3 仍指向它 → 唤醒/中断时经已释放/复用的
-    // 页表翻译 → 全系统内存损坏。内核根表高半区映射与本核一致，切换对运行中
-    // 内核透明；后续 switch_apply_next 切到新进程时会再写回其表。
+    // **顺序至关重要：必须先切回内核根页表，再 drain。**
+    //
+    // A4 修复：本核刚切下某个将死进程并停车，CR3 可能仍指向该进程的用户页表。
+    // 内核根表高半区映射与本核一致，切换对运行中的内核透明；后续
+    // `switch_apply_next` 切到新进程时会再写回其表。
+    //
+    // 先切 CR3 才有下面的安全性：`drain_dead_kstacks` 会 `drop(proc)`，而
+    // `UserAddressSpace::destroy` 释放顶层页表帧。若此刻本核 CR3 仍悬在该表上，
+    // 释放后本核下一条指令的取指就走已回收的表 → 取指缺页 → 三重故障。
+    // 切换在前即杜绝此路径（`destroy` 内部也据此判定为"非活动表"直接归还）。
     arch_x86_64::paging::switch_to_kernel_root();
+    // 本核已停车在**自己的 idle 栈**上（确定不在任何进程栈上执行）且已切回
+    // 内核根页表（确定不悬在任何将死页表上）：此时归还栈帧与地址空间才安全。
+    // 跨核收尸入队的、本核曾运行进程的资源，经 A3 go_idle 后本核已切下它们。
+    drain_dead_kstacks();
     // 开中断后 halt：与旧 idle halt 一致。spawn 不发 IPI，依赖下一次 IRQ0 醒睡後重检（同 start()）。
     arch_x86_64::interrupts::enable();
     loop {
