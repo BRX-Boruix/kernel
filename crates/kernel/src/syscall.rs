@@ -1779,7 +1779,8 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
         child_identity,
     ) {
         Ok(pid) => {
-            klib::info!(
+            // 每进程一条的流程细节：降为 debug（默认不输出）。
+            klib::debug!(
                 "[syscall] exec prog={} -> pid={} (ppid={}) entry={:#x}",
                 prog_name,
                 pid,
@@ -2030,7 +2031,7 @@ fn sys_thread_spawn(frame: &mut SyscallFrame) -> u64 {
     };
     match task::spawn_thread_with(tgid, "thread", entry, user_stack_top, starter) {
         Ok(tid) => {
-            klib::info!(
+            klib::debug!(
                 "[syscall] thread_spawn leader={} -> tid={} entry={:#x} stack={:#x}",
                 tgid,
                 tid,
@@ -2153,7 +2154,7 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
 fn sys_exit(frame: &mut SyscallFrame) -> u64 {
     let code = frame.a1;
     let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
-    klib::info!("[syscall] process {} exit(code={})", pid, code);
+    klib::debug!("[syscall] process {} exit(code={})", pid, code);
     task::exit_current(arch_frame(frame), code);
     0
 }

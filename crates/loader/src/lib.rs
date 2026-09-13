@@ -628,7 +628,7 @@ mod backend {
 
         let stack_top = setup_user_stack(addr_space, cmd)?;
 
-        klib::info!(
+        klib::debug!(
             "[elf] loaded {} segments, entry={:#x}, stack_top={:#x}",
             loaded,
             hdr.entry,

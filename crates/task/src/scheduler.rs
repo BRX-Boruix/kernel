@@ -316,7 +316,7 @@ fn spawn_home_cpu() -> usize {
                 let l = r.ready.len() + usize::from(r.current.is_some());
                 if l < bl { bl = l; best = c; }
             }
-            klib::info!("[sched] spawn least-loaded home={} (load={}, online={})", best, bl, n);
+            klib::debug!("[sched] spawn least-loaded home={} (load={}, online={})", best, bl, n);
             return best & (MAX_SCHED_CPUS - 1);
         }
     }
@@ -2458,11 +2458,41 @@ fn waitpid_inner(
     // 阻塞等待（WAIT_ANY 与单目标共用阻塞逻辑）。
     // 等待目标：WAIT_ANY 或具体 pid。
     let wait_for = if target_pid == WAIT_ANY { WAIT_ANY } else { target_pid };
-    let others_ready = run.ready.iter().any(|&p| {
-        if p == cur { return false; }
-        let gi = proc_bucket_lock(p);
-        matches!(gi.get(&p), Some(e) if e.proc.state() == TaskState::Ready)
-    });
+    // "有无可切对象"必须**全系统**判定，不能只看本核就绪队列。
+    //
+    // 旧实现只扫 `run.ready`（本核队列）便拒绝阻塞返回 `WouldBlock`。多核下
+    // 这几乎必然误判：子进程 home 在别的核、或此刻所有可运行进程都排在别的核
+    // 队列上时，本核队列为空 —— 但子进程**照样会跑完**，其终止路径经
+    // `deliver_ppid_home` **跨核**把本进程置 Ready 并唤醒（见终止路径注释）。
+    // 故"本核队列空"不等于"无人可运行"，更不等于"不该阻塞"。
+    //
+    // 误判代价极高：shell 前台 `exec` 后 `waitpid_any` 拿到 `WouldBlock`，
+    // 旧实现直接放弃并 exit(126)，留下仍在跑的子进程；init 随即重拉 shell，
+    // 多个将死 shell 并发读键盘缓冲瓜分输入（`clear` 变 `r`/`clea`）。
+    //
+    // 正确判据：**系统内是否还有别的可运行进程**（任意核的 ready 或某核正在
+    // 运行的非 cur 进程）。有 → 阻塞安全（cur 被唤醒的路径不依赖本核队列）。
+    // 只有全系统确实无他人可运行时才拒绝，避免让出后无人可运行。
+    let others_ready = {
+        let mut found = false;
+        for slot in 0..MAX_SCHED_CPUS {
+            if slot == my_cpu_slot() {
+                // 本核：直接用调用方已持有的 run（同域，不可重入取锁）。
+                if run.ready.iter().any(|&p| p != cur) {
+                    found = true;
+                    break;
+                }
+            } else {
+                // 经全路径调用，避开形参 `run` 的同名遮蔽。
+                let g = crate::scheduler::run(slot);
+                if g.ready.iter().any(|&p| p != cur) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        found
+    };
     // 登记/回滚在 cur 的 per-pid 锁内完成（与子进程终止路径对父的交付互斥）。
     let revert = |cur: usize| -> Error {
         let mut gc = proc_bucket_lock(cur);
