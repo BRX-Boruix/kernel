@@ -307,6 +307,21 @@ struct Ext2Inner {
     /// 分区起始字节地址 = 分区起始 LBA × 512。
     part_start_byte: u64,
     sb: Ext2Superblock,
+    /// 根 inode（固定 2 号）的缓存。
+    ///
+    /// **为何缓存**：`FileSystem::root()` 位于 VFS 路径解析的热路径上
+    /// （`mount.rs` 每次 resolve 都调）。不缓存则每次路径解析都要重新读
+    /// 组描述符 + 根 inode（两次设备 I/O），既浪费又**放大并发窗口**——
+    /// 本缺陷正是这条链上的并发短读。缓存把这两次 I/O 收敛到挂载时一次，
+    /// `root()` 退化为纯内存取用。
+    ///
+    /// **为何是 Mutex 而不是纯字段**：本文件系统**可写**，而在根目录下
+    /// 创建/删除条目会更新**父目录 inode**——对根目录而言就是 inode 2 本身
+    /// （见 `add_dir_entry`/`create_entry` 里的 `write_inode(dir)`，以及
+    /// `unlink`）。若只缓存不刷新，`root()` 就会交出**过期元数据**（陈旧
+    /// 的 size/mtime），那是伪数据，比崩溃更隐蔽。故 `write_inode` 在写
+    /// inode 2 时同步刷新本缓存。
+    root_inode: spin::Mutex<Inode>,
 }
 
 impl Ext2Fs {
@@ -318,12 +333,38 @@ impl Ext2Fs {
             return Err(Ext2Error::ShortRead);
         }
         let sb = parse_superblock(&sb_buf)?;
-        Ok(Self {
-            inner: Arc::new(Ext2Inner {
-                dev,
-                part_start_byte,
-                sb,
+        // **根 inode 在挂载时读一次并缓存**：
+        //
+        // 1. 读失败即 `open` 失败——这是正确的错误归属。镜像残缺应在挂载点
+        //    暴露，而不是等到某次路径解析时才炸穿内核。此前该读取发生在
+        //    `root()` 里且用 `expect`，把可恢复的 I/O 错误升级成了 panic
+        //    （实测：并发短读 → ShortRead → 内核 panic）。
+        // 2. 缓存消掉了路径解析热路径上的两次设备读（组描述符 + 根 inode），
+        //    因而也收窄了并发窗口——本缺陷正是这条链上的并发短读。
+        //
+        // 用自由函数 `read_inode_in` 而非 `self.read_inode`：此刻 `Arc` 尚未
+        // 构造，没有 `Ext2Fs` 可借用。`root_inode` 的初值只是占位，
+        // 紧接着被真实读值覆盖。
+        let mut inner = Ext2Inner {
+            dev,
+            part_start_byte,
+            sb,
+            // 占位；紧接着用真实读值填充（`Mutex` 内不能直接构造终值，
+            // 因为 `read_inode_in` 需要先有 `inner` 才能寻址）。
+            root_inode: spin::Mutex::new(Inode {
+                ino: EXT2_ROOT_INO,
+                mode: 0,
+                size: 0,
+                blocks: [0; 15],
+                sectors: 0,
+                mtime: 0,
+                ctime: 0,
             }),
+        };
+        let root = read_inode_in(&inner, EXT2_ROOT_INO)?;
+        *inner.root_inode.lock() = root;
+        Ok(Self {
+            inner: Arc::new(inner),
         })
     }
 
@@ -444,57 +485,12 @@ impl Ext2Fs {
     /// fs1 FM4 附带：直接按 32 字节定长栈缓冲读取，不再整块分配堆内存
     /// 只为取前 32 字节。空闲计数 @12/@16 为 M3 写路径的组级记账锚点。
     fn read_group_desc(&self, group: u32) -> Result<GroupDesc, Ext2Error> {
-        let sb = self.superblock();
-        let gdt_block = (sb.first_data_block + 1) as u64;
-        let mut buf = [0u8; 32];
-        let off_abs =
-            self.inner.part_start_byte + gdt_block * sb.block_size as u64 + group as u64 * 32;
-        let n = self.inner.dev.read_bytes(off_abs, &mut buf);
-        if n < 32 {
-            return Err(Ext2Error::ShortRead);
-        }
-        Ok(GroupDesc {
-            block_bitmap: le_u32(&buf, 0),
-            inode_bitmap: le_u32(&buf, 4),
-            inode_table: le_u32(&buf, 8),
-            free_blocks: le_u16(&buf, 12) as u32,
-            free_inodes: le_u16(&buf, 14) as u32,
-        })
+        read_group_desc_in(&self.inner, group)
     }
 
-    /// 按 inode 号读取 inode 结构。
+    /// 按 inode 号读取 inode 结构（`FileSystem` 侧入口，转发到自由函数）。
     pub fn read_inode(&self, ino: u32) -> Result<Inode, Ext2Error> {
-        let sb = self.superblock();
-        if ino == 0 || ino > sb.inodes_count || sb.inodes_per_group == 0 {
-            return Err(Ext2Error::BadInode);
-        }
-        let group = (ino - 1) / sb.inodes_per_group;
-        let idx = (ino - 1) % sb.inodes_per_group;
-        let gd = self.read_group_desc(group)?;
-        let inode_table = gd.inode_table;
-        let bs = sb.block_size as u64;
-        let abs = self.inner.part_start_byte
-            + inode_table as u64 * bs
-            + idx as u64 * sb.inode_size as u64;
-        let isz = sb.inode_size as usize;
-        let mut raw = alloc::vec![0u8; isz];
-        if self.inner.dev.read_bytes(abs, &mut raw) < isz {
-            return Err(Ext2Error::ShortRead);
-        }
-        let mut blocks = [0u32; 15];
-        for (i, slot) in blocks.iter_mut().enumerate() {
-            *slot = le_u32(&raw, 40 + i * 4);
-        }
-        Ok(Inode {
-            ino,
-            mode: le_u16(&raw, 0),
-            size: le_u32(&raw, 4),
-            blocks,
-            sectors: le_u32(&raw, 28),
-            // fs1 FM1：时间戳真读——偏移就在已取回的原始字节里。
-            mtime: le_u32(&raw, 8),
-            ctime: le_u32(&raw, 16),
-        })
+        read_inode_in(&self.inner, ino)
     }
 
     /// 逻辑块号 → 物理块号。直接 12 块 + 一级/二级/三重间接全寻址。
@@ -1004,6 +1000,12 @@ impl Ext2Fs {
         }
         if self.inner.dev.write_bytes(abs, &raw) < isz {
             return Err(Ext2Error::ShortRead);
+        }
+        // 写的就是根 inode 时同步刷新缓存——否则 `root()` 会交出过期
+        // 元数据（在根目录建/删条目会更新父目录 inode，而根目录的父
+        // 就是 inode 2 自己）。伪数据比崩溃更隐蔽。
+        if inode.ino == EXT2_ROOT_INO {
+            *self.inner.root_inode.lock() = inode.clone();
         }
         Ok(())
     }
@@ -1936,14 +1938,76 @@ impl INode for Ext2Node {
     }
 }
 
+/// 读组描述符（自由函数形式：`open` 构造 Arc 之前也要用）。
+fn read_group_desc_in(inner: &Ext2Inner, group: u32) -> Result<GroupDesc, Ext2Error> {
+    let sb = &inner.sb;
+    let gdt_block = (sb.first_data_block + 1) as u64;
+    let mut buf = [0u8; 32];
+    let off_abs = inner.part_start_byte + gdt_block * sb.block_size as u64 + group as u64 * 32;
+    let n = inner.dev.read_bytes(off_abs, &mut buf);
+    if n < 32 {
+        return Err(Ext2Error::ShortRead);
+    }
+    Ok(GroupDesc {
+        block_bitmap: le_u32(&buf, 0),
+        inode_bitmap: le_u32(&buf, 4),
+        inode_table: le_u32(&buf, 8),
+        free_blocks: le_u16(&buf, 12) as u32,
+        free_inodes: le_u16(&buf, 14) as u32,
+    })
+}
+
+/// 按 inode 号读取 inode 结构（自由函数形式）。
+///
+/// 之所以不放在 `impl Ext2Fs` 里：`open` 需要在 `Arc<Ext2Inner>` 构造**之前**
+/// 读根 inode（读失败即 `open` 失败），此时还没有 `Ext2Fs` 可借用。
+fn read_inode_in(inner: &Ext2Inner, ino: u32) -> Result<Inode, Ext2Error> {
+    let sb = &inner.sb;
+    if ino == 0 || ino > sb.inodes_count || sb.inodes_per_group == 0 {
+        return Err(Ext2Error::BadInode);
+    }
+    let group = (ino - 1) / sb.inodes_per_group;
+    let idx = (ino - 1) % sb.inodes_per_group;
+    let gd = read_group_desc_in(inner, group)?;
+    let inode_table = gd.inode_table;
+    let bs = sb.block_size as u64;
+    let abs =
+        inner.part_start_byte + inode_table as u64 * bs + idx as u64 * sb.inode_size as u64;
+    let isz = sb.inode_size as usize;
+    let mut raw = alloc::vec![0u8; isz];
+    if inner.dev.read_bytes(abs, &mut raw) < isz {
+        return Err(Ext2Error::ShortRead);
+    }
+    let mut blocks = [0u32; 15];
+    for (i, slot) in blocks.iter_mut().enumerate() {
+        *slot = le_u32(&raw, 40 + i * 4);
+    }
+    Ok(Inode {
+        ino,
+        mode: le_u16(&raw, 0),
+        size: le_u32(&raw, 4),
+        blocks,
+        sectors: le_u32(&raw, 28),
+        // fs1 FM1：时间戳真读——偏移就在已取回的原始字节里。
+        mtime: le_u32(&raw, 8),
+        ctime: le_u32(&raw, 16),
+    })
+}
+
 /// EXT2 文件系统句柄（实现 vfs::FileSystem，可挂入 MountTable）。
 impl FileSystem for Ext2Fs {
     fn root(&self) -> Arc<dyn INode> {
-        // open() 已校验超级块；根 inode（固定 2 号）缺失说明镜像残缺，
-        // 属于不可恢复契约，expect 表达该契约并让挂载方在启动日志中看到。
-        let inode = self
-            .read_inode(EXT2_ROOT_INO)
-            .expect("ext2 root inode must exist after successful open");
+        // **不再在此处读盘、更不 panic。**
+        //
+        // 这里曾经是 `self.read_inode(EXT2_ROOT_INO).expect(...)`，注释
+        // 假设「open() 校验过一次，之后恒成功」。该假设是错的：本函数位于
+        // VFS 路径解析的热路径上（`mount.rs` 每次 resolve 都调），背后是
+        // 真实的设备 I/O，会失败。实测一次并发的 ATA 短读就让这个 `expect`
+        // 把可恢复的 I/O 错误升级成了内核 panic。
+        //
+        // 现在根 inode 已在 `open()` 时读好并缓存（读失败即挂载失败，
+        // 错误归属正确），本函数退化为纯内存取用，**不会失败**。
+        let inode = self.inner.root_inode.lock().clone();
         Arc::new(Ext2Node {
             fs: self.clone(),
             inode,
@@ -2843,6 +2907,52 @@ mod tests {
         // 恰好 255 应成功。
         let ok255 = "b".repeat(255);
         assert!(root.create(&ok255, Permissions::all()).is_ok(), "255-byte name must succeed");
+    }
+
+    /// **根 inode 缓存的失效语义**（本轮修复引入，必须锁住）。
+    ///
+    /// `FileSystem::root()` 现在返回 `open()` 时缓存的根 inode，不再每次
+    /// 读盘。但本文件系统**可写**：在根目录下建/删条目会更新**父目录
+    /// inode**——对根目录而言就是 inode 2 自己。若 `write_inode` 不刷新
+    /// 缓存，`root()` 就会交出**过期元数据**（伪数据，比崩溃更隐蔽）。
+    ///
+    /// **为何直接调 `write_inode` 而不是 `create()`**：
+    /// `add_dir_entry` 确实会写根 inode，但它只改 mtime/ctime，而宿主测试
+    /// 里 `now_timestamp_secs()` 退回单调秒——测试跑在 1 秒内，值恒为 0；
+    /// 目录 size 也只在需要新块时才增长，建几个小文件不会变。
+    /// 靠 `create()` 观察变化会**测试通过但什么都没验证**。
+    /// 这里直接用一个可区分的值写根 inode，精确锁定失效机制本身。
+    #[test]
+    fn test_root_inode_cache_refreshes_on_write_inode() {
+        let fs = open_writable();
+        let cached_before = fs.inner.root_inode.lock().size;
+        // 取盘上真实根 inode，改一个可区分的字段后写回。
+        let mut root = fs.read_inode(EXT2_ROOT_INO).expect("read root inode");
+        let new_size = root.size.wrapping_add(4096);
+        root.size = new_size;
+        fs.write_inode(&root).expect("write root inode");
+        // 缓存必须已随写入刷新。
+        let cached_after = fs.inner.root_inode.lock().size;
+        assert_eq!(
+            cached_after, new_size,
+            "write_inode(root) must refresh the cached root inode \
+             (before={}, expected={}, got={} => stale cache)",
+            cached_before,
+            new_size,
+            cached_after
+        );
+        // 并且与盘上真值一致。
+        let on_disk = fs.read_inode(EXT2_ROOT_INO).expect("re-read root");
+        assert_eq!(cached_after, on_disk.size, "cache must equal disk truth");
+        // 反向：写**非根** inode 不得污染根缓存。
+        let mut other = fs.read_inode(EXT2_ROOT_INO).expect("read");
+        other.ino = 11; // 任一非根 inode 号
+        other.size = 9999;
+        let _ = fs.write_inode(&other);
+        assert_eq!(
+            fs.inner.root_inode.lock().size, new_size,
+            "writing a non-root inode must NOT touch the root cache"
+        );
     }
 
     /// S04/S31：名字校验与 VFS validate_name 对齐——含控制字符的名字在

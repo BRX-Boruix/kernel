@@ -11,6 +11,9 @@
 //! - `pci_classes`：Devices 阶段 PCI 类匹配**候选登记器**（candidate-only，
 //!   ADR-022 §1——无真实硬件控制，绑定以 candidate 前缀呈现）。
 
+/// `ata_lock`：ATA PIO 总线锁（跨 CPU 串行化通道寄存器多步时序）。
+/// 必须在 `ata_pio` 之前声明——`ata_pio` 的每个 PIO 事务都以它为临界区。
+pub mod ata_lock;
 pub mod ata_pio;
 pub mod cmos;
 pub mod keyboard;

@@ -60,6 +60,13 @@ const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
 /// 宁可拒绝也不带病服务。0x14/0xEB 见 [`ATAPI_SIG_LBA_MID`]/[`ATAPI_SIG_LBA_HIGH`]。
 pub const LBA28_MAX_SECTORS: u64 = 0x0FFF_FFFF;
 
+/// 单个扇区读/写的重试次数（PIO 事务级，在 [`ata_read_sector`] 内部还有
+/// 一次 3 次命令重试之上）。
+///
+/// 取 4：并发的瞬时挤占通常 1~2 次内消失；真拔盘则 4 次全败后由
+/// `is_device_gone` 判定。**不设为无限**——设备真消失时必须能退出。
+const SECTOR_RETRIES: usize = 4;
+
 /// ATAPI 设备在 IDENTIFY DEVICE 失败路径上的签名值（LBA Mid / High 口），
 /// ATA/ATAPI 规范定义；用于把"包设备"从"无设备"中显式区分出来（drv1 DD3）。
 const ATAPI_SIG_LBA_MID: u8 = 0x14;
@@ -164,6 +171,10 @@ fn set_lba_regs(channel: u16, lba: u64, count: u8) {
 /// - 命令失败且 LBA Mid/High 呈 ATAPI 签名（0x14/0xEB）→
 ///   [`AtaIdentify::AtapiPacket`]，把包设备从"无设备"中显式区分。
 pub fn identify_ata(channel: u16, slave: bool) -> AtaIdentify {
+    // IDENTIFY 同样是一条完整的 PIO 命令（发 0xEC、等 DRQ、读 256 个字），
+    // 与读写共用同一组端口。不加锁的话，启动期识别盘时会与已运行设备的
+    // 并发 I/O 互相破坏（ADR-030 四槽位探测与卷挂载可能重叠）。
+    let _bus = super::ata_lock::lock();
     if !wait_not_busy(channel) {
         return AtaIdentify::Absent;
     }
@@ -211,6 +222,11 @@ pub fn identify_ata(channel: u16, slave: bool) -> AtaIdentify {
 }
 
 fn ata_read_sector(channel: u16, slave: bool, lba: u64, out: &mut [u8; 512]) -> bool {
+    // 整个 PIO 事务在总线锁内：选驱动器 -> 发命令 -> 等 DRQ -> 读数据字。
+    // 锁必须在**函数入口**取得并覆盖全程——只锁单条 outb 无法阻止另一 CPU
+    // 在两次 outb 之间插入它自己的 LBA/COMMAND 写（那正是短读的成因）。
+    // 可重入：write_at 的部分扇区写会在持有本锁时再调本函数（读-改-写）。
+    let _bus = super::ata_lock::lock();
     for attempt in 0..3 {
         if !wait_not_busy(channel) {
             klib::error!(
@@ -249,6 +265,9 @@ fn ata_read_sector(channel: u16, slave: bool, lba: u64, out: &mut [u8; 512]) -> 
 }
 
 fn ata_write_sector(channel: u16, slave: bool, lba: u64, data: &[u8; 512]) -> bool {
+    // 同 ata_read_sector：读写在**同一组端口**上，写与读并发一样会互相破坏
+    // （尤其 write_at 的读-改-写序列本身就是读后立刻写）。
+    let _bus = super::ata_lock::lock();
     for _ in 0..3 {
         if !wait_not_busy(channel) {
             continue;
@@ -359,7 +378,23 @@ impl IoDevice for AtaPioDevice {
         let mut buf = [0u8; 512];
         let mut remaining = out.len();
         while remaining > 0 && lba < total_sectors {
-            if !ata_read_sector(self.channel, self.slave, lba, &mut buf) {
+            // **读失败先重试同一个 LBA，不要直接 break。**
+            //
+            // 此前失败即 break，把「读了一部分」当正常短读返回给上层——
+            // 于是并发的瞬时故障被静默降级成 ShortRead，一路冒泡到 EXT2
+            // 的根 inode 读取处炸成 panic。而 ATA 的瞬时失败（并发挤掉一次
+            // 命令、设备短暂 BSY）与真拔盘在**单次**失败上无法区分。
+            //
+            // 重试到耗尽仍失败，才按「设备消失」处理——那时 is_device_gone
+            // 的 3 次 status 重读才有判别力。
+            let mut rd_ok = false;
+            for _ in 0..SECTOR_RETRIES {
+                if ata_read_sector(self.channel, self.slave, lba, &mut buf) {
+                    rd_ok = true;
+                    break;
+                }
+            }
+            if !rd_ok {
                 // 热插拔被动检测：IO 失败后总线飘高为 0xFF ⇒ 设备已消失
                 // （拔盘/掉线）。触发一次 unregister + DeviceDeparted，使
                 // volumed 卸载对应卷（ADR-030 热插拔闭环）。
@@ -414,7 +449,15 @@ impl IoDevice for AtaPioDevice {
             let take = core::cmp::min(remaining, 512 - sector_off);
             if sector_off != 0 || take < 512 {
                 // 部分扇区写：真实的读-改-写序列，两条命令各计其账。
-                if !ata_read_sector(self.channel, self.slave, lba, &mut buf) {
+                // 同 read_at：先重试同扇区，耗尽才按设备消失处理。
+                let mut rd_ok = false;
+                for _ in 0..SECTOR_RETRIES {
+                    if ata_read_sector(self.channel, self.slave, lba, &mut buf) {
+                        rd_ok = true;
+                        break;
+                    }
+                }
+                if !rd_ok {
                     if is_device_gone(self.channel) {
                         notify_device_gone(self);
                     }
@@ -422,7 +465,14 @@ impl IoDevice for AtaPioDevice {
                 }
                 self.stats.record_read(1);
                 buf[sector_off..sector_off + take].copy_from_slice(&data[done..done + take]);
-                if !ata_write_sector(self.channel, self.slave, lba, &buf) {
+                let mut wr_ok = false;
+                for _ in 0..SECTOR_RETRIES {
+                    if ata_write_sector(self.channel, self.slave, lba, &buf) {
+                        wr_ok = true;
+                        break;
+                    }
+                }
+                if !wr_ok {
                     if is_device_gone(self.channel) {
                         notify_device_gone(self);
                     }
@@ -431,7 +481,14 @@ impl IoDevice for AtaPioDevice {
                 self.stats.record_write(1);
             } else {
                 buf.copy_from_slice(&data[done..done + 512]);
-                if !ata_write_sector(self.channel, self.slave, lba, &buf) {
+                let mut wr_ok = false;
+                for _ in 0..SECTOR_RETRIES {
+                    if ata_write_sector(self.channel, self.slave, lba, &buf) {
+                        wr_ok = true;
+                        break;
+                    }
+                }
+                if !wr_ok {
                     if is_device_gone(self.channel) {
                         notify_device_gone(self);
                     }
