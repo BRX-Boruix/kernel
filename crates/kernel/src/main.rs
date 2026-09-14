@@ -579,6 +579,10 @@ unsafe fn kmain_body() -> ! {
     tests::test_flock_close_release();
     #[cfg(feature = "kernel-tests")]
     tests::test_flock_syscall();
+    // flock 锁身份必须与文件系统实现无关（RamFS 缓存 Arc / EXT2 每次新建）。
+    // 须在 test_flock_syscall 之后：两者共用 /scratch 与 uid 空间。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_flock_identity_is_filesystem_independent();
     // ADR-014 SYS_ENTRY_READ (0x42)：标准紧凑 JSON 输出。
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_entry_read_json();

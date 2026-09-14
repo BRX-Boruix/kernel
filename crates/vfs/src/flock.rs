@@ -37,10 +37,26 @@ pub enum LockMode {
     Exclusive,
 }
 
-/// 锁表键：inode 指针身份 + owner uid。
+/// 锁表键：**稳定文件身份** + owner uid。
+///
+/// # 为什么不是 inode 的指针地址（原实现，已修）
+///
+/// 原实现用 `Arc::as_ptr(inode)` 当文件身份，即**内存布局的副产物**。这有两个
+/// 致命问题：
+///
+/// 1. **同一文件可能有两个身份**。RamFS 的 `lookup` 返回子节点表里缓存的同一个
+///    `Arc`（地址相同），而 EXT2 的 `lookup` 每次都 `Arc::new(Ext2Node { .. })`
+///    （地址不同）。于是安装模式（根 = EXT2）下两次 `open` 同一文件得到两个键，
+///    锁互不可见——**互斥静默失效**，`flock` 照样返回成功。
+/// 2. **不同文件可能撞成同一个身份**。堆块释放后地址会被下一个 `Arc` 复用，
+///    于是新建文件凭空继承已删除文件的锁记录（实测：`test_flock_syscall`
+///    正是被前一个用例的残留锁以这种方式污染）。
+///
+/// 现在身份由文件系统自己提供（[`INode::stable_id`]）：EXT2 用盘上 `ino`，
+/// RamFS 用构造时分配的不复用单调 id。键不再依赖内存布局。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct LockKey {
-    inode_addr: usize,
+    inode_id: u64,
     owner_uid: u32,
 }
 
@@ -53,10 +69,12 @@ struct LockRecord {
 /// 全局 flock 锁表。
 static LOCK_TABLE: IrqSpinLock<BTreeMap<LockKey, LockRecord>> = IrqSpinLock::new(BTreeMap::new());
 
-/// 取 inode 指针身份（Arc 稳定地址）。
-fn inode_key(inode: &Arc<dyn INode>) -> usize {
-    // dyn 胖指针先收窄为瘦指针再取地址（Rust 禁止直接 cast fat->usize）。
-    Arc::as_ptr(inode) as *const () as usize
+/// 取 inode 的**稳定文件身份**（转调 [`INode::stable_id`]）。
+///
+/// 保留这个单行包装是为了让"锁身份从哪来"在锁表这一侧**只有一个定义点**
+///（S15）——将来若身份模型再演进，只需改这里。
+fn inode_key(inode: &Arc<dyn INode>) -> u64 {
+    inode.stable_id()
 }
 
 /// 获取锁（advisory）。冲突返回 Err(Error::Busy)。
@@ -73,7 +91,7 @@ pub fn flock_lock(
 ) -> Result<(), Error> {
     let mode = if exclusive { LockMode::Exclusive } else { LockMode::Shared };
     let key = LockKey {
-        inode_addr: inode_key(inode),
+        inode_id: inode_key(inode),
         owner_uid: owner.uid,
     };
     let mut table = LOCK_TABLE.lock();
@@ -90,7 +108,7 @@ pub fn flock_lock(
         // 升级（Shared→Exclusive）：若有其他 owner 持此 inode 锁则拒绝（K2），
         // 否则 Exclusive 会与其他 owner 的 Shared 并存，破坏互斥。
         for (other_key, _) in table.iter() {
-            if other_key.inode_addr == key.inode_addr && other_key.owner_uid != key.owner_uid {
+            if other_key.inode_id == key.inode_id && other_key.owner_uid != key.owner_uid {
                 return Err(Error::Busy);
             }
         }
@@ -99,7 +117,7 @@ pub fn flock_lock(
     }
     // 新锁：冲突矩阵。
     for (other_key, rec) in table.iter() {
-        if other_key.inode_addr != key.inode_addr {
+        if other_key.inode_id != key.inode_id {
             continue;
         }
         if other_key.owner_uid == key.owner_uid {
@@ -116,7 +134,7 @@ pub fn flock_lock(
 /// 释放该 owner 在该 inode 上的锁（close_fd 钩子调用）。幂等。
 pub fn flock_unlock(inode: &Arc<dyn INode>, owner: LockOwner) {
     let key = LockKey {
-        inode_addr: inode_key(inode),
+        inode_id: inode_key(inode),
         owner_uid: owner.uid,
     };
     LOCK_TABLE.lock().remove(&key);

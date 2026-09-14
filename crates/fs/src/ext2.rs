@@ -1852,6 +1852,25 @@ fn node_type_of(mode: u16) -> Option<INodeType> {
 }
 
 impl INode for Ext2Node {
+    /// **稳定文件身份 = EXT2 inode 号**（S6 后补：flock 锁表键的正确来源）。
+    ///
+    /// # 为什么必须覆写默认实现
+    ///
+    /// 默认实现返回 `self` 的地址，而本实现的 `lookup` 是
+    /// `Arc::new(Ext2Node { .. })`——**每次解析同一路径都新建一个实例**，地址
+    /// 各不相同。于是两次 `open("/volumes/x")` 拿到两个"不同"身份，
+    /// 文件锁互不可见：**互斥静默失效**（`flock` 返回成功，实际没有任何保护）。
+    /// 这在 RamFS 上恰好不出现（其 `lookup` 返回缓存的同一个 `Arc`），所以
+    /// 缺陷只在安装模式（根 = EXT2）下暴露。
+    ///
+    /// `ino` 是 EXT2 在盘上的真实文件标识，满足契约：同一文件恒等、不同文件不等，
+    /// 且与内存布局无关——`lookup` 新建多少实例都不影响。
+    ///
+    /// `+1` 使 id 从 1 起（0 保留给"无身份"语义，与 pid 同一惯例）。
+    fn stable_id(&self) -> u64 {
+        self.inode.ino as u64 + 1
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         if self.inode.is_dir() {
             return Err(Error::IsDirectory);

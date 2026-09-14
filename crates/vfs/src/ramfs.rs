@@ -34,6 +34,18 @@ use spin::Once as SpinOnce;
 
 static MEMORY_TIGHT_HOOK: SpinOnce<fn() -> bool> = SpinOnce::new();
 
+/// RamFS 节点身份分配器（单调递增，**不复用**）。
+///
+/// 不复用是刻意的：复用的 id 会让"已删除文件"与"新建文件"撞成同一个身份，
+/// 于是新文件凭空继承前者的锁记录（真实缺陷的成因正是地址复用，见
+/// [`INode::stable_id`]）。`u64` 单次启动内不可能耗尽。
+static NEXT_NODE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// 分配下一个 RamFS 节点身份。
+fn alloc_node_id() -> u64 {
+    NEXT_NODE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// 注入内存水位钩子（内核启动期一次）：返回 true 表示内核内存紧张
 /// （实现侧读 mm 预留池统计）。RamFS 大跨度增长路径据此先驱逐全局
 /// PageCache 再试，仍紧张则如实失败。未注入（宿主单测）时不咨询。
@@ -93,6 +105,13 @@ enum RamNodeData {
 pub struct RamINode {
     meta: RwLock<FileMetadata>,
     data: RamNodeData,
+    /// **稳定文件身份**（见 [`INode::stable_id`]）。
+    ///
+    /// RamFS 的 `lookup` 返回子节点表里缓存的 `Arc`，故"地址"恰好在当前实现下
+    /// 也是稳定的——但那**依赖实现细节**，一旦将来引入 `Arc` 重建（缓存逐出、
+    /// 重新解析路径等）就会静默破坏文件锁。显式 id 把这条契约写进数据本身，
+    /// 不再依赖内存布局（S15 单点定义）。
+    id: u64,
 }
 
 impl RamINode {
@@ -102,6 +121,7 @@ impl RamINode {
         // 政策见 crate::inode 模块注释。
         let now = now_ms();
         Arc::new(Self {
+            id: alloc_node_id(),
             meta: RwLock::new(FileMetadata {
                 node_type: INodeType::RegularFile,
                 size: 0,
@@ -119,6 +139,7 @@ impl RamINode {
     pub fn new_dir(perm: Permissions) -> Arc<Self> {
         let now = now_ms();
         Arc::new(Self {
+            id: alloc_node_id(),
             meta: RwLock::new(FileMetadata {
                 node_type: INodeType::Directory,
                 size: 0,
@@ -136,6 +157,7 @@ impl RamINode {
     pub fn new_symlink(target: &str) -> Arc<Self> {
         let now = now_ms();
         Arc::new(Self {
+            id: alloc_node_id(),
             meta: RwLock::new(FileMetadata {
                 node_type: INodeType::Symlink,
                 size: target.len() as u64,
@@ -160,6 +182,14 @@ impl RamINode {
 }
 
 impl INode for RamINode {
+    /// 覆写为构造时分配的**单调 id**（见 [`RamINode::id`]）。
+    ///
+    /// 默认实现（`self` 地址）在当前 `lookup` 实现下恰好也正确，但那依赖
+    /// "同一文件永远复用同一个 `Arc` "这一未经声明的前提。显式 id 去掉该依赖。
+    fn stable_id(&self) -> u64 {
+        self.id
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         match &self.data {
             RamNodeData::File { content } => {

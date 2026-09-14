@@ -4756,7 +4756,13 @@ pub fn test_syscall_entry_create_kind() {
         crate::syscall::SYS_ENTRY_CREATE,
         base,
         ENTRY_KIND_DIRECTORY,
-        0o755,
+        // ABI 是 `Permissions::to_bits()`，**不是 POSIX mode**。
+        // 此前误传 `0o755`：其 bit2（=4）恰好对应 executable，但 bit3（=1）
+        // 落在 **system_only** 上——创建请求因此带上了"仅系统可访问"。
+        // RamFS 照单全收故长期未暴露；EXT2 无法表达 system_only、如实
+        // 返回 NotSupported 后这个误用才显形。
+        // 用户的真实写法见 `libsys::io::mkdir`（传 `perm.to_bits()`）。
+        vfs::inode::Permissions::read_exec().to_bits() as u64,
     );
     assert!(crate::syscall::syscall_entry(&mut mkdir));
     assert!(
@@ -4769,7 +4775,9 @@ pub fn test_syscall_entry_create_kind() {
         crate::syscall::SYS_ENTRY_CREATE,
         base + 0x1000,
         ENTRY_KIND_FILE,
-        0o644,
+        // 同上：ABI 是 Permissions 位集（`0o644` 的 bit3 恰为 0，故行为
+        // 本就正确；改用显式位集以免读者把它误读成 POSIX mode）。
+        vfs::inode::Permissions::read_write().to_bits() as u64,
     );
     assert!(crate::syscall::syscall_entry(&mut touch));
     assert!(
@@ -4794,7 +4802,7 @@ pub fn test_syscall_entry_create_kind() {
             crate::syscall::SYS_ENTRY_CREATE,
             base + 0x2000,
             bad_kind,
-            0o600,
+            vfs::inode::Permissions::read_write().to_bits() as u64,
         );
         assert!(crate::syscall::syscall_entry(&mut spec));
         assert_eq!(
@@ -10555,6 +10563,74 @@ pub fn test_flock_close_release() {
     vfs::flock::flock_release_all_for_owner(UID_OTHER);
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-flock-close] PASS");
+}
+
+/// flock 锁身份必须**与文件系统实现无关**：同一文件的两次路径解析必须给出同一身份。
+///
+/// # 红证语义（S23：先写必然失败的测试）
+///
+/// 锁表键此前用 `Arc::as_ptr(inode)`——**内存布局的副产物**。两种实现行为不同：
+///
+///   - RamFS 的 `lookup` 返回子节点表里缓存的同一个 `Arc` → 地址相同；
+///   - EXT2 的 `lookup` 每次都 `Arc::new(Ext2Node { .. })` → 地址不同。
+///
+/// 于是安装模式（根 = EXT2，ADR-029）下两次 `open` 同一文件得到两个键，
+/// 锁互不可见——**互斥静默失效**，`flock` 照样返回成功。ISO 模式（根 = RamFS）
+/// 恰好正常，故缺陷长期未暴露。
+///
+/// 本测试断言的是**行为**而非实现：对同一路径解析两次，第二次 `LockOwner` 必须
+/// 被第一次的 `LOCK_EX` 挡住。它在修复前**必然失败**（返回 Ok 而非 Busy），
+/// 且不依赖任何测试夹具之外的东西——两种启动方式下都是真实路径。
+pub fn test_flock_identity_is_filesystem_independent() {
+    use vfs::flock::{flock_lock, flock_release_all_for_owner};
+    use vfs::LockOwner;
+
+    info!("[test-flock-identity] === flock identity must be fs-independent ====");
+
+    const UID_HOLDER: u32 = 11;
+    const UID_RIVAL: u32 = 12;
+    // 前置隔离：清掉本测试两个 uid 的历史残留（K7 纪律）。
+    flock_release_all_for_owner(UID_HOLDER);
+    flock_release_all_for_owner(UID_RIVAL);
+
+    let root = crate::vfs_init::root();
+    let path = "/scratch/flock_identity.txt";
+    // 幂等建文件：带盘启动下可能已存在（/scratch 启动清空，但本测试可能
+    // 在同一启动内被调用两次）。
+    let _ = root.create_file(path, vfs::inode::Permissions::read_write());
+
+    // 两次独立解析——模拟两个进程各自 open 同一路径。
+    let a = root.resolve(path, true).expect("resolve #1");
+    let b = root.resolve(path, true).expect("resolve #2");
+
+    // 先断言身份本身（给出精确的诊断信息），再断言锁行为。
+    info!(
+        "[test-flock-identity] stable_id #1={} #2={} (equal={})",
+        a.stable_id(),
+        b.stable_id(),
+        (a.stable_id() == b.stable_id()) as u64
+    );
+    assert_eq!(
+        a.stable_id(),
+        b.stable_id(),
+        "same path resolved twice must yield the same file identity"
+    );
+
+    // 行为断言：holder 取独占锁后，rival 必须 Busy。
+    assert!(
+        flock_lock(&a, LockOwner { uid: UID_HOLDER }, true).is_ok(),
+        "holder takes LOCK_EX"
+    );
+    assert_eq!(
+        flock_lock(&b, LockOwner { uid: UID_RIVAL }, true),
+        Err(klib::error::Error::Busy),
+        "rival must be blocked: a second resolve of the same file is the same file"
+    );
+
+    // 清理（全量按 owner，不留残留——见 test_flock_close_release 的说明）。
+    flock_release_all_for_owner(UID_HOLDER);
+    flock_release_all_for_owner(UID_RIVAL);
+    info!("[test-flock-identity] PASS");
 }
 
 /// R6 flock 生产 syscall 链路（K1：SYS_STREAM_LOCK 真实入口，非仅测试温室）。
