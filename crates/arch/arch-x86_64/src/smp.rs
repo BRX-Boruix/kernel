@@ -97,24 +97,53 @@ fn alloc_stack_frames(order: u32) -> u64 {
     }
 }
 
+/// `LAPIC_TO_SLOT` 中「该 LAPIC id 尚未登记」的哨兵值（SMP 审计 S6）。
+///
+/// **为什么需要哨兵**：本表原以 `0` 初始化，而 `0` 是**合法槽位**（BSP）。
+/// 于是未登记的 LAPIC id 查询会返回 0——一个 AP 在 `record_slot_lapic` 之前
+/// 问「我是谁」，得到的是「你是 BSP」。这类「未登记伪装成有效值」的错误不会
+/// 立刻崩，而是让 AP 用 BSP 的槽位去索引 per-CPU 缓存/就绪队列，**静默改写
+/// BSP 的数据结构**。
+///
+/// 取 `usize::MAX`：紧凑槽位空间是 `0..cpu_count`（远小于此），故不可能是
+/// 合法槽位；且不像 `0` 那样与 BSP 冲突。
+const SLOT_UNREGISTERED: usize = usize::MAX;
+
 /// LAPIC id → 紧凑 CPU 槽位 映射。x86 LAPIC id 为 0..255。
 /// BSP 槽位 0，AP 按启动顺序分配 1..n。per-CPU 帧缓存用该紧凑槽位做索引，
 /// 避免真机上稀疏 LAPIC id 对固定数取模产生冲突。
-static LAPIC_TO_SLOT: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
+///
+/// 未登记项为 [`SLOT_UNREGISTERED`]（非 0）——见该常量说明。
+static LAPIC_TO_SLOT: [AtomicUsize; 256] =
+    [const { AtomicUsize::new(SLOT_UNREGISTERED) }; 256];
 
 /// 紧凑 CPU 槽位 → LAPIC id 反查表（MA1b：IPI 目标寻址需要从槽位还原
 /// LAPIC id）。槽位 0（BSP）由 init 写入，AP 在上线时写入自己的槽位。
+/// 未登记项为 `u32::MAX`（与 `LAPIC_TO_SLOT` 同一纪律：哨兵不可与合法值混淆）。
 static SLOT_TO_LAPIC: [AtomicU32; 256] = [const { AtomicU32::new(u32::MAX) }; 256];
 
-/// 记录槽位 → LAPIC id 映射（BSP init 与 ap_entry 各写自己的槽位一次）。
+/// 记录槽位 ↔ LAPIC id 双向映射（BSP init 与 ap_entry 各写自己的槽位一次）。
 fn record_slot_lapic(slot: usize, lapic_id: u32) {
     LAPIC_TO_SLOT[(lapic_id & 0xFF) as usize].store(slot, Ordering::Release);
     SLOT_TO_LAPIC[slot & 0xFF].store(lapic_id, Ordering::Release);
 }
 
-/// 查询 LAPIC id 对应的紧凑 CPU 槽位。
+/// 查询 LAPIC id 对应的紧凑 CPU 槽位；未登记时返回 `None`（S6）。
+///
+/// **不再**静默返回 0：`Some(0)` 只可能是真正登记过的 BSP，调用方据此区分
+/// 「这是 BSP」与「我不知道这是谁」。
+pub fn slot_of_lapic_checked(lapic_id: u32) -> Option<usize> {
+    let v = LAPIC_TO_SLOT[(lapic_id & 0xFF) as usize].load(Ordering::Acquire);
+    if v == SLOT_UNREGISTERED { None } else { Some(v) }
+}
+
+/// 查询 LAPIC id 对应的紧凑 CPU 槽位（兼容入口，未登记回退 0）。
+///
+/// **保留本入口的理由**：引导极早期（LAPIC 映射与槽位表均未就绪时）调用方
+/// 需要「当前就是 BSP」这一事实，而那时确实只有 BSP 在跑，回退 0 语义正确。
+/// 新代码若需要区分「未登记」，**必须**用 [`slot_of_lapic_checked`]。
 pub fn slot_of_lapic(lapic_id: u32) -> usize {
-    LAPIC_TO_SLOT[(lapic_id & 0xFF) as usize].load(Ordering::Relaxed)
+    slot_of_lapic_checked(lapic_id).unwrap_or(0)
 }
 
 /// 查询紧凑 CPU 槽位对应的 LAPIC id（MA1b：IPI 目标寻址）。

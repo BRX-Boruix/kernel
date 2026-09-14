@@ -93,14 +93,28 @@ pub fn current_lapic_id() -> u32 {
 }
 
 /// 当前 CPU 的紧凑槽位。LAPIC 未映射或映射缺失时回退 0（BSP 槽）。
-/// 启动早期（BSP 槽映射在 smp::init 写入）槽位表默认值即 0 = BSP，语义不变。
+/// 启动早期（LAPIC 映射建立前）只有 BSP 在跑，回退 0 语义正确。
 ///
-/// `pub` 供 SMP 的 TLB shootdown 会合使用（需要知道"本核是谁"以排除自投递）。
+/// `pub` 供 SMP 的 TLB shootdown 会合使用（需要知道「本核是谁」以排除自投递）。
+///
+/// **S6**：LAPIC 已映射但槽位未登记时回退 0（同上，此时刻仍只有 BSP 在跑），
+/// 但**必须是显式分支**——若放任 `slot_of_lapic` 的隐式回退，调用方无法区分
+/// 「我确定是 BSP」与「我不知道我是谁」，而后者会让 shootdown 误把本核排除
+/// 在会合之外（本核的 TLB 不被失效 → 用旧映射访问已回收帧）。
 pub fn my_slot() -> usize {
     if !is_mapped() {
         return 0;
     }
-    smp::slot_of_lapic(current_lapic_id()) & 0xFF
+    match smp::slot_of_lapic_checked(current_lapic_id()) {
+        Some(slot) => slot & 0xFF,
+        None => {
+            klib::debug!(
+                "[lapic] slot not registered yet for LAPIC {:#x}, assuming BSP slot 0",
+                current_lapic_id()
+            );
+            0
+        }
+    }
 }
 
 /// 本核（当前 CPU）已运行的 tick 数。多核下读的是当前核自己的定时器计数。

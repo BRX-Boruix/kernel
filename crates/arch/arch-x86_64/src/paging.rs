@@ -559,14 +559,28 @@ pub const CR3_NO_USER_SPACE: u64 = u64::MAX;
 ///
 /// **LAPIC 未映射时回退 0（BSP 槽）**：`current_lapic_id()` 会读 LAPIC MMIO，
 /// 而早期引导阶段（LAPIC 映射建立之前）该地址不可访问——直接读会 #PF
-/// （实测 `cr2=0x20`）。回退 0 是安全的：早期只跑在 BSP 上，且 `smp::init`
-/// 写入槽位表前其默认值本就是 0（与 `smp::my_slot` 同款纪律，不另立规矩）。
+/// （实测 `cr2=0x20`）。回退 0 是安全的：早期只跑在 BSP 上。
+///
+/// **S6**：LAPIC 已映射但**槽位未登记**时，`slot_of_lapic_checked` 返回 `None`。
+/// 此处同样回退 0，但**显式分支 + 记录**——本函数的返回值直接作为 `PER_CPU_CR3`
+/// 的索引，索引错即把本核的 CR3 记到别人头上，会让 S2 的跨核持有者判定失效
+/// （漏判 → 提前回收仍被别的核使用的页表）。回退 0 在此时刻仍正确（AP 在自己的
+/// `record_slot_lapic` 之前不跑任何改 CR3 的用户态代码），但必须可观测。
 #[inline]
 fn my_slot() -> usize {
     if !crate::lapic::is_mapped() {
         return 0;
     }
-    crate::smp::slot_of_lapic(crate::lapic::current_lapic_id())
+    match crate::smp::slot_of_lapic_checked(crate::lapic::current_lapic_id()) {
+        Some(slot) => slot,
+        None => {
+            klib::debug!(
+                "[paging] CR3 accounting: LAPIC {:#x} has no slot yet, using 0",
+                crate::lapic::current_lapic_id()
+            );
+            0
+        }
+    }
 }
 
 /// per-CPU 当前 CR3 记录：值 = 该核当前加载的用户顶层页表物理基址；
