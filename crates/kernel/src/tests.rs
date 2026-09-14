@@ -10215,8 +10215,21 @@ pub fn test_flock_matrix() {
     flock_unlock(&inode, o3);
     assert!(flock_lock(&inode, o1, false).is_ok(), "Shared after Exclusive released OK");
 
-    // 清理本测试的锁，避免污染后续用例（K7）。
-    flock_release_all_for_owner(0);
+    // 清理本测试用过的**全部** owner，避免污染后续用例（K7）。
+    //
+    // 原实现只调 `flock_release_all_for_owner(0)`，但本测试实际用的是 o1/o2/o3
+    // （uid 1/2/3）——uid 0 从未被本测试使用。于是 o1/o2/o3 的锁**从不释放**，
+    // 作为残留留在全局 LOCK_TABLE 里。
+    //
+    // 残留之所以长期未暴露：`LockKey` 以 inode 的**堆地址**做身份，而 matrix 的
+    // `flock_a.txt` 在本测试结束时被 drop、其堆块随后会被下一个创建的文件复用；
+    // 一旦复用，那个**完全无关**的文件就会凭空继承残留锁并收到 `Busy`。
+    // 带盘启动时 inode 分配路径不同（ext2 的 Ext2Node 构造顺序），恰好触发复用。
+    //
+    // 清理所有用过的 owner 才是与"本测试自足"一致的做法。
+    for uid in [0u32, 1, 2, 3] {
+        flock_release_all_for_owner(uid);
+    }
     info!("[test-flock-matrix] PASS");
 }
 
@@ -10261,6 +10274,17 @@ pub fn test_flock_close_release() {
 
     assert!(flock_lock(&inode, LockOwner { uid: UID_OTHER }, true).is_ok(), "released after close");
     flock_unlock(&inode, LockOwner { uid: UID_OTHER });
+    // 释放**本测试用过的全部 owner**，不留残留。
+    //
+    // 仅 `flock_unlock` 掉自己刚加的锁是不够的：`close_fd` 已释放 UID_LOCKER 的锁，
+    // 但若前述断言中途失败、或将来有人改动本测试的加锁序列，残留就会留在全局
+    // LOCK_TABLE 里。而 `LockKey` 以 inode 的**堆地址**为身份——本测试结束时
+    // `flock_b.txt` 的 Ext2Node 被 drop，其堆块会被下一个创建的文件复用，
+    // 于是那个无关文件凭空继承残留锁并收到 `Busy`（实测 `test_flock_syscall`
+    // 正是这样被本测试污染的）。按 owner 全量清理是与全局共享状态打交道时唯一
+    // 稳妥的做法。
+    vfs::flock::flock_release_all_for_owner(UID_LOCKER);
+    vfs::flock::flock_release_all_for_owner(UID_OTHER);
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-flock-close] PASS");
 }
@@ -10378,6 +10402,12 @@ pub fn test_flock_syscall() {
     crate::syscall::syscall_entry(&mut c1);
     let mut c2 = frame(crate::syscall::SYS_STREAM_CLOSE, fd_b, 0, 0);
     crate::syscall::syscall_entry(&mut c2);
+    // 关 fd 会释放该 owner 在该 inode 上的锁，但仍按 owner 全量清理一次：
+    // 与 `test_flock_close_release` 同一纪律——全局 LOCK_TABLE 以 inode **堆地址**
+    // 为键，本测试的 inode 释放后其堆块会被后续用例的新文件复用，任何残留都会
+    // 寄生到无关文件上（见 `test_flock_close_release` 的清理说明）。
+    vfs::flock::flock_release_all_for_owner(UID_A);
+    vfs::flock::flock_release_all_for_owner(UID_B);
     task::clear_current_proc();
     // 回收测试进程（`set_current_proc` 的配对；unsafe 还原裸指针）。
     unsafe { let _ = Box::from_raw(proc_raw); }
