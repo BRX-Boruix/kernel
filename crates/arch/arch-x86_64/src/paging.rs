@@ -507,6 +507,16 @@ impl arch::PageTable for X86PageTable {
     fn my_cpu_slot() -> usize {
         my_slot()
     }
+
+    /// 全系统失效单页翻译（S1）。
+    fn shootdown_one(vaddr: u64) -> usize {
+        crate::smp::tlb_shootdown(vaddr)
+    }
+
+    /// 全系统失效整张页表（S1）。
+    fn shootdown_all() -> usize {
+        crate::smp::tlb_shootdown(crate::smp::SHOOTDOWN_ALL)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +629,38 @@ pub fn active_user_cr3_count() -> usize {
 pub fn reset_tracking_slot(slot: usize) {
     assert!(slot < MAX_TRACKED_CPUS, "CR3 track slot out of range");
     PER_CPU_CR3[slot].store(CR3_NO_USER_SPACE, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
+// 全系统 TLB 失效（SMP 审计 S1）
+// ---------------------------------------------------------------------------
+//
+// `flush_tlb` 只作用于**本核**。而线程已跨核分布（同一进程的两个线程可能分别在
+// 核 1 / 核 2 上运行），故 `munmap` 或权限收紧后必须让**所有**核失效对应翻译，
+// 且必须**等到全部确认**才可归还物理帧——否则别的核会按陈旧 TLB 访问已复用的帧。
+
+/// 本架构是否提供可用的全系统 TLB 失效原语。
+///
+/// 恒为 `true`（`smp::tlb_shootdown` 始终可用，单核时退化为无操作）。
+/// 保留该查询是为了让上层不必假设架构能力——缺失式架构应返回 `false`，
+/// 而不是静默地"看起来成功"。
+pub fn shootdown_supported() -> bool {
+    true
+}
+
+/// 请求**全系统**失效虚拟地址 `vaddr` 的翻译，返回确认的其它核数量。
+///
+/// 调用方须在归还对应物理帧**之前**调用（会合语义：返回即代表各核已失效）。
+/// 本核的失效由调用方自己的 `flush_tlb` 负责——本函数只处理别的核。
+pub fn shootdown_tlb(vaddr: u64) -> usize {
+    crate::smp::tlb_shootdown(vaddr)
+}
+
+/// 请求全系统失效**整张当前页表**（各核重载 CR3）。
+///
+/// 供地址空间整表回收/销毁使用：整表重载比逐页 `invlpg` 便宜，且不会漏页。
+pub fn shootdown_tlb_all() -> usize {
+    crate::smp::tlb_shootdown(crate::smp::SHOOTDOWN_ALL)
 }
 
 /// 刷新 TLB 中一个虚拟地址。

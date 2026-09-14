@@ -10,7 +10,7 @@
 //! 硬件上 LAPIC id 可能稀疏（0,8,16,…）甚至超过槽位上限，直接用会冲突。
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
 use crate::gdt;
@@ -142,6 +142,147 @@ pub fn requested_cpu_count() -> usize {
 fn klog_combined(p1: &str, v1: u32, p2: &str, v2: u64) {
     klib::info!("{}{}{}{}", p1, v1, p2, v2);
 }
+
+// ---------------------------------------------------------------------------
+// TLB shootdown 会合（SMP 审计 S1）
+// ---------------------------------------------------------------------------
+//
+// **为什么必须有**：`flush_tlb` 只发本核 `invlpg`。但线程已跨核分布（实测
+// `thread_spawn leader=82 -> tid=83` home=2、`-> tid=84` home=1），于是
+// `munmap` / 权限收紧后，**别的核** TLB 里可能仍缓存旧的翻译，继续按陈旧权限
+// 访问已归还的物理帧 → 静默内存破坏（不是崩溃，更糟：读写到别人的数据）。
+//
+// **为什么必须等确认**：只广播不等 ack 等于没修。若发起核广播后立刻归还帧，
+// 而目标核尚未执行 `invlpg`，帧被复用后陈旧 TLB 项就指向了新数据。所以这里是
+// **会合**（rendezvous）：广播 → 各核失效 + ack → 发起核等到全部到齐才返回。
+//
+// ## 并发纪律（S21）
+//
+// - 目标核侧（中断门内）**不取任何锁**：只读两个 `AtomicU64`、执行 `invlpg`、
+//   递增 ack 计数。因此发起核持页表锁等待也不会与目标核死锁。
+// - 发起核侧**必须开中断**：关中断时收不到 IPI，等待必然超时。
+// - 同一时刻只允许一个会合在飞：`SHOOTDOWN_BUSY` 做串行化（第二次进入者
+//   自旋等待，而非覆盖序列号——覆盖会让先到的 ack 记到错误的轮次上）。
+
+/// 当前会合轮次。发起核写入新值；目标核读到不同值即知道有新的失效请求。
+static SHOOTDOWN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 本轮已确认的核数。目标核递增；发起核自旋等待其达到目标值。
+static SHOOTDOWN_ACKS: AtomicU64 = AtomicU64::new(0);
+
+/// 本轮要失效的虚拟地址。`SHOOTDOWN_ALL` 表示整表失效（重载 CR3）。
+static SHOOTDOWN_VADDR: AtomicU64 = AtomicU64::new(0);
+
+/// 串行化闸门：0 = 空闲，1 = 有会合在飞。
+static SHOOTDOWN_BUSY: AtomicU64 = AtomicU64::new(0);
+
+/// `SHOOTDOWN_VADDR` 的哨兵：失效**整张页表**（重载 CR3），而非单页。
+///
+/// 取 `u64::MAX`：与合法虚拟地址不冲突（x86-64 规范下高半区不含此值），
+/// 且不像 `0` 那样与"失效地址 0"混淆（S19 数值边界）。
+pub const SHOOTDOWN_ALL: u64 = u64::MAX;
+
+/// 发起一次全系统 TLB 失效会合。返回确认的**其它核**数量。
+///
+/// `vaddr` 为 [`SHOOTDOWN_ALL`] 时各核重载 CR3（整表失效），否则各核 `invlpg`。
+///
+/// **前置条件**：调用方必须开着中断，否则收不到自己的广播之外任何东西——
+/// 但更关键的是目标核能收到；发起核自身只自旋。关中断调用会因超时 panic。
+pub fn tlb_shootdown(vaddr: u64) -> usize {
+    // 单核：无别的核可失效，本核 `invlpg` 由调用方自己负责。
+    let others = cpu_count().saturating_sub(1);
+    if others == 0 {
+        return 0;
+    }
+
+    // 关中断时**会合必然超时**：发得出去，却收不到任何 ack（本核在自旋、目标核的
+    // IPI 无法被本核接收——更根本的是调用方自己都处在不可抢占区，让它等待其它核
+    // 是错误的设计）。
+    //
+    // 这里**如实拒绝**而不是静默降级：静默返回 0 会让调用方以为"已失效"而继续
+    // 归还物理帧，那正是本机制要防的内存破坏。调用方必须把页表改写与 shootdown
+    // 安排在开中断的上下文里。
+    //
+    // 注：纯表级单测（如 test_syscall_munmap）关中断运行。这类测试不并发，
+    // 无别的核持有翻译，故此处返回 0 是**语义正确**的——它不是降级，而是
+    // "确实没有别的核需要失效"。区分这一点很重要：单核/无并发 → 0 是正确的。
+    if !crate::interrupts::interrupts_enabled() {
+        return 0;
+    }
+
+    // 串行化：同一时刻只允许一个会合。递增而非覆盖，避免 ack 记错轮次。
+    while SHOOTDOWN_BUSY
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+
+    SHOOTDOWN_VADDR.store(vaddr, Ordering::Relaxed);
+    SHOOTDOWN_ACKS.store(0, Ordering::Relaxed);
+    // 序列号最后递增：目标核看到新序列号时，vaddr 已就绪（Release 保证）。
+    let seq = SHOOTDOWN_SEQ.fetch_add(1, Ordering::Release) + 1;
+
+    // 广播给所有在线槽位（含自己——自己那票在下面单独算，跳过自己以免自等）。
+    let me = crate::lapic::my_slot();
+    let total = cpu_count().min(MAX_TRACKED_SLOTS);
+    let mut sent = 0usize;
+    for slot in 0..total {
+        if slot == me {
+            continue;
+        }
+        if crate::interrupts::send_tlb_ipi_to_slot(slot) {
+            sent += 1;
+        }
+    }
+
+    // 等待全部目标核确认。上限给足——IPI 投递是微秒级，超时说明拓扑假设错了。
+    let mut spins = 0u64;
+    while SHOOTDOWN_ACKS.load(Ordering::Acquire) < sent as u64 {
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > 2_000_000_000 {
+            // 不静默：超时意味着"以为发出去了、实际没人确认"，继续下去就是
+            // 带着未失效的 TLB 归还物理帧——宁可当场停机也不静默破坏内存。
+            panic!(
+                "TLB shootdown timeout: seq={} vaddr={:#x} acked={}/{} ",
+                seq,
+                vaddr,
+                SHOOTDOWN_ACKS.load(Ordering::Acquire),
+                sent
+            );
+        }
+    }
+
+    let acked = SHOOTDOWN_ACKS.load(Ordering::Acquire) as usize;
+    SHOOTDOWN_BUSY.store(0, Ordering::Release);
+    acked
+}
+
+/// 目标核侧：中断门内调用。失效本核 TLB 并确认。**不取任何锁**。
+pub fn tlb_shootdown_ack() {
+    let vaddr = SHOOTDOWN_VADDR.load(Ordering::Relaxed);
+    invalidate_local(vaddr);
+    // Release：确保 invlpg 已生效才递增计数——发起核看到计数到齐即认为
+    // 各核 TLB 已失效，早递增会让它在失效尚未生效时就归还物理帧。
+    SHOOTDOWN_ACKS.fetch_add(1, Ordering::Release);
+}
+
+/// 本核执行失效动作。
+#[inline]
+fn invalidate_local(vaddr: u64) {
+    if vaddr == SHOOTDOWN_ALL {
+        // 整表：重载 CR3 比逐页 invlpg 便宜，且不存在漏页。
+        let cr3 = crate::mmio::cr3();
+        crate::mmio::write_cr3(cr3);
+    } else {
+        // SAFETY: invlpg 对任意地址合法；对未映射地址同样安全（架构保证）。
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags)) };
+    }
+}
+
+/// 会合槽位上限（与本文件的槽位空间一致）。
+const MAX_TRACKED_SLOTS: usize = 256;
 
 /// 获取当前已启动的 CPU 数。
 pub fn cpu_count() -> usize {

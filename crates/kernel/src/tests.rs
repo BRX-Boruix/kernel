@@ -8424,6 +8424,49 @@ pub fn test_s2_destroy_requires_no_active_cr3_holders() {
     info!("[test-s2] PASS");
 }
 
+/// S1 回归：跨核改页表后必须能**请求全系统 TLB 失效**。
+///
+/// 红证语义（SMP 审计 S1）：`flush_tlb` 只发 `invlpg`，**只作用于本核**。
+/// 但 `set_distribute_across_cpus(true)`（main.rs）已让同一进程的线程落到不同核
+/// ——实测 `_kt5.log`：`thread_spawn leader=82 -> tid=83` home=2，
+/// `leader=82 -> tid=84` home=1。
+///
+/// 于是 `munmap`/`mprotect` 收紧权限后，别的核 TLB 里可能仍缓存着旧的
+/// "可写/已映射"翻译，继续按陈旧权限访问已归还的物理帧 → 静默内存破坏。
+/// 目前全系统**零** shootdown（`shootdown` 一词在代码库中不存在）。
+///
+/// 断言的是**能力**而非实现：系统必须能发起一次全系统 TLB 失效并得到确认。
+/// 修复前该接口不存在 → 编译失败即"必然失败"的证明（S23）。
+pub fn test_s1_tlb_shootdown_capability() {
+    use task::scheduler::test_hooks as th;
+    info!("[test-s1] === cross-core TLB invalidation capability ===");
+    th::reset_all();
+
+    // 能力断言一：必须存在可发起的全系统失效操作。
+    //
+    // 注意：会合要求**开着中断**（关中断收不到 IPI，等待必然超时）。
+    // 这与 `test_cross_core_reap_safety` 的"全程关中断"纪律相反——那类测试
+    // 是纯表级不碰硬件，而本测试要验证的恰是硬件 IPI 往返。
+    arch_x86_64::interrupts::enable();
+    let vaddr: u64 = 0x0000_4000_0000;
+    let acked = arch_x86_64::paging::shootdown_tlb(vaddr);
+    info!("[test-s1] shootdown_tlb({:#x}) acknowledged by {} core(s)", vaddr, acked as u64);
+
+    // 单核夹具下不应有别的核需要确认——但调用本身必须**成功**（不允许静默失败）。
+    assert!(
+        arch_x86_64::paging::shootdown_supported(),
+        "arch must expose a working system-wide TLB invalidation primitive"
+    );
+
+    // 能力断言二：失效范围必须能表达"整表"（地址空间销毁时用），
+    // 且必须显式区分"单页"与"整表"——2MB 大页场景下二者语义不同。
+    let acked_all = arch_x86_64::paging::shootdown_tlb_all();
+    info!("[test-s1] shootdown_tlb_all() acknowledged by {} core(s)", acked_all as u64);
+
+    th::reset_all();
+    info!("[test-s1] PASS");
+}
+
 /// S26 回归：`block_current_with` 登记点失败不得丢失已弹出的就绪进程。
 ///
 /// 红证语义：旧实现 `pop_ready` 弹出 `next_pid` 后 `register()` 返回 false
@@ -10395,6 +10438,36 @@ pub fn test_smp_smoke() {
         SMOKE_TOTAL.load(Ordering::Relaxed)
     );
     info!("[test-smp] all {} AP(s) answered directed IPI round-trip", online - 1);
+
+    // 5) S1：**真实** TLB shootdown 会合——必须得到每个在线 AP 的确认。
+    //
+    // 与前面"接口存在"的能力断言不同，这里验证的是会合**真的跑通**：
+    // 广播 IPI → 各 AP 在中断门内 invlpg 并 ack → 本核等到计数到齐才返回。
+    // 只有跑到这一步（AP 已全部上线）才可能得到非零确认——早期调用返回 0 是
+    // 因为还没有别的核，那时验证不了任何东西（S39：不做虚荣断言）。
+    let acked = arch_x86_64::paging::shootdown_tlb(0x0000_4000_0000);
+    info!(
+        "[test-smp] TLB shootdown (single page) acknowledged by {}/{} other core(s)",
+        acked as u64,
+        online - 1
+    );
+    assert_eq!(
+        acked,
+        online - 1,
+        "[test-smp] TLB shootdown must be acknowledged by every other online core"
+    );
+
+    let acked_all = arch_x86_64::paging::shootdown_tlb_all();
+    info!(
+        "[test-smp] TLB shootdown (whole table) acknowledged by {}/{} other core(s)",
+        acked_all as u64,
+        online - 1
+    );
+    assert_eq!(
+        acked_all,
+        online - 1,
+        "[test-smp] whole-table TLB shootdown must be acknowledged by every other core"
+    );
     info!("[test-smp] PASS");
 }
 

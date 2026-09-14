@@ -94,7 +94,9 @@ pub fn current_lapic_id() -> u32 {
 
 /// 当前 CPU 的紧凑槽位。LAPIC 未映射或映射缺失时回退 0（BSP 槽）。
 /// 启动早期（BSP 槽映射在 smp::init 写入）槽位表默认值即 0 = BSP，语义不变。
-fn my_slot() -> usize {
+///
+/// `pub` 供 SMP 的 TLB shootdown 会合使用（需要知道"本核是谁"以排除自投递）。
+pub fn my_slot() -> usize {
     if !is_mapped() {
         return 0;
     }

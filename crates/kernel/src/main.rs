@@ -640,6 +640,12 @@ unsafe fn kmain_body() -> ! {
     // 提前归还 → 取指缺页 → #DF → 三重故障（纯值级，不切表、不依赖多核）。
     #[cfg(feature = "kernel-tests")]
     tests::test_s2_destroy_requires_no_active_cr3_holders();
+
+    // SMP 审计 S1：跨核改页表后必须能请求全系统 TLB 失效。
+    // 红证：`flush_tlb` 只发 `invlpg`（只作用本核），而线程已跨核分布；
+    // 缺此能力则 munmap/mprotect 后别的核可能沿用陈旧翻译 → 静默内存破坏。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_s1_tlb_shootdown_capability();
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
     tests::test_init_contract();

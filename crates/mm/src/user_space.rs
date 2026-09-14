@@ -1424,6 +1424,17 @@ where
         while vaddr < end {
             if let Some(phys) = core.pt.translate(VirtAddr::new(vaddr)) {
                 core.pt.unmap(VirtAddr::new(vaddr))?;
+                // S1（SMP 审计）：归还物理帧前必须让**所有**核失效该翻译。
+                //
+                // `pt.unmap` 内部的 `flush_tlb` 只发本核 `invlpg`；而线程已跨核
+                // 分布（实测同进程两个线程分别落在核 1 / 核 2）。别的核 TLB 里若
+                // 仍缓存旧翻译，就还能读写这个刚被 `deallocate_frame` 归还的帧；
+                // 帧一旦被 buddy 复用给别人，就是**静默内存破坏**（不是崩溃，
+                // 更糟：改的是别人的数据）。
+                //
+                // 会合语义：`shootdown_one` 返回时各核均已 `invlpg`，故紧随其后
+                // 的 `deallocate_frame` 是安全的——这正是"等确认"不可省的原因。
+                PT::shootdown_one(vaddr);
                 deallocate_frame(PhysFrame::from_paddr_raw(phys.as_u64()));
             }
             vaddr += PAGE_SIZE;

@@ -218,6 +218,9 @@ global_asm!(
     // phase2-M5 resched stub
     isr_noerr 66
 
+    // S1：TLB shootdown 会合向量（0x43）。发起者广播 → 各核 invlpg → 各自 ack。
+    isr_noerr 67
+
     // 软件中断 0x80（无错误码）：用户态软中断/系统调用入口（M2.5.4 / M3）。
     isr_noerr 128
 
@@ -598,6 +601,14 @@ pub const IPI_HALT_VECTOR: u8 = 0x41;
 /// 目标核若在运行则静默无副作用（处理函数仅 EOI 后返回）。与其它 IPI 向量同避让。
 pub const IPI_RESCHED_VECTOR: u8 = 0x42;
 
+/// TLB shootdown 会合向量（SMP 审计 S1）。
+///
+/// 发起核改完页表后广播本向量，目标核在中断门内执行 `invlpg`（或整表重载 CR3）
+/// 并递增 ack 计数；发起核自旋等待全部在线核（除自己）确认后，才**允许归还
+/// 物理帧**。缺了「等确认」这一步，帧可能在本核还没失效 TLB 时就被复用，
+/// 陈旧翻译指向新数据 → 静默内存破坏。
+pub const IPI_TLB_VECTOR: u8 = 0x43;
+
 /// x86-64 异常向量号（SDM Vol.3 §6.3.1）：页错误（#PF，有错误码 + CR2）。
 /// 分发路径按此号路由补页回调 / 内核故障检查器 / CR2 打印。
 pub const VECTOR_PAGE_FAULT: u64 = 14;
@@ -655,6 +666,25 @@ pub fn send_resched_ipi_to_slot(slot: usize) -> bool {
         Some(lapic_id) => crate::lapic::send_fixed_ipi(lapic_id, IPI_RESCHED_VECTOR),
         None => false,
     }
+}
+
+/// 给指定槽位发送 TLB shootdown 会合 IPI（S1）。
+///
+/// 返回是否**成功投递**（槽位未登记 = false，不静默当作成功）。
+pub fn send_tlb_ipi_to_slot(slot: usize) -> bool {
+    match crate::smp::lapic_id_of_slot(slot) {
+        Some(lapic_id) => crate::lapic::send_fixed_ipi(lapic_id, IPI_TLB_VECTOR),
+        None => false,
+    }
+}
+
+/// TLB shootdown 会合的中断侧处理：失效本核 TLB 并 ack，然后 EOI。
+///
+/// 在中断门内运行（IF 已关），**只做寄存器操作与原子递增，不取任何锁**
+/// ——这是发起核能安全地持页表锁等待 ack 的前提。
+fn dispatch_tlb_shootdown() {
+    crate::smp::tlb_shootdown_ack();
+    crate::lapic::end_of_interrupt();
 }
 
 /// 跨核停机处理（KA1）：中断门下 IF 已关，hlt 永久睡眠——本核不再参与任何
@@ -747,6 +777,12 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         // 阶段2（M5）：跨核重调度请求——本核若在调度空闲 halt 则被此中断唤醒，
         // 返回后重查自己就绪队列；若在运行则仅 EOI 无副作用。无需回调。
         dispatch_resched();
+        return;
+    }
+
+    if vector == IPI_TLB_VECTOR as u64 {
+        // S1：TLB shootdown 会合——在中断门内立即失效，然后 ack。
+        dispatch_tlb_shootdown();
         return;
     }
 
@@ -986,6 +1022,9 @@ pub fn init() {
         // 阶段2（M5）：跨核重调度向量 0x42。中断门；收到即唤醒调度空闲 halt。
         let handler = get_isr_addr(IPI_RESCHED_VECTOR as u16);
         (*idt_ptr).entries[IPI_RESCHED_VECTOR as usize].set_handler(handler, IDT_FLAG_INTERRUPT, 0);
+        // S1：TLB shootdown 会合向量 0x43。中断门；目标核在门内失效 TLB 并 ack。
+        let handler = get_isr_addr(IPI_TLB_VECTOR as u16);
+        (*idt_ptr).entries[IPI_TLB_VECTOR as usize].set_handler(handler, IDT_FLAG_INTERRUPT, 0);
 
         let idtr = build_idtr();
         x86_64_load_idt(&idtr as *const Idtr);
@@ -1070,6 +1109,7 @@ fn get_isr_addr(vector: u16) -> u64 {
         fn isr_64();
         fn isr_65();
         fn isr_66();
+fn isr_67();
         fn isr_255();
     }
 
@@ -1096,6 +1136,10 @@ fn get_isr_addr(vector: u16) -> u64 {
     // 阶段2（M5）：跨核重调度向量 0x42（isr_66）。
     if vector == IPI_RESCHED_VECTOR as u16 {
         return isr_66 as *const () as usize as u64;
+    }
+    // S1：TLB shootdown 会合向量 0x43（isr_67）。
+    if vector == IPI_TLB_VECTOR as u16 {
+        return isr_67 as *const () as usize as u64;
     }
     // 伪中断向量 0xFF 同样在固定表之外（isr_255）。
     if vector == SPURIOUS_VECTOR {
