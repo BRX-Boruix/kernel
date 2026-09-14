@@ -26,6 +26,27 @@ use vfs::sysfs::{SysFS, SystemInfoProvider};
 
 static VFS_ROOT: Once<Arc<MountTable>> = Once::new();
 
+/// 本次启动是否为**安装模式**（ADR-029：带盘启动，根 = 系统盘的 EXT2 分区）。
+///
+/// # 为何需要显式标记
+///
+/// 同一内核支持两种启动方式（`init_livecd` / `init_install`），而两种方式下的
+/// **根命名空间内容不同**：
+///
+/// - livecd（ISO）：根为内存 RamFS，`build_skeleton` 建出的目录即全部内容；
+/// - install（系统盘）：根为 EXT2 分区，除骨架外还含装盘流程写入的
+///   `/boot`（`kernel` + `limine/`，Limine 从 EXT2 引导的前提）。
+///
+/// 调用方（如 VFS 词法 linter）需要据此区分预期缺席与真实缺失——不能靠
+/// 「存在才检查」蒙混，那样安装模式下 `/boot` 真的丢失时会被静默放过。
+/// 故把「当前是哪种模式」记成**单一事实来源**（S15），由 `init_install` 置位。
+static INSTALL_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// 本次启动是否为安装模式（见 [`INSTALL_MODE`]）。
+pub fn is_install_mode() -> bool {
+    INSTALL_MODE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// 已挂载块设备登记：设备名 → 挂载路径（`try_mount_ext2_volumes` 启动期静态
 /// 挂载与 `mount_device_volume` 设备挂载成功时登记，两处同源）。
 ///
@@ -894,6 +915,10 @@ fn init_install(mbr_disk_id: u32, partition_index: u32) -> bool {
         };
         // 以启动盘 EXT2 为根建立安装模式根。
         let mount_table = Arc::new(MountTable::new(Arc::new(ext2)));
+        // 至此安装模式**已确定**（EXT2 根可用），置位单一事实来源。
+        // 放在确认点而非函数入口：入口处只是"尝试"，失败要回退到 livecd，
+        // 提前置位会让后续把失败的尝试误报为安装模式。
+        INSTALL_MODE.store(true, core::sync::atomic::Ordering::Relaxed);
         build_skeleton(&mount_table);
         // ADR-029 §决策4：安装模式 /programs 是池内普通目录，不做内置
         // payload 兜底——即**不遮蔽盘上的内容**，而非「盘上没有内容」。
@@ -936,6 +961,16 @@ fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
     ensure_dir("/devices");
     ensure_dir("/users");
     ensure_dir("/scratch");
+    // /scratch 是**临时文件区**（ADR-005 v2 / ADR-011 §1.1）。
+    //
+    // 带盘启动时根就是系统盘的 EXT2 分区，`/scratch` 因此**跨重启持久**，
+    // 上一轮运行留下的内容会原样保留。这与"临时"语义直接冲突，且会造成
+    // 具体故障：任何 `create_file("/scratch/x")` 在第二次启动时收到
+    // `AlreadyExists`（实测测试套件因此 panic）。
+    //
+    // 故启动时清空。清空失败**如实上报并继续**——残留内容不影响系统可用性，
+    // 但静默当作已清空会让后续 `AlreadyExists` 的病因难以定位。
+    clear_scratch(&mount_table, "/scratch");
     ensure_dir("/volumes");
     // 运行时安装的用户态驱动 ELF 集合目录（与 /programs 系统内置分离；
     // 词法规范 v2 登记于 test_vfs_lexicon LEXICON，ADR-037）。
@@ -1131,6 +1166,61 @@ fn audio_boot_selfcheck(mount_table: &Arc<vfs::mount::MountTable>) {
 /// 遮蔽 `/programs`（ADR-028 单源：外部盘改挂 `/volumes/{label}`）。
 /// 任一写入失败如实报错并继续（残留部分 payload 会使 init 加载失败可见，
 /// 不静默伪装成功）。
+/// 清空 `/scratch` 临时文件区的**直接子项**（不递归进子目录内部再删父目录？——
+/// 是递归的，见下）。
+///
+/// # 为什么需要
+///
+/// `/scratch` 的契约是"临时文件区"（ADR-005 v2、ADR-011 §1.1）。在没有持久
+/// 存储的启动方式下（ISO：根为 RamFS）它天然每次全新；但在**安装模式**
+///（`--systemdisk`，ADR-029）下根就是系统盘的 EXT2 分区，`/scratch` 会跨重启
+/// 保留上一轮的全部内容。两种启动方式语义不一致，且持久化的一侧违反"临时"
+/// 定义并导致 `create_file` 报 `AlreadyExists`。
+///
+/// # 行为
+///
+/// 逐个删除 `/scratch` 下的子项：目录**递归先清空**再删，文件直接删。
+/// 任一子项清理失败即 `warn` 并**继续**处理其余子项——一个删不掉的残留不应
+/// 阻断其余清理，更不应阻断启动。失败保持可见（不静默）。
+fn clear_scratch(mount_table: &Arc<vfs::mount::MountTable>, path: &str) {
+    let node = match mount_table.resolve(path, true) {
+        Ok(n) => n,
+        Err(e) => {
+            klib::warn!("[vfs] clear {}: resolve failed: {:?}", path, e);
+            return;
+        }
+    };
+    let entries = match node.list_dir() {
+        Ok(e) => e,
+        Err(e) => {
+            klib::warn!("[vfs] clear {}: list_dir failed: {:?}", path, e);
+            return;
+        }
+    };
+    let mut removed = 0usize;
+    for entry in entries.iter() {
+        let name = entry.name.as_str();
+        // 防御：`list_dir` 契约上不返回自引用项，但真出现了也绝不递归删除
+        // （`. ` 指向自身，递归即无限展开）。
+        if name == "." || name == ".." {
+            continue;
+        }
+        let child = alloc::format!("{}/{}", path, name);
+        if entry.node_type == vfs::inode::INodeType::Directory {
+            // 先递归清空子目录内部的条目，再删子目录本身——
+            // `unlink` 对非空目录返回 NotEmpty（与 rmdir 同语义）。
+            clear_scratch(mount_table, &child);
+        }
+        match mount_table.unlink(&child) {
+            Ok(_) => removed += 1,
+            Err(e) => klib::warn!("[vfs] clear {}: unlink {} failed: {:?}", path, child, e),
+        }
+    }
+    if removed > 0 {
+        klib::info!("[vfs] cleared {} stale entr(ies) from {}", removed, path);
+    }
+}
+
 fn populate_builtin_programs(mount_table: &Arc<vfs::mount::MountTable>) {
     for p in crate::binaries_payload::PAYLOADS {
         let path = alloc::format!("/programs/{}", p.name);

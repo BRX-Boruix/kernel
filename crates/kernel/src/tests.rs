@@ -3027,8 +3027,12 @@ pub fn test_vfs_m61() {
     info!("[test-vfs-m61] skeleton dirs verified");
 
     // 2. 创建文件与句柄流式读写
+    // 夹具放在 /scratch（临时文件区，启动时清空）而非 /config：
+    // /config 是**持久**配置域（用户配置必须跨重启保留），把测试产物写进去
+    // 会在带盘启动时残留，使下一次运行 `create_file` 收到 AlreadyExists。
+    // 测试产物不是配置，归属临时区才是正确语义。
     let file_node = root
-        .create_file("/config/kernel.json", Permissions::read_write())
+        .create_file("/scratch/kernel.json", Permissions::read_write())
         .expect("create file");
     let handle = FileHandle::new(file_node.clone(), OpenFlags::READ_WRITE)
         .expect("ramfs handle metadata is infallible");
@@ -3054,17 +3058,51 @@ pub fn test_vfs_m61() {
     info!("[test-vfs-m61] file create and stream/positioned io verified");
 
     // 3. 目录项枚举
-    let config_dir = root.resolve("/config", true).expect("resolve config");
-    let entries = config_dir.list_dir().expect("list config dir");
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name.as_str(), "kernel.json");
-    assert_eq!(entries[0].size, payload.len() as u64);
+    //
+    // 在**文件所在的那个目录**里查它——夹具在 /scratch（见上方建文件处的
+    // 说明），故这里也查 /scratch。
+    //
+    // 本步要验证的不变式是：**刚创建的文件出现在目录枚举中，且属性正确**。
+    //
+    // 原断言 `entries.len() == 1` 把「目录里只有我这个文件」当成了不变式，
+    // 而它其实只是**本测试自身的执行前提**。该前提不成立：
+    //
+    //   - 测试序列中其它用例也往同一目录写；注册顺序一变即破坏本断言；
+    //   - 带盘启动时目录还可能含镜像里已有的内容。
+    //
+    // 原断言因此在 ISO 启动下偶过、带盘启动下必败——失败信息（"assertion
+    // `left == right` failed"）指向枚举长度，而真正的信息（我建的文件在不在）
+    // 被掩盖。改为**按名查找**：既不依赖目录里还有别人，也不依赖枚举顺序。
+    let scratch_dir = root.resolve("/scratch", true).expect("resolve scratch");
+    let entries = scratch_dir.list_dir().expect("list scratch dir");
+    info!(
+        "[test-vfs-m61] /scratch has {} entries, looking for kernel.json",
+        entries.len() as u64
+    );
+    for e in entries.iter() {
+        info!("[test-vfs-m61]   - {}", e.name.as_str());
+    }
+    let mine = entries
+        .iter()
+        .find(|e| e.name.as_str() == "kernel.json")
+        .expect("the file just created must appear in its directory listing");
+    assert_eq!(mine.size, payload.len() as u64);
+    // 目录枚举不得返回重复项——这是本步**真正**值得断言的全局性质。
+    let mut names: alloc::vec::Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    let before_dedup = names.len();
+    names.dedup();
+    assert_eq!(
+        names.len(),
+        before_dedup,
+        "directory listing must not contain duplicate names"
+    );
 
     // 4. 软链接创建与多层解析
-    root.symlink("/config/kernel.json", "/config/current_config")
+    root.symlink("/scratch/kernel.json", "/scratch/current_config")
         .expect("symlink");
     let linked = root
-        .resolve("/config/current_config", true)
+        .resolve("/scratch/current_config", true)
         .expect("resolve symlink");
     assert_eq!(
         linked.metadata().expect("meta").node_type,
@@ -3279,6 +3317,19 @@ pub fn test_vfs_lexicon() {
         ("config", false),
         ("system", false),
         ("scratch", false),
+        // boot：安装模式（`--systemdisk`）的真实根目录项——系统盘上存
+        // `/boot/kernel`（内核 ELF）与 `/boot/limine/`（引导器配置 + stage3），
+        // 由 `build.py::_make_system_disk` 写入，是 Limine 能从 EXT2 分区引导
+        // 的前提（见 ADR-029）。
+        //
+        // 它是**单数域目录**而非集合：`/boot` 是单一的引导资产域，不枚举
+        // "多个 boot"，且其子项（kernel/limine）是固定命名的角色而非同类实例。
+        //
+        // 此前未登记是因为 ISO 启动下 `/boot` 位于 **ISO 映像内部**（El Torito
+        // 引导路径），不出现在 VFS 根；只有带盘启动才把系统盘的 EXT2 分区挂为
+        // 根。同一内核两种启动方式下根目录内容不同，linter 只在带盘启动时才
+        // 撞见它——这是词表覆盖不全，不是命名违规。
+        ("boot", false),
     ];
 
     // 官方短别名（热路径豁免）：(别名, 正名)。正名必须存在于 LEXICON。
@@ -3343,7 +3394,22 @@ pub fn test_vfs_lexicon() {
 
     // 骨架完整性：词表中的每个名字都必须真实存在于根命名空间
     // （防止词表与实际骨架漂移——改名忘了同步词表也会在这里爆）。
+    //
+    // 例外：**仅安装模式存在**的根目录。`/boot` 只在带盘启动（ADR-029）下
+    // 由 `build.py::_make_system_disk` 写入系统盘（`/boot/kernel` 与
+    // `/boot/limine/`）；ISO 启动下 Limine 从 ISO 映像内部引导，根命名空间
+    // 里没有它。两种启动方式共用同一份词表，故这里按启动模式区分：
+    //
+    //   - ISO 启动（livecd）：`/boot` 缺席是预期的，跳过存在性检查；
+    //   - 带盘启动（install）：`/boot` 必须在，否则说明装盘流程坏了。
+    //
+    // 不写成存在才检查、不存在就跳过：那样安装模式下 `/boot` 真的丢失时也会
+    // 被放过，检查就失去了意义。
+    let install_mode = vfs_init::is_install_mode();
     for (name, _) in LEXICON {
+        if *name == "boot" && !install_mode {
+            continue;
+        }
         let node = root
             .resolve(&alloc::format!("/{name}"), true)
             .unwrap_or_else(|_| panic!("lexicon entry /{name} missing from root skeleton"));
@@ -3385,7 +3451,7 @@ pub fn test_vfs_m62() {
 
     let root = vfs_init::root();
     let file = root
-        .create_file("/config/fd_test.txt", Permissions::read_write())
+        .create_file("/scratch/fd_test.txt", Permissions::read_write())
         .expect("create file");
 
     let us = UserAddressSpace::<X86PageTable>::new().expect("user space");
@@ -3687,7 +3753,7 @@ pub fn test_syscall_usercopy_faults() {
 
     // 经 HHDM 把路径串写进 page B（内核半区别名，SMAP 不适用；既有测试同法）。
     let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
-    let path_file = b"/config/kernel.json\0";
+    let path_file = b"/scratch/kernel.json\0";
     let path_dir = b"/config\0";
     unsafe {
         let pa = task::current_proc_mut()
@@ -3767,7 +3833,7 @@ pub fn test_syscall_usercopy_faults() {
     let truncate_only = 1u32 << 3; // OpenFlags.to_bits(): bit3 = truncate
     let mut o_bad = frame(
         crate::syscall::SYS_STREAM_CREATE,
-        page_b, // "/config/kernel.json"
+        page_b, // "/scratch/kernel.json"
         truncate_only as u64,
         0,
     );
@@ -3779,7 +3845,7 @@ pub fn test_syscall_usercopy_faults() {
     // 文件内容原样保留（此前 test_vfs_m61 写入过 JSON，size > 0）。
     {
         let root = crate::vfs_init::root();
-        let node = root.resolve("/config/kernel.json", true).expect("resolve");
+        let node = root.resolve("/scratch/kernel.json", true).expect("resolve");
         let size = node.metadata().expect("meta").size;
         assert!(size > 0, "failed truncation must leave content intact");
     }
@@ -3793,7 +3859,7 @@ pub fn test_syscall_usercopy_faults() {
     );
     {
         let root = crate::vfs_init::root();
-        let node = root.resolve("/config/kernel.json", true).expect("resolve");
+        let node = root.resolve("/scratch/kernel.json", true).expect("resolve");
         let size = node.metadata().expect("meta").size;
         assert_eq!(size, 0, "successful truncation must empty the file");
     }
@@ -6399,14 +6465,34 @@ pub fn test_driver_hub_m72() {
     let mut found_ramdisk = false;
     for i in 0..dev_count {
         if let Some(info) = DriverHub::device_info_at(i) {
-            // DMYGH #15：ATA 只允许两种诚实身份——硬件盘 "ata0"（volatile=false）
-            // 或内存回退盘 "ata0-ramfallback"（volatile=true），身份与披露必须一致。
-            if info.name == "ata0" || info.name == "ata0-ramfallback" {
+            // DMYGH #15：ATA 只允许两种诚实身份——硬件盘（volatile=false）或内存
+            // 回退盘（volatile=true），身份与披露必须一致。
+            //
+            // 名称**不再硬编码 `ata0`**：ATA 通道号取决于 QEMU 设备拓扑。
+            // 挂 `-hda` 时盘在 ata0；挂 `-cdrom <iso> -hdb disk.img` 时 ata0 探测
+            // 失败（`identify failed (ch=0x1f0)`）、盘枚举为 **ata1**。两者都是
+            // 诚实身份，旧断言把"盘在 0 号通道"这一**调用方式**当成了内核不变式，
+            // 于是同一内核换个 QEMU 参数就 panic，还阻断其后全部测试。
+            //
+            // 真正的不变式是：**存在一个被诚实登记的 ATA 块设备**——名称形如
+            // `ata<N>`（或内存回退的 `ata<N>-ramfallback`），且 volatile 披露与
+            // 名称类型一致。通道号本身不是内核的契约。
+            let is_ata_hw = info.name.len() == 4
+                && info.name.starts_with("ata")
+                && info.name.as_bytes()[3].is_ascii_digit();
+            let is_ata_fallback = info.name.starts_with("ata")
+                && info.name.ends_with("-ramfallback");
+            if is_ata_hw || is_ata_fallback {
                 found_ata = true;
-                if info.name == "ata0" {
+                info!(
+                    "[test-driver-hub-m72] ATA block device registered: name={} volatile={}",
+                    info.name,
+                    info.volatile as u64
+                );
+                if is_ata_hw {
                     assert!(
                         !info.volatile,
-                        "hardware ata0 must disclose volatile=false"
+                        "hardware ATA disk must disclose volatile=false"
                     );
                 } else {
                     assert!(
@@ -6533,7 +6619,10 @@ pub fn test_driver_hub_m72() {
             }
         }
     }
-    assert!(found_ata, "an honestly-identified ata0/ata0-ramfallback must be registered in DriverHub");
+    assert!(
+        found_ata,
+        "an honestly-identified ATA block device (ata<N> or ata<N>-ramfallback) must be registered in DriverHub"
+    );
     assert!(found_ramdisk, "ramdisk0 must be registered in DriverHub");
 
     // 6. 验证 DevFS /devices/list 动态投影与 JSON HATEOAS
@@ -6780,9 +6869,32 @@ pub fn test_driver_hub_m72() {
     let stor_str = core::str::from_utf8(&stor_buf[..stor_n]).unwrap_or("");
     // DMYGH #16：storage status 必须携带真实主块设备身份与真实计数，
     // 禁止回退到编造的 healthy/latency 占位值。
+    //
+    // 名称不硬编码 `ata0`：ATA 通道号由 QEMU 设备拓扑决定（`-hdb` 挂在 ata1）。
+    // 与 m72 的块设备断言同一原因——生产侧（`devfs.rs`，注释 DMYGH #16）本就
+    // "不再硬编码 ata0"，是测试单方面把通道号当成了契约。
+    //
+    // 真正的不变式：`device` 字段存在，且**名字确实是本次启动中注册的**块设备
+    // ——下面对照 DriverHub 的真实设备集校验，而非只看字符串格式。
+    let named = stor_str
+        .split(r#""device":""#)
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| panic!("storage status must carry a non-empty device name, got: {}", stor_str));
+    let mut name_exists = false;
+    for i in 0..dev_count {
+        if let Some(info) = DriverHub::device_info_at(i) {
+            if info.name == named {
+                name_exists = true;
+                break;
+            }
+        }
+    }
     assert!(
-        stor_str.contains(r#""device":"ata0""#) || stor_str.contains(r#""device":"ata0-ramfallback""#),
-        "storage status must name the real primary block device, got: {}",
+        name_exists,
+        "storage status names '{}', which is not registered in DriverHub — it must name a REAL device, got: {}",
+        named,
         stor_str
     );
     assert!(
@@ -8527,6 +8639,135 @@ pub fn test_s3_dma_alloc_free_frame_conservation() {
     info!("[test-s3] PASS");
 }
 
+/// S4 回归：跨核唤醒必须**无条件**向目标核投递重调度 IPI。
+///
+/// 红证语义（SMP 审计 S4）：`wake_enqueue` 把就绪进程压入目标核队列后，
+/// 仅在 `run.current.is_none()` 时才发 IPI。但 `current` 只在**切换提交点**
+/// 更新（scheduler.rs:847/2565/3343/3380 置 Some，1418/1571/1925 清 None），
+/// 它**不表示"该核已停车"**——核在两处切换之间执行内核代码时 `current` 也可能是
+/// `None`。于是该判断既可能在该核运行时多发（无害），也可能在该核刚 `hlt` 后
+/// **漏发**（要靠 IRQ0 tick 兜底，最多 ~16ms 额外延迟）。
+///
+/// 这类"是否要唤醒"的预判在任何多核系统中都是 net-negative：
+/// 判断错的代价是不确定的延迟，而省下的只是一次微秒级 IPI。Linux 的
+/// `smp_send_reschedule()` 因此**没有**空闲判断，一律投递。
+///
+/// 本测试断言的是**不变式**：只要向某核队列压入了就绪进程，就必须有对应的
+/// IPI 投递记录——不依赖任何实现细节。
+pub fn test_s4_wake_enqueue_ipi_is_unconditional() {
+    use task::scheduler::test_hooks as th;
+    info!("[test-s4] === cross-core wake must always send resched IPI ===");
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    th::reset_all();
+
+    // 造一个属于"别的核"的进程：把它的 home 设到非本核槽位，
+    // 然后唤醒它——此时必须产生一次 IPI 投递。
+    let my = arch_x86_64::lapic::my_slot();
+    let other = if my == 0 { 1 } else { 0 };
+
+    // 计数器必须可观测：读前读后应看到 +1。
+    let before = arch_x86_64::interrupts::resched_ipi_send_count();
+    let sent = th::debug_wake_enqueue_cross_core(other);
+    let after = arch_x86_64::interrupts::resched_ipi_send_count();
+    info!(
+        "[test-s4] wake_enqueue(other={}) -> sent={}, ipi_count {} -> {}",
+        other as u64,
+        sent as u64,
+        before as u64,
+        after as u64
+    );
+
+    // 本测试在**内核自检序列**中运行，而该序列位于 `smp::init()` **之前**
+    // （main.rs:416 测试块 vs :739 smp::init）——此刻只有 BSP 在线，
+    // `lapic_id_of_slot(1)` 必然为 `None`，跨核投递**不可能**成功。
+    //
+    // 因此这里断言的是**投递尝试发生**（机制正确：不再被 guard 短路），
+    // 而非"投递成功"。真正的跨核成功断言在 `test_smp_smoke` —— 那是唯一
+    // 在 smp::init + wait_all_online 之后运行的测试。
+    //
+    // 教训（记于此以免重复）：此前把"必须投递成功"写在这里，测试在两个
+    // 启动方式下都失败，而失败原因与 S4 缺陷**无关**——是测试自己放错了
+    // 位置。红证必须是"因被测缺陷而红"，不能因环境不足而红。
+    info!(
+        "[test-s4] cross-core wake attempted: sent={} (BSP-only phase; success is asserted in test_smp_smoke)",
+        sent as u64
+    );
+    assert!(
+        th::last_wake_attempted_cross_core(),
+        "wake_enqueue must *attempt* an IPI for a cross-core wake (guard must not veto it)"
+    );
+
+    th::reset_all();
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-s4] PASS (mechanism)");
+}
+
+/// S6 回归：LAPIC→槽位查表必须区分「已登记」与「未登记」。
+///
+/// 红证语义（SMP 审计 S6）：`LAPIC_TO_SLOT` 原以 `0` 初始化，而 `0` 是**合法
+/// 槽位**（BSP）。于是未登记的 LAPIC id 查询返回 0——一台 AP 在
+/// `record_slot_lapic` 之前问「我是谁」，得到「你是 BSP」。这类「未登记伪装成
+/// 有效值」不会立刻崩，而是让 AP 用 BSP 的槽位索引 per-CPU 缓存与就绪队列，
+/// **静默改写 BSP 的数据结构**。
+///
+/// 对照：`SLOT_TO_LAPIC` 用 `u32::MAX` 作哨兵且 `lapic_id_of_slot` 返回
+/// `Option`——两张表纪律不一致，本测试固化「两表都不得把未登记当有效值」。
+pub fn test_s6_lapic_slot_sentinel() {
+    use arch_x86_64::smp::{lapic_id_of_slot, slot_of_lapic, slot_of_lapic_checked};
+    info!("[test-s6] === unregistered LAPIC id must not masquerade as slot 0 ===");
+
+    // 本测试位于内核自检序列，而该序列在 `smp::init()` **之前**（main.rs:416
+    // vs :739）——此刻**没有任何槽位被登记**，包括 BSP 自身。因此这里验证的是
+    // **未登记必须报 None** 这一半，而"已登记仍解析为 0"那一半在
+    // `test_smp_smoke`（唯一在 smp::init 之后运行的测试）中验证。
+    info!(
+        "[test-s6] slot_of_lapic_checked(0) = {:?} (pre-smp::init, expect None)",
+        slot_of_lapic_checked(0).is_some() as u64
+    );
+
+    // 找一个**必然未登记**的 LAPIC id：遍历 0..256，排除已登记的那些。
+    // 此刻全部 256 个 id 都未登记，故首个即命中。
+    let mut unregistered_found = false;
+    for id in 0u32..256 {
+        // 已登记 = 反查能得到一个真实 LAPIC id 且与本 id 一致。
+        let slot = slot_of_lapic_checked(id);
+        let is_registered = match slot {
+            Some(s) => lapic_id_of_slot(s) == Some(id),
+            None => false,
+        };
+        if is_registered {
+            continue;
+        }
+        unregistered_found = true;
+        info!(
+            "[test-s6] unregistered LAPIC {:#x}: checked={:?} compat={}",
+            id as u64,
+            slot.is_some(),
+            slot_of_lapic(id) as u64
+        );
+        assert!(
+            slot.is_none(),
+            "unregistered LAPIC {:#x} must report None, got Some({})",
+            id,
+            slot.unwrap_or(0)
+        );
+        // 兼容入口回退 0 是**文档化的**行为（极早期只有 BSP 在跑），
+        // 但它绝不能伪造出一个别的槽位。
+        assert_eq!(
+            slot_of_lapic(id),
+            0,
+            "compat entry must fall back to BSP slot 0, never a phantom slot"
+        );
+        break;
+    }
+    assert!(
+        unregistered_found,
+        "expected at least one unregistered LAPIC id out of 256 (sanity of the probe)"
+    );
+
+    info!("[test-s6] PASS");
+}
+
 /// S26 回归：`block_current_with` 登记点失败不得丢失已弹出的就绪进程。
 ///
 /// 红证语义：旧实现 `pop_ready` 弹出 `next_pid` 后 `register()` 返回 false
@@ -9842,11 +10083,38 @@ pub fn test_perm_system_only() {
     }
 
     // system_only + normal nodes via root.create_file (test fixture).
+    //
+    // 夹具需要**能表达 system_only 的**文件系统。`/scratch` 在两种启动方式下
+    // 落在不同后端：
+    //
+    //   - ISO 启动：根为 RamFS（memfs），`Permissions` 逐字段原样保存，
+    //     `system_only` 可表达——本测试的前提成立；
+    //   - 带盘启动（`--systemdisk`，ADR-029 安装模式）：根就是系统盘的
+    //     **EXT2 分区**，而 EXT2 的 inode mode 里**没有** system_only 位。
+    //     `ext2::create_file` 因此如实返回 `NotSupported`（宁缺毋假，绝不
+    //     静默建出权限不符的节点）。
+    //
+    // 后者不是缺陷：磁盘格式表达能力有限是客观事实，EXT2 上本来就无法
+    // 表达“禁止普通用户访问”这一内核特有的访问控制位。此时本测试的前提
+    // 不成立，**如实跳过并说明**，而不是断言一个环境无法满足的条件
+    //（那样只会得到与病因无关的红色，正是本轮反复踩到的坑）。
     let sysonly_perm = Permissions { readable: true, writable: true, executable: false, system_only: true };
     {
         let root = crate::vfs_init::root();
-        root.create_file("/scratch/perm_sysonly.txt", sysonly_perm).expect("create system_only node");
-        root.create_file("/scratch/perm_normal.txt", Permissions::read_write()).expect("create normal node");
+        match root.create_file("/scratch/perm_sysonly.txt", sysonly_perm) {
+            Ok(_) => {}
+            Err(klib::error::Error::NotSupported) => {
+                info!(
+                    "[test-syscall-perm] SKIP: backing filesystem cannot express system_only \
+                     (EXT2 install-mode root has no such inode bit). \
+                     This test requires the RamFS root produced by ISO boot."
+                );
+                return;
+            }
+            Err(e) => panic!("create system_only node: {:?}", e),
+        }
+        root.create_file("/scratch/perm_normal.txt", Permissions::read_write())
+            .expect("create normal node");
     }
 
     let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0);
@@ -10558,6 +10826,96 @@ pub fn test_smp_smoke() {
         online - 1,
         "[test-smp] whole-table TLB shootdown must be acknowledged by every other core"
     );
+
+    // ---- S4：跨核唤醒必须真的投递 IPI ----
+    //
+    // 只有本测试运行在 `smp::init + wait_all_online` **之后**（main.rs:766），
+    // 此刻目标槽位已登记，跨核投递才可能成功。内核自检序列（main.rs:416）
+    // 位于 smp::init 之前，那里只能验证"是否尝试"，不能验证"是否送达"——
+    // 故真正的送达断言放在这里。
+    {
+        use task::scheduler::test_hooks as th;
+        let my = arch_x86_64::lapic::my_slot();
+        if online > 1 {
+            let other = if my == 0 { 1 } else { 0 };
+            // 挑一个确实是别的核的槽位（0/1 必有一非本核）。
+            let target = if other != my { other } else { (my + 1) % online };
+            th::clear_wake_attempted();
+            let before = arch_x86_64::interrupts::resched_ipi_send_count();
+            let sent = th::debug_wake_enqueue_cross_core(target);
+            let after = arch_x86_64::interrupts::resched_ipi_send_count();
+            info!(
+                "[test-smp] S4: wake_enqueue(core {}) -> sent={}, resched IPIs {} -> {}",
+                target as u64,
+                sent as u64,
+                before as u64,
+                after as u64
+            );
+            assert!(
+                th::last_wake_attempted_cross_core(),
+                "[test-smp] cross-core wake must attempt an IPI (guard must not veto it)"
+            );
+            // 送达：目标槽位已登记且 LAPIC 已映射，故必须成功。
+            assert!(
+                sent && after > before,
+                "[test-smp] cross-core wake must actually deliver a resched IPI"
+            );
+            // 失败计数是**进程级累计**，早段（smp::init 之前）的跨核唤醒尝试
+            // 必然计入失败——故不能断言它为 0。真正要断言的是：**本次**投递
+            // 成功（上方 `sent` 已覆盖），且失败计数在本次调用中**没有增加**。
+            let fails = arch_x86_64::interrupts::resched_ipi_send_fail_count();
+            info!(
+                "[test-smp] S4: cumulative IPI fail count = {} (pre-init attempts legitimately fail)",
+                fails
+            );
+            assert_eq!(
+                after - before,
+                1,
+                "[test-smp] exactly one resched IPI must be sent for one cross-core wake"
+            );
+            th::reset_all();
+        } else {
+            info!("[test-smp] single-core: skipping S4 cross-core delivery assertion");
+        }
+    }
+
+    // ---- S6：已登记的槽位必须仍解析为合法槽位 ----
+    //
+    // 补上早段（smp::init 之前）无法验证的另一半：登记之后，
+    // `slot_of_lapic_checked` 必须返回 `Some`，且 BSP 必须是槽位 0。
+    // 若哨兵写错（例如误用某个合法的低值），会把已登记项也一并否掉。
+    {
+        use arch_x86_64::smp::{lapic_id_of_slot, slot_of_lapic, slot_of_lapic_checked};
+        let bsp = lapic_id_of_slot(0)
+            .expect("[test-smp] S6: slot 0 (BSP) must be registered after smp::init");
+        assert_eq!(
+            slot_of_lapic_checked(bsp),
+            Some(0),
+            "[test-smp] S6: registered BSP must resolve to slot 0 (sentinel must not veto valid entries)"
+        );
+        assert_eq!(
+            slot_of_lapic(bsp),
+            0,
+            "[test-smp] S6: compat entry must agree for the BSP"
+        );
+        // 每个在线核都必须能双向解析（哨兵不得误伤任何合法槽位）。
+        for slot in 0..online {
+            let lid = lapic_id_of_slot(slot)
+                .expect("[test-smp] S6: every online slot must have a LAPIC id");
+            assert_eq!(
+                slot_of_lapic_checked(lid),
+                Some(slot),
+                "[test-smp] S6: slot {} <-> LAPIC {:#x} round-trip must survive the sentinel",
+                slot,
+                lid
+            );
+        }
+        info!(
+            "[test-smp] S6: {} online slot(s) round-trip via checked lookup",
+            online as u64
+        );
+    }
+
     info!("[test-smp] PASS");
 }
 

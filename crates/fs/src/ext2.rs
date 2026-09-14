@@ -78,6 +78,12 @@ pub enum Ext2Error {
     AlreadyExists,
     /// 实现不支持（如 EXT2 无 system_only 存储）。
     NotSupported,
+    /// 目录非空——删除目录时的**正常策略拒绝**（对应 `Error::NotEmpty`）。
+    ///
+    /// 为什么单独立一个变体（而不是复用 `CorruptDirEntry`）：非空目录不是
+    /// 盘上结构损坏，复用会让上层把 ENOTEMPTY 误报成 EUCLEAN，把排查方向
+    /// 从"目录里还有东西"引向"文件系统需要 fsck"——而数据其实完好。
+    DirNotEmpty,
 }
 
 /// 解析后的超级块（只保留只读路径需要的字段）。
@@ -1541,21 +1547,75 @@ impl Ext2Fs {
     }
 
     /// 创建普通文件（M3.3）。
+    /// 创建普通文件。
+    ///
+    /// # 权限处理（修复）
+    ///
+    /// 原实现把 `perm` 丢弃（参数名 `_perm`）并无条件写死 `0o644`。后果是
+    /// **调用方显式表达的权限被静默吞掉**：
+    ///
+    /// - `create_file(.., Permissions::readonly())` 实际建成可写文件——只读意图
+    ///   丢失；
+    /// - `create_file(.., system_only: true)` 在 EXT2 上建出**普通文件**，
+    ///   随后"未授权用户不得打开 system_only 节点"的访问控制断言失败。
+    ///   测试确实失败了，但病因不是访问控制——是权限在创建时就没落盘。
+    ///
+    /// 现行为：r/w/x 位按 `perm` 写入；`system_only` 在 EXT2 无对应存储位，
+    /// **如实返回 [`Ext2Error::NotSupported`]** 而不是建出一个权限不符的节点
+    /// （与 [`Self::set_permissions`] 同一纪律：宁缺毋假，绝不伪造）。
     pub fn create_file(
         &self,
         dir: &mut Inode,
         name: &str,
-        _perm: Permissions,
+        perm: Permissions,
     ) -> Result<Inode, Ext2Error> {
-        let (_, inode) = self.create_entry(dir, name, 0x8000 | 0o644, None)?;
+        // EXT2 的 mode 位里没有 system_only 的表示（见 set_permissions）。
+        // 静默降级会造出权限与请求不符的节点，故显式拒绝。
+        if perm.system_only {
+            return Err(Ext2Error::NotSupported);
+        }
+        let mut bits = 0o644u16 & !0o777;
+        if perm.readable {
+            bits |= 0o444;
+        }
+        if perm.writable {
+            bits |= 0o222;
+        }
+        if perm.executable {
+            bits |= 0o111;
+        }
+        let (_, inode) = self.create_entry(dir, name, 0x8000 | bits, None)?;
         Ok(inode)
     }
 
     /// 创建子目录（M3.3）：含 `.`/`..` 两项，`..` 指向父目录。
-    pub fn mkdir(&self, dir: &mut Inode, name: &str, _perm: Permissions) -> Result<Inode, Ext2Error> {
+    ///
+    /// 权限处理同 [`Self::create_file`]：`perm` 的 r/w/x 位如实落盘，
+    /// `system_only` 无 EXT2 存储位故显式 `NotSupported`（不静默降级）。
+    pub fn mkdir(&self, dir: &mut Inode, name: &str, perm: Permissions) -> Result<Inode, Ext2Error> {
+        if perm.system_only {
+            return Err(Ext2Error::NotSupported);
+        }
         // 先分配目录数据块。
         let block = self.alloc_block()?;
-        let (ino, mut inode) = self.create_entry(dir, name, 0x4000 | 0o755, Some(block))?;
+        let mut dbits = 0u16;
+        if perm.readable {
+            dbits |= 0o444;
+        }
+        if perm.writable {
+            dbits |= 0o222;
+        }
+        if perm.executable {
+            dbits |= 0o111;
+        }
+        // 目录的可遍历性由 x 位决定、可列目录须 r 位；缺失会使目录无法进入。
+        if dbits & 0o111 == 0 {
+            dbits |= 0o111;
+        }
+        if dbits & 0o444 == 0 {
+            dbits |= 0o444;
+        }
+        let (ino, mut inode) = self.create_entry(dir, name, 0x4000 | dbits, Some(block))?;
         // 写 `.` 和 `..` 两项，size=块大小。
         let bs = self.superblock().block_size as usize;
         let mut d = alloc::vec![0u8; bs];
@@ -1568,11 +1628,56 @@ impl Ext2Fs {
         Ok(inode)
     }
 
+    /// 目录是否"实际为空"——即除 `.` 与 `..` 外没有存活条目。
+    ///
+    /// 依据 [`Self::read_dir_raw`] 的真实解析结果判断，而不是看目录块里的
+    /// 原始字节：已删除的项仍会留下 `rec_len` 占位，字节非零**不**代表还有
+    /// 存活条目。用原始字节判断会把"删空了的目录"误判为非空，从而永久无法
+    /// 删除。
+    fn dir_is_effectively_empty(&self, dir: &Inode) -> Result<bool, Ext2Error> {
+        for e in self.read_dir_raw(dir)? {
+            let n = e.name.as_slice();
+            if n == b"." || n == b".." {
+                continue;
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// 删除目录项并释放其 inode 与数据块（M3.3）。
+    ///
+    /// # 目录的处理（修复）
+    ///
+    /// 原实现对**任何**目录一律返回 [`Ext2Error::CorruptDirEntry`]，注释写的是
+    /// "rmdir 需空目录"，但代码从未**检查**是否为空——空目录同样被拒。
+    /// 两个后果：
+    ///
+    /// 1. **语义与 ramfs 不一致**：`ramfs::unlink` 允许删除空目录，ext2 全部拒绝。
+    ///    同一 `INode::unlink` 契约下两个实现行为不同，上层无法依赖任何确定语义。
+    /// 2. **错误码撒谎**：`CorruptDirEntry` → `Error::Corrupt`（EUCLEAN，语义为
+    ///    "盘上结构损坏，需 fsck"）。而"目录非空"是一个**正常的策略拒绝**，
+    ///    对应 `Error::NotEmpty`（ENOTEMPTY）。用 Corrupt 报告会让运维/用户以为
+    ///    文件系统损坏，把排查引向完全错误的方向——而数据其实完好。
+    ///
+    /// 现行为：目录**为空**则连同 `.`/`..` 占用的数据块一并删除（等价 rmdir）；
+    /// **非空**则如实返回 [`Ext2Error::DirNotEmpty`]（→ `Error::NotEmpty`）。
     pub fn unlink(&self, dir: &mut Inode, name: &str) -> Result<(), Ext2Error> {
         let (_, inode) = self.lookup_in_dir(dir, name).map_err(|_| Ext2Error::CorruptDirEntry)?;
         if inode.is_dir() {
-            return Err(Ext2Error::CorruptDirEntry); // rmdir 需空目录，此处拒绝非空删除
+            // 空目录判定：目录块里只有 "." 与 ".." 两个项。
+            // 逐项扫描而非只看块内字节——已删除的项会留下 rec_len 占位，
+            // 字节非零不代表有存活项。
+            if !self.dir_is_effectively_empty(&inode)? {
+                return Err(Ext2Error::DirNotEmpty);
+            }
+            // 释放目录自身的数据块，再删除父目录里的项并回收 inode。
+            self.remove_dir_entry(dir, name)?;
+            self.free_inode_blocks(&inode)?;
+            let now = now_timestamp_secs();
+            dir.mtime = now;
+            dir.ctime = now;
+            return self.write_inode(dir);
         }
         self.remove_dir_entry(dir, name)?;
         self.free_inode_blocks(&inode)?;
@@ -1692,6 +1797,8 @@ pub(crate) fn ext2_to_klib(e: Ext2Error) -> Error {
         Ext2Error::CorruptDirEntry
         | Ext2Error::CorruptSuperblock
         | Ext2Error::BlockOutOfRange => Error::Corrupt,
+        // 非空目录是正常策略拒绝，不是结构损坏（见变体文档）。
+        Ext2Error::DirNotEmpty => Error::NotEmpty,
         Ext2Error::UnsupportedFragmentSize | Ext2Error::UnsupportedBlockSize => Error::NotSupported,
         Ext2Error::NotFound => Error::NotFound,
         Ext2Error::AlreadyExists => Error::AlreadyExists,
@@ -1896,6 +2003,24 @@ impl INode for Ext2Node {
     /// 列出子项：size 与 node_type 全部来自关联 inode 真值（fs1 F1/FA1）。
     /// 此前的 `size: 0` 硬编码让 sys_readdir 对每个 EXT2 文件都报"0 字节"
     /// ——与同一文件的 cat/exec 结果自相矛盾，属用户可见伪数据。
+    ///
+    /// # 为什么过滤 `.` 与 `..`
+    ///
+    /// EXT2 把 `.` 与 `..` 存为**真实目录项**（POSIX 也如此，Linux 的
+    /// `readdir(3)` 同样会返回它们）。但 BORUIX 的 `INode::list_dir` 契约是
+    /// "列出子项"，且**其它实现根本无法提供这两项**——RamFS/devfs/procfs 以
+    /// map 或动态构造持有子项，不存在 `.`/`..` 实体。
+    ///
+    /// 于是同一契约下两套语义：磁盘根目录（ext2）会列出 `.`/`..`，内存文件
+    /// 系统不会。后果是**用户可见**的——`ls /` 在安装模式多出两行，且
+    /// `sys_readdir` 的调用方（shell 的 ls、补全）必须各自特判，任何一处漏判
+    /// 就露出 `.`。ADR-005 v2 词法 linter 正是据此判定根目录含未登记项而失败。
+    ///
+    /// 在**本层**过滤是唯一能统一语义的位置：调用方拿不到区分"该目录恰好真有
+    /// 一个名为 `.` 的子项"与"这是自引用项"的信息，而本层有。
+    ///
+    /// 保留 `INode::lookup(".")` 的能力不受影响——`.`/`..` 的**解析**仍由
+    /// `lookup_in_dir` 按真实目录项处理，只是不再从枚举中泄露。
     fn list_dir(&self) -> Result<Vec<DirEntry>, Error> {
         if !self.inode.is_dir() {
             return Err(Error::NotDirectory);
@@ -1905,6 +2030,8 @@ impl INode for Ext2Node {
         let entries = self.fs.read_dir_raw(&dir).map_err(ext2_to_klib)?;
         entries
             .into_iter()
+            // 过滤自引用项 `.` / `..`：见上方理由（跨实现语义统一）。
+            .filter(|e| e.name.as_slice() != b"." && e.name.as_slice() != b"..")
             .map(|e| {
                 let node_type = node_type_of(e.mode).ok_or(Error::Corrupt)?;
                 // S02/S09：文件名是原始字节，非 UTF-8 即损坏。不得用

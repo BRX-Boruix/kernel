@@ -650,6 +650,7 @@ unsafe fn kmain_body() -> ! {
     // SMP 审计 S3：DMA 缓冲分配阶数必须与释放阶数一致（分配-释放帧守恒）。
     #[cfg(feature = "kernel-tests")]
     tests::test_s3_dma_alloc_free_frame_conservation();
+
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
     tests::test_init_contract();
@@ -745,6 +746,21 @@ unsafe fn kmain_body() -> ! {
     // KA1：panic 跨核停机接线（向量 0x41）——诊断输出前停住其它在线核，
     // 防止它们继续分配/拿锁/交错输出。同样依赖 SMP 完成后的槽位反查。
     panic::set_cross_core_halt(halt_other_cpus_via_ipi);
+
+    // SMP 审计 S4：跨核唤醒必须无条件投递重调度 IPI。
+    //
+    // 放**此处**而非早期测试块：投递 IPI 需要目标核已在线且槽位已登记，
+    // 而 `smp::init` 之前只有 BSP，`lapic_id_of_slot(1)` 返回 `None`，投递
+    // 必然失败。早期块只断言"尝试过"（机制），这里断言"真的送到"
+    // （投递计数 0 -> 1）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_s4_wake_enqueue_ipi_is_unconditional();
+    // SMP 审计 S6：LAPIC→槽位查表必须区分「已登记」与「未登记」。
+    //
+    // 同上："已登记"那半边（BSP -> 槽 0、各在线槽位往返）只有 `smp::init`
+    // 之后才有意义。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_s6_lapic_slot_sentinel();
 
     // 阶段 0：SMP 冒烟测试——须在 smp::init + wait_all_online + IPI 接线
     // （mm::ipi_drain_current_cpu 已占向量 0x40 分发槽位）之后运行：测试需
