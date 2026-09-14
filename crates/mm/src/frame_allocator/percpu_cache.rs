@@ -41,6 +41,26 @@ impl PerCpuCacheSet {
         self.caches.get().map(|c| c.len()).unwrap_or(0)
     }
 
+    /// 取 `cpu` 槽位的 per-CPU 缓存并施加 `f`。
+    ///
+    /// # 属主不变式（SMP 审计 S5）
+    ///
+    /// **`cpu` 必须是调用方自己的槽位**（即 `current_cpu_id()` 的结果）。
+    ///
+    /// 为什么这不只是约定：`PerCpuCache` 是裸结构体、**完全无同步**
+    /// （`heads: [Option<usize>; MAX_ORDER]` / `counts: [u16; MAX_ORDER]` 都是
+    /// 普通字段）。它的正确性**只**建立在「每个 CPU 独占访问自己的槽位」之上。
+    /// 一旦有调用方传入别人的槽位，两个 CPU 会无锁并发改写同一组字段——
+    /// 表现为帧链表被写坏、同一帧被发两次或永久丢失，且**没有任何症状能指向
+    /// 这里**（损坏发生在若干次分配之后）。
+    ///
+    /// 当前所有调用方都传 `current_cpu_id()`（api/compact/percpu/stats 共 7 处），
+    /// 故不是活跃缺陷；但该不变式此前**只存在于注释里**，一次误写即可静默破坏
+    /// 内存管理。此断言把不变式变成机器可检查的事实（S21 并发显式化）。
+    ///
+    /// 限制：断言只在 `debug_assertions` 下生效（release 构建零开销）。
+    /// 这是刻意的——release 下每次分配多读一次 LAPIC 不可接受；而越界与属主
+    /// 违规都是**开发期**缺陷，自检构建（`--test`）即可全部暴露。
     pub(crate) fn with_cache<F, R>(&self, cpu: usize, f: F) -> R
     where
         F: FnOnce(&mut PerCpuCache) -> R,
@@ -52,6 +72,14 @@ impl PerCpuCacheSet {
         if cpu >= caches.len() {
             panic!("per-CPU slot out of range: {} >= {}", cpu, caches.len());
         }
+        // S5：属主不变式——见上方文档。
+        debug_assert_eq!(
+            cpu,
+            super::current_cpu_id(),
+            "per-CPU cache may only be touched by its owning CPU (slot {} asked, caller owns {})",
+            cpu,
+            super::current_cpu_id()
+        );
         unsafe { f(&mut *(caches.as_ptr().add(cpu) as *mut PerCpuCache)) }
     }
 }
