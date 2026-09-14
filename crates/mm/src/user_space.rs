@@ -107,7 +107,14 @@ pub enum UserAreaKind {
     /// 保证 CPU 写对总线 DMA 可见（x86 一致性 DMA 语义）。**帧归本地址空间
     /// 所有**——与 DeviceMmap 相反，销毁/回收时 unmap + `deallocate_frame`
     /// （与匿名区同归还纪律）。
-    DmaBuffer,
+    ///
+    /// 携带**分配时使用的 buddy 阶数**（S3）：该缓冲是 `allocate_frames(order)`
+    /// 取得的**单个连续块**（覆盖 `2^order` 页），故归还必须用**同一个 order**
+    /// 整块释放。此前按页 `deallocate_frame` 是错的——非基址页根本不属于 order 0，
+    /// 逐页归还既破坏 buddy 记账（实测会**多还**帧），又在 `npages` 非 2 的幂时
+    /// 泄漏尾页。阶数随区域记账保存，使"怎么借的就怎么还"成为结构性保证，
+    /// 而非调用方需要记住的约定。
+    DmaBuffer { order: usize },
 }
 
 /// 用户区映射记录（按需分页 / 统计用）。
@@ -812,7 +819,10 @@ where
         {
             let areas = self.areas.lock();
             for a in areas.iter() {
-                if a.kind == UserAreaKind::DeviceMmap || a.kind == UserAreaKind::DmaBuffer {
+                if matches!(
+                    a.kind,
+                    UserAreaKind::DeviceMmap | UserAreaKind::DmaBuffer { .. }
+                ) {
                     continue;
                 }
                 let mut v = a.start.as_u64();
@@ -1036,8 +1046,31 @@ where
 
         // 1. 用户区叶帧 + 中间页表页（unmap 递归释放已空中间层）。
         //    DeviceMmap 区例外：帧属设备，只清 PTE、绝不归还（与 shm 同纪律）。
+        //
+        //    DmaBuffer 区**单独处理**（S3）：它是 `allocate_frames(order)` 取得的
+        //    单个连续块，必须按**同一个 order 整块**归还。走下面的通用逐页路径会
+        //    踩与 `munmap_dma` 相同的两个坑——非基址页按 order 0 归还破坏 buddy
+        //    记账（多还帧），且尾页泄漏。
         let areas = self.areas.lock().clone();
         for a in areas.iter() {
+            if let UserAreaKind::DmaBuffer { order } = a.kind {
+                let mut base_phys: Option<u64> = None;
+                let mut v = a.start.as_u64();
+                while v < a.end.as_u64() {
+                    if let Some(phys) = core.pt.translate(VirtAddr::new(v)) {
+                        let _ = core.pt.unmap(VirtAddr::new(v));
+                        if base_phys.is_none() {
+                            base_phys = Some(phys.as_u64());
+                        }
+                    }
+                    v += PageSize::Size4K.bytes();
+                }
+                if let Some(base) = base_phys {
+                    let base = base & !((1u64 << (12 + order)) - 1);
+                    deallocate_frame(PhysFrame::from_paddr_raw(base));
+                }
+                continue;
+            }
             let page = a.size.bytes();
             let mut v = a.start.as_u64();
             while v < a.end.as_u64() {
@@ -1296,7 +1329,7 @@ where
             VirtAddr::new(va + len),
             PageSize::Size4K,
             flags,
-            UserAreaKind::DmaBuffer,
+            UserAreaKind::DmaBuffer { order },
         ) {
             crate::deallocate_frame(frame);
             return Err(e);
@@ -1335,21 +1368,52 @@ where
         let (area_idx, area) = {
             let areas = self.areas.lock();
             let Some((idx, area)) = areas.iter().copied().enumerate().find(|(_, a)| {
-                a.kind == UserAreaKind::DmaBuffer && a.start.as_u64() == vaddr
+                matches!(a.kind, UserAreaKind::DmaBuffer { .. }) && a.start.as_u64() == vaddr
             }) else {
                 return Err(Error::NotFound.into());
             };
             (idx, area)
         };
-        // 整块释放：unmap + 还帧。
+        // S3：取回**分配时的阶数**，整块归还。
+        //
+        // 该缓冲由 `allocate_frames(order)` 取得一个 `2^order` 页的连续块。
+        // 归还必须是**同一个 order 的整块**：
+        //
+        // - 逐页 `deallocate_frame` 是错的——非基址页根本不属于 order 0，
+        //   buddy 会按错误的阶数记账并合并（实测**多还** 2 帧，即释放了从未
+        //   分配出去的帧，等价于把别人的内存标记为空闲）；
+        // - `npages` 非 2 的幂时（如 3 页 → order=2 覆盖 4 页），逐页只还 3 页，
+        //   尾页永久泄漏。
+        //
+        // 阶数随区域记账保存，故此处无需重算——"怎么借的就怎么还"是结构性保证。
+        let UserAreaKind::DmaBuffer { order } = area.kind else {
+            // 不可达：上面按 DmaBuffer 筛选过。显式 panic 而非静默继续，
+            // 避免将来筛选条件改动后悄悄退化成错误的释放路径。
+            panic!("munmap_dma area is not a DmaBuffer");
+        };
         let end = area.end.as_u64();
+        let mut base_phys: Option<u64> = None;
         let mut v = vaddr;
         while v < end {
             if let Some(phys) = core.pt.translate(VirtAddr::new(v)) {
                 let _ = core.pt.unmap(VirtAddr::new(v));
-                deallocate_frame(PhysFrame::from_paddr_raw(phys.as_u64()));
+                if base_phys.is_none() {
+                    base_phys = Some(phys.as_u64());
+                }
             }
             v += PAGE;
+        }
+        // 整块归还：物理基址 + 分配时的 order。
+        if let Some(base) = base_phys {
+            // 复位位必须与分配一致——`allocate_frames` 返回的就是块基址。
+            let base = base & !((1u64 << (12 + order)) - 1);
+            // S1：归还前必须让所有核失效该缓冲的翻译（别的核可能正按旧 TLB
+            // 读写它；帧一旦被复用就是静默内存破坏）。整块一次失效。
+            PT::shootdown_all();
+            crate::deallocate_frame(PhysFrame::from_paddr_raw(base));
+        } else {
+            // 一页都没映射 = 没有任何帧可归还。显式记录，不静默。
+            klib::warn!("[user-space] munmap_dma: no mapped page in area, nothing freed");
         }
         self.cow_pages
             .lock()
@@ -1374,7 +1438,7 @@ where
         let areas = self.areas.lock();
         let area = areas
             .iter()
-            .find(|a| a.kind == UserAreaKind::DmaBuffer && a.start.as_u64() == vaddr)?;
+            .find(|a| matches!(a.kind, UserAreaKind::DmaBuffer { .. }) && a.start.as_u64() == vaddr)?;
         let core = self.core.lock();
         core.pt.translate(VirtAddr::new(area.start.as_u64()))
             .map(|p| p.as_u64())

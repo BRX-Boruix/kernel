@@ -8467,6 +8467,66 @@ pub fn test_s1_tlb_shootdown_capability() {
     info!("[test-s1] PASS");
 }
 
+/// S3 回归：DMA 缓冲的**分配阶数**必须与**释放阶数**一致，且不留尾巴。
+///
+/// 红证语义（SMP 审计 S3）：`alloc_dma_user` 按 `order = ceil_log2(npages)`
+/// 分配一个 `2^order` 页的**连续块**（`allocate_frames(order)`），
+/// 但 `munmap_dma` 用 `deallocate_frame` **逐页**归还。两处不一致：
+///
+/// 1. 非基址页被按 order 0 归还——它们本属于一个高阶块，buddy 记账错乱；
+/// 2. npages 不是 2 的幂时（如 3 页 → order=2 分配 4 页），**尾部整页泄漏**。
+///
+/// 本测试用"分配-释放后帧数必须回到起点"作为**不变式**断言：它不依赖任何
+/// 实现细节，只要求资源守恒——这正是缺陷的实际后果（泄漏）。
+///
+/// 断言前先确认它**真的分配了**（否则"没泄漏"是因为什么都没做）。
+pub fn test_s3_dma_alloc_free_frame_conservation() {
+    use mm::user_space::UserAddressSpace;
+    info!("[test-s3] === DMA buffer alloc/free must conserve frames ===");
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    task::clear_current_proc();
+
+    // 选一个**非 2 的幂**的页数：3 页 → order=2 → 实分 4 帧。
+    // 若实现正确，释放后 4 帧全回；错误实现只回 3 帧。
+    const NPAGES: u64 = 3;
+    let bytes = NPAGES * 4096;
+
+    let aspace = UserAddressSpace::<X86PageTable>::new().expect("create test addr space");
+    let before = mm::frame_stats().allocated_frames;
+
+    let (va, _pa) = aspace.alloc_dma_user(bytes).expect("alloc dma buffer");
+    let after_alloc = mm::frame_stats().allocated_frames;
+    info!(
+        "[test-s3] alloc {} page(s): frames {} -> {} (+{})",
+        NPAGES,
+        before as u64,
+        after_alloc as u64,
+        (after_alloc - before) as u64
+    );
+    assert!(
+        after_alloc > before,
+        "alloc must actually allocate frames (else the conservation check is vacuous)"
+    );
+
+    aspace.munmap_dma(va).expect("munmap dma buffer");
+    let after_free = mm::frame_stats().allocated_frames;
+    info!(
+        "[test-s3] after munmap: frames {} (delta from start: {})",
+        after_free as u64,
+        (after_free as i64 - before as i64)
+    );
+
+    assert_eq!(
+        after_free,
+        before,
+        "DMA alloc/free must conserve frames: leak of {} frame(s)",
+        after_free as u64 - before as u64
+    );
+
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-s3] PASS");
+}
+
 /// S26 回归：`block_current_with` 登记点失败不得丢失已弹出的就绪进程。
 ///
 /// 红证语义：旧实现 `pop_ready` 弹出 `next_pid` 后 `register()` 返回 false

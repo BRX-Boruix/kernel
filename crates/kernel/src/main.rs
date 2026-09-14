@@ -646,6 +646,10 @@ unsafe fn kmain_body() -> ! {
     // 缺此能力则 munmap/mprotect 后别的核可能沿用陈旧翻译 → 静默内存破坏。
     #[cfg(feature = "kernel-tests")]
     tests::test_s1_tlb_shootdown_capability();
+
+    // SMP 审计 S3：DMA 缓冲分配阶数必须与释放阶数一致（分配-释放帧守恒）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_s3_dma_alloc_free_frame_conservation();
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
     tests::test_init_contract();
