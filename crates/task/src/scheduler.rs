@@ -260,6 +260,14 @@ const MAX_SCHED_CPUS: usize = 256;
 /// 全局单调 pid 分配器（M4.2/阶段2：pid 由核无关的原子单点分配，
 /// 保证全系统唯一且单调不复用——ppid=槽位索引不变式不随调度分核而破）。
 /// 初值 1：0 保留给“无父”语义。usize::MAX 个并发进程物理不可达（task1 KM6）。
+/// S4 观测：最近一次 `wake_enqueue` 是否**尝试**了跨核 IPI 投递。
+///
+/// 与 `interrupts::resched_ipi_send_count` 的区别：后者只统计**成功**投递。
+/// BSP 单核自检阶段（`smp::init` 之前）目标槽位未登记，投递必然失败——此时
+/// 「是否尝试」才是 S4 的判据（缺陷版本会因 guard 短路而**根本不尝试**）。
+static WAKE_ATTEMPTED_CROSS_CORE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 static NEXT_PID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
 
 /// 分配下一个全局 pid（fetch_add 单调递增）。
@@ -1457,12 +1465,35 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
 /// 的 per-pid 锁（不得与 RUN[home] 同持——IrqSpinLock 不可重入；各唤醒路径在
 /// 入队前已 drop pid 锁）。空闲判定 = current[home] 为 None（该核无进程运行、在
 /// start() 空队 halt）。目标核若在运行则 IPI 仅 EOI 无副作用（arch 的
-/// dispatch_resched 不碰调度锁，不会与本锁死锁）。发送失败静默——目标核自身
-/// IRQ0 兜底会重查，IPI 只是即时优化。
+/// dispatch_resched 不碰调度锁，不会与本锁死锁）。
+///
+/// ## 为什么**无条件**投递（SMP 审计 S4）
+///
+/// 旧实现在 `home != my_cpu_slot()` 之外还加了 `run.current.is_none()` 作为
+/// "目标核已停车"的预判，据此**跳过** IPI。该预判是错的：`current` 只在**切换
+/// 提交点**更新（在 `commit_next`/`pop_and_commit_switch` 里置 Some，在
+/// `block_current`/`schedule_from_block` 入口清 None），它表示"本核当前没有
+/// 正在运行的进程"，**不表示"本核已 hlt"**。核在两处切换之间执行内核代码时
+/// `current` 同样是 `None`。
+///
+/// 后果是**单向**的：预判错只会导致**漏发** IPI，此时目标核已 `hlt`，只能等
+/// IRQ0 tick（~16ms）兜底重查——唤醒延迟被无谓放大。而省下的只是一次微秒级
+/// IPI。任何"要不要唤醒"的预判在多核系统中都是净负收益：判错的代价是不确定
+/// 延迟，收益近乎为零。Linux 的 `smp_send_reschedule()` 因此**没有**空闲判断，
+/// 一律投递；本实现对齐该语义。
+///
+/// 投递结果不再 `let _ =` 丢弃：`send_resched_ipi_to_slot` 内部按成功/失败分别
+/// 计数（`resched_ipi_send_count` / `resched_ipi_send_fail_count`），失败可观测。
 fn wake_enqueue(pid: usize, home: usize) {
     let mut run = run_mut(home);
     run.ready.push_back(pid);
-    if home != my_cpu_slot() && run.current.is_none() {
+    drop(run);
+    // 无条件投递：见上方理由。本核自己不需要（本核就在执行本函数）。
+    if home != my_cpu_slot() {
+        // 记录"尝试投递"这一事实，与投递成败分开：BSP 单核自检阶段
+        // （smp::init 之前）跨核投递**必然**失败，但"是否尝试"仍可验证，
+        // 而它正是 S4 缺陷的判据（旧 guard 会连尝试都跳过）。
+        WAKE_ATTEMPTED_CROSS_CORE.store(true, core::sync::atomic::Ordering::Release);
         let _ = arch_x86_64::interrupts::send_resched_ipi_to_slot(home);
     }
 }
@@ -2155,6 +2186,10 @@ fn terminate_member_locked(pid: usize, code: u64) -> Termination {
     // + 脱机同款）。
     let mut hrun = run_mut(home);
     hrun.ready.retain(|&p| p != pid);
+    // 注意与 `wake_enqueue` 的区别：此处条件是**断言性**的——它断言"该核正在运行
+    // 这个 pid"（`current` 的真实语义就是"本核正在运行的进程"），不是猜测性预判，
+    // 故条件成立且必要：被终止的进程正占着那个核，必须促其尽快切走。
+    // 投递失败计入 `resched_ipi_send_fail_count`，非静默。
     let cross_core_running = home != my_cpu_slot() && hrun.current == Some(pid);
     if cross_core_running {
         let _ = arch_x86_64::interrupts::send_resched_ipi_to_slot(home);
@@ -2233,6 +2268,8 @@ fn terminate_process_locked(pid: usize, code: u64) -> Termination {
     {
         let mut hrun = run_mut(home);
         hrun.ready.retain(|&p| p != pid);
+        // 同 L2179：断言性条件（该核正在运行此 pid），非猜测性预判。
+        // 投递失败计入 `resched_ipi_send_fail_count`。
         if home != my_cpu_slot() && hrun.current == Some(pid) {
             let _ = arch_x86_64::interrupts::send_resched_ipi_to_slot(home);
         }
@@ -3132,6 +3169,31 @@ pub mod test_hooks {
         spawn_with_ppid(ppid, name, 0x1000, 0x5000, dummy_space()?)
     }
 
+    /// S4：最近一次 `wake_enqueue` 是否尝试了跨核投递（与成败无关）。
+    pub fn last_wake_attempted_cross_core() -> bool {
+        WAKE_ATTEMPTED_CROSS_CORE.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// S4：清零尝试标志（夹具前后各调一次，避免跨用例残留）。
+    pub fn clear_wake_attempted() {
+        WAKE_ATTEMPTED_CROSS_CORE.store(false, core::sync::atomic::Ordering::Release);
+    }
+
+    /// S4 夹具：向 `home` 槽位的就绪队列压入一个进程并返回**是否投递了 IPI**。
+    ///
+    /// 直接练 `wake_enqueue` 的投递契约——这是跨核唤醒唯一会产生 IPI 的路径。
+    /// 用一个真实在册的 pid（否则入队的是野 pid，虽不影响 IPI 判定但会污染队列）。
+    pub fn debug_wake_enqueue_cross_core(home: usize) -> bool {
+        let pid = match spawn_with_ppid(0, "s4.probe", 0x1000, 0x5000, dummy_space().unwrap()) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        // 直接调用投递路径：与 wake_enqueue 内部同一条（同一函数，无复制逻辑）。
+        let before = arch_x86_64::interrupts::resched_ipi_send_count();
+        wake_enqueue(pid, home);
+        arch_x86_64::interrupts::resched_ipi_send_count() > before
+    }
+
     /// 进程状态探针：(状态, 名称, waiting_for, saved.rax, ppid)。名称为 PCB 缓冲拷贝。
     pub fn probe(pid: usize) -> Option<(TaskState, alloc::string::String, Option<usize>, u64, usize)> {
         // 分桶化：pid 在册则持其所在桶读探针。
@@ -3210,6 +3272,8 @@ pub mod test_hooks {
     /// 过其内核栈，帧可**就地**归还（延迟队列的"将死栈在执行中"前提对
     /// 哑进程不成立）；顺带清空回收队列保证帧计数断言的确定性。
     pub fn reset_all() -> usize {
+        // S4：清零跨核投递尝试标志，避免用例间残留导致假阳。
+        WAKE_ATTEMPTED_CROSS_CORE.store(false, core::sync::atomic::Ordering::Release);
         // 分桶化：逐桶持锁清空全部 pid（无全局 PROCS）。
         let mut n = 0;
         for bucket in PROCESSES.iter() {

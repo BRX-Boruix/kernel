@@ -661,10 +661,43 @@ fn dispatch_resched() {
 /// 在别核（且该核空闲 halt）的进程后，即时促其醒来重查就绪队列。返回是否成功
 /// 投递（目标槽位失联/尚未上线则 false，调用方可静默忽略——被唤醒核自身 IRQ0
 /// 兜底会在 ~16ms 内重查，IPI 只是即时优化）。
+/// 已投递的重调度 IPI 计数（S4 可观测性）。
+///
+/// 存在的理由：跨核唤醒**必须**投递 IPI 这一不变式此前无任何观测手段——
+/// `let _ = send_resched_ipi_to_slot(..)` 把结果丢弃，投递与否、投给谁，
+/// 全都不可见。计数本身也是真实的运行期指标（可据此判断 IPI 风暴）。
+static RESCHED_IPI_SENDS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// 读取已投递的重调度 IPI 总数。
+pub fn resched_ipi_send_count() -> u64 {
+    RESCHED_IPI_SENDS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// 投递失败计数（目标槽位失联）。与成功计数分开，避免"看起来发了"。
+static RESCHED_IPI_FAILS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// 读取重调度 IPI 投递失败总数。
+pub fn resched_ipi_send_fail_count() -> u64 {
+    RESCHED_IPI_FAILS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn send_resched_ipi_to_slot(slot: usize) -> bool {
     match crate::smp::lapic_id_of_slot(slot) {
-        Some(lapic_id) => crate::lapic::send_fixed_ipi(lapic_id, IPI_RESCHED_VECTOR),
-        None => false,
+        Some(lapic_id) => {
+            let ok = crate::lapic::send_fixed_ipi(lapic_id, IPI_RESCHED_VECTOR);
+            if ok {
+                RESCHED_IPI_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            } else {
+                RESCHED_IPI_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            ok
+        }
+        None => {
+            RESCHED_IPI_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            false
+        }
     }
 }
 
