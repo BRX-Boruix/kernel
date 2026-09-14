@@ -8362,6 +8362,68 @@ pub fn test_cross_core_reap_safety() {
     info!("[test-reap-race] PASS");
 }
 
+/// S2 回归：地址空间销毁前必须能确认**没有任何核**的 CR3 仍指向它。
+///
+/// 红证语义（SMP 审计 S2）：`UserAddressSpace::destroy` 第 1 步逐页 `unmap`，
+/// 而 `unmap` 在中间页表页变空时会 `dealloc_frame` 它（arch 分页层的回收段）。
+/// 该段只由 `!kernel_half` 门控 —— 挡的是**内核半区**，对用户半区自己的中间页
+/// **无条件归还**。第 3 步的 `top == PT::current_paddr()` 只包住**顶层页**，
+/// 且 `current_paddr()` 读的是**本核** CR3。
+///
+/// 后果：别的核此刻 CR3 仍悬在该进程表上（`kill_pid` 只远程置 Exit + 发 IPI，
+/// home 核到调度点前 CR3 不变），用到被归还的中间页表页 → 取指缺页 → #DF →
+/// 三重故障重启。这正是 `DeadRetire` 文档承认存在、但只堵了顶层页的那条路径。
+///
+/// 断言的是**不变式**而非实现细节：体系结构必须能回答"哪些核的 CR3 指向这张表"。
+/// 在修复前该接口不存在 → 编译失败即"必然失败"的证明（S23）。
+pub fn test_s2_destroy_requires_no_active_cr3_holders() {
+    use task::scheduler::test_hooks as th;
+    info!("[test-s2] === destroy must not free page tables while another core holds CR3 ===");
+    arch_x86_64::interrupts::disable();
+    th::reset_all();
+
+    // 造一个活着的进程（其地址空间有真实页表）。
+    let pid = th::spawn_named_child_of(0, "s2.elf").expect("spawn s2 probe proc");
+    let (_, _, _, _, _) = th::probe(pid).expect("probe live proc");
+
+    // 核心断言：必须能查询"还有多少核的 CR3 指向某张用户表"——
+    // 这是 `destroy` 决定中间页表页能否归还的唯一依据。
+    // 修复前只有本核视角的 `PT::current_paddr()`，不足以支撑跨核销毁安全。
+    let some_table: u64 = 0x1000;
+    let others = arch_x86_64::paging::other_holders_of(some_table, 0);
+    info!("[test-s2] other_holders_of(0x1000, 0) = {}", others as u64);
+    assert_eq!(others, 0, "no other core recorded as holding that table");
+
+    // 记录/查询往返：本核记录后，别核（传不同 except_slot）必须看得见。
+    arch_x86_64::paging::record_current_cr3(0, some_table);
+    assert_eq!(
+        arch_x86_64::paging::recorded_cr3_of(0),
+        some_table,
+        "recorded CR3 must round-trip"
+    );
+    assert_eq!(
+        arch_x86_64::paging::other_holders_of(some_table, 1),
+        1,
+        "core 0 holds it; queried from another slot must see exactly one holder"
+    );
+    assert_eq!(
+        arch_x86_64::paging::other_holders_of(some_table, 0),
+        0,
+        "the holder itself is excluded via except_slot"
+    );
+    arch_x86_64::paging::reset_tracking_slot(0);
+    assert_eq!(
+        arch_x86_64::paging::recorded_cr3_of(0),
+        arch_x86_64::paging::CR3_NO_USER_SPACE,
+        "reset must restore the no-user-space sentinel"
+    );
+
+    let cleared = th::reset_all();
+    info!("[test-s2] cleanup: cleared {} test procs", cleared);
+    arch_x86_64::interrupts::enable();
+    info!("[test-s2] PASS");
+}
+
 /// S26 回归：`block_current_with` 登记点失败不得丢失已弹出的就绪进程。
 ///
 /// 红证语义：旧实现 `pop_ready` 弹出 `next_pid` 后 `register()` 返回 false

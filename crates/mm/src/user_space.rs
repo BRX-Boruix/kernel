@@ -526,7 +526,11 @@ where
         PT: ActivePageTable,
     {
         let core = self.core.lock();
-        core.pt.activate();
+        // S2（SMP 审计）：装载后必须让"本核 CR3 指向这张表"这一事实可被销毁方
+        // 观测到，否则 `destroy` 归还中间页表页时无法判断还有没有别的核悬在其上。
+        // 顺序（先记录、后写 CR3）由架构层的 `record_current_cr3` + trait 实现共同
+        // 保证——此处只负责把"本核槽位"这一信息交给架构层。
+        core.pt.activate_tracked();
     }
 
     /// 顶层页表物理基址（= 装载到 CR3 的值）。
@@ -989,6 +993,47 @@ where
         }
         core.destroyed = true;
 
+        // 0. **跨核切离门（SMP 审计 S2）**。
+        //
+        // 为什么必须在第 1 步之前：第 1 步逐页 `unmap`，而 `unmap` 在中间页表页
+        // 变空时会 `dealloc_frame` 它。该回收只看 `!kernel_half`（挡内核半区），
+        // 对用户半区自己的中间页**无条件归还**——它没有任何"本表是否仍是某核
+        // 活动 CR3 路径"的判定。第 3 步那个 `top == PT::current_paddr()` 只包住
+        // **顶层页**，且 `current_paddr()` 读的是**本核** CR3。
+        //
+        // 危险方向是单向的：若**别的核**此刻 CR3 仍悬在本表上（跨核 kill 只远程
+        // 置 Exit + 发 IPI，home 核到调度点前 CR3 不变），本表页一被归还就可能立刻
+        // 被 buddy 复用，那个核接着执行内核代码即取指缺页 → #DF → 三重故障重启。
+        //
+        // 故先"回家"：把本核切到内核根表（使本核不再是持有者），再确认除本核外
+        // 无人持有，然后才允许进入第 1 步。
+        let top = core.pt.paddr();
+        if PT::current_paddr() == top {
+            // 本核正挂在该表上：必须离去（否则第 1 步会改自己正在走的页表）。
+            if !PT::switch_to_kernel_root() {
+                klib::warn!(
+                    "[user-space] leaking table {:#x}: no kernel root snapshot to switch to",
+                    top
+                );
+                return;
+            }
+        }
+        let my_slot = PT::my_cpu_slot();
+        let others = PT::other_holders_of(top, my_slot);
+        if others != 0 {
+            // 仍有别的核悬在本表上——**绝不归还任何页表页**。
+            //
+            // 如实泄漏而非静默冒险：泄漏一页页表内存是可恢复的资源损失，
+            // 提前归还则是不可恢复的内存破坏（三重故障）。两害相权取其轻，
+            // 且此处显式 warn，绝不静默（S20 失败模式优先 / S39 禁止虚荣）。
+            klib::warn!(
+                "[user-space] leaking table {:#x}: {} other core(s) still hold it in CR3",
+                top,
+                others as u64
+            );
+            return;
+        }
+
         // 1. 用户区叶帧 + 中间页表页（unmap 递归释放已空中间层）。
         //    DeviceMmap 区例外：帧属设备，只清 PTE、绝不归还（与 shm 同纪律）。
         let areas = self.areas.lock().clone();
@@ -1027,20 +1072,10 @@ where
         //    运行中的内核代码透明），随后顶层表页即可安全归还；架构未提供
         //    快照（理论不可达：kmain 必先快照）时保留旧的保守路径并显式 warn，
         //    绝不静默。
-        let top = core.pt.paddr();
-        let cur = PT::current_paddr();
-        if top == cur {
-            if PT::switch_to_kernel_root() {
-                deallocate_frame(PhysFrame::from_paddr_raw(top));
-            } else {
-                klib::warn!(
-                    "[user-space] leaking active top-level table {:#x}: arch has no kernel root snapshot",
-                    top
-                );
-            }
-        } else {
-            deallocate_frame(PhysFrame::from_paddr_raw(top));
-        }
+        // 走到这里时第 0 步已保证：本核不在本表上，且无别的核持有本表。
+        // 故顶层页可无条件归还——原先那个 `top == current_paddr()` 的本核判定
+        // 已被第 0 步的跨核门完全覆盖（前者只是后者的单核特例）。
+        deallocate_frame(PhysFrame::from_paddr_raw(top));
     }
 
     /// 解映射并释放虚拟区间 `[lo, hi)` 内**已补页**的物理页（未映射的页跳过）。

@@ -9,6 +9,8 @@
 //! 由于 `arch-x86_64` 不依赖 `mm`（避免循环），页表页的分配通过
 //! 启动时注入的函数指针完成。
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use arch::{PageFlags, PageSize, PhysAddr, VirtAddr, phys_to_virt};
 use spin::Once;
 
@@ -180,7 +182,20 @@ impl X86PageTable {
     }
 
     /// 把本页表切换为活动页表（写 CR3）。
+    ///
+    /// **不更新 per-CPU CR3 追踪**——需要追踪时用 [`Self::activate_tracked`]。
+    /// 保留此入口供"地址空间不归任何进程所有"的场合（如内核自检切表）。
     pub fn activate(&self) {
+        mmio::write_cr3(self.pml4);
+    }
+
+    /// 切到本页表并**记录**到 per-CPU CR3 追踪（SMP 审计 S2）。
+    ///
+    /// 顺序有意为之：**先记录、后写 CR3**。这样别核若在两步之间查询，看到的是
+    /// "记录已指向新表"——即便硬件尚未切换，判定方向也是保守的（认为有人持有），
+    /// 绝不会出现"以为没人持有、实际有人"的危险方向。
+    pub fn activate_tracked(&self) {
+        record_current_cr3(my_slot(), self.pml4);
         mmio::write_cr3(self.pml4);
     }
 
@@ -241,6 +256,16 @@ impl arch::ActivePageTable for X86PageTable {
     fn activate(&self) {
         mmio::write_cr3(self.pml4);
     }
+
+    /// 切换活动页表并更新 per-CPU CR3 追踪（SMP 审计 S2）。
+    ///
+    /// 先记录、后写 CR3：别核若在两步之间查询，看到"已记录"即保守认为有人
+    /// 持有，绝不会出现"以为没人持有、实际有人"的危险方向。
+    fn activate_tracked(&self) {
+        record_current_cr3(my_slot(), self.pml4);
+        mmio::write_cr3(self.pml4);
+    }
+
 }
 
 impl arch::PageTable for X86PageTable {
@@ -472,6 +497,128 @@ impl arch::PageTable for X86PageTable {
     fn switch_to_kernel_root() -> bool {
         switch_to_kernel_root()
     }
+
+    /// 有多少**别的**核的 CR3 指向 `top` 这张表（S2：跨核销毁门）。
+    fn other_holders_of(top: u64, except_slot: usize) -> usize {
+        other_holders_of(top, except_slot)
+    }
+
+    /// 本核紧凑槽位（经 LAPIC id 反查）。
+    fn my_cpu_slot() -> usize {
+        my_slot()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// per-CPU CR3 追踪（SMP 审计 S2）
+// ---------------------------------------------------------------------------
+//
+// **为什么必须有这个**：`UserAddressSpace::destroy` 逐页 `unmap`，而 `unmap`
+// 在中间页表页变空时会 `dealloc_frame` 它。该回收只看 `!kernel_half`（挡内核
+// 半区），对用户半区自己的中间页**无条件归还**；`destroy` 第 3 步的
+// `top == PT::current_paddr()` 也只包住**顶层页**，且 `current_paddr()` 读的是
+// **本核** CR3。于是：别的核 CR3 仍悬在该进程表上时表页被归还 → 该核执行内核
+// 代码取指缺页 → #DF → 三重故障重启。
+//
+// 修复的前提是**能回答"此刻哪些核的 CR3 指向这张表"**。本表即该事实的唯一记录。
+//
+// ## 并发纪律（S21）
+//
+// - 写入者：只有**本核**写自己的槽。跨核写别人的槽是 bug。
+// - 读写序：`record_current_cr3` 必须在 `mov cr3` **之前**调用（见
+//   [`PAGE_TABLE::activate_tracked`]）。这样任何别核读到的状态都是
+//   "记录已更新"——若记录说"有人持有"，硬件必然已经（或即将）持有，
+//   方向保守，不会漏判。
+// - 内存序：写 `Release` / 读 `Acquire`。
+// - 哨兵：`CR3_NO_USER_SPACE` 用 `u64::MAX` 而非 `0`——`0` 在架构上是合法 CR3，
+//   兼作"无"的标记会掩盖真错误（S19 数值边界）。
+
+/// 可追踪的 CPU 槽位上限。与 SMP 子系统分配的紧凑槽位空间一致；
+/// 越界槽位是调用方缺陷，一律显式 panic（S19：不静默错位）。
+pub const MAX_TRACKED_CPUS: usize = 256;
+
+/// "本核当前不持有任何用户地址空间"的哨兵值。
+///
+/// CR3 物理基址必然 4KiB 对齐，故 `u64::MAX`（低 12 位全 1）不可能是合法 CR3。
+pub const CR3_NO_USER_SPACE: u64 = u64::MAX;
+
+/// 本核的紧凑槽位。由 LAPIC id 反查（`smp` 在 AP 上线时登记该映射）。
+///
+/// 为什么在这里算而不从 `task` 传入：`arch-x86_64` 不依赖 `task`（避免循环），
+/// 而槽位本身是**架构层**概念（LAPIC ↔ 紧凑索引），故在本层解析最合适。
+///
+/// **LAPIC 未映射时回退 0（BSP 槽）**：`current_lapic_id()` 会读 LAPIC MMIO，
+/// 而早期引导阶段（LAPIC 映射建立之前）该地址不可访问——直接读会 #PF
+/// （实测 `cr2=0x20`）。回退 0 是安全的：早期只跑在 BSP 上，且 `smp::init`
+/// 写入槽位表前其默认值本就是 0（与 `smp::my_slot` 同款纪律，不另立规矩）。
+#[inline]
+fn my_slot() -> usize {
+    if !crate::lapic::is_mapped() {
+        return 0;
+    }
+    crate::smp::slot_of_lapic(crate::lapic::current_lapic_id())
+}
+
+/// per-CPU 当前 CR3 记录：值 = 该核当前加载的用户顶层页表物理基址；
+/// 哨兵表示该核不在用户地址空间上（如运行在内核根表或 idle）。
+static PER_CPU_CR3: [AtomicU64; MAX_TRACKED_CPUS] =
+    [const { AtomicU64::new(CR3_NO_USER_SPACE) }; MAX_TRACKED_CPUS];
+
+/// 记录某核当前持有的用户地址空间顶层表。
+///
+/// **调用时机**：必须在写 CR3 之前（保守方向，见模块内并发纪律）。
+/// `top` 必须 4KiB 对齐；传 [`CR3_NO_USER_SPACE`] 表示离开用户地址空间。
+pub fn record_current_cr3(slot: usize, top: u64) {
+    assert!(slot < MAX_TRACKED_CPUS, "CR3 track slot out of range");
+    assert!(
+        top == CR3_NO_USER_SPACE || top & 0xFFF == 0,
+        "CR3 must be 4KiB-aligned or the no-user-space sentinel"
+    );
+    PER_CPU_CR3[slot].store(top, Ordering::Release);
+}
+
+/// 某核当前记录的 CR3 值（不在用户地址空间时为 [`CR3_NO_USER_SPACE`]）。
+pub fn recorded_cr3_of(slot: usize) -> u64 {
+    assert!(slot < MAX_TRACKED_CPUS, "CR3 track slot out of range");
+    PER_CPU_CR3[slot].load(Ordering::Acquire)
+}
+
+/// 查询**除 `except_slot` 外**有多少核的 CR3 指向 `top` 这张表。
+///
+/// `destroy` 用它回答"我能不能安全归还这张表的页表页"：调用方传自己（销毁核）
+/// 的槽位——销毁核已经（或将）离开该表，不该把自己算作持有者。
+pub fn other_holders_of(top: u64, except_slot: usize) -> usize {
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < MAX_TRACKED_CPUS {
+        if i != except_slot && PER_CPU_CR3[i].load(Ordering::Acquire) == top {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// 当前有多少核处于用户地址空间（记录值非哨兵）。
+pub fn active_user_cr3_count() -> usize {
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < MAX_TRACKED_CPUS {
+        if PER_CPU_CR3[i].load(Ordering::Acquire) != CR3_NO_USER_SPACE {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// 自检用：把某槽复位为"不在用户地址空间"。
+///
+/// 仅测试夹具可调：生产路径上槽的生命周期由调度器的 CR3 切换唯一维护，
+/// 手动复位会制造"硬件在用户表、记录说没有"的反向不一致（危险方向）。
+pub fn reset_tracking_slot(slot: usize) {
+    assert!(slot < MAX_TRACKED_CPUS, "CR3 track slot out of range");
+    PER_CPU_CR3[slot].store(CR3_NO_USER_SPACE, Ordering::Release);
 }
 
 /// 刷新 TLB 中一个虚拟地址。
@@ -561,6 +708,10 @@ pub fn snapshot_kernel_root() {
 pub fn switch_to_kernel_root() -> bool {
     match KERNEL_ROOT.get() {
         Some(root) => {
+            // 顺序同 `activate_tracked`：**先记录、后写 CR3**（保守方向）。
+            // 本核离开用户地址空间，故记录置哨兵 —— 此后销毁该表的核不会把
+            // 本核误判为持有者。
+            record_current_cr3(my_slot(), CR3_NO_USER_SPACE);
             mmio::write_cr3(*root);
             true
         }

@@ -845,6 +845,16 @@ fn switch_apply_next(
     let ktop = slot.kstack_top;
     let proc_ptr = &mut *slot.proc as *mut Process<X86PageTable>;
     run.current = Some(next);
+    // S2（SMP 审计）：**先记录、后写 CR3**。
+    //
+    // 记录的意义：`UserAddressSpace::destroy` 要判断"还有没有别的核 CR3 悬在
+    // 这张表上"，据此决定中间页表页能否归还。缺了这一步，销毁方只能看到本核
+    // （`current_paddr()`），别的核悬着时表页被提前归还 → 取指缺页 → #DF → 三重故障。
+    //
+    // 顺序取保守方向：先让世界看到"本核持有该表"，再真正切换。反序会留下
+    // "硬件已切走、记录仍说持有"的窗口（保守，安全）；而"硬件未切、记录说没有"
+    // 才是危险方向——先记录可杜绝它。
+    arch_x86_64::paging::record_current_cr3(my_cpu_slot(), cr3);
     arch_x86_64::mmio::write_cr3(cr3);
     gdt::set_rsp0(ktop);
     set_current_proc(proc_ptr);

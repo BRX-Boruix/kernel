@@ -174,6 +174,31 @@ pub trait PageTable {
     {
         false
     }
+
+    /// 查询**除 `except_slot` 外**有多少核的 CR3 指向 `top` 这张用户顶层表（S2）。
+    ///
+    /// 供 `UserAddressSpace::destroy` 判断"中间页表页能否安全归还"：只要还有别的
+    /// 核悬在该表上，归还任何页表页都会让那个核执行内核代码时取指缺页
+    /// （→ #DF → 三重故障）。
+    ///
+    /// `except_slot` 传调用方自己的槽位——销毁核已经（或将）离开该表。
+    /// 默认 `0`：未实现的架构不谎报"有人持有"，但调用方据 `current_paddr`
+    /// 的既有保守语义自行决定；支持多核的架构**必须**覆盖本方法。
+    fn other_holders_of(_top: u64, _except_slot: usize) -> usize
+    where
+        Self: Sized,
+    {
+        0
+    }
+
+    /// 本核的紧凑 CPU 槽位（架构层经 LAPIC id 反查）。
+    /// 默认 `0`（单核架构恒为 BSP 槽位）。
+    fn my_cpu_slot() -> usize
+    where
+        Self: Sized,
+    {
+        0
+    }
 }
 
 /// 当前活动的页表（活动地址空间）。
@@ -184,7 +209,19 @@ pub trait ActivePageTable {
     fn current() -> Self;
 
     /// 切换活动页表（装入 CR3）。
+    ///
+    /// **不更新 per-CPU CR3 追踪**。需要追踪时用 [`Self::activate_tracked`]。
     fn activate(&self);
+
+    /// 切换活动页表（装入 CR3）**并更新 per-CPU CR3 追踪**。
+    ///
+    /// 槽位由架构实现自行解析（`arch-x86_64` 经 LAPIC id 反查紧凑槽位），
+    /// 故本方法无需参数——架构无关层（`mm`）不掌握槽位概念，也不该掌握。
+    ///
+    /// **顺序纪律**：实现必须**先记录、后写 CR3**（保守方向），详见
+    /// `arch-x86_64::paging` 的 per-CPU CR3 追踪说明。
+    fn activate_tracked(&self);
+
 }
 
 /// #PF 错误码的语义视图（ADR-007：位编码知识归架构层所有）。

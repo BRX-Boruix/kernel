@@ -634,6 +634,12 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_cross_core_reap_safety();
 
+
+    // SMP 审计 S2：地址空间销毁前必须能确认没有别的核仍持有其 CR3。
+    // 红证：修复前只有本核视角的 `current_paddr()`，别的核悬着时中间页表页被
+    // 提前归还 → 取指缺页 → #DF → 三重故障（纯值级，不切表、不依赖多核）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_s2_destroy_requires_no_active_cr3_holders();
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
     tests::test_init_contract();
