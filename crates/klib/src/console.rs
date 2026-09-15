@@ -16,7 +16,8 @@
 //!   保留 [`register`] 便捷注册（内部包装为 [`FnConsole`]）。
 
 use core::fmt;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::sync::spin::SpinMutex;
 
 // S04：sink 表把 `&'static dyn Console` 胖指针拆成 (data, vtable) 两个 usize
 // 原子槽，依赖 dyn trait 对象 = data+vtable 且各占一个 usize 的 ABI 内部结构。
@@ -192,6 +193,162 @@ pub fn write_bytes(bytes: &[u8]) {
             c.write_bytes(bytes);
         }
     }
+}
+
+/// stdout **行缓冲**写入：攒到换行（或缓冲将满）才整体提交给所有 sink。
+///
+/// # 为什么需要（实测缺陷）
+///
+/// 用户程序普遍按"片段"写 stdout：`say(b"[x] msg")` 之后单独
+/// `write(b"\n")`，甚至一行拆成文本/数字/换行三段。`write_bytes` 的原子性
+/// 边界是**单次调用**而非"一行"——多核下另一核的输出恰好插在两段之间，
+/// 产生 `boruix$ l[audiod] mixed …` 与"横幅被切成碎片"（实测）。
+///
+/// 行缓冲把原子性边界升到**行**：持锁累积，遇 `\n` 或缓冲将满才一次性下发。
+/// 临界区只是一次 memcpy 或一次整行转发，串口写在内层自有串口锁，无自旋等外设。
+///
+/// # 契约
+///
+/// - 仅用于**进程 stdout**（syscall 路径）；内核日志不经此路径（它有自己的
+///   行组装，且中断上下文不允许持有可能自旋的行锁）。
+/// - 缓冲将满且仍无换行时立即整段下发：超长无换行输出（二进制数据）退化为
+///   逐块，行完整性对它本就无意义；不静默丢弃，也不无限等待。
+/// 每 CPU 行缓冲的 CPU 序号来源（内核启动早期注入一次；klib 不依赖 arch，
+/// 与 `set_stdout_sink` 同一解耦模式）。
+///
+/// klib 无 `spin::Once` 依赖，手写一次性槽位：`SET` 保证只接受第一次注入，
+/// 其后写入被丢弃（注入点是启动早期单核路径，无竞争窗口）。
+static CPU_HINT_FN: AtomicUsize = AtomicUsize::new(0);
+static CPU_HINT_SET: AtomicBool = AtomicBool::new(false);
+
+/// 注入当前 CPU 序号函数（内核启动路径调用一次，重复注入被忽略）。
+pub fn set_line_cpu_hint(f: fn() -> usize) {
+    if !CPU_HINT_SET.swap(true, Ordering::AcqRel) {
+        CPU_HINT_FN.store(f as usize, Ordering::Release);
+    }
+}
+
+#[inline]
+fn line_cpu_hint() -> Option<fn() -> usize> {
+    if !CPU_HINT_SET.load(Ordering::Acquire) {
+        return None;
+    }
+    let addr = CPU_HINT_FN.load(Ordering::Acquire);
+    if addr == 0 {
+        return None;
+    }
+    // SAFETY: 地址只由 `set_line_cpu_hint` 从真实 `fn() -> usize` 写入，
+    // 类型与签名在注入点受编译器检查，此处还原是安全的。
+    Some(unsafe { core::mem::transmute::<usize, fn() -> usize>(addr) })
+}
+
+pub fn write_line_buffered(bytes: &[u8]) {
+    // 每 CPU 一份行缓冲（不是全局一份！）：
+    //
+    // 全局单缓冲 + 全局锁会让**不同进程**的片段在同一行里物理拼接——init
+    // 的 "[init] volumed started (pid " 与 volumed 的 "[volumed] " 恰好
+    // 在两次 write() 之间同入一个缓冲，实测拼出 "(pid 77[volumed] )"。
+    // 行缓冲的正确语义是"**同一输出流**内片段重组"，而 stdout 流的边界
+    // 就是 CPU（任务在让出前恒在单核上跑；同核抢占插行是下一层问题，
+    // 属于分流的范围）。
+    //
+    // SAFETY: LINE_BUFS/LINE_LENS 仅被本 CPU 索引访问；中断上下文不会调用
+    // 本函数（内核日志走 write_bytes），故不存在"中断打断半行再写入"的自锁。
+    static LINE_BUFS: [SpinMutex<LineBufInner>; 64] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const EMPTY: SpinMutex<LineBufInner> = SpinMutex::new(LineBufInner {
+            data: [0; LINE_BUF_CAP],
+            len: 0,
+        });
+        [EMPTY; 64]
+    };
+    let idx = match line_cpu_hint() {
+        // 注入的 cpu 序号函数（内核启动早期接线，arch 槽位号恒 < 64）。
+        Some(f) => {
+            let n = f() as usize;
+            if n < 64 { n } else { 0 }
+        }
+        // 未接线（极早启动期）：退化为 0 号缓冲。此时只有 BSP 在跑，
+        // 不存在多核拼行问题。
+        None => 0,
+    };
+    let mut line = LINE_BUFS[idx].lock();
+    let mut consumed = 0usize;
+    while consumed < bytes.len() {
+        let chunk = &bytes[consumed..];
+        match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                // 有换行：连同换行符一起提交，行边界清晰。极端超长单行先冲刷
+                // 已有内容，仍超行容量则整段直发（不截断、不拆行）。
+                let take = i + 1;
+                if line.len + take > LINE_BUF_CAP {
+                    flush_line_buf(&mut line);
+                }
+                if take <= LINE_BUF_CAP {
+                    let start = line.len;
+                    line.data[start..start + take].copy_from_slice(&chunk[..take]);
+                    line.len = start + take;
+                    flush_line_buf(&mut line);
+                } else {
+                    flush_line_buf(&mut line);
+                    write_bytes(&chunk[..take]);
+                }
+                consumed += take;
+            }
+            None => {
+                // 无换行：能塞多少塞多少；塞不下先冲刷腾地方。
+                let free = LINE_BUF_CAP - line.len;
+                if free == 0 {
+                    flush_line_buf(&mut line);
+                    continue;
+                }
+                let take = core::cmp::min(chunk.len(), free);
+                let start = line.len;
+                line.data[start..start + take].copy_from_slice(&chunk[..take]);
+                line.len = start + take;
+                consumed += take;
+                if line.len == LINE_BUF_CAP {
+                    flush_line_buf(&mut line);
+                }
+            }
+        }
+    }
+}
+
+/// 冲刷行缓冲（仅在持有 LINE 锁时调用）。
+fn flush_line_buf(line: &mut LineBufInner) {
+    if line.len > 0 {
+        write_bytes(&line.data[..line.len]);
+        line.len = 0;
+    }
+}
+
+
+/// [`write_line_buffered`] 的 `fmt::Write` 适配：供 init 等用户进程日志的
+/// 多段格式化复用同一行缓冲（`write_fmt` 会把 `{}` 展开成多次 `write_str`，
+/// 直接用 `write_bytes` 会回到碎片原子性问题）。
+struct LineFmtWriter;
+
+impl core::fmt::Write for LineFmtWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        write_line_buffered(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// 用行缓冲输出格式化参数。
+pub fn write_fmt_line_buffered(args: core::fmt::Arguments) {
+    let mut w = LineFmtWriter;
+    let _ = core::fmt::Write::write_fmt(&mut w, args);
+}
+/// 行缓冲容量：与 [`FMT_CAP`] 同量级——容纳全部现有单行输出，静态区开销
+/// 可忽略。超长无换行输出按块冲刷（见 [`write_line_buffered`]）。
+const LINE_BUF_CAP: usize = 1024;
+
+/// [`LineBuf`] 的去封装视图，供 [`flush_line_buf`] 以函数形式复用。
+struct LineBufInner {
+    data: [u8; LINE_BUF_CAP],
+    len: usize,
 }
 
 /// 把 `fmt::Arguments` 格式化后输出到所有 sink。

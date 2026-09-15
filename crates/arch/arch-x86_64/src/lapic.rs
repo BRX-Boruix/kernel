@@ -225,7 +225,11 @@ pub extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
     let t = TICKS[slot].fetch_add(1, Ordering::Relaxed) + 1;
     if t <= 3 {
         // 前几次 per-core tick 打印，便于启动期确认每个核的定时器都在推进。
-        klib::info!("[lapic] tick cpu_slot={} count={}", slot, t);
+        // 用 debug 级别（默认 Info 不显示）：多核下每核打 1-3 条，恰好在启动
+        // 横幅附近输出，把横幅切成碎片（实测）。定时器在推进由 "SMP done,
+        // N cpus online" 与 shell 可交互背书，无需每次启动刷屏。需要观察时
+        // klib::log::set_level(LogLevel::Debug)。
+        klib::debug!("[lapic] tick cpu_slot={} count={}", slot, t);
     }
     // 软件定时器队列仅由 BSP（槽 0）驱动；AP 空转不碰（阶段 1 纪律）。
     if slot == 0 {

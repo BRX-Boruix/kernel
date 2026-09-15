@@ -485,8 +485,15 @@ unsafe fn kmain_body() -> ! {
     // KM1：标准流数据链路接线——stdin 源 = 键盘缓冲、stdout/stderr sink =
     // console。此后 fd 0/1/2 是每进程 fd 表内的真实句柄，syscall 层无任何
     // fd 号特判。
+    // 行缓冲的 CPU 序号来源：接 arch 的当前核槽位（每 CPU 一份缓冲的前提）。
+    klib::console::set_line_cpu_hint(arch_x86_64::lapic::my_slot);
     vfs::stdio::set_stdin_source(stdin_source);
-    vfs::stdio::set_stdout_sink(klib::console::write_bytes);
+    // stdout sink 用**行缓冲**版（修复多核输出互相插行）：
+    // 用户程序按片段写（文本/数字/换行分多次 write），write_bytes 的原子
+    // 边界是单次调用，另一核的输出会插进一行中间（实测横幅被切成碎片、
+    // 提示符里插进 [audiod] 行）。行缓冲把原子边界升到"行"。
+    // 内核自己的日志仍走 write_bytes/write_fmt（中断上下文不能持行锁）。
+    vfs::stdio::set_stdout_sink(klib::console::write_line_buffered);
 
     // vfs1 A2/D4（ADR-023 §1/§7）：全局页缓存与 RamFS 内存水位钩子接线。
     // - 全局缓存注入后，一切 FileHandle 写都经 write_cached 写穿并作废受
