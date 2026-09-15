@@ -142,18 +142,53 @@ fn notify_data_ready() {
 ///
 /// **S21 并发显式化**：
 /// - 生产者 = 写者进程（VFS `write_at`），只推进 `write_pos`；
-/// - 消费者 = 音频驱动（`AUDIO_FETCH`/`AUDIO_COMMIT`），只推进 `read_pos`；
+/// - 消费者 = 音频驱动（`AUDIO_FETCH`/`AUDIO_COMMIT`），只推进 `read_pos`
+///   （取数时经 `reserved_pos` 中转，见该字段说明）；
 /// - 两端各只写自己的指针、只读对方指针——**无锁、无自旋、无等待环**；
-/// - 因为只有两个原子量而没有锁，**不存在锁获取顺序与死锁风险**；
-/// - 内存序：写指针用 `Release`，读指针用 `Acquire`，构成 SPSC 标准配对；
-/// - 数据区经 `UnsafeCell` 共享，但可达区间由两个指针隔离：生产者只写
+/// - 因只有原子量而没有锁，**不存在锁获取顺序与死锁风险**；
+/// - 内存序：写侧一律 `Release`，读侧一律 `Acquire`，构成 SPSC 标准配对；
+/// - 数据区经 `UnsafeCell` 共享，但可达区间由三个指针隔离：生产者只写
 ///   `[write_pos, write_pos+n)`，消费者只读 `[read_pos, read_pos+m)`，
-///   且 `n + m <= capacity`，故两端永不触碰同一字节。
+///   且任一时刻 `已写未提交 + 可写 <= capacity`，故两端永不触碰同一字节。
+///
+/// ## 三个指针的分工（**本类型的关键不变量**）
+///
+/// ```text
+/// read_pos == reserved_pos == write_pos   空
+///    |             |              |
+///    |             |              +-- 生产者已写入的全部数据上界
+///    |             +-- 消费者已"取走"（借出）的上界，尚未确认播完
+///    +-- 消费者已"确认播完"的上界；此前的空间已交还生产者
+/// ```
+///
+/// - `[read_pos, reserved_pos)` = **已借出、尚未确认播完**（在硬件手里）；
+/// - `[reserved_pos, write_pos)` = **已写入、尚未被借出**（等着被取）。
+///
+/// **为何必须有 `reserved_pos`**（本字段的引入理由，属缺陷修复而非装饰）：
+/// 初版只有 `read_pos`/`write_pos` 两个指针，`peek` 不推进任何指针，
+/// 于是"这一字节已经被取走"这件事**只存在于消费者自己的记账里**
+/// （intel-hda 的 `chunk_filled[]`），内核完全无从知晓。后果有三：
+///   1. 同一个消费者可以**反复 peek 到同一段字节**（第二次取到的是第一次的
+///      副本），驱动若少 commit 一次就直接把同一段声音播两遍——这正是实测
+///      "播放特别卡、有重复"的根因；
+///   2. `commit(n)` 的合法性只能拿 `write_pos - read_pos` 校验，而该量
+///      **同时包含"已借出"和"未借出"两部分**，内核分不清二者，于是
+///      "本类型"与"消费者账本"成为两个可分裂的真相源（违反 S15 单点）；
+///   3. 借出量一旦超过 `write_pos - read_pos`，commit 被如实拒绝，但读指针
+///      停滞会让后续 peek 继续返回同一段，错误自我放大。
+/// 引入 `reserved_pos` 后**借出本身就是 ring 的一等状态**：同一字节在
+/// 被 commit 前不可能被第二次借出，commit 的边界校验也有了精确依据。
 pub struct AudioRing {
     buf: core::cell::UnsafeCell<Vec<u8>>,
     capacity: usize,
     write_pos: AtomicUsize,
     read_pos: AtomicUsize,
+    /// 已借出（peek 取走）但尚未确认播完的上界。
+    ///
+    /// 只有消费者推进它（peek 时），只有 `commit` 让它回落到 `read_pos`。
+    /// 语义与 `read_pos` 同为单调递增的"绝对位置"（不回绕，取模只在访问
+    /// 缓冲区时做），故三者的差值恒为可解释的正数。
+    reserved_pos: AtomicUsize,
     /// 消费者注册槽：持有 pid，`NO_CONSUMER` 表示空闲。
     ///
     /// **S15 单点定义**：这是"谁在消费"的**唯一**真相来源——写路径门禁
@@ -180,12 +215,17 @@ impl AudioRing {
             capacity,
             write_pos: AtomicUsize::new(0),
             read_pos: AtomicUsize::new(0),
+            reserved_pos: AtomicUsize::new(0),
             consumer: AtomicU32::new(NO_CONSUMER),
             underruns: AtomicU64::new(0),
         }
     }
 
-    /// 已占用字节数（写入但消费者尚未提交的部分）。
+    /// 已占用字节数（写入但消费者尚未确认播完的部分）。
+    ///
+    /// **S15 单点**：这是"ring 里还有多少数据没被确认消费"的**唯一**定义，
+    /// 生产者背压（`free`）与 `status` 披露都读它。已借出未提交的部分
+    /// **计入已占用**——那些字节仍在缓冲区内、生产者不得覆盖它们。
     pub fn used(&self) -> usize {
         let w = self.write_pos.load(Ordering::Acquire);
         let r = self.read_pos.load(Ordering::Acquire);
@@ -195,6 +235,17 @@ impl AudioRing {
     /// 剩余可写空间（字节）。
     pub fn free(&self) -> usize {
         self.capacity - self.used()
+    }
+
+    /// 已借出（peek 取走）但尚未 `commit` 确认播完的字节数。
+    ///
+    /// 供 `status` 披露与诊断使用；`commit` 的边界校验亦以此为准
+    /// （而不是拿 `used()` 兜底——后者含"尚未借出"的部分，会把
+    /// "提交了从未取走的数据"这种错误一并放行）。
+    pub fn reserved(&self) -> usize {
+        let p = self.reserved_pos.load(Ordering::Acquire);
+        let r = self.read_pos.load(Ordering::Acquire);
+        p.wrapping_sub(r)
     }
 
     pub fn capacity(&self) -> usize {
@@ -308,12 +359,22 @@ impl AudioRing {
         n
     }
 
-    /// 消费：取出至多 `dst.len()` 字节，**不推进读指针**。
+    /// 消费：取出至多 `dst.len()` 字节，**只推进** `reserved_pos`（借出），
+    /// **不推进** `read_pos`。
     ///
-    /// 读指针由 [`AudioRing::commit`] 推进，以支持"取走 → 喂硬件 →
-    /// 播完 → 提交"的两阶段语义（plan_audio_vfs.md §3.2）。
+    /// 两阶段语义（plan_audio_vfs.md §3.2）：取走 → 喂硬件 → 播完 → 提交。
+    /// `read_pos` 仍只由 [`AudioRing::commit`] 推进，故"取走后未确认播完"的
+    /// 数据不会丢失。**但借出本身必须被记录**：本函数推进 `reserved_pos`，
+    /// 使同一字节在被 `commit` 之前**不可能被第二次借出**。
+    ///
+    /// **S21 并发论证**：本函数只被**唯一**消费者调用（`attach` 的独占槽
+    /// 保证同一时刻至多一个消费进程），故对 `reserved_pos` 的
+    /// load-then-store 不存在竞争；生产者只读它、从不写，也不会与之冲突。
+    /// 若将来允许并发消费者，此处须改为 CAS 循环——该前提由独占槽强制，
+    /// 不是"恰好只有一个"的巧合。
     pub fn peek(&self, dst: &mut [u8]) -> usize {
-        let r = self.read_pos.load(Ordering::Acquire);
+        // 从**借出上界**而非读上界起读：已被借出但未提交的字节不重复交付。
+        let r = self.reserved_pos.load(Ordering::Acquire);
         let w = self.write_pos.load(Ordering::Acquire);
         let avail = w.wrapping_sub(r);
         let n = core::cmp::min(dst.len(), avail);
@@ -332,18 +393,31 @@ impl AudioRing {
                 core::ptr::copy_nonoverlapping(base, dst.as_mut_ptr().add(first), n - first);
             }
         }
+        // Release：记录借出。必须在数据拷出**之后**发布——否则消费者可能
+        // 先看到"已借出"再读数据，而数据拷贝尚未完成（S21 顺序纪律）。
+        self.reserved_pos.store(r + n, Ordering::Release);
         n
     }
 
     /// 提交：推进读指针 `n` 字节，把空间交还生产者。
     ///
-    /// **S19 边界论证**：`n` 超过"已取未提交"量时**如实拒绝**，绝不静默
-    /// 截断——静默截断会让读指针越过写指针，`used()` 回绕成巨额数值，
-    /// 进而把 ring 永久堵死。
+    /// **S19 边界论证（已修正）**：`n` 超过"**已借出**未提交"量时如实拒绝，
+    /// 绝不静默截断。校验基准是 `reserved()`（=`reserved_pos - read_pos`），
+    /// **不是** `used()`（=`write_pos - read_pos`）。
+    ///
+    /// 初版用 `used()` 校验，语义上放行了"提交从未取走的数据"：`used()`
+    /// 含尚未借出的部分，故消费者可以 commit 一段它根本没 peek 过的字节，
+    /// 读指针随之越过借出上界——而 `reserved_pos` 不跟进，二者永久错位，
+    /// 后续 `peek` 会从错误位置继续取数据。以 `reserved()` 为准后，
+    /// "能提交的"与"已取走的"成为同一个量（S15 单点），该错误结构性消失。
+    ///
+    /// 不变式：`read_pos <= reserved_pos <= write_pos` 恒成立——本函数只
+    /// 把 `read_pos` 推进到**不超过** `reserved_pos` 的位置，`peek` 只把
+    /// `reserved_pos` 推进到不超过 `write_pos` 的位置。
     pub fn commit(&self, n: usize) -> Result<(), Error> {
         let r = self.read_pos.load(Ordering::Acquire);
-        let w = self.write_pos.load(Ordering::Acquire);
-        if n > w.wrapping_sub(r) {
+        let p = self.reserved_pos.load(Ordering::Acquire);
+        if n > p.wrapping_sub(r) {
             return Err(Error::InvalidParam);
         }
         self.read_pos.store(r + n, Ordering::Release);
@@ -517,6 +591,10 @@ impl DspNode {
                 let _ = obj.field_u64("capacity", ring.capacity() as u64);
                 let _ = obj.field_u64("used", ring.used() as u64);
                 let _ = obj.field_u64("free", ring.free() as u64);
+                // 已借出（peek 取走）但尚未 commit 确认播完的字节数。
+                // 如实披露：它是"驱动手里攥着多少还没归还"的直接证据，
+                // 恒 <= used()。稳态下应约为一个 BDL 周期（16 KiB）。
+                let _ = obj.field_u64("reserved", ring.reserved() as u64);
                 let _ = obj.field_u64("underruns", ring.underruns());
                 let _ = obj.end();
             }

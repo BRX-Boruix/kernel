@@ -1329,9 +1329,53 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
 /// 由用户态决定重试策略——与 `driver_irq_wait` 同口径。
 ///
 /// `has_data` 探针直接读 ring 水位（S15：就绪条件单点定义为"ring 非空"）。
+/// 音频 `fetch` 空读阻塞的**有限**超时（纳秒）。
+///
+/// **取值理由（S17）**：必须**显著大于**一个驱动的 BDL 周期，否则正常
+/// 欠载会被误判为超时；又必须足够短，使"驱动已死/生产者已退出"能被及时
+/// 发现而不是永久挂起。intel-hda 的一个周期 = `STREAM_CHUNK_BYTES`(16 KiB)
+/// ÷ 192000 B/s ≈ 85 ms，故取 500 ms（约 6 个周期）——正常播放绝不会连续
+/// 6 个周期拿不到数据，而一旦拿不到，500 ms 内必定如实返回。
+///
+/// **为何不用无限等待**：见本文件 `audio_fetch_blocking` 的说明——初版就是
+/// 事实上的无限等待，导致驱动在"已 attach 但生产者未写入"的窗口里永久睡着。
+const AUDIO_FETCH_TIMEOUT_NS: u64 = 500_000_000; // 500 ms
+
 fn audio_fetch_blocking(frame: &mut SyscallFrame, inode: &alloc::sync::Arc<dyn vfs::inode::INode>) -> DispatchResult {
     let Some(pid) = current_proc_mut().map(|p| p.pid()) else {
         return done(pack_err(Error::WouldBlock));
+    };
+    // **注册超时定时器**（本轮补上的缺陷修复）。
+    //
+    // 初版本函数**没有任何超时**：`wake_audio_timeout` / `set_audio_timeout_timer`
+    // / `clear_audio_timeout_timer` 三个函数在 task crate 里定义齐全并已导出，
+    // 却**零调用点**——本路径忘了接上。后果是 `libsys::audio::fetch` 文档承诺的
+    // "阻塞等待（有限超时）"根本不存在：驱动一旦在"已 attach 但生产者尚未写入"
+    // 的窗口里 fetch（实测日志 `[audio] pid=4 fetch blocking on empty ring` →
+    // `switched out (asleep)` → 之后才 `[dma] alloc`），就**永久睡着**，只能等
+    // 生产者首次写入才被唤醒。驱动起流因此被推迟到生产者之后，ring 在等待期间
+    // 被灌满并持续背压，播放从头就落在欠载边缘。
+    //
+    // 与 `event_wait_blocking` 同构（S15 单点：同一套超时纪律，不另造一套）：
+    // 定时器到期经 `task::wake_audio_timeout` 把保存帧 rax 预置 `0`（超时无数据）
+    // 并唤醒；记录 id 供 `wake_audio` 在数据唤醒时取消。本函数所有"立即返回"的
+    // 路径亦显式取消并清 AUDIO_TIMER，杜绝 stale 定时器泄漏与级联污染（S18/S21）。
+    // 定时器表满时静默退化——数据到达仍能唤醒，超时仅是对活性的兜底。
+    let registered_timer =
+        match klib::time::set_timeout(AUDIO_FETCH_TIMEOUT_NS, task::wake_audio_timeout, pid) {
+            Some(tid) => {
+                task::set_audio_timeout_timer(tid);
+                Some(tid)
+            }
+            None => None,
+        };
+    // 返回前取消超时定时器并清 AUDIO_TIMER（仅"已确定交付/返回"的路径调用；
+    // Switched 阻塞路径不清，交给数据唤醒取消或到期自然触发）。
+    let cancel_timer = |registered: Option<u64>| {
+        if let Some(tid) = registered {
+            klib::time::cancel_timeout(tid);
+        }
+        task::clear_audio_timeout_timer();
     };
     // 重新登记前清理本进程残留的音频等待者身份（超时唤醒路径不清，见
     // clear_audio_waiter_if），否则本次 CAS 失败且 wake_audio 会误读本 pid。
@@ -1351,7 +1395,9 @@ fn audio_fetch_blocking(frame: &mut SyscallFrame, inode: &alloc::sync::Arc<dyn v
         // 重试。绝不在此伪造数据。
         task::SwitchOutcome::NotSwitched => {
             // 数据已在复检时就绪 / 已有并发等待者 → 如实 EAGAIN 让调用方重试。
-            done(pack_err(Error::WouldBlock))
+            let r = done(pack_err(Error::WouldBlock));
+            cancel_timer(registered_timer);
+            r
         }
     }
 }

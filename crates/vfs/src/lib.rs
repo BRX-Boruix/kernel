@@ -1155,6 +1155,7 @@ mod tests {
         assert_eq!(out, data);
 
         // S19：commit 越界必须如实拒绝，绝不静默截断。
+        // 边界以 `reserved()`（=已借出量 16）为准，故 17 越界。
         assert_eq!(ring.commit(17), Err(Error::InvalidParam));
         assert_eq!(ring.commit(16), Ok(()));
         assert_eq!(ring.used(), 0);
@@ -1176,16 +1177,105 @@ mod tests {
         assert_eq!(ring.peek(&mut small), 4);
         assert_eq!(small, [3u8; 4]);
         assert_eq!(ring.used(), 10, "peek must not advance read_pos");
+        // 借出水位推进 4：这 4 字节已被取走，不构成"未借出"的可用数据。
+        assert_eq!(ring.reserved(), 4);
+        // 续读只能拿到剩下的 6 字节，**不会重放**刚取过的 4 字节。
+        let mut rest = [0u8; 8];
+        assert_eq!(ring.peek(&mut rest), 6);
+        assert_eq!(ring.reserved(), 10);
+        // 累计提交 10（= 全部借出量）：越界与否以借出量为准。
         assert_eq!(ring.commit(10), Ok(()));
 
         // 超大输入：短写为容量值，不 panic。
         let huge = alloc::vec![9u8; 1000];
         assert_eq!(ring.push(&huge), 16, "push must short-write, not panic");
+        // **必须先借出才能提交**（不变量 3）：初版此处直接 commit(16) 而
+        // 从未 peek —— 那正是"提交从未取走的数据"，现被如实拒绝。
+        assert_eq!(ring.commit(16), Err(Error::InvalidParam));
+        let mut hb = [0u8; 16];
+        assert_eq!(ring.peek(&mut hb), 16);
+        assert_eq!(hb, [9u8; 16]);
         assert_eq!(ring.commit(16), Ok(()));
 
         // 空输入：无副作用。
         assert_eq!(ring.push(&[]), 0);
         assert_eq!(ring.used(), 0);
+    }
+
+    /// **根治轮新增**：`reserved_pos` 三指针不变式与"借出不重复"语义。
+    ///
+    /// 本测试锁定的是导致实测"播放卡顿、重复"的**根因**：在只有
+    /// `read_pos`/`write_pos` 两指针的初版里，`peek` 不推进任何指针，
+    /// 同一个消费者可以**反复取到同一段字节**——驱动一旦少 commit 一次
+    /// （或 commit 被拒），硬件就把同一段声音重复播出去。
+    ///
+    /// 三条不变式必须同时成立（任一被破坏即成缺陷）：
+    ///   1. `read_pos <= reserved_pos <= write_pos`；
+    ///   2. 同一字节在被 `commit` 前**不可被第二次 peek 交付**；
+    ///   3. `commit` 只能提交**已借出**的量（不能提交从未取走的数据）。
+    #[test]
+    fn test_audio_ring_reserved_prevents_double_delivery() {
+        let ring = AudioRing::with_capacity(64);
+        assert_eq!(ring.push(&[1u8; 16]), 16);
+        assert_eq!(ring.used(), 16);
+        assert_eq!(ring.reserved(), 0, "未取走前借出量为 0");
+
+        // 第一次取：拿到 16，借出水位推进到 16。
+        let mut a = [0u8; 16];
+        assert_eq!(ring.peek(&mut a), 16);
+        assert_eq!(a, [1u8; 16]);
+        assert_eq!(ring.reserved(), 16);
+        assert_eq!(ring.used(), 16, "peek 不推进 read_pos");
+
+        // **第二次取：必须取不到**（不变量 2）。
+        let mut b = [0xFFu8; 16];
+        assert_eq!(ring.peek(&mut b), 0, "已借出的字节不得重复交付");
+        assert_eq!(b, [0xFFu8; 16], "取不到时不得改写调用方缓冲（S09）");
+
+        // **不能提交从未取走的数据**（不变量 3）：此刻仅借出 16，17 越界。
+        assert_eq!(ring.push(&[2u8; 16]), 16);
+        assert_eq!(ring.commit(17), Err(Error::InvalidParam));
+        assert_eq!(ring.commit(16), Ok(()), "提交恰好等于借出量");
+        assert_eq!(ring.reserved(), 0);
+        assert_eq!(ring.used(), 16, "只有借出的 16 被释放，后写的 16 仍在");
+
+        // 提交后原先那 16 字节不再可读，剩下的是第二次写入的数据——
+        // 证明读位置确实前进了，而不是原地重放。
+        let mut c = [0u8; 16];
+        assert_eq!(ring.peek(&mut c), 16);
+        assert_eq!(c, [2u8; 16], "commit 后必须读到后续数据，不是旧数据");
+
+        // 不变量 1：三指针单调且有序。
+        assert_eq!(ring.reserved(), 16);
+        assert_eq!(ring.used(), 16);
+        ring.commit(16).unwrap();
+        assert_eq!(ring.reserved(), 0);
+        assert_eq!(ring.used(), 0);
+        assert_eq!(ring.free(), 64, "全部提交后空间完整归还");
+    }
+
+    /// 输入流（`WriteGate::Open`）走 peek+commit，在 reserved 语义下
+    /// 必须**恰好消费一次**——既不多（重复交付）也不少（丢数据）。
+    ///
+    /// 这是对 `test_audio_stream_read_consumes_data` 的强化：该测试只验证
+    /// "读后 used()==0"，在初版实现下**照样通过**（因为 commit 兜住了）；
+    /// 本测试追加"借出量归零"，使 `reserved_pos` 与 `read_pos` 同步前进
+    /// 成为被断言的事实，防止只改一半。
+    #[test]
+    fn test_audio_stream_open_gate_consumes_exactly_once() {
+        let stream = DspNode::stream_with_capacity(64);
+        stream.write_at(0, &[9u8; 32]).unwrap();
+        assert_eq!(stream.as_audio_ring().unwrap().reserved(), 0);
+
+        let mut out = [0u8; 32];
+        assert_eq!(stream.read_at(0, &mut out), Ok(32));
+        assert_eq!(out, [9u8; 32]);
+        // 输入端读走即取走：used 与 reserved 双双归零。
+        assert_eq!(stream.as_audio_ring().unwrap().used(), 0);
+        assert_eq!(stream.as_audio_ring().unwrap().reserved(), 0);
+
+        // 再读必须为空（不重放）。
+        assert_eq!(stream.read_at(0, &mut out), Err(Error::WouldBlock));
     }
 
     /// A1 诚实性红线正向测试：附加消费者后，写入必须真正落进 ring。
@@ -1230,8 +1320,6 @@ mod tests {
         assert_ne!(s, s2, "status must be per-instance real state, not a constant");
     }
 
-    /// A1 满 ring 背压：必须如实 WouldBlock，绝不静默丢弃。
-    #[test]
     /// M1：`stream/N` 是混音器**输入端**，写入门禁必须与 `dsp` 不同。
     ///
     /// **为何必须有这条测试**：`dsp` 的语义是"无消费者即拒绝写入"（A1 红线，
@@ -1332,6 +1420,11 @@ mod tests {
     /// This is the control for the test above: making every read consume would break
     /// the driver contract, where fetched data must be delivered to hardware BEFORE
     /// being committed, so a crash mid-transfer does not silently discard audio.
+    ///
+    /// **修正（根治轮）**：初版本测试只断言 `used()` 仍为 32，即"数据还在"。
+    /// 该断言**不足以防住真正的缺陷**：它放过了"同一个消费者能反复取到同一段
+    /// 字节"——那正是实测"播放卡顿、重复"的根因。现在 `peek` 推进
+    /// `reserved_pos`，故补上"第二次取必须取不到"的断言（见下）。
     #[test]
     fn test_audio_dsp_read_still_peeks_until_commit() {
         let dsp = DspNode::with_capacity(256);
@@ -1347,10 +1440,27 @@ mod tests {
             32,
             "dsp read must NOT consume; two-phase contract requires commit"
         );
+        // 但**已经借出**：32 字节全部在 reserved 水位里。
+        assert_eq!(
+            dsp.as_audio_ring().unwrap().reserved(),
+            32,
+            "peek must record the borrowed bytes so they cannot be borrowed twice"
+        );
+
+        // **关键新断言**：再读一次必须取不到数据（而不是重放同一段）。
+        // 初版 peek 不推进任何指针，此处会再次返回 32 字节——驱动少 commit
+        // 一次就会把同一段声音播两遍（实测症状的直接来源）。
+        let mut again = [0u8; 32];
+        assert!(
+            dsp.read_at(0, &mut again).is_err(),
+            "a second peek must not replay already-borrowed bytes"
+        );
+        assert_eq!(again, [0u8; 32], "拒绝时不得写入任何数据（S09）");
 
         // After an explicit commit the data is gone.
         dsp.as_audio_ring().unwrap().commit(32).unwrap();
         assert_eq!(dsp.as_audio_ring().unwrap().used(), 0);
+        assert_eq!(dsp.as_audio_ring().unwrap().reserved(), 0);
     }
 fn test_audio_dsp_backpressure() {
         let node = DspNode::with_capacity(8);
