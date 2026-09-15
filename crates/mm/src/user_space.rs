@@ -1350,7 +1350,15 @@ where
                 return Err(e);
             }
         }
-        Ok((va, phys))
+        // 以**页表翻译真值**作为返回物理地址：DMA 描述符必须指向 CPU 实际
+        // 访问的那片物理内存。若此处与连续帧假设不一致，返回假设值会让设备
+        // 访问到完全不同的物理页（症状：设备读到代码页/读到 0）。
+        let effective = core
+            .pt
+            .translate(VirtAddr::new(va))
+            .map(|p| p.as_u64())
+            .unwrap_or(phys);
+        Ok((va, effective))
     }
 
     /// 释放一整块 DMA 一致性缓冲（阶段二 alloc_dma_user 的逆操作）。

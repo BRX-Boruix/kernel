@@ -59,7 +59,14 @@ fn refs_cell(paddr: u64) -> *mut AtomicU32 {
     }
 }
 
-/// 登记一个刚分配的物理帧，引用计数置 1（覆盖残留登记）。
+/// "已归还"哨兵：用于区分"从未登记（0）"与"已归还（DEAD）"。
+///
+/// `decref` 把未登记帧的 0 翻成该值，从而保证同一帧只被归还一次。
+/// `init`（每次分配时调用）会把它重置为 1，故帧被重新分配后可正常复用。
+/// 取 `u32::MAX` 是因为正常引用计数不可能达到该值（`incref` 已在接近时断言失败）。
+pub const DEAD: u32 = u32::MAX;
+
+/// 登记一个刚分配的物理帧，引用计数置 1（覆盖残留登记，含 DEAD 哨兵）。
 pub fn init(paddr: u64) {
     // Relaxed 足够：此刻帧刚脱离分配器、尚无任何其它执行流持有引用。
     unsafe { (*refs_cell(paddr)).store(1, Ordering::Relaxed) }
@@ -87,6 +94,11 @@ pub fn incref(paddr: u64) {
                     return;
                 }
             }
+            // 已归还（哨兵）：该帧不属于任何存活映射，**不得复活**。
+            // 若在此 CAS(DEAD→DEAD+1)，计数会绕回 0/1，之后任何 decref 都会
+            // 再次返回 true，把已经归还的帧又归还一次（重复释放复活路径）。
+            // 保留其"不可再归还"的语义：直接返回，不增计数。
+            DEAD => return,
             v => {
                 assert!(v != u32::MAX, "refcount overflow on frame {:#x}", paddr);
                 if unsafe {
@@ -105,17 +117,45 @@ pub fn incref(paddr: u64) {
 ///
 /// 返回 `true` 表示引用降到 0，调用方（`deallocate_frame`）应真正归还物理帧；
 /// 返回 `false` 表示仍有其它引用（如父子 COW 共享），仅减计数、不归还。
+///
+/// ## 未登记帧（count==0）的语义修正（本轮定位的真实缺陷）
+///
+/// 旧实现把 `0` 一律当作"按 count=1 处理，直接归还"，即**每次调用都返回 true**。
+/// 后果：一个帧首次归还（1→0）后即处于未登记态，此后**任何**针对该地址的
+/// `deallocate_frame` 都会再次返回 true，把同一个物理帧反复交还分配器。
+/// 实测症状：HDA 驱动的 DMA 缓冲帧（如 0x8a8000/0x8a9000）在一次 boot 内被
+/// 释放十余次，而它们从未被重新分配；与此同时这些帧被分配器再次发给其它进程，
+/// 进程代码覆盖了驱动的 CORB/RIRB/BDL 内容——设备 DMA 读到的因此是 x86 机器码，
+/// 表现为 `bdl/0: 0x0`、LPIB 恒 0、CORB 命令"取走了却没有应答"。
+///
+/// 修正：未登记帧**只允许归还一次**。用 CAS(0→`DEAD`) 把"已归还"与"从未登记"
+/// 区分开——首个 decref 把 0 翻成哨兵值并返回 true，后续 decref 看到哨兵即返回
+/// false（不再归还）。这样既保留"reserve 直通帧可被释放一次"的既有能力，
+/// 又杜绝重复归还。
 pub fn decref(paddr: u64) -> bool {
     let cell = refs_cell(paddr);
     loop {
         match unsafe { (*cell).load(Ordering::Acquire) } {
-            // 未登记：按 count=1 处理直接归还；保持 0 不改写（reserve 直通帧
-            // 可能再次被查询计数）。
-            0 => return true,
-            // 归零：CAS 1→0 保证并发双 decref 只有一方看到胜利。
+            // 未登记：CAS 0→DEAD，只有第一个调用者获胜并归还。
+            0 => {
+                if unsafe { (*cell)
+                    .compare_exchange_weak(0, DEAD, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok() }
+                {
+                    return true;
+                }
+            }
+            // 已归还过：不再归还（防重复释放）。
+            DEAD => return false,
+            // 归零：CAS 1→DEAD（**直接落到哨兵**，不是落到 0）。
+            //
+            // 关键：若这里落到 0，后续 decref 会命中上面的 0 分支再做 CAS(0→DEAD)
+            // 并**再次返回 true**——重复归还依旧发生（本实现第一版即踩此坑，
+            // 实测某帧在一次 boot 内仍被释放三次）。一步落到 DEAD 后，后续
+            // decref 立即命中 DEAD 分支返回 false，重复归还才真正被杜绝。
             1 => {
                 if unsafe { (*cell)
-                    .compare_exchange_weak(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange_weak(1, DEAD, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok() }
                 {
                     return true;
@@ -134,9 +174,15 @@ pub fn decref(paddr: u64) -> bool {
 }
 
 /// 当前引用计数（未登记按 1 计）。
+///
+/// 语义与 incref/decref 保持一致：
+/// - 0（从未登记，如 reserve 直通块）按 1 计；
+/// - DEAD（已归还）**按 0 计**——否则会把"已归还的帧"报告成 u32::MAX 引用，
+///   误导所有读侧调用方（旧实现只折叠 0，会把哨兵原样返回）。
 pub fn count(paddr: u64) -> u32 {
     match unsafe { (*refs_cell(paddr)).load(Ordering::Acquire) } {
         0 => 1,
+        DEAD => 0,
         v => v,
     }
 }

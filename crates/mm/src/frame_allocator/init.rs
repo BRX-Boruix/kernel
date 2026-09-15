@@ -267,7 +267,11 @@ impl LazyBuddyAllocator {
     ///
     /// # Safety
     /// This function must be called only once and with valid memory map.
-    pub(crate) unsafe fn init(&self, mmap: &[NonNullPtr<MemmapEntry>]) {
+    pub(crate) unsafe fn init(
+        &self,
+        mmap: &[NonNullPtr<MemmapEntry>],
+        kernel_image: (usize, usize),
+    ) {
         unsafe {
             FREE_LISTS.call_once(FreeListTable::new);
             let mut timer = InitTimer::new();
@@ -471,21 +475,41 @@ impl LazyBuddyAllocator {
                 block_size: 4096,
             };
 
-            // Simple array of reserved ranges, sorted
-            let mut reserved = [
+            // 保留区间：分配器自身元数据 + 内核镜像物理占用区。
+            //
+            // 【严重缺陷修复】此前 reserved 只含分配器元数据三块，**未排除内核自身
+            // 镜像**。usable 区域 0x100000-0xe822000 覆盖了内核代码/数据所在的物理内存，
+            // 于是 allocate_frames 会把**正在运行的內核代码页**当作 DMA 缓冲发出去：
+            // 设备从该物理地址读到的自然不是驱动写的数据，而是 x86 机器码
+            // （实测 HMP 在 CORB/BDL 物理地址读到 `48 8d b4 24 ...` 之类的指令）。
+            // 这是驱动侧一切"DMA 读不一致"症状的根因。
+            let mut reserved_buf: [(usize, usize); 8] = [(0, 0); 8];
+            let mut n_reserved = 0usize;
+            for r in [
                 (map_paddr, map_end),
                 (uninit_paddr, uninit_end),
                 (pool_paddr, pool_end),
-            ];
+            ] {
+                reserved_buf[n_reserved] = r;
+                n_reserved += 1;
+            }
+            for (rs, re) in [kernel_image] {
+                if n_reserved < reserved_buf.len() && rs < re {
+                    reserved_buf[n_reserved] = (rs, re);
+                    n_reserved += 1;
+                    info!(
+                        "[pmm] reserving kernel image phys 0x{:x}-0x{:x} ({} KiB)",
+                        rs,
+                        re,
+                        (re - rs) / 1024
+                    );
+                }
+            }
+            let reserved = &mut reserved_buf[..n_reserved];
             reserved.sort_unstable_by_key(|r| r.0);
             info!(
                 "[pmm] reserved metadata ranges: map(0x{:x}-0x{:x}) uninit(0x{:x}-0x{:x}) pool(0x{:x}-0x{:x})",
-                reserved[0].0,
-                reserved[0].1,
-                reserved[1].0,
-                reserved[1].1,
-                reserved[2].0,
-                reserved[2].1
+                map_paddr, map_end, uninit_paddr, uninit_end, pool_paddr, pool_end
             );
 
             for entry in entries_iter.clone() {

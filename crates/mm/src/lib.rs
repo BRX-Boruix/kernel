@@ -35,6 +35,10 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new(0);
 #[limine::limine_tag]
 static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new(0);
 
+/// Limine kernel-address 请求：给出内核镜像的物理/虚拟基址，用于把镜像自身的
+/// 物理区间从帧分配器的可用内存中排除（见 `kernel_image_range`）。
+static KERNEL_ADDRESS_REQUEST: limine::KernelAddressRequest = limine::KernelAddressRequest::new(0);
+
 /// CPU 数读取器（函数指针注入，避免 `mm` 重复声明 Limine SMP 请求）。
 ///
 /// 由内核在 `mm::init()` 前注入 `arch_x86_64::smp::requested_cpu_count`，
@@ -57,6 +61,46 @@ pub fn cpu_count() -> usize {
     }
 }
 
+/// 计算内核镜像在**物理地址空间**中的占用区间，供帧分配器保留。
+///
+/// 为什么必须有这个函数：帧分配器的 usable 区域来自 Limine 内存映射，而内核镜像
+/// 所在的物理页在映射里仍标记为 Usable。若不显式排除，`allocate_frames` 会把
+/// 正在运行的内核代码页当作 DMA 缓冲发出去——设备从该物理地址读到的不是驱动写的
+/// 数据，而是 x86 机器码。这正是 HDA 驱动 DMA 一切异常的根因。
+///
+/// 镜像跨度取 "首个 4K 对齐的 physical_base" 起的 `KERNEL_IMAGE_RESERVE_BYTES`。
+/// 该值按实际内核链接产物保守上界取定（见 kernel/.cargo 与 kernel.ld 的布局），
+/// 宁可多保留、不可少保留：多保留只损失少量物理内存，少保留会让内核代码被当
+/// 空闲帧分发出去。
+fn kernel_image_range(phys_offset: u64) -> (usize, usize) {
+    /// 内核镜像物理占用的保守上界（含 .text/.rodata/.data/.bss 与嵌入模块）。
+    /// 实测内核产物 + 内嵌 initrd/modules 远小于此；取 64 MiB 上界。
+    const KERNEL_IMAGE_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+
+    let base = KERNEL_ADDRESS_REQUEST
+        .get_response()
+        .get()
+        .map(|r| r.physical_base)
+        .unwrap_or(0);
+    if base == 0 {
+        // 拿不到镜像基址时如实报告并退化为"不额外保留"，由调用方日志暴露。
+        klib::error!("[mm] Limine kernel address response missing; kernel image NOT reserved");
+        return (0, 0);
+    }
+    let start = base & !0xfff;
+    let end = (base + KERNEL_IMAGE_RESERVE_BYTES + 0xfff) & !0xfff;
+    klib::info!(
+        "[mm] kernel image phys base {:#x} (virt {:#x}) -> reserving {:#x}-{:#x} ({} MiB), HHDM {:#x}",
+        base,
+        KERNEL_ADDRESS_REQUEST.get_response().get().map(|r| r.virtual_base).unwrap_or(0),
+        start,
+        end,
+        KERNEL_IMAGE_RESERVE_BYTES / 1024 / 1024,
+        phys_offset
+    );
+    (start as usize, end as usize)
+}
+
 /// 初始化内存管理子系统。
 ///
 /// 从 Limine 获取 HHDM 偏移和内存映射，然后初始化物理页帧分配器。
@@ -77,7 +121,7 @@ pub fn init() {
                 memmap_resp.entries.as_ptr(),
                 memmap_resp.entry_count as usize,
             );
-            frame_allocator::init(entries);
+            frame_allocator::init(entries, kernel_image_range(phys_offset));
         }
     } else {
         panic!("Failed to get Memory Map from Limine");

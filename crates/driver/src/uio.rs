@@ -256,6 +256,40 @@ pub fn uio_claim_device(uio_id: usize, caller_pid: usize) -> Result<(), Error> {
             }
         }
     }
+    // 【根因修复】PCI Bus Master Enable。
+    //
+    // QEMU 的设备 DMA（pci_dma_read/pci_dma_write/ldl_le_pci_dma/stl_le_pci_dma）
+    // 全部经由 dev->bus_master_as，而该地址空间的使能完全由客户机的
+    // PCI_COMMAND.BusMaster（bit 2）决定：
+    //     static void pci_set_master(PCIDevice *d, bool enable) {
+    //         memory_region_set_enabled(&d->bus_master_enable_region, enable);
+    //     }
+    // 未使能时该 region 被禁用，所有 DMA 访问失败：
+    //   * 读失败 -> 调用方缓冲区**保持原值**（栈上未初始化 -> 全 0）；
+    //   * 写失败 -> 数据被直接丢弃。
+    //
+    // 本内核此前**从未**调用过 enable_bus_master（函数存在但零调用点），
+    // 因此 HDA 设备的所有 DMA 都是失败的。这单一原因完整解释了全部症状：
+    //   * CORB 取命令：CORBRP 前进，但 verb 读回 0x00000000；
+    //   * BDL 解析：bdl/0 恒为 0x0 +0x0；
+    //   * RIRB 应答与 LPIB 写回：状态位置位，目标页却恒为全 0；
+    //   * 而 QEMU monitor 读同一物理地址能看到正确数据（CPU 路径不经 DMA）。
+    //
+    // 认领设备即授予其驱动 DMA 能力，故在此使能 Bus Master + Memory Space。
+    if let Some((bus, device, function)) = DriverHub::pci_location_of(dev_str) {
+        let before = crate::drivers::pci_bus::read_config_u16(bus, device, function, 0x04);
+        crate::drivers::pci_bus::enable_bus_master(bus, device, function);
+        let after = crate::drivers::pci_bus::read_config_u16(bus, device, function, 0x04);
+        info!(
+            "[uio] PCI bus master enabled: dev={} bdf={:02x}:{:02x}.{} cmd {:#06x} -> {:#06x} (MASTER={})",
+            dev_str, bus, device, function, before, after, (after & (1 << 2)) != 0
+        );
+    } else {
+        warn!(
+            "[uio] PCI location unknown for dev={}; cannot enable bus master",
+            dev_str
+        );
+    }
     Ok(())
 }
 

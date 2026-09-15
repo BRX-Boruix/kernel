@@ -110,10 +110,14 @@ pub fn init_percpu_caches(cpu_count: usize) {
 unsafe impl Send for LazyBuddyAllocator {}
 unsafe impl Sync for LazyBuddyAllocator {}
 
-/// Initialize the global allocator
-pub unsafe fn init(mmap: &[NonNullPtr<MemmapEntry>]) {
+/// Initialize the global allocator.
+///
+/// `kernel_image` 是内核镜像在物理地址空间中的占用区间 `(start, end)`，必须从
+/// 可用内存中排除：Limine 的内存映射把镜像所在页仍标为 Usable，若不排除，
+/// 帧分配器会把正在运行的内核代码页当作 DMA 缓冲分发出去。
+pub unsafe fn init(mmap: &[NonNullPtr<MemmapEntry>], kernel_image: (usize, usize)) {
     unsafe {
-        ALLOCATOR.init(mmap);
+        ALLOCATOR.init(mmap, kernel_image);
     }
 }
 
