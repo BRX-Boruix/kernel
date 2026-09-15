@@ -242,26 +242,29 @@ fn line_cpu_hint() -> Option<fn() -> usize> {
     Some(unsafe { core::mem::transmute::<usize, fn() -> usize>(addr) })
 }
 
+/// 每 CPU 一份行缓冲（不是全局一份！）。
+///
+/// 全局单缓冲 + 全局锁会让**不同进程**的片段在同一行里物理拼接——init
+/// 的 "[init] volumed started (pid " 与 volumed 的 "[volumed] " 恰好
+/// 在两次 write() 之间同入一个缓冲，实测拼出 "(pid 77[volumed] )"。
+/// 行缓冲的正确语义是"**同一输出流**内片段重组"，而 stdout 流的边界
+/// 就是 CPU（任务在让出前恒在单核上跑；同核抢占插行是下一层问题，
+/// 属于分流的范围）。
+///
+/// SAFETY: LINE_BUFS 仅被本 CPU 索引写入；中断上下文不会调用
+/// [`write_line_buffered`]（内核日志走 write_bytes），故不存在"中断打断
+/// 半行再写入"的自锁。冲刷方（[`flush_all_line_buffers`]）只 try_lock，
+/// 拿不到锁（正主持有中）就跳过，绝不自旋等锁。
+static LINE_BUFS: [SpinMutex<LineBufInner>; 64] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const EMPTY: SpinMutex<LineBufInner> = SpinMutex::new(LineBufInner {
+        data: [0; LINE_BUF_CAP],
+        len: 0,
+    });
+    [EMPTY; 64]
+};
+
 pub fn write_line_buffered(bytes: &[u8]) {
-    // 每 CPU 一份行缓冲（不是全局一份！）：
-    //
-    // 全局单缓冲 + 全局锁会让**不同进程**的片段在同一行里物理拼接——init
-    // 的 "[init] volumed started (pid " 与 volumed 的 "[volumed] " 恰好
-    // 在两次 write() 之间同入一个缓冲，实测拼出 "(pid 77[volumed] )"。
-    // 行缓冲的正确语义是"**同一输出流**内片段重组"，而 stdout 流的边界
-    // 就是 CPU（任务在让出前恒在单核上跑；同核抢占插行是下一层问题，
-    // 属于分流的范围）。
-    //
-    // SAFETY: LINE_BUFS/LINE_LENS 仅被本 CPU 索引访问；中断上下文不会调用
-    // 本函数（内核日志走 write_bytes），故不存在"中断打断半行再写入"的自锁。
-    static LINE_BUFS: [SpinMutex<LineBufInner>; 64] = {
-        #[allow(clippy::declare_interior_mutable_const)]
-        const EMPTY: SpinMutex<LineBufInner> = SpinMutex::new(LineBufInner {
-            data: [0; LINE_BUF_CAP],
-            len: 0,
-        });
-        [EMPTY; 64]
-    };
     let idx = match line_cpu_hint() {
         // 注入的 cpu 序号函数（内核启动早期接线，arch 槽位号恒 < 64）。
         Some(f) => {
@@ -320,6 +323,28 @@ fn flush_line_buf(line: &mut LineBufInner) {
     if line.len > 0 {
         write_bytes(&line.data[..line.len]);
         line.len = 0;
+    }
+}
+
+/// 冲刷**所有** CPU 的行缓冲（有锁在手的槽位跳过——该核正持锁写入，
+/// 自会按行边界提交）。
+///
+/// # 为什么需要（实测缺陷）
+///
+/// 行缓冲把原子边界升到"行"，但交互式 shell 的回显是逐字符 write（无
+/// `\n`）——字符全攒在缓冲里，直到用户按 Enter（shell 输出 `\n`）才一次性
+/// 可见：盲打无回显、Enter 后整行突然吐出（实测）。Unix 的 tty 回显在
+/// tty 层即时完成；本内核 shell 的回显走用户态 write，必须由内核提供
+/// "交互读之前先把已攒输出交出去"的冲刷点。
+///
+/// 冲刷点选在**交互 stdin 阻塞读之前**（syscall 交互分支）：shell 写完
+/// 提示符/回显后必经 read 等键，此处冲刷正好让上述内容即时可见；整行
+/// 原子性不受影响（冲刷提交的也是整行片段，仍经串口锁逐行原子下发）。
+pub fn flush_all_line_buffers() {
+    for slot in LINE_BUFS.iter() {
+        if let Some(mut line) = slot.try_lock() {
+            flush_line_buf(&mut line);
+        }
     }
 }
 

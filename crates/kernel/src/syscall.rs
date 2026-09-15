@@ -1282,6 +1282,12 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
                 // 等待者并阻塞切走。Busy = 已有并发 stdin 读者，如实返回
                 // EAGAIN 而不是把对方顶掉（KM15）；Switched = 帧已整体切换，
                 // 禁止再写 rax（K1a）。唤醒后用户 read 重试取字符。
+                //
+                // 交互读前的行缓冲冲刷：shell 的提示符/回显是逐字符 write（无
+                // `\n`），全部攒在 stdout 行缓冲里；阻塞等键之前冲刷，用户才
+                // 能看到即时回显（否则盲打无回显，Enter 后整行突然吐出——
+                // 实测缺陷）。冲刷的是整行片段，行原子性不变。
+                klib::console::flush_all_line_buffers();
                 if total == 0 && e == Error::WouldBlock && handle.inode.interactive_input() {
                     return match task::block_for_kbd(arch_frame(frame)) {
                         task::scheduler::BlockKbdOutcome::Switched => DispatchResult::Switched,
