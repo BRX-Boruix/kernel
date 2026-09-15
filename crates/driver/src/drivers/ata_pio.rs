@@ -52,6 +52,15 @@ const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_SECTORS: u8 = 0x20;
 const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
 
+/// 通道控制寄存器基址（Primary 0x3F6 / Secondary 0x376）。
+///
+/// 与命令块基址不同口：Device Control 寄存器（SRST/nIEN）在独立的控制块上。
+const CTRL_PRIMARY: u16 = 0x3F6;
+const CTRL_SECONDARY: u16 = 0x376;
+
+/// Device Control 寄存器位 2：Software Reset（SRST）。
+const CTRL_SRST: u8 = 0x04;
+
 /// LBA28 可寻址扇区上限（28 位寻址域，drv1 DA2）。
 ///
 /// 本驱动命令字 0x20/0x30 + `(lba>>24)&0x0F` 高位口只覆盖 28 位 LBA；
@@ -121,6 +130,55 @@ fn wait_not_busy(channel: u16) -> bool {
         }
     }
     false
+}
+
+/// 通道软复位（SRST）。
+///
+/// **为什么需要**（实测缺陷，用户报告）：命令重叠/宿主后端卡住会让设备停在
+/// BSY=1，重试只是反复撞同一堵墙——primary 通道上 ata0/ata1 共享总线，一个
+/// 驱动位卡死即全通道瘫痪，且 ext2 无块缓存，每次目录列表都直接打盘，故障
+/// 立刻可见（根目录列表缩水/报错）。
+///
+/// ATA 规范的恢复路径：Device Control 寄存器置 SRST≥5µs 后清除，设备自行
+/// 内部复位并回到 READY。复位作用于**整个通道**（两个驱动位一起复位），
+/// 这正是需要的语义：坏的是通道状态机，不是某一个驱动位。
+///
+/// `channel` 是命令块基址（状态口所在）；控制块基址由调用方按通道给出。
+/// 返回复位后通道是否回到可服务状态（BSY 清除，从命令块状态口判定）。
+/// 命令块基址 → 控制块基址（两通道同构映射；其它基址无控制口，返回 None）。
+fn ctrl_base_of(channel: u16) -> Option<u16> {
+    match channel {
+        ATA_PRIMARY_BASE => Some(CTRL_PRIMARY),
+        ATA_SECONDARY_BASE => Some(CTRL_SECONDARY),
+        _ => None,
+    }
+}
+
+/// 通道软复位（SRST）。
+///
+/// **为什么需要**（实测缺陷，用户报告）：命令重叠/宿主后端卡住会让设备停在
+/// BSY=1，重试只是反复撞同一堵墙——primary 通道上 ata0/ata1 共享总线，一个
+/// 驱动位卡死即全通道瘫痪，且 ext2 无块缓存，每次目录列表都直接打盘，故障
+/// 立刻可见（根目录列表缩水/报错）。
+///
+/// ATA 规范的恢复路径：Device Control 寄存器置 SRST≥5µs 后清除，设备自行
+/// 内部复位并回到 READY。复位作用于**整个通道**（两个驱动位一起复位），
+/// 这正是需要的语义：坏的是通道状态机，不是某一个驱动位。
+///
+/// `channel` 是命令块基址（状态口所在）；控制块基址由调用方按通道给出。
+/// 返回复位后通道是否回到可服务状态（BSY 清除，从命令块状态口判定）。
+fn soft_reset_channel(channel: u16, ctrl_base: u16) -> bool {
+    // 置位 SRST（nIEN 位保持 0，与驱动的轮询模型无冲突）。
+    outb(ctrl_base, CTRL_SRST);
+    // 规范要求 SRST 保持至少 5µs；一次 io_delay ≈ 1µs，4 次留足余量。
+    io_delay();
+    io_delay();
+    io_delay();
+    io_delay();
+    // 清除 SRST，设备开始内部复位。
+    outb(ctrl_base, 0);
+    // 复位完成判定：BSY 从命令块状态口读取。
+    wait_not_busy(channel)
 }
 
 fn wait_drq(channel: u16) -> bool {
@@ -227,13 +285,31 @@ fn ata_read_sector(channel: u16, slave: bool, lba: u64, out: &mut [u8; 512]) -> 
     // 在两次 outb 之间插入它自己的 LBA/COMMAND 写（那正是短读的成因）。
     // 可重入：write_at 的部分扇区写会在持有本锁时再调本函数（读-改-写）。
     let _bus = super::ata_lock::lock();
+    let drive = if slave { "slave" } else { "master" };
     for attempt in 0..3 {
         if !wait_not_busy(channel) {
             klib::error!(
-                "[ata_pio] read lba={} attempt={} failed: device stuck BSY (10k polls)",
+                "[ata_pio] read ch={:#x} {} lba={} attempt={} failed: device stuck BSY",
+                channel,
+                drive,
                 lba,
                 attempt
             );
+            // 重试前软复位通道：卡死的 BSY 不会自愈，空转重试只是撞墙。
+            // （attempt=0 不复位：瞬时挤占常见，复位成本（通道全体离线片刻）
+            //  只该在确认卡死时支付。）
+            if attempt > 0 {
+                if let Some(ctrl) = ctrl_base_of(channel) {
+                    let ok = soft_reset_channel(channel, ctrl);
+                    if !ok {
+                        klib::error!(
+                            "[ata_pio] read ch={:#x} {}: soft reset did not clear BSY",
+                            channel,
+                            drive
+                        );
+                    }
+                }
+            }
             continue;
         }
         select_drive_lba(channel, lba, slave);
@@ -244,7 +320,9 @@ fn ata_read_sector(channel: u16, slave: bool, lba: u64, out: &mut [u8; 512]) -> 
         if st == 0xFF || (st & ATA_SR_ERR) != 0 || (st & ATA_SR_DF) != 0 || !drq_ok {
             // 失败诊断：status 原值 + 各标志位拆解（ERR=0x01 DF=0x20 DRQ=0x08）。
             klib::error!(
-                "[ata_pio] read lba={} attempt={} failed: status={:#04x} err={} df={} drq_wait={}",
+                "[ata_pio] read ch={:#x} {} lba={} attempt={} failed: status={:#04x} err={} df={} drq_wait={}",
+                channel,
+                drive,
                 lba,
                 attempt,
                 st,
@@ -252,6 +330,9 @@ fn ata_read_sector(channel: u16, slave: bool, lba: u64, out: &mut [u8; 512]) -> 
                 st & ATA_SR_DF != 0,
                 drq_ok
             );
+            if let Some(ctrl) = ctrl_base_of(channel) {
+                let _ = soft_reset_channel(channel, ctrl);
+            }
             continue;
         }
         for i in 0..256 {
@@ -261,6 +342,11 @@ fn ata_read_sector(channel: u16, slave: bool, lba: u64, out: &mut [u8; 512]) -> 
         }
         return true;
     }
+    // 重试耗尽：兜底软复位，把通道留在干净状态——下一个 LBA/下一次调用
+    // 从 attempt=0 开始，不复位就会先白撞三次 BSY。
+    if let Some(ctrl) = ctrl_base_of(channel) {
+        let _ = soft_reset_channel(channel, ctrl);
+    }
     false
 }
 
@@ -268,8 +354,22 @@ fn ata_write_sector(channel: u16, slave: bool, lba: u64, data: &[u8; 512]) -> bo
     // 同 ata_read_sector：读写在**同一组端口**上，写与读并发一样会互相破坏
     // （尤其 write_at 的读-改-写序列本身就是读后立刻写）。
     let _bus = super::ata_lock::lock();
-    for _ in 0..3 {
+    let drive = if slave { "slave" } else { "master" };
+    for attempt in 0..3 {
         if !wait_not_busy(channel) {
+            klib::error!(
+                "[ata_pio] write ch={:#x} {} lba={} attempt={} failed: device stuck BSY",
+                channel,
+                drive,
+                lba,
+                attempt
+            );
+            // 同 read：确认卡死才复位（attempt>0），通道级恢复。
+            if attempt > 0 {
+                if let Some(ctrl) = ctrl_base_of(channel) {
+                    let _ = soft_reset_channel(channel, ctrl);
+                }
+            }
             continue;
         }
         select_drive_lba(channel, lba, slave);
@@ -288,9 +388,15 @@ fn ata_write_sector(channel: u16, slave: bool, lba: u64, data: &[u8; 512]) -> bo
         // 的真实根因：与 LBA 位置无关，任何写后立即读都可能触发。
         if !wait_not_busy(channel) {
             klib::error!(
-                "[ata_pio] write lba={} failed: device stuck BSY after data phase",
-                lba
+                "[ata_pio] write ch={:#x} {} lba={} attempt={} failed: device stuck BSY after data phase",
+                channel,
+                drive,
+                lba,
+                attempt
             );
+            if let Some(ctrl) = ctrl_base_of(channel) {
+                let _ = soft_reset_channel(channel, ctrl);
+            }
             continue;
         }
         let st = status_read(channel);
@@ -298,12 +404,22 @@ fn ata_write_sector(channel: u16, slave: bool, lba: u64, data: &[u8; 512]) -> bo
             return true;
         }
         klib::error!(
-            "[ata_pio] write lba={} failed: status={:#04x} err={} df={}",
+            "[ata_pio] write ch={:#x} {} lba={} attempt={} failed: status={:#04x} err={} df={}",
+            channel,
+            drive,
             lba,
+            attempt,
             st,
             st & ATA_SR_ERR != 0,
             st & ATA_SR_DF != 0
         );
+        if let Some(ctrl) = ctrl_base_of(channel) {
+            let _ = soft_reset_channel(channel, ctrl);
+        }
+    }
+    // 耗尽兜底：同 read——把通道留在干净状态。
+    if let Some(ctrl) = ctrl_base_of(channel) {
+        let _ = soft_reset_channel(channel, ctrl);
     }
     false
 }

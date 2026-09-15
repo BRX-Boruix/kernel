@@ -652,6 +652,22 @@ impl Ext2Fs {
                     size: linked.size,
                     mode: linked.mode,
                 });
+            } else {
+                // 空槽（ino=0 的已删项）是 ext2 规范内状态，静默跳过没错。
+                // 但**槽体带非零字节**（name_len>0 或名字区非零）却走了跳过
+                // 分支 = 数据可疑：典型来源是底层把垃圾读成"成功"（ATA 通道
+                // 卡死后的错位读）。必须留痕——静默跳过曾把"根目录缩水成两项"
+                // 伪装成正常输出，让上层无从察觉介质在说谎。
+                let body = &data[(cur + 8).min(data.len())..(cur + rec_len).min(data.len())];
+                let body_nonzero = body.iter().any(|&b| b != 0);
+                if ino == 0 && (name_len != 0 || body_nonzero) {
+                    klib::warn!(
+                        "[ext2] dir ino={} suspicious empty entry at off={}: ino=0 name_len={} body_nonzero=true",
+                        dir.ino,
+                        cur,
+                        name_len
+                    );
+                }
             }
             cur += rec_len;
         }
