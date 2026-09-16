@@ -75,8 +75,68 @@ pub fn is_device_mounted(name: &str) -> bool {
 }
 
 /// 按挂载路径注销设备登记（`sys_volume_unmount` 调用），使设备可再次挂载。
+///
+/// 同时**释放该设备的块缓存实例**（S18：与挂载时的建立成对）。
+/// 这一步不是可选清理：若保留旧缓存，同一设备卸载后重新挂载（热插拔往返、
+/// 手动重挂）会复用属于**上一次挂载**的数据，把陈旧内容当作当前内容返回。
 pub fn unmark_device_by_path(path: &str) {
-    MOUNTED_DEVICES.lock().retain(|(_, p)| p != path);
+    // 先取出被注销的设备名，再释放其缓存（同一把锁内完成，避免两处查找分叉）。
+    let freed: Option<String> = {
+        let mut reg = MOUNTED_DEVICES.lock();
+        let found = reg.iter().find(|(_, p)| p == path).map(|(d, _)| d.clone());
+        reg.retain(|(_, p)| p != path);
+        found
+    };
+    if let Some(name) = freed {
+        release_device_cache(&name);
+    }
+}
+
+/// 块设备缓存注册表（设备名 -> 单一缓存实例）。
+///
+/// **为什么需要注册表**（S15 单点真相 / S21 顺序显式化）：
+/// 三处接线点（`init_install`、`try_mount_ext2_volumes`、`mount_device_volume`）
+/// 各自遍历设备并构造 bridge。同一物理设备会被其中多处看到：
+/// - `init_install` 先为启动盘建 bridge（:878）用于探测根分区；
+/// - 它随后调 `try_mount_ext2_volumes`，后者**再次**为该启动盘建 bridge，
+///   直到 `parse_mbr` 之后才按磁盘签名跳过（:1331）——bridge 与缓存已经建好；
+/// - volumed 对每个设备调 `mount_device_volume`，又一次。
+///
+/// 若各处各自 `new` 一个缓存，同一设备最多存在三份 2 MiB 缓存：既浪费内存，
+/// 更严重的是**三份缓存各自看到不同写入**——A 点写入后 B 点的副本仍是旧值，
+/// 构成静默返回陈旧数据。故同一设备必须全局只有一份缓存实例。
+///
+/// **键选设备名而非 (bus, location)**：ATA 的 `location` 是 I/O 基址，
+/// 主/从盘共用（`ata0`/`ata1` 同为 `ATA_PRIMARY_BASE`），用它作键会让主从盘
+/// 共享一份缓存——那是实打实的数据错误。设备名是 DriverHub 自身寻址该设备的
+/// 既有键（`device_at`/`unregister_device_by_name` 等均按名），沿用它而非另造身份。
+///
+/// **热插拔（S20 失败模式优先）**：设备拔除后若同名设备重新插入，复用旧缓存
+/// 会把**旧设备的数据**当作新设备的数据返回。故卸载路径必须同时释放该设备的
+/// 缓存条目，使重新挂载时拿到干净实例。
+static DEVICE_CACHES: Mutex<Vec<(String, Arc<dyn fs::ByteDevice>)>> = Mutex::new(Vec::new());
+
+/// 取（必要时建立）设备 name 的唯一缓存实例。
+///
+/// 首次调用为 ops 建立 CachingByteDevice（分配 2 MiB，见 fs::block_cache）；
+/// 之后同名调用一律返回同一实例，保证全系统对该设备只有一份缓存视图。
+fn cached_bridge_for(name: &str, ops: &'static dyn driver::Device) -> Arc<dyn fs::ByteDevice> {
+    let mut reg = DEVICE_CACHES.lock();
+    if let Some((_, dev)) = reg.iter().find(|(n, _)| n == name) {
+        return dev.clone();
+    }
+    let raw: Arc<dyn fs::ByteDevice> = Arc::new(DrvByteBridge(ops));
+    let cached: Arc<dyn fs::ByteDevice> = Arc::new(fs::block_cache::CachingByteDevice::new(raw));
+    reg.push((String::from(name), cached.clone()));
+    cached
+}
+
+/// 释放设备 name 的缓存实例（设备卸载/拔除时调用）。
+///
+/// 与 DEVICE_CACHES 的插入成对（S18）。释放后该设备若再次挂载，
+/// 会建立全新缓存，绝不复用属于旧设备的数据。
+pub fn release_device_cache(name: &str) {
+    DEVICE_CACHES.lock().retain(|(n, _)| n != name);
 }
 
 /// 获取全局 VFS 挂载表。
@@ -875,7 +935,9 @@ fn init_install(mbr_disk_id: u32, partition_index: u32) -> bool {
         let Some(ops) = driver::DriverHub::device_at(i) else {
             continue;
         };
-        let bridge: Arc<dyn fs::ByteDevice> = Arc::new(DrvByteBridge(ops));
+        // 经注册表取该设备的**唯一**缓存实例（S15）：同一设备在其它接线点也
+        // 会用到这里建立的同一份缓存，避免多份副本各自看到不同写入。
+        let bridge = cached_bridge_for(info.name, ops);
         let mut sector = [0u8; 512];
         if bridge.read_bytes(0, &mut sector) < 512 {
             continue;
@@ -1318,7 +1380,8 @@ fn try_mount_ext2_volumes(
         let Some(ops) = driver::DriverHub::device_at(i) else {
             continue;
         };
-        let bridge: Arc<dyn fs::ByteDevice> = Arc::new(DrvByteBridge(ops));
+        // 与其它接线点共享同一份缓存实例（S15 单点真相）。
+        let bridge = cached_bridge_for(name, ops);
         let mut sector = [0u8; 512];
         if bridge.read_bytes(0, &mut sector) < 512 {
             klib::warn!("[ext2] skip '{}': LBA0 short read, no MBR", name);
@@ -1449,7 +1512,8 @@ pub fn mount_device_volume(name: &str) -> Result<String, klib::error::Error> {
         let Some(ops) = driver::DriverHub::device_at(i) else {
             return Err(klib::error::Error::NotFound);
         };
-        let bridge: Arc<dyn fs::ByteDevice> = Arc::new(DrvByteBridge(ops));
+        // 与其它接线点共享同一份缓存实例（S15 单点真相）。
+        let bridge = cached_bridge_for(name, ops);
         let mut sector = [0u8; 512];
         if bridge.read_bytes(0, &mut sector) < 512 {
             return Err(klib::error::Error::Corrupt);
