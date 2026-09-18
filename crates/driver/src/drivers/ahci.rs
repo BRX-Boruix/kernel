@@ -679,8 +679,15 @@ impl Port {
         // 正确性不依赖等待方式：完成判定（`PxIS` 完成位 + `PxCI` 出队
         // + `PxTFD` 无错）三条证据不变（S20）。
         let irq = CONTROLLER_IRQ_LINE.load(core::sync::atomic::Ordering::Relaxed);
+        // 冷却期递减：退让只暂停一段时间，冷却结束自动恢复中断优先（见
+        // `IRQ_BACKOFF_COMMANDS` 的实测理由——永久停用曾把瞬态落空升级成故障）。
+        let cooldown = IRQ_COOLDOWN_REMAINING.load(core::sync::atomic::Ordering::Relaxed);
+        if cooldown > 0 {
+            IRQ_COOLDOWN_REMAINING.store(cooldown - 1, core::sync::atomic::Ordering::Relaxed);
+        }
         let irq_ok = irq >= 3
-            && IRQ_COMPLETION_ENABLED.load(core::sync::atomic::Ordering::Relaxed);
+            && IRQ_COMPLETION_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+            && cooldown == 0;
 
         // 步骤 1：立即复检。同步完成的控制器在此处已返回，零自旋。
         let mut completed = self.read32(PX_IS) & PXIS_COMPLETION_BITS != 0;
@@ -691,6 +698,10 @@ impl Port {
         // 两条路径都只是「等待方式」，不改变完成判定。
         if !completed {
             if irq_ok {
+                let if_on = arch_x86_64::interrupts::interrupts_enabled();
+                if !if_on {
+                    IF_OFF_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 let got = crate::irq_owner::wait_bounded_irq(irq, IRQ_WAIT_SPINS);
                 if got {
                     LATCH_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -706,13 +717,36 @@ impl Port {
                     if n + 1 >= IRQ_WAIT_MISS_LIMIT {
                         // 只在**首次**切入退让时告警一次，避免每次重新使能都刷屏。
                         if !IRQ_FALLBACK_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                            warn!(
-                                "[ahci] IRQ {} not delivered; using bounded-polling completion \
-                                 (interrupt path stays compiled and re-arms if an IRQ ever latches)",
-                                irq
-                            );
+                            // 区分两种情形，避免日志把「预期内」误报成故障：
+                            //   - 系统级中断尚未开启（`late_storage_init` 跑在 `sti`
+                            //     之前）：等不到中断是**必然**的，属预期；
+                            //   - 中断已开启却仍等不到：这才是真需要关注的情形。
+                            if arch_x86_64::interrupts::interrupts_enabled() {
+                                // **措辞很重要（实测教训）**：这不一定是故障。实测抓到
+                                // 的落空现场是 `port_is=0x40000000`（bit30 = PxIS.PSS，
+                                // **不是**完成位）+ `ci=0x1`（命令**仍在执行**）——即命令
+                                // 还没完成、中断也还没到，25000 次自旋的窗口就过去了。
+                                // 典型场景是「冷启动后的第一条命令」：此前数百个测试跑过，
+                                // 控制器/中断路径已冷，首条命令的中断延迟超出窗口；随后
+                                // 命令照常完成（走有界轮询），下一批命令又能命中闩锁。
+                                // 故这里报 info 而非 warn：它是**延迟偏高**，不是「中断不可用」。
+                                info!(
+                                    "[ahci] IRQ {} slower than the {} -spin window on this \
+                                     command; completed via bounded polling (path stays enabled)",
+                                    irq, IRQ_WAIT_SPINS
+                                );
+                            } else {
+                                info!(
+                                    "[ahci] IRQ {} pending: interrupts not yet enabled at this \
+                                     stage; bounded polling until re-arm after sti",
+                                    irq
+                                );
+                            }
                         }
-                        IRQ_COMPLETION_ENABLED.store(false, core::sync::atomic::Ordering::Relaxed);
+                        // **退让而非永久停用**：只跳过接下来的 IRQ_BACKOFF_COMMANDS
+                        // 条命令，之后自动重试（见该常量的实测理由）。
+                        IRQ_COOLDOWN_REMAINING
+                            .store(IRQ_BACKOFF_COMMANDS, core::sync::atomic::Ordering::Relaxed);
                     }
                 } else {
                     IRQ_WAIT_MISSES.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -1254,12 +1288,25 @@ static CONTROLLER_HBA_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::
 pub static IRQ_COMPLETION_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
-/// 连续多少次闩锁等待落空后放弃中断优先（见 `wait_command` 的自适应退让）。
+/// 连续多少次闩锁等待落空后**暂时**停用中断优先（见 `wait_command` 的自适应退让）。
 ///
-/// 取 2：一次落空可能是该条命令恰好极快、中断尚未投递；连续两次则足以判定
-/// 本环境不投递该 IRQ，继续等待是纯浪费。过大的值会让退让前的浪费变多，
-/// 过小则可能在偶发抖动下过早放弃。
-const IRQ_WAIT_MISS_LIMIT: u32 = 2;
+/// 取 4：一次落空很可能只是该条命令恰好极快、中断尚未投递；连续两次也可能
+/// 出现在**启动早期 IRQ 尚未真正开始投递**的窗口。**实测教训**：原取 2 时，
+/// `test-ahci6b` 的首批命令连续两次落空即**永久**关掉中断优先，导致该测试
+/// 打印「interrupts are enabled 却 not delivered」——而稍后同一次启动里的 6d
+/// 实测 `latch_hits=108`（中断其实完全可用）。这正是「过小则过早放弃」的真实
+/// 后果：一次瞬态抖动被当成永久判决。
+const IRQ_WAIT_MISS_LIMIT: u32 = 4;
+
+/// **停用时长（命令条数）**：退让不是永久判决，而是「暂停一会儿再试」。
+///
+/// 为什么必须有它：永久停用会把「瞬态落空」升级成「本启动内再也不走中断」，
+/// 而这正是实测踩到的缺陷。改为冷却 N 条命令后自动重试——若中断真的不可用，
+/// 每次重试只多付一次有界等待（可接受）；若只是瞬态，则自动恢复。
+///
+/// 取 64：远大于任何「偶发抖动」的尺度，又足够小以保证恢复及时（一次 64 条
+/// 命令的窗口在真实负载下是毫秒级）。
+const IRQ_BACKOFF_COMMANDS: u32 = 64;
 
 /// 连续落空计数（成功等到闩锁即清零）。
 static IRQ_WAIT_MISSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -1267,6 +1314,10 @@ static IRQ_WAIT_MISSES: core::sync::atomic::AtomicU32 = core::sync::atomic::Atom
 /// 退让告警只报一次（避免重复刷屏）。
 static IRQ_FALLBACK_WARNED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// 退让冷却剩余命令数（>0 表示当前暂停中断优先，逐条递减）。
+static IRQ_COOLDOWN_REMAINING: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 /// TEMP-PROBE: ACK 回调调用次数与闩锁命中次数。
 pub static ACK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1278,6 +1329,14 @@ pub static ACK_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// 已烧掉的自旋次数（有界轮询路径）。用于**证明**机制而非假设：
 /// 若中断路径为 0 而轮询路径接近预算，则「中断省掉了空转」是实测结论。
 pub static POLL_SPINS_BURNED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 等待时 CPU 中断标志为关的次数。
+///
+/// **含义**：为关则中断 handler 根本不可能在等待窗口内运行，此时等待必然落空。
+/// 实测这些计数**全部来自启动期**（`late_storage_init` 跑在 `sti` 之前），属预期，
+/// 不是故障——它正是「自适应退让需要冷却而非永久停用」的量化依据。
+pub static IF_OFF_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 
 /// 控制器的真实 PCI 中断线（配置空间 0x3C；0 = 未分配/无中断）。
 ///
@@ -1837,6 +1896,7 @@ pub fn rearm_interrupt_completion() {
         return; // 无控制器：无需再使能
     }
     IRQ_WAIT_MISSES.store(0, core::sync::atomic::Ordering::Relaxed);
+    IRQ_COOLDOWN_REMAINING.store(0, core::sync::atomic::Ordering::Relaxed);
     IRQ_FALLBACK_WARNED.store(false, core::sync::atomic::Ordering::Relaxed);
     IRQ_COMPLETION_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
     info!("[ahci] interrupt-first completion re-armed (interrupts now enabled)");

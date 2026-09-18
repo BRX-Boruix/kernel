@@ -9340,6 +9340,10 @@ pub fn test_storage_ahci6d_irq_vs_polling_benchmark() {
         irq_spins
     );
     info!(
+        "[test-ahci6d] IF-off waits: {} (if >0, IRQs cannot fire inside the wait window)",
+        driver::drivers::ahci::IF_OFF_WAITS.load(core::sync::atomic::Ordering::Relaxed)
+    );
+    info!(
         "[test-ahci6d] ack overhead: {} cycles total over {} acks ({} per ack, same-basis)",
         ack_cycles,
         ack_calls,
