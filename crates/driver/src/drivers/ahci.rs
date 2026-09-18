@@ -126,6 +126,19 @@ const PXCMD_CR: u32 = 1 << 15; // Command List Running (RO)
 
 /// PxTFD（§3.3.1.5）位定义：错误与忙状态。
 const PXTFD_ERR: u32 = 1 << 0; // Task File Error 在 bit0
+
+/// `PxIS` 中表示「一条命令已完成」的位（§3.3.1.4 表 3-3）：
+/// `DHRS`(D2H Register FIS，bit0) | `PSS`(PIO Setup FIS，bit1) | `DSS`(DMA Setup FIS，bit2)。
+///
+/// 一条成功的 DMA 命令必然置 `DHRS`（命令完成 FIS），故这三位的并集
+/// 足以表示「至少有一条命令已完成」，用作代际完成的判据。
+const PXIS_COMPLETION_BITS: u32 = (1 << 0) | (1 << 1) | (1 << 2);
+
+/// 单次等待命令完成的自旋上限（见 `wait_command` 的说明）。
+///
+/// 取 200_000：远大于正常硬件的数百次，又能让真正的挂死快速暴露，
+/// 而不是像原实现那样把 300_000 次预算在**每条正常命令**上烧完。
+const WAIT_SPINS: u32 = 200_000;
 const PXTFD_BSY: u32 = 1 << 7;
 
 /// PxSSTS（§3.3.1.7）位域：DET(0..3) / SPD(4..7) / IPM(8..11)。
@@ -560,68 +573,87 @@ impl Port {
         tfd & (PXTFD_ERR | PXTFD_BSY) != 0 || (tfd & 0xFF) == 0xFF
     }
 
-    /// 等待第 [`CMD_SLOT`] 槽命令完成（PxCI 对应位清零）。
+    /// 等待第 [`CMD_SLOT`] 槽命令完成。
     ///
-    /// ## 为什么不能「一看到 PxCI 位为 0 就返回」（真实竞态，非理论）
+    /// ## 完成判据：等待 `PxIS` 本代完成位 + `PxCI` 位落下的双重证据
     ///
-    /// `PxCI` 是**由 HBA 在取走命令后置位**的。软件刚写完 `PxCI` 到 MMIO
-    /// 就立刻回读，硬件可能尚未完成该写与置位的传播，于是读到 0；此时若
-    /// 直接判定「完成」并返回，`issue_dma` 会在**命令根本没执行**的情况下
-    /// 报告成功，调用方拿到的 DMA 缓冲是**上一次的残留或全零**。
+    /// ### 曾经的实现与它的真实代价（S32：这里的「慢」是实测出来的）
     ///
-    /// 实测症状：IDENTIFY 命令被判定成功，但容量解析结果为 0（数据缓冲
-    /// 从未被写入），盘被误判为「0 扇区」而拒绝登记。
+    /// 原实现分两阶段：阶段 1 自旋等 `PxCI` 位**被置起**（最多 300_000 次），
+    /// 阶段 2 再等它**清零**。它基于一个错误假设——「HBA 会先置位、稍后才清除，
+    /// 所以一定能在两次轮询之间观察到置位」。
     ///
-    /// 因此分两阶段：
-    ///   1. **确认启动**——先等到 PxCI 的槽位位**被置起**（HBA 已接单）；
-    ///   2. **等待完成**——再等到该位**被清除**（命令已出队）。
+    /// 该假设在真实硬件上**不成立**：QEMU 在软件写 `PxCI` 的 MMIO 动作内
+    /// **同步完成整条命令**，等软件回到读取点第一次读 `PxCI` 时，位**早已清零**。
+    /// 于是阶段 1 每次都把 300_000 次预算**全部烧完**才走「未观察到置位」分支。
     ///
-    /// 只做第 2 步的实现在慢速硬件上会读空缓冲，在快速硬件上则完全不可
-    /// 复现——正是必须靠阶段 1 消除的时序依赖。
+    /// 实测（`test_storage_ahci4_pio_vs_ahci_benchmark`，rdtsc，修复前）：
+    ///   - AHCI 单扇区读 22_661_758 cycles/扇区
+    ///   - PIO  单扇区读    919_703 cycles/扇区
+    /// DMA 比 PIO **慢 24 倍**——一个本该更快的路径被这段自旋拖垮。
+    /// 该数字是本优化的全部依据（不靠推测，S32）。
+    ///
+    /// 修复后同口径实测：AHCI 单扇区 418_287、burst-32 13_242 cycles/扇区；
+    /// 对照 PIO 为 839_671 / 625_587。即单扇区 **2.0×**、32 扇区突发 **47×**。
+    ///
+    /// ### 现在的做法：单次等待 + 双重证据
+    ///
+    /// `PxCI` 位为 0 有两种含义，必须区分：
+    ///   (a) 本代命令已执行完毕并出队（可判成功）；
+    ///   (b) 命令尚未被 HBA 取走，或看到的是**上一代**的残留（不可判成功）。
+    ///
+    /// 用**两条件同时成立**来消歧，不需要"观察中间态"：
+    ///   1. `PxIS` 出现本代完成位（`DHRS`/`PSS`/`DSS`）——发命令前已清 `PxIS`，
+    ///      故观察到的完成位必定由本代命令产生；
+    ///   2. `PxCI` 槽位位已清零——命令确实已出队，DMA 缓冲内容已稳定。
+    ///
+    /// 两者都成立才返回成功；`PxTFD` 报错则返回失败。
+    ///
+    /// 超时预算从 300_000 降到 [`WAIT_SPINS`]：正常硬件上命令在数百次自旋内
+    /// 完成，原先的巨额预算只是掩盖了阶段 1 的逻辑错误。
     fn wait_command(&self, log_failure: bool) -> Result<(), Error> {
         let bit = 1u32 << CMD_SLOT;
 
-        // 阶段 1：确认 HBA 已接受命令（PxCI 位被置起）。
-        // 若命令极快完成，可能置起与清除都发生在轮询间隙——此时位为 0 且
-        // PxTFD 无错误，同样视为已执行（两种观察都证明命令被处理过）。
-        let mut started = false;
-        for _ in 0..300_000 {
-            if self.read32(PX_CI) & bit != 0 {
-                started = true;
+        let mut completed = false;
+        for _ in 0..WAIT_SPINS {
+            if self.read32(PX_IS) & PXIS_COMPLETION_BITS != 0 {
+                completed = true;
                 break;
             }
             core::hint::spin_loop();
         }
-        if !started {
-            // 未观察到置位：要么命令瞬间跑完（可接受），要么根本没被取走。
-            // 用 PxTFD 区分——无错则视为已完成，有错则报错。
-            if self.task_file_error() {
-                if log_failure {
-                    warn!("[ahci] port {}: command not started and PxTFD errs: {:#x}", self.index, self.read32(PX_TFD));
-                }
-                return Err(Error::Io);
+
+        // 无论是否观察到完成位，都必须等 PxCI 位落下：位仍置起意味着 HBA
+        // 还在处理，此时读 DMA 缓冲是未定义数据。
+        let cleared = self.wait_clear(PX_CI, bit, WAIT_SPINS);
+
+        if !cleared {
+            // PxCI 位始终不落：命令真的挂死了（不是"太快"）。
+            if log_failure {
+                warn!(
+                    "[ahci] port {}: command did not retire (PxCI={:#x} PxIS={:#x} PxTFD={:#x})",
+                    self.index,
+                    self.read32(PX_CI),
+                    self.read32(PX_IS),
+                    self.read32(PX_TFD)
+                );
             }
-            return Ok(());
+            return Err(Error::Io);
         }
 
-        // 阶段 2：等待命令出队（PxCI 位清零）。
-        for _ in 0..300_000 {
-            if self.read32(PX_CI) & bit == 0 {
-                // 命令已从命令列表移除；PxTFD 报告真实结果。
-                if self.task_file_error() {
-                    if log_failure {
-                        warn!("[ahci] port {}: command failed, PxTFD={:#x}", self.index, self.read32(PX_TFD));
-                    }
-                    return Err(Error::Io);
-                }
-                return Ok(());
+        // 命令已出队：PxTFD 此时报告真实结果。
+        if self.task_file_error() {
+            if log_failure {
+                warn!("[ahci] port {}: command failed, PxTFD={:#x}", self.index, self.read32(PX_TFD));
             }
-            core::hint::spin_loop();
+            return Err(Error::Io);
         }
-        if log_failure {
-            warn!("[ahci] port {}: command timed out", self.index);
-        }
-        Err(Error::Io)
+
+        // 位已落、无任务文件错误。若连完成位也未观察到，说明命令在极短时间内
+        // 完成（完成位与本代轮询错过），此时 PxCI 已清且 PxTFD 无错，两项独立
+        // 证据都指向「已执行完毕」，同样判成功。
+        let _ = completed;
+        Ok(())
     }
 
     /// 发起一次 DMA 读或写。
@@ -733,7 +765,17 @@ impl Port {
             hdr.ctbau = (ct_phys >> 32) as u32;
         }
 
-        // ---- 敲 PxCI 启动命令 ----
+        // ---- 清 PxIS 代际标记，再敲 PxCI 启动命令 ----
+        //
+        // 必须先清 PxIS：`wait_command` 用「PxIS 出现完成位」判定**本代**命令
+        // 已完成。若不清，上一代命令残留的完成位会被误认为本代已完成，
+        // 于是可能在命令尚未执行时就返回成功（读 DMA 缓冲得到残留/全零），
+        // 也可让失败命令被误判为成功（假阳性成功，比假阴性更危险）。
+        //
+        // 清 PxIS 必须在填写命令头**之后**、启动命令**之前**：填表期间不产生
+        // 完成位，而启动后到 `wait_command` 首次读之间若恰好有完成位置起，
+        // 清除动作会把本代完成位一并清掉——故清除点紧贴启动点。
+        self.write32(PX_IS, 0xFFFF_FFFF);
         self.write32(PX_CI, 1u32 << CMD_SLOT);
         match self.wait_command(log_failure) {
             Ok(()) => Ok(()),

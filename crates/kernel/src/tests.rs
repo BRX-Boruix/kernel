@@ -8887,6 +8887,130 @@ pub fn test_ahci2_real_read_write_roundtrip() {
     info!("[test-ahci2] PASS");
 }
 
+/// STORAGE-AHCI-4：PIO vs AHCI 的**量化**对比（实测，不估算）。
+///
+/// ## 为什么必须实测（S32）
+///
+/// 优化不能靠"DMA 显然更快"的直觉宣称收益。本测试用 `rdtsc` 周期计数
+/// （`klib::time::read_cycle_counter`）在**同一次启动**内测量同一个块设备
+/// 的读放大成本，并如实打印。
+///
+/// ## 方法论与其局限（如实声明，不夸大）
+///
+/// 两条路径**无法在同一次 QEMU 启动内同时存在**：AHCI 需要在 PCI 上挂
+/// `ich9-ahci` 控制器，PIO 走传统 IDE 通道。本测试的做法是：
+///   1. 测量**当前启动**所用驱动的每扇区读成本（周期/扇区）；
+///   2. 打印当前驱动名，使两次不同配置的启动可横向对比；
+///   3. 断言测量本身有效（周期数非零、读数正确），**不断言谁更快**——
+///      谁更快由两次运行的数据说话，不由本测试预设。
+///
+/// 这样即使某次运行没有 SATA 控制器，测试也能给出该路径的真实数字
+/// （PIO 路径的绝对值），而不是 SKIP 掉。
+///
+/// ## 测什么
+///
+/// 单扇区随机读（LBA 遍布全盘）+ 连续 32 扇区读（AHCI 单命令上限），
+/// 分别给出每扇区周期数。连续读能体现 DMA 的批量优势，随机读体现
+/// 每次命令的固定开销。
+pub fn test_storage_ahci4_pio_vs_ahci_benchmark() {
+    info!("[test-ahci4] === PIO vs AHCI quantitative benchmark (rdtsc) ===");
+
+    // 找到第一个真实块设备（非 volatile 的盘）。
+    let mut picked: Option<(&'static str, &'static str)> = None; // (device, driver)
+    for i in 0..driver::DriverHub::device_count() {
+        let Some(info) = driver::DriverHub::device_info_at(i) else { continue };
+        if info.kind != driver::DeviceKind::Block || info.volatile {
+            continue;
+        }
+        let Some(drv) = driver::DriverHub::driver_name_of(info.name) else { continue };
+        picked = Some((info.name, drv));
+        break;
+    }
+
+    let Some((dev_name, driver_name)) = picked else {
+        info!("[test-ahci4] SKIP: no non-volatile block device in this run");
+        return;
+    };
+
+    let dev = driver::DriverHub::device_by_name(dev_name).expect("picked device must resolve");
+    let block = dev.as_block().expect("picked block device must expose BlockDevice");
+    let sectors = block.block_count();
+    assert!(sectors > 1024, "benchmark needs a disk with room to sample");
+
+    info!(
+        "[test-ahci4] target={} driver={} sectors={}",
+        dev_name, driver_name, sectors
+    );
+
+    // ---- 场景 1：单扇区随机读 ----
+    // 用确定性的步进（不是真随机）以便复现：黄金比例步进遍历全盘。
+    const SINGLE_N: usize = 64;
+    let mut buf = [0u8; 512];
+    let golden: u64 = 0x9E3779B97F4A7C15;
+    let mut lba: u64 = (sectors / 4) | 1;
+
+    // 预热：第一发命令含链路/缓存冷启动成本，必须先跑掉再计时。
+    let _ = block.read_at(lba * 512, &mut buf);
+
+    let t0 = klib::time::read_cycle_counter();
+    for _ in 0..SINGLE_N {
+        lba = (lba.wrapping_add(golden)) % sectors;
+        let n = block.read_at(lba * 512, &mut buf);
+        assert_eq!(n, 512, "benchmark read must succeed (LBA {})", lba);
+    }
+    let t1 = klib::time::read_cycle_counter();
+
+    let single_total = t1.wrapping_sub(t0);
+    let single_per_sector = single_total / SINGLE_N as u64;
+
+    // ---- 场景 2：连续 32 扇区读（AHCI PRDT 单命令上限）----
+    const BURST_SECTORS: usize = 32;
+    const BURST_N: usize = 8;
+    let mut burst = [0u8; 512 * BURST_SECTORS];
+    let base = sectors / 2;
+    // 同样先预热，避免把冷启动算进批量数据。
+    let _ = block.read_at(base * 512, &mut burst[..512]);
+
+    let b0 = klib::time::read_cycle_counter();
+    for k in 0..BURST_N {
+        let off = (base + (k * BURST_SECTORS) as u64) * 512;
+        let n = block.read_at(off, &mut burst);
+        assert_eq!(n, 512 * BURST_SECTORS, "burst read must return full length");
+    }
+    let b1 = klib::time::read_cycle_counter();
+
+    let burst_total = b1.wrapping_sub(b0);
+    let burst_sectors = (BURST_N * BURST_SECTORS) as u64;
+    let burst_per_sector = burst_total / burst_sectors;
+
+    // ---- 测量有效性（而非"谁赢"）----
+    // rdtsc 在无 TSC 的架构上返回 0；此时数据无意义，如实报告并退出。
+    if single_total == 0 || burst_total == 0 {
+        info!("[test-ahci4] SKIP: cycle counter unavailable (rdtsc returned 0)");
+        return;
+    }
+    assert!(
+        single_per_sector > 0,
+        "cycles per sector must be nonzero for a real measurement"
+    );
+    // 批量读的每扇区成本不应**远高于**单扇区（否则多半是测量把冷启动算进去了）。
+    assert!(
+        burst_per_sector <= single_per_sector * 4,
+        "burst per-sector cost ({}) grossly exceeds single ({}) - measurement is suspect",
+        burst_per_sector,
+        single_per_sector
+    );
+
+    info!(
+        "[test-ahci4] driver={} single-sector: {} cycles/sector over {} reads ({} total)",
+        driver_name, single_per_sector, SINGLE_N, single_total
+    );
+    info!(
+        "[test-ahci4] driver={} burst-{}sector: {} cycles/sector over {} sectors ({} total)",
+        driver_name, BURST_SECTORS, burst_per_sector, burst_sectors, burst_total
+    );
+    info!("[test-ahci4] PASS (measurement valid; cross-path comparison is done across two runs)");
+}
 /// S4 回归：跨核唤醒必须**无条件**向目标核投递重调度 IPI。
 ///
 /// 红证语义（SMP 审计 S4）：`wake_enqueue` 把就绪进程压入目标核队列后，

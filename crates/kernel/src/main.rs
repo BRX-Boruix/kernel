@@ -684,6 +684,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_ahci2_real_read_write_roundtrip();
 
+    // STORAGE-AHCI-4：PIO vs AHCI 量化对比（rdtsc 实测，不估算）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_storage_ahci4_pio_vs_ahci_benchmark();
+
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
     tests::test_init_contract();
