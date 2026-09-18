@@ -191,6 +191,57 @@ pub fn irq_pending_peek(irq: u8) -> bool {
     IRQ_PENDING[irq as usize].load(Ordering::Acquire) == 1
 }
 
+/// 内核态驱动的**有界中断等待**：等到该 IRQ 的待服务闩锁置位，或自旋预算耗尽。
+///
+/// 返回 `true` = 观察到中断（闩锁已消费）；`false` = 预算耗尽（**不阻塞、不挂死**）。
+///
+/// ## 为什么是「有界自旋」而不是「睡下去」
+///
+/// 本原语服务**内核态同步块驱动**（AHCI）。它与用户态驱动的处境根本不同：
+///
+/// 1. **没有调度帧**：AHCI 盘到 ext2 的链路全同步——
+///    `ext2 -> CachingByteDevice -> DrvByteBridge(vfs_init.rs:1329) -> io.read_at(...)`。
+///    `read_bytes` 直接同步调用，没有 `&mut InterruptFrame` 可传；而面向用户态的
+///    `task::block_for_irq` 必须有帧（唯一调用点是 syscall 路径）。
+/// 2. **不能持锁切走**：本函数通常在 `fs`/`vfs` 层锁内被调用（块缓存到盘）。
+///    持锁状态下阻塞切走，下一进程会在同一把锁上自旋死锁——`scheduler.rs:1199`
+///    明确禁止「持锁阻塞切走」。
+///
+/// 故本原语**绝不阻塞调度**，只把「不可中断的长自旋」换成「中断通知 + 紧界自旋」。
+/// 收益来自消除长自旋空转（STORAGE-AHCI-4 实测修复前 22.6M cycles/扇区），
+/// **不是**「等待期间让出 CPU」——后者需要改 `BlockDevice`/`ByteDevice` 契约，
+/// 不在本原语职责内。
+///
+/// ## 失败模式（S20：先定义再实现）
+///
+/// - **中断提前到达**：闩锁已置 → 首次复检即消费返回 `true`（不丢失）。
+/// - **中断在自旋中到达**：下一轮复检消费返回 `true`。
+/// - **中断永不到达**：预算耗尽返回 `false`——调用方据此**回退到有界轮询**，
+///   绝不永久挂死。
+/// - **闩锁无归属不置**：无归属者的 IRQ 上 `device_irq_handler` 不置闩锁
+///   （见归属语义），此时本函数等价于纯自旋，语义仍正确。
+///
+/// ## 并发与锁序（S21）
+///
+/// 本函数**不获取任何锁**：只对 `IRQ_PENDING` 做原子读改写（与中断上下文的
+/// `device_irq_handler` 共享该原子，AcqRel 保证可见性）。因此可在任意锁内调用，
+/// 不引入新的锁序边，也不存在与中断上下文的死锁面。
+///
+/// `spins == 0` 退化为「只做一次复检」——调用方要求「不等待、只查状态」时使用。
+pub fn wait_bounded_irq(irq: u8, spins: u32) -> bool {
+    // 首次复检：覆盖「中断在等待开始前已到达」的 lost-wakeup 面。
+    if irq_pending_consume(irq) {
+        return true;
+    }
+    for _ in 0..spins {
+        if irq_pending_consume(irq) {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
 /// 返回某 IRQ 上当前已注册的 arch handler 数量（供测试/诊断）。
 pub fn irq_handler_count_of(irq: u8) -> usize {
     if irq as usize >= PIC_IRQ_COUNT {

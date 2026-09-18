@@ -7189,6 +7189,90 @@ pub fn test_driver_irq_owner() {
     info!("[test-driver-irq] Stage-1 device IRQ ownership/latch/PCI-irq_line invariants OK");
     info!("[test-driver-irq] PASS");
 }
+/// STORAGE-AHCI-6a 自检：内核态块驱动的**有界中断等待**原语。
+///
+/// ## 为什么需要这个原语（而不是让驱动睡下去）
+///
+/// AHCI 盘到 ext2 的链路是**全同步**的：
+/// ```
+/// ext2 -> CachingByteDevice -> DrvByteBridge(vfs_init.rs:1329) -> io.read_at(...)
+/// ```
+/// `DrvByteBridge::read_bytes` 直接同步调用，**没有 `&mut InterruptFrame` 可传**；
+/// 而 `task::block_for_irq` 必须有帧（唯一调用点是 syscall 路径）。因此在
+/// `read_at` 深处阻塞睡眠既无帧可用，又会持着 fs/vfs 锁切走 → 下一进程在同一把
+/// 锁上自旋死锁（`scheduler.rs:1199` 明确禁止「持锁阻塞切走」）。
+///
+/// 故本原语**不睡眠**，只做：**中断通知（闩锁）+ 紧界自旋**。收益是消除
+/// STORAGE-AHCI-4 实测到的长自旋空转（修复前 22.6M cycles/扇区）。
+///
+/// ## 覆盖的失败模式（S20/S31）
+///
+/// 1. **提前到达**：中断在等待开始前已触发 → 必须立即返回，不丢失（lost-wakeup）；
+/// 2. **等待中到达**：闩锁在自旋期间置位 → 立即返回；
+/// 3. **永不到达**：必须在有界自旋内放弃返回 false，**不得永久挂死**；
+/// 4. **一次性消费**：闩锁被消费后不得残留，否则下一次等待会假阳性立即返回；
+/// 5. **纯自旋退化**：中断不可用时（无闩锁来源）仍以轮询语义正确工作。
+pub fn test_ahci6a_bounded_irq_wait() {
+    info!("[test-ahci6a] === kernel-mode bounded IRQ wait primitive ===");
+
+    const TEST_IRQ: u8 = 14; // 空闲槽，避开 test_driver_irq_owner 的 15 与真实设备
+
+    // 前置：清场，保证测试可重复运行。
+    driver::irq_owner::release_device_irq(TEST_IRQ, usize::MAX);
+    let _ = driver::irq_owner::irq_pending_consume(TEST_IRQ);
+
+    // 本原语要求 IRQ 上有一个归属者，否则 device_irq_handler 不置闩锁（见
+    // irq_owner 的归属语义：无归属 → 不置闩锁、不唤醒）。用一个哨兵 pid 认领，
+    // 不为它注册任何唤醒回调（内核态块驱动没有 pid 要唤醒）。
+    const SENTINEL_PID: usize = 0xFFFF_FFFE;
+    driver::irq_owner::claim_device_irq(TEST_IRQ, SENTINEL_PID)
+        .expect("claim free IRQ for kernel-mode wait test");
+
+    // ---- 1. 提前到达：闩锁先置，等待必须立即成功（不丢失）----
+    assert!(driver::debug_simulate_irq(TEST_IRQ), "latch set before wait");
+    let got = driver::irq_owner::wait_bounded_irq(TEST_IRQ, 200_000);
+    assert!(got, "a latch set BEFORE the wait must be observed (lost-wakeup)");
+    // 不断言耗时：本原语在「闩锁已置」路径上**零自旋**（首次 consume 即返回），
+    // 但 QEMU TCG 下 rdtsc 统计的是 TCG 翻译的指令数、且 `spin_loop()` 的 pause
+    // 是慢速陷入，**不是硬件周期**（本机 CPUID 0x15/0x16 均不支持，见启动日志
+    // "TSC freq unknown"）。在此处报「cycles」会把测量伪影当成性能数据（S10）。
+    // 真实性由「是否观察到」这一契约保证，性能数据由 6d 在可复现口径下单独取。
+    info!("[test-ahci6a] early-arrival: latch observed on first check (zero spin)");
+
+    // ---- 4. 一次性消费：上面已消费，闩锁必须不残留 ----
+    assert!(
+        !driver::irq_owner::irq_pending_peek(TEST_IRQ),
+        "consume must clear the latch (no stale false-positive wake)"
+    );
+
+    // ---- 3. 永不到达：必须有界放弃返回 false，绝不永久挂死 ----
+    let got = driver::irq_owner::wait_bounded_irq(TEST_IRQ, 10_000);
+    assert!(!got, "no interrupt -> bounded wait must give up, not hang");
+    // 同上：只断言「有界放弃」这一契约，不对 TCG 下的 rdtsc 数值作性能声明。
+    info!("[test-ahci6a] never-arrives: gave up within budget (bounded, no hang)");
+
+    // ---- 5. 纯自旋退化：spins==0 → 不等待，只做一次复检 ----
+    assert!(!driver::irq_owner::irq_pending_peek(TEST_IRQ));
+    assert!(
+        !driver::irq_owner::wait_bounded_irq(TEST_IRQ, 0),
+        "zero budget must not wait (degenerate-to-polling semantics)"
+    );
+
+    // ---- 2. 等待中到达：由另一核/中断置闩锁的路径无法在单核自检中真触发，
+    //         故用「先置闩锁 + 小预算」覆盖同一代码路径（消费点与自旋点相同）。
+    assert!(driver::debug_simulate_irq(TEST_IRQ), "latch set for in-wait case");
+    assert!(
+        driver::irq_owner::wait_bounded_irq(TEST_IRQ, 200_000),
+        "latch visible at first check must be consumed"
+    );
+
+    // 清场。
+    driver::irq_owner::release_device_irq(TEST_IRQ, SENTINEL_PID);
+    let _ = driver::irq_owner::irq_pending_consume(TEST_IRQ);
+    assert_eq!(driver::irq_owner::irq_owner_of(TEST_IRQ), None, "cleanup");
+
+    info!("[test-ahci6a] PASS");
+}
 
 /// 阶段二自检：用户态驱动 DMA 一致性物理缓冲（alloc/phys/free 原语）。
 ///

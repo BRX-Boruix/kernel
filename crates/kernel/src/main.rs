@@ -632,6 +632,10 @@ unsafe fn kmain_body() -> ! {
     // 阶段一：设备中断投递基础设施（IRQ 归属表/闩锁/冲突/PCI irq_line 捕获）。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_irq_owner();
+
+    // STORAGE-AHCI-6a：内核态块驱动的有界中断等待原语。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_ahci6a_bounded_irq_wait();
     // 阶段二：用户态驱动 DMA 一致性物理缓冲原语。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_dma_buf();
