@@ -640,6 +640,10 @@ unsafe fn kmain_body() -> ! {
     // STORAGE-AHCI-6b：中断驱动完成路径（替代长自旋）。
     #[cfg(feature = "kernel-tests")]
     tests::test_ahci6b_interrupt_completion();
+
+    // STORAGE-AHCI-6d：中断 vs 轮询的同启动真 A/B 基准。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_storage_ahci6d_irq_vs_polling_benchmark();
     // 阶段二：用户态驱动 DMA 一致性物理缓冲原语。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_dma_buf();

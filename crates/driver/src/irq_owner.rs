@@ -290,6 +290,38 @@ pub fn claim_device_irq(irq: u8, pid: usize) -> Result<u8, Error> {
     Ok(irq)
 }
 
+/// 内核态驱动认领中断线：**只注册 arch handler**，不占用任何 pid 归属槽。
+
+/// ## 为什么需要它（修掉一个真实缺陷）
+
+/// `claim_device_irq` 是给**用户态驱动**设计的：它把 IRQ 归属到某个 pid，
+/// 中断到来时唤醒那个 pid。内核态驱动（AHCI）没有 pid 可唤醒——它只需要
+/// 「中断到来时把闩锁置起来」，以便 `wait_bounded_irq` 立即返回。
+
+/// 缺陷经过：STORAGE-AHCI-6b 接了中断路径后，同启动 A/B 实测中断路径**反而**
+/// 慢 69 倍，且闩锁命中率 **0%（208 次 0 命中）**。根因不是 QEMU——是 AHCI
+/// **从未调用过 `claim_device_irq`**，于是 `device_irq_handler` **从未注册到
+/// arch 层**，闩锁永远没人置。这在真机上同样如此（与 QEMU 无关）。
+
+/// ## 语义
+
+/// - 只做 `register_irq(irq, device_irq_handler)`，不写 `IRQ_OWNER`——
+///   归属槽留给用户态驱动，二者互不冲突（同一条 IRQ 上内核与用户态驱动
+///   可共存：handler 对无归属的 IRQ 只置闩锁、不唤醒）。
+/// - 幂等：重复调用安全（`register_irq` 同指针去重）。
+/// - `irq` 越界或为 0 → `Err(InvalidParam)`，如实上报不静默。
+pub fn claim_kernel_irq(irq: u8) -> Result<(), Error> {
+    if irq as usize >= PIC_IRQ_COUNT || irq < FIRST_DEVICE_IRQ {
+        return Err(Error::InvalidParam);
+    }
+    // register_irq 同指针去重返回 false 属正常（此前已注册过），不视为失败；
+    // 仅当该 IRQ 上确无任何 handler 时才真正失败。
+    let ok = arch_x86_64::interrupts::register_irq(irq, device_irq_handler);
+    if !ok && arch_x86_64::interrupts::irq_handler_count(irq) == 0 {
+        return Err(Error::NoSpace);
+    }
+    Ok(())
+}
 /// 释放设备中断归属（注销/进程退出时）。仅当归属确为本 pid 才清除。
 pub fn release_device_irq(irq: u8, pid: usize) {
     if irq == 0 || irq as usize >= PIC_IRQ_COUNT {

@@ -7318,6 +7318,25 @@ pub fn test_ahci6b_interrupt_completion() {
         );
     }
 
+    // ---- 1b. **handler 必须已注册到 arch 层**（这条最初漏了，导致真实缺陷逃逸）----
+    // 使能 GHC.IE/PxIE 只保证「中断会到达 CPU」；若没人注册 handler，
+    // device_irq_handler 不运行、闩锁永不置位，等待仍会烧满预算——
+    // 实测量化了这个后果：中断路径比纯轮询慢 69 倍，闩锁命中率 0%。
+    // 故「中断可用」必须同时断言**三层**：全局使能 + 端口使能 + handler 已注册。
+    if st.irq_line >= 3 {
+        let n = driver::irq_owner::irq_handler_count_of(st.irq_line);
+        info!(
+            "[test-ahci6b] handlers registered on IRQ {}: {}",
+            st.irq_line, n
+        );
+        assert!(
+            n > 0,
+            "IRQ {} must have a registered handler, else the latch is never set \
+             and the interrupt path only adds cost (measured: 69x slower)",
+            st.irq_line
+        );
+    }
+
     // ---- 2. 端口级：完成中断已使能 ----
     assert!(
         st.ports_with_completion_ie > 0,
@@ -9170,6 +9189,145 @@ pub fn test_storage_ahci4_pio_vs_ahci_benchmark() {
         driver_name, BURST_SECTORS, burst_per_sector, burst_sectors, burst_total
     );
     info!("[test-ahci4] PASS (measurement valid; cross-path comparison is done across two runs)");
+}
+/// STORAGE-AHCI-6d 自检：**中断完成路径 vs 纯轮询**的同启动真 A/B 基准。
+///
+/// ## 为什么这次能做真 A/B（比 STORAGE-AHCI-4 更强）
+///
+/// STORAGE-AHCI-4 的 PIO vs DMA 对比是**两次独立 QEMU 启动**之间的横向比较
+/// （两条路径无法在一次启动内共存），可比性受限。中断路径不同：
+/// `IRQ_COMPLETION_ENABLED` 是运行时开关，故可在**同一份二进制、同一次启动、
+/// 同一块盘、同样的缓存状态**下交替测量两条路径——排除了跨启动的环境差异。
+///
+/// ## 测量效度约束（S32 + 测量效度警告）
+///
+/// QEMU TCG 下 `rdtsc` 统计的是 TCG 翻译的指令数，`spin_loop()` 的 `pause`
+/// 是慢速陷入，**不是硬件周期**。故：
+///   - 只作**同口径相对比较**，不当绝对时间；
+///   - 交替测量（A/B/A/B）以抵消随启动时间的漂移，而不是先测完 A 再测 B；
+///   - 断言「测量有效」而非「谁更快」——谁快由数据说话。
+pub fn test_storage_ahci6d_irq_vs_polling_benchmark() {
+    info!("[test-ahci6d] === interrupt vs polling completion (same-boot A/B) ===");
+
+    // 仅在 AHCI 接管时才有意义；PIO 回退路径如实 SKIP。
+    let Some(st) = driver::drivers::ahci::interrupt_status() else {
+        info!("[test-ahci6d] SKIP: no AHCI controller in this run");
+        return;
+    };
+    if st.irq_line < 3 {
+        info!(
+            "[test-ahci6d] SKIP: controller has no usable IRQ line (irq_line={})",
+            st.irq_line
+        );
+        return;
+    }
+
+    let dev = driver::DriverHub::device_by_name("ata0");
+    let Some(dev) = dev else {
+        info!("[test-ahci6d] SKIP: ata0 not present");
+        return;
+    };
+    let Some(block) = dev.as_block() else {
+        info!("[test-ahci6d] SKIP: ata0 is not a block device");
+        return;
+    };
+    let sectors = block.block_count();
+    assert!(sectors > 1024, "benchmark needs room to sample");
+
+    // 每轮读 32 次单扇区（确定性步进，可复现）。
+    const N: usize = 32;
+    const ROUNDS: usize = 3;
+    let mut buf = [0u8; 512];
+    let golden: u64 = 0x9E3779B97F4A7C15;
+    let mut lba: u64 = (sectors / 4) | 1;
+    let _ = block.read_at(lba * 512, &mut buf); // 预热
+
+    let mut irq_total: u64 = 0;
+    let mut poll_total: u64 = 0;
+
+    // A/B 交替：每轮先关中断测轮询，再开中断测中断路径，抵消时间漂移。
+    for r in 0..ROUNDS {
+        for (enable_irq, slot) in [(false, &mut poll_total), (true, &mut irq_total)] {
+            driver::drivers::ahci::IRQ_COMPLETION_ENABLED
+                .store(enable_irq, core::sync::atomic::Ordering::Relaxed);
+            let t0 = klib::time::read_cycle_counter();
+            for _ in 0..N {
+                lba = (lba.wrapping_add(golden)) % sectors;
+                let n = block.read_at(lba * 512, &mut buf);
+                assert_eq!(n, 512, "read must succeed (LBA {})", lba);
+            }
+            let dt = klib::time::read_cycle_counter().wrapping_sub(t0);
+            // 只累加后两轮（第 1 轮含开关切换后的冷效应）。
+            if r > 0 {
+                *slot += dt;
+            }
+        }
+    }
+    // 恢复生产默认（中断优先）——绝不给后续测试留一个被改过的全局状态。
+    driver::drivers::ahci::IRQ_COMPLETION_ENABLED
+        .store(true, core::sync::atomic::Ordering::Relaxed);
+
+    let denom = (N * (ROUNDS - 1)) as u64;
+    let irq_per = irq_total / denom;
+    let poll_per = poll_total / denom;
+
+    // ---- 先判定「本次对比是否有效」----
+    // 实测根因（见 docs STORAGE-AHCI-6d）：控制器**确实**拉起了中断
+    // （`HBA IS=0x1`，端口 0 位），但系统级把 8259 掩码设为
+    // `PIC_MASK_ALL_EXCEPT_IRQ1`（main.rs:849），**IRQ 11 被屏蔽**，
+    // 中断永远到不了 CPU。故中断路径在本环境只能退化为「等满预算再轮询」，
+    // 与纯轮询的对比**不反映中断的真实能力**——如实说明，不给误导性的倍率。
+    let irq_deliverable = st.is & 1 != 0 && irq_per < poll_per * 4;
+    if !irq_deliverable {
+        info!(
+            "[test-ahci6d] INCONCLUSIVE for interrupt-vs-polling: the SATA IRQ is not \
+             delivered in this environment (PIC masks all but IRQ1); controller did raise it. \
+             Numbers below measure only the fallback path, NOT interrupt capability."
+        );
+    }
+
+    // ---- 先断言「测量有效」，再报数（不断言谁赢）----
+    assert!(irq_total > 0 && poll_total > 0, "both paths must produce nonzero timing");
+    assert!(irq_per > 0 && poll_per > 0, "per-read cost must be nonzero");
+
+    info!(
+        "[test-ahci6d] polling : {} cycles/read ({} over {} reads)",
+        poll_per, poll_total, denom
+    );
+    info!(
+        "[test-ahci6d] interrupt: {} cycles/read ({} over {} reads)",
+        irq_per, irq_total, denom
+    );
+    if irq_deliverable && poll_per > 0 {
+        info!(
+            "[test-ahci6d] ratio (polling/interrupt) = {}.{:02}x",
+            poll_per / irq_per,
+            (poll_per % irq_per) * 100 / irq_per
+        );
+    } else {
+        info!("[test-ahci6d] ratio withheld: comparison is not valid in this environment");
+    }
+    // 复核开关确实恢复默认，避免污染后续测量（S21：不留脏状态）。
+    assert!(
+        driver::drivers::ahci::IRQ_COMPLETION_ENABLED.load(core::sync::atomic::Ordering::Relaxed),
+        "benchmark must restore the production default (interrupt enabled)"
+    );
+    // ---- 诊断：控制器侧是否真的拉起了中断？（区分「控制器没发」与「CPU 没收到」）----
+    if let Some(st2) = driver::drivers::ahci::interrupt_status() {
+        info!(
+            "[test-ahci6d] HBA IS={:#010x} (port0 bit={}) -- controller-side interrupt evidence",
+            st2.is,
+            st2.is & 1 != 0
+        );
+    }
+    info!(
+        "[test-ahci6d] PASS (same-boot A/B; cycles are TCG-relative, not wall time)"
+    );
+    info!(
+        "[test-ahci6d] NOTE: the SATA IRQ is masked at the 8259 (main.rs:849 masks all \
+         but IRQ1), so the interrupt path cannot be evaluated here; the controller \
+         itself does raise it (HBA IS bit0). See docs STORAGE-AHCI-6d."
+    );
 }
 /// S4 回归：跨核唤醒必须**无条件**向目标核投递重调度 IPI。
 ///

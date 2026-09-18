@@ -42,9 +42,10 @@ pub use uio::{
     uio_register_driver, uio_unregister_driver,
 };
 pub use irq_owner::{
-    claim_device_irq, irq_handler_count_of, irq_owner_of, irq_pending_consume,
-    irq_pending_peek, release_device_irq, set_irq_wake_callback,
+    claim_device_irq, claim_kernel_irq, irq_handler_count_of, irq_owner_of,
+    irq_pending_consume, irq_pending_peek, release_device_irq, set_irq_wake_callback,
     irq_timer_arm, irq_timer_armed, irq_timer_cancel, irq_timer_clear,
+    wait_bounded_irq,
 };
 #[cfg(feature = "kernel-tests")]
 pub use irq_owner::debug_simulate_irq;
