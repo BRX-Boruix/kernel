@@ -342,6 +342,30 @@ impl DriverHub {
         DEVICES.lock().len()
     }
 
+    /// 按名字取设备实例（`&'static dyn Device`）。
+    ///
+    /// 供自检直接对真实设备发起 IO 验收（如 STORAGE-AHCI-2 的读写回环）——
+    /// 不经 VFS 层，验证的是驱动本身。
+    pub fn device_by_name(name: &str) -> Option<&'static dyn Device> {
+        DEVICES
+            .lock()
+            .iter()
+            .find(|e| e.info.name == name)
+            .and_then(|e| e.dev)
+    }
+
+    /// 按名字取该设备当前绑定的驱动名（未绑定返回 `None`）。
+    ///
+    /// 供自检断言「某设备由哪个驱动接管」——例如确认 `ata0` 走的是 AHCI
+    /// 而非 PIO 回退（S29：验收必须针对真实绑定，不能只看驱动是否加载）。
+    pub fn driver_name_of(name: &str) -> Option<&'static str> {
+        DEVICES
+            .lock()
+            .iter()
+            .find(|e| e.info.name == name)
+            .and_then(|e| e.driver_name)
+    }
+
     /// 指定名称的设备是否已注册（S08：供 UIO 认领等 name-based 入口校验）。
     pub fn device_exists(name: &str) -> bool {
         DEVICES.lock().iter().any(|e| e.info.name == name)
@@ -401,6 +425,20 @@ impl DriverHub {
             .unwrap_or(false)
     }
 
+    /// 指定索引设备绑定的驱动是否**声明控制硬件**（ADR-022 的另一面）。
+    ///
+    /// 与 [`Self::device_driver_is_candidate`] 严格互补：一个绑定必须二选一。
+    /// 两者同时为真意味着驱动身份自相矛盾（既称候选又称已接管），同时为假
+    /// 意味着绑定未声明身份——都是必须能被自检发现的真实缺陷，故此处如实
+    /// 返回原始标志而**不**做归一化。
+    pub fn device_driver_controls_hardware(index: usize) -> bool {
+        DEVICES
+            .lock()
+            .get(index)
+            .map(|e| e.driver_name.is_some() && e.driver_controls_hardware)
+            .unwrap_or(false)
+    }
+
     fn ensure_registered() {
         if REGISTERED.swap(true, AcqRel) {
             return;
@@ -411,9 +449,19 @@ impl DriverHub {
             ("keyboard", crate::drivers::keyboard::register_keyboard_driver()),
             ("cmos", crate::drivers::cmos::register_cmos_driver()),
             ("pseudo", crate::drivers::pseudo::register_pseudo_driver()),
-            ("ata_pio", crate::drivers::ata_pio::register_ata_driver()),
             ("ramdisk", crate::drivers::ramdisk::register_ramdisk_driver()),
             ("pci-bus", crate::drivers::pci_bus::register_pci_bus_driver()),
+            // STORAGE-AHCI-2：AHCI 与 ATA PIO 都**不**在此阶段做硬件初始化。
+            //
+            // 原因：块存储需要分配物理连续帧（DMA 描述符/数据缓冲）并映射
+            // MMIO，而 `DriverHub` 的四个阶段全部由 `drivers::init()` 触发，
+            // 早于 `mm::init()` 与 `paging::init()`。在本阶段初始化必然撞上
+            // `PHYS_OFFSET not initialized`（实测复现）。
+            //
+            // 二者改由 `ahci::late_storage_init()` 在内存管理就绪后统一启动：
+            // 先 AHCI（依赖 PCI 枚举 + 帧分配），再 ATA PIO（跳过 AHCI 已认领
+            // 的槽位）。此处仅登记驱动条目供 DriverHub 列举。
+            ("ahci", crate::drivers::ahci::register_ahci_driver()),
             (
                 "pci-class-candidates",
                 crate::drivers::pci_classes::register_pci_class_drivers(),

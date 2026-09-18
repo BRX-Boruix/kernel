@@ -6444,13 +6444,36 @@ pub fn test_driver_hub_m72() {
                     let score = DriverHub::device_driver_score_at(i);
                     bound_pci_count += 1;
                     assert!(score >= 50, "bound driver must have score >= 50");
-                    // DR1a（ADR-022 §1）：PCI 类绑定全部来自 pci_classes
-                    // 候选登记器——必须以候选身份呈现，绝不伪装成已接管。
+                    // DR1a（ADR-022 §1）：绑定身份必须**如实呈现**——来自
+                    // pci_classes 候选登记器的绑定是候选（无真实硬件控制）；
+                    // 真实驱动（如 `ahci`）的绑定是已接管。
+                    //
+                    // 本断言原先无条件要求「PCI 类绑定一律是候选」，那是
+                    // AHCI 落地**之前**的事实：当时没有任何真实 PCI 块驱动，
+                    // SATA/AHCI 控制器只被候选登记器认领。STORAGE-AHCI-2 之后
+                    // 该前提不再成立（控制器被真实驱动接管），旧断言会把正确
+                    // 的新状态判为失败。
+                    //
+                    // 真正的不变式（两条都要守）：
+                    //   1. 绑定必须**声明**自己是否控制硬件，不得两边都占；
+                    //   2. 候选身份只允许出现在 pci_classes 的候选驱动名下——
+                    //      绝不能有真实驱动伪装成候选来逃避「已接管」的责任。
+                    let is_candidate = DriverHub::device_driver_is_candidate(i);
+                    let controls_hw = DriverHub::device_driver_controls_hardware(i);
                     assert!(
-                        DriverHub::device_driver_is_candidate(i),
-                        "pci-class binding must be presented as candidate, driver={}",
-                        driver
+                        is_candidate != controls_hw,
+                        "binding must declare exactly one identity: driver={} candidate={} controls_hardware={}",
+                        driver, is_candidate as u64, controls_hw as u64
                     );
+                    // 候选身份只能来自 pci_classes 候选登记器。真实驱动不得冒充
+                    // 候选（否则即以候选之名掩盖真实硬件控制）。
+                    if is_candidate {
+                        assert!(
+                            driver == "pci-block" || driver == "pci-display" || driver == "pci-net",
+                            "candidate identity may only come from pci_classes registrar, got driver={}",
+                            driver
+                        );
+                    }
                     info!(
                         "[test-driver-hub-m72] PCI device candidate binding: name={} candidate={} score={} vendor={:04x}:{:04x}",
                         info.name, driver, score, info.vendor_id, info.device_id
@@ -8772,6 +8795,98 @@ pub fn test_ahci1_kernel_dma_buffer_truth_and_conservation() {
     info!("[test-ahci1] PASS");
 }
 
+/// STORAGE-AHCI-2 验收：AHCI 盘真读真写（不是识别到就算通过）。
+///
+/// 断言四件事：
+///   1. `ata0` 由 `ahci` 驱动接管（而非 ata_pio 回退）；
+///   2. 同一扇区读两次结果一致，且 LBA0 带 MBR 签名 0x55AA——
+///      这是「读到的确实是盘首扇区」的独立证据，排除 DMA 落到错误内存；
+///   3. 写-读回环：写入魔数模式到盘尾空闲扇区，读回逐字节一致；
+///   4. 恢复原内容并复验——测试不得污染盘（selftest 的盘跨运行持久沿用）。
+pub fn test_ahci2_real_read_write_roundtrip() {
+    info!("[test-ahci2] === AHCI real DMA read/write round-trip ===");
+
+    // 1. 确认 ata0 由 ahci 驱动接管。无 SATA 环境下如实 SKIP（不假装通过）。
+    let driver_of_ata0 = driver::DriverHub::driver_name_of("ata0");
+    if driver_of_ata0 != Some("ahci") {
+        info!(
+            "[test-ahci2] SKIP: ata0 not served by ahci (driver={:?}); no SATA controller in this run",
+            driver_of_ata0
+        );
+        return;
+    }
+
+    // 2. 取块设备。
+    let dev = match driver::DriverHub::device_by_name("ata0") {
+        Some(d) => d,
+        None => {
+            panic!("[test-ahci2] ata0 bound to ahci but device lookup returned None");
+        }
+    };
+    let block = match dev.as_block() {
+        Some(b) => b,
+        None => {
+            panic!("[test-ahci2] ata0 is not a block device");
+        }
+    };
+    let sectors = block.block_count();
+    assert!(sectors > 0, "AHCI disk reports zero capacity");
+    info!("[test-ahci2] ata0: {} sectors served by ahci", sectors);
+
+    // 3. 读稳定性 + MBR 签名（独立证据：真的读到了盘首扇区）。
+    let mut a = [0u8; 512];
+    let mut b = [0u8; 512];
+    let n1 = block.read_at(0, &mut a);
+    let n2 = block.read_at(0, &mut b);
+    assert!(
+        n1 == 512 && n2 == 512,
+        "LBA0 read must return 512 bytes (got {} and {})",
+        n1,
+        n2
+    );
+    assert!(a == b, "two reads of one sector must be identical");
+    assert!(
+        a[510] == 0x55 && a[511] == 0xAA,
+        "LBA0 must carry MBR signature 0x55AA (got {:02x}{:02x}) - DMA may hit wrong memory",
+        a[511],
+        a[510]
+    );
+    info!("[test-ahci2] LBA0 read OK; MBR signature 0x55AA verified");
+
+    // 4. 写-读回环（盘尾空闲扇区），随后恢复原内容。
+    let target = sectors - 1;
+    let offset = target * 512;
+    let mut original = [0u8; 512];
+    let rn = block.read_at(offset, &mut original);
+    assert!(rn == 512, "read of last sector failed ({} bytes)", rn);
+
+    let mut pattern = [0u8; 512];
+    for (i, byte) in pattern.iter_mut().enumerate() {
+        *byte = ((i * 7 + 0x5A) & 0xFF) as u8;
+    }
+    let w = block.write_at(offset, &pattern);
+    assert!(w == 512, "write to last sector failed ({} bytes)", w);
+
+    let mut readback = [0u8; 512];
+    let rr = block.read_at(offset, &mut readback);
+    assert!(rr == 512, "read-back failed ({} bytes)", rr);
+    assert!(
+        readback == pattern,
+        "write-read round-trip mismatch: disk did not retain what AHCI DMA wrote"
+    );
+    info!("[test-ahci2] write-read round-trip OK on LBA {}", target);
+
+    // 5. 恢复并复验（不留污染）。
+    let res = block.write_at(offset, &original);
+    assert!(res == 512, "restore of last sector failed");
+    let mut verify = [0u8; 512];
+    let _ = block.read_at(offset, &mut verify);
+    assert!(verify == original, "restore verification failed - disk left corrupted");
+    info!("[test-ahci2] original content restored; disk left clean");
+
+    info!("[test-ahci2] PASS");
+}
+
 /// S4 回归：跨核唤醒必须**无条件**向目标核投递重调度 IPI。
 ///
 /// 红证语义（SMP 审计 S4）：`wake_enqueue` 把就绪进程压入目标核队列后，
@@ -9666,11 +9781,23 @@ pub fn test_drv1_remediation() {
         !list_str.contains("\"driver\":\"pci-net\""),
         "bare pci-net presentation would be a false 'attached' claim"
     );
-    // ata0 由 ata_pio 在 init 中真实接管（identify 完成），必须保持真驱动呈现。
+    // ata0 由**真实存在的块驱动**接管，必须保持「真驱动」呈现而非降级为候选。
+    //
+    // 不断言具体是 `ata_pio`：存储路径存在两个合法实现——有 SATA 控制器时
+    // 由 `ahci`（DMA）接管，否则回退 `ata_pio`（PIO）。二者都是真驱动，
+    // 断言绑定某一个名字会把「AHCI 正常接管」误判为失败（实测：加入 AHCI
+    // 后本断言即 panic）。这里断言真正的不变量：**呈现的驱动名必须是一个
+    // 已注册的真驱动，且不得是候选呈现**。
     if list_str.contains("\"name\":\"ata0\"") {
+        let real_driver = list_str.contains("\"driver\":\"ahci\"")
+            || list_str.contains("\"driver\":\"ata_pio\"");
         assert!(
-            list_str.contains("\"driver\":\"ata_pio\""),
-            "real hardware takeover must not be downgraded to candidate"
+            real_driver,
+            "ata0 must be served by a real block driver (ahci or ata_pio), not a candidate"
+        );
+        assert!(
+            !list_str.contains("\"driver\":\"candidate:ata"),
+            "a real storage takeover must not be downgraded to candidate presentation"
         );
     }
     info!("[test-drv1] DR1a candidate presentation OK");

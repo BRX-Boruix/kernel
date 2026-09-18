@@ -296,6 +296,20 @@ unsafe fn kmain_body() -> ! {
     // 需在 paging::init 之后（依赖页表页分配器注入）。
     arch_x86_64::mmio::test_map_phys_4k();
 
+    // STORAGE-AHCI-2：块存储栈在此启动，**必须在 mm::init + paging::init 之后**。
+    //
+    // 为什么不能放在 `drivers::init()`（上方 line ~215）：块驱动需要分配物理
+    // 连续帧（DMA 描述符/数据缓冲）并把 ABAR 映射进内核地址空间，而 DriverHub
+    // 的全部阶段都早于内存管理初始化——在那里初始化会撞 `PHYS_OFFSET not
+    // initialized` panic（实测复现）。
+    //
+    // 顺序：AHCI 优先（真 DMA），未找到 SATA 盘时 ATA PIO 接管（兼容路径）。
+    let storage_disks = driver::drivers::ahci::late_storage_init();
+    info!(
+        "[kmain] storage stack ready: {} AHCI disk(s)",
+        storage_disks
+    );
+
     // T3：初始化 HPET（高精度事件定时器）——ACPI 探测（基址/周期）+ 4KB MMIO
     // 映射 + 使能计数器，提供微秒级高精度单调时钟补充。ACPI 表在
     // acpi::init() 已解析（hpet_info）；映射依赖页表页分配器（paging::init）。
@@ -665,6 +679,10 @@ unsafe fn kmain_body() -> ! {
     // STORAGE-AHCI-1：内核态 DMA 缓冲的真实性（HHDM 对应 + 可写可读）与资源守恒。
     #[cfg(feature = "kernel-tests")]
     tests::test_ahci1_kernel_dma_buffer_truth_and_conservation();
+
+    // STORAGE-AHCI-2：AHCI 盘真读真写（DMA 读写回环 + MBR 签名独立证据）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_ahci2_real_read_write_roundtrip();
 
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]

@@ -25,7 +25,7 @@ const CONFIG_DATA: u16 = 0xCFC;
 const ENABLE_BIT: u32 = 0x8000_0000;
 
 /// PCI 配置空间类代码（offset 0x0B）：海量存储（IDE/AHCI/NVMe 等）。
-const PCI_CLASS_MASS_STORAGE: u8 = 0x01;
+pub const PCI_CLASS_MASS_STORAGE: u8 = 0x01;
 /// PCI 配置空间类代码：网络控制器。
 const PCI_CLASS_NETWORK: u8 = 0x02;
 /// PCI 配置空间类代码：显示控制器。
@@ -40,7 +40,7 @@ const PCI_CLASS_MULTIMEDIA: u8 = 0x04;
 /// 海量存储子类（offset 0x0A）：IDE 控制器。
 const PCI_SUBCLASS_IDE: u8 = 0x01;
 /// 海量存储子类：SATA（AHCI 模式）。
-const PCI_SUBCLASS_SATA: u8 = 0x06;
+pub const PCI_SUBCLASS_SATA: u8 = 0x06;
 /// 网络子类：以太网控制器。
 const PCI_SUBCLASS_ETHERNET: u8 = 0x00;
 /// 显示子类：VGA 兼容控制器。

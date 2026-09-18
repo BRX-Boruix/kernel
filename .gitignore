@@ -19,3 +19,7 @@
 # liveCD 内置用户程序 payload（SDK 构建生成，不提交）
 /crates/kernel/src/binaries_payload.rs
 /crates/kernel/pthread_bench.elf
+/crates/kernel/audiod.elf
+/crates/kernel/audioe2e.elf
+/crates/kernel/audiofile.elf
+/crates/kernel/selftest.elf

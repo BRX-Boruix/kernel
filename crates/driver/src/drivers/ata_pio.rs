@@ -724,6 +724,22 @@ pub fn init_ata(_hub: &DriverHub) {
     let mut found_hardware = false;
 
     for (dev, channel, slave) in DEVICE_SLOTS {
+        // STORAGE-AHCI-2：AHCI 已认领的同名设备必须跳过。
+        //
+        // 为什么必须显式跳：`register_device_info` **不检查重名**（它只 push）。
+        // 若 AHCI 已登记 `ata0`（走 DMA），而本驱动又为同一块盘登记一次 `ata0`
+        // （走 PIO），设备表里就有两条同名条目；`DriverHub` 的 name-based 查找
+        // （`DEVICE_CACHES` 键、`pci_location_of`、DevFS 投影）只会命中最先那条，
+        // 第二条成为不可达的僵尸——同时盘还会被两条路径重复访问。
+        //
+        // 顺序由 `hub.rs` 的注册表保证：ahci 排在 ata_pio 之前。
+        if DriverHub::device_exists(dev.name) {
+            info!(
+                "[ata_pio] slot '{}' already claimed by another driver (AHCI); PIO path skips it",
+                dev.name
+            );
+            continue;
+        }
         match identify_ata(channel, slave) {
             AtaIdentify::Ata(sec) if sec <= LBA28_MAX_SECTORS => {
                 *dev.sectors.lock() = sec;
@@ -759,6 +775,14 @@ pub fn init_ata(_hub: &DriverHub) {
     }
 
     if found_hardware {
+        return;
+    }
+
+    // AHCI 已接管存储时不得再落 RAM 回退盘：那会在有真实 SATA 盘的机器上
+    // 额外冒出一个易失假盘（S07/S09）。只要 AHCI 认领了任一同名槽位，即认为
+    // 存储已由 AHCI 服务。
+    if DEVICE_SLOTS.iter().any(|(d, _, _)| DriverHub::device_exists(d.name)) {
+        info!("[ata_pio] storage served by AHCI; no PIO fallback registered");
         return;
     }
 

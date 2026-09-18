@@ -11,4 +11,6 @@ kernel-tests = []
 [dependencies]
 klib = { path = "../klib" }
 arch-x86_64 = { path = "../arch/arch-x86_64" }
+# STORAGE-AHCI-2：AHCI 驱动需内核态 DMA 缓冲（mm::dma）分配物理连续帧。
+mm = { path = "../mm" }
 spin = "0.9"

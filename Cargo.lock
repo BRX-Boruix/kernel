@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "arch-x86_64",
  "klib",
+ "mm",
  "spin",
 ]
 
