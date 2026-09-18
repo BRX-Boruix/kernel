@@ -662,6 +662,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_s3_dma_alloc_free_frame_conservation();
 
+    // STORAGE-AHCI-1：内核态 DMA 缓冲的真实性（HHDM 对应 + 可写可读）与资源守恒。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_ahci1_kernel_dma_buffer_truth_and_conservation();
+
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
     tests::test_init_contract();

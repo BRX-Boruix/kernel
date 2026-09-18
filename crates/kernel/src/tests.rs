@@ -8647,6 +8647,131 @@ pub fn test_s3_dma_alloc_free_frame_conservation() {
     info!("[test-s3] PASS");
 }
 
+/// STORAGE-AHCI-1 验收：内核态 DMA 缓冲的**真实性**与**资源守恒**。
+///
+/// 与 `test_s3_dma_alloc_free_frame_conservation`（用户态路径）互补：
+/// 本条覆盖 `mm::dma` 的内核态路径，断言四件事——
+///
+/// 1. **真的分配了物理帧**（帧数增加），否则后续断言空转；
+/// 2. **虚拟/物理对应为真**：`virt_addr()` 经页表翻译必须等于 `phys_addr()`
+///    的 HHDM 映射。这是 DMA 正确性的根——两者若不一致，设备会访问到
+///    与 CPU 写入**不同**的物理内存（症状：设备读到 0 或读到代码页）；
+/// 3. **真的可写可读**：写魔数读回。只检查指针非零是无效验收（S29）；
+/// 4. **释放后帧守恒**：Drop 归还整块，不留尾巴（S18）。
+///
+/// 用**非 2 的幂**页数（3 页 → order 2 → 实分 4 帧）：若释放按请求页数而非
+/// 分配阶数归还，尾部整帧泄漏，帧计数不会回到起点。
+pub fn test_ahci1_kernel_dma_buffer_truth_and_conservation() {
+    use mm::dma::{MAX_KERNEL_DMA_BYTES, KernelDmaError, alloc_kernel_dma};
+    info!("[test-ahci1] === kernel-mode DMA buffer: truth + conservation ===");
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+
+    const NPAGES: u64 = 3;
+    const BYTES: u64 = NPAGES * 4096;
+    let before = mm::frame_stats().allocated_frames;
+
+    // --- 1. 分配真实发生 ---
+    let mut buf = alloc_kernel_dma(BYTES).expect("alloc kernel dma buffer");
+    let after_alloc = mm::frame_stats().allocated_frames;
+    info!(
+        "[test-ahci1] alloc {} bytes -> order={} capacity={} phys={:#x} virt={:#x} (frames {} -> {}, +{})",
+        buf.len(),
+        buf.order(),
+        buf.capacity(),
+        buf.phys_addr(),
+        buf.virt_addr(),
+        before as u64,
+        after_alloc as u64,
+        (after_alloc - before) as u64
+    );
+    assert!(
+        after_alloc > before,
+        "alloc must actually allocate frames (else conservation check is vacuous)"
+    );
+    assert_eq!(buf.len(), BYTES, "len must be the requested byte count");
+    assert!(
+        buf.capacity() >= BYTES,
+        "capacity must cover the request: {} < {}",
+        buf.capacity(),
+        BYTES
+    );
+    // 3 页 -> order 2 -> 4 页容量。若为 order 1 则容量 2 页 < 请求，属实现错误。
+    assert_eq!(buf.order(), 2, "3 pages must need order 2 (2^2=4 >= 3)");
+    assert_eq!(buf.capacity(), 4 * 4096, "order 2 => 4 pages capacity");
+
+    // --- 2. 虚拟/物理对应为真（DMA 正确性的根） ---
+    // HHDM 是线性映射：phys_to_virt(phys) 必须等于 buf.virt_addr()，
+    // 且二者低 12 位（页内偏移）一致。若不成立，说明返回的物理地址
+    // 不是 CPU 实际写入的那片内存——设备 DMA 会打到别处。
+    let expect_virt = arch::phys_to_virt(buf.phys_addr());
+    assert_eq!(
+        buf.virt_addr(),
+        expect_virt,
+        "virt_addr must be the HHDM image of phys_addr (else device DMA hits other memory)"
+    );
+    assert_eq!(
+        buf.phys_addr() % 4096,
+        0,
+        "DMA base physical address must be page-aligned"
+    );
+    assert_eq!(buf.virt_addr() % 4096, 0, "virt address must be page-aligned");
+
+    // --- 3. 真的可写可读 ---
+    // 魔数写满整块，再从物理地址侧经 HHDM 读回，证明 CPU 的写确实落在
+    // 该物理内存上（而非某处别名页）。
+    let cap = buf.capacity() as usize;
+    {
+        let s = buf.as_mut_slice();
+        assert_eq!(s.len(), cap, "slice covers whole capacity");
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x5A;
+        }
+    }
+    {
+        let s = buf.as_slice();
+        for (i, b) in s.iter().enumerate() {
+            assert_eq!(*b, (i as u8) ^ 0x5A, "byte {i} must round-trip");
+        }
+    }
+    // 经物理地址独立复验：用 phys 重算 HHDM 地址读取，确认同源。
+    let phys_view = unsafe {
+        core::slice::from_raw_parts(arch::phys_to_virt(buf.phys_addr()) as *const u8, 64)
+    };
+    for (i, b) in phys_view.iter().enumerate() {
+        assert_eq!(*b, (i as u8) ^ 0x5A, "phys view byte {i} must match");
+    }
+
+    // --- 4. 释放后帧守恒 ---
+    drop(buf);
+    let after_free = mm::frame_stats().allocated_frames;
+    info!(
+        "[test-ahci1] after drop: frames {} (delta from start: {})",
+        after_free as u64,
+        (after_free as i64 - before as i64)
+    );
+    assert_eq!(
+        after_free, before,
+        "kernel DMA alloc/drop must conserve frames: leak of {} frame(s)",
+        after_free as u64 - before as u64
+    );
+
+    // --- 5. 错误路径不得泄漏帧（S18：错误路径同样释放） ---
+    let before_rej = mm::frame_stats().allocated_frames;
+    assert_eq!(alloc_kernel_dma(0).err(), Some(KernelDmaError::InvalidParam));
+    assert_eq!(
+        alloc_kernel_dma(MAX_KERNEL_DMA_BYTES + 1).err(),
+        Some(KernelDmaError::InvalidParam)
+    );
+    assert_eq!(
+        mm::frame_stats().allocated_frames,
+        before_rej,
+        "rejected requests must not allocate (leak on error path)"
+    );
+
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-ahci1] PASS");
+}
+
 /// S4 回归：跨核唤醒必须**无条件**向目标核投递重调度 IPI。
 ///
 /// 红证语义（SMP 审计 S4）：`wake_enqueue` 把就绪进程压入目标核队列后，

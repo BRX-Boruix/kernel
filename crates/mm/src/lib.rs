@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod dma;
 pub mod frame_allocator;
 pub mod mapper;
 pub mod user_space;
