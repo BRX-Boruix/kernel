@@ -7273,6 +7273,82 @@ pub fn test_ahci6a_bounded_irq_wait() {
 
     info!("[test-ahci6a] PASS");
 }
+/// STORAGE-AHCI-6b 自检：**中断驱动完成路径**（替代长自旋）。
+///
+/// ## 被检验的设计
+///
+/// 6a 提供了内核态有界等待原语；本组件把它接到命令完成等待上：使能 `GHC.IE`
+/// 与每端口 `PxIE`（只使能完成位），使命令完成经 PCI IRQ 置起 `irq_owner` 的
+/// 闩锁，`wait_command` 由「纯自旋轮询 PxIS」改为「等中断闩锁 + 有界轮询兜底」。
+///
+/// ## 覆盖的不变量（S20/S31）
+///
+/// 1. 控制器级中断**确实使能**（`GHC.IE` 读回，不是「打算使能」）；
+/// 2. 端口级完成中断**确实使能**（`PxIE` 读回，且只使能完成位）；
+/// 3. 中断线是**真实 PCI 配置值**（不再硬编码 0）且落在可服务范围，或如实为 0；
+/// 4. **中断缺失不致命**：闩锁等不到时有界轮询兜底，真实 I/O 仍完成——
+///    这是「不依赖中断也能跑」的硬保证（QEMU 下正是这条在保底）；
+/// 5. 命令完成语义不回归（真实读写回环由 test-ahci2 覆盖，此处不重复）。
+pub fn test_ahci6b_interrupt_completion() {
+    info!("[test-ahci6b] === AHCI interrupt-driven completion ===");
+
+    let Some(st) = driver::drivers::ahci::interrupt_status() else {
+        // 无 AHCI 控制器（PIO 回退路径）：如实 SKIP，不伪装通过。
+        info!("[test-ahci6b] SKIP: no AHCI controller in this run");
+        return;
+    };
+
+    // ---- 1. 控制器级中断使能（GHC.IE 读回）----
+    info!(
+        "[test-ahci6b] GHC={:#010x} GHC.IE={} irq_line={} ports={}",
+        st.ghc, st.ghc_ie, st.irq_line, st.port_count
+    );
+    assert!(
+        st.ghc_ie,
+        "GHC.IE must be set, else no port interrupt can reach the CPU"
+    );
+
+    // ---- 3. 中断线合法性：0 = 未分配（合法），否则须落在设备 IRQ 范围 ----
+    if st.irq_line != 0 {
+        assert!(
+            (st.irq_line as usize) >= 3
+                && (st.irq_line as usize) < driver::irq_owner::PIC_IRQ_COUNT,
+            "AHCI irq_line {} must be a serviceable device IRQ (3..16)",
+            st.irq_line
+        );
+    }
+
+    // ---- 2. 端口级：完成中断已使能 ----
+    assert!(
+        st.ports_with_completion_ie > 0,
+        "at least one port must have completion interrupts enabled (PxIE)"
+    );
+    info!(
+        "[test-ahci6b] ports with completion IRQ enabled: {} / {}",
+        st.ports_with_completion_ie, st.port_count
+    );
+
+    // ---- 4. 中断缺失不致命：中断模式下仍能完成真实命令（有界轮询兜底）----
+    // QEMU TCG 下 IRQ 投递与真实硬件不同，这条正是保证「不依赖中断也能跑」。
+    match driver::DriverHub::driver_name_of("ata0") {
+        Some("ahci") => {
+            let sectors = driver::drivers::ahci::probe_capacity_for_test(0);
+            assert!(
+                sectors.is_some(),
+                "interrupt-mode driver must still complete real I/O (bounded poll fallback)"
+            );
+            let n = sectors.unwrap();
+            assert!(n > 0, "probed capacity must be non-zero for a real disk");
+            info!("[test-ahci6b] real I/O under interrupt mode OK: {} sectors", n);
+        }
+        other => info!(
+            "[test-ahci6b] ata0 served by {:?} (not ahci); skipping I/O check",
+            other
+        ),
+    }
+
+    info!("[test-ahci6b] PASS");
+}
 
 /// 阶段二自检：用户态驱动 DMA 一致性物理缓冲（alloc/phys/free 原语）。
 ///

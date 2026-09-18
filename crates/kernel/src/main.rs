@@ -636,6 +636,10 @@ unsafe fn kmain_body() -> ! {
     // STORAGE-AHCI-6a：内核态块驱动的有界中断等待原语。
     #[cfg(feature = "kernel-tests")]
     tests::test_ahci6a_bounded_irq_wait();
+
+    // STORAGE-AHCI-6b：中断驱动完成路径（替代长自旋）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_ahci6b_interrupt_completion();
     // 阶段二：用户态驱动 DMA 一致性物理缓冲原语。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_dma_buf();

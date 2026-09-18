@@ -94,6 +94,14 @@ const GHC_HR: u32 = 1 << 0;
 /// 固件已建立的端口链路状态（实测在 QEMU ich9-ahci 上使 PxSIG 变为无效值
 /// 0xffffffff 而无法识别盘）。详见 `init_controller` 的说明。
 const GHC_AE: u32 = 1 << 31;
+/// GHC.IE（§3.1.2，bit1）：全局中断使能。
+///
+/// 只有在 GHC.IE 与对应 `PxIE` 位**同时**置起时，端口事件才会向上汇聚到
+/// HBA 的 `IS` 并经 PCI IRQ 投递到 CPU（§3.1.3）。二者缺一即静默丢弃——
+/// 这也是「使能了中断却收不到」的常见错因，故自检对两者都做读回断言。
+const GHC_IE: u32 = 1 << 1;
+/// HBA 支持的最大端口数（§3.1.3 `CAP.NP` 是 5 位字段，规范上限 32）。
+const MAX_PORTS: u32 = 32;
 
 // ===========================================================================
 // Port Register Set（AHCI 1.3.1 §3.3，偏移 0x100 + 0x80 * port）
@@ -117,6 +125,14 @@ const PX_SSTS: u64 = 0x28; // SATA Status (SCR0: SStatus)
 
 const PX_SERR: u64 = 0x30; // SATA Error (SCR2, RWC)
 const PX_CI: u64 = 0x38; // Command Issue
+const PX_IE: u64 = 0x14; // Interrupt Enable (R/W)
+
+/// `PxIE`（§3.3.1.4）使能位：与 `PXIS_COMPLETION_BITS` 同组。
+///
+/// 使能后，`PxIS` 中对应位置起会**向上汇聚**到 HBA 的 `IS`，在 `GHC.IE` 也
+/// 使能时经 PCI IRQ 投递到 CPU。本驱动只使能「命令完成」相关位——不使能
+/// `PxE`/错误位，避免磁盘错误把端口中断线淹在错误风暴里（S20）。
+const PXIE_COMPLETION_BITS: u32 = PXIS_COMPLETION_BITS;
 
 /// PxCMD（§3.3.1.4）位定义。
 const PXCMD_ST: u32 = 1 << 0; // Start: 允许处理命令列表
@@ -139,6 +155,14 @@ const PXIS_COMPLETION_BITS: u32 = (1 << 0) | (1 << 1) | (1 << 2);
 /// 取 200_000：远大于正常硬件的数百次，又能让真正的挂死快速暴露，
 /// 而不是像原实现那样把 300_000 次预算在**每条正常命令**上烧完。
 const WAIT_SPINS: u32 = 200_000;
+
+/// 等 IRQ 闩锁的自旋上限（STORAGE-AHCI-6b）。
+///
+/// 取值理由：这只是**中断到达前的短暂等待**，不是命令完成的全部预算——
+/// 闩锁等不到时会退回 `WAIT_SPINS` 的有界轮询，故此处无需给足。
+/// 取 `WAIT_SPINS / 8`：给中断投递留出合理窗口，同时保证中断失效时
+/// 额外开销只占轮询预算的八分之一。
+const IRQ_WAIT_SPINS: u32 = WAIT_SPINS / 8;
 const PXTFD_BSY: u32 = 1 << 7;
 
 /// PxSSTS（§3.3.1.7）位域：DET(0..3) / SPD(4..7) / IPM(8..11)。
@@ -484,6 +508,22 @@ impl Port {
         self.write32(PX_IS, 0xFFFF_FFFF);
         self.write32(PX_SERR, 0xFFFF_FFFF);
 
+        // STORAGE-AHCI-6b：使能**本端口**的命令完成中断。
+        //
+        // 只使能完成位（`PXIE_COMPLETION_BITS`，与 `PXIS_COMPLETION_BITS` 同组），
+        // **不**使能错误位（S20）：磁盘错误若也走中断线，错误风暴会把端口 IRQ
+        // 淹在重复投递里，反而掩盖真正的失败；错误仍由 `PxTFD` 在完成点判定。
+        //
+        // 顺序：先清 `PxIS`（上一行）再置 `PxIE`，避免使能瞬间把历史状态
+        // 当作一次新事件投递出去。
+        self.write32(PX_IE, PXIE_COMPLETION_BITS);
+        let ie_rb = self.read32(PX_IE);
+        if ie_rb & PXIE_COMPLETION_BITS != PXIE_COMPLETION_BITS {
+            // 读回不一致：中断使能未生效。这不是致命错误（有界轮询兜底仍能工作），
+            // 但必须留痕——否则「以为有中断、实际没有」会让性能判断失真（S39）。
+            warn!("[ahci] port {}: PxIE not latched (wrote {:#x}, read {:#x})", self.index, PXIE_COMPLETION_BITS, ie_rb);
+        }
+
         // 步骤 4：置 FRE 与 ST 启动命令引擎与 FIS 接收。
         //
         // 只动 ST 与 FRE 这两位的理由：它们是 §3.3.1.4 明确定义且本驱动
@@ -614,13 +654,36 @@ impl Port {
     fn wait_command(&self, log_failure: bool) -> Result<(), Error> {
         let bit = 1u32 << CMD_SLOT;
 
+        // STORAGE-AHCI-6b：**中断优先 + 有界轮询兜底**。
+        //
+        // 先用 `wait_bounded_irq` 等 IRQ 闩锁：真实硬件上命令完成后控制器
+        // 经 PCI IRQ 置闩锁，等待立刻结束，**不再烧满自旋预算**（这正是
+        // STORAGE-AHCI-4 实测 22.6M cycles/扇区 的来源）。
+        //
+        // 闩锁等不到时**必须仍能工作**：中断可能未分配（irq_line==0）、
+        // 被共享线掩盖，或 QEMU TCG 不投递——此时退回下面的有界轮询。
+        // 两条路径都只是「等待方式」，完成判定（PxIS 完成位 + PxCI 出队
+        // + PxTFD 无错）完全一致，故不改变成功/失败语义（S20）。
+        let irq = CONTROLLER_IRQ_LINE.load(core::sync::atomic::Ordering::Relaxed);
+        let irq_latched = if irq >= 3 {
+            crate::irq_owner::wait_bounded_irq(irq, IRQ_WAIT_SPINS)
+        } else {
+            false // 无中断线：直接走轮询（不伪装成「等过中断」）
+        };
+
         let mut completed = false;
-        for _ in 0..WAIT_SPINS {
-            if self.read32(PX_IS) & PXIS_COMPLETION_BITS != 0 {
-                completed = true;
-                break;
+        // 中断已到时也仍做一次 MMIO 复检：闩锁证明「控制器报告过完成」，
+        // 而 `PX_IS` 是权威位。两者互证，且复检不花额外等待。
+        if !irq_latched {
+            for _ in 0..WAIT_SPINS {
+                if self.read32(PX_IS) & PXIS_COMPLETION_BITS != 0 {
+                    completed = true;
+                    break;
+                }
+                core::hint::spin_loop();
             }
-            core::hint::spin_loop();
+        } else {
+            completed = self.read32(PX_IS) & PXIS_COMPLETION_BITS != 0;
         }
 
         // 无论是否观察到完成位，都必须等 PxCI 位落下：位仍置起意味着 HBA
@@ -1117,6 +1180,18 @@ const fn new_slot(name: &'static str, index: u8) -> AhciDevice {
 /// 已探测到的 SATA 控制器数（诊断/遥测用）。
 static AHCI_CONTROLLERS: Mutex<u32> = Mutex::new(0);
 
+/// 首个可用控制器的 HBA 寄存器虚拟基址（0 = 无）。
+///
+/// 由 `init_controller` 在成功初始化后写入；供中断完成路径与自检观测使用。
+static CONTROLLER_HBA_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 控制器的真实 PCI 中断线（配置空间 0x3C；0 = 未分配/无中断）。
+///
+/// **不再硬编码 0**：`register_device` 曾写死 `irq_line: 0`，而 PCI 枚举其实
+/// 已从 0x3C 读到真实值（QEMU `ich9-ahci` 实测为 11）。中断完成路径需要
+/// 这个值才能把端口事件与 `irq_owner` 的 IRQ 槽对应起来。
+static CONTROLLER_IRQ_LINE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 /// 探测并初始化 AHCI。找到可用盘时逐块登记到 DriverHub。
 ///
 /// 返回找到的盘数。**不注册任何伪造回退盘**——无控制器时如实返回 0，
@@ -1309,10 +1384,32 @@ fn init_controller(bus: u8, dev: u8, func: u8) -> Result<usize, Error> {
     }
     // HR 清除后须重新置 AE（复位会清掉它）。
     hba.write32(HBA_GHC, hba.read32(HBA_GHC) | GHC_AE);
-    info!(
-        "[ahci] post-reset: GHC={:#x} PI={:#x}",
-        hba.read32(HBA_GHC), hba.read32(HBA_PI)
+
+    // STORAGE-AHCI-6b：使能**全局中断**并使 HBA 定位可被中断路径复用。
+    //
+    // 规范（§3.1.3）：只有当 `GHC.IE` 与对应端口的 `PxIE` 位**同时**置起时，
+    // 端口事件才会汇聚到 HBA 的 `IS` 并经 PCI IRQ 投递；缺一即静默丢弃。
+    // 故两处都要使能——本处是全局闸门，端口级在 `init_port` 中置 `PxIE`。
+    //
+    // 保存 ABAR 与真实中断线：命令完成等待（`wait_command`）需据此把端口事件
+    // 与 `irq_owner` 的 IRQ 槽对应。中断线来自 PCI 配置空间 0x3C，**不是**假定值。
+    CONTROLLER_IRQ_LINE.store(
+        read_config_u8(bus, dev, func, 0x3C),
+        core::sync::atomic::Ordering::Relaxed,
     );
+    let irq_line = CONTROLLER_IRQ_LINE.load(core::sync::atomic::Ordering::Relaxed);
+    hba.write32(HBA_GHC, hba.read32(HBA_GHC) | GHC_IE);
+    let ghc_now = hba.read32(HBA_GHC);
+    info!(
+        "[ahci] post-reset: GHC={:#x} PI={:#x} GHC.IE={} irq_line={}",
+        ghc_now,
+        hba.read32(HBA_PI),
+        ghc_now & GHC_IE != 0,
+        irq_line
+    );
+
+    // 控制器已可用：记下 ABAR 供中断路径与自检观测（0 = 无）。
+    CONTROLLER_HBA_BASE.store(abar, core::sync::atomic::Ordering::Relaxed);
 
     let cap = hba.read32(HBA_CAP);
     let pi = hba.read32(HBA_PI);
@@ -1547,6 +1644,85 @@ fn register_device(dev: &'static AhciDevice) {
 // 改用**编入二进制的自检**：`run_builtin_asserts` 由启动自检调用，在真实
 // 硬件上执行，失败即 panic。这与本仓库 `arch_x86_64::mmio::test_map_phys_4k`
 // 等既有做法同源。
+
+
+/// 取第 `index` 块已登记的盘对应的设备槽（未探测到盘时为 None）。
+fn ahci_device(index: usize) -> Option<&'static AhciDevice> {
+    if index >= SLOT_COUNT {
+        return None;
+    }
+    // SAFETY：与 `AHCI_SLOTS` 的既有访问同源——槽只在启动期单线程写入，
+    // 此后 `port` 只读借用（见 SlotCell 的 SAFETY 注释）。
+    let dev = unsafe { &*AHCI_SLOTS[index].0.get() };
+    if dev.port.is_some() {
+        Some(dev)
+    } else {
+        None
+    }
+}
+// ===========================================================================
+// 中断驱动完成路径的观测接口（STORAGE-AHCI-6b 自检用）
+// ===========================================================================
+
+/// 中断驱动完成路径的状态快照（供自检断言，不参与生产逻辑）。
+pub struct InterruptStatus {
+    /// HBA 全局控制寄存器原值。
+    pub ghc: u32,
+    /// `GHC.IE` 是否使能（bit1）。
+    pub ghc_ie: bool,
+    /// 控制器的 PCI 中断线（来自配置空间 0x3C；0 = 未分配）。
+    pub irq_line: u8,
+    /// 控制器实现的端口数。
+    pub port_count: usize,
+    /// 其中**已使能命令完成中断**（`PxIE` 含完成位）的端口数。
+    pub ports_with_completion_ie: usize,
+}
+
+/// 采集中断完成路径状态；无控制器时返回 `None`（调用方据此如实 SKIP）。
+///
+/// 只读 MMIO，不改变任何状态（幂等，可重复调用）。
+pub fn interrupt_status() -> Option<InterruptStatus> {
+    let hba_base = CONTROLLER_HBA_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    if hba_base == 0 {
+        return None; // 无控制器：如实返回 None，调用方据此 SKIP
+    }
+    let r = HbaRegs { base: hba_base };
+    let ghc = r.read32(HBA_GHC);
+    let pi = r.read32(HBA_PI);
+    let mut port_count = 0usize;
+    let mut armed = 0usize;
+    for p in 0..MAX_PORTS {
+        if pi & (1u32 << p) == 0 {
+            continue;
+        }
+        port_count += 1;
+        // 端口寄存器块 = HBA 基址 + 0x100 + 0x80*p（与 `Port::reg` 同一算法）。
+        let pr = HbaRegs {
+            base: hba_base + PORT_BASE + PORT_STRIDE * (p as u64),
+        };
+        if pr.read32(PX_IE) & PXIE_COMPLETION_BITS != 0 {
+            armed += 1;
+        }
+    }
+    Some(InterruptStatus {
+        ghc,
+        ghc_ie: ghc & GHC_IE != 0,
+        irq_line: CONTROLLER_IRQ_LINE.load(core::sync::atomic::Ordering::Relaxed),
+        port_count,
+        ports_with_completion_ie: armed,
+    })
+}
+
+/// 容量探测的测试入口：对指定端口重新走一次 48 位二分，返回容量（扇区）。
+///
+/// 复用生产路径的探测实现，**不是**另写一份（S28：不得自造第二实现）；
+/// 仅用于在中断模式下确认「真实 I/O 仍能完成」。
+pub fn probe_capacity_for_test(index: usize) -> Option<u64> {
+    let dev = ahci_device(index)?;
+    // 与生产路径共用同一次探测实现（S28：不自造第二实现）。
+    let port = dev.port.as_ref()?;
+    probe_capacity(port).ok()
+}
 
 /// 编译进来的运行时自检：把「规范事实」在真实启动路径上再验证一遍。
 ///
