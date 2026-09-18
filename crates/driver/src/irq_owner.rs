@@ -123,6 +123,37 @@ pub fn set_irq_wake_callback(cb: fn(usize)) {
     IRQ_WAKE_CB.store(cb as usize, Ordering::Release);
 }
 
+/// 每 IRQ 的「设备侧应答」回调（内核态驱动注册）。
+///
+/// ## 为什么必须有它（实测根因）
+///
+/// PCI 中断是**电平触发**：设备拉高中断线后，必须由驱动**清除设备侧的中断
+/// 状态位**才会释放该线。若不清除，8259 会认为「还在服务」而**立即重新触发**，
+/// 表现为中断风暴并饿死其它工作——实测现象：使能 AHCI 中断后，`IRQ 11` 连续
+/// 到达，卷挂载阶段永久挂住（228 行 vs 正常的 960 行）。
+///
+/// 用户态驱动的路径不需要这个：它的「应答」发生在用户态服务例程里。内核态
+/// 驱动（AHCI）在中断上下文里没有用户态服务例程，故必须在此显式应答。
+///
+/// 回调在**中断上下文**执行，须无锁（与 `IRQ_WAKE_CB` 同款约束）。
+static IRQ_ACK_CB: [AtomicUsize; PIC_IRQ_COUNT] = {
+    const ZERO: AtomicUsize = AtomicUsize::new(0);
+    [ZERO; PIC_IRQ_COUNT]
+};
+
+/// 为某 IRQ 注册设备侧应答回调（内核态驱动用）。`None` = 注销。
+///
+/// 中断上下文安全：只写一个 usize 原子槽。
+pub fn set_irq_ack_callback(irq: u8, cb: Option<fn(u8)>) {
+    if irq as usize >= PIC_IRQ_COUNT {
+        return;
+    }
+    let v = match cb {
+        Some(f) => f as usize,
+        None => 0,
+    };
+    IRQ_ACK_CB[irq as usize].store(v, Ordering::Release);
+}
 /// arch 设备中断 handler（注册到 arch_x86_64::interrupts::register_irq）。
 ///
 /// 中断上下文执行，只做无锁读 + 定向唤醒：
@@ -133,14 +164,36 @@ extern "C" fn device_irq_handler(irq: u8) -> bool {
     if irq as usize >= PIC_IRQ_COUNT {
         return false;
     }
+    // **顺序至关重要，且是本函数最容易写错的地方（实测踩过）：**
+    //
+    //   1. 先置闩锁 `IRQ_PENDING` —— 这是「中断发生过」的**唯一持久证据**。
+    //   2. 再调设备应答 —— 应答会清除控制器的完成状态位（W1C）。
+    //
+    // 为什么不能反过来：典型的等待方是「先查状态、未完成才等中断」
+    // （`wait_command` 先读 `PxIS`，未完成再 `wait_bounded_irq`）。若先应答，
+    // `PxIS` 被清掉，等待方随后读 `PxIS` 看到的是「没完成」，**而此时闩锁
+    // 还没置**，于是它老老实实等满预算再超时——实测就表现为
+    // `ack_calls=209 latch_hits=0`：中断明明来了 209 次，等待方却一次都没等到。
+    //
+    // 反过来则安全：闩锁先置，等待方无论何时检查都能看到、并立即返回。
+    IRQ_PENDING[irq as usize].store(1, Ordering::Release);
+
+    // 设备侧应答（内核态驱动注册；用户态驱动为 None——它的应答在用户态服务例程）。
+    // 必须在**所有** IRQ 上尝试，包括无 pid 归属的内核态驱动（见 `claim_kernel_irq`）：
+    // 漏掉应答会让电平触发的中断线永不释放，8259 立即重投递——实测为中断风暴 +
+    // 卷挂载阶段挂死（228 行 vs 正常 ~1000 行）。
+    let ack = IRQ_ACK_CB[irq as usize].load(Ordering::Acquire);
+    if ack != 0 {
+        // 指针来自 set_irq_ack_callback 写入的合法 'static 函数地址。
+        let f: fn(u8) = unsafe { core::mem::transmute(ack) };
+        f(irq);
+    }
+
     let pid = IRQ_OWNER[irq as usize].load(Ordering::Acquire);
     if pid == NO_OWNER {
-        return false;
+        // 无 pid 归属：内核态驱动。闩锁已置（上方），它据此感知完成。
+        return ack != 0;
     }
-    // 置待服务闩锁（丢失边沿防线）：即使驱动此刻未阻塞等待，下次
-    // driver_irq_wait 也能立即发现该 IRQ 已触发。Release 保证此前对归属
-    // pid 的观察对等待方可见。
-    IRQ_PENDING[irq as usize].store(1, Ordering::Release);
     // 本 IRQ 触发归属驱动 = 该次 driver_irq_wait 等待已被满足：取消其阻塞段
     // 登记的超时定时器并清槽，杜绝定时器残留到下一次等待（复查 FINDING-1）。
     // 中断上下文安全（cancel_timeout 与 poll_timeouts 同持 IRQ-safe 锁）。

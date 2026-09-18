@@ -692,6 +692,9 @@ impl Port {
         if !completed {
             if irq_ok {
                 let got = crate::irq_owner::wait_bounded_irq(irq, IRQ_WAIT_SPINS);
+                if got {
+                    LATCH_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 if !got {
                     // **自适应退让（S32：不付无收益的成本）**：闩锁一次都没等到，
                     // 说明本环境不投递该 IRQ（实测根因：8259 掩码屏蔽了 IRQ11，
@@ -714,16 +717,29 @@ impl Port {
                 } else {
                     IRQ_WAIT_MISSES.store(0, core::sync::atomic::Ordering::Relaxed);
                 }
-                // 闩锁只作「该来看了」的通知；权威判据仍是 `PxIS`。
-                completed = self.read32(PX_IS) & PXIS_COMPLETION_BITS != 0;
+                // 闩锁命中即视为**完成**——这不是「该来看了」的提示，而是权威
+                // 判据之一。原因：中断 handler 会应答控制器（清 `PxIS`/`IS`，
+                // W1C），所以此处再读 `PxIS` 可能已被清成 0。
+                //
+                // 实测教训：曾写成「闩锁只是提示，仍以 PxIS 为准」，结果
+                // `ack_calls=209 latch_hits=0` —— 中断来了 209 次，每次应答
+                // 都把 `PxIS` 清掉，等待方读到的永远是「没完成」，于是白等满
+                // 预算。**闩锁是在应答之前置的**（见 device_irq_handler 的顺序
+                // 说明），因此它才是不可能被自己清掉的可靠证据。
+                completed = got || self.read32(PX_IS) & PXIS_COMPLETION_BITS != 0;
             }
             if !completed {
-                for _ in 0..WAIT_SPINS {
+                for i in 0..WAIT_SPINS {
                     if self.read32(PX_IS) & PXIS_COMPLETION_BITS != 0 {
+                        POLL_SPINS_BURNED.fetch_add(i as u64, core::sync::atomic::Ordering::Relaxed);
                         completed = true;
                         break;
                     }
                     core::hint::spin_loop();
+                }
+                if !completed {
+                    // 预算耗尽仍未观察到完成位：如实把整段预算计入（S10：不美化）。
+                    POLL_SPINS_BURNED.fetch_add(WAIT_SPINS as u64, core::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -1252,6 +1268,17 @@ static IRQ_WAIT_MISSES: core::sync::atomic::AtomicU32 = core::sync::atomic::Atom
 static IRQ_FALLBACK_WARNED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// TEMP-PROBE: ACK 回调调用次数与闩锁命中次数。
+pub static ACK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LATCH_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 累计应答开销（cycles，同口径相对值）。
+pub static ACK_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 已烧掉的自旋次数（有界轮询路径）。用于**证明**机制而非假设：
+/// 若中断路径为 0 而轮询路径接近预算，则「中断省掉了空转」是实测结论。
+pub static POLL_SPINS_BURNED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// 控制器的真实 PCI 中断线（配置空间 0x3C；0 = 未分配/无中断）。
 ///
 /// **不再硬编码 0**：`register_device` 曾写死 `irq_line: 0`，而 PCI 枚举其实
@@ -1469,6 +1496,18 @@ fn init_controller(bus: u8, dev: u8, func: u8) -> Result<usize, Error> {
     // 「中断路径反而慢 69 倍、闩锁命中率 0%」的真实根因（与 QEMU 无关，真机同样）。
     // 用 `claim_kernel_irq`（不占 pid 归属槽），与用户态驱动的 claim 互不冲突。
     if irq_line >= 3 {
+        // **先解屏蔽，再注册 handler**：8259 掩码是系统级闸门，屏蔽时中断
+        // 根本到不了 CPU（实测确认：控制器侧 `HBA IS=0x1` 已置位，但 CPU 侧
+        // 闩锁 0% 命中）。`unmask_irq` 对 IRQ>=8 会自动一并打开级联线 IRQ2。
+        let after = arch_x86_64::pic::unmask_irq(irq_line);
+        info!(
+            "[ahci] unmasked IRQ {} for SATA completion (PIC mask now {:#06x})",
+            irq_line, after
+        );
+        // 注册设备侧应答：电平触发的中断**必须**清除控制器状态位才释放中断线，
+        // 否则 8259 立即重投递（实测为中断风暴 + 挂载挂死）。在 claim 之前注册，
+        // 避免「handler 已注册但应答未就绪」的窗口内触发风暴。
+        crate::irq_owner::set_irq_ack_callback(irq_line, Some(ahci_irq_ack));
         match crate::irq_owner::claim_kernel_irq(irq_line) {
             Ok(()) => info!("[ahci] kernel IRQ handler registered on IRQ {}", irq_line),
             Err(e) => warn!(
@@ -1725,6 +1764,83 @@ fn register_device(dev: &'static AhciDevice) {
 // 等既有做法同源。
 
 
+/// AHCI 中断应答（中断上下文执行，**只做 MMIO 写，不取任何锁**）。
+///
+/// ## 为什么必须应答（实测根因）
+///
+/// PCI 中断是电平触发的：控制器置起 `PxIS.DHRS` 后拉高中断线。**只有写 1 到
+/// `PxIS` 对应位（W1C）才会清除该位、进而释放中断线**。不应答的后果实测为
+/// 中断风暴：`IRQ 11` 被 8259 反复重投递，卷挂载阶段永久挂死。
+///
+/// 必须同时清两处（§3.1.2 / §3.3.1.4）：
+///   - 端口 `PxIS`（W1C）：完成位来源；
+///   - HBA `IS`（W1C，offset 0x08）：端口状态的汇聚，它才是连到 PCI 中断线的
+///     那一位。只清 `PxIS` 而留 `IS` 置位，中断线仍不释放。
+///
+/// 安全性：只对已映射的 BAR5 窗口做 volatile 写；写 1 到 W1C 位是规范定义的
+/// 清除语义，对未置位的位写 1 无害（§3.1.2）。不读、不分配、不取锁，故在中断
+/// 上下文严格安全（S21）。
+fn ahci_irq_ack(_irq: u8) {
+    ACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // 采样累计应答开销（S32：优化前先量化）。rdtsc 在 QEMU TCG 下是「相对」
+    // 计数而非墙上时间，故只用于**同口径比较**（应答开销 vs 总线时间）。
+    let t0 = klib::time::read_cycle_counter();
+    let base = CONTROLLER_HBA_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    if base == 0 {
+        return; // 无控制器（不应发生：本回调只在探到控制器后注册）
+    }
+    let r = HbaRegs { base };
+    // 先清端口完成位（各端口独立），再清 HBA 汇聚位——顺序对应「源 → 汇聚」。
+    //
+    // **只遍历 PI 中实际存在的端口**：`MAX_PORTS`=32 是规范的硬上限，但真实
+    // 控制器（QEMU `ich9-ahci` 实测 NP=5，PI=0x3f，6 个端口）远小于它。遍历
+    // 32 个端口意味着**每次中断多做 26 次 MMIO 读**，而 TCG 下每次 MMIO 访问
+    // 都是较重的陷阱——实测每次应答的开销会被显著放大。按 PI 裁剪是纯粹的白赚，
+    // 且不改变语义（PI 之外的端口本来就不存在）。
+    let pi = r.read32(HBA_PI);
+    for p in 0..MAX_PORTS {
+        if pi & (1u32 << p) == 0 {
+            continue;
+        }
+        let pr = HbaRegs {
+            base: base + PORT_BASE + PORT_STRIDE * (p as u64),
+        };
+        let is = pr.read32(PX_IS);
+        if is & PXIS_COMPLETION_BITS != 0 {
+            pr.write32(PX_IS, is & PXIS_COMPLETION_BITS); // W1C：只清置起的完成位
+        }
+    }
+    // HBA IS：清全部已置位（W1C），确保中断线释放。
+    let hba_is = r.read32(HBA_IS);
+    if hba_is != 0 {
+        r.write32(HBA_IS, hba_is);
+    }
+    let dt = klib::time::read_cycle_counter().wrapping_sub(t0);
+    ACK_CYCLES.fetch_add(dt, core::sync::atomic::Ordering::Relaxed);
+}
+/// 重新使能中断优先完成路径（在系统级 `sti` / LAPIC 初始化**之后**调用）。
+///
+/// ## 为什么需要这个再使能点（实测根因）
+///
+/// AHCI 的 `late_storage_init()` 在 `kmain` 中被调用时，**CPU 中断尚未开启**
+/// （`sti` 在更晚的 `InterruptController::enable()`）。那段窗口内的容量探测等
+/// I/O 必然等不到中断，于是自适应退让把中断路径**永久关掉**了——即使此后
+/// `sti` 打开、中断完全可用，驱动也不会再尝试。
+///
+/// 实测证据：中断开启后 IRQ 11 **确实到达**（探针记录到连续投递），但驱动
+/// 因早期退让而停留在轮询模式，`test-ahci6d` 仍报「not delivered」。
+///
+/// 故提供本函数：清除退让状态、重新开启中断优先，让中断路径在真正可用的
+/// 阶段重新生效。幂等，可安全重复调用。
+pub fn rearm_interrupt_completion() {
+    if CONTROLLER_HBA_BASE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return; // 无控制器：无需再使能
+    }
+    IRQ_WAIT_MISSES.store(0, core::sync::atomic::Ordering::Relaxed);
+    IRQ_FALLBACK_WARNED.store(false, core::sync::atomic::Ordering::Relaxed);
+    IRQ_COMPLETION_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
+    info!("[ahci] interrupt-first completion re-armed (interrupts now enabled)");
+}
 /// 取第 `index` 块已登记的盘对应的设备槽（未探测到盘时为 None）。
 fn ahci_device(index: usize) -> Option<&'static AhciDevice> {
     if index >= SLOT_COUNT {

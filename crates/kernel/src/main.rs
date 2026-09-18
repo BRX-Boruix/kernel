@@ -353,6 +353,10 @@ unsafe fn kmain_body() -> ! {
     info!("[kmain] enabling interrupts (LAPIC timer ~100Hz)");
     arch_x86_64::lapic::init();
     <arch_x86_64::interrupt::X86InterruptController as InterruptController>::enable();
+    // 中断现已开启：重新武装 AHCI 的中断完成路径。`late_storage_init` 跑在
+    // `sti` **之前**，那段窗口内等不到中断会触发自适应退让；此处让中断优先
+    // 在真正可用的阶段重新生效（幂等；无控制器时为空操作）。
+    driver::drivers::ahci::rearm_interrupt_completion();
 
     // 短暂等待验证时钟中断确实触发
     #[cfg(feature = "kernel-tests")]
@@ -843,9 +847,11 @@ unsafe fn kmain_body() -> ! {
     // AD2：原 `ioapic::init` 改名 `imcr::switch_to_pic_mode`——该调用从不
     // 编程 I/O APIC，真实职责只有 IMCR 切换。
     arch_x86_64::imcr::switch_to_pic_mode();
-    // IMCR 切到 PIC 模式会让 QEMU 重置 8259 掩码，须在切换后重新解屏蔽键盘
-    // IRQ1（其余保持屏蔽：IRQ0 timer 由 LAPIC 接管）。否则键盘中断被 8259 屏蔽。
-    // KD4：掩码位型常量化——8259 掩码寄存器按位取"1=屏蔽"，仅清 IRQ1 位。
+    // 注意：**IRQ2 级联位不在此解屏蔽**。AHCI 的 SATA 中断线（实测 IRQ11）
+    // 在从片上，需要 IRQ2 级联，但「是否需要 + 具体哪条线」要等 PCI 枚举读到
+    // 控制器的 0x3C 才知道，故由 AHCI 驱动在 `late_storage_init` 中按实测值
+    // 解屏蔽（见 `arch_x86_64::pic::unmask_irq` 与 ahci.rs 的调用点）。
+    // 此处只保证键盘可用。
     const PIC_MASK_ALL_EXCEPT_IRQ1: u16 = !(1u16 << 1);
     arch_x86_64::pic::set_mask(PIC_MASK_ALL_EXCEPT_IRQ1);
     arch_x86_64::keyboard::init();

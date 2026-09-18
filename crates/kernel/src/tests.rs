@@ -9244,12 +9244,15 @@ pub fn test_storage_ahci6d_irq_vs_polling_benchmark() {
 
     let mut irq_total: u64 = 0;
     let mut poll_total: u64 = 0;
+    let mut irq_spins: u64 = 0;
+    let mut poll_spins: u64 = 0;
 
     // A/B 交替：每轮先关中断测轮询，再开中断测中断路径，抵消时间漂移。
     for r in 0..ROUNDS {
         for (enable_irq, slot) in [(false, &mut poll_total), (true, &mut irq_total)] {
             driver::drivers::ahci::IRQ_COMPLETION_ENABLED
                 .store(enable_irq, core::sync::atomic::Ordering::Relaxed);
+            let s0 = driver::drivers::ahci::POLL_SPINS_BURNED.load(core::sync::atomic::Ordering::Relaxed);
             let t0 = klib::time::read_cycle_counter();
             for _ in 0..N {
                 lba = (lba.wrapping_add(golden)) % sectors;
@@ -9257,9 +9260,17 @@ pub fn test_storage_ahci6d_irq_vs_polling_benchmark() {
                 assert_eq!(n, 512, "read must succeed (LBA {})", lba);
             }
             let dt = klib::time::read_cycle_counter().wrapping_sub(t0);
+            let spins = driver::drivers::ahci::POLL_SPINS_BURNED
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .wrapping_sub(s0);
             // 只累加后两轮（第 1 轮含开关切换后的冷效应）。
             if r > 0 {
                 *slot += dt;
+                if enable_irq {
+                    irq_spins += spins;
+                } else {
+                    poll_spins += spins;
+                }
             }
         }
     }
@@ -9271,18 +9282,22 @@ pub fn test_storage_ahci6d_irq_vs_polling_benchmark() {
     let irq_per = irq_total / denom;
     let poll_per = poll_total / denom;
 
-    // ---- 先判定「本次对比是否有效」----
-    // 实测根因（见 docs STORAGE-AHCI-6d）：控制器**确实**拉起了中断
-    // （`HBA IS=0x1`，端口 0 位），但系统级把 8259 掩码设为
-    // `PIC_MASK_ALL_EXCEPT_IRQ1`（main.rs:849），**IRQ 11 被屏蔽**，
-    // 中断永远到不了 CPU。故中断路径在本环境只能退化为「等满预算再轮询」，
-    // 与纯轮询的对比**不反映中断的真实能力**——如实说明，不给误导性的倍率。
-    let irq_deliverable = st.is & 1 != 0 && irq_per < poll_per * 4;
+    // ---- 先判定「本次对比是否有效」：用**实测证据**，不用启发式 ----
+    //
+    // 判据必须是「中断真的被投递并被等待方观察到」。唯一可信的证据是
+    // **闩锁命中计数**（`latch_hits`）——它直接说明中断到达并置了闩锁。
+    //
+    // 不用 `HBA IS` 位做判据：应答（W1C）会把它清掉，事后读到 0 并不能说明
+    // 「没投递」（实测踩过：中断正常工作时 `IS` 反而读到 0）。也不再用
+    // 「时间倍率」当启发式——那是把结论当前提。
+    let latch_hits = driver::drivers::ahci::LATCH_HITS.load(core::sync::atomic::Ordering::Relaxed);
+    let ack_calls = driver::drivers::ahci::ACK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let irq_deliverable = latch_hits > 0;
     if !irq_deliverable {
         info!(
-            "[test-ahci6d] INCONCLUSIVE for interrupt-vs-polling: the SATA IRQ is not \
-             delivered in this environment (PIC masks all but IRQ1); controller did raise it. \
-             Numbers below measure only the fallback path, NOT interrupt capability."
+            "[test-ahci6d] INCONCLUSIVE: no interrupt was ever observed (latch_hits=0, \
+             ack_calls={}); the numbers below measure only the bounded-polling fallback.",
+            ack_calls
         );
     }
 
@@ -9312,21 +9327,26 @@ pub fn test_storage_ahci6d_irq_vs_polling_benchmark() {
         driver::drivers::ahci::IRQ_COMPLETION_ENABLED.load(core::sync::atomic::Ordering::Relaxed),
         "benchmark must restore the production default (interrupt enabled)"
     );
-    // ---- 诊断：控制器侧是否真的拉起了中断？（区分「控制器没发」与「CPU 没收到」）----
-    if let Some(st2) = driver::drivers::ahci::interrupt_status() {
-        info!(
-            "[test-ahci6d] HBA IS={:#010x} (port0 bit={}) -- controller-side interrupt evidence",
-            st2.is,
-            st2.is & 1 != 0
-        );
-    }
+    let ack_cycles = driver::drivers::ahci::ACK_CYCLES.load(core::sync::atomic::Ordering::Relaxed);
     info!(
-        "[test-ahci6d] PASS (same-boot A/B; cycles are TCG-relative, not wall time)"
+        "[test-ahci6d] evidence: latch_hits={} ack_calls={} irq_path_enabled={}",
+        latch_hits,
+        ack_calls,
+        driver::drivers::ahci::IRQ_COMPLETION_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
     );
     info!(
-        "[test-ahci6d] NOTE: the SATA IRQ is masked at the 8259 (main.rs:849 masks all \
-         but IRQ1), so the interrupt path cannot be evaluated here; the controller \
-         itself does raise it (HBA IS bit0). See docs STORAGE-AHCI-6d."
+        "[test-ahci6d] spin evidence: polling burned {} spins, interrupt burned {}",
+        poll_spins,
+        irq_spins
+    );
+    info!(
+        "[test-ahci6d] ack overhead: {} cycles total over {} acks ({} per ack, same-basis)",
+        ack_cycles,
+        ack_calls,
+        if ack_calls > 0 { ack_cycles / ack_calls } else { 0 }
+    );
+    info!(
+        "[test-ahci6d] PASS (same-boot A/B; cycles are TCG-relative, not wall time)"
     );
 }
 /// S4 回归：跨核唤醒必须**无条件**向目标核投递重调度 IPI。
