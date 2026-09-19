@@ -793,14 +793,24 @@ global_asm!(
         //
         // 栈上 5 个槽（由低到高）：RIP, CS, RFLAGS, RSP, SS。
         //
-        // **顺序陷阱（首版在此出错）**：`pop rsp` 一旦执行，RSP 就变成**用户栈指针**，
-        // 之后再 `add rsp, 8` 加的是**用户栈**，而不是帧指针——SS 槽永远消费不到，
-        // 用户的 RSP 还会多偏 8 字节。故必须**先跳过 SS 槽，最后才 pop rsp**。
+        // **槽位消费精确表（FAST-4c 实测修正，见下）**：此处栈上由低到高为
+        //   [RIP, CS, RFLAGS, RSP, SS]。
+        // 正确消费：pop rcx 取 RIP → add rsp,8 丢 CS → pop r11 取 RFLAGS →
+        // **pop rsp 直接取用户 RSP**。SS 槽位于最高处，`pop rsp` 切到用户栈后
+        // 该槽自然废弃，**绝不需要第二条 add rsp,8**。
+        //
+        // **实测踩坑（_fast4ab5 TEMP-dispatch 证实）**：首版（以及此前的「修复版」）
+        // 在 pop r11 之后又 `add rsp,8` 注释称「丢弃 SS」——实际跳过的是**用户 RSP
+        // 槽**，随后 `pop rsp` 装进的是 **SS 槽的值 0x30**。用户程序拿到 rsp=0x30
+        // 后不带栈地继续跑（write/yield 全是展开代码，不碰栈），一切「正常」；
+        // 直到首个用寄存器做循环计数的 bench（dec r8 + jnz）才暴露：RIP 每轮
+        // 倒回 mov r8 处（rcx 恒 0x195）、r8 恒 8，死循环。教训：**无栈访问的
+        // 测试程序测不出返回栈损坏**；验收程序必须包含使用循环计数寄存器与
+        // 内存写屏障的循环。
         pop rcx                    // RIP  -> rcx（sysretq 要求）
         add rsp, 8                 // 丢弃 CS
         pop r11                    // RFLAGS -> r11（sysretq 要求）
-        add rsp, 8                 // 丢弃 SS（**必须在 pop rsp 之前**）
-        pop rsp                    // 用户 RSP（最后一步，此后不再依赖帧指针）
+        pop rsp                    // 用户 RSP（直接取；SS 槽自然废弃）
 
         // ---- 阶段 8：换回 GS 并快速返回 ----
         // 与阶段 1 的 `swapgs` 配对：恢复「用户 GS 值 / per-CPU 在 KERNEL_GS_BASE」。

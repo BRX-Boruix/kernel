@@ -9028,15 +9028,18 @@ pub fn test_syscall_fast4_userspace_syscall_e2e() {
     let code = fast4_user_code();
     info!("[test-fast4] built {} bytes of user code using the `syscall` instruction", code.len());
 
-    // 自检：机器码里必须**不含** `int 0x80`（否则测的还是老路径）。
-    let has_int80 = code.windows(2).any(|w| w == [0xCD, 0x80]);
+    // 自检：机器码必须含 `syscall`。**注意不再断言「不含 int 0x80」**：
+    // 双入口功能 A/B 段（下方收尾前）刻意走一次 `int 0x80` 兜底路径，
+    // 故 0xCD 0x80 会合法出现。快速路径本体仍只用 `syscall`——首个 bench
+    // 循环与全部 write/yield 均为 0F 05。
     let has_syscall = code.windows(2).any(|w| w == [0x0F, 0x05]);
+    // 双入口 A/B 段会合法引入 0xCD 0x80（兜底路径实测），只报告不断言。
+    let has_int80 = code.windows(2).any(|w| w == [0xCD, 0x80]);
+    assert!(has_syscall, "the test program must use the syscall instruction");
     info!(
-        "[test-fast4] code scan: contains int 0x80 = {} contains syscall = {}",
+        "[test-fast4] code scan: contains int 0x80 = {} contains syscall = {} (int80 legal in the A/B tail only)",
         has_int80, has_syscall
     );
-    assert!(!has_int80, "the test program must NOT use int 0x80 (that is the fallback)");
-    assert!(has_syscall, "the test program must use the syscall instruction");
 
     let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
 
@@ -9108,7 +9111,7 @@ const FAST4_MSG_ADDR: u64 = 0x0000_0000_9500_0000;
 ///
 /// 实测所需：每轮 81 字节 × 4 轮 = 324，加收尾 32 字节，共 358。取 512 留余量。
 /// 首版误用 128 导致越界停机——`guard!` 宏现会在构造期以可读信息失败。
-const FAST4_CODE_CAP: usize = 512;
+const FAST4_CODE_CAP: usize = 1024;
 
 /// 生成 FAST-4 的机器码用户程序：**只用 `syscall` 指令**。
 ///
@@ -9202,6 +9205,46 @@ fn fast4_user_code() -> [u8; FAST4_CODE_CAP] {
     // 但 `scheduler::start()` 只有取不到就绪进程时才会返回主流程（打印版本横幅，
     // 即运行脚本的完成标记）。一个永不退出的进程让横幅永远打不出来，
     // 整个内核就永远「跑不完」。exit(0) 后调度器自然收尸并回到主流程。
+    // ---- 双入口功能 A/B（SYSCALL-FAST-4 验收项「两条路径行为一致」）----
+    //
+    // 各跑 8 轮 `getpid`(0x39)：第一轮走 `syscall`(0F 05)，第二轮走 `int 0x80`
+    // (CD 80)。结果核对：最后一轮的返回值（=本进程 pid，非 0）必须非零，否则
+    // 计入失败 r9。**计时说明（S30 如实）**：用户态无可用时钟 ABI（内核未提供
+    // 用户可读的单调时钟 syscall），单次调用 ns 级开销在本 todo 范围内不可测，
+    // 已在 perf-shortboards.md 中预声明为后续项；此处验证的是「两条路径都
+    // 真实工作且语义一致」，不是性能数字。
+    // 第一轮：syscall 路径（a1=0x11 作日志指纹）
+    emit!(0x48, 0xC7, 0xC7, 0x11, 0, 0, 0); // mov rdi, 0x11 (imm32 sign-ext)
+    emit!(0x49, 0xC7, 0xC0, 8, 0, 0, 0); // mov r8, 8
+    // loop_a:
+    emit!(0x48, 0xB8);
+    c[i..i + 8].copy_from_slice(&0x39u64.to_le_bytes()); // rax = SYS_TASK_GETPID
+    i += 8;
+    emit!(0x0F, 0x05);                   // syscall
+    // **字节级陷阱（实测踩中两次）**：FF /1 的 ModRM 是 mod=11,reg=/1(操作码
+    // 扩展),rm=操作数。DEC r8 必须 REX.B=1（49 FF C8）；写 48 FF C8 会变成
+    // **DEC RAX**（rm=000）——rax 每轮被减但立刻被 getpid 覆盖，r8 恒 8，
+    // 死循环。与上文 inc r9 = 49 FF C1 的 REX.B 道理相同。
+    emit!(0x49, 0xFF, 0xC8);             // dec r8（REX.B=1，rm=000 -> r8）
+    emit!(0x75, 0xEF);                   // jnz loop_a (-17：回 mov rax 处)
+    // 返回值核对：pid 非零（rax 仍持有最后一轮 getpid 的返回值）
+    emit!(0x48, 0x85, 0xC0);             // test rax, rax
+    emit!(0x75, 0x03);                   // jnz +3
+    emit!(0x49, 0xFF, 0xC1);             // inc r9
+    // 第二轮：int 0x80 兜底路径（a1=0x22 作日志指纹）
+    emit!(0x48, 0xC7, 0xC7, 0x22, 0, 0, 0); // mov rdi, 0x22
+    emit!(0x49, 0xC7, 0xC0, 8, 0, 0, 0); // mov r8, 8
+    // loop_b:
+    emit!(0x48, 0xB8);
+    c[i..i + 8].copy_from_slice(&0x39u64.to_le_bytes());
+    i += 8;
+    emit!(0xCD, 0x80);                   // int 0x80
+    emit!(0x49, 0xFF, 0xC8);             // dec r8（同上：REX.B=1）
+    emit!(0x75, 0xEF);                   // jnz loop_b (-17：回 mov rax 处)
+    emit!(0x48, 0x85, 0xC0);             // test rax, rax
+    emit!(0x75, 0x03);                   // jnz +3
+    emit!(0x49, 0xFF, 0xC1);             // inc r9
+
     emit!(0x48, 0xB8);
     c[i..i + 8].copy_from_slice(&0x34u64.to_le_bytes()); // SYS_TASK_EXIT = 0x34
     i += 8;
