@@ -2187,16 +2187,35 @@ pub fn test_cow_derive_bench() {
     let small_pages = 64u64;
     let large_pages = 256u64;
 
+    // **取 N 次中的最小值**（best-of-N），而非单次测量。
+    //
+    // 为什么必须这样（实测教训）：本档位曾出现 small=15_309_915 / large=2_268_860，
+    // 即「页少的反而慢 6.7 倍」——F2 单调性断言因此触发内核 panic。但这不是
+    // clone_cow 不平摊，而是**单次采样被一次卡顿污染**：测量窗口内任何一个
+    // 中断、页表页分配或调度点，都会把那一档抬到噪声量级（QEMU TCG 下尤甚）。
+    // 计时类断言必须对离群点免疫，否则「测出来的」波动会被当成被测代码的
+    // 性质——这正是 F2 想防的伪结论，只是它自己先被同类噪声骗了。
+    //
+    // 取最小值是标准做法：最小值 = 最干净的观测（最少被打断的那次），
+    // 且随采样次数增加**单调不增**，天然收敛到真实成本；平均值则会被离群点
+    // 拖高且需要更多样本来稳定。
+    const SAMPLES: usize = 5;
     let mut measure = |pages: u64| -> (u64, u64, u64) {
         let us = build_space(pages);
         let size = pages * 0x1000;
         let n = mapped_pages(&us, BASE, size);
-        let t0 = read_cycle_counter();
-        let child = us.clone_cow().expect("clone_cow must succeed");
-        let dt = read_cycle_counter().wrapping_sub(t0);
-        // S18：立即回收子空间，避免累加占用物理内存影响后续档位。
-        drop(child);
-        (dt, n, dt / n.max(1))
+        let mut best = u64::MAX;
+        for _ in 0..SAMPLES {
+            let t0 = read_cycle_counter();
+            let child = us.clone_cow().expect("clone_cow must succeed");
+            let dt = read_cycle_counter().wrapping_sub(t0);
+            if dt < best {
+                best = dt;
+            }
+            // S18：立即回收子空间，避免累加占用物理内存影响后续档位。
+            drop(child);
+        }
+        (best, n, best / n.max(1))
     };
 
     // 预热一次（首次调用含冷路径：页表页分配等），不计入测量。
