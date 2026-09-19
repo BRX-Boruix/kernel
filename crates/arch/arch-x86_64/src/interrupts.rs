@@ -868,6 +868,13 @@ pub const VECTOR_PAGE_FAULT: u64 = 14;
 /// IST 切换）。打印时附带内核栈溢出提示。
 pub const VECTOR_DOUBLE_FAULT: u64 = 8;
 
+/// x86-64 异常向量号（SDM Vol.3 §6.3.1）：通用保护故障（#GP，有错误码）。
+///
+/// 与 #PF 的关键差别：#GP **没有 CR2**，出错地址不会由硬件记录。定位只能靠
+/// 「出错 rip + 当时寄存器值」，故分发路径对本向量额外转储全部通用寄存器
+/// （见致命路径的寄存器转储段）。
+pub const VECTOR_GENERAL_PROTECTION: u64 = 13;
+
 /// IPI 到达回调（MA1b）：目标 CPU 在中断上下文执行（中断门，IF 已关）。
 /// 回调须短小、不睡眠、只触碰本 CPU 私有数据。
 pub type IpiHandler = fn();
@@ -1144,6 +1151,42 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             // Double Fault：打印错误码（0 表示外部中断/软件引起的 DF）
             raw_serial_fmt(format_args!("  error:  {:#x}\n", frame.error_code));
             raw_serial_fmt(format_args!("  (Double Fault - possible kernel stack overflow)\n"));
+        }
+        // GPF 的定位依赖**完整寄存器现场**，故单独转储（本节为此存在）。
+        //
+        // 为何 GPF 特别需要它：#PF 有 CR2 直接指出出错地址，GPF 没有——出错信息
+        // 只存在于「哪条指令 + 当时寄存器值」里。而 GPF 在内核态最常见的两个成因
+        // 都表现为「寄存器里是一个非规范地址」（bit 47..63 未按要求符号扩展）或
+        // 「段/对齐违规」，两者都只能从寄存器里读出来。只打印 rip 会让定位停在
+        // 「知道在哪条指令、不知道它在算什么」，这是本轮实测踩到的实际困难。
+        //
+        // 转储成本只发生在本就致命的路径上（随后 halt_forever），且走裸串口
+        // （不经 console sink/锁/堆，理由同上方 AM7），故不引入新的失败模式。
+        if vector == VECTOR_GENERAL_PROTECTION {
+            // 帧里的 ss/cs/vector 与 GPR 同等重要：本向量的错误码**就是段选择子**
+            // （GDT 索引 <<3 | TI | 外部事件位），要判「哪个选择子非法」必须同时
+            // 看到 ss/cs 当前值；vector 则回答「是哪条进入路径进来的」。
+            raw_serial_fmt(format_args!("  ss:     {:#x}\n", frame.ss));
+            raw_serial_fmt(format_args!("  rsp:    {:#x}\n", frame.rsp));
+            raw_serial_fmt(format_args!("  cs:     {:#x}\n", frame.cs));
+            raw_serial_fmt(format_args!("  rflags: {:#x}\n", frame.rflags));
+            raw_serial_fmt(format_args!("  error:  {:#x}\n", frame.error_code));
+            raw_serial_fmt(format_args!("  vector: {:#x} ({})\n", frame.vector, exception_name(frame.vector as u8)));
+            raw_serial_fmt(format_args!("  rax:    {:#x}\n", frame.rax));
+            raw_serial_fmt(format_args!("  rbx:    {:#x}\n", frame.rbx));
+            raw_serial_fmt(format_args!("  rcx:    {:#x}\n", frame.rcx));
+            raw_serial_fmt(format_args!("  rdx:    {:#x}\n", frame.rdx));
+            raw_serial_fmt(format_args!("  rsi:    {:#x}\n", frame.rsi));
+            raw_serial_fmt(format_args!("  rdi:    {:#x}\n", frame.rdi));
+            raw_serial_fmt(format_args!("  rbp:    {:#x}\n", frame.rbp));
+            raw_serial_fmt(format_args!("  r8:     {:#x}\n", frame.r8));
+            raw_serial_fmt(format_args!("  r9:     {:#x}\n", frame.r9));
+            raw_serial_fmt(format_args!("  r10:    {:#x}\n", frame.r10));
+            raw_serial_fmt(format_args!("  r11:    {:#x}\n", frame.r11));
+            raw_serial_fmt(format_args!("  r12:    {:#x}\n", frame.r12));
+            raw_serial_fmt(format_args!("  r13:    {:#x}\n", frame.r13));
+            raw_serial_fmt(format_args!("  r14:    {:#x}\n", frame.r14));
+            raw_serial_fmt(format_args!("  r15:    {:#x}\n", frame.r15));
         }
         raw_serial_fmt(format_args!("==================================\n"));
         crate::halt_forever();
