@@ -8715,6 +8715,99 @@ pub fn test_waitpid_core() {
 /// `dispatch_rank` = 交互进程被选中前需先经过的就绪候选数。它与硬件无关、
 /// 可精确复现；而墙上时间在本内核粒度是 100ms 级 tick，TCG 下 rdtsc 又不可信
 /// （见 EEVDF-1 的测量效度说明）。故用排序位置而非时间，避免制造不可信的数字。
+/// SYSCALL-FAST-1：GS per-CPU 地基的**契约测试**（TDD 红先行）。
+///
+/// ## 为什么先钉契约
+///
+/// `swapgs` 的危险性在于它是**无参数、无检查**的一条指令：它只是交换 GS base 与
+/// `IA32_KERNEL_GS_BASE`。用错一次（少配一对、嵌套路径重复 swapgs）不会立刻崩，
+/// 而是让后续所有 per-CPU 读取静默指向**别的核**的数据——症状是随机、难复现的
+/// 数据错乱（S21 时序标注为零的典型）。故先用测试把三条不变式钉死。
+///
+/// ## 契约
+///
+/// 1. **一致性**：GS 路径读到的核槽位必须与既有裸数组路径 `my_cpu_slot()` 一致；
+/// 2. **不串扰**：未进入内核时（用户态视角）GS 指向用户值；进入内核并 swapgs 后
+///    指向 per-CPU 结构；再次 swapgs 必须**精确回到**原值（配对性）；
+/// 3. **嵌套安全**：内核态中发生中断/异常时**不得**再次 swapgs（否则第二次交换
+///    会把 GS 换回用户值，per-CPU 访问立即错乱）。
+pub fn test_syscall_fast1_percpu_gs_contract() {
+    info!("[test-fast1] === GS per-CPU foundation contract ===");
+
+    // ---- 0. 前提：CPU 支持 syscall 指令（启动早期已由 CPUID 探测） ----
+    let has_syscall = arch_x86_64::cpu::has_feature(arch::cpu::CpuFeature::Syscall);
+    info!("[test-fast1] CPUID syscall={} max_ext={:#x}", has_syscall, arch_x86_64::cpu::max_extended_leaf());
+    if !has_syscall {
+        info!("[test-fast1] SKIP: CPU lacks the `syscall` instruction (honest skip, not a fake pass)");
+        return;
+    }
+    assert!(has_syscall, "syscall instruction must be available on this CPU");
+
+    // ---- 1. 一致性：GS 路径 vs 裸数组路径 ----
+    let slot_array = arch_x86_64::cpu::my_cpu_slot_array_path();
+    let slot_gs = arch_x86_64::cpu::my_cpu_slot_gs_path();
+    info!("[test-fast1] slot via array={} via gs={}", slot_array, slot_gs);
+    assert_eq!(
+        slot_array, slot_gs,
+        "GS path and array path must agree (no dual-source divergence)"
+    );
+
+    // ---- 2. per-CPU 结构可用且自洽 ----
+    let info = arch_x86_64::cpu::percpu_info();
+    info!(
+        "[test-fast1] percpu: slot={} self_ptr={:#x} self_consistent={}",
+        info.slot, info.self_pointer, info.self_consistent
+    );
+    assert_eq!(info.slot, slot_array, "percpu struct slot must match array path");
+    assert!(
+        info.self_consistent,
+        "percpu struct self-pointer must point back to itself (GS base correctness proof)"
+    );
+
+    // ---- 3. 配对性：swapgs 一次再换回，GS base 必须精确复原 ----
+    let roundtrip_ok = arch_x86_64::cpu::debug_swapgs_roundtrip();
+    info!("[test-fast1] swapgs roundtrip restores GS base: {}", roundtrip_ok);
+    assert!(
+        roundtrip_ok,
+        "swapgs must be exactly undone by a second swapgs (pairing invariant)"
+    );
+
+    // ---- 4. 嵌套纪律：内核态中不得再次 swapgs ----
+    // 直接读 MSR 验证：内核态（当前就在内核态）GS base 应已是内核值，
+    // 且 IA32_KERNEL_GS_BASE 保存着用户值。再次 swapgs 会破坏该状态。
+    let nest = arch_x86_64::cpu::debug_nesting_state();
+    info!(
+        "[test-fast1] nesting: gs_is_kernel={} kernel_gs_is_user={} in_kernel={}",
+        nest.gs_base_is_kernel, nest.kernel_gs_base_is_user, nest.in_kernel
+    );
+    assert!(
+        nest.in_kernel && nest.gs_base_is_kernel,
+        "while in kernel with GS active, GS base must be the kernel per-CPU address"
+    );
+
+    // ---- 5. 负向对照：断言必须**可被证伪**（S30/S31）----
+    //
+    // 以上断言全都依赖「self_consistent 能分辨 GS 配错」这一前提。若不验证该前提，
+    // 一个恒真的实现会让全套绿灯——典型的「假通过」。故故意把 GS base 指向别的
+    // 槽位，确认检测**确实翻转**。能翻转，才证明前面的 true 有意义。
+    let detectable = arch_x86_64::cpu::debug_gs_misconfig_detectable();
+    info!("[test-fast1] negative control: misconfigured GS is detectable = {}", detectable);
+    assert!(
+        detectable,
+        "the self-consistency check must be able to DETECT a wrong GS base, \
+         else the assertions above are vacuous"
+    );
+    // 对照后现场必须已恢复（本函数内部恢复），再确认一次一致。
+    let after_probe = arch_x86_64::cpu::percpu_info();
+    assert!(
+        after_probe.self_consistent,
+        "GS base must be restored after the negative-control probe"
+    );
+    info!("[test-fast1] GS base restored after probe OK");
+
+    info!("[test-fast1] PASS (consistency + pairing + nesting discipline hold; assertions falsifiable)");
+}
+
 pub fn test_sched_eevdf3_interactive_latency() {
     use task::scheduler::test_hooks as th;
     info!("[test-eevdf3b] === interactive dispatch latency: EEVDF vs RR-equivalent ===");

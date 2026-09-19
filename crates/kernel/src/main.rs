@@ -358,6 +358,32 @@ unsafe fn kmain_body() -> ! {
     // 在真正可用的阶段重新生效（幂等；无控制器时为空操作）。
     driver::drivers::ahci::rearm_interrupt_completion();
 
+    // SYSCALL-FAST-1：建立 GS per-CPU 地基。
+    //
+    // **必须在 `lapic::init()` 之后**：槽位来源 `my_cpu_slot()` 依赖 LAPIC 已映射
+    // （未映射时恒回退 BSP 槽，会把 AP 错认成 0 号核）。
+    //
+    // 此刻只建立**地基**（GS base + per-CPU 结构），**不改变**任何既有 per-CPU
+    // 访问路径——`my_cpu_slot()` 的裸数组路径原样保留，两条路径由 FAST-1 的
+    // 对拍测试验证一致。真正切换到 GS 路径在 FAST-2/4 完成帧与 ABI 之后。
+    {
+        let slot = arch_x86_64::cpu::my_cpu_slot_array_path();
+        // 本核内核栈顶：取当前 RSP 所在栈的基址（`syscall` 入口将切到此栈）。
+        let kstack_top = arch_x86_64::cpu::current_kernel_stack_top();
+        let ok = arch_x86_64::percpu::init_current(slot, kstack_top);
+        if ok {
+            info!(
+                "[percpu] GS foundation enabled on slot {} (gs_base={:#x}, kstack_top={:#x})",
+                slot,
+                arch_x86_64::percpu::read_gs_base(),
+                kstack_top
+            );
+        } else {
+            // S09：不伪装成功——地基未建立时如实上报，后续 FAST-2/4 依赖它。
+            warn!("[percpu] GS foundation NOT enabled (slot {} out of range)", slot);
+        }
+    }
+
     // 短暂等待验证时钟中断确实触发
     #[cfg(feature = "kernel-tests")]
     tests::test_timer();
@@ -489,6 +515,9 @@ unsafe fn kmain_body() -> ! {
     tests::test_sched_eevdf3_nice_weights();
     tests::test_sched_eevdf3_nice_affects_scheduling();
     tests::test_sched_eevdf3_interactive_latency();
+
+    // SYSCALL-FAST-1：GS per-CPU 地基（一致性 / 配对性 / 嵌套纪律）。
+    tests::test_syscall_fast1_percpu_gs_contract();
 
     // M4.3 静态 ELF 加载验收：解析并加载 ELF 镜像到用户空间，spawn 运行
     // （停机验收，不返回主流程），单独 gate。

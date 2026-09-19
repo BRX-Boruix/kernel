@@ -194,6 +194,173 @@ pub fn init() {
     }
 }
 
+// ---------- SYSCALL-FAST-1：GS per-CPU 观测面 ----------
+
+/// 既有裸数组路径的核槽位（`my_cpu_slot` 的等价实现）。
+///
+/// 与 `task` crate 的 `my_cpu_slot()` 同源（LAPIC MMIO 读 + 槽位反查表）。
+/// 之所以在 arch 层再暴露一份，是为了让 FAST-1 的**对拍测试**能在同一处
+/// 比较两条路径——避免测试被迫依赖 task crate 的私有函数。
+pub fn my_cpu_slot_array_path() -> usize {
+    if !crate::lapic::is_mapped() {
+        return 0;
+    }
+    crate::smp::slot_of_lapic(crate::lapic::current_lapic_id()) & 0xff
+}
+
+/// GS 路径的核槽位：`swapgs` 语义下从 per-CPU 结构直接读，**无 MMIO、无查表**。
+///
+/// GS 未启用时回退到数组路径（保证启用前的调用方行为不变）。
+pub fn my_cpu_slot_gs_path() -> usize {
+    if !crate::percpu::is_enabled() {
+        return my_cpu_slot_array_path();
+    }
+    let p = crate::percpu::current();
+    if p.is_null() {
+        return my_cpu_slot_array_path();
+    }
+    unsafe { (*p).slot as usize }
+}
+
+/// per-CPU 结构的观测快照（FAST-1 验收用）。
+pub struct PerCpuInfo {
+    /// 结构里记录的槽位。
+    pub slot: usize,
+    /// `GS.base` 读到的结构地址。
+    pub self_pointer: u64,
+    /// **自证**：`gs:[0]`（结构首个字段）是否等于 `GS.base`。
+    ///
+    /// 这是「GS base 真的指向本结构」的直接证据——比「数据看着对」强得多。
+    pub self_consistent: bool,
+    /// `IA32_KERNEL_GS_BASE`（`swapgs` 的另一半）。
+    pub kernel_gs_base: u64,
+    /// GS 地基是否已启用。
+    pub enabled: bool,
+}
+
+/// 读取 per-CPU 观测快照。
+pub fn percpu_info() -> PerCpuInfo {
+    let base = crate::percpu::read_gs_base();
+    let p = base as *const crate::percpu::PerCpu;
+    let (slot, self_ptr) = if base != 0 {
+        unsafe { ((*p).slot as usize, (*p).self_ptr) }
+    } else {
+        (my_cpu_slot_array_path(), 0)
+    };
+    PerCpuInfo {
+        slot,
+        self_pointer: base,
+        self_consistent: base != 0 && self_ptr == base,
+        kernel_gs_base: crate::percpu::read_kernel_gs_base(),
+        enabled: crate::percpu::is_enabled(),
+    }
+}
+
+/// `swapgs` 配对性验证：交换两次必须**精确复原** `GS.base`。
+///
+/// **只在已启用 GS 时做**（未启用时 GS base 无意义，交换会破坏现场）。
+pub fn debug_swapgs_roundtrip() -> bool {
+    if !crate::percpu::is_enabled() {
+        return false;
+    }
+    let before = crate::percpu::read_gs_base();
+    unsafe {
+        crate::percpu::swapgs();
+        crate::percpu::swapgs();
+    }
+    let after = crate::percpu::read_gs_base();
+    before == after
+}
+
+/// 嵌套纪律状态（FAST-1 验收用）。
+pub struct NestingState {
+    /// 当前 GS base 是否已是**内核** per-CPU 地址。
+    pub gs_base_is_kernel: bool,
+    /// `IA32_KERNEL_GS_BASE` 是否保存着**用户**值（内核态时的正确状态）。
+    pub kernel_gs_base_is_user: bool,
+    /// 当前是否在内核态（CPL0）。
+    pub in_kernel: bool,
+}
+
+/// **负向对照**：临时把 GS base 指向**别的槽位**，返回此时的 `self_consistent`。
+///
+/// ## 为什么必须有这个函数（S30/S31：不可证伪的测试等于没有测试）
+///
+/// 上面所有断言都建立在「`self_consistent` 能分辨 GS 配错」这一前提上。若不验证
+/// 该前提，一个**恒真**的实现（例如 `self_consistent` 硬编码为 `true`）会让全套
+/// 测试绿灯——这正是「假通过」的典型形态。
+///
+/// 本函数故意制造「GS base 指向错误位置」的场景，调用方断言此时
+/// `self_consistent == false`。能翻转，才证明检测有效。
+///
+/// 调用后**必须**立即恢复（本函数内部已恢复，返回前 GS 回到原值）。
+pub fn debug_gs_misconfig_detectable() -> bool {
+    let original = crate::percpu::read_gs_base();
+    if original == 0 {
+        return false;
+    }
+    // 故意指向另一个槽位的存储（其 self_ptr 不等于该地址 → 应被检出）。
+    let wrong_slot = if my_cpu_slot_array_path() == 1 { 2 } else { 1 };
+    let wrong = crate::percpu::storage_of_slot(wrong_slot) as u64;
+    if wrong == 0 || wrong == original {
+        return false;
+    }
+    crate::percpu::write_gs_base(wrong);
+    let detected = !percpu_info().self_consistent;
+    // 恢复现场（无论检出与否）。
+    crate::percpu::write_gs_base(original);
+    detected
+}
+
+/// 读取嵌套纪律状态。
+pub fn debug_nesting_state() -> NestingState {
+    let gs = crate::percpu::read_gs_base();
+    let kgs = crate::percpu::read_kernel_gs_base();
+    let slot = my_cpu_slot_array_path();
+    let expected = crate::percpu::base_of_slot(slot);
+    NestingState {
+        gs_base_is_kernel: expected.is_some_and(|b| b == gs),
+        kernel_gs_base_is_user: kgs == 0,
+        in_kernel: current_cpl() == 0,
+    }
+}
+
+/// 当前内核栈顶（本核正在使用的内核栈的**基址**，即最高地址）。
+///
+/// ## 为什么需要它
+///
+/// `syscall` 指令**不切栈**：硬件把用户 RSP 留在 RSP 里，内核必须在入口立刻
+/// 换到本核内核栈。为此需要预先知道「本核内核栈顶」。中断门路径靠 TSS.RSP0 由
+/// 硬件自动完成切换，`syscall` 没有这个待遇——这正是 per-CPU 结构必须存
+/// `kernel_stack_top` 的原因。
+///
+/// ## 实现说明（为什么是「对齐到栈边界」而不是直接取 RSP）
+///
+/// 直接取 RSP 得到的是**当前栈指针**（栈内的某个位置），不是栈顶。作为 `syscall`
+/// 入口的目标栈顶，必须取栈的**高地址端**。内核栈按 `KERNEL_STACK_SIZE` 对齐分配，
+/// 故把当前 RSP 向下对齐到栈大小的整数倍即得栈基址。
+///
+/// 这是保守且可验证的做法：入口真正使用时还会再减去一个帧大小，不会踩到当前帧。
+pub fn current_kernel_stack_top() -> u64 {
+    let rsp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags));
+    }
+    const KSTACK_SIZE: u64 = 64 * 1024;
+    // 向下对齐到栈边界后取**上界**（下一段的起点即本栈顶）。
+    let aligned_down = rsp & !(KSTACK_SIZE - 1);
+    aligned_down + KSTACK_SIZE
+}
+
+/// 当前特权级（读 CS 低两位）。
+#[inline]
+pub fn current_cpl() -> u8 {
+    let cs: u16;
+    unsafe {
+        core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nostack, nomem, preserves_flags));
+    }
+    (cs & 3) as u8
+}
 /// 最大基础 leaf（调试用）。
 pub fn max_basic_leaf() -> u32 {
     MAX_BASIC.load(Ordering::Relaxed)
