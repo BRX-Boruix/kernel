@@ -852,8 +852,27 @@ where
         for (v, phys, flags) in shares {
             let ro = readonly_flags(flags);
             // 父 PTE 改只读（unmap 清 TLB + 重建只读，保留共享物理帧）。
-            if core.pt.unmap(VirtAddr::new(v)).is_err() {
-                continue;
+            //
+            // R7 修复（2026-09-19）：原实现此处 `continue`——**静默跳过该页**。
+            // 后果与另外两条失败路径（下方 map 失败）不对称：那一页父侧仍是原
+            // 可写映射，子侧**没有任何映射**，且无 incref、无 CowPage 记账——
+            // 父子在这段地址空间**静默分歧**（子访问即未映射 #PF → 被当作非法
+            // 访问终止）。更隐蔽的是它**不返回错误**：调用方拿不到任何信号，
+            // 派生出的是一个看似成功、实则残缺的子进程。
+            //
+            // 按本项目「失败必须可见」（S34 / degradation.md）与 MM3 的既有纪律
+            // （任何失败都不得留下无解释缺页洞），此处与另外两条路径对齐：
+            // 父页**未被 unmap 改动**（unmap 失败即 PTE 原样），故无需回滚；
+            // 直接上抛——子半成品由 Drop 统一回收（destroy 按已记账的 CowPage
+            // 归还 incref 份额，与失败前状态天然对称），父空间完整无损。
+            if let Err(e) = core.pt.unmap(VirtAddr::new(v)) {
+                klib::warn!(
+                    "[cow] clone abort: parent unmap failed v={:#x} phys={:#x}: {:?}",
+                    v,
+                    phys,
+                    e
+                );
+                return Err(e);
             }
             if let Err(e) = core.pt.map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)
             {
