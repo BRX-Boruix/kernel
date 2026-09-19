@@ -583,6 +583,10 @@ unsafe fn kmain_body() -> ! {
     // 重构中无声退化，故钉在可证伪断言上）。
     #[cfg(feature = "kernel-test-m5")]
     tests::test_derive_multithreaded_parent_rejected();
+    // ADR-038 D6：COW 成本**分解**测量（先立尺第二步——判断 >=20% 门槛是否存在
+    // 优化空间，避免盲目改进）。
+    #[cfg(feature = "kernel-test-m5")]
+    tests::test_cow_cost_breakdown();
     #[cfg(feature = "kernel-test-m5")]
     tests::test_process_reclaim();
 

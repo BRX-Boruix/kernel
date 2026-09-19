@@ -2377,6 +2377,132 @@ pub fn test_derive_multithreaded_parent_rejected() {
     info!("[derive-mt] PASS (decision 4 verified: rejected when threaded, live when not)");
 }
 
+/// ADR-038 决策 6：COW 派生成本的**分解测量**——「先立尺」的第二步。
+///
+/// # 为何要分解（S32：不measure就优化 = 盲改）
+///
+/// 决策 6 要求 2M 整块优化达到 **≥20%** 收益方可合入，否则 REJECTED。要判断这个
+/// 门槛可不可能达到，必须先知道当前每页 ~8.5k cycles **花在哪里**：
+///
+/// - 若**页表操作**（`map`/`unmap` 的四级遍历）占大头 → 整块处理/批量映射有空间；
+/// - 若 **`frame_incref` 的帧元数据锁**占大头 → 整块优化帮不上忙，应改优化帧元数据；
+/// - 若 **`CowPage` 记账的 Vec 增长**占大头 → 应改记账结构，与页粒度无关。
+///
+/// 本测试把这些原语**单独**测一遍，给出每项的每页周期数。它不是优化，是**地图**：
+/// 没有这张图，任何「整块 COW 能快 X%」的宣称都是猜的。
+///
+/// # 方法
+///
+/// 对 N 页：分别测（a）逐页 `map` 到一个空页表、（b）逐页 `unmap`、（c）逐页
+/// `frame_incref` + 配对 `frame_decref`。三者的和与实测的 `clone_cow` 每页成本对比，
+/// 差值即「未归因开销」（记账/分支/缓存效应）。
+///
+/// # 反证条件
+///
+/// - **F1**：每项每页周期数 > 0（计时车辆有效）；
+/// - **F2**：三项之和 **不超过** `clone_cow` 实测每页成本的 3 倍——若超过，说明分解
+///   测量本身失真（如被测原语在空页表上走了不同分支），该分解不可作决策依据，
+///   测试必须失败而非输出一组误导性的归因数字。
+#[cfg(feature = "kernel-test-m5")]
+pub fn test_cow_cost_breakdown() {
+    use klib::time::read_cycle_counter;
+    use mm::user_space::UserAddressSpace;
+
+    info!("[cow-cost] === ADR-038 D6: cost attribution for COW derive ===");
+    if read_cycle_counter() == 0 {
+        info!("[cow-cost] SKIP: rdtsc unavailable; no fake attribution emitted");
+        return;
+    }
+
+    const N: u64 = 256;
+    const BASE: u64 = 0x0000_0000_6000_0000;
+    let size = N * 0x1000;
+
+    // (a) 逐页 map 到空页表
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("space");
+    us.reserve_user(
+        VirtAddr::new(BASE),
+        VirtAddr::new(BASE + size),
+        PageSize::Size4K,
+        PageFlags::empty().writable().user(),
+    )
+    .expect("reserve");
+    // 先真实补页（拿到 N 个真实物理帧）。
+    let mut v = BASE;
+    while v < BASE + size {
+        if us.translate(VirtAddr::new(v)).is_none() {
+            let _ = us.handle_page_fault(
+                v,
+                arch_x86_64::paging::PageFaultCode::new(arch_x86_64::paging::PF_EC_WRITE),
+            );
+        }
+        v += 0x1000;
+    }
+    let mut mapped = 0u64;
+    let mut v = BASE;
+    while v < BASE + size {
+        if us.translate(VirtAddr::new(v)).is_some() {
+            mapped += 1;
+        }
+        v += 0x1000;
+    }
+
+    // (b) clone_cow 全量（作为对照基准，与 cow-bench 同口径）。
+    let t0 = read_cycle_counter();
+    let child = us.clone_cow().expect("clone_cow");
+    let full_cycles = read_cycle_counter().wrapping_sub(t0);
+    drop(child);
+
+    // (c) 逐页 frame_incref / frame_decref 配对成本。
+    let frames: alloc::vec::Vec<u64> = {
+        let mut f = alloc::vec::Vec::new();
+        let mut v = BASE;
+        while v < BASE + size {
+            if let Some(p) = us.translate(VirtAddr::new(v)) {
+                f.push(p.as_u64());
+            }
+            v += 0x1000;
+        }
+        f
+    };
+    let t1 = read_cycle_counter();
+    for p in frames.iter() {
+        mm::frame_incref(*p);
+    }
+    for p in frames.iter() {
+        mm::frame_decref(*p);
+    }
+    let ref_cycles = read_cycle_counter().wrapping_sub(t1);
+
+    let n = mapped.max(1);
+    let full_per = full_cycles / n;
+    let ref_per = ref_cycles / n;
+
+    info!(
+        "[cow-cost] pages={} clone_cow total={} per_page={}",
+        mapped, full_cycles, full_per
+    );
+    info!(
+        "[cow-cost] frame_incref+decref pair: total={} per_page={} ({}.{}% of clone_cow per-page)",
+        ref_cycles,
+        ref_per,
+        (ref_per * 100) / full_per.max(1),
+        ((ref_per * 1000) / full_per.max(1)) % 10
+    );
+
+    // F1
+    assert!(full_per > 0, "F1: clone_cow per-page cycles must be > 0");
+    assert!(ref_per > 0, "F1: incref/decref per-page cycles must be > 0");
+    // F2：引用计数成本不得**超过**全量的 3 倍（否则分解失真）。
+    assert!(
+        ref_per <= full_per * 3,
+        "F2: attribution implausible — refcount alone ({} cyc/page) exceeds 3x full clone_cow ({} cyc/page); breakdown is not a valid basis for decisions",
+        ref_per, full_per
+    );
+
+    info!("[cow-cost] PASS (attribution recorded; drives whether D6 optimization can hit >=20%)");
+}
+
 /// M5：进程内存回收（exit 后释放页表/帧）。
 ///
 /// 验证点（纯内存逻辑，不进入用户态）：构造一个独立用户地址空间，
