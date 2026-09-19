@@ -542,13 +542,6 @@ unsafe fn kmain_body() -> ! {
     // SYSCALL-FAST-3：r10 捕获通道在两条 ABI 下的一致性（a4 为保留输出）。
     tests::test_syscall_fast3_r10_capture_contract();
 
-    // SYSCALL-FAST-4 是**破坏性**的：它启动调度器进入用户态运行 `syscall` 程序，
-    // `scheduler::start()` 永不返回。因此它**必须放在整个测试序列的最后**——
-    // 否则其后所有测试都不会执行。放在版本横幅之前，横幅即成为「全部测试已跑完」
-    // 的标记（运行脚本据此判定完成）。
-    #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_fast4_userspace_syscall_e2e();
-
     // M4.3 静态 ELF 加载验收：解析并加载 ELF 镜像到用户空间，spawn 运行
     // （停机验收，不返回主流程），单独 gate。
     #[cfg(feature = "kernel-test-m43")]
@@ -893,12 +886,32 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_smp_smoke();
 
-    // 内核全部组件加载完成（测试若开启也已全部通过）：打印版本横幅。
+    // 内核全部组件加载完成、**非破坏性**测试全部通过：打印版本横幅。
+    // （测试构建里真正的「终点」是下面的 FAST-4 测试——它自己调用
+    // `scheduler::start()` 且该函数 `-> !`，永不返回。）
     info!("============================================================");
     info!("BORUIX KERNEL v.{}", env!("CARGO_PKG_VERSION"));
     info!("Git Commit: {}", env!("BORUIX_GIT_COMMIT"));
     info!("Build Timestamp: {}", env!("BORUIX_BUILD_TIMESTAMP"));
     info!("============================================================");
+
+    // SYSCALL-FAST-4 是**破坏性**测试：它 spawn 用户进程后**自己调用
+    // `scheduler::start()`**，而该函数返回类型 `-> !`（就绪队列空只 halt，
+    // 绝不返回 kmain）——本调用**永不返回**，其后任何代码都执行不到。
+    // 修订记录：首版把横幅放在本测试之后并注释称「横幅因此成为全部测试
+    // 已跑完的标记」——这是错的（_fast4fin2 实测：exit(code=0) 已交付、
+    // 横幅从未打印）。横幅已上移，其语义改为「非破坏性阶段全部通过」。
+    //
+    // **必须在此处（而非更早）**：用户程序经 fd 1 (`SYS_STREAM_WRITE`) 输出，
+    // 而 stdout sink 直到上面的 `vfs::stdio::set_stdout_sink(...)` 才接线。
+    // 首版把本测试放在序列前段，write 如实返回 ENOTSUP(-95)——内核行为正确，
+    // 是测试放错了位置（缺 sink 的 write 本就不该成功）。
+    //
+    // 本测试的**完成标记**：`[test-fast4] process N exit(code=0) -- 0 = all writes ok`
+    // （sys_exit 在 kernel-tests 构建下以 info! 留痕；code 是用户程序自校验的
+    // write 失败计数）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_syscall_fast4_userspace_syscall_e2e();
     // KM13：符号表快照溯源。直连 cargo build 会使用 checked-in 快照——
     // .text 布局漂移后 panic 回溯给出错误函数名，比空表更有害；此处如实
     // 告警而非静默放行。SDK 构建路径两遍编译同纪元，不触发。

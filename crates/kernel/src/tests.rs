@@ -9139,6 +9139,11 @@ fn fast4_user_code() -> [u8; FAST4_CODE_CAP] {
     macro_rules! emit {
         ($($b:expr),*) => { $( guard!(1); c[i] = $b; i += 1; )* };
     }
+    // r9 = 失败计数（进入循环前置 0）。用户程序**自行校验**每次 write 的返回值：
+    // rax != 1 则 r9 += 1。程序退出前无法被内核读取（scheduler::start 永不返回），
+    // 故把「是否全对」的判据放在 write 返回值的内核日志（nr=0x13 -> 0x1）+
+    // 下面 exit code 上：exit code = r9（0 = 全部成功）。
+    emit!(0x49, 0xC7, 0xC1, 0, 0, 0, 0); // mov r9, 0
     for _ in 0..4 {
         // mov rax, SYS_STREAM_WRITE(0x13)
         emit!(0x48, 0xB8);
@@ -9168,6 +9173,16 @@ fn fast4_user_code() -> [u8; FAST4_CODE_CAP] {
         i += 8;
         // syscall  <-- 这一条是本测试的核心
         emit!(0x0F, 0x05);
+        // 校验：cmp rax, 1；!= 1 则 inc r9（失败计数）。
+        //
+        // **跳转偏移陷阱（实测踩中）**：`inc r9`（49 FF C1）是 **3 字节**，
+        // je 的相对位移必须 +3。首版写 +2，跳转目标落在 inc 的**最后一个字节**
+        // 上——write 成功（rax==1）时 je 恰好被跳入，从半条指令中间执行，
+        // 现场立即卡死。且只有**成功路径**才触发，失败路径反而正常，
+        // 症状极具迷惑性（这正是 `_fast4z` 能跑 6 轮而 `_fast4fin` 卡死的原因）。
+        emit!(0x48, 0x83, 0xF8, 0x01);       // cmp rax, 1
+        emit!(0x74, 0x03);                   // je +3（恰好跳过 3 字节的 inc）
+        emit!(0x49, 0xFF, 0xC1);             // inc r9
         // mov rax, SYS_TASK_WAIT(0x32)
         emit!(0x48, 0xB8);
         c[i..i + 8].copy_from_slice(&0x32u64.to_le_bytes());
@@ -9181,21 +9196,22 @@ fn fast4_user_code() -> [u8; FAST4_CODE_CAP] {
         i += 8;
         emit!(0x0F, 0x05); // syscall (yield)
     }
-    // 收尾：SYS_TASK_WAIT(0, 1000ms) 睡眠，让其它测试继续跑
+    // 收尾：SYS_TASK_EXIT(0) —— 必须**真正退出**。
+    //
+    // 首版这里写成 sleep + `jmp $` 无限循环，理由是「保持存活避免收尸干扰」——
+    // 但 `scheduler::start()` 只有取不到就绪进程时才会返回主流程（打印版本横幅，
+    // 即运行脚本的完成标记）。一个永不退出的进程让横幅永远打不出来，
+    // 整个内核就永远「跑不完」。exit(0) 后调度器自然收尸并回到主流程。
     emit!(0x48, 0xB8);
-    c[i..i + 8].copy_from_slice(&0x32u64.to_le_bytes());
+    c[i..i + 8].copy_from_slice(&0x34u64.to_le_bytes()); // SYS_TASK_EXIT = 0x34
     i += 8;
-    emit!(0x48, 0xBF);
-    c[i..i + 8].copy_from_slice(&0u64.to_le_bytes());
-    i += 8;
-    emit!(0x48, 0xBE);
-    c[i..i + 8].copy_from_slice(&1000u64.to_le_bytes());
-    i += 8;
-    emit!(0x0F, 0x05); // syscall (sleep)
-    // 无限循环（保持进程存活，避免收尸路径干扰）
-    let start = i;
-    emit!(0xEB, 0xFE); // jmp $-2
-    let _ = start;
+    // exit code = r9（失败计数；0 = 全部 write 都返回 1）。
+    // 调度器收尸时会打印 exit code，这就是用户态自校验的交付通道。
+    emit!(0x4C, 0x89, 0xCF);             // mov rdi, r9
+    i += 3;
+    emit!(0x0F, 0x05); // syscall exit（不返回）
+    // 兜底：exit 若意外返回（不应发生），原地自旋，绝不跌进 NOP 雪橇。
+    emit!(0xEB, 0xFE); // jmp $
     c
 }
 

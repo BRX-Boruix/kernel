@@ -1094,7 +1094,6 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
         Some(vfs::file_handle::OpenHandle::Pipe { .. }) => unreachable!("handled above"),
         None => return pack_err(Error::InvalidParam),
     };
-
     // KM1：无 fd 号特判——1/2 与普通句柄走同一条路，stdout/stderr 节点在
     // write_at 内直发字节（K5 完全体：串口 sink 字节透明，文本 sink 自行
     // lossy），syscall 层零转换。
@@ -2219,6 +2218,12 @@ fn sys_exit(frame: &mut SyscallFrame) -> u64 {
     let code = frame.a1;
     let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
     klib::debug!("[syscall] process {} exit(code={})", pid, code);
+    // SYSCALL-FAST-4 验收通道（仅自检构建）：用户程序把 write 失败计数作为
+    // exit code 交付（0 = 全部 4 次 write 都返回 1）。debug! 在 release 被裁掉，
+    // 故测试构建用 info! 显式留痕——这是用户态**自校验**结果的唯一交付通道
+    //（scheduler::start 永不返回，内核无法事后读用户内存）。
+    #[cfg(feature = "kernel-tests")]
+    klib::info!("[test-fast4] process {} exit(code={}) -- 0 = all writes ok", pid, code);
     task::exit_current(arch_frame(frame), code);
     0
 }
