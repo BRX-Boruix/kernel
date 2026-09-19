@@ -539,6 +539,9 @@ unsafe fn kmain_body() -> ! {
     // SYSCALL-FAST-2：syscall 帧布局与 InterruptFrame 的二进制兼容契约。
     tests::test_syscall_fast2_frame_layout_contract();
 
+    // SYSCALL-FAST-3：r10 捕获通道在两条 ABI 下的一致性（a4 为保留输出）。
+    tests::test_syscall_fast3_r10_capture_contract();
+
     // M4.3 静态 ELF 加载验收：解析并加载 ELF 镜像到用户空间，spawn 运行
     // （停机验收，不返回主流程），单独 gate。
     #[cfg(feature = "kernel-test-m43")]

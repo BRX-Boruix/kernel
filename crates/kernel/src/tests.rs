@@ -8919,6 +8919,73 @@ pub fn test_syscall_fast2_frame_layout_contract() {
     info!("[test-fast2] PASS (frame offsets match naked-asm ABI; MSRs configured; checks falsifiable)");
 }
 
+/// SYSCALL-FAST-3：`r10` 捕获通道在 `int 0x80` 与 `syscall` 两条 ABI 下的一致性。
+///
+/// ## 冲突的本质（先把它说清楚，再决定怎么改）
+///
+/// `invoke_capture_r10` 依赖「`int 0x80` 后 `r10` 不被 ABI 破坏」，内核借此把被收尸
+/// 子进程 pid 交付给用户态（`aux_pid` → 返回帧 `r10`）。
+///
+/// 而 `syscall` ABI 里 `r10` **是第 4 个参数寄存器 `a4`**。表面上直接冲突。
+///
+/// 实核后的事实（重要，避免过度设计）：
+///   - `sys_task_wait` 只使用 `a1`(target_pid) 与 `a2`(timeout_ns)，**不用 a4**；
+///   - `dispatch_fork_wait`（同款交付）同样不用 a4；
+///   - 两条 ABI 下 `r10` 都**能**承载输出：`int 0x80` 硬件不碰 r10；`sysretq` 只消耗
+///     `rcx`/`r11`，`r10` 由内核构造的帧原样恢复。
+///
+/// 所以「`syscall` 破坏了 r10 交付」**不成立**——真正的脆弱点是：
+///   1. 把一个 **ABI 参数寄存器**当作**输出通道**，属隐式约定：将来任何给 waitpid
+///      传 a4 的调用方会被**静默破坏**；
+///   2. 该约定只写在注释里，没有测试锁定，也没有在 ABI 文档中登记为保留输出。
+///
+/// ## 本项的策略：显式化 + 兼容，而非替换
+///
+/// 保留 `r10` 交付（兼容既有用户态），但把它**升级为成文契约**并用测试锁定：
+///   - 断言 `a4` 在 waitpid 两条路径中**均不被读取**（用哨兵值验证）；
+///   - 断言 `r10` 在两条 ABI 下都能带回 pid（对拍）。
+pub fn test_syscall_fast3_r10_capture_contract() {
+    info!("[test-fast3] === r10 capture channel under both ABIs ===");
+
+    // ---- 1. 契约：a4 是保留的**输出**通道，内核不得读取它 ----
+    // 用哨兵值填入 a4，确认 waitpid 的结果不受影响。
+    let sentinel: u64 = 0xDEAD_BEEF_CAFE_0000;
+    let r = arch_x86_64::syscall::debug_r10_channel_probe(sentinel);
+    info!(
+        "[test-fast3] sentinel a4={:#x} -> rax={:#x} r10(aux_pid)={:#x} a4_was_read={}",
+        sentinel, r.rax, r.r10_out, r.a4_was_read
+    );
+    assert!(
+        !r.a4_was_read,
+        "a4 must be a RESERVED OUTPUT channel: the kernel must not read it, \
+         else the pid delivery silently corrupts a legitimate argument"
+    );
+
+    // ---- 2. 两条 ABI 下 r10 交付口径一致 ----
+    let both = arch_x86_64::syscall::debug_r10_delivery_matches_across_abis();
+    info!("[test-fast3] r10 delivery identical under int80 and syscall: {}", both);
+    assert!(
+        both,
+        "the reaped-pid delivery must be identical on both entry paths"
+    );
+
+    // ---- 3. 负向对照：证明「a4 未被读取」的检测有效 ----
+    // 若检测恒真（例如永远返回 false），第 1 条断言毫无意义。
+    let detects = arch_x86_64::syscall::debug_r10_probe_is_falsifiable();
+    info!("[test-fast3] negative control: a4-read detection is falsifiable = {}", detects);
+    assert!(detects, "the a4-read check must be able to fire (falsifiable)");
+
+    // ---- 4. 阻塞路径与同步路径的交付通道必须一致（都是 r10）----
+    let channels_match = arch_x86_64::syscall::debug_r10_channels_consistent();
+    info!(
+        "[test-fast3] sync path (aux_pid->frame.r10) == blocking path (saved.r10): {}",
+        channels_match
+    );
+    assert!(channels_match, "sync and blocking paths must deliver via the same register");
+
+    info!("[test-fast3] PASS (a4 reserved as output; r10 delivery identical on both ABIs)");
+}
+
 pub fn test_sched_eevdf3_interactive_latency() {
     use task::scheduler::test_hooks as th;
     info!("[test-eevdf3b] === interactive dispatch latency: EEVDF vs RR-equivalent ===");
