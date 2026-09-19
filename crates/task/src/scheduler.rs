@@ -30,7 +30,6 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -126,6 +125,12 @@ struct ProcEntry {
     /// 切出点 rdmsr 归档、切入点 wrmsr 恢复（镜像 FPU eager save/restore 点）——
     /// 保证线程切换后 CPU FS base 恒指向当前单元的 TCB（防旧线程 base 泄漏给无 FS 程序）。
     fs_base: u64,
+    /// **EEVDF 虚拟运行时间**（SCHED-EEVDF-2）。单调不减、饱和不回绕。
+    ///
+    /// 语义：本进程累计获得的 CPU 份额（加权）。**越小越该被调度**。
+    /// 保护：**per-pid 桶锁**（不做全局原子，避免新的全局争用点）。
+    /// 不变式：只在持有该 pid 桶锁时读写；比较与入队一律使用「读出的快照」。
+    vruntime: u64,
 }
 
 /// 已退出进程的内核栈帧延迟回收队列（task1 K3，S18 释放路径的单点实现）。
@@ -343,8 +348,14 @@ fn spawn_home_cpu() -> usize {
 /// 处理下每核 AP 用自己的槽位在自己的 IRQ0 tick 上调度本核就绪队列（阶段2 M4 后），
 /// 跨核只经目标 pid 锁 + 目标核 RUN[home]（锁序 pid → RUN[home]）协调。
 struct PerCpuRun {
-    /// 每核就绪队列（RR）。索引 = 紧凑 CPU 槽位；[my_cpu_slot] 为当前核槽位。
-    ready: VecDeque<usize>,
+    /// 每核就绪队列（**EEVDF**：按 vruntime 排序的最小堆）。索引 = 紧凑 CPU 槽位；
+    /// [my_cpu_slot] 为当前核槽位。
+    ///
+    /// SCHED-EEVDF-2：由 `VecDeque<usize>`（纯 RR FIFO）替换为
+    /// [`crate::sched_eevdf::VruntimeQueue`]。**语义差异是刻意的**：
+    /// 入队不再固定到队尾，而是按 vruntime 决定位置——vruntime 小者先跑。
+    /// 对「新进程 vruntime 取当前最小基准」的处理见 `enqueue_ready`。
+    ready: crate::sched_eevdf::VruntimeQueue,
     /// 每核当前运行进程。索引 = 紧凑 CPU 槽位（与 process.rs 的 per-CPU
     /// CURRENT_PROC 同槽同步更新，保持“调度器 current 与裸指针别名”单点对应）。
     current: Option<usize>,
@@ -353,7 +364,7 @@ struct PerCpuRun {
 impl PerCpuRun {
     const fn new() -> Self {
         Self {
-            ready: VecDeque::new(),
+            ready: crate::sched_eevdf::VruntimeQueue::new(),
             current: None,
         }
     }
@@ -570,6 +581,9 @@ pub fn spawn_with_ppid_fds(
         waiting_for: None,
         home_cpu,
         fs_base: 0,
+        // 新进程 vruntime 先置 0；真正入队时由 `enqueue_ready(is_new=true)`
+        // 改写到「当前最小基准」，避免新进程凭空获得优先权。
+        vruntime: 0,
     });
     // 分桶化：把入口按 pid 写入其所在桶（堆分配 Box，地址稳定）；桶锁随即释放
     // 再入队 home 核（pid 桶 → RUN 锁序：桶锁释放后再取 RUN，不同时持有）。
@@ -578,7 +592,8 @@ pub fn spawn_with_ppid_fds(
     // 承运转到本核的进程（对称多处理），而非一律落在创建核。进程运行中阻塞后再
     // 唤醒仍回 home 核队列（跨核唤醒），实现按核常驻。入队走 RUN[home_cpu] 域
     // （pid 锁已释放，再取 RUN；home 可能非本核）。
-    run_mut(home_cpu).ready.push_back(pid);
+    // EEVDF：统一入队口，首次入队 vruntime 取当前最小基准。
+    enqueue_ready(&mut run_mut(home_cpu), pid, true);
     Ok(pid)
 }
 /// 线程派生（T1-1 / ADR-035 D1/D2 / threads.md T1-1）：在组长 `tgid` 所在的线程组内
@@ -654,9 +669,11 @@ pub fn spawn_thread_with(
         waiting_for: None,
         home_cpu,
         fs_base: 0,
+        vruntime: 0,
     });
     proc_bucket_lock(pid).insert(pid, entry);
-    run_mut(home_cpu).ready.push_back(pid);
+    // EEVDF：首次入队走统一入队口（vruntime 取当前最小基准，非 0）。
+    enqueue_ready(&mut run_mut(home_cpu), pid, true);
     Ok(pid)
 }
 
@@ -706,6 +723,112 @@ pub fn is_group_leader(pid: usize) -> bool {
     let b = proc_bucket_lock(pid);
     b.get(&pid).map(|e| e.proc.tgid() == pid).unwrap_or(false)
 }
+/// ---- SCHED-EEVDF-2：vruntime 记账 ----
+///
+/// ## 记账模型（为什么是「按已运行时间折算」而不是直接累加墙上时间）
+///
+/// EEVDF 的 vruntime 是 **加权**运行时间：`vruntime += elapsed * (NICE_0_WEIGHT / w)`。
+/// 权重 `w` 越大（优先级越高），同样的 `elapsed` 折算出的 vruntime 增量越小，
+/// 因而越「不着急」，可以跑更久。SCHED-EEVDF-3 引入 nice 后由 `weight_of` 提供
+/// `w`；本阶段（2）尚无 nice，全部进程同权，故 `w == NICE_0_WEIGHT`，折算比为 1，
+/// vruntime 即「实际运行的 tick 数」。**这是刻意的分步**：先让记账正确且可验证，
+/// 再引入权重（S24：单组件变更可独立验证）。
+///
+/// ## 记账点（为什么记在切出、而不是记在 tick 顶部）
+///
+/// 记在切出点时，`elapsed` 恰好等于「本进程本次连续运行了多久」，语义精确，
+/// 且与「谁真的用了 CPU」天然对齐。若记在 tick 顶部，则被抢占但未真正切走的
+/// 情形（`NothingSelf`/`Empty`）也会被计入，导致 vruntime 虚增。
+///
+/// ## 并发（S21）
+///
+/// vruntime 存放于 **per-pid 桶锁** 保护的 `ProcEntry.vruntime`，不做全局原子。
+/// 记账必须在该 pid 的桶锁内完成，避免与他核的唤醒/收尸交错。
+const NICE_0_WEIGHT: u64 = 1024;
+
+/// 单次 tick 折算出的 vruntime 增量（同权阶段 = 1 个 tick 单位）。
+///
+/// 用 `TIMESLICE_TICKS` 的倒数关系表达：一个完整时间片让 vruntime 前进 1 个「片」，
+/// 使 vruntime 的量纲与 RR 的轮转节奏可比，便于 EEVDF-3 做对照测量。
+#[inline]
+fn vruntime_charge(weight: u64) -> u64 {
+    if weight == 0 {
+        return NICE_0_WEIGHT; // 防 0 权重导致除零/无限增量（S18 边界）
+    }
+    // elapsed 固定为 1 个 tick；折算比 = NICE_0_WEIGHT / weight。
+    // 同权时 weight == NICE_0_WEIGHT，结果为 1。
+    (NICE_0_WEIGHT as u128 * 1 / weight as u128) as u64
+}
+
+/// 把 `pid` 的 vruntime 累加 `delta`（饱和不回绕，S19）。须在 pid 桶锁内调用。
+fn charge_vruntime_locked(slot: &mut ProcEntry, delta: u64) {
+    slot.vruntime = crate::sched_eevdf::vruntime_add(slot.vruntime, delta);
+}
+
+/// 就绪队列的**最小 vruntime 基准**：新就绪的进程以此为起点，避免「新进程
+/// vruntime=0 从而长期霸占 CPU」这一经典 EEVDF/CFS 缺陷。
+///
+/// 队列为空时取 `current` 的 vruntime，仍为空则取 0。
+fn min_vruntime_base(run: &PerCpuRun) -> u64 {
+    if let Some(v) = run.ready.min_vruntime() {
+        return v;
+    }
+    match run.current {
+        Some(c) => proc_bucket_lock(c).get(&c).map(|s| s.vruntime).unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// 统一的就绪入队口：**所有**入队都必须经此，以便集中维护 vruntime 语义。
+///
+/// `is_new` = 该进程是首次进入就绪态（spawn）还是被唤醒/让出后重新入队。
+/// 两者语义不同：
+///   - **首次**：vruntime 取当前最小基准（不取 0，防霸占）；
+///   - **重新**：保留既有 vruntime（它是「已消耗的 CPU 份额」的历史，不能重置，
+///     否则长期占用 CPU 的进程每次让出都清零、重新获得优先权 → 饿死他人）。
+fn enqueue_ready(run: &mut PerCpuRun, pid: usize, is_new: bool) {
+    let base = min_vruntime_base(run);
+    let vt = {
+        let mut g = proc_bucket_lock(pid);
+        match g.get_mut(&pid) {
+            Some(slot) => {
+                if is_new {
+                    // 新进程从当前最小基准起步（等价于 CFS 的 `place_entity`）。
+                    slot.vruntime = base;
+                }
+                slot.vruntime
+            }
+            // 槽已不存在（被跨核 reap）：不入队，调用方按既有竞态语义处理。
+            None => return,
+        }
+    };
+    run.ready.insert(pid, vt);
+}
+
+/// **无锁**就绪入队：调用方已持有该 pid 的桶锁（或已取好 vruntime 快照）时使用。
+///
+/// ## 为什么必须有无锁变体（S21：锁序纪律）
+///
+/// `block_current_locked` 在**已持 `cur_pid` 桶锁**的临界区内，需要把先前弹出的
+/// `peer` 放回就绪队列（登记失败/cur 已 Exit 两条回滚路径）。若此处调用会自行
+/// 取 `peer` 桶锁的 [`enqueue_ready`]，而 `peer` 与 `cur_pid` 恰好散列到**同一桶**，
+/// 就会在同一临界区内重复获取同一把 `IrqSpinLock`（不可重入）→ **自死锁**，且此时
+/// 中断已关，表现为整机挂死。
+///
+/// 这不是理论风险：`cur`/`peer` 由同一父进程连续 spawn，pid 相邻、散列到同桶的
+/// 概率不低 —— 实测中 `test-block-register-false` 正是这样卡死的。
+///
+/// 原实现用 `push_back`（纯 RUN 操作、**不取任何 pid 锁**）所以从未暴露该问题；
+/// 本变体保持同样的「调用方自持锁」契约。
+fn enqueue_ready_with_vruntime(run: &mut PerCpuRun, pid: usize, vt: u64) {
+    run.ready.insert(pid, vt);
+}
+
+/// 从就绪队列移除（幂等；不在队列中返回 false）。
+fn dequeue_ready(run: &mut PerCpuRun, pid: usize) -> bool {
+    run.ready.remove(pid)
+}
+
 /// 当前就绪进程数（诊断）。
 #[allow(dead_code)]
 pub fn ready_count() -> usize {
@@ -805,9 +928,15 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
         if let Some(slot) = g.get_mut(&cur_pid) {
             slot.saved = *frame;
             slot.proc.set_state(TaskState::Ready);
+            // EEVDF 记账：本进程刚用完一个时间片，按权重折算累加 vruntime。
+            // 记在此处（持 cur 桶锁、已确认非 Exit）恰与「谁真的用了 CPU」对齐：
+            // 走到这里必然是真的运行满了 TIMESLICE_TICKS 个用户态 tick。
+            charge_vruntime_locked(slot, vruntime_charge(NICE_0_WEIGHT));
         }
     }
-    run.ready.push_back(cur_pid);
+    // EEVDF：重新入队保留既有 vruntime（不清零，否则长期占用者每次让出都
+    // 重新获得优先权 → 饿死他人）。
+    enqueue_ready(&mut run, cur_pid, false);
 
     // 统一"选 next + 原子提交切换"原语：从就绪队列弹候选、持 next 桶锁判存在+Ready 后
     // 原子置 Running+*frame=saved 并物理切入（FPU/CR3/RSP0/CURRENT 单点收口）。跨核收尸
@@ -982,7 +1111,9 @@ fn pop_and_commit_switch(
     exclude: usize,
 ) -> NextCommit {
     loop {
-        let Some(next) = run.ready.pop_front() else { return NextCommit::Empty };
+        // EEVDF：取 vruntime 最小者（而非 FIFO 队首）。`pop_min` 空队列返回 None，
+        // 保持既有「绝不 panic」纪律（返回 Empty 由调用方按原语义处理）。
+        let Some((next, _vt)) = run.ready.pop_min() else { return NextCommit::Empty };
         if next == exclude { continue; }
         if prev == Some(next) {
             // 弹回被切出进程自身（cur，仅当其被重新入队如 tick/yield 才会发生）：不切换。
@@ -1033,9 +1164,13 @@ pub fn yield_now(frame: &mut InterruptFrame) -> SwitchOutcome {
         if let Some(slot) = g.get_mut(&cur_pid) {
             slot.saved = *frame;
             slot.proc.set_state(TaskState::Ready);
+            // EEVDF 记账：主动 yield 也消耗了一个时间片的 CPU 份额。
+            // 若不计账，忙轮询式 yield 的进程可以无限让出而不积累 vruntime，
+            // 从而永久占据最小 vruntime、始终被优先选中 —— 必须计。
+            charge_vruntime_locked(slot, vruntime_charge(NICE_0_WEIGHT));
         }
     }
-    run.ready.push_back(cur_pid);
+    enqueue_ready(&mut run, cur_pid, false);
 
     // 统一"选 next + 原子提交切换"原语（同 tick）。跨核收尸竞态修复：候选被 reap/置 Exit
     // 时丢弃重选，绝不 .expect panic；next 桶锁贯穿切换结束，杜绝窗口 B。
@@ -1075,7 +1210,9 @@ pub fn yield_now(frame: &mut InterruptFrame) -> SwitchOutcome {
 /// Blocked 项入队，本函数也不会把它切上 CPU。返回第一个有效 pid，
 /// 队列空/仅含死进程时返回 `None`。
 fn pop_ready(run: &mut PerCpuRun, exclude: usize) -> Option<usize> {
-    while let Some(pid) = run.ready.pop_front() {
+    // EEVDF：按 vruntime 升序取（`pop_min`），语义等价于原 FIFO 的"取下一个"，
+    // 只是"下一个"的定义由队首变为 vruntime 最小者。
+    while let Some((pid, _vt)) = run.ready.pop_min() {
         if pid == exclude {
             continue;
         }
@@ -1097,16 +1234,17 @@ fn pop_ready(run: &mut PerCpuRun, exclude: usize) -> Option<usize> {
 /// 目标者挪回队尾（保持其 Ready 可调度性），直到取到 `target`；不在队列返回
 /// `None`。
 fn extract_from_ready(run: &mut PerCpuRun, target: usize) -> Option<usize> {
-    let n = run.ready.len();
-    for _ in 0..n {
-        let pid = run.ready.pop_front().expect("len>0 in bounded loop");
-        if pid == target {
-            return Some(pid);
-        }
-        // 非目标：保持就绪，放回队尾（不破坏其可调度性/公平轮转）。
-        run.ready.push_back(pid);
+    // EEVDF 下用 `remove` 直接摘取目标：**不再需要**「逐个弹出、非目标放回」的
+    // 撞运气式实现。原实现的前提是 FIFO 队列没有按 key 删除的能力；最小堆在本
+    // 类型里已提供 O(n) 定位的 `remove`（`sched_eevdf` 有文档说明为何不用懒惰标记）。
+    //
+    // 这不只是简化：原实现的 `expect("len>0 in bounded loop")` 是一个 panic 点，
+    // 且依赖「`n` 次内必命中」的脆弱假设。`remove` 天然无此风险（S23：失败模式优先）。
+    if run.ready.remove(target) {
+        Some(target)
+    } else {
+        None
     }
-    None
 }
 
 /// [`schedule_from_block`] 的切走结果（K1-1，ADR-031 决策-改造要点 1 的
@@ -1166,7 +1304,8 @@ fn schedule_from_block(frame: &mut InterruptFrame, cur_pid: usize) -> BlockResum
         let mut run = run_mut(my_cpu_slot());
         // SwitchedSelf 主路径：cur_pid 已被唤醒入队，先尝试切回自身。持 RUN 下
         // contains/extract 连续（reap 移出就绪也须本核 RUN，被本锁阻断），故 cur 必被取出。
-        if run.ready.contains(&cur_pid) {
+        // EEVDF：`contains` 语义不变（是否在就绪队列中）。
+        if run.ready.contains(cur_pid) {
             let c = extract_from_ready(&mut run, cur_pid).expect("woken waiter in ready");
             // 跨核收尸竞态修复：cur(被唤醒等待者)在提取后仍可能被收尸(reap 只取 cur 桶锁
             // 不依赖 RUN)——commit_next 在持 cur 桶锁下重判存在+Ready；无效(cur 槽 None/置
@@ -1283,6 +1422,9 @@ fn block_current_locked(
     // 预检：须存在至少一个非 cur 的就绪候选才可能阻塞（无同伴则调用方 WouldBlock，
     // 绝不置 Blocked 后无人接盘 CPU 而自锁）。pop_ready 已滤 Exit/None 并返回首个有效项；
     // 按其桶锁再确认存在+Ready（§6d 预检，缩小"register 后 peer 才失效"的回滚面）。
+    // 记录 peer 的 vruntime 快照：下方两条回滚路径必须在**不取 peer 桶锁**的前提下
+    // 把 peer 放回队列（此时可能已持 cur 桶锁，同桶会自死锁）。在取任何锁之前读好，
+    // 使回滚路径彻底无锁，恢复原 `push_back` 的锁纪律。
     let mut peer = loop {
         let Some(p) = pop_ready(run, usize::MAX) else {
             return SwitchOutcome::NotSwitched;
@@ -1292,6 +1434,8 @@ fn block_current_locked(
         }
         // p 已 Exit/被 reap：pop_ready 弹出但随即失效，丢弃重选（I1，不重放）。
     };
+    // 取快照后即可安全用于两条回滚路径（此刻未持任何桶锁）。
+    let peer_vruntime = proc_bucket_lock(peer).get(&peer).map(|s| s.vruntime).unwrap_or(0);
     // 登记点必须与唤醒方（wake/wake_with_value 持目标 pid 锁）原子互斥，故持
     // cur 的 per-pid 锁执行 register + 置 Blocked；失败即整体放弃，现场未动。
     {
@@ -1305,14 +1449,20 @@ fn block_current_locked(
         // 语义正确)——本函数只持 reborrow，不能在此 go_idle(会留下 caller 的 RUN 未释放)。
         if gcur.get(&cur_pid).is_some_and(|s| s.proc.state() == TaskState::Exit) {
             drop(gcur);
-            run.ready.push_back(peer);
+            // EEVDF：放回时保留其既有 vruntime（本次并未消耗 CPU）。
+            // **必须用无锁变体**：此刻持有 cur 桶锁，若 peer 与 cur 同桶，
+            // `enqueue_ready` 会重复获取同一把不可重入锁而自死锁。
+            enqueue_ready_with_vruntime(run, peer, peer_vruntime);
             return SwitchOutcome::NotSwitched;
         }
         if !register() {
             // S26 回归：`peer` 已在上方被 `pop_ready` 弹出（仍为 Ready 态），
             // 若直接返回将永久丢失该就绪进程（无人重新入队 → 饿死）。
             // 必须把它放回就绪队列，保证"登记失败零副作用"成立。
-            run.ready.push_back(peer);
+            // EEVDF：保留其 vruntime（本次未消耗 CPU，不得重置）。
+            // 注意 `run` 本身已是 `&mut PerCpuRun`，直接传（`&mut run` 会重借用失败）。
+            // 同样必须无锁：此刻仍持有 cur 桶锁（ISSUE: 同桶自死锁）。
+            enqueue_ready_with_vruntime(run, peer, peer_vruntime);
             return SwitchOutcome::NotSwitched;
         }
         if let Some(slot) = gcur.get_mut(&cur_pid) {
@@ -1486,7 +1636,10 @@ pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
 /// 计数（`resched_ipi_send_count` / `resched_ipi_send_fail_count`），失败可观测。
 fn wake_enqueue(pid: usize, home: usize) {
     let mut run = run_mut(home);
-    run.ready.push_back(pid);
+    // EEVDF：被唤醒的进程保留其既有 vruntime（is_new=false）。
+    // 若在此重置，一个频繁阻塞/唤醒的进程能不断"清空"自己的 CPU 份额，
+    // 从而长期占据最小 vruntime、饿死 CPU 密集型进程。
+    enqueue_ready(&mut run, pid, false);
     drop(run);
     // 无条件投递：见上方理由。本核自己不需要（本核就在执行本函数）。
     if home != my_cpu_slot() {
@@ -2185,7 +2338,8 @@ fn terminate_member_locked(pid: usize, code: u64) -> Termination {
     // 移出 home 核就绪队列；跨核且正运行则发 resched IPI（与既有 terminate 移出就绪
     // + 脱机同款）。
     let mut hrun = run_mut(home);
-    hrun.ready.retain(|&p| p != pid);
+    // EEVDF：`retain` -> `remove`（语义等价：把该 pid 移出就绪队列）。
+    dequeue_ready(&mut hrun, pid);
     // 注意与 `wake_enqueue` 的区别：此处条件是**断言性**的——它断言"该核正在运行
     // 这个 pid"（`current` 的真实语义就是"本核正在运行的进程"），不是猜测性预判，
     // 故条件成立且必要：被终止的进程正占着那个核，必须促其尽快切走。
@@ -2267,7 +2421,8 @@ fn terminate_process_locked(pid: usize, code: u64) -> Termination {
     // dispatch_resched 只 EOI、不碰任何调度锁，跨核发送安全。
     {
         let mut hrun = run_mut(home);
-        hrun.ready.retain(|&p| p != pid);
+        // EEVDF：`retain` -> `remove`（语义等价）。
+        dequeue_ready(&mut hrun, pid);
         // 同 L2179：断言性条件（该核正在运行此 pid），非猜测性预判。
         // 投递失败计入 `resched_ipi_send_fail_count`。
         if home != my_cpu_slot() && hrun.current == Some(pid) {
@@ -2525,14 +2680,15 @@ fn waitpid_inner(
         for slot in 0..MAX_SCHED_CPUS {
             if slot == my_cpu_slot() {
                 // 本核：直接用调用方已持有的 run（同域，不可重入取锁）。
-                if run.ready.iter().any(|&p| p != cur) {
+                // EEVDF：`iter()` -> `iter_pids()`（只看 pid，与顺序无关）。
+                if run.ready.iter_pids().any(|p| p != cur) {
                     found = true;
                     break;
                 }
             } else {
                 // 经全路径调用，避开形参 `run` 的同名遮蔽。
                 let g = crate::scheduler::run(slot);
-                if g.ready.iter().any(|&p| p != cur) {
+                if g.ready.iter_pids().any(|p| p != cur) {
                     found = true;
                     break;
                 }
@@ -3324,7 +3480,8 @@ pub mod test_hooks {
             slot.home_cpu
         };
         drop(g);
-        run_mut(home).ready.retain(|&p| p != pid);
+        // EEVDF：`retain` -> `remove`（语义等价）。
+        dequeue_ready(&mut run_mut(home), pid);
         true
     }
 
@@ -3381,9 +3538,12 @@ pub mod test_hooks {
     /// 场景构造需要"current=A 且队列仅含 B"的状态——spawn 会自动入队，
     /// 无法用现有钩子表达"A 不在队中"。测试夹具专用，生产路径禁用。
     pub fn debug_set_ready_queue(pids: &[usize]) {
-        let mut q = VecDeque::new();
-        for p in pids {
-            q.push_back(*p);
+        let mut q = crate::sched_eevdf::VruntimeQueue::new();
+        // EEVDF：测试夹具按给定顺序赋 vruntime，使取出顺序**可预期地等于入参顺序**
+        // （否则夹具的"队列仅含 B"前提仍成立，但依赖顺序的用例会不确定）。
+        // 递增的 vruntime 让堆的取出顺序与入参一致。
+        for (i, p) in pids.iter().enumerate() {
+            q.insert(*p, i as u64);
         }
         // 纯 RUN（b）：整体替换本核 RUN 域就绪队列。
         run_mut(my_cpu_slot()).ready = q;
@@ -3403,11 +3563,12 @@ pub mod test_hooks {
         // per-pid（a）：只取本核 RUN 域。
         let mut run = run_mut(my_cpu_slot());
         run.ready.clear();
-        run.ready.push_back(peer);
+        // EEVDF：夹具只需 peer 在队中；vruntime 取 0 即可（队列仅此一项）。
+        run.ready.insert(peer, 0);
         run.current = Some(current);
         let mut frame = initial_frame(0x400000, 0x7ffefffff000, 0);
         let outcome = block_current_locked(&mut run, &mut frame, &mut || false);
-        outcome == SwitchOutcome::NotSwitched && run.ready.contains(&peer)
+        outcome == SwitchOutcome::NotSwitched && run.ready.contains(peer)
     }
 
     /// 审计 R5-F2 验收钩子：丢弃 FPU 模板缓存，令下一次 spawn 重新快照。
@@ -3698,8 +3859,9 @@ pub mod test_hooks {
     pub fn debug_commit_switch_table(ready: &[usize]) -> Option<usize> {
         let mut run = run_mut(my_cpu_slot());
         run.ready.clear();
-        for p in ready {
-            run.ready.push_back(*p);
+        // EEVDF：夹具按入参顺序赋递增 vruntime，保证提交顺序可预期。
+        for (i, p) in ready.iter().enumerate() {
+            run.ready.insert(*p, i as u64);
         }
         run.current = None;
         while let Some(p) = pop_ready(&mut run, usize::MAX) {
