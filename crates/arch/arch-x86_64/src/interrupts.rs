@@ -114,9 +114,21 @@ global_asm!(
         push r14
         push r15
 
-        mov rdi, rsp
-        // SYSCALL-FAST-4：GS 进入钩子（仅向量 0x80 且来自用户态时 swapgs）。
-        call gs_entry_hook
+        // SYSCALL-FAST-4：GS 进入判定——**只看本帧 CS 的 CPL，不看向量**。
+        //
+        // 任何来自 Ring3 的进入（int 0x80、时钟、异常……）都发生在「用户态 GS
+        // 状态」下（`GS.base` = 用户值，`KERNEL_GS_BASE` = per-CPU），内核必须先
+        // `swapgs` 换回 per-CPU 地址；内核态进入（CPL0，含嵌套中断）则**不得**换。
+        //
+        // 为什么不用 Rust 钩子 + 全局标志：嵌套中断时内层会把外层置的标志清掉，
+        // 外层返回用户态时漏掉 swapgs——GS 状态翻转，偶发 #GP，极难复现。
+        // 每次进出都从**自己的帧**读 CPL，天然嵌套安全（无共享状态）。
+        // 偏移 144 = CS 在 InterruptFrame 中的位置（FAST-2 实测钉死）。
+        // `test mem, imm` 不破坏任何寄存器——此刻 15 个 GPR 都已是待保存的现场。
+        test byte ptr [rsp + 144], 3
+        jz 7f
+        swapgs
+        7:
         mov rdi, rsp
         call interrupt_dispatch
 
@@ -139,15 +151,16 @@ global_asm!(
 
         // 跳过中断号 + 错误码（各 8 字节）
         add rsp, 16
-        // SYSCALL-FAST-4：GS 退出钩子（与进入钩子配对，回到用户 GS 状态）。
-        // 必须在 iretq 之前、且在帧已被消费之后调用（此处 rsp 已指向 iretq 帧）。
-        push rdi
-        push rsi
-        push rax
-        call gs_exit_hook
-        pop rax
-        pop rsi
-        pop rdi
+        // SYSCALL-FAST-4：GS 退出判定——与进入判定配对，但**读的是即将 iretq 的
+        // 那一帧的 CS**（[rsp+8]）。调度器可能在分发期间把帧整体替换成另一进程的
+        // 保存帧：若那也是用户帧（cs&3==3），照样要 swapgs；若替换成了内核帧则不换。
+        // 判据跟着「要回哪」走，而不是跟着「从哪来」走，这才是配对不变式：
+        //   **CPL3 ⟺ GS.base 是用户值**。
+        // 同样只用 `test mem, imm`——此刻用户 GPR 已全部恢复，多碰一个都是破坏现场。
+        test byte ptr [rsp + 8], 3
+        jz 8f
+        swapgs
+        8:
         iretq
 
     // 生成异常入口（无错误码）：先压占位错误码 0，再压中断号。
@@ -704,7 +717,16 @@ global_asm!(
         // 用户 RSP 先存到 GS:24 的暂存位（本核私有，无需跨核同步）。
         // 注意：此时 RSP 仍是用户栈，任何 push 都会踩用户栈——故先只用 mov。
         mov qword ptr gs:[24], rsp
-        mov rsp, qword ptr gs:[16]
+        // 切换到**本核专用 syscall 栈**（gs:[48]），而**不是** gs:[16]。
+        //
+        // gs:[16] 是「借来的当前内核栈」（引导期由 RSP 向上对齐推出）。若 syscall
+        // 发自内核正在使用该栈的时刻，压入 176 字节的帧会直接覆盖内核的活动栈帧，
+        // 而 `sysretq` 不弹帧 —— 内核随后带着被破坏的栈继续跑。
+        // 实测症状：`sys_write` 第二次进入时在堆分配器内部异常（标记 `1 1 a A`
+        // 之后不再前进），以及更早版本的整体静默停机。
+        //
+        // gs:[48] 指向 `SYSCALL_STACKS[slot]`（16 KiB，`.bss`），与任何内核栈无关。
+        mov rsp, qword ptr gs:[48]
 
         // ---- 阶段 3：在内核栈上构造 InterruptFrame ----
         // 布局（低->高）与 interrupt_common_stub 完全一致：
@@ -999,55 +1021,13 @@ fn raw_serial_fmt(args: core::fmt::Arguments) {
     crate::serial::write_str(s);
 }
 
-// ---------- SYSCALL-FAST-4：GS 进入/退出钩子 ----------
-
-/// 本核本次中断是否需要「退出时 swapgs」（由进入钩子置位）。
-///
-/// 语义：`int 0x80` 从用户态进入时置 1，退出钩子据此 `swapgs` 换回用户 GS 状态。
-/// 其它向量、以及内核态发起的 `int 0x80` 保持 0（不动作）。
-static GS_UNSWAP_PENDING: AtomicUsize = AtomicUsize::new(0);
-
-/// GS 进入钩子：**仅**「向量 0x80 且来自 CPL3」时 `swapgs`。
-///
-/// ## 为什么需要它
-///
-/// `enter_usermode` 在切到用户态前 `swapgs`，故用户态 `GS.base` = 用户值。
-/// 从用户态进入内核必须换回 per-CPU 地址；返回用户态前再换回去。`syscall` 的
-/// stub 自己做这一对，但 `int 0x80` 走公共 stub，故在此补上。
-///
-/// ## 为什么用 CS 门控
-///
-/// 内核态自己执行 `int 0x80` 时 GS **已是** per-CPU 地址，再换一次会把它换成用户值。
-/// 故只在 CS 低两位为 3（来自用户态）时动作。
-///
-/// # Safety
-/// 由汇编 `interrupt_common_stub` 以 `rdi = frame` 调用；帧必须是有效的中断帧。
-#[unsafe(no_mangle)]
-pub extern "C" fn gs_entry_hook(frame: *const InterruptFrame) {
-    // 地基未建立时不动作（避免把垃圾换进 GS.base）。
-    if !crate::percpu::is_enabled() {
-        GS_UNSWAP_PENDING.store(0, Ordering::Release);
-        return;
-    }
-    let f = unsafe { &*frame };
-    let from_user = f.vector == 0x80 && (f.cs & 3) == 3;
-    if from_user {
-        unsafe { crate::percpu::swapgs() };
-        GS_UNSWAP_PENDING.store(1, Ordering::Release);
-    } else {
-        GS_UNSWAP_PENDING.store(0, Ordering::Release);
-    }
-}
-
-/// GS 退出钩子：与 [`gs_entry_hook`] 配对，换回用户 GS 状态。
-///
-/// 必须在 `iretq` **之前**调用，且只在进入钩子置位时才动作（配对性）。
-#[unsafe(no_mangle)]
-pub extern "C" fn gs_exit_hook() {
-    if GS_UNSWAP_PENDING.swap(0, Ordering::AcqRel) == 1 {
-        unsafe { crate::percpu::swapgs() };
-    }
-}
+// ---------- SYSCALL-FAST-4：GS 进出判定（已内联进 interrupt_common_stub）----------
+//
+// 历史备注：本节原是 `gs_entry_hook`/`gs_exit_hook` 两个 Rust 钩子 + 一个全局
+// `GS_UNSWAP_PENDING` 标志。实测发现该设计有**嵌套中断缺陷**：内层中断会把外层
+// 置位的标志清掉，外层返回用户态时漏掉 swapgs，GS 状态整体翻转，此后偶发 #GP。
+// 已改为 stub 内联 CPL 判定（`test [rsp+144], 3` / `test [rsp+8], 3`），每次进出
+// 都读**自己那一帧**，无共享状态，天然嵌套安全。钩子已删除（单一来源）。
 
 /// 分发入口（由汇编 `interrupt_common_stub` 调用）。
 ///

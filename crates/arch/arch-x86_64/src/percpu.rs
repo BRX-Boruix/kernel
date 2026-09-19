@@ -69,6 +69,16 @@ pub struct PerCpu {
     pub syscall_user_rip: u64,
     /// `syscall` 入口的用户 RFLAGS 暂存槽（offset 40）。
     pub syscall_user_rflags: u64,
+    /// 本核**专用 syscall 入口栈**的栈顶（offset 48，高地址端）。
+    ///
+    /// 与 `kernel_stack_top` 的区别：后者是「借来的」当前内核栈（引导期由 RSP
+    /// 推出），syscall 入口把 176 字节的帧压进去会**覆盖内核自己的活动栈帧**，
+    /// 而 `sysretq` 返回用户态时又不弹出该帧——实测导致内核堆分配器内部异常。
+    /// 本字段指向 `SYSCALL_STACKS` 的独立缓冲，现场彻底隔离。
+    ///
+    /// **放在结构末尾**：24/32/40 三个偏移被入口 stub 硬编码，插入字段会移位，
+    /// 编译期 `offset_of!` 断言会立刻拦下（本字段首版正是插在 offset 16 处被拦）。
+    pub syscall_stack_top: u64,
 }
 
 /// 每核一个（256 = 与 `smp.rs` 槽位容量同源的上限）。
@@ -100,6 +110,10 @@ const _: () = {
         "PerCpu.syscall_user_rip must be at 32 (hardcoded in syscall stub)"
     );
     assert!(
+        core::mem::offset_of!(PerCpu, syscall_stack_top) == 48,
+        "PerCpu.syscall_stack_top must be at 48 (appended at the end, never inserted)"
+    );
+    assert!(
         core::mem::offset_of!(PerCpu, syscall_user_rflags) == 40,
         "PerCpu.syscall_user_rflags must be at 40 (hardcoded in syscall stub)"
     );
@@ -122,6 +136,37 @@ static GS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// 用独立的 `AtomicU64` 把「汇编可读」变成显式契约（S21）。
 pub static GS_READY_FLAG: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// 每个 CPU 的**专用 syscall 入口栈**（16 KiB，`.bss`，64 字节对齐）。
+///
+/// ## 为什么必须独立于「当前内核栈」
+///
+/// `syscall` 指令**不切栈**，内核必须在入口立刻换栈。首版用
+/// `current_kernel_stack_top()`（把**启动时**的 RSP 向上对齐到 64 KiB 边界）
+/// 作为目标栈顶——那是**引导期 kmain 栈**。当内核正在该栈上执行、用户进程
+/// 又发起 `syscall` 时，入口把 176 字节的帧压进**同一个 64 KiB 窗口**，
+/// 直接覆盖内核的活动栈帧；`sysretq` 返回用户态时又**不弹出**该帧，
+/// 于是内核带着被破坏的栈继续跑。实测症状：`sys_write` 第二次进入时在
+/// 内核堆分配器内部异常，以及更早的整体静默停机。
+///
+/// 专用栈把 syscall 现场与任何内核栈彻底隔离（S23：不共享可变状态）。
+#[repr(C, align(64))]
+pub struct SyscallStack(pub [u8; SYSCALL_STACK_SIZE]);
+
+/// 专用 syscall 栈大小（16 KiB）。
+pub const SYSCALL_STACK_SIZE: usize = 16 * 1024;
+
+impl SyscallStack {
+    /// 栈顶（高地址端，栈向下增长）。
+    pub fn top(&self) -> u64 {
+        (self.0.as_ptr() as u64).wrapping_add(SYSCALL_STACK_SIZE as u64)
+    }
+}
+
+/// 每 CPU 一张专用 syscall 栈。
+#[unsafe(no_mangle)]
+pub static SYSCALL_STACKS: [SyscallStack; MAX_CPUS] =
+    [const { SyscallStack([0; SYSCALL_STACK_SIZE]) }; MAX_CPUS];
 
 /// 读 `IA32_KERNEL_GS_BASE`（0xC000_0102）。`swapgs` 的另一半。
 #[inline]
@@ -260,6 +305,7 @@ impl PerCpuStorage {
                 syscall_user_rsp: 0,
                 syscall_user_rip: 0,
                 syscall_user_rflags: 0,
+                syscall_stack_top: 0,
             },
         }
     }
@@ -285,12 +331,14 @@ pub fn storage_of_slot(slot: usize) -> *mut PerCpu {
 /// 返回是否成功。
 pub fn init_current(slot: usize, kernel_stack_top: u64) -> bool {
     let base = storage_of_slot(slot);
-    if base.is_null() {
+    if base.is_null() || slot >= MAX_CPUS {
         return false;
     }
     register_slot(slot, base);
     unsafe {
         (*base).kernel_stack_top = kernel_stack_top;
+        // 专用 syscall 栈顶：**与任何内核栈无关**，见 `SYSCALL_STACKS` 的说明。
+        (*base).syscall_stack_top = SYSCALL_STACKS[slot].top();
     }
     enable_on_current(slot)
 }
