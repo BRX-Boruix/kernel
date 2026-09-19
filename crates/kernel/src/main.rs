@@ -571,6 +571,10 @@ unsafe fn kmain_body() -> ! {
     tests::test_cow_clone_huge_page();
     #[cfg(feature = "kernel-test-m5")]
     tests::test_ipc();
+    // ADR-038 T6：SYS_TASK_DERIVE 端到端验收（真实 syscall 路径，含 COW 共享、
+    // 新组语义、亲子关系、子首跑 rax=0 与写隔离）。
+    #[cfg(feature = "kernel-test-m5")]
+    tests::test_task_derive_e2e();
     #[cfg(feature = "kernel-test-m5")]
     tests::test_process_reclaim();
 

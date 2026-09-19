@@ -1860,6 +1860,245 @@ pub fn test_ipc1_semantics() {
     info!("[test-ipc1] PASS");
 }
 
+/// ADR-038 / T6：**端到端** COW 派生（`SYS_TASK_DERIVE` / 0x3A）真实路径验收。
+///
+/// 与 `test_cow_clone`（只测 `clone_cow` 这一 mm 层原语）不同，本测试走**完整**
+/// syscall 路径：安装伪当前进程 → 构造真实 `arch_frame`（SyscallFrame 的关键字段）
+/// → `syscall_entry(SYS_TASK_DERIVE)` → 检查内核真实装配出的子进程。
+///
+/// 这正对应 ADR-038 风险 R1：`clone_cow` 此前**从未有生产调用方**，本测试是它的
+/// 第一个真实消费者，因此必须验证的是「ADR-019 引用计数记账 + destroy 清理在真实
+/// 路径下成立」，而不是原语自身的单元行为。
+///
+/// 断言（全部可证伪）：
+/// 1. **父收 pid**：syscall 返回 `> 0` 且该 pid 确实在进程表内注册；
+/// 2. **子进程形成独立组**：子进程 tgid == 自身 pid（≠ 父 pid），即**新线程组**
+///    （与线程的 tgid == 组长 pid 判然不同）；
+/// 3. **亲子关系成立**：子进程 ppid == 父 pid，故 waitpid 可收（POSIX 语义）；
+/// 4. **地址空间 COW 共享**：子进程地址空间对父已映射页解析到**同一物理帧**，
+///    且该帧引用计数为 2（父 + 子各一）；
+/// 5. **子首跑帧 rax = 0**：POSIX fork 铁律的内核侧证据（子从 syscall 返回 0）；
+///    父返回值为真 pid——一次调用、两次返回，两种取值都可观测；
+/// 6. **写隔离**：对子侧页触发写故障后，子拿到**新帧**、父帧内容不变、父帧
+///    引用计数回落 1（COW 语义未被共享破坏）；
+/// 7. **保留位如实拒绝**：`flags/entry_rsp/entry_rip` 任一非 0 → `InvalidParam`，
+///    且**不产生任何子进程**（对抗性输入，S31）。
+///
+/// 收尾（S18 资源纪律）：子进程 PCB 与其地址空间显式回收，帧计数回到基线。
+#[cfg(feature = "kernel-test-m5")]
+pub fn test_task_derive_e2e() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use arch_x86_64::interrupts::InterruptFrame;
+    use klib::error::Error;
+    use task::Process;
+
+    info!("[derive-e2e] === ADR-038 T6: end-to-end SYS_TASK_DERIVE ===");
+    // KM16 纪律（同 test_syscall_munmap / test_waitpid_core）：本测试安装伪当前
+    // 进程并直接派发 syscall；若 LAPIC tick 中途到来，调度器会把就绪队列里其它
+    // 进程的保存帧 iretq 进真实入口，测试现场即被摧毁。全程关中断，结束复原。
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+
+    // 真实用户态现场：derive 会**读**它来构造子进程首跑帧，故必须是真的。
+    const USER_RIP: u64 = 0x0000_0000_0040_1234;
+    const USER_RSP: u64 = 0x0000_0000_7FFF_F000;
+    let mut ifr = InterruptFrame {
+        r15: 0x15, r14: 0x14, r13: 0x13, r12: 0x12,
+        r11: 0x11, r10: 0xDEAD, r9: 0x09, r8: 0x08,
+        rbp: 0xB0, rdi: 0xD1, rsi: 0x51, rdx: 0xD2,
+        rcx: 0xC1, rbx: 0xB1,
+        // rax 是「syscall 返回值」槽：父侧会被 pack_ok 覆写为 pid，
+        // 子侧应被固定为 0 而**与父不同**。初值取非 0 以便证伪「未改写」。
+        rax: 0xAA,
+        vector: 0,
+        error_code: 0,
+        rip: USER_RIP,
+        cs: task::process::user_code_selector() as u64,
+        rflags: 0x202,
+        rsp: USER_RSP,
+        ss: task::process::user_data_selector() as u64,
+    };
+
+    let mut frame = |nr: u32, a1: u64, a2: u64, a3: u64| SyscallFrame {
+        nr: nr as u64,
+        a1,
+        a2,
+        a3,
+        a4: 0,
+        a5: 0,
+        result: 0,
+        switched: false,
+        arch_frame: (&mut ifr as *mut InterruptFrame) as usize,
+        aux_pid: 0,
+    };
+
+    // ---- 父进程：一个独立组，含一页真实映射的数据。 ----
+    let mut parent_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("parent address space");
+    const DATA: u64 = 0x0000_0000_0060_0000;
+    parent_space
+        .reserve_user(
+            VirtAddr::new(DATA),
+            VirtAddr::new(DATA + 0x1000),
+            PageSize::Size4K,
+            PageFlags::empty().writable().user(),
+        )
+        .expect("reserve parent data page");
+    assert!(parent_space.handle_page_fault(
+        DATA,
+        arch_x86_64::paging::PageFaultCode::new(arch_x86_64::paging::PF_EC_WRITE),
+    ));
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let parent_phys = parent_space.translate(VirtAddr::new(DATA)).unwrap().as_u64();
+    const MARKER: u64 = 0xF0F0_1234_5678_9ABC;
+    unsafe { core::ptr::write_volatile((parent_phys + off) as *mut u64, MARKER) };
+    info!(
+        "[derive-e2e] parent data v={:#x} phys={:#x} marker={:#x}",
+        DATA, parent_phys, MARKER
+    );
+
+    let parent_pid = 0x5150usize; // 刻意避开 init/测试用的 pid，便于辨识。
+    // 父进程必须**同时**满足两件事：
+    // 1. 登记进分桶进程表——`spawn_derived` 的父校验与 fd/cwd 快照都走
+    //    `proc_bucket_lock(ppid)`（`set_current_proc` 只写裸指针，不登记表）；
+    // 2. 成为 `CURRENT_PROC`——`sys_task_derive` 取父 pid 走 `current_proc_mut()`。
+    // **地址空间必须进表内入口**：`spawn_derived` 取父地址空间走
+    // `proc_bucket_lock(ppid).get(&ppid)`，故把带 DATA 页的 parent_space 交给
+    // 夹具登记（哑/另建空间都不会被派生看到——实测踩到）。
+    assert!(
+        task::test_hooks::register_test_entry_with_space(
+            parent_pid, 0, "derive-parent", parent_space
+        ),
+        "parent must register into the process table with its real address space"
+    );
+    // 另建一个 PCB 仅用于充当 `CURRENT_PROC`（`sys_task_derive` 取父 pid 走
+    // `current_proc_mut()`）；其地址空间不参与派生，用哑空间即可。
+    let parent = Box::new(Process::new(
+        parent_pid,
+        USER_RIP,
+        USER_RSP,
+        0,
+        alloc::sync::Arc::new(
+            mm::user_space::UserAddressSpace::<X86PageTable>::new().expect("current-proc space"),
+        ),
+    ));
+    let parent_raw = Box::into_raw(parent);
+    task::set_current_proc(parent_raw);
+
+    // ---- 对抗性输入先手（S31）：保留位非 0 必须被拒且不产生子进程。 ----
+    let procs_before = task::process_snapshots().len();
+    let mut bad = frame(crate::syscall::SYS_TASK_DERIVE, 1, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut bad));
+    assert_eq!(
+        bad.result as i64,
+        -(Error::InvalidParam.to_errno() as i64),
+        "nonzero flags must be rejected with InvalidParam"
+    );
+    let mut bad2 = frame(crate::syscall::SYS_TASK_DERIVE, 0, 0x1000, 0);
+    assert!(crate::syscall::syscall_entry(&mut bad2));
+    assert_eq!(
+        bad2.result as i64,
+        -(Error::InvalidParam.to_errno() as i64),
+        "nonzero entry_rsp must be rejected with InvalidParam"
+    );
+    let mut bad3 = frame(crate::syscall::SYS_TASK_DERIVE, 0, 0, 0x400000);
+    assert!(crate::syscall::syscall_entry(&mut bad3));
+    assert_eq!(
+        bad3.result as i64,
+        -(Error::InvalidParam.to_errno() as i64),
+        "nonzero entry_rip must be rejected with InvalidParam"
+    );
+    assert_eq!(
+        task::process_snapshots().len(),
+        procs_before,
+        "rejected derive must not create any process"
+    );
+    info!("[derive-e2e] reserved-arg rejection OK (3 cases, no process created)");
+
+    // ---- 真实 derive：父收 pid。 ----
+    let mut dv = frame(crate::syscall::SYS_TASK_DERIVE, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut dv));
+    let child_pid = dv.result as i64;
+    assert!(
+        child_pid > 0,
+        "parent must receive a positive child pid, got {}",
+        child_pid
+    );
+    let child_pid = child_pid as usize;
+    assert_ne!(child_pid, parent_pid, "child pid must differ from parent");
+    info!("[derive-e2e] parent {} derived child {}", parent_pid, child_pid);
+
+    // 断言 2/3/5：子进程的组/亲子关系 + 首跑帧 rax=0。
+    let (child_tgid, child_ppid, child_saved_rax, child_rip, child_rsp) =
+        task::test_hooks::probe_derived_child(child_pid)
+            .expect("child must be registered in the process table");
+    assert_eq!(
+        child_tgid, child_pid,
+        "derived child must lead its OWN new thread group (tgid == own pid)"
+    );
+    assert_eq!(child_ppid, parent_pid, "child ppid must be the parent pid");
+    assert_eq!(
+        child_saved_rax, 0,
+        "POSIX fork: child's first-run rax must be 0 (got {:#x})",
+        child_saved_rax
+    );
+    assert_eq!(child_rip, USER_RIP, "child must resume at parent's user RIP");
+    assert_eq!(child_rsp, USER_RSP, "child must resume on parent's user RSP");
+    info!(
+        "[derive-e2e] child group/ppid/rax OK: tgid={} ppid={} rax=0 rip={:#x}",
+        child_tgid, child_ppid, child_rip
+    );
+
+    // 断言 4：地址空间 COW 共享同一物理帧，引用计数 = 2。
+    let child_phys = task::test_hooks::probe_derived_child_translate(child_pid, DATA)
+        .expect("child must see the COW-shared data page");
+    assert_eq!(
+        child_phys, parent_phys,
+        "child must share the parent's physical frame (COW)"
+    );
+    assert_eq!(
+        mm::frame_refcount(parent_phys), 2,
+        "shared frame refcount must be exactly 2 (parent + child)"
+    );
+    info!("[derive-e2e] COW sharing OK: phys={:#x} refcount=2", parent_phys);
+
+    // 断言 6：写隔离——子侧写故障复制后子拿新帧、父内容不变、父帧 rc 回落 1。
+    assert!(
+        task::test_hooks::probe_derived_child_write_fault(child_pid, DATA),
+        "child COW write fault must be handled"
+    );
+    let child_new = task::test_hooks::probe_derived_child_translate(child_pid, DATA)
+        .expect("child page after COW");
+    assert_ne!(
+        child_new, parent_phys,
+        "child must get its own frame after write fault"
+    );
+    let copied = unsafe { core::ptr::read_volatile((child_new + off) as *const u64) };
+    assert_eq!(copied, MARKER, "COW copy must preserve parent content");
+    let parent_still = unsafe { core::ptr::read_volatile((parent_phys + off) as *const u64) };
+    assert_eq!(parent_still, MARKER, "parent content must be untouched");
+    assert_eq!(
+        mm::frame_refcount(parent_phys), 1,
+        "parent frame refcount must fall back to 1 after child copies"
+    );
+    info!("[derive-e2e] write isolation OK: child got new frame, parent rc back to 1");
+
+    // ---- 收尾（S18）：回收子进程，帧计数回基线。 ----
+    // 子进程 PCB 及其地址空间（含 COW 私有帧）显式释放。
+    assert!(
+        task::test_hooks::reclaim_entry(child_pid),
+        "child entry must be reclaimable"
+    );
+    info!("[derive-e2e] child reclaimed");
+
+    // 卸载伪当前进程（Box::into_raw 的对称回收）。
+    task::set_current_proc(core::ptr::null_mut());
+    unsafe { drop(Box::from_raw(parent_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+
+    info!("[derive-e2e] PASS (real syscall path: fork semantics verified end to end)");
+}
+
 /// M5：进程内存回收（exit 后释放页表/帧）。
 ///
 /// 验证点（纯内存逻辑，不进入用户态）：构造一个独立用户地址空间，
@@ -4588,16 +4827,16 @@ pub fn test_syscall_pipe() {
         // 用 8KB 映射区（base..base+0x2000）填充可辨识模式：字节 = 索引 mod 251。
         let pattern_len = 6000usize;
         unsafe {
-            let off_mask = arch::PageSize::Size4K.bytes() - 1;
             for i in 0..pattern_len {
-                let pa = task::current_proc_mut()
+                // R7-huge 修复后 `translate` **已含**页内偏移（见 arch paging.rs
+                // `leaf_paddr_at`），故此处**不得**再补一次偏移——原实现补偏移是
+                // 为绕开「translate 只返回页基址」的旧行为；那正是被修掉的缺陷。
+                let phys = task::current_proc_mut()
                     .expect("proc")
                     .addr_space()
                     .translate(arch::VirtAddr::new(base + i as u64))
                     .expect("resident")
                     .as_u64();
-                // translate 返回页基物理地址，须补页内偏移才能落到 base+i。
-                let phys = pa + ((i as u64) & off_mask);
                 core::ptr::write((phys + off) as *mut u8, (i % 251) as u8);
             }
         }
@@ -4628,16 +4867,14 @@ pub fn test_syscall_pipe() {
         // 读回校验：内容与写入模式一致（逐字节比对）。
         let mut mismatch = None;
         unsafe {
-            let off_mask = arch::PageSize::Size4K.bytes() - 1;
             for i in 0..pattern_len {
-                let pa = task::current_proc_mut()
+                // 同填充侧：`translate` 已含页内偏移，不再补（见上方说明）。
+                let phys = task::current_proc_mut()
                     .expect("proc")
                     .addr_space()
                     .translate(arch::VirtAddr::new(base + i as u64))
                     .expect("resident")
                     .as_u64();
-                // 同填充：translate 返回页基 PA，须补页内偏移。
-                let phys = pa + ((i as u64) & off_mask);
                 let b = core::ptr::read((phys + off) as *const u8);
                 if b != (i % 251) as u8 {
                     mismatch = Some((i, b));
@@ -7861,18 +8098,17 @@ fn expect_loader_reject(elf: &[u8], cmd: &[u8], want: klib::error::Error, ctx: &
 
 /// 经页表翻译读取用户页一个字节（HHDM 直读物理帧）。
 ///
-/// 注意：`PageTable::translate` 返回的是**叶层条目的页基址物理地址**
-/// （`entry_paddr` 按页大小掩码），不包含页内偏移；页内偏移必须由调用方
-/// 补回，掩码取自 arch 页大小抽象（audit-r2 S2/S13：测试代码不豁免
-/// 零魔法值纪律）。此前漏算偏移会让任意页内探测都退化为读帧首字节。
+/// `PageTable::translate` 返回**该地址自身**的物理地址（R7-huge 修复后：
+/// 块基址 + 页内偏移，见 arch paging.rs `leaf_paddr_at`），故调用方**直接**
+/// 以返回值为物理地址即可，**不得**再补一次页内偏移——补两次会越出目标字节
+/// 落到相邻页（原先需手补偏移是「translate 只返回页基址」旧行为的绕行，
+/// 那正是被修掉的缺陷）。
 #[cfg(feature = "kernel-tests")]
 fn read_user_byte(us: &mm::user_space::UserAddressSpace<X86PageTable>, v: u64) -> u8 {
     let pa = us
         .translate(arch::VirtAddr::new(v))
         .unwrap_or_else(|| panic!("[test-loader] translate({:#x}) failed", v));
-    let page_off_mask = arch::PageSize::Size4K.bytes() - 1;
-    let phys = pa.as_u64() + (v & page_off_mask);
-    unsafe { (arch::phys_to_virt(phys) as *const u8).read_volatile() }
+    unsafe { (arch::phys_to_virt(pa.as_u64()) as *const u8).read_volatile() }
 }
 
 /// loader1/LA4：恶意/畸形 ELF 拒绝面对抗自检。

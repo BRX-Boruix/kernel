@@ -3558,6 +3558,140 @@ pub mod test_hooks {
         guard.get(&pid).map(|e| e.proc.addr_space().declared_bytes())
     }
 
+    /// ADR-038 T6 夹具：把 `pid` 注册为进程表内的一个真实入口（哑入口/栈，永不被
+    /// 调度执行——内核主线程不跑 `scheduler::start`）。
+    ///
+    /// 为何必须有：`set_current_proc` 只写 `CURRENT_PROC` 裸指针，**不**把进程登记
+    /// 进分桶进程表；而 `spawn_derived` 的父校验走 `proc_bucket_lock(ppid)`，故测试
+    /// 若只 `set_current_proc` 会得到 `NotFound`（这正是本夹具的由来，实测踩到）。
+    /// 返回是否成功插入。
+    pub fn register_test_entry(pid: usize, ppid: usize, name: &str) -> bool {
+        let (name_buf, name_len) = match store_name(name) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let space = match dummy_space() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let mut proc = Box::new(Process::<X86PageTable>::new(pid, 0x1000, 0x5000, 0, Arc::new(space)));
+        let _ = &mut proc;
+        let entry = Box::new(ProcEntry {
+            proc,
+            saved: initial_frame(0x1000, 0x5000, 0),
+            kstack_frames: match mm::allocate_frames(KSTACK_ORDER) {
+                Some(f) => f,
+                None => return false,
+            },
+            kstack_top: 0,
+            fpu: fpu_template_snapshot(),
+            name: name_buf,
+            name_len,
+            ppid,
+            exit_code: 0,
+            waiting_for: None,
+            home_cpu: my_cpu_slot(),
+            fs_base: 0,
+            vruntime: 0,
+            nice: 0,
+        });
+        // 不 `enqueue_ready`：本入口仅作表内存在（供父校验/fd 快照），绝不入就绪
+        // 队列——否则 tick 会把它调度执行，摧毁测试现场（KM16 纪律）。
+        proc_bucket_lock(pid).insert(pid, entry).is_none()
+    }
+
+    /// ADR-038 T6 夹具（带地址空间版）：把 `pid` 登记进进程表，并使用**调用方提供**
+    /// 的地址空间（而非哑空间）。
+    ///
+    /// 为何需要：`spawn_derived` 的地址空间来自**进程表内该 pid 的 PCB**
+    /// （`proc_bucket_lock(ppid).get(&ppid).proc.addr_space()`），而非 `CURRENT_PROC`。
+    /// 故测试要让派生共享到自己构造的数据页，必须把该地址空间放进**表内入口**；
+    /// 只 `set_current_proc` 一个另建的 PCB 不会生效（实测踩到：子进程共享到的是
+    /// 哑空间，DATA 页翻译不到）。
+    ///
+    /// 返回是否成功插入。
+    pub fn register_test_entry_with_space(
+        pid: usize,
+        ppid: usize,
+        name: &str,
+        space: UserAddressSpace<X86PageTable>,
+    ) -> bool {
+        let (name_buf, name_len) = match store_name(name) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let proc = Box::new(Process::<X86PageTable>::new(pid, 0x1000, 0x5000, 0, Arc::new(space)));
+        let entry = Box::new(ProcEntry {
+            proc,
+            saved: initial_frame(0x1000, 0x5000, 0),
+            kstack_frames: match mm::allocate_frames(KSTACK_ORDER) {
+                Some(f) => f,
+                None => return false,
+            },
+            kstack_top: 0,
+            fpu: fpu_template_snapshot(),
+            name: name_buf,
+            name_len,
+            ppid,
+            exit_code: 0,
+            waiting_for: None,
+            home_cpu: my_cpu_slot(),
+            fs_base: 0,
+            vruntime: 0,
+            nice: 0,
+        });
+        proc_bucket_lock(pid).insert(pid, entry).is_none()
+    }
+
+    /// ADR-038 T6 探针：返回 COW 派生子的组/亲子/首跑帧事实。
+    ///
+    /// 返回 `(tgid, ppid, saved.rax, saved.rip, saved.rsp)`。用于端到端验收
+    /// 「新组 + fork 亲子 + 子首跑 rax=0 + 从父 RIP/RSP 继续」四条语义——
+    /// 这些字段都在 PCB 内部，只有同 crate 的探针能取到，故走本模块
+    /// （沿用既有 `probe`/`probe_trampoline` 的同一纪律）。
+    pub fn probe_derived_child(pid: usize) -> Option<(usize, usize, u64, u64, u64)> {
+        let guard = proc_bucket_lock(pid);
+        guard.get(&pid).map(|e| {
+            (
+                e.proc.tgid(),
+                e.ppid,
+                e.saved.rax,
+                e.saved.rip,
+                e.saved.rsp,
+            )
+        })
+    }
+
+    /// ADR-038 T6 探针：在派生子的地址空间上翻译某用户地址（用于断言 COW 共享同一
+    /// 物理帧）。取子所在桶锁后直接调其地址空间（内部自锁，不重入桶锁）。
+    pub fn probe_derived_child_translate(pid: usize, vaddr: u64) -> Option<u64> {
+        let guard = proc_bucket_lock(pid);
+        let e = guard.get(&pid)?;
+        e.proc
+            .addr_space()
+            .translate(arch::VirtAddr::new(vaddr))
+            .map(|p| p.as_u64())
+    }
+
+    /// ADR-038 T6 探针：在派生子的地址空间上驱动一次写故障（真实 COW 复制路径）。
+    /// 返回是否被处理。用于验证「子侧写 → 复制私有帧 → 父帧内容/引用计数不受影响」。
+    pub fn probe_derived_child_write_fault(pid: usize, vaddr: u64) -> bool {
+        let guard = proc_bucket_lock(pid);
+        let Some(e) = guard.get(&pid) else {
+            return false;
+        };
+        e.proc.addr_space().handle_page_fault(
+            vaddr,
+            arch_x86_64::paging::PageFaultCode::new(arch_x86_64::paging::PF_EC_WRITE),
+        )
+    }
+
+    /// ADR-038 T6 夹具：从进程表移除并**回收** `pid` 的 ProcEntry（含地址空间 →
+    /// 走 destroy 归还全部帧）。用于测试收尾，使帧计数回基线（S18）。
+    pub fn reclaim_entry(pid: usize) -> bool {
+        proc_bucket_lock(pid).remove(&pid).is_some()
+    }
+
     /// 终止 `pid`（真实核心路径），返回终止分支名（测试断言用）。
     pub fn terminate(pid: usize, code: u64) -> &'static str {
         // per-pid：terminate_locked 自持各 pid 锁。
