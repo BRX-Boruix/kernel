@@ -2233,6 +2233,150 @@ pub fn test_cow_derive_bench() {
     info!("[cow-bench] PASS (baseline recorded; D6 optimization must compare against these numbers)");
 }
 
+/// ADR-038 决策 4 验收：**多线程父进程的 `derive` 必须被如实拒绝**。
+///
+/// # 为何这条要专门测（而不是靠 `spawn_derived` 里那行 `if` 自证）
+///
+/// 决策 4 是 ADR-038 里**唯一以「拒绝」为交付内容**的决策，而拒绝类语义最容易
+/// 在重构中被无声退化：把 `NotSupported` 换成 `Ok`、或把成员数判定写错（如用
+/// `>` 而非 `!=`、或漏掉组长自身计数），代码照样编译、其它测试照样全绿，
+/// 直到某个真实多线程程序 `fork` 后子进程里出现永久死锁。本条测试就是把该决策
+/// 钉在可证伪的断言上。
+///
+/// # 语义背景（决策 4 的理由）
+///
+/// POSIX `fork()` 在子进程内只保留**调用线程**，其余线程消失。但那些线程可能正
+/// 持有互斥锁、或维护着某个全局不变式的中途状态；在子进程里这些锁将**永久无人
+/// 释放**（持有者不存在了）。BORUIX 选择**如实拒绝**而非静默产出一个会随机死锁
+/// 的子进程——这是「失败必须可见」（S34）在能力边界上的应用。
+///
+/// # 断言（全部可证伪）
+///
+/// 1. **单线程父允许**：未派生线程前，同一进程的 `derive` 成功（对照组——否则
+///    本测试可能因为「什么都不允许」而假绿）；
+/// 2. **多线程父拒绝**：为父进程派生一个同组线程后，`derive` 返回 `NotSupported`
+///    （ENOTSUP），**而非** `Ok`；
+/// 3. **拒绝不产生子进程**：拒绝前后进程表条目数不变（拒绝路径零副作用——S20；
+///    若实现先在别处创建了 PCB 再判定，这里会抓住）；
+/// 4. **拒绝后父仍可用**：移除该线程后，`derive` 重新成功——证明成员数判定是
+///    **实时**的而非一次性粘滞状态（防止「一旦多线程就永久拒绝」的实现错误）。
+#[cfg(feature = "kernel-test-m5")]
+pub fn test_derive_multithreaded_parent_rejected() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use arch_x86_64::interrupts::InterruptFrame;
+    use klib::error::Error;
+    use task::Process;
+
+    info!("[derive-mt] === ADR-038 decision 4: multi-threaded parent must be rejected ===");
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+
+    // 常量先立于闭包之外（闭包可变借用 ifr，之后再读 ifr.rip 会冲突）。
+    const MT_RIP: u64 = 0x0000_0000_0040_2000;
+    const MT_RSP: u64 = 0x0000_0000_7FFF_E000;
+    let mut ifr = InterruptFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0, error_code: 0,
+        rip: MT_RIP,
+        cs: task::process::user_code_selector() as u64,
+        rflags: 0x202,
+        rsp: MT_RSP,
+        ss: task::process::user_data_selector() as u64,
+    };
+    let mut frame = |a1: u64, a2: u64, a3: u64| SyscallFrame {
+        nr: crate::syscall::SYS_TASK_DERIVE as u64,
+        a1,
+        a2,
+        a3,
+        a4: 0,
+        a5: 0,
+        result: 0,
+        switched: false,
+        arch_frame: (&mut ifr as *mut InterruptFrame) as usize,
+        aux_pid: 0,
+    };
+
+    let parent_pid = 0x5151usize;
+    assert!(
+        task::test_hooks::register_test_entry_with_space(
+            parent_pid,
+            0,
+            "mt-parent",
+            mm::user_space::UserAddressSpace::<X86PageTable>::new().expect("mt parent space"),
+        ),
+        "parent must register"
+    );
+    let parent = Box::new(Process::new(
+        parent_pid,
+        MT_RIP,
+        MT_RSP,
+        0,
+        alloc::sync::Arc::new(
+            mm::user_space::UserAddressSpace::<X86PageTable>::new().expect("current space"),
+        ),
+    ));
+    let parent_raw = Box::into_raw(parent);
+    task::set_current_proc(parent_raw);
+
+    // --- 断言 1（对照组）：单线程父 → derive 成功 ---
+    let mut ok1 = frame(0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut ok1));
+    assert!(
+        (ok1.result as i64) > 0,
+        "single-threaded parent must be allowed to derive (control group), got {}",
+        ok1.result as i64
+    );
+    let child1 = ok1.result as usize;
+    info!("[derive-mt] control: single-threaded parent derived child {}", child1);
+    assert!(task::test_hooks::reclaim_entry(child1), "reclaim control child");
+
+    // --- 造一个同组线程，使父变成多线程 ---
+    let tid = task::test_hooks::spawn_thread_of(parent_pid, "mt-worker")
+        .expect("spawn a second thread in the parent group");
+    info!("[derive-mt] parent now has an extra thread tid={}", tid);
+
+    // --- 断言 2 + 3：多线程父 → NotSupported，且不产生子进程 ---
+    let procs_before = task::process_snapshots().len();
+    let mut mt = frame(0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut mt));
+    assert_eq!(
+        mt.result as i64,
+        -(Error::NotSupported.to_errno() as i64),
+        "multi-threaded parent MUST be rejected with ENOTSUP, got {}",
+        mt.result as i64
+    );
+    assert_eq!(
+        task::process_snapshots().len(),
+        procs_before,
+        "rejected derive must create no process (zero side effects)"
+    );
+    info!("[derive-mt] multi-threaded parent correctly rejected with ENOTSUP (no process created)");
+
+    // --- 断言 4：移除该线程后，父重新可用（判定是实时的，非粘滞） ---
+    assert!(
+        task::test_hooks::reclaim_entry(tid),
+        "remove the extra thread to restore single-threaded parent"
+    );
+    let mut ok2 = frame(0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut ok2));
+    assert!(
+        (ok2.result as i64) > 0,
+        "after the extra thread is gone, derive must succeed again (liveness of the check), got {}",
+        ok2.result as i64
+    );
+    let child2 = ok2.result as usize;
+    assert!(task::test_hooks::reclaim_entry(child2), "reclaim second child");
+    info!("[derive-mt] check is live: parent usable again after thread removal");
+
+    // 收尾（S18）：卸下伪当前进程 + 回收父入口。
+    task::set_current_proc(core::ptr::null_mut());
+    unsafe { drop(Box::from_raw(parent_raw)) };
+    assert!(task::test_hooks::reclaim_entry(parent_pid), "reclaim parent");
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+
+    info!("[derive-mt] PASS (decision 4 verified: rejected when threaded, live when not)");
+}
+
 /// M5：进程内存回收（exit 后释放页表/帧）。
 ///
 /// 验证点（纯内存逻辑，不进入用户态）：构造一个独立用户地址空间，

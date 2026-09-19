@@ -579,6 +579,10 @@ unsafe fn kmain_body() -> ! {
     // 「优化了 X%」的声明不可证伪）。纯内存测量，返回主流程。
     #[cfg(feature = "kernel-test-m5")]
     tests::test_cow_derive_bench();
+    // ADR-038 决策 4：多线程父进程的 derive 必须被如实拒绝（拒绝类语义最容易在
+    // 重构中无声退化，故钉在可证伪断言上）。
+    #[cfg(feature = "kernel-test-m5")]
+    tests::test_derive_multithreaded_parent_rejected();
     #[cfg(feature = "kernel-test-m5")]
     tests::test_process_reclaim();
 
