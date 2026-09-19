@@ -575,6 +575,10 @@ unsafe fn kmain_body() -> ! {
     // 新组语义、亲子关系、子首跑 rax=0 与写隔离）。
     #[cfg(feature = "kernel-test-m5")]
     tests::test_task_derive_e2e();
+    // ADR-038 D6：COW 派生每页成本的**基线**测量（先立尺再动刀；无基线则任何
+    // 「优化了 X%」的声明不可证伪）。纯内存测量，返回主流程。
+    #[cfg(feature = "kernel-test-m5")]
+    tests::test_cow_derive_bench();
     #[cfg(feature = "kernel-test-m5")]
     tests::test_process_reclaim();
 

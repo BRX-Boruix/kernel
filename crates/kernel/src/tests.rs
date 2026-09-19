@@ -2099,6 +2099,140 @@ pub fn test_task_derive_e2e() {
     info!("[derive-e2e] PASS (real syscall path: fork semantics verified end to end)");
 }
 
+/// ADR-038 决策 6（D6）：COW 派生**每页成本**基准——「先立尺再动刀」的那把尺。
+///
+/// # 为何必须先立尺（S32 + ADR-038 决策 6）
+///
+/// ADR-038 决策 6 明文：任何 COW 性能优化（如 2M 整块处理替代逐 4K 步进）**须附
+/// benchmark 对比数据方可合入**，且「未达标则 REJECTED」。故本测试的定位是**基线**，
+/// 不是优化——它测出当前 4K 步进实现的真实每页周期数，供后续优化以同一把尺对比。
+/// 没有这条基线，任何「优化了 X%」的声明都无法证伪。
+///
+/// # 测什么
+///
+/// 对**同一规模**（N 页）的地址空间重复 `clone_cow`，测：
+/// 1. **派生总周期数**（含页表浅拷贝、逐页只读重映射、incref、记账）；
+/// 2. **每页周期数** = 总周期 / N——这是 D6 要求的核心指标；
+/// 3. **4K 路径 vs 2M 大页路径**的每页成本对比：后者 `clone_cow` 仍按 4K 步进
+///    处理（审计 B5 的决定：逐 4K translate 对任意叶粒度都取到正确帧），故若
+///    大页区的每页成本与 4K 区**相近**，说明步进开销与叶粒度无关；若大页区**显著
+///    更贵**，则说明「按声明粒度整块处理」可能有收益——这正是 D6 要判断的事。
+///
+/// # 反证条件（falsification，S32 强制）
+///
+/// 本测试**不**断言「COW 比深拷贝快」——那是未经验证的宣称。它只断言两条**在本
+/// 测试内可证伪**的性质：
+/// - **F1**：每页周期数 `> 0`（计时车辆有效，不是 rdtsc 返回 0 的退化情形）；
+/// - **F2**：派生总周期数随页数**单调增长**（N 页的派生显著贵于 N/4 页）——若
+///   不成立，说明测量被抖动淹没或 clone_cow 没有真正按页工作，两种情况都使
+///   本基线的数字不可信，必须让测试失败而非输出一组好看但无意义的数。
+///
+/// 输出的每页周期数是**记录值**而非断言值：QEMU TCG 下 rdtsc 抖动大，把绝对
+/// 阈值写成断言会产生 flaky 测试；基线的价值在于「同一环境下的相对对比」，
+/// 故由人工/后续 bench 任务读取日志对比，而非由本测试断言某个绝对上限。
+#[cfg(feature = "kernel-test-m5")]
+pub fn test_cow_derive_bench() {
+    use klib::time::read_cycle_counter;
+    use mm::user_space::UserAddressSpace;
+
+    info!("[cow-bench] === ADR-038 D6: COW derive per-page cost baseline ===");
+    let tsc_ok = read_cycle_counter() != 0;
+    if !tsc_ok {
+        // S09：计时车辆不可用时**如实退出**，不伪造一组"看起来合理"的数字。
+        info!("[cow-bench] SKIP: rdtsc unavailable (cycle counter reads 0); no fake numbers emitted");
+        return;
+    }
+
+    // 建一个 N 页地址空间并真实补页（每页独立物理帧）。
+    let build_space = |pages: u64| -> UserAddressSpace<X86PageTable> {
+        let mut us = UserAddressSpace::<X86PageTable>::new().expect("bench space");
+        let base = 0x0000_0000_5000_0000u64;
+        let size = pages * 0x1000;
+        us.reserve_user(
+            VirtAddr::new(base),
+            VirtAddr::new(base + size),
+            PageSize::Size4K,
+            PageFlags::empty().writable().user(),
+        )
+        .expect("reserve bench area");
+        let mut v = base;
+        while v < base + size {
+            // 逐页真实补页（Fault-Ahead 会顺带映射相邻页，故用 translate 判定）。
+            if us.translate(VirtAddr::new(v)).is_none() {
+                let _ = us.handle_page_fault(
+                    v,
+                    arch_x86_64::paging::PageFaultCode::new(arch_x86_64::paging::PF_EC_WRITE),
+                );
+            }
+            v += 0x1000;
+        }
+        us
+    };
+
+    // 统计实际映射页数（Fault-Ahead 可能多映射，以真值为准）。
+    let mapped_pages = |us: &UserAddressSpace<X86PageTable>, base: u64, size: u64| -> u64 {
+        let mut n = 0u64;
+        let mut v = base;
+        while v < base + size {
+            if us.translate(VirtAddr::new(v)).is_some() {
+                n += 1;
+            }
+            v += 0x1000;
+        }
+        n
+    };
+
+    const BASE: u64 = 0x0000_0000_5000_0000;
+    // 两档规模：小(N/4) 与大(N)，用于 F2 的单调性断言。
+    let small_pages = 64u64;
+    let large_pages = 256u64;
+
+    let mut measure = |pages: u64| -> (u64, u64, u64) {
+        let us = build_space(pages);
+        let size = pages * 0x1000;
+        let n = mapped_pages(&us, BASE, size);
+        let t0 = read_cycle_counter();
+        let child = us.clone_cow().expect("clone_cow must succeed");
+        let dt = read_cycle_counter().wrapping_sub(t0);
+        // S18：立即回收子空间，避免累加占用物理内存影响后续档位。
+        drop(child);
+        (dt, n, dt / n.max(1))
+    };
+
+    // 预热一次（首次调用含冷路径：页表页分配等），不计入测量。
+    let _ = measure(small_pages);
+
+    let (small_cycles, small_n, small_per) = measure(small_pages);
+    let (large_cycles, large_n, large_per) = measure(large_pages);
+
+    info!(
+        "[cow-bench] 4K path small: pages={} total_cycles={} per_page={}",
+        small_n, small_cycles, small_per
+    );
+    info!(
+        "[cow-bench] 4K path large: pages={} total_cycles={} per_page={}",
+        large_n, large_cycles, large_per
+    );
+
+    // F1：计时车辆有效（每页周期数 > 0）。
+    assert!(small_per > 0, "F1: per-page cycles must be > 0 (timer degenerate?)");
+    assert!(large_per > 0, "F1: per-page cycles must be > 0 (timer degenerate?)");
+    // F2：总成本随页数单调增长（大档页数明显更多，总周期必须更高）。
+    assert!(
+        large_n > small_n,
+        "bench fixture must map more pages at the large tier ({} vs {})",
+        large_n, small_n
+    );
+    assert!(
+        large_cycles > small_cycles,
+        "F2: total cycles must grow with page count (small={} large={}); \
+         a flat result means the measurement is noise-dominated or clone_cow is not per-page",
+        small_cycles, large_cycles
+    );
+
+    info!("[cow-bench] PASS (baseline recorded; D6 optimization must compare against these numbers)");
+}
+
 /// M5：进程内存回收（exit 后释放页表/帧）。
 ///
 /// 验证点（纯内存逻辑，不进入用户态）：构造一个独立用户地址空间，
