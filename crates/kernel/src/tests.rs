@@ -61,6 +61,37 @@ pub fn test_paging() {
         "[test-paging] 2M: translate -> {:#x}",
         pt2.translate(vaddr2m).unwrap().as_u64()
     );
+    // ---- 2b. 2M 大页的**页内偏移**翻译（R7-huge 回归，2026-09-19）----
+    //
+    // 根因：`entry_paddr` 按大页大小掩掉低位，只给块基址；`translate` 原先直接
+    // 返回它，导致大页内**任意**地址都解析到同一物理地址。调用方据 HHDM 访问
+    // 会命中错误内存（静默数据腐蚀）。原测试只在 2M **基址**上 translate，
+    // 恰好在偏移 0 处，故对本缺陷不可见。
+    //
+    // 本段用 2M 基址 + 多个非零偏移断言 `phys == phys2m + offset`，可证伪。
+    for off in [0u64, 0x1000, 0x40000, 0x1F_F000] {
+        let got = pt2.translate(VirtAddr::new(vaddr2m.as_u64() + off)).unwrap().as_u64();
+        assert_eq!(
+            got,
+            phys2m + off,
+            "2M leaf translate must add in-block offset {:#x} (got {:#x}, base {:#x})",
+            off,
+            got,
+            phys2m
+        );
+    }
+    // `translate_with_flags` 必须与 `translate` 给出**同一**物理地址
+    // （两条路径曾各自独立使用 entry_paddr，存在不一致风险）。
+    for off in [0u64, 0x3000, 0x10_0000] {
+        let a = pt2.translate(VirtAddr::new(vaddr2m.as_u64() + off)).unwrap().as_u64();
+        let (b, _flags) = pt2
+            .translate_with_flags(VirtAddr::new(vaddr2m.as_u64() + off))
+            .unwrap();
+        assert_eq!(a, b.as_u64(), "translate vs translate_with_flags must agree");
+        assert_eq!(a, phys2m + off, "both paths must include in-block offset");
+    }
+    info!("[test-paging] 2M: in-block offset translation (4 offsets) + flags-path agreement OK");
+
     info!(
         "[test-paging] 2M: unmap -> {:#x}",
         pt2.unmap(vaddr2m).unwrap().as_u64()
@@ -1449,6 +1480,153 @@ pub fn test_cow_clone() {
     info!("[cow-test] PASS");
 }
 
+/// M5 补充（R7 验收）：**2M 大页**地址空间上的 COW 派生。
+///
+/// 为何单独一个测试：`clone_cow` 固定按 4K 步进逐页处理，而父侧 `unmap` 在遇到
+/// **2M 叶**时会走 `paging::unmap` 的**大页拆分**路径（分配下级 PT 页，把 2M 叶
+/// 展开成 512 个 4K 叶）——该路径可因**无空闲帧而失败**（`OutOfMemory`）。
+/// 原实现对这一失败 `continue`（静默跳过该页），使父子在整段地址空间静默分歧。
+/// 既有 `test_cow_clone` 只覆盖 4K 叶，**从未触及**这条路径。
+///
+/// 本测试断言（可证伪）：
+/// 1. 2M 大页区经 `clone_cow` 后，父在该整区的**每一个 4K 子页都可翻译**
+///    （即拆分未漏页——这正是 R7 静默跳过会破坏的不变式）；
+/// 2. 子侧对应页同样全部可翻译，且与父**共享同一物理帧**；
+/// 3. 覆盖区首/中/尾抽样点内容经子侧 #PF 写复制后保持（数据未丢）；
+/// 4. 全部共享帧引用计数由 2 归位到 1（无泄漏、无重复归还）。
+#[cfg(feature = "kernel-test-m5")]
+pub fn test_cow_clone_huge_page() {
+    use alloc::vec::Vec;
+    use mm::user_space::UserAddressSpace;
+    info!("[cow-huge] === R7: COW over 2M huge page (split path coverage) ===");
+
+    // 2M 对齐的用户区基址（远离栈/堆/其它测试用的固定地址）。
+    const HUGE_BASE: u64 = 0x0000_0000_4000_0000;
+    const HUGE_SIZE: u64 = 2 * 1024 * 1024;
+
+    let mut parent = UserAddressSpace::<X86PageTable>::new().expect("parent space");
+    // 预留一整块 2M 对齐区域，声明粒度 = Size2M。
+    parent
+        .reserve_user(
+            VirtAddr::new(HUGE_BASE),
+            VirtAddr::new(HUGE_BASE + HUGE_SIZE),
+            PageSize::Size2M,
+            PageFlags::empty().writable().user(),
+        )
+        .expect("reserve 2M area");
+    // 经缺页路径真实建立一张 2M 大页（或退化为 4K 混合——两者都是合法状态，
+    // 断言只看「无漏页」这一不变式）。
+    let ok = parent.handle_page_fault(
+        HUGE_BASE,
+        arch_x86_64::paging::PageFaultCode::new(arch_x86_64::paging::PF_EC_WRITE),
+    );
+    assert!(ok, "establish first page of huge area");
+
+    // 在首/中/尾三处写入可辨识内容（经物理映射写，绕过页表权限）。
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let mark = |v: u64| -> u64 {
+        parent
+            .translate(VirtAddr::new(v))
+            .expect("parent page mapped")
+            .as_u64()
+    };
+    for (i, v) in [HUGE_BASE, HUGE_BASE + HUGE_SIZE / 2, HUGE_BASE + HUGE_SIZE - 0x1000]
+        .iter()
+        .enumerate()
+    {
+        // 确保该子页在父侧已映射（缺页即补）。
+        if parent.translate(VirtAddr::new(*v)).is_none() {
+            let _ = parent.handle_page_fault(
+                *v,
+                arch_x86_64::paging::PageFaultCode::new(arch_x86_64::paging::PF_EC_WRITE),
+            );
+        }
+        let p = mark(*v);
+        unsafe { core::ptr::write_volatile((p + off) as *mut u64, 0xA000_0000u64 + i as u64) };
+    }
+
+    // 收集父侧改动前「已映射的 4K 子页」集合——这是断言的基准。
+    let mut before: Vec<(u64, u64)> = Vec::new();
+    let mut v = HUGE_BASE;
+    while v < HUGE_BASE + HUGE_SIZE {
+        if let Some(p) = parent.translate(VirtAddr::new(v)) {
+            before.push((v, p.as_u64()));
+        }
+        v += 0x1000;
+    }
+    assert!(!before.is_empty(), "parent must have mapped pages to clone");
+    info!("[cow-huge] parent mapped {} 4K pages in the 2M area", before.len());
+    // 不变式（R7-huge 根因的判别式）：一个 2M 区内**每个** 4K 子页必须解析到
+    // **互不相同**的物理帧（同一大页内 offset 递增）。若 `PageTable::translate`
+    // 对大页叶只返回块基址而不加页内偏移，这里会塌缩成 1 个帧——这正是本测试
+    // 要钉死的缺陷（见下方 distinct 断言）。
+    let distinct: alloc::collections::BTreeSet<u64> = before.iter().map(|(_, p)| *p).collect();
+    assert_eq!(
+        distinct.len(),
+        before.len(),
+        "every 4K sub-page in a 2M area must map to its own frame (got {} distinct for {})",
+        distinct.len(),
+        before.len()
+    );
+
+    // ---- clone_cow ----
+    let child = parent.clone_cow().expect("clone_cow over huge page area");
+
+    // 断言 1+2：父与子对**每一个**原已映射页都可翻译，且物理帧相同。
+    let mut shared = 0usize;
+    for (v, p_phys) in before.iter() {
+        let pp = parent
+            .translate(VirtAddr::new(*v))
+            .expect("R7: parent page must survive clone");
+        let cp = child
+            .translate(VirtAddr::new(*v))
+            .expect("R7: child page must exist for every parent page");
+        assert_eq!(pp.as_u64(), *p_phys, "parent frame unchanged at {:#x}", v);
+        assert_eq!(cp.as_u64(), *p_phys, "child shares parent frame at {:#x}", v);
+        assert_eq!(
+            mm::frame_refcount(*p_phys),
+            2,
+            "shared frame refcount=2 at {:#x}",
+            v
+        );
+        shared += 1;
+    }
+    info!("[cow-huge] {} pages shared 1:1, refcount=2 each", shared);
+
+    // 断言 3：抽样点经子侧写故障复制后内容保持。
+    for (i, v) in [HUGE_BASE, HUGE_BASE + HUGE_SIZE / 2, HUGE_BASE + HUGE_SIZE - 0x1000]
+        .iter()
+        .enumerate()
+    {
+        if child.translate(VirtAddr::new(*v)).is_none() {
+            continue; // 该子页父侧本就未映射（稀疏区），跳过。
+        }
+        let old_phys = child.translate(VirtAddr::new(*v)).unwrap().as_u64();
+        let handled = child.handle_page_fault(
+            *v,
+            arch_x86_64::paging::PageFaultCode::new(arch_x86_64::paging::PF_EC_WRITE),
+        );
+        assert!(handled, "child COW fault handled at {:#x}", v);
+        let new_phys = child.translate(VirtAddr::new(*v)).unwrap().as_u64();
+        assert_ne!(new_phys, old_phys, "child copied to a new frame at {:#x}", v);
+        let copied = unsafe { core::ptr::read_volatile((new_phys + off) as *const u64) };
+        assert_eq!(
+            copied,
+            0xA000_0000u64 + i as u64,
+            "content preserved across COW at {:#x}",
+            v
+        );
+        // 父侧内容不受影响。
+        let pf = parent.translate(VirtAddr::new(*v)).unwrap().as_u64();
+        let pv = unsafe { core::ptr::read_volatile((pf + off) as *const u64) };
+        assert_eq!(pv, 0xA000_0000u64 + i as u64, "parent content intact at {:#x}", v);
+        assert_eq!(mm::frame_refcount(pf), 1, "parent frame refcount back to 1");
+    }
+    info!("[cow-huge] sampled COW copies preserve content; parent intact");
+
+    info!("[cow-huge] PASS (no page silently skipped; 1:1 sharing holds)");
+}
+
 /// M5：IPC 共享内存 + 管道。
 ///
 /// 验证点（纯内存逻辑，不经用户态/调度阻塞）：
@@ -1538,6 +1716,18 @@ pub fn test_ipc() {
         .expect("map_user buf");
     let buf_kern = arch::phys_to_virt(buf_frame.start_paddr());
     unsafe { core::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_kern as *mut u8, 5) };
+    // **必须先把 `user_buf` 切为活动页表**（2026-09-19 修复）。
+    //
+    // `pipe_write`/`pipe_read` 走的是**真实用户缓冲路径**：`validate_user_range`
+    // 只查页表项（与 CR3 无关，故此前能通过校验），随后 `copy_from_user` 直接
+    // **解引用 `src` 这个虚拟地址**——而它是在**当前活动地址空间**里解引用的。
+    // 原测试把 `buf_va = 0x400000` 映射在一个**未激活**的地址空间中，于是内核态
+    // 读 `0x400000` 落在当前（内核）页表的未映射区 → #PF 停机（cr2=0x400000）。
+    //
+    // 这是**测试夹具缺陷，非被测代码缺陷**：真实 syscall 路径下用户缓冲必然在
+    // 调用进程自己的活动地址空间内（syscall 入口已装载该进程 CR3）。既有
+    // `test_user_space`（tests.rs:187/201）正是 `activate()` + 复原的同一套做法。
+    user_buf.activate();
     let n = ipc::pipe_write(&mut frame, pipe_id, &user_buf, buf_va, 5).expect("pipe_write");
     assert_eq!(n, 5, "wrote 5 bytes");
     let mut dst_page = [0u8; 8];
@@ -1560,6 +1750,10 @@ pub fn test_ipc() {
         "empty pipe read -> WouldBlock"
     );
     ipc::pipe_close(pipe_id).expect("pipe_close");
+    // 复原内核页表（与上方 `user_buf.activate()` 成对；同一纪律，见
+    // `test_user_space` tests.rs:201）。必须在本测试返回前复原——后续测试与
+    // 启动流程都假定运行在内核页表上。
+    X86PageTable::current().activate();
     info!("[ipc-test] PASS");
 }
 

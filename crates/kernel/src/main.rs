@@ -564,6 +564,11 @@ unsafe fn kmain_body() -> ! {
     // 逻辑验收，不进入用户态、不依赖 tick，返回主流程继续启动）。单独 gate。
     #[cfg(feature = "kernel-test-m5")]
     tests::test_cow_clone();
+    // R7 验收：2M 大页区上的 COW 派生——覆盖 `clone_cow` 固定 4K 步进在遇到
+    // 大页叶时会触及的 `unmap` 拆分路径（该路径可因无帧而失败）。既有
+    // `test_cow_clone` 只覆盖 4K 叶，从未触及此路径。
+    #[cfg(feature = "kernel-test-m5")]
+    tests::test_cow_clone_huge_page();
     #[cfg(feature = "kernel-test-m5")]
     tests::test_ipc();
     #[cfg(feature = "kernel-test-m5")]
