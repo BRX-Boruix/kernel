@@ -740,10 +740,29 @@ global_asm!(
         // 这里改用 `r11` 暂存——`r11` 是 `syscall` 硬件写入的 RFLAGS，
         // 我们要的值已在下面 `push r11` 前读到栈上了吗？没有——故同样不能碰。
         // 正确做法：**直接用内存操作数**把 gs:[24] 压栈，不经过任何通用寄存器。
-        push 0x30                  // SS  = 用户数据段
+        // **RPL=3 不可省略（GPF 修复）**：此处曾写 `push 0x30` / `push 0x28`——
+        // 那是 UDATA/UCODE 的**索引值**，低 2 位 RPL=0。本 stub 自己走 `sysretq`
+        // 回程（段选择子由 STAR 推算，**不读这两个槽**），故在单纯 syscall 路径上
+        // 这两个值从不被校验，RPL=0 一直「看起来正常」。
+        //
+        // 但该帧会被**存进进程的 saved 现场**（阻塞类 syscall / yield 经
+        // `slot.saved = *frame`），此后由**另一条路径**恢复：时钟中断（IRQ0）的
+        // `commit_next` 做 `*frame = slot.saved`，再经 `interrupt_common_stub` 的
+        // **`iretq`** 返回。`iretq` 的返回来特权级取 **CS.RPL**：RPL=0 表示「回到
+        // Ring0」，而 0x28 对应描述符的 DPL=3 —— RPL 与 DPL 不符，硬件 #GP，
+        // 错误码即该选择子（实测 `error=0x28`，`rip` 落在 `iretq`）。
+        //
+        // 实测症状：用户态一跑起来（真正发生 syscall）就随机 #GP 停机，raw 转储里
+        // `iretq` 帧「看起来完全合法」（RIP/CS/RSP/SS 都是合理值），唯有 RPL 位缺失——
+        // 这正是它极难定位的原因：帧里每个字段单独看都对。
+        //
+        // 修复：与 task::process 的单点构造 `user_code_selector` / `user_data_selector`
+        // 保持一致（`UCODE|3` / `UDATA|3`）。sysretq 回程不受影响——
+        // 它本就不读这两个槽。
+        push 0x33                  // SS  = 用户数据段 | RPL3
         push qword ptr gs:[24]     // RSP = 用户 RSP（阶段 2 暂存；不占用任何 GPR）
         push r11                   // RFLAGS（syscall 硬件存入 r11）
-        push 0x28                  // CS  = 用户代码段
+        push 0x2b                  // CS  = 用户代码段 | RPL3
         push rcx                   // RIP（syscall 硬件存入 rcx）
         // 错误码占位 + 中断号（与 isr_noerr 宏一致）
         .byte 0x6a, 0              // push 0 (错误码占位)
@@ -1172,6 +1191,22 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             raw_serial_fmt(format_args!("  rflags: {:#x}\n", frame.rflags));
             raw_serial_fmt(format_args!("  error:  {:#x}\n", frame.error_code));
             raw_serial_fmt(format_args!("  vector: {:#x} ({})\n", frame.vector, exception_name(frame.vector as u8)));
+            // iretq 帧转储：#GP 若由 `iretq` 触发，出错信息**不在**上面这些字段里，
+            // 而在 iretq 正要弹出、位于 frame.rsp 处的那个 5 槽帧里
+            // （RIP/CS/RFLAGS/RSP/SS）。上面 15 个 GPR 是 iretq **执行时**的寄存器，
+            // 与「iretq 想装载什么」是两件事——本向量最容易在这里被误读。
+            // 裸读 rsp 处 6 个 qword（多读 1 个以便判别帧边界）。
+            // SAFETY：仅在内核已致命停机前诊断路径上读；frame.rsp 是内核栈地址，
+            // 该栈在本次异常发生前一直有效，读操作不改变任何状态，也不解引用其内容。
+            unsafe {
+                let p = frame.rsp as *const u64;
+                raw_serial_fmt(format_args!("  [rsp+0]  {:#018x}  (iretq RIP )\n", core::ptr::read_volatile(p)));
+                raw_serial_fmt(format_args!("  [rsp+8]  {:#018x}  (iretq CS  )\n", core::ptr::read_volatile(p.add(1))));
+                raw_serial_fmt(format_args!("  [rsp+16] {:#018x}  (iretq FLAG)\n", core::ptr::read_volatile(p.add(2))));
+                raw_serial_fmt(format_args!("  [rsp+24] {:#018x}  (iretq RSP )\n", core::ptr::read_volatile(p.add(3))));
+                raw_serial_fmt(format_args!("  [rsp+32] {:#018x}  (iretq SS  )\n", core::ptr::read_volatile(p.add(4))));
+                raw_serial_fmt(format_args!("  [rsp+40] {:#018x}  (beyond    )\n", core::ptr::read_volatile(p.add(5))));
+            }
             raw_serial_fmt(format_args!("  rax:    {:#x}\n", frame.rax));
             raw_serial_fmt(format_args!("  rbx:    {:#x}\n", frame.rbx));
             raw_serial_fmt(format_args!("  rcx:    {:#x}\n", frame.rcx));
