@@ -10,6 +10,7 @@
 extern crate alloc;
 
 pub mod process;
+pub mod sched_eevdf;
 pub mod scheduler;
 pub mod signal;
 pub mod signal_set;

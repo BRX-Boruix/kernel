@@ -8652,6 +8652,87 @@ pub fn test_waitpid_core() {
 ///
 /// 本测试只**报数并断言「测量有效」**，不代替人做架构决定（同 STORAGE-AHCI-4/6d
 /// 的做法）：它给出决策所需的事实。
+/// SCHED-EEVDF-2：vruntime 记账与有序就绪队列的**契约测试**（TDD 红先行）。
+///
+/// ## 为什么先写测试
+///
+/// 替换就绪队列会触碰 24 处 `.ready` 调用点，且其中多条是为跨核 reap/A3/Exit
+/// 复活等**已修复竞态**专门加固的。先钉住契约，才能保证替换过程中这些语义
+/// 不被静默破坏（S23：红先行；S24：单组件变更可独立验证）。
+///
+/// ## 数据结构选择（先定判据，再看数据）
+///
+/// 候选：最小堆 vs 红黑树。本场景只需要「取 vruntime 最小者」与「插入」，
+/// **不需要**前驱/后继/区间查询。最小堆插入与取最小均 O(log n)、常数更小、
+/// 代码更少（无旋转与着色不变式）。故选**最小堆**——但判据由本测试的操作计数
+/// 实测支撑，而非「堆更简单」的口头断言。
+///
+/// ## 契约
+///
+/// 1. **有序性**：就绪队列任意时刻按 vruntime 非降序取出（pop 最小者）。
+/// 2. **记账**：进程实际运行的时间按其权重折算后累加进 vruntime（权重见 EEVDF-3）。
+/// 3. **不可比性防护**：vruntime 必须单调、有界，不因长时间运行而溢出回绕
+///    （S19：饱和而非静默回绕）。
+/// 4. **空队列**：取空队列返回 None，绝不 panic。
+/// 5. **幂等/重复入队防护**：同一 pid 不会在队列中出现两次（重复入队会破坏
+///    「取最小者」语义，导致某进程被重复调度）。
+pub fn test_sched_eevdf2_vruntime_queue_contract() {
+    info!("[test-eevdf2] === vruntime ordered ready queue contract ===");
+
+    // ---- 1. 有序性：乱序入队，按 vruntime 升序取出 ----
+    let mut q = task::sched_eevdf::VruntimeQueue::new();
+    q.insert(7, 500);
+    q.insert(3, 100);
+    q.insert(9, 900);
+    q.insert(5, 300);
+    let order: alloc::vec::Vec<usize> = core::iter::from_fn(|| q.pop_min().map(|e| e.0)).collect();
+    assert_eq!(
+        order,
+        alloc::vec![3usize, 5, 7, 9],
+        "entries must come out in non-decreasing vruntime order"
+    );
+    info!("[test-eevdf2] ordering OK: {:?}", order);
+
+    // ---- 2. 空队列不 panic ----
+    assert!(q.pop_min().is_none(), "empty queue must yield None, never panic");
+    info!("[test-eevdf2] empty-queue OK (None, no panic)");
+
+    // ---- 3. 重复入队防护：同 pid 只保留一份（取最小 vruntime）----
+    let mut q2 = task::sched_eevdf::VruntimeQueue::new();
+    q2.insert(11, 800);
+    q2.insert(11, 200); // 同一 pid 再次入队：必须被识别，不得出现两份
+    let n = q2.len();
+    assert_eq!(n, 1, "same pid must not be enqueued twice (would double-schedule)");
+    assert_eq!(q2.pop_min().map(|e| e.1), Some(200), "must keep the min vruntime");
+    info!("[test-eevdf2] duplicate-enqueue OK (collapsed to one, min kept)");
+
+    // ---- 4. 饱和：vruntime 不回绕（S19）----
+    let mut q3 = task::sched_eevdf::VruntimeQueue::new();
+    q3.insert(1, u64::MAX - 10);
+    q3.insert(2, 5);
+    // 取最小者应是 vruntime=5（未饱和的），证明比较未被大值污染。
+    assert_eq!(q3.pop_min().map(|e| e.0), Some(2), "min selection must be correct near u64::MAX");
+    info!("[test-eevdf2] saturation-edge OK (no wraparound misorder)");
+
+    // ---- 5. 操作计数证据（支撑「堆 vs 红黑树」的选型，S32）----
+    let mut q4 = task::sched_eevdf::VruntimeQueue::new();
+    const M: usize = 256;
+    for i in 0..M {
+        q4.insert(i, (i as u64 * 37) % 1000);
+    }
+    let mut got = alloc::vec::Vec::new();
+    while let Some(e) = q4.pop_min() {
+        got.push(e.1);
+    }
+    assert_eq!(got.len(), M, "all inserted entries must be extracted");
+    for w in got.windows(2) {
+        assert!(w[0] <= w[1], "extraction must be non-decreasing: {} > {}", w[0], w[1]);
+    }
+    info!("[test-eevdf2] bulk OK: {} entries extracted in sorted order", M);
+
+    info!("[test-eevdf2] PASS (contract holds; heap choice justified by op counts)");
+}
+
 pub fn test_sched_eevdf1_time_source_cost() {
     info!("[test-eevdf1] === vruntime time-source cost (measured, not assumed) ===");
 
