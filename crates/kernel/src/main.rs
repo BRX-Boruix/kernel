@@ -478,6 +478,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-test-m42")]
     tests::test_scheduler();
 
+    // SCHED-EEVDF-1：vruntime 时间基准的实测取证（HPET 直读 vs per-CPU TSC）。
+    // 放在调度测试之前：它只读时间源、不依赖调度状态，且结论是 2/3 的前提。
+    tests::test_sched_eevdf1_time_source_cost();
+
     // M4.3 静态 ELF 加载验收：解析并加载 ELF 镜像到用户空间，spawn 运行
     // （停机验收，不返回主流程），单独 gate。
     #[cfg(feature = "kernel-test-m43")]

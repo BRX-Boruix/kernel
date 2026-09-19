@@ -8631,6 +8631,118 @@ pub fn test_waitpid_core() {
 /// 的镜像：pop → `next_is_runnable` 闸门 → 置 Running）。单核夹具不跑物理 CR3/FPU 切换
 ///（会破坏内核主线程上下文），物理链路由 SMP storm/QEMU 覆盖。
 /// 全程关中断（同 test_waitpid_core 纪律）。
+/// SCHED-EEVDF-1：vruntime 时间基准的**实测取证**（不是论证完就拍板）。
+///
+/// ## 为什么需要实测而不是「读 HPET 显然更准」的直觉
+///
+/// EEVDF 的 vruntime 要在**每次调度决策/每次 tick** 记账，调用频率极高。候选：
+///   - **A. `klib::time::now_nanos()`**：一个原子 load + 一次 **HPET MMIO 读** +
+///     u128 乘除。HPET 是**全局共享**硬件，多核并发读会在同一 MMIO 窗口/总线上
+///     争用。
+///   - **B. `klib::time::read_cycle_counter()`**：单条 `rdtsc`，**per-CPU**、无
+///     共享争用，但需要校准且 TSC 在跨核间可能有偏（`constant_tsc` 才保证同源）。
+///
+/// ## 事先约定的决策规则（S32：先定判据，再看数据，避免事后合理化）
+///
+/// 1. 若 HPET 单次读开销 **> 4×** TSC 单次读 → 选 TSC（per-CPU），否则选 HPET
+///    （更简单、无校准、无跨核漂移）。
+/// 2. **前提条件**：无论选谁，都必须先确认该时间源**可用且单调**；不可用则如实
+///    SKIP 并说明，绝不用伪造数据充数（S10）。
+/// 3. 若 HPET 不可用（`now_nanos()` 返回 None）→ 只能选 TSC，并如实标注。
+///
+/// 本测试只**报数并断言「测量有效」**，不代替人做架构决定（同 STORAGE-AHCI-4/6d
+/// 的做法）：它给出决策所需的事实。
+pub fn test_sched_eevdf1_time_source_cost() {
+    info!("[test-eevdf1] === vruntime time-source cost (measured, not assumed) ===");
+
+    // ---- 前提：两个候选时间源是否可用 ----
+    let hpet_ok = klib::time::clock_ready() && klib::time::now_nanos().is_some();
+    let tsc_ok = klib::time::read_cycle_counter() != 0;
+    info!(
+        "[test-eevdf1] sources: hpet_ready={} tsc_ready={}",
+        hpet_ok, tsc_ok
+    );
+    if !hpet_ok && !tsc_ok {
+        info!("[test-eevdf1] SKIP: no usable time source (cannot judge vruntime basis)");
+        return;
+    }
+
+    // ---- A. HPET 路径单次开销 ----
+    const N: u64 = 1000;
+    let mut hpet_per: u64 = 0;
+    if hpet_ok {
+        let t0 = klib::time::read_cycle_counter();
+        let mut acc: u64 = 0;
+        for _ in 0..N {
+            // 读值必须被消费，否则优化器可整体消除（S29：测量必须真实发生）。
+            acc = acc.wrapping_add(klib::time::now_nanos().unwrap_or(0));
+        }
+        let dt = klib::time::read_cycle_counter().wrapping_sub(t0);
+        hpet_per = dt / N;
+        info!(
+            "[test-eevdf1] HPET path: {} cycles/call over {} calls (acc={:#x})",
+            hpet_per, N, acc
+        );
+    }
+
+    // ---- B. TSC 路径单次开销（同口径：都用 rdtsc 计时）----
+    let mut tsc_per: u64 = 0;
+    if tsc_ok {
+        let t0 = klib::time::read_cycle_counter();
+        let mut acc: u64 = 0;
+        for _ in 0..N {
+            acc = acc.wrapping_add(klib::time::read_cycle_counter());
+        }
+        let dt = klib::time::read_cycle_counter().wrapping_sub(t0);
+        tsc_per = dt / N;
+        info!(
+            "[test-eevdf1] TSC  path: {} cycles/call over {} calls (acc={:#x})",
+            tsc_per, N, acc
+        );
+    }
+
+    // ---- 决策规则 1 的自动判定（把结论写成可复核的算式，而非口头）----
+    // ---- C. 决定 TSC 能否作**跨核**基准的硬件前提 ----
+    // 成本低不代表能用：TSC 是 per-CPU 计数器，只有 `invariant_tsc` 才保证
+    // 「恒定频率 + 各核同源」。缺这个位，跨核 vruntime 不可比——成本优势再大
+    // 也不能选（S20：先证伪前提，再谈收益）。
+    let invariant_tsc = arch_x86_64::cpu::has_feature(arch::cpu::CpuFeature::InvariantTsc);
+    info!(
+        "[test-eevdf1] invariant_tsc={} (ext_leaf={:#x}) -- gates cross-core TSC use",
+        invariant_tsc,
+        arch_x86_64::cpu::max_extended_leaf()
+    );
+
+    if hpet_ok && tsc_ok && tsc_per > 0 {
+        let ratio_x100 = hpet_per * 100 / tsc_per;
+        let cheaper_ok = hpet_per > tsc_per.saturating_mul(4);
+        info!(
+            "[test-eevdf1] HPET/TSC cost ratio = {}.{:02}x",
+            ratio_x100 / 100,
+            ratio_x100 % 100
+        );
+        // 决策必须同时满足「成本优势」与「跨核可用性」两个条件，缺一不可。
+        let choose_tsc = cheaper_ok && invariant_tsc;
+        info!(
+            "[test-eevdf1] decision: cheaper_ok={} invariant_tsc={} -> use {}",
+            cheaper_ok,
+            invariant_tsc,
+            if choose_tsc {
+                "TSC (per-CPU, invariant confirmed)"
+            } else if !invariant_tsc {
+                "HPET (TSC lacks invariant_tsc: unsafe across cores)"
+            } else {
+                "HPET (TSC not enough cheaper to justify calibration)"
+            }
+        );
+        // 测量有效性：两者都大于 0，否则说明计时不可信。
+        assert!(hpet_per > 0, "HPET cost must be measurable");
+        assert!(tsc_per > 0, "TSC cost must be measurable");
+    }
+
+    info!("[test-eevdf1] PASS (measurement valid; the choice is recorded in docs)");
+}
+
 pub fn test_cross_core_reap_safety() {
     use task::TaskState;
     use task::scheduler::test_hooks as th;

@@ -94,11 +94,30 @@ pub fn init() {
     MAX_BASIC.store(max_basic, Ordering::Relaxed);
 
     // 扩展 leaf 0x80000000：最大扩展 leaf。
-    let max_ext = if max_basic >= 0x8000_0000 {
-        cpuid(0x8000_0000, 0).eax
-    } else {
-        0
-    };
+    //
+    // **修掉一个长期存在、静默的探测缺陷（本次 SCHED-EEVDF-1 实测发现）。**
+    //
+    // 错误写法（原先）：`if max_basic >= 0x8000_0000 { cpuid(0x8000_0000,0).eax }`。
+    // `max_basic` 是 leaf 0 返回的**基础**最大 leaf（实测 0xd），永远 < 0x8000_0000，
+    // 故该条件**恒假**，`max_ext` 永远是 0，于是所有依赖它的探测全部静默失效：
+    //   - `Syscall` / `Nx` / `Abm` / `Sse4a` 恒为 false；
+    //   - 品牌字符串（leaf 0x80000002..4）恒为空。
+    // 实测证据：QEMU `-cpu max`（xlevel=0x8000000A，确实有扩展 leaf）下，
+    // `[cpu] brand:` 仍为空、features 里没有 `syscall`/`nx`。
+    //
+    // 正确写法：扩展 leaf 是否存在，取决于 **CPUID.80000000H 是否可读**，而判据是
+    // 「基础最大 leaf ≥ 0x80000000」这一**约定**——即 leaf 0 的 eax 必须至少是
+    // 0x80000000 才说明存在扩展空间。这里保留该约定判断，但**用对变量**：
+    // 只有 `max_basic >= 0x8000_0000` 才去读 0x80000000；真实 CPU 的 max_basic
+    // 通常是 0xd~0x20，远小于 0x80000000，**因此 x86 上扩展 leaf 实际上总是可读的**。
+    //
+    // x86 的既定事实：任何支持 CPUID 0x80000000 的 CPU 都能读它；Intel/AMD 均保证
+    // 扩展 leaf 空间从 0x80000000 起总是存在（返回 ≥ 0x80000000 的值）。
+    // 故此处直接读，并用**读回值本身**判断有没有扩展 leaf（≥ 0x80000000 才算有）。
+    // 这比「拿基础 leaf 去猜扩展空间」既正确又自证。
+    let max_ext_raw = cpuid(0x8000_0000, 0).eax;
+    // 极端/虚拟化场景下无扩展 leaf：如实置 0，后续所有 max_ext 守卫自然跳过。
+    let max_ext = if max_ext_raw >= 0x8000_0000 { max_ext_raw } else { 0 };
     MAX_EXT.store(max_ext, Ordering::Relaxed);
 
     // ---- 特性位 ----
@@ -137,6 +156,16 @@ pub fn init() {
         set_feat(&mut feat, CpuFeature::Nx, rx.edx & (1 << 20) != 0);
         set_feat(&mut feat, CpuFeature::Abm, rx.ecx & (1 << 5) != 0);
         set_feat(&mut feat, CpuFeature::Sse4a, rx.ecx & (1 << 6) != 0);
+    }
+    // leaf 0x80000007：高级电源管理/频率特性。EDX[8] = 不变 TSC。
+    //
+    // 该位决定 SCHED-EEVDF-1 能否把 TSC 当**跨核**时间基准：无它则各核 TSC
+    // 可能不同源/变频，vruntime 跨核不可比。故必须实测探测，不能假定。
+    // 用 `max_ext` 守卫：老 CPU 无此 leaf 时不应访问（CPUID 未定义 leaf 会
+    // 返回垃圾或 0，直接读正是 S19 要避免的「假设返回有意义」）。
+    if max_ext >= 0x8000_0007 {
+        let r7x = cpuid(0x8000_0007, 0);
+        set_feat(&mut feat, CpuFeature::InvariantTsc, r7x.edx & (1 << 8) != 0);
     }
     FEATURES.store(feat, Ordering::Relaxed);
 

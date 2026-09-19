@@ -47,6 +47,17 @@ pub enum CpuFeature {
     Smep = 24,
     /// Supervisor Mode Access Prevention (x86 CPUID.7.0:EBX[7]).
     Smap = 25,
+    /// **不变 TSC**（x86 `CPUID.80000007H:EDX[8]`，AMD 称 `InvariantTSC`，
+    /// Intel 称 `Invariant TSC` / 常与 `ConstantTsc`+`NonstopTsc` 并列）。
+    ///
+    /// **为什么它必须被探测**：`rdtsc` 是 **per-CPU** 计数器。没有该位时，
+    /// 各核的 TSC 可能**不同步、且频率随 P-state 变化**——把它当**跨核全局**
+    /// 时间基准（如 vruntime）会得到不可比的读数。有该位则保证 TSC 以恒定
+    /// 频率运行且各核同源，可安全作跨核单调时钟。
+    ///
+    /// 本位的探测直接决定 SCHED-EEVDF-1 的选型：无该位就不能选 TSC 做 vruntime
+    /// 基准（须退回 HPET 或 per-CPU 校准），故选型结论必须引用它而非假定。
+    InvariantTsc = 26,
 }
 
 impl CpuFeature {
@@ -79,6 +90,7 @@ impl CpuFeature {
             Self::Sse4a => "sse4a",
             Self::Smep => "smep",
             Self::Smap => "smap",
+            Self::InvariantTsc => "invariant_tsc",
         }
     }
 
