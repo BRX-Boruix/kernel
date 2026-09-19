@@ -834,6 +834,33 @@ where
                 }
             }
         }
+        // 1b. 诊断/防御：同一 vaddr 只能出现一次。
+        //
+        // 为何需要：`shares` 由「遍历 areas，对每个可 translate 的页 push」得到。
+        // 若两个 area 在虚拟地址上**重叠**且都覆盖 v，v 会被 push 两次；
+        // 第二次迭代时子页表已有该页 → `map` 返回 AlreadyExists，整个 clone 失败，
+        // 且回滚也会二次 unmap 而失败（实测 v=0x7ffefffff000，栈顶页）。
+        // 这里显式检测并去重（保留首个），使 clone 对重叠 area 免疫——
+        // 地址空间布局的合法性应由登记处把关，clone 不应因此崩掉。
+        {
+            let before = shares.len();
+            let mut seen: Vec<u64> = Vec::with_capacity(before);
+            shares.retain(|(v, _, _)| {
+                if seen.contains(v) {
+                    false
+                } else {
+                    seen.push(*v);
+                    true
+                }
+            });
+            if shares.len() != before {
+                klib::warn!(
+                    "[cow] clone: {}/{} pages were duplicated by overlapping areas; deduped",
+                    before - shares.len(),
+                    before
+                );
+            }
+        }
         // 2. 新建子地址空间（继承内核半区，用户区空），复制布局状态。
         //    child 尚未共享：直接经其 core 锁读写；next_mmap/heap_break 取父
         //    锁内一致快照（两游标已在 core 中，同一临界区读到一致值）。
@@ -878,6 +905,12 @@ where
             {
                 // 父只读重建失败：恢复父页原映射（原权限），保持父空间完整。
                 // 恢复失败必须告警（B6：静默即无解释缺页洞）。
+                klib::warn!(
+                    "[cow] clone abort at PARENT read-only remap v={:#x} phys={:#x}: {:?}",
+                    v,
+                    phys,
+                    e
+                );
                 if core
                     .pt
                     .map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, flags)
@@ -898,6 +931,12 @@ where
                     .pt
                     .map(VirtAddr::new(v), PhysAddr::new(phys), PageSize::Size4K, ro)
                 {
+                    klib::warn!(
+                        "[cow] clone abort at CHILD shared remap v={:#x} phys={:#x}: {:?}",
+                        v,
+                        phys,
+                        e
+                    );
                     // 子映射失败：撤销本页的 COW 改动——恢复父页原映射（原权限），
                     // 引用计数未增无需回退，父空间不留洞。恢复失败告警（B6 同款）。
                     if core
@@ -943,16 +982,27 @@ where
             for m in inherited.iter() {
                 let npages = ((m.end - m.vaddr) / 0x1000) as usize;
                 for i in 0..npages {
-                    if let Some(phys) = core
-                        .pt
-                        .translate(VirtAddr::new(m.vaddr + (i as u64) * 0x1000))
-                    {
+                    let v = m.vaddr + (i as u64) * 0x1000;
+                    if let Some(phys) = core.pt.translate(VirtAddr::new(v)) {
                         ccore.pt.map(
-                            VirtAddr::new(m.vaddr + (i as u64) * 0x1000),
+                            VirtAddr::new(v),
                             phys,
                             PageSize::Size4K,
                             PageFlags::empty().writable().user(),
-                        )?;
+                        )
+                        .map_err(|e| {
+                            // 失败必须可归因（S34）：`?` 会把 AlreadyExists 原样抛出，
+                            // 而 clone_cow 的调用方只看到一个 errno，无从知道是哪一段
+                            // 地址、哪个循环失败的。此处点名 vaddr/shm id/phys。
+                            klib::warn!(
+                                "[cow] shm remap failed v={:#x} phys={:#x} shm_id={} : {:?}",
+                                v,
+                                phys.as_u64(),
+                                m.id,
+                                e
+                            );
+                            e
+                        })?;
                     }
                 }
             }
