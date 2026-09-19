@@ -8697,6 +8697,76 @@ pub fn test_waitpid_core() {
 /// 上一测试验证 `nice_to_weight`/`weight_charge` 的纯函数方向；本测试验证
 /// 「设置 nice -> 真实调度记账 -> 选中顺序改变」这条完整链路上确实通了。
 /// 二者缺一不可：纯函数对而接线错（例如记账点取的仍是常量权重）同样没效果。
+/// SCHED-EEVDF-3 验收：交互响应延迟的**同口径 A/B**（EEVDF vs RR 等价物）。
+///
+/// ## 对照设计（S32：同基线、同口径，否则数据无意义）
+///
+/// 本内核不再有可切换的 RR 实现，故用**等价物**做对照：
+///   - **RR 等价臂**：交互进程 nice=0，与 CPU 密集进程**同权**。此时 EEVDF 的
+///     选取退化为「就绪集合内轮转」——因为所有进程权重相同，每轮 vruntime 增量
+///     相同，最小者即最久未跑者。这正是 RR 的语义，故可作为 RR 基线。
+///   - **EEVDF 臂**：交互进程 nice=-10（高权重），CPU 密集进程 nice=0。
+///
+/// 两臂**同一函数、同一次启动、同一 tick 数、同一进程数**，仅 nice 不同，
+/// 是严格的可比对照。
+///
+/// ## 度量（为什么不用毫秒）
+///
+/// `dispatch_rank` = 交互进程被选中前需先经过的就绪候选数。它与硬件无关、
+/// 可精确复现；而墙上时间在本内核粒度是 100ms 级 tick，TCG 下 rdtsc 又不可信
+/// （见 EEVDF-1 的测量效度说明）。故用排序位置而非时间，避免制造不可信的数字。
+pub fn test_sched_eevdf3_interactive_latency() {
+    use task::scheduler::test_hooks as th;
+    info!("[test-eevdf3b] === interactive dispatch latency: EEVDF vs RR-equivalent ===");
+
+    const HOGS: usize = 4;
+
+    // ---- RR 等价臂：同权（nice=0 / nice=0）----
+    let (rank_rr, vi_rr, vh_rr) = th::debug_interactive_dispatch_rank(0, HOGS, 0);
+    info!(
+        "[test-eevdf3b] RR-equivalent: rank={} (interactive vt={} hog vt={})",
+        rank_rr, vi_rr, vh_rr
+    );
+
+    // ---- EEVDF 臂：交互进程高优先级 ----
+    let (rank_eevdf, vi_ee, vh_ee) = th::debug_interactive_dispatch_rank(-10, HOGS, 0);
+    info!(
+        "[test-eevdf3b] EEVDF(nice=-10): rank={} (interactive vt={} hog vt={})",
+        rank_eevdf, vi_ee, vh_ee
+    );
+
+    info!(
+        "[test-eevdf3b] dispatch rank: RR={} -> EEVDF={} ({} hogs)",
+        rank_rr, rank_eevdf, HOGS
+    );
+
+    // ---- 断言：EEVDF 下交互进程必须排到最前（rank 0）----
+    assert_eq!(
+        rank_eevdf, 0,
+        "high-priority interactive process must be dispatched first (got rank {})",
+        rank_eevdf
+    );
+
+    // ---- 断言：同权时应表现为轮转（交互进程与其它进程机会均等，排名靠后）----
+    assert!(
+        rank_rr > rank_eevdf,
+        "RR-equivalent must NOT favour the interactive process: rr={} eevdf={}",
+        rank_rr, rank_eevdf
+    );
+
+    // ---- 权重差异必须真实存在（否则上面的 rank 差异可能来自别处）----
+    assert!(
+        vi_ee < vh_ee,
+        "interactive must accumulate less vruntime: {} !< {}",
+        vi_ee, vh_ee
+    );
+
+    info!(
+        "[test-eevdf3b] PASS: worst-case candidates before interactive runs: {} -> {}",
+        rank_rr, rank_eevdf
+    );
+}
+
 pub fn test_sched_eevdf3_nice_affects_scheduling() {
     use task::scheduler::test_hooks as th;
     info!("[test-eevdf3e2e] === nice must actually change scheduling ===");

@@ -3588,6 +3588,60 @@ pub mod test_hooks {
         Some((va, vb))
     }
 
+    /// EEVDF-3 交互延迟探针：模拟「一个 CPU 密集进程 + 一个交互进程」的就绪集合，
+    /// 返回**交互进程被选中前，需要先经过多少个就绪候选**。
+    ///
+    /// ## 为什么用「候选数」而不是墙上时间
+    ///
+    /// 本内核的调度粒度是 LAPIC tick（TCG 档 10 tick/片 ≈ 100ms 虚拟时间），
+    /// 而 TCG 下 rdtsc 计的是翻译指令数、不是真实时间（EEVDF-1 已实测），
+    /// 直接报「毫秒」会得到不可信的数字。**候选数**是与硬件无关、可精确复现的
+    /// 量：0 = 唤醒后立刻被选中（最优），N = 还要等 N 个进程先跑。
+    ///
+    /// 本探针**不改动生产记账**，只在独立队列实例上复现同样的插入/选取逻辑，
+    /// 故可安全在任意测试上下文调用。
+    pub fn debug_interactive_dispatch_rank(
+        interactive_nice: i32,
+        hog_count: usize,
+        hog_nice: i32,
+    ) -> (usize, u64, u64) {
+        use crate::sched_eevdf::{nice_to_weight, weight_charge, VruntimeQueue};
+        let mut q = VruntimeQueue::new();
+        let wi = nice_to_weight(interactive_nice);
+        let wh = nice_to_weight(hog_nice);
+        // 所有进程都跑相同 tick 数（对等负载），差异只来自 nice 权重。
+        const TICKS: u64 = 10;
+        let vi = weight_charge(TICKS, wi);
+        let vh = weight_charge(TICKS, wh);
+        // **平局判定必须对交互进程不利**，否则本探针会测出假象。
+        //
+        // `VruntimeQueue` 在 vruntime 相等时按 **pid 升序**决定（刻意做成确定性）。
+        // 若让交互进程持有最小 pid，则同权（RR 等价）臂里它也会因平局胜出，
+        // rank 恒为 0 —— 于是「EEVDF 更快」根本无法与「pid 恰好更小」区分。
+        // 实测正是如此：两臂 rank 都是 0，断言失败。
+        //
+        // 故把交互进程放在**最大 pid**：平局时它排最后，唯一能胜出的途径就是
+        // 真实的 vruntime 优势。这才是有效的对照。
+        let interactive_pid = 1 + hog_count;
+        for i in 0..hog_count {
+            q.insert(1 + i, vh);
+        }
+        q.insert(interactive_pid, vi);
+        // 统计交互进程被选中前排在前面的候选数。
+        let mut rank = 0usize;
+        loop {
+            match q.pop_min() {
+                Some((pid, _)) if pid == interactive_pid => break,
+                Some(_) => rank += 1,
+                None => break,
+            }
+            if rank > hog_count + 2 {
+                break; // 防御性上限，避免探针本身成为死循环
+            }
+        }
+        (rank, vi, vh)
+    }
+
     pub fn debug_set_ready_queue(pids: &[usize]) {
         let mut q = crate::sched_eevdf::VruntimeQueue::new();
         // EEVDF：测试夹具按给定顺序赋 vruntime，使取出顺序**可预期地等于入参顺序**
