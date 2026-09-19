@@ -2219,7 +2219,15 @@ fn sys_task_derive(frame: &mut SyscallFrame) -> u64 {
             //    rax=0 形成对照，完成「一次调用、两次返回」的分流。
             pack_ok(pid as u64)
         }
-        Err(e) => pack_err(e),
+        // S34：失败必须可见。此前这里只 `pack_err(e)` 就返回——用户态只收到一个
+        // 负 errno，内核侧**不留任何痕迹**，排查时无法区分是哪个失败点
+        // （spawn_derived 有 NotFound / NotSupported / OutOfMemory / clone_cow 四类，
+        // 各自映射到不同 errno，但用户态只看到一个数字）。实测正是被这个盲区挡住。
+        // 用 warn!（而非 debug!）：derive 失败是调用方需要知道的事件，不是调试噪音。
+        Err(e) => {
+            klib::warn!("[derive] pid={} spawn_derived failed: {:?} (errno {})", ppid, e, e.to_errno());
+            pack_err(e)
+        }
     }
 }
 
