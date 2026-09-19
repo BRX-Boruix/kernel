@@ -54,6 +54,21 @@ pub struct PerCpu {
     /// 硬件把用户 RSP 留在 RSP 里。内核必须在入口立刻换到本核内核栈——
     /// 而取栈顶必须先知道「我是谁」，这正是 per-CPU 存在的首要理由。
     pub kernel_stack_top: u64,
+    /// `syscall` 入口的用户 RSP 暂存槽（offset 24）。
+    ///
+    /// **为什么需要暂存**：`syscall` 进入时 RSP 还是用户栈，而构造帧又必须先
+    /// 拿到内核栈。用户 RSP 一旦切栈就取不回了，故先存此处。
+    ///
+    /// 放 per-CPU 结构而非普通寄存器：入口阶段通用寄存器**全部尚未保存**
+    /// （它们本身就是待构造帧的内容），没有空闲寄存器可用。
+    pub syscall_user_rsp: u64,
+    /// `syscall` 入口的用户 RIP 暂存槽（offset 32）。
+    ///
+    /// syscall 硬件把 RIP 存入 `rcx`，但构造帧时 `rcx` 还要作为通用寄存器入帧，
+    /// 顺序上会互相覆盖，故同样先暂存。
+    pub syscall_user_rip: u64,
+    /// `syscall` 入口的用户 RFLAGS 暂存槽（offset 40）。
+    pub syscall_user_rflags: u64,
 }
 
 /// 每核一个（256 = 与 `smp.rs` 槽位容量同源的上限）。
@@ -66,6 +81,29 @@ struct PerCpuSlot {
 }
 
 const MAX_CPUS: usize = 256;
+
+// **布局是 ABI**：`syscall_entry_stub` 用 `gs:[16]/[24]/[32]/[40]` 硬编码寻址。
+// 用编译期断言把偏移钉死——字段顺序一旦变动就**编译失败**，而不是运行时静默错乱。
+const _: () = {
+    assert!(core::mem::offset_of!(PerCpu, self_ptr) == 0, "PerCpu.self_ptr must be at 0");
+    assert!(core::mem::offset_of!(PerCpu, slot) == 8, "PerCpu.slot must be at 8");
+    assert!(
+        core::mem::offset_of!(PerCpu, kernel_stack_top) == 16,
+        "PerCpu.kernel_stack_top must be at 16 (hardcoded in syscall stub)"
+    );
+    assert!(
+        core::mem::offset_of!(PerCpu, syscall_user_rsp) == 24,
+        "PerCpu.syscall_user_rsp must be at 24 (hardcoded in syscall stub)"
+    );
+    assert!(
+        core::mem::offset_of!(PerCpu, syscall_user_rip) == 32,
+        "PerCpu.syscall_user_rip must be at 32 (hardcoded in syscall stub)"
+    );
+    assert!(
+        core::mem::offset_of!(PerCpu, syscall_user_rflags) == 40,
+        "PerCpu.syscall_user_rflags must be at 40 (hardcoded in syscall stub)"
+    );
+};
 
 static PERCPU_SLOTS: [PerCpuSlot; MAX_CPUS] = [const {
     PerCpuSlot {
@@ -208,6 +246,9 @@ impl PerCpuStorage {
                 self_ptr: 0,
                 slot: 0,
                 kernel_stack_top: 0,
+                syscall_user_rsp: 0,
+                syscall_user_rip: 0,
+                syscall_user_rflags: 0,
             },
         }
     }

@@ -309,6 +309,43 @@ pub struct InterruptFrame {
     pub ss: u64,
 }
 
+// ---------- SYSCALL-FAST-2：帧布局自省（供契约测试对拍裸汇编偏移） ----------
+
+/// `InterruptFrame` 各字段的**实测**偏移与大小。
+///
+/// 这些值由 `offset_of!` 从**真实结构**算出，不是抄来的常量。
+/// 意义：`resume_interrupt_frame` 用裸汇编硬编码偏移寻址，二者若漂移则静默错乱；
+/// 本结构让测试能直接断言「结构布局 == 汇编假设」。
+pub struct InterruptFrameOffsets {
+    pub size: usize,
+    pub r15: usize,
+    pub rdi: usize,
+    pub rax: usize,
+    pub vector: usize,
+    pub error_code: usize,
+    pub rip: usize,
+    pub cs: usize,
+    pub rflags: usize,
+    pub rsp: usize,
+    pub ss: usize,
+}
+
+/// 实测 `InterruptFrame` 布局。
+pub fn debug_interrupt_frame_offsets() -> InterruptFrameOffsets {
+    InterruptFrameOffsets {
+        size: core::mem::size_of::<InterruptFrame>(),
+        r15: core::mem::offset_of!(InterruptFrame, r15),
+        rdi: core::mem::offset_of!(InterruptFrame, rdi),
+        rax: core::mem::offset_of!(InterruptFrame, rax),
+        vector: core::mem::offset_of!(InterruptFrame, vector),
+        error_code: core::mem::offset_of!(InterruptFrame, error_code),
+        rip: core::mem::offset_of!(InterruptFrame, rip),
+        cs: core::mem::offset_of!(InterruptFrame, cs),
+        rflags: core::mem::offset_of!(InterruptFrame, rflags),
+        rsp: core::mem::offset_of!(InterruptFrame, rsp),
+        ss: core::mem::offset_of!(InterruptFrame, ss),
+    }
+}
 // ---------- A2: 从任意内存中恢复一个完整 InterruptFrame 并 iretq 回用户态 ----------
 
 /// 从内存中的 InterruptFrame 恢复全部通用寄存器并 iretq 进入该帧描述的用户态上下文。
@@ -575,6 +612,135 @@ pub fn register_kernel_fault_inspector(f: KernelFaultInspector) {
 ///
 /// 由调度器注册（kernel 层）。回调持有 `&mut InterruptFrame`，可**整体改写**
 /// 中断帧（寄存器 + iretq 帧）为另一进程的保存帧，并切换 CR3/TSS.RSP0；
+// ---------- SYSCALL-FAST-2：`syscall` 指令入口 stub ----------
+
+/// `syscall` 指令的硬件行为（与中断门的本质差异）：
+///   - 走 `IA32_LSTAR` 直接跳转，**不经过 IDT**；
+///   - **不压栈**：RIP→`rcx`、RFLAGS→`r11`，其余寄存器原样；
+///   - **不切栈**：RSP 仍是**用户栈**；
+///   - 按 `IA32_FMASK` 清 RFLAGS 位（我们掩了 IF/TF，故进入时中断已关）。
+///
+/// 本 stub 的职责：把这种「没有任何栈帧」的进入状态，**人工构造成与
+/// `interrupt_common_stub` 完全一致**的 `InterruptFrame`，然后复用同一个
+/// `interrupt_dispatch`。
+///
+/// ## 为什么必须逐字节一致
+///
+/// 因为下游全部依赖该布局：`resume_interrupt_frame` 用**裸汇编硬编码偏移**寻址；
+/// 调度器 `pop_and_commit_switch` **整体改写**该帧；阻塞类 syscall 靠整帧替换
+/// 语义在进程间迁移现场。布局偏一个字段就静默错乱。
+///
+/// ## 栈切换的安全性（顺序不可调换）
+///
+/// 进入时 RSP 是**用户栈**，此时若发生中断就会在用户栈上压内核帧——用户态可借此
+/// 控制内核栈（提权面）。故顺序严格为：
+///   1. `swapgs`（拿到 per-CPU 结构；此刻 CS 已是 Ring0）；
+///   2. 从 per-CPU 取**内核栈顶**并切栈（`mov rsp, ...`）；
+///   3. 在**内核栈**上压帧。
+/// FMASK 已保证 IF=0，故 1→2 之间不存在中断窗口。
+///
+/// ## 与 `int 0x80` 的语义差异（刻意保留在帧里）
+///
+/// 软中断路径的帧由**硬件**压入 RIP/CS/RFLAGS/RSP/SS；本 stub 必须**手工**压入
+/// 等价内容：
+///   - RIP 来自 `rcx`（syscall 硬件存入）；
+///   - RFLAGS 来自 `r11`；
+///   - CS = 用户代码段（因为这是从用户态进来的）；
+///   - RSP = 进入时的用户 RSP（须在任何切栈**之前**保存）；
+///   - SS = 用户数据段。
+global_asm!(
+    r#"
+    .section .text
+
+    .global syscall_entry_stub
+    .type syscall_entry_stub, @function
+    syscall_entry_stub:
+        // ---- 阶段 1：换 GS 到内核 per-CPU（CS 此刻已是 Ring0）----
+        swapgs
+
+        // ---- 阶段 2：保存用户 RSP，切到本核内核栈 ----
+        // per-CPU 结构偏移：self_ptr=0, slot=8, kernel_stack_top=16（见 percpu.rs）。
+        // 用户 RSP 先存到 GS:24 的暂存位（本核私有，无需跨核同步）。
+        // 注意：此时 RSP 仍是用户栈，任何 push 都会踩用户栈——故先只用 mov。
+        mov qword ptr gs:[24], rsp
+        mov rsp, qword ptr gs:[16]
+
+        // ---- 阶段 3：在内核栈上构造 InterruptFrame ----
+        // 布局（低->高）与 interrupt_common_stub 完全一致：
+        //   15 个通用寄存器, vector, error_code, RIP, CS, RFLAGS, RSP, SS
+        //
+        // 先压硬件上下文（栈顶->底）：SS, RSP, RFLAGS, CS, RIP
+        // 用户 SS/CS 常量：SS=0x30, CS=0x28（与 GDT 一致；sysret 回程用 0x38，见 syscall.rs）。
+        push 0x30                  // SS  = 用户数据段
+        mov rax, qword ptr gs:[24]
+        push rax                   // RSP = 用户 RSP（阶段 2 暂存）
+        push r11                   // RFLAGS（syscall 硬件存入 r11）
+        push 0x28                  // CS  = 用户代码段
+        push rcx                   // RIP（syscall 硬件存入 rcx）
+        // 错误码占位 + 中断号（与 isr_noerr 宏一致）
+        .byte 0x6a, 0              // push 0 (错误码占位)
+        push 0x80                  // vector = 0x80（复用软中断分发路径）
+        // 15 个通用寄存器，顺序与 interrupt_common_stub 完全相同
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push rbp
+        push r8
+        push r9
+        push r10
+        push r11
+        push r12
+        push r13
+        push r14
+        push r15
+
+        // ---- 阶段 4：复用同一分发入口（帧语义与软中断路径完全一致）----
+        mov rdi, rsp
+        call interrupt_dispatch
+
+        // ---- 阶段 5：恢复寄存器 ----
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rbp
+        pop rdi
+        pop rsi
+        pop rdx
+        pop rcx
+        pop rbx
+        pop rax
+
+        // ---- 阶段 6：跳过中断号 + 错误码 ----
+        add rsp, 16
+
+        // ---- 阶段 7：弹出硬件上下文（不 iretq，用 sysretq 快速返回）----
+        pop rcx                    // RIP -> rcx（sysretq 要求）
+        add rsp, 8                 // 丢弃 CS
+        pop r11                    // RFLAGS -> r11（sysretq 要求）
+        pop rsp                    // 用户 RSP
+        add rsp, 8                 // 丢弃 SS
+
+        // ---- 阶段 8：换回 GS 并快速返回 ----
+        swapgs
+        sysretq
+    "#
+);
+
+/// `syscall` 入口 stub 的地址（供 LSTAR 使用）。
+pub fn syscall_entry_addr() -> u64 {
+    unsafe extern "C" {
+        fn syscall_entry_stub();
+    }
+    syscall_entry_stub as *const () as usize as u64
+}
 /// `interrupt_common_stub` 返回后 iretq 即进入目标进程用户态。返回 void，
 /// 若调度器未切换（无其他就绪进程），帧保持不变，原进程继续执行。
 ///

@@ -382,6 +382,23 @@ unsafe fn kmain_body() -> ! {
             // S09：不伪装成功——地基未建立时如实上报，后续 FAST-2/4 依赖它。
             warn!("[percpu] GS foundation NOT enabled (slot {} out of range)", slot);
         }
+
+        // SYSCALL-FAST-2：配置 `syscall`/`sysret` 的 MSR（EFER.SCE/STAR/FMASK/LSTAR）。
+        //
+        // 顺序要求：必须在 GS 地基之后（入口 stub 第一步就 `swapgs` 并用
+        // `gs:[16]` 取内核栈），且必须在**任何 `syscall` 指令执行之前**。
+        //
+        // 注意：本步只**配置 MSR**，用户态仍走 `int 0x80`（FAST-4 才切换）。
+        // 故此处配置不会改变现有行为，只是让快速路径就绪、可被测试验证。
+        if ok {
+            let entry = arch_x86_64::interrupts::syscall_entry_addr();
+            let configured = arch_x86_64::syscall::init_syscall_msrs(entry);
+            let st = arch_x86_64::syscall::msr_state();
+            info!(
+                "[syscall] MSRs configured={} SCE={} STAR={:#x} LSTAR={:#x} FMASK={:#x}",
+                configured, st.sce_enabled, st.star, st.lstar, st.fmask
+            );
+        }
     }
 
     // 短暂等待验证时钟中断确实触发
@@ -518,6 +535,9 @@ unsafe fn kmain_body() -> ! {
 
     // SYSCALL-FAST-1：GS per-CPU 地基（一致性 / 配对性 / 嵌套纪律）。
     tests::test_syscall_fast1_percpu_gs_contract();
+
+    // SYSCALL-FAST-2：syscall 帧布局与 InterruptFrame 的二进制兼容契约。
+    tests::test_syscall_fast2_frame_layout_contract();
 
     // M4.3 静态 ELF 加载验收：解析并加载 ELF 镜像到用户空间，spawn 运行
     // （停机验收，不返回主流程），单独 gate。

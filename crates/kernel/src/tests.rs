@@ -8808,6 +8808,117 @@ pub fn test_syscall_fast1_percpu_gs_contract() {
     info!("[test-fast1] PASS (consistency + pairing + nesting discipline hold; assertions falsifiable)");
 }
 
+/// SYSCALL-FAST-2：`syscall` 入口帧与 `InterruptFrame` 的**二进制兼容**契约。
+///
+/// ## 为什么这是成本大头
+///
+/// `syscall` 指令与中断门有本质差异：
+///   - **不经过 IDT**（走 LSTAR MSR 直接跳转）；
+///   - **硬件不压完整帧**：只把 RIP→`rcx`、RFLAGS→`r11`，且**不切栈**；
+///   - 因此必须**自建**与 `InterruptFrame` 布局一致的帧。
+///
+/// 兼容性是**硬约束**，因为：
+///   1. `interrupts.rs` 的 `resume_interrupt_frame` 是**裸汇编硬编码偏移**
+///      （[rdi+136]=rip … [rdi+168]=ss）；
+///   2. 调度器 `pop_and_commit_switch` 会**整体改写**该帧；
+///   3. 阻塞类 syscall（read/waitpid/exit/kill/pipe）靠整帧替换语义工作。
+///
+/// 帧布局只改一端必然静默错乱，故先用测试把布局钉死。
+pub fn test_syscall_fast2_frame_layout_contract() {
+    info!("[test-fast2] === syscall frame layout vs InterruptFrame ===");
+
+    // ---- 1. 字段偏移必须与裸汇编硬编码的偏移逐一吻合 ----
+    // 这些数字直接来自 `resume_interrupt_frame` 的汇编，是**不可协商**的事实。
+    let off = arch_x86_64::interrupts::debug_interrupt_frame_offsets();
+    info!(
+        "[test-fast2] InterruptFrame: size={} r15={} rdi={} rax={} vector={} error={} rip={} cs={} rflags={} rsp={} ss={}",
+        off.size, off.r15, off.rdi, off.rax, off.vector, off.error_code,
+        off.rip, off.cs, off.rflags, off.rsp, off.ss
+    );
+    assert_eq!(off.r15, 0, "r15 at offset 0 (matches `mov r15,[rdi+0]`)");
+    assert_eq!(off.rdi, 72, "rdi at 72 (matches `mov rax,[rdi+72]`)");
+    assert_eq!(off.rax, 112, "rax at 112 (matches `mov rax,[rdi+112]`)");
+    assert_eq!(off.vector, 120, "vector at 120");
+    assert_eq!(off.error_code, 128, "error_code at 128");
+    assert_eq!(off.rip, 136, "rip at 136 (matches `mov rax,[rdi+136]`)");
+    assert_eq!(off.cs, 144, "cs at 144");
+    assert_eq!(off.rflags, 152, "rflags at 152");
+    assert_eq!(off.rsp, 160, "rsp at 160");
+    assert_eq!(off.ss, 168, "ss at 168 (matches `mov rax,[rdi+168]`)");
+    assert_eq!(off.size, 176, "frame size 176 = 15 regs + vector + error + 5 ctx");
+
+    // ---- 2. MSR 常量必须是正确的 IA32 编号 ----
+    info!(
+        "[test-fast2] MSRs: STAR={:#x} LSTAR={:#x} FMASK={:#x} EFER={:#x}",
+        arch_x86_64::syscall::IA32_STAR, arch_x86_64::syscall::IA32_LSTAR,
+        arch_x86_64::syscall::IA32_FMASK, arch_x86_64::syscall::IA32_EFER
+    );
+    assert_eq!(arch_x86_64::syscall::IA32_STAR, 0xC000_0081, "IA32_STAR is 0xC0000081");
+    assert_eq!(arch_x86_64::syscall::IA32_LSTAR, 0xC000_0082, "IA32_LSTAR is 0xC0000082");
+    assert_eq!(arch_x86_64::syscall::IA32_FMASK, 0xC000_0084, "IA32_FMASK is 0xC0000084");
+
+    // ---- 3. STAR 的段选择子必须与 GDT 实际布局吻合 ----
+    // syscall: 硬件从 STAR[47:32] 取 CS/SS（Ring0）；
+    // sysret:  硬件从 STAR[63:48] 取 CS/SS（Ring3），且 UCODE = 该值+16, UDATA = +8。
+    let star = arch_x86_64::syscall::compute_star_value();
+    let kcode = ((star >> 32) & 0xffff) as u16;
+    let ucode_base = ((star >> 48) & 0xffff) as u16;
+    info!(
+        "[test-fast2] STAR={:#x} -> kernel CS={:#x} SS={:#x}; user CS={:#x} SS={:#x}",
+        star, kcode, kcode + 8, ucode_base + 16, ucode_base + 8
+    );
+    assert_eq!(kcode, 0x08, "kernel CS must be GDT KCODE (0x08)");
+    assert_eq!(kcode + 8, 0x10, "kernel SS must be GDT KDATA (0x10)");
+    // sysret 推导（**实测纠正后的正确规则**）：CS = base+16, SS = base+8。
+    //
+    // 初始假设 base=0x18 可得 CS=0x28/UCODE；但 SS 会是 0x20 —— 那是 TSS_high
+    // （64 位 TSS 描述符占两个槽），不是数据段，sysretq 会 #GP。这暴露了一个
+    // **真实的架构不兼容**：既有 GDT 布局下 UCODE 与 TSS 相邻，sysret 无法复用。
+    //
+    // 解法：base=0x28 -> CS=0x38（新增 UCODE_SYSRET 槽），SS=0x30（既有 UDATA）。
+    assert_eq!(ucode_base + 16, 0x38, "sysret CS must be the dedicated slot 0x38");
+    assert_eq!(ucode_base + 8, 0x30, "sysret SS must be UDATA (0x30), a real data segment");
+    // 关键不变式：sysret 推算出的 SS **绝不能**落在 TSS 槽上。
+    assert_ne!(ucode_base + 8, 0x20, "sysret SS must NOT be TSS_high (would #GP)");
+
+    // ---- 4. 规范地址判定（sysretq 对非规范 RIP 触发 #GP）----
+    // 这是 sysret 的真实陷阱：RIP 非规范时不是「返回错误」，而是**直接 #GP**。
+    let canon = arch_x86_64::syscall::is_canonical;
+    info!(
+        "[test-fast2] canonical: 0x400000={} 0xffff800000000000={} 0x0000800000000000={}",
+        canon(0x400000), canon(0xffff_8000_0000_0000), canon(0x0000_8000_0000_0000)
+    );
+    assert!(canon(0x400000), "low user address is canonical");
+    assert!(canon(0xffff_8000_0000_0000), "high half address is canonical");
+    assert!(!canon(0x0000_8000_0000_0000), "bit47 != sign-extended bits is NOT canonical");
+
+    // ---- 5. MSR 实际已配置且值正确（读回验证，非「应该配了」）----
+    let st = arch_x86_64::syscall::msr_state();
+    info!(
+        "[test-fast2] MSR readback: EFER={:#x}(SCE={}) STAR={:#x} LSTAR={:#x} FMASK={:#x}",
+        st.efer, st.sce_enabled, st.star, st.lstar, st.fmask
+    );
+    assert!(st.sce_enabled, "EFER.SCE must be set for syscall/sysret to work");
+    assert_eq!(
+        st.star, arch_x86_64::syscall::compute_star_value(),
+        "STAR readback must equal the computed value"
+    );
+    assert_eq!(
+        st.fmask, arch_x86_64::syscall::SYSCALL_RFLAGS_MASK,
+        "FMASK must mask IF and TF (no window where userspace RSP is live with IF=1)"
+    );
+    assert!(st.lstar != 0, "LSTAR must point at a real entry");
+    info!("[test-fast2] syscall entry ready={}", arch_x86_64::syscall::is_ready());
+
+    // ---- 6. 负向对照：规范地址判定必须可证伪 ----
+    // 若 is_canonical 恒真，第 4 节的断言全部无意义。这里确认它能拒绝坏地址。
+    let rejects_bad = !canon(0x0000_8000_0000_0000) && !canon(0x0000_7fff_ffff_ffff_ffff);
+    info!("[test-fast2] negative control: is_canonical rejects non-canonical = {}", rejects_bad);
+    assert!(rejects_bad, "is_canonical must reject non-canonical addresses (falsifiable)");
+
+    info!("[test-fast2] PASS (frame offsets match naked-asm ABI; MSRs configured; checks falsifiable)");
+}
+
 pub fn test_sched_eevdf3_interactive_latency() {
     use task::scheduler::test_hooks as th;
     info!("[test-eevdf3b] === interactive dispatch latency: EEVDF vs RR-equivalent ===");

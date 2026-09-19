@@ -14,12 +14,21 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 pub const KCODE: u16 = 0x08;
 pub const KDATA: u16 = 0x10;
 pub const TSS_SEL: u16 = 0x18;
+
 /// 用户代码段（DPL=3，Ring 3 可执行）。
 /// 选择子 index = 0x28>>3 = 5，对应 GDT entries[5]。
 pub const UCODE: u16 = 0x28;
 /// 用户数据段（DPL=3，Ring 3 可读写）。
 /// 选择子 index = 0x30>>3 = 6，对应 GDT entries[6]。
+/// `sysret` 与 `iretq` **共用**此数据段（sysret 的 SS 由 base+8 推算而得 0x30）。
 pub const UDATA: u16 = 0x30;
+/// **`sysretq` 专用**的用户代码段选择子（槽 7 = 0x38）。
+///
+/// 为什么不能复用 `UCODE`：`sysretq` 的 SS 固定落在 `base+8`。若 base 取 0x18 以
+/// 使 CS=0x28，则 SS=0x20 —— 那是 `TSS_high`，不是数据段，`sysretq` 会 #GP。
+/// 故 base 取 0x28：CS=0x38（本槽）、SS=0x30（既有 `UDATA`，合法）。
+/// 详见 [`Gdt`] 的布局说明。
+pub const UCODE_SYSRET: u16 = 0x38;
 
 /// 单 CPU 内核栈大小（64KB）。BSP 与各 AP 各持一份。
 pub const KSTACK_SIZE: usize = 0x10000;
@@ -84,17 +93,35 @@ impl Tss {
 
 /// GDT 条目（8 字节，由 u64 表示）。
 ///
-/// 布局：null, KCODE(1), KDATA(2), TSS_low(3), TSS_high(4), UCODE(5), UDATA(6)
+/// 布局：null, KCODE(1), KDATA(2), TSS_low(3), TSS_high(4), UCODE(5), UDATA(6),
+/// **UCODE_SYSRET(7)**。
+///
+/// ## 为什么需要第 7 项（SYSCALL-FAST-2 的架构发现）
+///
+/// `sysretq` 的段选择子是**推算**的，不是给定的：硬件规则固定为
+///   - 目标 CS = `IA32_STAR[63:48]` + 16
+///   - 目标 SS = `IA32_STAR[63:48]` + 8
+///
+/// 而本 GDT 中 TSS 占**两个槽位**（64 位 TSS 描述符 16 字节），于是 0x20 是
+/// `TSS_high`。若想 `sysret` 回到既有的 `UCODE=0x28`，则 base 必须取 0x18，
+/// 推出 SS = 0x20 —— **那是 TSS 的高半部，不是数据段**，`sysretq` 会直接 #GP。
+///
+/// 即：**现有 GDT 布局与 `sysret` 不兼容**——这不是配置疏漏，是布局约束。
+///
+/// 解法取**最小侵入**：在末尾追加一个用户代码段描述符（槽 7 = 0x38），
+/// 令 base = 0x28，则 CS = 0x38（新增）、SS = 0x30（既有的 `UDATA`，合法数据段）。
+/// 这样**既有 iretq 路径使用的 0x28/0x30 完全不动**（帧里仍是 `UCODE|3`/`UDATA|3`），
+/// 只有 `sysret` 走新槽位。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Gdt {
-    entries: [u64; 7],
+    entries: [u64; 8],
 }
 
 impl Gdt {
     /// 新建 GDT，初始化内核/用户代码数据段。
     pub const fn new() -> Self {
-        let mut g = Self { entries: [0; 7] };
+        let mut g = Self { entries: [0; 8] };
         // 内核代码段：present, DPL0, 可读可执行, 64 位 (L=1)
         g.entries[1] = 0x00_A0_9A_00_0000_FFFF;
         // 内核数据段：present, DPL0, 可读写, 展开向上。
@@ -111,6 +138,10 @@ impl Gdt {
         // （其 bit6=1 使 D=1，仍被标为 32 位段）——iretq 到 Ring3 恢复 SS 时，
         // 若 SS 被标为 32 位段（D=1）会触发 #SS。
         g.entries[6] = 0x00_8C_F2_00_0000_FFFF;
+        // UCODE_SYSRET（槽 7 = 选择子 0x38）：与 UCODE 同为用户代码段（DPL3,
+        // 可读可执行, L=1）。仅 `sysretq` 使用——因为 sysret 的 SS 由 base+8 推算，
+        // base 取 0x28 时 SS 恰为既有的 UDATA(0x30)（见本结构文档）。
+        g.entries[7] = 0x00_A0_FA_00_0000_FFFF;
         g
     }
 
