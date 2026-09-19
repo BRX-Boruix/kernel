@@ -115,6 +115,14 @@ static PERCPU_SLOTS: [PerCpuSlot; MAX_CPUS] = [const {
 /// GS 地基是否已启用（`swapgs` 路径可用）。
 static GS_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// 供**裸汇编**读取的地基就绪标志（`0` = 未就绪，非 0 = 就绪）。
+///
+/// 为什么单独开一个 `AtomicU64` 而不是复用 `GS_ENABLED`：`AtomicBool` 的布局未
+/// 承诺为可裸读的宽度；汇编里用 `cmp qword ptr [rip + sym], 0` 需要确定的 8 字节。
+/// 用独立的 `AtomicU64` 把「汇编可读」变成显式契约（S21）。
+pub static GS_READY_FLAG: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// 读 `IA32_KERNEL_GS_BASE`（0xC000_0102）。`swapgs` 的另一半。
 #[inline]
 pub fn read_kernel_gs_base() -> u64 {
@@ -220,12 +228,15 @@ pub fn enable_on_current(slot: usize) -> bool {
     write_gs_base(base);
     write_kernel_gs_base(0); // 用户态 GS 值：当前无用户 GS 需求，取 0
     GS_ENABLED.store(true, Ordering::Release);
+    // 裸汇编可见的就绪标志：**最后**置位，确保前面的 MSR 写入都已生效。
+    GS_READY_FLAG.store(1, Ordering::Release);
     true
 }
 
 /// 停用（仅供测试构造反向场景）。
 pub fn disable_for_test() {
     GS_ENABLED.store(false, Ordering::Release);
+    GS_READY_FLAG.store(0, Ordering::Release);
 }
 
 // ---------- 静态 per-CPU 存储（BSP 用；AP 上线的对称分配留待后续） ----------

@@ -115,6 +115,9 @@ global_asm!(
         push r15
 
         mov rdi, rsp
+        // SYSCALL-FAST-4：GS 进入钩子（仅向量 0x80 且来自用户态时 swapgs）。
+        call gs_entry_hook
+        mov rdi, rsp
         call interrupt_dispatch
 
         // 恢复寄存器（interrupt_dispatch 返回后）
@@ -136,6 +139,15 @@ global_asm!(
 
         // 跳过中断号 + 错误码（各 8 字节）
         add rsp, 16
+        // SYSCALL-FAST-4：GS 退出钩子（与进入钩子配对，回到用户 GS 状态）。
+        // 必须在 iretq 之前、且在帧已被消费之后调用（此处 rsp 已指向 iretq 帧）。
+        push rdi
+        push rsi
+        push rax
+        call gs_exit_hook
+        pop rax
+        pop rsi
+        pop rdi
         iretq
 
     // 生成异常入口（无错误码）：先压占位错误码 0，再压中断号。
@@ -222,6 +234,24 @@ global_asm!(
     isr_noerr 67
 
     // 软件中断 0x80（无错误码）：用户态软中断/系统调用入口（M2.5.4 / M3）。
+    //
+    // SYSCALL-FAST-4：**不再**用 `isr_noerr`（它直连 `interrupt_common_stub`，
+    // 而该 stub 不处理 `swapgs`）。改用专用入口 `isr_128`，理由：
+    //   - `enter_usermode` 在切到用户态前 `swapgs`，故用户态 `GS.base` = 用户值；
+    //   - 从用户态进入内核（无论 `int 0x80` 还是 `syscall`）都必须 `swapgs` 换回
+    //     per-CPU 地址，返回用户态前再换回去；
+    //   - 只有 CPL3 → CPL0 的进入才该换。内核态自己 `int 0x80` 时**不得**换
+    //     （否则把 GS 换成用户值），故用 CS 低两位做门控。
+    //
+    // 实现方式：`int 0x80` 仍走 `interrupt_common_stub`（不改公共 stub 的帧逻辑），
+    // 但公共 stub 在**调用分发之前**与**执行 iretq 之前**各调用一个 Rust 侧钩子，
+    // 由钩子按帧里的 CS 决定是否 `swapgs`。这样：
+    //   - GS 协议集中在一处（Rust），无需在多处汇编里重复 CPL 门控；
+    //   - 公共 stub 的寄存器/帧布局**完全不变**（ST_2 的硬约束）；
+    //   - 只有向量 0x80 的钩子会真正动作（其它向量钩子立即返回）。
+    //
+    // 注意：钩子由**公共 stub** 调用，故向量 0x80 这里仍用普通 `isr_noerr`。
+    // （曾一度改为专用入口，但那会删掉 `isr_128` 符号，导致链接失败的连锁问题。）
     isr_noerr 128
 
     // LAPIC 伪中断向量 255（0xFF，无错误码）：SVR 使能后伪中断会以此向量
@@ -371,6 +401,15 @@ pub extern "C" fn resume_interrupt_frame(frame: *const InterruptFrame) -> ! {
         "mov [rsp + 8], rax",               // cs
         "mov rax, [rdi + 136]",
         "mov [rsp], rax",                   // rip
+        // SYSCALL-FAST-4：若目标是**用户帧**，在 iretq 前 swapgs（把用户 GS 值换进
+        // GS.base），与用户态 `syscall`/`int 0x80` 入口的 swapgs 配对。
+        //
+        // 判据用帧里的 CS 低两位。内核帧（cs&3==0）不换——内核态本就该持有 perCPU。
+        // 注意：此判据必须在所有寄存器被覆盖**之前**求值，且只用 rdi（帧基址）。
+        "test byte ptr [rdi + 144], 3",      // [rdi+144] = cs 的低字节
+        "jz 9f",
+        "swapgs",
+        "9:",
         "mov rax, [rdi + 72]",              // rdi 恢复值先储到 [rsp+40]（rdi 仍为帧基址）
         "mov [rsp + 40], rax",
         "mov r15, [rdi + 0]",
@@ -656,6 +695,8 @@ global_asm!(
     .type syscall_entry_stub, @function
     syscall_entry_stub:
         // ---- 阶段 1：换 GS 到内核 per-CPU（CS 此刻已是 Ring0）----
+        // 前提：用户态运行时 `GS.base` = 用户值、`IA32_KERNEL_GS_BASE` = per-CPU 地址。
+        // 该前提由 `x86_64_enter_usermode` 在 `iretq` 前 `swapgs` 建立（配对的一半）。
         swapgs
 
         // ---- 阶段 2：保存用户 RSP，切到本核内核栈 ----
@@ -671,9 +712,14 @@ global_asm!(
         //
         // 先压硬件上下文（栈顶->底）：SS, RSP, RFLAGS, CS, RIP
         // 用户 SS/CS 常量：SS=0x30, CS=0x28（与 GDT 一致；sysret 回程用 0x38，见 syscall.rs）。
+        // **寄存器保全铁律**：`rax` 装的是用户传的系统调用号，绝不能当暂存用。
+        // 首版误用 `mov rax, gs:[24]` 取用户 RSP，把**系统调用号冲掉**，
+        // 导致帧里 rax 是垃圾（实测 `nr=0x30`，且 a3 泄漏了 stub 用过的 rdx=0x3f8）。
+        // 这里改用 `r11` 暂存——`r11` 是 `syscall` 硬件写入的 RFLAGS，
+        // 我们要的值已在下面 `push r11` 前读到栈上了吗？没有——故同样不能碰。
+        // 正确做法：**直接用内存操作数**把 gs:[24] 压栈，不经过任何通用寄存器。
         push 0x30                  // SS  = 用户数据段
-        mov rax, qword ptr gs:[24]
-        push rax                   // RSP = 用户 RSP（阶段 2 暂存）
+        push qword ptr gs:[24]     // RSP = 用户 RSP（阶段 2 暂存；不占用任何 GPR）
         push r11                   // RFLAGS（syscall 硬件存入 r11）
         push 0x28                  // CS  = 用户代码段
         push rcx                   // RIP（syscall 硬件存入 rcx）
@@ -722,13 +768,20 @@ global_asm!(
         add rsp, 16
 
         // ---- 阶段 7：弹出硬件上下文（不 iretq，用 sysretq 快速返回）----
-        pop rcx                    // RIP -> rcx（sysretq 要求）
+        //
+        // 栈上 5 个槽（由低到高）：RIP, CS, RFLAGS, RSP, SS。
+        //
+        // **顺序陷阱（首版在此出错）**：`pop rsp` 一旦执行，RSP 就变成**用户栈指针**，
+        // 之后再 `add rsp, 8` 加的是**用户栈**，而不是帧指针——SS 槽永远消费不到，
+        // 用户的 RSP 还会多偏 8 字节。故必须**先跳过 SS 槽，最后才 pop rsp**。
+        pop rcx                    // RIP  -> rcx（sysretq 要求）
         add rsp, 8                 // 丢弃 CS
         pop r11                    // RFLAGS -> r11（sysretq 要求）
-        pop rsp                    // 用户 RSP
-        add rsp, 8                 // 丢弃 SS
+        add rsp, 8                 // 丢弃 SS（**必须在 pop rsp 之前**）
+        pop rsp                    // 用户 RSP（最后一步，此后不再依赖帧指针）
 
         // ---- 阶段 8：换回 GS 并快速返回 ----
+        // 与阶段 1 的 `swapgs` 配对：恢复「用户 GS 值 / per-CPU 在 KERNEL_GS_BASE」。
         swapgs
         sysretq
     "#
@@ -944,6 +997,56 @@ fn raw_serial_fmt(args: core::fmt::Arguments) {
     // write_str 只追加完整 &str 或其字符边界前缀，len 永远停在边界。
     let s = unsafe { core::str::from_utf8_unchecked(&buf[..len]) };
     crate::serial::write_str(s);
+}
+
+// ---------- SYSCALL-FAST-4：GS 进入/退出钩子 ----------
+
+/// 本核本次中断是否需要「退出时 swapgs」（由进入钩子置位）。
+///
+/// 语义：`int 0x80` 从用户态进入时置 1，退出钩子据此 `swapgs` 换回用户 GS 状态。
+/// 其它向量、以及内核态发起的 `int 0x80` 保持 0（不动作）。
+static GS_UNSWAP_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// GS 进入钩子：**仅**「向量 0x80 且来自 CPL3」时 `swapgs`。
+///
+/// ## 为什么需要它
+///
+/// `enter_usermode` 在切到用户态前 `swapgs`，故用户态 `GS.base` = 用户值。
+/// 从用户态进入内核必须换回 per-CPU 地址；返回用户态前再换回去。`syscall` 的
+/// stub 自己做这一对，但 `int 0x80` 走公共 stub，故在此补上。
+///
+/// ## 为什么用 CS 门控
+///
+/// 内核态自己执行 `int 0x80` 时 GS **已是** per-CPU 地址，再换一次会把它换成用户值。
+/// 故只在 CS 低两位为 3（来自用户态）时动作。
+///
+/// # Safety
+/// 由汇编 `interrupt_common_stub` 以 `rdi = frame` 调用；帧必须是有效的中断帧。
+#[unsafe(no_mangle)]
+pub extern "C" fn gs_entry_hook(frame: *const InterruptFrame) {
+    // 地基未建立时不动作（避免把垃圾换进 GS.base）。
+    if !crate::percpu::is_enabled() {
+        GS_UNSWAP_PENDING.store(0, Ordering::Release);
+        return;
+    }
+    let f = unsafe { &*frame };
+    let from_user = f.vector == 0x80 && (f.cs & 3) == 3;
+    if from_user {
+        unsafe { crate::percpu::swapgs() };
+        GS_UNSWAP_PENDING.store(1, Ordering::Release);
+    } else {
+        GS_UNSWAP_PENDING.store(0, Ordering::Release);
+    }
+}
+
+/// GS 退出钩子：与 [`gs_entry_hook`] 配对，换回用户 GS 状态。
+///
+/// 必须在 `iretq` **之前**调用，且只在进入钩子置位时才动作（配对性）。
+#[unsafe(no_mangle)]
+pub extern "C" fn gs_exit_hook() {
+    if GS_UNSWAP_PENDING.swap(0, Ordering::AcqRel) == 1 {
+        unsafe { crate::percpu::swapgs() };
+    }
 }
 
 /// 分发入口（由汇编 `interrupt_common_stub` 调用）。

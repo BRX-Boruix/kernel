@@ -542,6 +542,13 @@ unsafe fn kmain_body() -> ! {
     // SYSCALL-FAST-3：r10 捕获通道在两条 ABI 下的一致性（a4 为保留输出）。
     tests::test_syscall_fast3_r10_capture_contract();
 
+    // SYSCALL-FAST-4 是**破坏性**的：它启动调度器进入用户态运行 `syscall` 程序，
+    // `scheduler::start()` 永不返回。因此它**必须放在整个测试序列的最后**——
+    // 否则其后所有测试都不会执行。放在版本横幅之前，横幅即成为「全部测试已跑完」
+    // 的标记（运行脚本据此判定完成）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_syscall_fast4_userspace_syscall_e2e();
+
     // M4.3 静态 ELF 加载验收：解析并加载 ELF 镜像到用户空间，spawn 运行
     // （停机验收，不返回主流程），单独 gate。
     #[cfg(feature = "kernel-test-m43")]

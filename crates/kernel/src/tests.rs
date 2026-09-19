@@ -8986,6 +8986,219 @@ pub fn test_syscall_fast3_r10_capture_contract() {
     info!("[test-fast3] PASS (a4 reserved as output; r10 delivery identical on both ABIs)");
 }
 
+/// SYSCALL-FAST-4：用户态真的执行 `syscall` 指令的**端到端**验证。
+///
+/// ## 为什么必须有这一项
+///
+/// FAST-1/2/3 验证的都是**内核侧**性质（GS 地基、帧布局、MSR 配置）。但没有任何
+/// 测试让**用户态真的执行 `syscall` 指令**——而「`syscall` 能不能用」恰恰取决于
+/// 一堆只有真跑才会暴露的细节：
+///   - `sysretq` 的段选择子是否与 GDT 吻合（**FAST-2 已抓到一个真实的布局不兼容**）；
+///   - 入口 stub 切栈是否正确（错误顺序会踩用户栈或在用户栈上跑内核代码）；
+///   - 用户态寄存器是否原样往返（ABI 保真）。
+///
+/// ## 做法
+///
+/// 构造一段**机器码**用户程序（不依赖 libsys 链接），它：
+///   1. 用 `syscall` 执行一次 `SYS_STREAM_WRITE`，向 stdout 写一个标记字符；
+///   2. 用 `syscall` 执行一次 `SYS_TASK_WAIT(0,0)` 主动让出；
+///   3. 循环若干次后退出。
+///
+/// 若 `syscall` 路径有任何一处不对（选段、切栈、返回、帧布局），这里会立刻
+/// #GP / 三连异常 / 挂死，而不是像内核单测那样「悄悄通过」。
+pub fn test_syscall_fast4_userspace_syscall_e2e() {
+    use mm::user_space::UserAddressSpace;
+    use task::process::{user_code_selector, user_data_selector};
+    use task::scheduler;
+
+    info!("[test-fast4] === userspace actually executes `syscall` ===");
+
+    // ---- 0. 前提：内核侧快速路径必须已就绪 ----
+    assert!(
+        arch_x86_64::syscall::is_ready(),
+        "syscall MSRs must be configured before userspace may use `syscall`"
+    );
+    assert!(
+        arch_x86_64::percpu::is_enabled(),
+        "GS per-CPU foundation must be live: the entry stub does `swapgs` first"
+    );
+    info!("[test-fast4] kernel-side fast path ready (MSRs + GS foundation)");
+
+    // ---- 1. 构造机器码用户程序：只用 `syscall`，不用 `int 0x80` ----
+    let code = fast4_user_code();
+    info!("[test-fast4] built {} bytes of user code using the `syscall` instruction", code.len());
+
+    // 自检：机器码里必须**不含** `int 0x80`（否则测的还是老路径）。
+    let has_int80 = code.windows(2).any(|w| w == [0xCD, 0x80]);
+    let has_syscall = code.windows(2).any(|w| w == [0x0F, 0x05]);
+    info!(
+        "[test-fast4] code scan: contains int 0x80 = {} contains syscall = {}",
+        has_int80, has_syscall
+    );
+    assert!(!has_int80, "the test program must NOT use int 0x80 (that is the fallback)");
+    assert!(has_syscall, "the test program must use the syscall instruction");
+
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+
+    // ---- 2. 建地址空间并装载 ----
+    let code_frame = mm::allocate_frame().expect("code frame").start_paddr();
+    let stack_frame = mm::allocate_frame().expect("stack frame").start_paddr();
+    // 数据页帧：见下方 map_user 的说明（缺页会让 SYS_STREAM_WRITE 返回 EFAULT）。
+    let data_frame = mm::allocate_frame().expect("data frame").start_paddr();
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), (code_frame + off) as *mut u8, code.len());
+        // 清零数据页：让「用户确实写过」的判据不受残留垃圾影响。
+        core::ptr::write_bytes((data_frame + off) as *mut u8, 0, 4096);
+    }
+    let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
+    us.map_user(
+        VirtAddr::new(FAST4_CODE_ADDR),
+        VirtAddr::new(FAST4_CODE_ADDR + 0x1000),
+        PageSize::Size4K,
+        PageFlags::empty().writable().executable().user(),
+        &[code_frame],
+    )
+    .expect("map code");
+    us.map_user(
+        VirtAddr::new(FAST4_STACK_TOP - 0x1000),
+        VirtAddr::new(FAST4_STACK_TOP),
+        PageSize::Size4K,
+        PageFlags::empty().writable().user(),
+        &[stack_frame],
+    )
+    .expect("map stack");
+    // 数据页：用户程序写标记字节的目标。**必须显式映射**——首版只映射了代码与栈，
+    // 数据页缺失导致 `SYS_STREAM_WRITE` 返回 EFAULT(-29)（地址本身正确也照样失败）。
+    us.map_user(
+        VirtAddr::new(FAST4_MSG_ADDR),
+        VirtAddr::new(FAST4_MSG_ADDR + 0x1000),
+        PageSize::Size4K,
+        PageFlags::empty().writable().user(),
+        &[data_frame],
+    )
+    .expect("map data");
+
+    // ---- 3. 启动（进入用户态后由 tick 轮转，永不返回）----
+    info!(
+        "[test-fast4] launching user process: entry={:#x} stack={:#x} cs={:#x} ss={:#x}",
+        FAST4_CODE_ADDR, FAST4_STACK_TOP, user_code_selector(), user_data_selector()
+    );
+    let pid = scheduler::spawn("fast4.elf", FAST4_CODE_ADDR, FAST4_STACK_TOP, us)
+        .expect("scheduler spawn");
+    info!("[test-fast4] spawned pid={} -- if `syscall` is broken we will NOT see its output", pid);
+
+    scheduler::start();
+}
+
+/// FAST-4 用户程序的虚拟地址（独立于既有 sched 测试，避免地址冲突）。
+/// FAST-4 用户程序地址。
+///
+/// **必须落在内核用户空间映射器接受的窗口内**。首版用 0x60_0000_0000（虽规范地址，
+/// 但超出本内核用户 VA 窗口）→ 进程进入用户态后立即停机、无任何输出。
+/// 改用既有 sched 测试**已验证可用**的区间：代码 0x9000_0000、栈顶 0x4000_0000 之下。
+const FAST4_CODE_ADDR: u64 = 0x0000_0000_9000_0000;
+const FAST4_STACK_TOP: u64 = 0x0000_0000_4000_0000;
+/// 用户程序写标记字节的缓冲区。
+///
+/// **必须是一张真正映射且可写的页**。首版用 `STACK_TOP - 8`（栈顶之上），
+/// 该地址未映射 → `SYS_STREAM_WRITE` 返回 EFAULT(-29)，随后用户态 #PF 刷屏。
+/// 改用既有 M4.1 测试已验证可写的 magic 页（`0x9500_0000`）。
+const FAST4_MSG_ADDR: u64 = 0x0000_0000_9500_0000;
+/// 用户程序机码缓冲区容量。
+///
+/// 实测所需：每轮 81 字节 × 4 轮 = 324，加收尾 32 字节，共 358。取 512 留余量。
+/// 首版误用 128 导致越界停机——`guard!` 宏现会在构造期以可读信息失败。
+const FAST4_CODE_CAP: usize = 512;
+
+/// 生成 FAST-4 的机器码用户程序：**只用 `syscall` 指令**。
+///
+/// 程序逻辑：
+///   loop 4 times:
+///     syscall SYS_STREAM_WRITE(0x13) fd=1, buf=<marker>, len=1   // 打印 \n
+///     syscall SYS_TASK_WAIT(0x32) a1=0 a2=0                       // 主动让出
+///   loop 4 times: syscall SYS_TASK_WAIT(0x32) a1=0 a2=1000 (sleep)
+///   exit: syscall SYS_TASK_EXIT via TASK domain write
+///
+/// 直接用 `syscall`（`0F 05`）替换原 `int 0x80`（`CD 80`），其余字节完全一致——
+/// 这正是「两条路径行为一致」的最强验证形式：**同一段逻辑，换一条指令**。
+fn fast4_user_code() -> [u8; FAST4_CODE_CAP] {
+    let mut c = [0x90u8; FAST4_CODE_CAP]; // NOP 填充
+    let mut i = 0;
+    // 每次 emit 前做**边界自检**：首版用 128 字节装不下 358 字节的程序，
+    // 在数组索引处停机（index out of bounds: len 128, index 128）。
+    // 这类错误应该在构造期就失败得**可读**，而不是让它跑到越界。
+    macro_rules! guard {
+        ($n:expr) => {
+            assert!(
+                i + $n <= FAST4_CODE_CAP,
+                "fast4 user code exceeds buffer (need {} + {} > {})",
+                i, $n, FAST4_CODE_CAP
+            );
+        };
+    }
+    macro_rules! emit {
+        ($($b:expr),*) => { $( guard!(1); c[i] = $b; i += 1; )* };
+    }
+    for _ in 0..4 {
+        // mov rax, SYS_STREAM_WRITE(0x13)
+        emit!(0x48, 0xB8);
+        c[i..i + 8].copy_from_slice(&0x13u64.to_le_bytes());
+        i += 8;
+        // mov rdi, 1 (fd=stdout)
+        emit!(0x48, 0xBF);
+        c[i..i + 8].copy_from_slice(&1u64.to_le_bytes());
+        i += 8;
+        // mov rsi, marker addr（FAST4_MSG_ADDR：已映射且可写的页）
+        emit!(0x48, 0xBE);
+        c[i..i + 8].copy_from_slice(&FAST4_MSG_ADDR.to_le_bytes());
+        i += 8;
+        // mov rdx, 1 (len)
+        emit!(0x48, 0xBA);
+        c[i..i + 8].copy_from_slice(&1u64.to_le_bytes());
+        i += 8;
+        // mov r10, u64::MAX (a4 = STREAM_OFFSET_CURRENT 顺序写哨兵)
+        //
+        // **这是本测试确认的有效 ABI 细节**：`sys_write` 对不可定位的字符流要求
+        // `a4 == u64::MAX`，否则按 `pwrite(offset)` 处理并如实返回 ESPIPE(-29)。
+        // 首版填 0 → 返回 -29（一度误判为 EFAULT/缺页，实际是 ESPIPE）。
+        // 走 `syscall` 时 a4 从 **r10** 传入（FAST-3 确立的通道）；`int 0x80` 则
+        // 从帧的 a4 槽读。本程序只用 `syscall`，故必须显式设 r10。
+        emit!(0x49, 0xBA); // mov r10, imm64
+        c[i..i + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        i += 8;
+        // syscall  <-- 这一条是本测试的核心
+        emit!(0x0F, 0x05);
+        // mov rax, SYS_TASK_WAIT(0x32)
+        emit!(0x48, 0xB8);
+        c[i..i + 8].copy_from_slice(&0x32u64.to_le_bytes());
+        i += 8;
+        // mov rdi, 0 ; mov rsi, 0  (yield)
+        emit!(0x48, 0xBF);
+        c[i..i + 8].copy_from_slice(&0u64.to_le_bytes());
+        i += 8;
+        emit!(0x48, 0xBE);
+        c[i..i + 8].copy_from_slice(&0u64.to_le_bytes());
+        i += 8;
+        emit!(0x0F, 0x05); // syscall (yield)
+    }
+    // 收尾：SYS_TASK_WAIT(0, 1000ms) 睡眠，让其它测试继续跑
+    emit!(0x48, 0xB8);
+    c[i..i + 8].copy_from_slice(&0x32u64.to_le_bytes());
+    i += 8;
+    emit!(0x48, 0xBF);
+    c[i..i + 8].copy_from_slice(&0u64.to_le_bytes());
+    i += 8;
+    emit!(0x48, 0xBE);
+    c[i..i + 8].copy_from_slice(&1000u64.to_le_bytes());
+    i += 8;
+    emit!(0x0F, 0x05); // syscall (sleep)
+    // 无限循环（保持进程存活，避免收尸路径干扰）
+    let start = i;
+    emit!(0xEB, 0xFE); // jmp $-2
+    let _ = start;
+    c
+}
+
 pub fn test_sched_eevdf3_interactive_latency() {
     use task::scheduler::test_hooks as th;
     info!("[test-eevdf3b] === interactive dispatch latency: EEVDF vs RR-equivalent ===");

@@ -109,9 +109,27 @@ pub extern "C" fn x86_switch_to(prev: &mut TaskContext, next: &mut TaskContext) 
 ///
 /// ABI：`frame` 在 rdi。返回后必然进入用户态，本函数不返回（末尾 `iretq`）。
 ///
+/// ## `swapgs` 协议的另一半（SYSCALL-FAST-4 实核补上）
+///
+/// per-CPU 地基（FAST-1）建立的不变式是**成对**的：
+///   - 内核态：`GS.base` = per-CPU 结构，`IA32_KERNEL_GS_BASE` = 用户值；
+///   - 用户态：`GS.base` = 用户值，`IA32_KERNEL_GS_BASE` = per-CPU 结构。
+///
+/// 进入内核的 `swapgs`（`syscall_entry_stub` 第一步）只实现了「换进来」这一半。
+/// **必须还有「换出去」这一半**：在切到用户态**之前** `swapgs`，否则用户态运行时
+/// `GS.base` 仍是 per-CPU 地址、`KERNEL_GS_BASE` 是 0；此时用户执行 `syscall`，
+/// 入口的 `swapgs` 会把 `GS.base` 换成 **0**，紧接着的 `gs:[...]` 访问立即 #GP。
+///
+/// 这正是 FAST-4 端到端测试暴露的问题：内核单测全绿（因为不涉及用户态 GS 状态），
+/// 真跑用户态 `syscall` 才暴露。
+///
+/// `int 0x80` 路径**不需要**在此之外额外处理：它同样经本函数出去（换出一次），
+/// 入口 stub 里由 CPL 门控决定是否换回（见 `interrupt_common_stub` 的说明）。
+///
 /// # Safety
 /// 由 `arch::task::enter_usermode` 调用；`frame` 必须指向有效的 `TrapFrame`，
 /// 其 cs/ss 须为 Ring 3 段选择子，rflags 须含 IF=1；`cr3` 若非 0 须为有效页表基址。
+/// 且**调用前必须已建立 GS 地基**（否则 `swapgs` 会把垃圾换进 `GS.base`）。
 #[unsafe(naked)]
 pub extern "C" fn x86_64_enter_usermode(frame: &arch::task::TrapFrame) {
     core::arch::naked_asm!(
@@ -133,6 +151,15 @@ pub extern "C" fn x86_64_enter_usermode(frame: &arch::task::TrapFrame) {
         "push rax",
         "mov rax, [rdi + 0]", // rip
         "push rax",
+        // ---- swapgs：把 per-CPU 地址换到 KERNEL_GS_BASE，把用户值换进 GS.base ----
+        // 必须在 iretq **之前**：此后 GS.base 是用户值，用户态执行 syscall 时入口
+        // 的 swapgs 才能把 per-CPU 地址正确换回来（与 FAST-1 的不变式配对）。
+        //
+        // **无条件** swapgs：本函数的唯一用途就是进入用户态，故必然要把用户 GS 值
+        // 换进 GS.base。首版加了「地基是否就绪」的条件判断（读一个静态标志），但
+        // 那样引入了额外依赖且实测未能生效——进入用户态本就要求地基已建立，
+        // 该前提由 `scheduler::start` 的上游保证，无需在裸汇编里再判一次。
+        "swapgs",
         "iretq", // 弹出 RIP/CS/RFLAGS/RSP/SS → 切到 Ring 3
     );
 }
