@@ -686,6 +686,152 @@ pub fn spawn_thread_with(
     Ok(pid)
 }
 
+// ---------- COW 派生子进程（ADR-038 / kernel-tests M5+） ----------
+
+/// `derive` 内核原语：以 `ppid` 为父，**COW 派生**一个独立线程组的新子进程（ADR-038）。
+///
+/// 与 [`spawn_with_ppid_fds`] / [`spawn_thread_with`] 的语义分工：
+/// - `spawn_with_ppid_fds`：**新地址空间 + load ELF**（等价 `exec`）。子进程从
+///   ELF 入口开始，与父无共享；
+/// - `spawn_thread_with`：**同组**新调度单元（线程）。共享组长地址空间（`Arc::clone`）；
+/// - 本函数：**新组**新子进程，用户地址空间经 [`UserAddressSpace::clone_cow`] 与父
+///   **共享物理帧**（写时复制），即 POSIX `fork` 的内核语义。子进程**不**从入口开始，
+///   而是从父被 syscall 中断处继续（首跑帧 = 父帧的副本，`rax` 改写为 0）。
+///
+/// # 返回语义（POSIX fork 铁律）
+///
+/// 本函数只负责**创建**；「父收 pid、子收 0」的分流由调用方（kernel syscall 层）
+/// 在返回给父的帧里写 pid 完成——子进程的首跑帧已在此处固定 `rax = 0`。
+///
+/// # 失败路径（S20：失败路径优先设计）
+///
+/// 本函数**要么完全成功，要么不留任何痕迹**。各步失败点与其回滚：
+/// 1. 父不存在/已 Exit → `NotFound`（无副作用）；
+/// 2. `clone_cow` 失败（无帧/页表拆分 OOM）→ `clone_cow` 内部已回滚父侧只读位与
+///    incref，此处直接上抛，父进程状态不变；
+/// 3. 内核栈分配失败 → `OutOfMemory`。此时 `clone_cow` **已成功**，子地址空间
+///    持有父帧的 incref 引用——**必须显式释放**，否则父帧引用计数永久泄漏
+///    （父退出时帧不归还）。由下方 `drop(child_space)` 承担：
+///    `UserAddressSpace::drop` 走 destroy 路径按 kind 归还帧，与失败前状态对称；
+/// 4. pid 分配（`alloc_pid`）在栈之后，无额外失败点。
+///
+/// # 多线程父进程
+///
+/// 若父所在线程组有**多于一个存活成员**，如实返回 `NotSupported`——ADR-038 决策 4：
+/// 仅复制调用线程的执行现场，其余线程在子进程内不存在，而它们持有的用户态锁/
+/// 不变式状态在子进程里会永久悬空。宁可如实拒绝，绝不静默产出一个语义残缺的子进程。
+///
+/// # 锁序（S21）
+///
+/// 全程遵守既有 `桶锁 → RUN 锁` 顺序（与 `spawn_with_ppid_fds` 同）：
+/// 先短持父桶锁取组容器信息并释放，再 `clone_cow`（持父地址空间 `core` 锁），
+/// 最后取新 pid 桶锁插入、再取 RUN 入队。**不同时持有**桶锁与 RUN 锁。
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_derived(
+    ppid: usize,
+    name: &str,
+    first_run_frame: InterruptFrame,
+) -> Result<usize, Error> {
+    let (name_buf, name_len) = store_name(name)?;
+    // 阶段 1：校验父在册、非 Exit，并快照其组共享态（fd 表 / cwd / identity /
+    // 地址空间）与组内成员数。**父桶锁在本块结束即释放**——后续 clone_cow 需要
+    // 取父地址空间的 core 锁，若此处仍持桶锁则形成 桶锁→core 的嵌套（S21 禁止）。
+    // **顺序至关重要（S21 / 自身死锁教训）**：`group_members` 会遍历并逐桶加锁
+    // ——其中**包含 `ppid` 所在桶**。`proc_bucket_lock` 是不可重入自旋锁，若在
+    // 已持 `ppid` 桶锁的临界区内调用它，本核会自旋等待自己已持有的锁 → 永久
+    // 死锁（单核下表现为整机静默挂起）。故成员数必须在**取任何桶锁之前**求得。
+    // 含组长自身，故单线程父 == 1。
+    let member_count = group_members(ppid).len();
+    let (fd_table, cwd, identity, trampoline) = {
+        let g = proc_bucket_lock(ppid);
+        let Some(leader) = g.get(&ppid) else {
+            return Err(Error::NotFound);
+        };
+        if leader.proc.state() == TaskState::Exit {
+            return Err(Error::NotFound);
+        }
+        (
+            leader.proc.clone_fd_table(),
+            leader.proc.cwd(),
+            leader.proc.identity(),
+            leader.proc.signal().trampoline(),
+        )
+    };
+    // ADR-038 决策 4：多线程父进程如实拒绝（见函数文档）。
+    // 注意顺序：本判定在快照之后，是为了让「父不存在」优先于「父多线程」报错
+    // （NotFound 比 NotSupported 更具体地指向调用方的真实错误）。
+    if member_count != 1 {
+        return Err(Error::NotSupported);
+    }
+    // 阶段 2：COW 克隆父地址空间。失败时 clone_cow 自身已回滚（见其文档），
+    // 父状态不变，直接上抛。
+    let child_space = {
+        let g = proc_bucket_lock(ppid);
+        let Some(leader) = g.get(&ppid) else {
+            return Err(Error::NotFound);
+        };
+        leader.proc.addr_space().clone_cow().map_err(Error::from)?
+    };
+    // 阶段 3：为子进程分配独立内核栈。**这是 clone_cow 之后唯一的失败点**；
+    // 失败必须归还子地址空间（否则父帧 incref 泄漏，见函数文档第 3 点）。
+    let stack_frame = match mm::allocate_frames(KSTACK_ORDER) {
+        Some(f) => f,
+        None => {
+            // 显式释放：drop 走 destroy 路径按 kind 归还全部帧并递减父帧 incref。
+            drop(child_space);
+            return Err(Error::OutOfMemory);
+        }
+    };
+    let kstack_top = arch::phys_to_virt(stack_frame.start_paddr()) + KSTACK_SIZE as u64;
+    let pid = alloc_pid();
+    // 阶段 4：装配子 PCB。`Process::new` 自建**全新独立组**（默认标准流表 + `/`
+    // cwd + 默认身份），随后逐项注入从父快照来的 fd/cwd/identity —— 这正是
+    // 「新组 + 深拷贝共享态」与线程「同组 + Arc 共享」的关键区别：子进程改 cwd
+    // 或关 fd **不影响父**（POSIX fork 语义），而线程会互相影响。
+    let mut proc = Box::new(Process::<X86PageTable>::new(
+        pid,
+        first_run_frame.rip,
+        first_run_frame.rsp,
+        kstack_top,
+        Arc::new(child_space),
+    ));
+    // fd 表深拷贝的语义：`clone_fd_table` 只做结构性克隆（`OpenHandle` 的
+    // `Clone`），**pipe 端引用计数递增不在 task 层**——由 kernel syscall 层在
+    // 本函数返回后对每个 `Pipe { id }` 调 `ipc::pipe_ref_inc`（task 不依赖 ipc，
+    // 见 `spawn_with_ppid_fds` 同款注释）。
+    proc.set_inherited_fd_table(fd_table);
+    proc.set_cwd(cwd);
+    proc.set_identity(identity);
+    // 信号：子进程继承父已装进**共享地址空间保留区**的 restorer 地址（地址同，
+    // 因 COW 子空间与父共享该页）。同样与线程路径一致。
+    proc.signal_mut().set_trampoline(trampoline);
+    let home_cpu = spawn_home_cpu();
+    let entry = Box::new(ProcEntry {
+        proc,
+        // 子进程首跑帧 = 父被 syscall 中断处的帧副本（**这是 fork 的核心**：子进程
+        // 从父的当前位置继续执行，而非从入口）。`rax` 已由调用方置 0 —— 子进程
+        // 从 syscall 返回时收 0（POSIX fork 铁律）。
+        saved: first_run_frame,
+        kstack_frames: stack_frame,
+        kstack_top,
+        fpu: fpu_template_snapshot(),
+        name: name_buf,
+        name_len,
+        // **亲子关系**：ppid = 调用父 pid，使 waitpid 能收到子进程（与线程的
+        // ppid = tgid 的「属于组长」关系不同——子进程是真正的 waitpid 亲子）。
+        ppid,
+        exit_code: 0,
+        waiting_for: None,
+        home_cpu,
+        fs_base: 0,
+        vruntime: 0,
+        nice: 0,
+    });
+    proc_bucket_lock(pid).insert(pid, entry);
+    enqueue_ready(&mut run_mut(home_cpu), pid, true);
+    Ok(pid)
+}
+
 // ---------- T1-2 线程组成员关系查询（ADR-035 D2 / threads.md T1-2） ----------
 
 /// 组内遍历：返回线程组 `tgid`（组长 pid）的全部成员 pid（含组长自身）。
