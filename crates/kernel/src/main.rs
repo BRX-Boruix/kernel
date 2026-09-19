@@ -521,26 +521,34 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-test-m42")]
     tests::test_scheduler();
 
-    // SCHED-EEVDF-1：vruntime 时间基准的实测取证（HPET 直读 vs per-CPU TSC）。
-    // 放在调度测试之前：它只读时间源、不依赖调度状态，且结论是 2/3 的前提。
-    tests::test_sched_eevdf1_time_source_cost();
+    // SCHED-EEVDF-1/2/3 与 SYSCALL-FAST-1/2/3：常规自检测试族（非停机验收，
+    // 跑完返回主流程继续启动）。它们与 `tests` 模块同属 `kernel-tests` 门控——
+    // 门控必须成对：只 gate 模块不 gate 调用点会让**默认构建**（不带
+    // `kernel-tests`，即 SDK `--test` 之外的常规构建）在编译期就失败。
+    // 本块原缺此门控，导致默认构建 E0433「cannot find module tests」×8。
+    #[cfg(feature = "kernel-tests")]
+    {
+        // SCHED-EEVDF-1：vruntime 时间基准的实测取证（HPET 直读 vs per-CPU TSC）。
+        // 放在调度测试之前：它只读时间源、不依赖调度状态，且结论是 2/3 的前提。
+        tests::test_sched_eevdf1_time_source_cost();
 
-    // SCHED-EEVDF-2：vruntime 有序就绪队列的契约（TDD 红先行的产物）。
-    tests::test_sched_eevdf2_vruntime_queue_contract();
+        // SCHED-EEVDF-2：vruntime 有序就绪队列的契约（TDD 红先行的产物）。
+        tests::test_sched_eevdf2_vruntime_queue_contract();
 
-    // SCHED-EEVDF-3：nice 权重语义（纯函数方向 + 端到端接线）。
-    tests::test_sched_eevdf3_nice_weights();
-    tests::test_sched_eevdf3_nice_affects_scheduling();
-    tests::test_sched_eevdf3_interactive_latency();
+        // SCHED-EEVDF-3：nice 权重语义（纯函数方向 + 端到端接线）。
+        tests::test_sched_eevdf3_nice_weights();
+        tests::test_sched_eevdf3_nice_affects_scheduling();
+        tests::test_sched_eevdf3_interactive_latency();
 
-    // SYSCALL-FAST-1：GS per-CPU 地基（一致性 / 配对性 / 嵌套纪律）。
-    tests::test_syscall_fast1_percpu_gs_contract();
+        // SYSCALL-FAST-1：GS per-CPU 地基（一致性 / 配对性 / 嵌套纪律）。
+        tests::test_syscall_fast1_percpu_gs_contract();
 
-    // SYSCALL-FAST-2：syscall 帧布局与 InterruptFrame 的二进制兼容契约。
-    tests::test_syscall_fast2_frame_layout_contract();
+        // SYSCALL-FAST-2：syscall 帧布局与 InterruptFrame 的二进制兼容契约。
+        tests::test_syscall_fast2_frame_layout_contract();
 
-    // SYSCALL-FAST-3：r10 捕获通道在两条 ABI 下的一致性（a4 为保留输出）。
-    tests::test_syscall_fast3_r10_capture_contract();
+        // SYSCALL-FAST-3：r10 捕获通道在两条 ABI 下的一致性（a4 为保留输出）。
+        tests::test_syscall_fast3_r10_capture_contract();
+    }
 
     // M4.3 静态 ELF 加载验收：解析并加载 ELF 镜像到用户空间，spawn 运行
     // （停机验收，不返回主流程），单独 gate。
