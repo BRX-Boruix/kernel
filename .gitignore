@@ -23,3 +23,5 @@
 /crates/kernel/audioe2e.elf
 /crates/kernel/audiofile.elf
 /crates/kernel/selftest.elf
+# ADR-038 U1：真实 C 用户态 fork() 端到端验收程序（csrc/prog/forkdemo.c 经 SDK 编译）。
+/crates/kernel/forkdemo.elf
