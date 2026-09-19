@@ -137,18 +137,45 @@ pub(crate) fn index_at(level: usize, levels: usize, vaddr: u64) -> usize {
     ((vaddr >> bit) & 0x1FF) as usize
 }
 
-/// 从叶层表项解析物理地址（区分大页与 4KB 页）。
+/// 从叶层表项解析该**大页块的物理基址**（区分大页与 4KB 页）。
 ///
 /// `leaf` 是该叶子所处的层级（从顶层 0 数起），`levels` 为页表层级数。
 /// 大页大小 = 2^(12 + (levels - 1 - leaf) * 9)。
 ///
 /// 必须与 `ADDR_MASK` 相与以排除 NX（bit63）等高位标志位——否则启用 NX 后
 /// `translate`/`unmap` 会把 NX 位误当作物理地址的一部分返回（见回归修复）。
+///
+/// **语义边界（2026-09-19 R7-huge 修复）**：本函数返回的是**块基址**，即大页
+/// 起始的物理地址，**不含**虚拟地址在块内的偏移。它只对「整块操作」的调用方
+/// 正确——目前唯一这样的调用方是 `unmap` 的 2M 拆分路径（按基址 + i*4K 展开
+/// 512 个 4K 叶）。**地址翻译**（`translate` / `translate_with_flags`）必须用
+/// [`leaf_paddr_at`]，否则同一大页内所有地址都会解析到同一个块基址。
 #[inline]
 fn entry_paddr(entry: u64, leaf: usize, levels: usize) -> u64 {
     let shift = 12 + (levels - 1 - leaf) * 9;
     // ADDR_MASK 排除 bit63/NX 及其它标志位；再按页大小对齐掩掉低位。
     entry & ADDR_MASK & !((1u64 << shift) - 1)
+}
+
+/// 从叶层表项与虚拟地址解析**真实物理地址**（块基址 + 页内偏移）。
+///
+/// 大页（2M/1G）叶在页表中只记录块基址；虚拟地址在块内的偏移必须由本函数补回，
+/// 否则 `translate` 会把整块任意地址都解析成同一个物理地址——调用方据此经
+/// HHDM 访问将命中**错误的内存**（静默数据腐蚀，而非报错）。
+///
+/// 4KB 叶的偏移域为 0（`shift == 12`，掩码只剩低 12 位），本函数退化为等值。
+///
+/// 偏移计算用虚拟地址而非物理地址：`vaddr & (block_size - 1)`。
+/// 大页在页表中的块基址天然按块大小对齐（`entry_paddr` 已掩低位），故
+/// `base + offset` 不会跨出该块。
+#[inline]
+fn leaf_paddr_at(entry: u64, leaf: usize, levels: usize, vaddr: u64) -> u64 {
+    let shift = 12 + (levels - 1 - leaf) * 9;
+    let base = entry_paddr(entry, leaf, levels);
+    // shift 取值：LA48（levels=4）下 leaf=0→39（1G 叶）、leaf=1→30（2M 叶）、
+    // leaf=2→12（4K 叶）；LA57（levels=5）下最大为 leaf=0→48。全部 < 64，
+    // `1u64 << shift` 无溢出，掩码运算在 u64 内封闭。
+    base + (vaddr & ((1u64 << shift) - 1))
 }
 
 // ---- 页表 ----
@@ -454,12 +481,27 @@ impl arch::PageTable for X86PageTable {
             }
         }
 
-        Ok(PhysAddr::new(entry_paddr(entries[leaf], leaf, levels)))
+        // R7-huge 修复：返回**该地址自身**的物理地址（块基址 + 页内偏移）。
+        //
+        // 到达此处时叶已是 4K（大页在上方拆分路径中已展开并递归重走），
+        // 偏移域为 0，故与 `entry_paddr` 等值；用 `leaf_paddr_at` 是为语义
+        // 单一——「返回被解映射地址的物理地址」不依赖「叶必为 4K」这一隐含前提。
+        Ok(PhysAddr::new(leaf_paddr_at(entries[leaf], leaf, levels, v)))
     }
 
     fn translate(&self, vaddr: VirtAddr) -> Option<PhysAddr> {
         let (entries, leaf, levels) = unsafe { self.walk(vaddr.as_u64()) }?;
-        Some(PhysAddr::new(entry_paddr(entries[leaf], leaf, levels)))
+        // R7-huge 修复（根因）：必须补回**大页块内偏移**。原实现直接用
+        // `entry_paddr`（块基址），使 2M 大页内任意地址都解析到同一物理地址
+        // ——调用方（如 `clone_cow` 逐 4K translate，user_space.rs:830）据此
+        // 会得到 512 个相同帧，造成**静默数据腐蚀**而非报错。
+        // 既有 `test_paging` 只在 2M 基址上 translate，故从未暴露。
+        Some(PhysAddr::new(leaf_paddr_at(
+            entries[leaf],
+            leaf,
+            levels,
+            vaddr.as_u64(),
+        )))
     }
 
     fn translate_with_flags(&self, vaddr: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
@@ -481,7 +523,12 @@ impl arch::PageTable for X86PageTable {
         if entry & (1 << 63) == 0 {
             flags = flags.executable();
         }
-        Some((PhysAddr::new(entry_paddr(entry, leaf, levels)), flags))
+        // R7-huge 修复：同 `translate`，补回大页块内偏移（两处必须一致，
+        // 否则 `translate` 与 `translate_with_flags` 对同一地址给出不同答案）。
+        Some((
+            PhysAddr::new(leaf_paddr_at(entry, leaf, levels, vaddr.as_u64())),
+            flags,
+        ))
     }
 
     fn paddr(&self) -> u64 {
