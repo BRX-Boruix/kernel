@@ -172,6 +172,31 @@ pub const SYS_TASK_GETTID: u32 = nr(domain::TASK, 0x08); // 0x38
 /// Running 进程的脆弱启发（SMP/多线程下会挑错成员）。TASK 域扩展动词 0x09；双侧镜像（S13）：
 /// 与 libsys `nr.rs::SYS_TASK_GETPID` 同值。
 pub const SYS_TASK_GETPID: u32 = nr(domain::TASK, 0x09); // 0x39
+
+/// `derive(flags, entry_rsp, entry_rip) -> pid`：**COW 派生子进程**（ADR-038）。
+///
+/// 语义：以调用进程为父，派生一个**新线程组**的子进程，其用户地址空间与父
+/// **共享全部已映射数据帧**（写时复制），fd 表/cwd/identity 按 ADR-038 §2 决策 2
+/// 逐项取得。子进程在父被本 syscall 中断处继续执行。
+///
+/// **返回语义（POSIX fork 铁律）**：父收新子进程 pid（>0）、子收 0、失败父收 -errno。
+///
+/// **入参（首期保留，非 0 即拒绝——绝不静默忽略）**：`flags` / `entry_rsp` /
+/// `entry_rip` 首期必须全为 `0`（表示「继承父当前 RIP/RSP」）。保留是为将来
+/// 「带入口的派生」预留 ABI 位置；现取值一律返回 `InvalidParam`。
+///
+/// **不新增 fork syscall**（ADR-003 明文禁止 POSIX `fork()` 进入内核）：本动词是
+/// TASK 域的 object-verb 原语，符合 ADR-014 编码规则；POSIX 兼容层的 `fork()`
+/// 由 libc 包装本调用提供。TASK 域扩展动词 0x0A；双侧镜像（S13）：与 libsys
+/// `nr.rs::SYS_TASK_DERIVE` 同值、注释互指。
+pub const SYS_TASK_DERIVE: u32 = nr(domain::TASK, 0x0A); // 0x3A
+
+/// `SYS_TASK_DERIVE` 的保留位域（ADR-038 §2 决策 1）。
+///
+/// 首期只接受 [`DERIVE_FLAGS_NONE`]；任何其它位如实 `InvalidParam`。
+/// 用命名常量而非字面量 0，使「保留位」是一处成文的语义而非魔法值（S13）。
+pub const DERIVE_FLAGS_NONE: u64 = 0;
+
 pub const SYS_ENTRY_CREATE: u32 = nr(domain::VFS, op::CREATE); // 0x41
 pub const SYS_ENTRY_READ: u32 = nr(domain::VFS, op::READ); // 0x42
 pub const SYS_ENTRY_UPDATE: u32 = nr(domain::VFS, op::WRITE); // 0x43
