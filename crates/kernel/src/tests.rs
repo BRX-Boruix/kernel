@@ -8676,6 +8676,161 @@ pub fn test_waitpid_core() {
 /// 4. **空队列**：取空队列返回 None，绝不 panic。
 /// 5. **幂等/重复入队防护**：同一 pid 不会在队列中出现两次（重复入队会破坏
 ///    「取最小者」语义，导致某进程被重复调度）。
+/// SCHED-EEVDF-3：nice 权重语义与交互/CPU 密集负载的**可量化**区分。
+///
+/// ## 为什么先写测试（TDD 红先行）
+///
+/// EEVDF-3 要引入「优先级」这一新语义维度。优先级最容易被做成「看起来对、实际
+/// 反向」——例如权重方向写反（高优先级反而分到更少 CPU）在功能测试中不报错，
+/// 只在混合负载下表现为「交互进程更卡」。故先用**方向性断言**把它钉死。
+///
+/// ## 判据（先把判据说清楚，再看数据）
+///
+/// EEVDF 权重语义：`vruntime += elapsed * (NICE_0_WEIGHT / weight)`。
+///   - 权重 **越大**（nice 越小 / 优先级越高）→ 同等运行时间下 vruntime 增量**越小**
+///     → 该进程「欠账」最少 → **越常被选中** → 分到**更多** CPU；
+///   - 权重 **越小**（nice 越大）→ vruntime 增长越快 → 越少被选中。
+///
+/// 本测试直接验证该单调方向，并验证 nice 到权重的映射单调性。
+/// SCHED-EEVDF-3：nice 在**真实调度器**中生效（端到端，非仅纯函数单测）。
+///
+/// 上一测试验证 `nice_to_weight`/`weight_charge` 的纯函数方向；本测试验证
+/// 「设置 nice -> 真实调度记账 -> 选中顺序改变」这条完整链路上确实通了。
+/// 二者缺一不可：纯函数对而接线错（例如记账点取的仍是常量权重）同样没效果。
+pub fn test_sched_eevdf3_nice_affects_scheduling() {
+    use task::scheduler::test_hooks as th;
+    info!("[test-eevdf3e2e] === nice must actually change scheduling ===");
+
+    arch_x86_64::interrupts::disable();
+    th::reset_all();
+
+    let a = th::spawn_named_child_of(0, "hi.elf").expect("spawn a");
+    let b = th::spawn_named_child_of(0, "lo.elf").expect("spawn b");
+
+    // 默认同为 nice 0（引入 nice 不得改变既有行为）。
+    assert_eq!(task::scheduler::nice_of(a), Some(0), "default nice must be 0");
+    assert_eq!(task::scheduler::nice_of(b), Some(0), "default nice must be 0");
+    info!("[test-eevdf3e2e] defaults both nice=0 (no behavior change) OK");
+
+    // 越界钳制（S18）：不得 panic、不得静默接受。
+    assert_eq!(task::scheduler::set_nice(a, -999), Some(-20), "must clamp low to -20");
+    assert_eq!(task::scheduler::nice_of(a), Some(-20));
+    assert_eq!(task::scheduler::set_nice(b, 999), Some(19), "must clamp high to 19");
+    assert_eq!(task::scheduler::nice_of(b), Some(19));
+    info!("[test-eevdf3e2e] out-of-range clamped to [-20,19], no panic OK");
+
+    // 不存在的 pid：返回 None，不 panic。
+    assert_eq!(task::scheduler::set_nice(0xDEAD_BEEF, 5), None);
+    assert_eq!(task::scheduler::nice_of(0xDEAD_BEEF), None);
+    info!("[test-eevdf3e2e] missing pid -> None, no panic OK");
+
+    // 记账差异：高优先级(a, nice=-20)与低优先级(b, nice=19)跑同样 tick 数，
+    // a 的 vruntime 增量必须远小于 b。
+    let (vt_a, vt_b) = th::debug_nice_charge_probe(a, b, 10).expect("charge probe");
+    info!(
+        "[test-eevdf3e2e] after 10 ticks: nice=-20 vt={} vs nice=19 vt={} (ratio {}x)",
+        vt_a, vt_b, if vt_a == 0 { 0 } else { vt_b / vt_a }
+    );
+    assert!(
+        vt_a < vt_b,
+        "higher-priority process must accumulate less vruntime: {} !< {}",
+        vt_a, vt_b
+    );
+
+    info!("[test-eevdf3e2e] PASS (nice -> scheduling is wired end to end)");
+}
+
+pub fn test_sched_eevdf3_nice_weights() {
+    use task::sched_eevdf::{nice_to_weight, weight_charge};
+    info!("[test-eevdf3] === nice weight semantics ===");
+
+    // ---- 1. nice -> 权重 单调递减 ----
+    // nice -20 是最高优先级（权重最大），nice +19 最低（权重最小）。
+    let w_neg20 = nice_to_weight(-20);
+    let w_0 = nice_to_weight(0);
+    let w_19 = nice_to_weight(19);
+    info!(
+        "[test-eevdf3] weights: nice(-20)={} nice(0)={} nice(19)={}",
+        w_neg20, w_0, w_19
+    );
+    assert!(
+        w_neg20 > w_0 && w_0 > w_19,
+        "weight must decrease monotonically with nice: {} > {} > {}",
+        w_neg20, w_0, w_19
+    );
+
+    // ---- 2. 记账方向：权重越大，同等运行时间积累的 vruntime 越少 ----
+    let base = 1000u64;
+    let charge_hi = weight_charge(base, w_neg20);
+    let charge_0 = weight_charge(base, w_0);
+    let charge_lo = weight_charge(base, w_19);
+    info!(
+        "[test-eevdf3] charge({} ticks): hi={} mid={} lo={}",
+        base, charge_hi, charge_0, charge_lo
+    );
+    assert!(
+        charge_hi < charge_0 && charge_0 < charge_lo,
+        "higher-priority must accumulate LESS vruntime: {} < {} < {}",
+        charge_hi, charge_0, charge_lo
+    );
+
+    // ---- 2b. 防饿死：最高优先级也必须**积累非零** vruntime（真实缺陷回归）----
+    //
+    // 原实现 `elapsed * NICE_0_WEIGHT / weight` 在 weight > NICE_0_WEIGHT 时
+    // 整数截断为 **0**：nice=-20 的进程每 tick 记账 0，vruntime 永远停在原值，
+    // 永远是最小者，**饿死所有其它进程**。实测暴露为 `nice=-20 vt=0`。
+    // 单 tick 都必须 > 0，否则上面的饿死机制就回来了。
+    let one_tick_hi = weight_charge(1, w_neg20);
+    info!("[test-eevdf3] single-tick charge at nice=-20 = {} (must be > 0)", one_tick_hi);
+    assert!(
+        one_tick_hi > 0,
+        "nice=-20 must still accumulate non-zero vruntime per tick, else it starves others"
+    );
+    // 全部 40 档 nice 都必须单 tick 非零（不只测最极端的一档）。
+    for n in -20i32..=19 {
+        let c = weight_charge(1, nice_to_weight(n));
+        assert!(c > 0, "nice={} charges 0 per tick -> would starve others", n);
+    }
+    info!("[test-eevdf3] all 40 nice levels charge > 0 per tick (no starvation) OK");
+
+    // ---- 3. 权重 0 防护（S18 边界：不得除零/不得产生 u64::MAX 式暴走）----
+    assert!(nice_to_weight(0) > 0, "weight must never be 0");
+    let w_safe = nice_to_weight(19);
+    assert!(w_safe > 0, "extreme nice must still yield positive weight");
+    info!("[test-eevdf3] zero-weight guard OK");
+
+    // ---- 4. 调度后果：交互进程 vs CPU 密集型，谁被更频繁选中 ----
+    // 模拟：两个进程各运行相同 tick 数，但交互进程 nice=-10（高权重）。
+    // 期望：交互进程的 vruntime 增长更慢 => 在就绪队列中更靠前（被更常选中）。
+    let mut q = task::sched_eevdf::VruntimeQueue::new();
+    let interactive = 1usize;
+    let cpu_hog = 2usize;
+    q.insert(interactive, 0);
+    q.insert(cpu_hog, 0);
+    // 两者各跑 10 个 tick，但交互进程按高权重折算。
+    let w_i = nice_to_weight(-10);
+    let w_c = nice_to_weight(0);
+    let mut vt_i = 0u64;
+    let mut vt_c = 0u64;
+    for _ in 0..10 {
+        vt_i += weight_charge(1, w_i);
+        vt_c += weight_charge(1, w_c);
+    }
+    q.insert(interactive, vt_i);
+    q.insert(cpu_hog, vt_c);
+    let first = q.pop_min().expect("queue non-empty");
+    info!(
+        "[test-eevdf3] after 10 ticks: interactive vt={} cpu-hog vt={} -> next = {}",
+        vt_i, vt_c, first.0
+    );
+    assert_eq!(
+        first.0, interactive,
+        "higher-priority (interactive) must be selected first"
+    );
+
+    info!("[test-eevdf3] PASS (nice->weight monotonic; direction correct)");
+}
+
 pub fn test_sched_eevdf2_vruntime_queue_contract() {
     info!("[test-eevdf2] === vruntime ordered ready queue contract ===");
 

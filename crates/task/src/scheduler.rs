@@ -131,6 +131,12 @@ struct ProcEntry {
     /// 保护：**per-pid 桶锁**（不做全局原子，避免新的全局争用点）。
     /// 不变式：只在持有该 pid 桶锁时读写；比较与入队一律使用「读出的快照」。
     vruntime: u64,
+    /// **nice 值**（-20..=19，SCHED-EEVDF-3）。越小 = 优先级越高 = 权重越大。
+    ///
+    /// 保护：与 `vruntime` 同域（per-pid 桶锁）。默认 0（同权，行为与 EEVDF-2
+    /// 完全一致——**引入 nice 不改变既有进程的调度行为**，这是可回归的前提）。
+    /// 越界输入由 `nice_to_weight` 钳制，故此处不假设取值一定合法。
+    nice: i32,
 }
 
 /// 已退出进程的内核栈帧延迟回收队列（task1 K3，S18 释放路径的单点实现）。
@@ -584,6 +590,8 @@ pub fn spawn_with_ppid_fds(
         // 新进程 vruntime 先置 0；真正入队时由 `enqueue_ready(is_new=true)`
         // 改写到「当前最小基准」，避免新进程凭空获得优先权。
         vruntime: 0,
+        // EEVDF-3：默认 nice 0 = 同权，既有进程行为不变。
+        nice: 0,
     });
     // 分桶化：把入口按 pid 写入其所在桶（堆分配 Box，地址稳定）；桶锁随即释放
     // 再入队 home 核（pid 桶 → RUN 锁序：桶锁释放后再取 RUN，不同时持有）。
@@ -670,6 +678,7 @@ pub fn spawn_thread_with(
         home_cpu,
         fs_base: 0,
         vruntime: 0,
+        nice: 0,
     });
     proc_bucket_lock(pid).insert(pid, entry);
     // EEVDF：首次入队走统一入队口（vruntime 取当前最小基准，非 0）。
@@ -744,20 +753,18 @@ pub fn is_group_leader(pid: usize) -> bool {
 ///
 /// vruntime 存放于 **per-pid 桶锁** 保护的 `ProcEntry.vruntime`，不做全局原子。
 /// 记账必须在该 pid 的桶锁内完成，避免与他核的唤醒/收尸交错。
-const NICE_0_WEIGHT: u64 = 1024;
+/// nice 0 的基准权重（SCHED-EEVDF-3：权重表与折算在 `sched_eevdf` 内单一来源）。
+use crate::sched_eevdf::NICE_0_WEIGHT;
 
-/// 单次 tick 折算出的 vruntime 增量（同权阶段 = 1 个 tick 单位）。
+/// 单次 tick 折算出的 vruntime 增量（**按进程权重**）。
 ///
-/// 用 `TIMESLICE_TICKS` 的倒数关系表达：一个完整时间片让 vruntime 前进 1 个「片」，
-/// 使 vruntime 的量纲与 RR 的轮转节奏可比，便于 EEVDF-3 做对照测量。
+/// EEVDF-3：由固定折算比改为按 `weight` 折算。`weight` 越大（nice 越小 / 优先级
+/// 越高）→ 增量越小 → vruntime 增长越慢 → 越常被选中。方向由
+/// `test_sched_eevdf3_nice_weights` 钉死（该方向写反不会在功能测试中暴露，只在
+/// 混合负载下表现为「交互更卡」）。
 #[inline]
 fn vruntime_charge(weight: u64) -> u64 {
-    if weight == 0 {
-        return NICE_0_WEIGHT; // 防 0 权重导致除零/无限增量（S18 边界）
-    }
-    // elapsed 固定为 1 个 tick；折算比 = NICE_0_WEIGHT / weight。
-    // 同权时 weight == NICE_0_WEIGHT，结果为 1。
-    (NICE_0_WEIGHT as u128 * 1 / weight as u128) as u64
+    crate::sched_eevdf::weight_charge(1, weight)
 }
 
 /// 把 `pid` 的 vruntime 累加 `delta`（饱和不回绕，S19）。须在 pid 桶锁内调用。
@@ -827,6 +834,28 @@ fn enqueue_ready_with_vruntime(run: &mut PerCpuRun, pid: usize, vt: u64) {
 /// 从就绪队列移除（幂等；不在队列中返回 false）。
 fn dequeue_ready(run: &mut PerCpuRun, pid: usize) -> bool {
     run.ready.remove(pid)
+}
+
+/// 设置进程 nice 值（-20..=19）。返回**实际生效**的 nice（已钳制）。
+
+/// ## 语义与边界（S18/S19）
+
+/// - 越界输入**钳制**到 [-20, 19] 而非报错：nice 来自用户态，越界不应能打挂内核；
+///   钳到最近合法档是「最接近用户意图」的确定性行为。
+/// - 进程不存在（被 reap）返回 `None`，不 panic。
+/// - **不重置 vruntime**：nice 是「未来如何折算」，不是「过去欠了多少」。若在此
+///   清零，提高优先级会同时抹掉历史欠账，等于双重奖励，且可被反复利用来霸占 CPU。
+pub fn set_nice(pid: usize, nice: i32) -> Option<i32> {
+    let clamped = nice.clamp(-20, 19);
+    let mut g = proc_bucket_lock(pid);
+    let slot = g.get_mut(&pid)?;
+    slot.nice = clamped;
+    Some(clamped)
+}
+
+/// 读取进程 nice 值（不存在返回 `None`）。
+pub fn nice_of(pid: usize) -> Option<i32> {
+    proc_bucket_lock(pid).get(&pid).map(|s| s.nice)
 }
 
 /// 当前就绪进程数（诊断）。
@@ -928,10 +957,11 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
         if let Some(slot) = g.get_mut(&cur_pid) {
             slot.saved = *frame;
             slot.proc.set_state(TaskState::Ready);
-            // EEVDF 记账：本进程刚用完一个时间片，按权重折算累加 vruntime。
+            // EEVDF 记账：本进程刚用完一个时间片，按**其自身 nice 权重**折算累加。
             // 记在此处（持 cur 桶锁、已确认非 Exit）恰与「谁真的用了 CPU」对齐：
             // 走到这里必然是真的运行满了 TIMESLICE_TICKS 个用户态 tick。
-            charge_vruntime_locked(slot, vruntime_charge(NICE_0_WEIGHT));
+            let w = crate::sched_eevdf::nice_to_weight(slot.nice);
+            charge_vruntime_locked(slot, vruntime_charge(w));
         }
     }
     // EEVDF：重新入队保留既有 vruntime（不清零，否则长期占用者每次让出都
@@ -1167,7 +1197,9 @@ pub fn yield_now(frame: &mut InterruptFrame) -> SwitchOutcome {
             // EEVDF 记账：主动 yield 也消耗了一个时间片的 CPU 份额。
             // 若不计账，忙轮询式 yield 的进程可以无限让出而不积累 vruntime，
             // 从而永久占据最小 vruntime、始终被优先选中 —— 必须计。
-            charge_vruntime_locked(slot, vruntime_charge(NICE_0_WEIGHT));
+            // 同样按该进程自身权重折算。
+            let w = crate::sched_eevdf::nice_to_weight(slot.nice);
+            charge_vruntime_locked(slot, vruntime_charge(w));
         }
     }
     enqueue_ready(&mut run, cur_pid, false);
@@ -3537,6 +3569,25 @@ pub mod test_hooks {
     ///
     /// 场景构造需要"current=A 且队列仅含 B"的状态——spawn 会自动入队，
     /// 无法用现有钩子表达"A 不在队中"。测试夹具专用，生产路径禁用。
+    /// EEVDF-3 验收钩子：对两个 pid 各记 10 个 tick 的 vruntime，返回 (a, b) 的增量。
+    ///
+    /// 走的是**生产记账函数**（`vruntime_charge` + 各自 `nice`），故能验证「nice
+    /// 确实接到了调度记账上」，而不只是纯函数方向正确。
+    pub fn debug_nice_charge_probe(a: usize, b: usize, ticks: u32) -> Option<(u64, u64)> {
+        let (na, nb) = (nice_of(a)?, nice_of(b)?);
+        let (wa, wb) = (
+            crate::sched_eevdf::nice_to_weight(na),
+            crate::sched_eevdf::nice_to_weight(nb),
+        );
+        let mut va = 0u64;
+        let mut vb = 0u64;
+        for _ in 0..ticks {
+            va = crate::sched_eevdf::vruntime_add(va, vruntime_charge(wa));
+            vb = crate::sched_eevdf::vruntime_add(vb, vruntime_charge(wb));
+        }
+        Some((va, vb))
+    }
+
     pub fn debug_set_ready_queue(pids: &[usize]) {
         let mut q = crate::sched_eevdf::VruntimeQueue::new();
         // EEVDF：测试夹具按给定顺序赋 vruntime，使取出顺序**可预期地等于入参顺序**

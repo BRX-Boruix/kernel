@@ -50,6 +50,87 @@ pub fn vruntime_add(base: u64, delta: u64) -> u64 {
     base.saturating_add(delta)
 }
 
+// ---------- SCHED-EEVDF-3：nice -> 权重 ----------
+
+/// nice 0 的基准权重（对齐 Linux CFS 的 `NICE_0_LOAD`，便于对照其既有数据）。
+pub const NICE_0_WEIGHT: u64 = 1024;
+
+/// 权重表：nice -20..=19 共 40 档，**索引 = nice + 20**。
+///
+/// **为什么用查表而不是公式**：
+///   1. 逐档可直接审阅，不存在「浮点/幂运算在 no_std 下的精度与确定性」问题；
+///   2. 调度路径上是一次数组索引，无乘除（`weight_charge` 里那一次除法是必须的
+///      折算，属不可避免）；
+///   3. 数值取自 Linux CFS 的 `sched_prio_to_weight[]`——**采用业已广泛验证的
+///      取值**比自创一套曲线更可辩护，也使本实现的行为可与既有 EEVDF/CFS 资料对照。
+///
+/// 单调性由测试 `test_sched_eevdf3_nice_weights` 断言（权重随 nice 递减）。
+const WEIGHT_TABLE: [u64; 40] = [
+    88761, 71755, 56483, 46273, 36291, // nice -20..-16
+    29154, 23254, 18705, 14949, 11916, // nice -15..-11
+    9548, 7620, 6100, 4904, 3906, // nice -10..-6
+    3121, 2501, 1991, 1586, 1277, // nice -5..-1
+    1024, // nice 0
+    820, 655, 526, 423, // nice 1..4
+    335, 272, 215, 172, // nice 5..8
+    137, 110, 87, 70, // nice 9..12
+    56, 45, 36, 29, // nice 13..16
+    23, 18, 15, // nice 17..19
+];
+
+/// nice（-20..=19）-> 权重。超范围**钳制**到边界（S18：不 panic、不静默错值）。
+///
+/// 钳制而非报错：nice 来自用户态，越界输入不应能打挂内核；
+/// 钳到最近合法档是「最接近用户意图」的确定性行为。
+#[inline]
+pub fn nice_to_weight(nice: i32) -> u64 {
+    let idx = (nice + 20).clamp(0, 39) as usize;
+    WEIGHT_TABLE[idx]
+}
+
+/// vruntime 的**定点缩放因子**（2^20）。
+///
+/// ## 为什么必须缩放（这是一个真实缺陷的修复，不是洁癖）
+///
+/// 朴素写法 `delta = elapsed * NICE_0_WEIGHT / weight` 在**整数除法**下有致命截断：
+/// 当 `weight > NICE_0_WEIGHT`（即高优先级，如 nice=-20 的 88761）时，
+/// `1 * 1024 / 88761 == 0` —— **每个 tick 记账为 0**。
+///
+/// 后果是**饿死全部其它进程**：一个 nice=-20 的进程 vruntime 永远停在原值，
+/// 永远是最小者，永远被优先选中，其它进程再也拿不到 CPU。
+///
+/// 实测暴露：`nice=-20` 进程跑 10 个 tick 后 `vt=0`，而 `nice=0` 的对照是 `vt=10`。
+/// 这个 0 看着「像高优先级的正确表现」，实则是截断错误——**必须靠质疑可疑数值**
+/// 才能发现，功能测试不会报错。
+///
+/// 修复：把 vruntime 记在**放大 2^20 的定点单位**里。
+const VRUNTIME_SHIFT: u32 = 20;
+
+/// 定点单位下的基准权重（`NICE_0_WEIGHT << VRUNTIME_SHIFT`）。
+const SCALED_NICE_0_WEIGHT: u64 = NICE_0_WEIGHT << VRUNTIME_SHIFT;
+
+/// 按权重折算 `elapsed` 个 tick 对应的 vruntime 增量（**定点**）。
+///
+/// 公式：`delta = elapsed * (NICE_0_WEIGHT << SHIFT) / weight`。
+///
+/// 先乘后除（`u128` 中间量），使商在权重高达 88761 时仍 >= 1：
+/// `1 * (1024 << 20) / 88761 == 12090`，远大于 0，**不再截断**。
+///
+/// **方向（易写反，故测试钉死）**：权重越大 → `delta` 越小 → vruntime 增长越慢
+/// → 越常被选中 → 分到更多 CPU。故「高优先级」= 高权重 = nice 小。
+///
+/// 边界：`weight == 0` 时按 `NICE_0_WEIGHT` 处理（防除零）；末端饱和到
+/// `u64::MAX`（S19：不静默回绕）。
+///
+/// **量纲说明**：返回值是定点单位（1 个 tick 在 nice=0 下 = 2^20）。
+/// 内部比较只看相对大小，故量纲不影响正确性。
+#[inline]
+pub fn weight_charge(elapsed_ticks: u64, weight: u64) -> u64 {
+    let w = if weight == 0 { NICE_0_WEIGHT } else { weight };
+    let v = (elapsed_ticks as u128) * (SCALED_NICE_0_WEIGHT as u128) / (w as u128);
+    if v > u64::MAX as u128 { u64::MAX } else { v as u64 }
+}
+
 impl VruntimeQueue {
     /// 新建空队列（`const`，可作 static 初始化）。
     pub const fn new() -> Self {

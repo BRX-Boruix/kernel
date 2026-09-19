@@ -485,6 +485,10 @@ unsafe fn kmain_body() -> ! {
     // SCHED-EEVDF-2：vruntime 有序就绪队列的契约（TDD 红先行的产物）。
     tests::test_sched_eevdf2_vruntime_queue_contract();
 
+    // SCHED-EEVDF-3：nice 权重语义（纯函数方向 + 端到端接线）。
+    tests::test_sched_eevdf3_nice_weights();
+    tests::test_sched_eevdf3_nice_affects_scheduling();
+
     // M4.3 静态 ELF 加载验收：解析并加载 ELF 镜像到用户空间，spawn 运行
     // （停机验收，不返回主流程），单独 gate。
     #[cfg(feature = "kernel-test-m43")]
