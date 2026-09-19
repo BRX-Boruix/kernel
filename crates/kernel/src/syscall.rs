@@ -2159,6 +2159,70 @@ fn sys_getpid(_frame: &mut SyscallFrame) -> u64 {
     pack_ok(tgid as u64)
 }
 
+/// `derive` 处理器（ADR-038 / SYS_TASK_DERIVE / 0x3A）：**COW 派生子进程**。
+///
+/// # 返回语义（POSIX fork 铁律）
+///
+/// 父收新子进程 pid（> 0）、子收 0。实现方式：子进程的首跑帧在 `task::spawn_derived`
+/// 内固定为**父帧的副本且 rax=0**；父侧则在本处理器内把 rax 写成 pid。父进程从本
+/// syscall 返回后继续执行，子进程在其首次被调度时从同一用户态位置继续——两条路径
+/// 各自看到 `rax` 的不同值，这正是「一次调用、两次返回」的实现机制。
+///
+/// # 参数校验（S31：对抗性输入）
+///
+/// `a1`(flags) / `a2`(entry_rsp) / `a3`(entry_rip) 首期必须全为 [`DERIVE_FLAGS_NONE`]
+/// （= 0，表示「继承父当前 RIP/RSP」）。任一非 0 一律 `InvalidParam`——**绝不静默
+/// 忽略**：静默忽略会让调用方以为「带入口的派生」已生效，而实际跑的是继承语义，
+/// 是典型的能力谎言（S06/S09）。
+///
+/// # 与 `arch_frame` 的关系
+///
+/// 本处理器需要**读**当前 syscall 的完整用户态现场（RIP/RSP/RFLAGS/全部 GPR）来构造
+/// 子进程的首跑帧。`arch_frame` 的文档限定「仅切换路径使用」——本处理器**不切换**
+/// （返回 `done`），仅在一次调用内读取该现场并立即复制完毕，不把借用跨越任何调度
+/// 调用，故不违反该纪律。
+///
+/// 失败一律不改动父帧（`pack_err`），父进程从 syscall 正常返回负值。
+fn sys_task_derive(frame: &mut SyscallFrame) -> u64 {
+    // 1. 保留位校验：任一非 0 → InvalidParam（见上方 S31 说明）。
+    if frame.a1 != DERIVE_FLAGS_NONE || frame.a2 != DERIVE_FLAGS_NONE || frame.a3 != DERIVE_FLAGS_NONE
+    {
+        klib::warn!(
+            "[derive] reserved args must be 0, got flags={:#x} rsp={:#x} rip={:#x}",
+            frame.a1,
+            frame.a2,
+            frame.a3
+        );
+        return pack_err(Error::InvalidParam);
+    }
+    // 2. 取父 pid（借用立即结束，KA3：借用不跨越调度调用）。
+    let Some(ppid) = current_proc_mut().map(|p| p.pid()) else {
+        return pack_err(Error::NotFound);
+    };
+    // 3. 构造子进程首跑帧：**父当前用户态现场的完整副本**，仅 rax 置 0。
+    //
+    // `arch_frame(frame)` 是架构耦合边界（见其文档），此处只读一次并立刻 `*`
+    // 复制成 owned 值——InterruptFrame 是 `Copy`，复制后借用即结束，
+    // 不跨越下方任何 `task::*` 调用。
+    let mut child_frame = *arch_frame(frame);
+    // **POSIX fork 铁律**：子进程从本 syscall 返回 0。
+    child_frame.rax = 0;
+    // r10 也被清 0：既有约定里 r10 是 aux 输出槽（waitpid 用它送回被收尸 pid）。
+    // 子进程没有「被收尸对象」可言，保留父的 r10 会泄漏一个无意义的 pid 给用户态，
+    // 故一并清零，使子进程的返回寄存器状态是干净的。
+    child_frame.r10 = 0;
+    // 4. 调 task 层原语创建子进程（失败 → 父收负值，父帧不动）。
+    match task::spawn_derived(ppid, "forked", child_frame) {
+        Ok(pid) => {
+            klib::debug!("[derive] pid={} derived child pid={}", ppid, pid);
+            // 5. **父侧返回 pid**。rax 由 pack_ok 写入返回帧——与子侧的首跑帧
+            //    rax=0 形成对照，完成「一次调用、两次返回」的分流。
+            pack_ok(pid as u64)
+        }
+        Err(e) => pack_err(e),
+    }
+}
+
 /// thread_join 处理器（T1-7 / SYS_TASK_THREAD_JOIN / 0x36）：等价组长对**具体组员
 /// pid** 的 waitpid 收尸取退出码（T1-3 单目标 join 交付）。薄委托 `task::waitpid`，
 /// 与 `sys_task_wait` 单目标分支同构：
@@ -3331,6 +3395,9 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         // gettid/getpid：非阻塞，返回本线程 pid / 组长 tgid（T2-6 / 0x38/0x39）。
         SYS_TASK_GETTID => done(sys_gettid(frame)),
         SYS_TASK_GETPID => done(sys_getpid(frame)),
+        // derive：COW 派生子进程（ADR-038 / 0x3A）。非阻塞、返回两次语义
+        // （父 rax=pid、子 rax=0），不切换——故返回 done。
+        SYS_TASK_DERIVE => done(sys_task_derive(frame)),
 
         // VFS Domain (0x40)
         SYS_ENTRY_CREATE => done(sys_entry_create(frame)),
