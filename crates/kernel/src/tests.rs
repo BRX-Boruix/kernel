@@ -9776,6 +9776,154 @@ pub fn test_ace_inheritance_e2e() {
     info!("[test-ace-inherit] === A2-8 pass ===");
 }
 
+/// A2-6 前置（ADR-040 §3.5.3 已知隐患）：**chown 不得静默清空显式 ACE**。
+///
+/// 隐患事实（本测试的判据，以代码为准）：`ENTRY_UPDATE_CHOWN` 分支经
+/// `from_wire(meta.permissions.to_wire() & 0o777)` **重建**策略——而 `from_wire`
+/// 恒产出 `aces: Vec::new()`（to_wire 只有单个 u32，无 ACE 通道）。故一次 chown
+/// 就把节点上全部显式 ACE 清零。原注释写「显式 ACE 如实整体替换」，**该断言不实**
+/// ——不是"如实整体替换"，而是"替换为空"。
+///
+/// 为何这是安全缺陷而非单纯功能缺失：显式 deny ACE 一旦被清空，原本被拒绝的主体
+/// 会因显式列表消失而落到 classic 尾部段，可能**由拒绝变为放行**——静默策略降级。
+/// ADR-040 §3.5.3 明确要求本隐患「须在 G4 落地前解决」，本测试即为该前置的红线。
+pub fn test_chown_preserves_explicit_aces() {
+    use alloc::boxed::Box;
+    use alloc::vec;
+    use arch::syscall::SyscallFrame;
+    use task::{Process, ProcessIdentity};
+    use vfs::inode::{Ace, AccessPolicy, Principal};
+
+    info!("[test-chown-ace] === A2-6 pre: chown must preserve explicit ACEs ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3, a4, a5: 0,
+            result: 0, switched: false, arch_frame: 0, aux_pid: 0,
+        }
+    }
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    // 以 system(1) 身份：chown 需要属主或 CAP_OWNER；易他主需 CAP_SYSTEM。
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
+
+    let root = crate::vfs_init::root();
+    let _ = root.unlink("/scratch/a2_6_chown.txt");
+    let node = root
+        .create_file("/scratch/a2_6_chown.txt", 0o644, (1, 1))
+        .expect("create fixture");
+    // 植入一条**显式 deny** ACE（针对 2002 读）。
+    let deny = Ace {
+        principal: Principal::NamedUid(2002),
+        allow: false,
+        perms: vfs::inode::PermBits::READ,
+        inherit: false,
+    };
+    let mut seeded = AccessPolicy::new(vec![deny], 0o644);
+    seeded = seeded.with_owner(1, 1);
+    node.set_permissions(&seeded).expect("seed explicit ACE");
+    assert_eq!(seeded.explicit_aces().count(), 1, "fixture has 1 explicit ACE");
+
+    // 经**真实 syscall** 发 chown（改 gid，uid 不变以免动易主门禁）。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    let buf = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space().handle_page_fault(buf, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let ps = b"/scratch/a2_6_chown.txt\x00";
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(buf)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(ps.as_ptr(), (pa + off) as *mut u8, ps.len());
+    }
+    let mut c = frame(
+        crate::syscall::SYS_ENTRY_UPDATE,
+        buf,
+        1, // new_uid 保持不变
+        7, // new_gid: 改 gid
+        crate::syscall::ENTRY_UPDATE_CHOWN,
+    );
+    assert!(crate::syscall::syscall_entry(&mut c));
+    assert_eq!(c.result, 0, "chown must succeed");
+    info!("[test-chown-ace] chown via real syscall OK");
+
+    // 核心断言：显式 ACE 必须**仍在**。
+    let after = root
+        .resolve("/scratch/a2_6_chown.txt", true)
+        .expect("resolve after chown")
+        .metadata()
+        .expect("meta after chown")
+        .permissions;
+    assert_eq!(
+        after.explicit_aces().count(),
+        1,
+        "chown must NOT silently drop explicit ACEs (ADR-040 3.5.3)"
+    );
+    // 且语义不变：2002 仍被拒读（若 ACE 被清空，此处会变成放行——策略静默降级）。
+    let subject = vfs::inode::Subject { uid: 2002, gid: 2002, groups: &[] };
+    assert_eq!(
+        after.evaluate(&subject, vfs::inode::PermBits::READ),
+        Err(klib::error::Error::PermissionDenied),
+        "explicit deny must survive chown unchanged"
+    );
+    // 对照组：chown 只改属主 gid，classic 三段不应变。
+    assert_eq!(after.classic_mode(), 0o644, "classic mode unchanged by chown");
+    assert_eq!(after.owner_gid(), 7, "chown applied the new gid");
+    info!("[test-chown-ace] explicit ACE + semantics preserved across chown OK");
+
+    // ---- 同类缺陷回归：**chmod 也不得清空显式 ACE**（同一 `from_wire` 重建病因）----
+    let mut c2 = frame(
+        crate::syscall::SYS_ENTRY_UPDATE,
+        buf,
+        0o640,
+        0,
+        crate::syscall::ENTRY_UPDATE_CHMOD,
+    );
+    assert!(crate::syscall::syscall_entry(&mut c2));
+    assert_eq!(c2.result, 0, "chmod must succeed");
+    let after_chmod = root
+        .resolve("/scratch/a2_6_chown.txt", true)
+        .expect("resolve after chmod")
+        .metadata()
+        .expect("meta after chmod")
+        .permissions;
+    assert_eq!(
+        after_chmod.explicit_aces().count(),
+        1,
+        "chmod must NOT silently drop explicit ACEs (same root cause as chown)"
+    );
+    assert_eq!(after_chmod.classic_mode(), 0o640, "chmod applied new mode");
+    assert_eq!(after_chmod.owner_gid(), 7, "chmod must not disturb owner (A1-5)");
+    assert_eq!(
+        after_chmod.evaluate(&subject, vfs::inode::PermBits::READ),
+        Err(klib::error::Error::PermissionDenied),
+        "explicit deny survives chmod too"
+    );
+    info!("[test-chown-ace] explicit ACE preserved across chmod OK");
+
+    let _ = root.unlink("/scratch/a2_6_chown.txt");
+    task::clear_current_proc();
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    unsafe { drop(Box::from_raw(proc_raw)); }
+    info!("[test-chown-ace] === A2-6 pre pass ===");
+}
+
+
 
 
 

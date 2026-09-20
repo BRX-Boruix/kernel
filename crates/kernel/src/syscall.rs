@@ -1240,13 +1240,13 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
             if let Err(e) = check_chmod_access(&identity, &meta.permissions) {
                 return pack_err(e);
             }
-            // A1-5（chmod 保主）：chmod 是写门径而非易主——目标策略自节点
-            // 现策略补全属主（with_owner）后再写回，`from_wire` 的 (0,0)
-            // 过渡属主不得覆盖盘上 i_uid/i_gid / RamFS 策略属主。
-            let policy = vfs::inode::AccessPolicy::from_wire(mode_bits).with_owner(
-                meta.permissions.owner_uid(),
-                meta.permissions.owner_gid(),
-            );
+            // A1-5（chmod 保主）+ A2-6（chmod 保 ACE）：chmod 是**写门径**，只改
+            // classic 9 位 mode——属主、**显式 ACE 列表**、门禁位一律原样保留。
+            // 此前经 `from_wire(mode_bits)` 重建策略：`from_wire` 恒产出空 ACE
+            // 列表（wire 只有单个 u32，无 ACE 通道），于是**一次 chmod 就把全部
+            // 显式 ACE 清零**（ADR-040 §3.5.3 隐患）。改由 `with_classic_mode`
+            // 单点派生（S13）：只换 mode，其余字段原样。
+            let policy = meta.permissions.with_classic_mode(mode_bits);
             match node.set_permissions(&policy) {
                 Ok(()) => pack_ok(0),
                 Err(e) => pack_err(e),
@@ -1287,9 +1287,13 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
             if changes_owner && !identity.caps.contains(Caps::SYSTEM) {
                 return pack_err(Error::PermissionDenied);
             }
-            // A1-5：with_owner 烙印新属主——显式 ACE 如实整体替换（wire 无 ACE 通道）。
-            let policy = vfs::inode::AccessPolicy::from_wire(meta.permissions.to_wire() & 0o777)
-                .with_owner(new_uid, new_gid);
+            // A1-5 / A2-6：with_owner 烙印新属主。**必须从现有策略派生**，不得经
+            // `from_wire` 重建——`from_wire` 恒产出空 ACE 列表（wire 只有单个 u32，
+            // 无 ACE 通道），重建即**静默清空全部显式 ACE**（ADR-040 §3.5.3 隐患；
+            // 显式 deny 被清空后主体落到 classic 尾部段，可能由拒绝变放行）。
+            // 原注释称"显式 ACE 如实整体替换"，**该说法不实**——是"替换为空"。
+            // with_owner 单点只换属主，classic 三段/门禁位/ACE 列表原样保留。
+            let policy = meta.permissions.with_owner(new_uid, new_gid);
             match node.set_permissions(&policy) {
                 Ok(()) => pack_ok(0),
                 Err(e) => pack_err(e),

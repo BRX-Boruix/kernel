@@ -271,6 +271,23 @@ impl AccessPolicy {
         self.mode | ((self.gate_system as u32) << 9)
     }
 
+    /// 只替换 **classic 9 位 mode**、保留显式 ACE 列表与门禁位的副本。
+    ///
+    /// A2-6 前置（ADR-040 §3.5.3）：`chmod` 是**写门径**，不是"重建策略"。
+    /// 此前强制层经 `from_wire(mode)` 重建——而 `from_wire` 恒产出空 ACE 列表
+    /// （wire 只有一个 u32，无 ACE 通道），于是**一次 chmod 就把全部显式 ACE 清零**。
+    /// 显式 deny 被清空后主体会落到 classic 尾部段，可能**由拒绝变放行**——
+    /// 静默策略降级。本方法提供"只改 mode、其余原样"的正确写回形态（S13 单点）。
+    pub fn with_classic_mode(&self, mode: u32) -> Self {
+        Self {
+            aces: self.aces.clone(),
+            mode: mode & 0o777,
+            owner_uid: self.owner_uid,
+            owner_gid: self.owner_gid,
+            gate_system: self.gate_system,
+        }
+    }
+
     /// 返回**属主替换为 `(uid, gid)`** 的策略副本（A1-5）。
     ///
     /// 用途：chmod/set_permissions 写回路径——chmod 是写门径而非易主

@@ -793,6 +793,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_ace_inheritance_e2e();
 
+    // A2-6 前置（ADR-040 §3.5.3）：chown 不得静默清空显式 ACE（返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_chown_preserves_explicit_aces();
+
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();
