@@ -986,6 +986,25 @@ fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
         }
         None => return pack_err(Error::InvalidParam),
     }
+    // A1-5 / §2.6：unlink 还需**目标属主**面（或 `CAP_OWNER`）——被删节点
+    // 的属主即持有者（A1-3 时属主真值未落地，注释记账至此补全）。父目录
+    // 写面在前：无父目录写权限者在目标面之前即被拒（判定序成文）。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        let target = match root.resolve(&path, false) {
+            Ok(n) => n,
+            Err(e) => return pack_err(e),
+        };
+        let meta = match target.metadata() {
+            Ok(m) => m,
+            Err(e) => return pack_err(e),
+        };
+        if identity.uid != meta.permissions.owner_uid() && !identity.caps.contains(Caps::OWNER) {
+            return pack_err(Error::PermissionDenied);
+        }
+    }
     match root.unlink(&path) {
         Ok(()) => pack_ok(0),
         Err(e) => pack_err(e),
@@ -1061,6 +1080,32 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
                 }
                 None => return pack_err(Error::InvalidParam),
             }
+            // A1-5 / §2.6：rename 还需**目标属主**面（或 `CAP_OWNER`）——
+            // 源（被改名者）与目标（被覆盖者，若存在）的属主即持有者。
+            // 源/目标不存在时其属主面空缺：缺失源的报错语义（跨目录
+            // NotSupported / 同目录 NotFound）交由 root.rename 原生契约，
+            // 属主面不得截胡（test-syscall-entry-update 5a 锚定的契约）。
+            let identity = current_proc_mut()
+                .map(|p| p.identity())
+                .unwrap_or_else(ProcessIdentity::default_user);
+            if let Ok(src) = root.resolve(&old_path, false) {
+                if let Ok(meta) = src.metadata() {
+                    if identity.uid != meta.permissions.owner_uid()
+                        && !identity.caps.contains(Caps::OWNER)
+                    {
+                        return pack_err(Error::PermissionDenied);
+                    }
+                }
+            }
+            if let Ok(dst) = root.resolve(&new_path, false) {
+                if let Ok(meta) = dst.metadata() {
+                    if identity.uid != meta.permissions.owner_uid()
+                        && !identity.caps.contains(Caps::OWNER)
+                    {
+                        return pack_err(Error::PermissionDenied);
+                    }
+                }
+            }
             match root.rename(&old_path, &new_path) {
                 Ok(()) => pack_ok(0),
                 Err(e) => pack_err(e),
@@ -1078,8 +1123,6 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
                 Ok(a) => a,
                 Err(e) => return pack_err(e),
             };
-            // A1-1：wire 位集 → 策略本体（整体替换语义见 set_permissions 文档）。
-            let policy = vfs::inode::AccessPolicy::from_wire(mode_bits);
             let root = crate::vfs_init::root();
             let node = match root.resolve(&path, false) {
                 Ok(n) => n,
@@ -1097,6 +1140,13 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
             if let Err(e) = check_chmod_access(&identity, &meta.permissions) {
                 return pack_err(e);
             }
+            // A1-5（chmod 保主）：chmod 是写门径而非易主——目标策略自节点
+            // 现策略补全属主（with_owner）后再写回，`from_wire` 的 (0,0)
+            // 过渡属主不得覆盖盘上 i_uid/i_gid / RamFS 策略属主。
+            let policy = vfs::inode::AccessPolicy::from_wire(mode_bits).with_owner(
+                meta.permissions.owner_uid(),
+                meta.permissions.owner_gid(),
+            );
             match node.set_permissions(&policy) {
                 Ok(()) => pack_ok(0),
                 Err(e) => pack_err(e),

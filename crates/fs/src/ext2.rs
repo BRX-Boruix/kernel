@@ -263,6 +263,10 @@ pub fn parse_superblock(sb: &[u8; 1024]) -> Result<Ext2Superblock, Ext2Error> {
 pub struct Inode {
     pub ino: u32,
     pub mode: u16,
+    /// i_uid（盘上偏移 @2）：文件属主 uid（A1-5 真值贯通）。
+    pub uid: u16,
+    /// i_gid（盘上偏移 @24）：文件属主 gid（A1-5 真值贯通）。
+    pub gid: u16,
     pub size: u32,
     pub blocks: [u32; 15],
     /// i_blocks（@28，512B 扇区计数）。fast/slow symlink 的权威判别位：
@@ -371,6 +375,8 @@ impl Ext2Fs {
             root_inode: spin::Mutex::new(Inode {
                 ino: EXT2_ROOT_INO,
                 mode: 0,
+                uid: 0,
+                gid: 0,
                 size: 0,
                 blocks: [0; 15],
                 sectors: 0,
@@ -1024,6 +1030,10 @@ impl Ext2Fs {
             return Err(Ext2Error::ShortRead);
         }
         raw[0..2].copy_from_slice(&inode.mode.to_le_bytes());
+        // A1-5：i_uid@2 / i_gid@24 写侧（读-改-写保留未建模字段的纪律下，
+        // 属主是已建模字段，覆盖写回）。
+        raw[2..4].copy_from_slice(&inode.uid.to_le_bytes());
+        raw[24..26].copy_from_slice(&inode.gid.to_le_bytes());
         raw[4..8].copy_from_slice(&inode.size.to_le_bytes());
         raw[8..12].copy_from_slice(&inode.mtime.to_le_bytes());
         raw[16..20].copy_from_slice(&inode.ctime.to_le_bytes());
@@ -1538,6 +1548,7 @@ impl Ext2Fs {
         dir: &mut Inode,
         name: &str,
         mode: u16,
+        owner: (u32, u32),
         init_block: Option<u32>,
     ) -> Result<(u32, Inode), Ext2Error> {
         // 名字合法性（统一校验：非空、≤255、无 `/`、无控制字符）。入口即拒，
@@ -1554,6 +1565,9 @@ impl Ext2Fs {
         let mut inode = Inode {
             ino,
             mode,
+            // A1-5：属主=创建者（POSIX 语义），烙印 i_uid/i_gid 盘上真值。
+            uid: owner.0 as u16,
+            gid: owner.1 as u16,
             size: 0,
             blocks: [0u32; 15],
             sectors: 0,
@@ -1581,18 +1595,19 @@ impl Ext2Fs {
     /// 折叠编码在强制矩阵落地后=权限放大漏洞）。门禁位（wire bit9）在
     /// EXT2 mode（16 位）无存储位——置位时**如实 [`Ext2Error::NotSupported`]**
     /// 而不是建出门禁丢失的节点（宁缺毋假纪律不变）。
-    /// 属主位（i_uid/i_gid）烙印是 A1-5 项（Inode 结构尚无该字段）。
+    /// 属主（`owner`）烙印 i_uid/i_gid（A1-5：属主=创建者，POSIX 语义）。
     pub fn create_file(
         &self,
         dir: &mut Inode,
         name: &str,
         mode: u32,
+        owner: (u32, u32),
     ) -> Result<Inode, Ext2Error> {
         if mode & vfs::inode::GATE_SYSTEM_BIT != 0 {
             return Err(Ext2Error::NotSupported);
         }
         let bits = (mode & 0o777) as u16;
-        let (_, inode) = self.create_entry(dir, name, 0x8000 | bits, None)?;
+        let (_, inode) = self.create_entry(dir, name, 0x8000 | bits, owner, None)?;
         Ok(inode)
     }
 
@@ -1601,7 +1616,13 @@ impl Ext2Fs {
     /// 权限处理同 [`Self::create_file`]（A1-1 三段忠实编码；门禁位置位
     /// 如实 `NotSupported`）。目录可遍历性护栏保留：编码结果若 x/r 段
     /// 全零会建出无法进入/列出的目录，按既有行为补齐（成文语义）。
-    pub fn mkdir(&self, dir: &mut Inode, name: &str, mode: u32) -> Result<Inode, Ext2Error> {
+    pub fn mkdir(
+        &self,
+        dir: &mut Inode,
+        name: &str,
+        mode: u32,
+        owner: (u32, u32),
+    ) -> Result<Inode, Ext2Error> {
         if mode & vfs::inode::GATE_SYSTEM_BIT != 0 {
             return Err(Ext2Error::NotSupported);
         }
@@ -1615,7 +1636,7 @@ impl Ext2Fs {
         if dbits & 0o444 == 0 {
             dbits |= 0o444;
         }
-        let (ino, mut inode) = self.create_entry(dir, name, 0x4000 | dbits, Some(block))?;
+        let (ino, mut inode) = self.create_entry(dir, name, 0x4000 | dbits, owner, Some(block))?;
         // 写 `.` 和 `..` 两项，size=块大小。
         let bs = self.superblock().block_size as usize;
         let mut d = alloc::vec![0u8; bs];
@@ -1721,17 +1742,26 @@ impl Ext2Fs {
             return Err(Ext2Error::NotSupported);
         }
         let mut inode = self.read_inode(ino)?;
+        // A1-5（chmod 保主）：属主不变——chmod 是写门径而非易主，策略自
+        // 盘上 i_uid/i_gid 补全属主后整体写回（显式 ACE 如实整体替换）。
+        let policy = policy.with_owner(inode.uid as u32, inode.gid as u32);
         inode.mode = (inode.mode & 0xF000) | policy.classic_mode() as u16;
         inode.ctime = now_timestamp_secs();
         self.write_inode(&inode)
     }
 
     /// 创建软链接（M3.3）：目标 ≤60B 内联（fast），否则走数据块（slow）。
-    pub fn symlink(&self, dir: &mut Inode, name: &str, target: &str) -> Result<Inode, Ext2Error> {
+    pub fn symlink(
+        &self,
+        dir: &mut Inode,
+        name: &str,
+        target: &str,
+        owner: (u32, u32),
+    ) -> Result<Inode, Ext2Error> {
         let target_bytes = target.as_bytes();
         if target_bytes.len() <= FAST_SYMLINK_MAX as usize {
             // fast：目标内联 i_block 区，blocks 全 0。
-            let (_, mut inode) = self.create_entry(dir, name, 0xA000 | 0o777, None)?;
+            let (_, mut inode) = self.create_entry(dir, name, 0xA000 | 0o777, owner, None)?;
             inode.size = target_bytes.len() as u32;
             inode.sectors = 0; // fast 判别位
             let mut raw = alloc::vec![0u8; FAST_SYMLINK_MAX as usize];
@@ -1750,7 +1780,7 @@ impl Ext2Fs {
             // 目标写进单个数据块（旧实现 `d[..target_bytes.len()]` 会越界
             // panic）。目标上限仍受 size 字段 u32 约束，grow 侧已显式拒绝
             // 超限。
-            let (_, mut inode) = self.create_entry(dir, name, 0xA000 | 0o777, None)?;
+            let (_, mut inode) = self.create_entry(dir, name, 0xA000 | 0o777, owner, None)?;
             let bs = self.superblock().block_size as u64;
             // 先 grow 再设 size：grow 以 inode.size 为"当前已占"基准，若预先
             // 把 size 提到目标值会让 grow 误判"无需扩展"而不分配任何块（见
@@ -1922,11 +1952,15 @@ impl INode for Ext2Node {
         Ok(FileMetadata {
             node_type,
             size: inode.size as u64,
-            // A1-1（PRE-3 消解）：盘上 mode 的 owner/group/other 三段**忠实
-            // 解码**（不再"任意一位抹平"）——塌缩在强制矩阵落地后=权限放大。
-            // 门禁位：EXT2 mode 无存储位，恒不置位。属主 (0,0) 为 A1-1 过渡
-            // 态（i_uid/i_gid 真值是 A1-5 项），uid0 进程是事实属主。
-            permissions: AccessPolicy::from_classic((inode.mode & 0o777) as u32),
+            // A1-1（PRE-3 消解）+ A1-5：盘上 mode 的 owner/group/other 三段
+            // **忠实解码**（不再"任意一位抹平"）+ i_uid/i_gid 真属主
+            // （不再过渡态 (0,0)）——评估的 Owner principal 从此命中真值。
+            // 门禁位：EXT2 mode 无存储位，恒不置位。
+            permissions: AccessPolicy::from_classic_owned(
+                (inode.mode & 0o777) as u32,
+                inode.uid as u32,
+                inode.gid as u32,
+            ),
             created_time: 0,
             modified_time: inode.mtime as u64,
             changed_time: inode.ctime as u64,
@@ -1952,7 +1986,7 @@ impl INode for Ext2Node {
             return Err(Error::NotDirectory);
         }
         let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
-        let inode = self.fs.create_file(&mut dir, name, mode).map_err(ext2_to_klib)?;
+        let inode = self.fs.create_file(&mut dir, name, mode, owner).map_err(ext2_to_klib)?;
         Ok(Arc::new(Ext2Node {
             fs: self.fs.clone(),
             inode,
@@ -1965,7 +1999,7 @@ impl INode for Ext2Node {
             return Err(Error::NotDirectory);
         }
         let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
-        let inode = self.fs.mkdir(&mut dir, name, mode).map_err(ext2_to_klib)?;
+        let inode = self.fs.mkdir(&mut dir, name, mode, owner).map_err(ext2_to_klib)?;
         Ok(Arc::new(Ext2Node {
             fs: self.fs.clone(),
             inode,
@@ -1998,12 +2032,18 @@ impl INode for Ext2Node {
     }
 
     /// M3：创建软链接（fast/slow 双形态）。
+    ///
+    /// A1-5 诚实边界：`INode::symlink` 签名不携带属主（mount/vfs 层同），
+    /// fs 原语参数已就位，trait 层暂以 `(0, 0)` 烙印——软链接创建者烙印
+    /// 随 trait 签名携带身份的演进（A1-8/A1-9 用户态门径）补全；不影响
+    /// §3.2 #7 往返验收（软链接 mode 恒 0777）。
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn INode>, Error> {
         if !self.inode.is_dir() {
             return Err(Error::NotDirectory);
         }
+        let owner = (0u32, 0u32);
         let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
-        let inode = self.fs.symlink(&mut dir, name, target).map_err(ext2_to_klib)?;
+        let inode = self.fs.symlink(&mut dir, name, target, owner).map_err(ext2_to_klib)?;
         Ok(Arc::new(Ext2Node {
             fs: self.fs.clone(),
             inode,
@@ -2122,6 +2162,9 @@ fn read_inode_in(inner: &Ext2Inner, ino: u32) -> Result<Inode, Ext2Error> {
     Ok(Inode {
         ino,
         mode: le_u16(&raw, 0),
+        // A1-5：i_uid@2 / i_gid@24 盘上真值（此前未建模，读侧恒缺）。
+        uid: le_u16(&raw, 2),
+        gid: le_u16(&raw, 24),
         size: le_u32(&raw, 4),
         blocks,
         sectors: le_u32(&raw, 28),
@@ -2528,6 +2571,64 @@ mod tests {
         Ext2Fs::open(dev, PART_START_LBA * SECTOR).expect("writable fixture opens")
     }
 
+    /// A1-5 / §3.2 #7：三段忠实往返 + `i_uid`/`i_gid` 真属主往返。
+    ///
+    /// PRE-3 教训的回归锚：写 0700 → 重挂读回仍 0700（非塌缩 0777）；
+    /// 属主 (1000,100) 烙印 i_uid/i_gid，重挂读回一致；chmod 保主
+    /// （写门径非易主）；真属主语义进入评估（Owner principal 命中真值）。
+    #[test]
+    fn test_ext2_owner_persistence_roundtrip() {
+        use vfs::inode::{AccessPolicy, FileSystem, PermBits, Subject, INode};
+        let img = build_writable_image();
+        let dev: Arc<dyn ByteDevice> = Arc::new(MockByteDevice::new(img));
+        // 阶段 1：建 0700 文件/目录（属主 (1000,100)）+ chmod 保主。
+        {
+            let fs = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("open 1");
+            let root = FileSystem::root(&fs);
+            let f = root.create("private.txt", 0o700, (1000, 100)).expect("create 0700");
+            let m = f.metadata().expect("meta");
+            assert_eq!(m.permissions.classic_mode(), 0o700, "three-segment encode 0700");
+            assert_eq!(m.permissions.owner_uid(), 1000, "owner uid stamped");
+            assert_eq!(m.permissions.owner_gid(), 100, "owner gid stamped");
+            let d = root.mkdir("privdir", 0o700, (1000, 100)).expect("mkdir 0700");
+            let dm = d.metadata().expect("dir meta");
+            assert_eq!(dm.permissions.classic_mode(), 0o700, "dir 0700 kept (x/r present)");
+            assert_eq!(dm.permissions.owner_uid(), 1000, "dir owner stamped");
+            // chmod 保主：非 (0,0) 属主节点 chmod → mode 写入、属主不变。
+            f.set_permissions(&AccessPolicy::from_wire(0o600)).expect("chmod");
+            let m2 = f.metadata().expect("meta after chmod");
+            assert_eq!(m2.permissions.classic_mode(), 0o600, "chmod writes mode");
+            assert_eq!(m2.permissions.owner_uid(), 1000, "chmod preserves owner uid");
+            assert_eq!(m2.permissions.owner_gid(), 100, "chmod preserves owner gid");
+        }
+        // 阶段 2：重挂——盘上 i_uid/i_gid + mode 三段忠实往返。
+        {
+            let fs = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("reopen");
+            let root = FileSystem::root(&fs);
+            let f = root.lookup("private.txt").expect("file present");
+            let m = f.metadata().expect("meta after remount");
+            assert_eq!(m.permissions.classic_mode(), 0o600, "mode roundtrip (no collapse)");
+            assert_eq!(m.permissions.owner_uid(), 1000, "i_uid roundtrip");
+            assert_eq!(m.permissions.owner_gid(), 100, "i_gid roundtrip");
+            let d = root.lookup("privdir").expect("dir present");
+            let dm = d.metadata().expect("dir meta after remount");
+            assert_eq!(dm.permissions.classic_mode(), 0o700, "dir mode roundtrip");
+            assert_eq!(dm.permissions.owner_uid(), 1000, "dir i_uid roundtrip");
+            // 阶段 3（同 fs 实例）：真属主进入评估——非属主写拒、属主写放。
+            let other = Subject { uid: 2000, gid: 100, groups: &[] };
+            let owner = Subject { uid: 1000, gid: 100, groups: &[] };
+            let policy = &dm.permissions;
+            assert!(
+                policy.evaluate(&other, PermBits::WRITE).is_err(),
+                "non-owner write on 0700 dir must deny"
+            );
+            assert!(
+                policy.evaluate(&owner, PermBits::WRITE).is_ok(),
+                "owner write on 0700 dir must allow"
+            );
+        }
+    }
+
     /// M3 端到端 + 重挂一致性（M3.5）：建文件 → 写入 → 重开（重挂）→ 读回一致。
     #[test]
     fn test_write_create_and_remount_consistency() {
@@ -2835,6 +2936,8 @@ mod tests {
             let mut oob = Inode {
                 ino: 99,
                 mode: 0x8000,
+                uid: 0,
+                gid: 0,
                 size: 1024,
                 blocks: [0u32; 15],
                 sectors: 2,
@@ -2979,6 +3082,8 @@ mod tests {
         let sparse = Inode {
             ino: 99,
             mode: 0x8000,
+            uid: 0,
+            gid: 0,
             size: 2048,
             blocks: [0u32; 15],
             sectors: 0,
@@ -3246,6 +3351,8 @@ mod tests {
         let mut ino = Inode {
             ino: 3, // 首个可分配 inode（inode 表块 5 内，不与数据块 8+ 冲突）
             mode: 0x8000,
+            uid: 0,
+            gid: 0,
             size: ((triple_start + 1) * per_block * 4) as u32,
             blocks: [0u32; 15],
             sectors: 0,

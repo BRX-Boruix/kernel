@@ -271,6 +271,26 @@ impl AccessPolicy {
         self.mode | ((self.gate_system as u32) << 9)
     }
 
+    /// 返回**属主替换为 `(uid, gid)`** 的策略副本（A1-5）。
+    ///
+    /// 用途：chmod/set_permissions 写回路径——chmod 是写门径而非易主
+    /// （POSIX 语义：chmod 不改属主），自存储本体（盘上 i_uid/i_gid /
+    /// RamFS 策略字段）补全属主后整体写回。显式 ACE 如实整体替换，
+    /// **不做** ACE 归属重写。
+    ///
+    /// 依赖注记：不提供「读当前进程属主」的 vfs 级助手——task 依赖 vfs，
+    /// 反向助手会成环；fs 层属主来源由调用方（kernel trait 层 / fs 原语
+    /// 参数）携带。
+    pub fn with_owner(&self, uid: u32, gid: u32) -> Self {
+        Self {
+            aces: self.aces.clone(),
+            mode: self.mode,
+            owner_uid: uid,
+            owner_gid: gid,
+            gate_system: self.gate_system,
+        }
+    }
+
     /// 有效策略：显式列表 ++ 三条隐式尾部 ACE（ADR-040 §2.2）。
     ///
     /// **命中即停**由 [`Self::evaluate`] 的首匹配即决保证；本方法只负责

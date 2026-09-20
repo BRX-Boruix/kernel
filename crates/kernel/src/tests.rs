@@ -12862,8 +12862,8 @@ pub fn test_access_enforcement_matrix() {
     root.mkdir("/scratch/a3_d0700", 0o700, (0, 0)).expect("fixture dir 0700");
     root.create_file("/programs/a3_nox.elf", 0o400, (0, 0)).expect("fixture no-exec program");
 
-    // 用户缓冲：路径串槽位（0x100 间隔）+ readdir 输出页。
-    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0);
+    // 用户缓冲：路径串槽位（0x100 间隔；A1-5 扩至 0x3000 共 12 槽）+ readdir 输出页。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x3000, 0, 0);
     assert!(crate::syscall::syscall_entry(&mut map));
     assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
     let buf = map.result;
@@ -12874,7 +12874,7 @@ pub fn test_access_enforcement_matrix() {
     {
         let p = task::current_proc_mut().expect("test proc");
         let mut a = buf;
-        while a < buf + 0x2000 {
+        while a < buf + 0x3000 {
             p.addr_space().handle_page_fault(a, arch_x86_64::paging::PageFaultCode::new(0));
             a += 0x1000;
         }
@@ -13010,6 +13010,92 @@ pub fn test_access_enforcement_matrix() {
     assert!(crate::syscall::syscall_entry(&mut ul2));
     assert!(ul2.result & ERR_FLAG == 0, "parent-write: CAP_OWNER unlink must pass");
     info!("[test-access-matrix] parent-write face (create/unlink) OK");
+
+    // ---- A1-5 目标属主面（§2.6 unlink/rename 补全；§3.2 #7 伴随）----
+    // 夹具：sys 建 0700/0600 文件、属主各异；路径槽 0 动态复用（改名目标）。
+    let write_path = |slot: u64, s: &[u8]| unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(slot))
+            .expect("slot resident")
+            .as_u64();
+        let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+        core::ptr::copy_nonoverlapping(s.as_ptr(), (pa + off) as *mut u8, s.len());
+    };
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(sys);
+    }
+    // /scratch/a5_home 0777 (0,0)：父目录写面人人可过——EACCES 只能来自
+    // A1-5 目标属主面（判别力保证）。
+    root.mkdir("/scratch/a5_home", 0o777, (0, 0)).expect("fixture a5_home");
+    root.create_file("/scratch/a5_home/other.txt", 0o700, (77, 88)).expect("fixture other");
+    root.create_file("/scratch/a5_home/mine.txt", 0o600, (77, 88)).expect("fixture mine");
+    root.create_file("/scratch/a5_home/theirs.txt", 0o600, (99, 99)).expect("fixture theirs");
+    root.create_file("/scratch/a5_home/dst.txt", 0o600, (55, 55)).expect("fixture dst");
+    root.create_file("/scratch/a5_home/chmodme.txt", 0o600, (77, 88)).expect("fixture chmodme");
+    write_path(buf + 0x400, b"/scratch/a5_home/other.txt\x00");
+    write_path(buf + 0x500, b"/scratch/a5_home/mine.txt\x00");
+    write_path(buf + 0x600, b"/scratch/a5_home/mine2.txt\x00");
+    write_path(buf + 0x700, b"/scratch/a5_home/theirs.txt\x00");
+    write_path(buf + 0x800, b"/scratch/a5_home/dst.txt\x00");
+    write_path(buf + 0x900, b"/scratch/a5_home/chmodme.txt\x00");
+    // User(1000)：非属主 unlink 他人 0700 文件 → 目标属主面 EACCES。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(user);
+    }
+    let mut ul3 = frame(crate::syscall::SYS_ENTRY_DELETE, buf + 0x400, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut ul3));
+    assert_eq!(ul3.result, EACCES_U64, "A1-5: unlink other's file must EACCES (target owner face)");
+    // CAP_OWNER → 放行（§2.6 目标属主绕过）。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(user_owner);
+    }
+    let mut ul4 = frame(crate::syscall::SYS_ENTRY_DELETE, buf + 0x400, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut ul4));
+    assert!(ul4.result & ERR_FLAG == 0, "A1-5: CAP_OWNER unlink other's file must pass");
+    // rename 源属主面：属主 (77) 改自己的名 → 放行。
+    write_path(buf, b"/scratch/a5_home/mine2.txt\x00");
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity { uid: 77, gid: 88, groups: Groups::empty(), caps: Caps::EMPTY });
+    }
+    let mut rn1 = frame4(crate::syscall::SYS_ENTRY_UPDATE, buf + 0x500, buf, 0, crate::syscall::ENTRY_UPDATE_RENAME);
+    assert!(crate::syscall::syscall_entry(&mut rn1));
+    assert!(rn1.result & ERR_FLAG == 0, "A1-5: owner rename own file must pass");
+    // rename 源属主面：非属主 (77) 改他人 (99) 的名 → EACCES。
+    write_path(buf, b"/scratch/a5_home/theirs2.txt\x00");
+    let mut rn2 = frame4(crate::syscall::SYS_ENTRY_UPDATE, buf + 0x700, buf, 0, crate::syscall::ENTRY_UPDATE_RENAME);
+    assert!(crate::syscall::syscall_entry(&mut rn2));
+    assert_eq!(rn2.result, EACCES_U64, "A1-5: rename other's file must EACCES (src owner face)");
+    // rename 目标覆盖属主面：属主 (77) 改名覆盖他人 (55) 的既有文件 → EACCES。
+    let mut rn3 = frame4(crate::syscall::SYS_ENTRY_UPDATE, buf + 0x600, buf + 0x800, 0, crate::syscall::ENTRY_UPDATE_RENAME);
+    assert!(crate::syscall::syscall_entry(&mut rn3));
+    assert_eq!(rn3.result, EACCES_U64, "A1-5: rename over other's file must EACCES (dst owner face)");
+    // chmod 保主（A1-5）：属主 (77,88) chmod 0600→0644 → mode 写入、属主不变。
+    let mut ch = frame4(crate::syscall::SYS_ENTRY_UPDATE, buf + 0x900, 0o644, 0, crate::syscall::ENTRY_UPDATE_CHMOD);
+    assert!(crate::syscall::syscall_entry(&mut ch));
+    assert!(ch.result & ERR_FLAG == 0, "A1-5: owner chmod must pass");
+    let mut st5 = frame4(crate::syscall::SYS_ENTRY_READ, buf + 0x900, out_buf, 0x100, crate::syscall::ENTRY_READ_STAT);
+    assert!(crate::syscall::syscall_entry(&mut st5));
+    assert!(st5.result & ERR_FLAG == 0, "A1-5: stat after chmod must succeed");
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(out_buf))
+            .expect("stat out resident")
+            .as_u64();
+        let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+        let info = core::ptr::read_unaligned((pa + off) as *const vfs::inode::StatInfo);
+        assert_eq!(info.owner_uid, 77, "A1-5: chmod must preserve owner uid (no chown)");
+        assert_eq!(info.owner_gid, 88, "A1-5: chmod must preserve owner gid");
+        assert_eq!(info.perms & 0o777, 0o644, "A1-5: chmod wrote new mode");
+    }
+    info!("[test-access-matrix] A1-5 target-owner faces (unlink/rename/chmod-keep-owner) OK");
 
     // ---- readdir 面：0700 目录他人 EACCES、CAP_OWNER 放行 ----
     {
