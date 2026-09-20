@@ -18,7 +18,7 @@ use spin::Mutex;
 use spin::Once;
 
 use vfs::devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
-use vfs::inode::Permissions;
+use vfs::inode::AccessPolicy;
 use vfs::mount::MountTable;
 use vfs::procfs::{ProcFS, ProcessInfoProvider, ProcessSnapshot};
 use vfs::ramfs::RamFS;
@@ -1006,7 +1006,7 @@ fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
     // 幂等语义：骨架目录首次安装/启动时创建并持久化到 root；已安装盘再次
     // 初始化时目录已存在属正常——不可把 AlreadyExists 当故障 panic，否则
     // SDK 预装的 /programs 等内容会在每次重启被重复创建而冲突。
-    let ensure_dir = |path: &str| match mount_table.mkdir(path, Permissions::all()) {
+    let ensure_dir = |path: &str| match mount_table.mkdir(path, 0o755, (0, 0)) {
         Ok(_) => {}
         Err(klib::error::Error::AlreadyExists) => {}
         Err(e) => panic!("mkdir {}: {:?}", path, e),
@@ -1286,7 +1286,10 @@ fn clear_scratch(mount_table: &Arc<vfs::mount::MountTable>, path: &str) {
 fn populate_builtin_programs(mount_table: &Arc<vfs::mount::MountTable>) {
     for p in crate::binaries_payload::PAYLOADS {
         let path = alloc::format!("/programs/{}", p.name);
-        let node = match mount_table.create_file(&path, Permissions::readonly()) {
+        // A1-1：内置可执行 payload 需要执行位——0o555（owner 含 x）。原
+        // readonly()（无 x）在 A1-3 EXEC 强制下会全盘拒绝执行，此处如实
+        // 表达"系统提供的可执行程序"语义。
+        let node = match mount_table.create_file(&path, 0o555, (0, 0)) {
             Ok(n) => n,
             Err(e) => {
                 klib::error!("[vfs] built-in payload failed (create {}): {:?}", path, e);

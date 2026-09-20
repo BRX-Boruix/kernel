@@ -28,7 +28,7 @@ use klib::error::Error;
 use klib::json::{JsonWriter, VecTarget};
 
 use crate::dynamic::{DynamicDirNode, DynamicFileNode};
-use crate::inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
+use crate::inode::{AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
 
 /// 总线名"PCI"（S13：devfs 按总线名划分子树，字面量集中定义，避免散落漂移
 /// 静默漏设备；与 driver crate 的 `BusType::Pci` 语义对应，此处是字符串投影）。
@@ -228,7 +228,7 @@ impl INode for SerialDeviceNode {
         Ok(FileMetadata {
             size: 0,
             node_type: INodeType::CharacterDevice,
-            permissions: Permissions::read_write(),
+            permissions: AccessPolicy::read_write(),
             created_time: 0,
             modified_time: 0,
             changed_time: 0,
@@ -250,11 +250,11 @@ impl INode for SerialDeviceNode {
         self.children.lookup(name)
     }
 
-    fn create(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn create(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::PermissionDenied)
     }
 
-    fn mkdir(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn mkdir(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::PermissionDenied)
     }
 
@@ -309,7 +309,7 @@ impl INode for RandomDeviceNode {
         Ok(FileMetadata {
             size: 0,
             node_type: INodeType::CharacterDevice,
-            permissions: Permissions::readonly(),
+            permissions: AccessPolicy::readonly(),
             created_time: 0,
             modified_time: 0,
             changed_time: 0,
@@ -329,11 +329,11 @@ impl INode for RandomDeviceNode {
         self.children.lookup(name)
     }
 
-    fn create(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn create(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::PermissionDenied)
     }
 
-    fn mkdir(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn mkdir(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::PermissionDenied)
     }
 

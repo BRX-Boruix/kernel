@@ -1573,68 +1573,41 @@ impl Ext2Fs {
         Ok((ino, inode))
     }
 
-    /// 创建普通文件（M3.3）。
-    /// 创建普通文件。
+    /// 创建普通文件（M3.3；A1-1 三段忠实编码）。
     ///
-    /// # 权限处理（修复）
+    /// # 权限处理（A1-1）
     ///
-    /// 原实现把 `perm` 丢弃（参数名 `_perm`）并无条件写死 `0o644`。后果是
-    /// **调用方显式表达的权限被静默吞掉**：
-    ///
-    /// - `create_file(.., Permissions::readonly())` 实际建成可写文件——只读意图
-    ///   丢失；
-    /// - `create_file(.., system_only: true)` 在 EXT2 上建出**普通文件**，
-    ///   随后"未授权用户不得打开 system_only 节点"的访问控制断言失败。
-    ///   测试确实失败了，但病因不是访问控制——是权限在创建时就没落盘。
-    ///
-    /// 现行为：r/w/x 位按 `perm` 写入；`system_only` 在 EXT2 无对应存储位，
-    /// **如实返回 [`Ext2Error::NotSupported`]** 而不是建出一个权限不符的节点
-    /// （与 [`Self::set_permissions`] 同一纪律：宁缺毋假，绝不伪造）。
+    /// `mode` 的 classic 9 位**按 owner/group/other 三段忠实落盘**（PRE-3：
+    /// 折叠编码在强制矩阵落地后=权限放大漏洞）。门禁位（wire bit9）在
+    /// EXT2 mode（16 位）无存储位——置位时**如实 [`Ext2Error::NotSupported`]**
+    /// 而不是建出门禁丢失的节点（宁缺毋假纪律不变）。
+    /// 属主位（i_uid/i_gid）烙印是 A1-5 项（Inode 结构尚无该字段）。
     pub fn create_file(
         &self,
         dir: &mut Inode,
         name: &str,
-        perm: Permissions,
+        mode: u32,
     ) -> Result<Inode, Ext2Error> {
-        // EXT2 的 mode 位里没有 system_only 的表示（见 set_permissions）。
-        // 静默降级会造出权限与请求不符的节点，故显式拒绝。
-        if perm.system_only {
+        if mode & vfs::inode::GATE_SYSTEM_BIT != 0 {
             return Err(Ext2Error::NotSupported);
         }
-        let mut bits = 0o644u16 & !0o777;
-        if perm.readable {
-            bits |= 0o444;
-        }
-        if perm.writable {
-            bits |= 0o222;
-        }
-        if perm.executable {
-            bits |= 0o111;
-        }
+        let bits = (mode & 0o777) as u16;
         let (_, inode) = self.create_entry(dir, name, 0x8000 | bits, None)?;
         Ok(inode)
     }
 
     /// 创建子目录（M3.3）：含 `.`/`..` 两项，`..` 指向父目录。
     ///
-    /// 权限处理同 [`Self::create_file`]：`perm` 的 r/w/x 位如实落盘，
-    /// `system_only` 无 EXT2 存储位故显式 `NotSupported`（不静默降级）。
-    pub fn mkdir(&self, dir: &mut Inode, name: &str, perm: Permissions) -> Result<Inode, Ext2Error> {
-        if perm.system_only {
+    /// 权限处理同 [`Self::create_file`]（A1-1 三段忠实编码；门禁位置位
+    /// 如实 `NotSupported`）。目录可遍历性护栏保留：编码结果若 x/r 段
+    /// 全零会建出无法进入/列出的目录，按既有行为补齐（成文语义）。
+    pub fn mkdir(&self, dir: &mut Inode, name: &str, mode: u32) -> Result<Inode, Ext2Error> {
+        if mode & vfs::inode::GATE_SYSTEM_BIT != 0 {
             return Err(Ext2Error::NotSupported);
         }
         // 先分配目录数据块。
         let block = self.alloc_block()?;
-        let mut dbits = 0u16;
-        if perm.readable {
-            dbits |= 0o444;
-        }
-        if perm.writable {
-            dbits |= 0o222;
-        }
-        if perm.executable {
-            dbits |= 0o111;
-        }
+        let mut dbits = (mode & 0o777) as u16;
         // 目录的可遍历性由 x 位决定、可列目录须 r 位；缺失会使目录无法进入。
         if dbits & 0o111 == 0 {
             dbits |= 0o111;
@@ -1738,21 +1711,17 @@ impl Ext2Fs {
         Ok(())
     }
 
-    /// 设置节点权限（INode::set_permissions 的 EXT2 原语）。
+    /// 设置节点权限（INode::set_permissions 的 EXT2 原语，A1-1）。
     ///
-    /// mode 字段的 r/w/x 位与 BORUIX Permissions 一一对应：
-    /// readable→0o444，writable→0o222，executable→0o111，保留类型位（0xF000）。
-    /// EXT2 无 system_only 存储：设置它如实`NotSupported`，不伪造。
-    pub fn set_permissions(&self, ino: u32, perms: Permissions) -> Result<(), Ext2Error> {
-        if perms.system_only {
+    /// classic 9 位整体写回 inode mode（保留类型位 0xF000）。策略携带的
+    /// 门禁位（wire bit9）在 EXT2 mode 无存储位：置位时如实
+    /// [`Ext2Error::NotSupported`]，不伪造（纪律不变）。
+    pub fn set_permissions(&self, ino: u32, policy: &AccessPolicy) -> Result<(), Ext2Error> {
+        if policy.gate_system() {
             return Err(Ext2Error::NotSupported);
         }
         let mut inode = self.read_inode(ino)?;
-        let mut mode = inode.mode & 0xF000; // 保留类型位
-        if perms.readable { mode |= 0o444; }
-        if perms.writable { mode |= 0o222; }
-        if perms.executable { mode |= 0o111; }
-        inode.mode = mode;
+        inode.mode = (inode.mode & 0xF000) | policy.classic_mode() as u16;
         inode.ctime = now_timestamp_secs();
         self.write_inode(&inode)
     }
@@ -1852,7 +1821,7 @@ fn now_timestamp_secs() -> u32 {
 // ---- VFS 集成 ----
 
 use alloc::string::String;
-use vfs::inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
+use vfs::inode::{AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
 
 /// EXT2 的 VFS 目录/文件节点。
 pub struct Ext2Node {
@@ -1953,16 +1922,11 @@ impl INode for Ext2Node {
         Ok(FileMetadata {
             node_type,
             size: inode.size as u64,
-            permissions: Permissions {
-                // fd1 FD3 映射取舍：单用户内核无身份区分，owner/group/other
-                // 抹平为"任意一位即可"。粒度损失是有意的简化，接线多用户
-                // 身份模型时此处必须重审。
-                readable: inode.mode & 0o444 != 0,
-                // M3：可写挂载，writable 如实为 true（写路径已接通）。
-                writable: true,
-                executable: inode.mode & 0o111 != 0,
-                system_only: false,
-            },
+            // A1-1（PRE-3 消解）：盘上 mode 的 owner/group/other 三段**忠实
+            // 解码**（不再"任意一位抹平"）——塌缩在强制矩阵落地后=权限放大。
+            // 门禁位：EXT2 mode 无存储位，恒不置位。属主 (0,0) 为 A1-1 过渡
+            // 态（i_uid/i_gid 真值是 A1-5 项），uid0 进程是事实属主。
+            permissions: AccessPolicy::from_classic((inode.mode & 0o777) as u32),
             created_time: 0,
             modified_time: inode.mtime as u64,
             changed_time: inode.ctime as u64,
@@ -1982,26 +1946,26 @@ impl INode for Ext2Node {
         }))
     }
 
-    /// M3：创建普通文件（EXT2 可写支集）。
-    fn create(&self, name: &str, perm: Permissions) -> Result<Arc<dyn INode>, Error> {
+    /// M3：创建普通文件（EXT2 可写支集；A1-1 mode+属主直通）。
+    fn create(&self, name: &str, mode: u32, owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         if !self.inode.is_dir() {
             return Err(Error::NotDirectory);
         }
         let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
-        let inode = self.fs.create_file(&mut dir, name, perm).map_err(ext2_to_klib)?;
+        let inode = self.fs.create_file(&mut dir, name, mode).map_err(ext2_to_klib)?;
         Ok(Arc::new(Ext2Node {
             fs: self.fs.clone(),
             inode,
         }))
     }
 
-    /// M3：创建子目录（含 `.`/`..`）。
-    fn mkdir(&self, name: &str, perm: Permissions) -> Result<Arc<dyn INode>, Error> {
+    /// M3：创建子目录（含 `.`/`..`；A1-1 mode+属主直通）。
+    fn mkdir(&self, name: &str, mode: u32, owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         if !self.inode.is_dir() {
             return Err(Error::NotDirectory);
         }
         let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
-        let inode = self.fs.mkdir(&mut dir, name, perm).map_err(ext2_to_klib)?;
+        let inode = self.fs.mkdir(&mut dir, name, mode).map_err(ext2_to_klib)?;
         Ok(Arc::new(Ext2Node {
             fs: self.fs.clone(),
             inode,
@@ -2027,10 +1991,10 @@ impl INode for Ext2Node {
         self.fs.rename_in_dir(&mut dir, old_name, new_name).map_err(ext2_to_klib)
     }
 
-    /// 设置节点权限（EXT2 实现）：把 Permissions 写回 inode mode 的 r/w/x 位。
-    /// EXT2 无 system_only 存储，设置它如实 NotSupported（不伪造）。
-    fn set_permissions(&self, perms: Permissions) -> Result<(), Error> {
-        self.fs.set_permissions(self.inode.ino, perms).map_err(ext2_to_klib)
+    /// 设置节点权限（EXT2 实现，A1-1）：classic 段整体写回 inode mode。
+    /// 门禁位无 EXT2 存储位，置位如实 NotSupported（不伪造）。
+    fn set_permissions(&self, policy: &AccessPolicy) -> Result<(), Error> {
+        self.fs.set_permissions(self.inode.ino, policy).map_err(ext2_to_klib)
     }
 
     /// M3：创建软链接（fast/slow 双形态）。
@@ -2369,17 +2333,25 @@ mod tests {
         let root = vfs::inode::FileSystem::root(&fs);
         let entries = root.list_dir().expect("root is a directory");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"."), "must list .");
-        assert!(names.contains(&".."), "must list ..");
+        // 自引用项契约（见 Ext2INode::list_dir 注释）：`.`/`..` 不从枚举中
+        // 泄露（与 RamFS 语义统一，ADR-005 v2 linter 依赖）；解析面
+        // `lookup(".")` 仍按真实目录项工作。
+        assert!(!names.contains(&"."), "dot entries must be filtered from listing");
+        assert!(!names.contains(&".."), "dot entries must be filtered from listing");
+        assert!(root.lookup(".").is_ok(), "lookup(\".\") still resolves");
         assert!(names.contains(&"hello.txt"));
         assert!(names.contains(&"big.bin"));
 
         let hello = root.lookup("hello.txt").expect("hello.txt present");
         let meta = hello.metadata().expect("metadata");
         assert_eq!(meta.node_type, INodeType::RegularFile);
-        // M3 可写契约：writable 如实为 true（写路径已接通）。
-        assert!(meta.permissions.writable);
-        assert!(meta.permissions.readable);
+        // M3 可写契约（A1-1 重述）：盘上 0644 的 owner 段含 r/w，三段忠实
+        // 解码后 classic mode 如实回读。
+        assert_eq!(
+            meta.permissions.classic_mode(),
+            0o644,
+            "three-segment faithful decode of on-disk mode"
+        );
         // 对文件做 lookup 必须 NotDirectory。
         assert_eq!(
             hello.lookup("anything").map(|_| ()).unwrap_err(),
@@ -2406,9 +2378,13 @@ mod tests {
         };
         assert_eq!(by_name("hello.txt").size, hello.len() as u64, "F1: real size");
         assert_eq!(by_name("big.bin").size, big.len() as u64, "F1: real size");
-        assert_eq!(by_name(".").size, 1024);
+        // 自引用项已从枚举过滤（契约见 list_dir）——目录 size/type 经
+        // lookup 路径断言（`.` 解析仍工作）。
         assert_eq!(by_name("hello.txt").node_type, INodeType::RegularFile);
-        assert_eq!(by_name(".").node_type, INodeType::Directory);
+        let dot = root.lookup(".").expect("resolve dot");
+        let dot_meta = dot.metadata().expect("dot meta");
+        assert_eq!(dot_meta.size, 1024, "root dir size via lookup path");
+        assert_eq!(dot_meta.node_type, INodeType::Directory);
         // FA1(b)：symlink 不再被抹平成 RegularFile。
         assert_eq!(by_name("link").node_type, INodeType::Symlink);
         assert_eq!(by_name("longlink").node_type, INodeType::Symlink);
@@ -2555,8 +2531,9 @@ mod tests {
     /// M3 端到端 + 重挂一致性（M3.5）：建文件 → 写入 → 重开（重挂）→ 读回一致。
     #[test]
     fn test_write_create_and_remount_consistency() {
-        use vfs::inode::{FileSystem, Permissions};
-        let perm = Permissions::all();
+        use vfs::inode::{AccessPolicy, FileSystem};
+        let mode = 0o777u32;
+        let owner = (0u32, 0u32);
         let img = build_writable_image();
         let dev: Arc<dyn ByteDevice> = Arc::new(MockByteDevice::new(img));
         let payload = b"M3 write-through payload: hello ext2 write path!";
@@ -2564,8 +2541,13 @@ mod tests {
         {
             let fs = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("open 1");
             let root = FileSystem::root(&fs);
-            let f = root.create("new.txt", perm).expect("create file");
-            assert_eq!(f.metadata().expect("meta").permissions.writable, true);
+            let f = root.create("new.txt", mode, owner).expect("create file");
+            // A1-1：AccessPolicy 无布尔披露位——以 classic 段断言（owner 含 w）。
+            assert_eq!(
+                f.metadata().expect("meta").permissions.classic_mode() & 0o200,
+                0o200,
+                "owner writable bit encoded"
+            );
             let n = f.write_at(0, payload).expect("write");
             assert_eq!(n, payload.len());
         }
@@ -2591,8 +2573,9 @@ mod tests {
     /// 用它断言增量会读到陈旧值（那正是"重挂一致性"要锁定的真值）。
     #[test]
     fn test_write_dir_ops_and_free_count_accounting() {
-        use vfs::inode::{FileSystem, Permissions};
-        let perm = Permissions::all();
+        use vfs::inode::{AccessPolicy, FileSystem};
+        let mode = 0o777u32;
+        let owner = (0u32, 0u32);
         let img = build_writable_image();
         let dev: Arc<dyn ByteDevice> = Arc::new(MockByteDevice::new(img));
         let (free_blocks_before, free_inodes_before) = {
@@ -2604,19 +2587,20 @@ mod tests {
             let fs = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("open");
             let root = FileSystem::root(&fs);
             // 建目录（耗 1 inode + 1 块），建文件（耗 1 inode），symlink（耗 1 inode）。
-            let d = root.mkdir("subdir", perm).expect("mkdir");
-            root.create("afile", perm).expect("create");
+            let d = root.mkdir("subdir", mode, owner).expect("mkdir");
+            root.create("afile", mode, owner).expect("create");
             root.symlink("alink", "afile").expect("symlink");
             // 目录列出新项。
             let names: Vec<String> = root.list_dir().unwrap().iter().map(|e| e.name.clone()).collect();
             assert!(names.iter().any(|n| n == "subdir"));
             assert!(names.iter().any(|n| n == "afile"));
             assert!(names.iter().any(|n| n == "alink"));
-            // subdir 内 `.`/`..`。
+            // 自引用项契约：枚举不含 `.`/`..`（见 list_dir），解析面仍工作。
             let sub_entries = d.list_dir().expect("subdir list");
             let sub_names: Vec<&str> = sub_entries.iter().map(|e| e.name.as_str()).collect();
-            assert!(sub_names.contains(&"."));
-            assert!(sub_names.contains(&".."));
+            assert!(!sub_names.contains(&"."), "dot filtered from listing");
+            assert!(!sub_names.contains(&".."), "dotdot filtered from listing");
+            assert!(d.lookup(".").is_ok(), "lookup still resolves dot");
             // 删除 afile：inode 与块归还。
             root.unlink("afile").expect("unlink afile");
             assert_eq!(root.lookup("afile").map(|_| ()).unwrap_err(), Error::NotFound);
@@ -2638,11 +2622,12 @@ mod tests {
     /// M3：文件写越界自动扩展（grow）与 truncate 收缩。
     #[test]
     fn test_write_grow_and_truncate() {
-        use vfs::inode::{FileSystem, Permissions};
-        let perm = Permissions::all();
+        use vfs::inode::{AccessPolicy, FileSystem};
+        let mode = 0o777u32;
+        let owner = (0u32, 0u32);
         let fs = open_writable();
         let root = FileSystem::root(&fs);
-        let f = root.create("grow.bin", perm).expect("create");
+        let f = root.create("grow.bin", mode, owner).expect("create");
         // 写 3000 字节（跨 3 个 1KB 块，触发 grow + 多块分配）。
         let payload: Vec<u8> = (0..3000usize).map(|i| (i % 251) as u8).collect();
         let n = f.write_at(0, &payload).expect("write 3000B");
@@ -3071,15 +3056,15 @@ mod tests {
     /// 超长名在入口被显式拒绝为 CorruptDirEntry。
     #[test]
     fn test_create_rejects_name_over_255() {
-        use vfs::inode::{FileSystem, Permissions};
+        use vfs::inode::{AccessPolicy, FileSystem};
         let fs = open_writable();
         let root = FileSystem::root(&fs);
         let long = "a".repeat(256);
-        let err = root.create(&long, Permissions::all()).map(|_| ()).unwrap_err();
+        let err = root.create(&long, 0o777, (0, 0)).map(|_| ()).unwrap_err();
         assert_eq!(err, Error::Corrupt, "256-byte name must be rejected (name_len is u8)");
         // 恰好 255 应成功。
         let ok255 = "b".repeat(255);
-        assert!(root.create(&ok255, Permissions::all()).is_ok(), "255-byte name must succeed");
+        assert!(root.create(&ok255, 0o777, (0, 0)).is_ok(), "255-byte name must succeed");
     }
 
     /// **根 inode 缓存的失效语义**（本轮修复引入，必须锁住）。
@@ -3133,15 +3118,15 @@ mod tests {
     /// 不一致条目。
     #[test]
     fn test_create_rejects_control_chars() {
-        use vfs::inode::{FileSystem, Permissions};
+        use vfs::inode::{AccessPolicy, FileSystem};
         let fs = open_writable();
         let root = FileSystem::root(&fs);
         for bad in ["bad\nname", "ctl\x01name", "tab\tname", "del\x7fname"] {
-            let err = root.create(bad, Permissions::all()).map(|_| ()).unwrap_err();
+            let err = root.create(bad, 0o777, (0, 0)).map(|_| ()).unwrap_err();
             assert_eq!(err, Error::Corrupt, "control-char name '{}' must be rejected", bad);
         }
         // 正例：合法名字可建。
-        assert!(root.create("ok-name.txt", Permissions::all()).is_ok());
+        assert!(root.create("ok-name.txt", 0o777, (0, 0)).is_ok());
     }
 
     /// S31：超块缓存陈旧修复——分配后不重挂，同进程内再分配不会因缓存
@@ -3181,10 +3166,10 @@ mod tests {
     /// S04：truncate 目标超过 u32::MAX 显式拒绝（不再 `as u32` 静默截断）。
     #[test]
     fn test_truncate_rejects_size_overflow() {
-        use vfs::inode::{FileSystem, INode, Permissions};
+        use vfs::inode::{AccessPolicy, FileSystem, INode};
         let fs = open_writable();
         let root = FileSystem::root(&fs);
-        let f = root.create("big.bin", Permissions::all()).expect("create");
+        let f = root.create("big.bin", 0o777, (0, 0)).expect("create");
         // 目标超过 u32::MAX：底层 truncate_inode 必须显式 BlockOutOfRange 拒绝，
         // 而非 `as u32` 静默截断成一个看似合法的错误 size。4GB 目标远超镜像
         // 容量，但先触发的应是 size 越界判据（在分配任何块之前）。
@@ -3225,10 +3210,10 @@ mod tests {
     /// 表与数据）。
     #[test]
     fn test_write_read_unlink_double_indirect() {
-        use vfs::inode::{FileSystem, Permissions};
+        use vfs::inode::{AccessPolicy, FileSystem};
         let fs = open_writable();
         let root = FileSystem::root(&fs);
-        let f = root.create("dbl.bin", Permissions::all()).expect("create");
+        let f = root.create("dbl.bin", 0o777, (0, 0)).expect("create");
         // 每块 1KB，per_block=256；跨一级间接区需 > (12+256)*1024 字节。
         let size = (12 + 256 + 5) * 1024; // 进入二级间接区 5 块
         let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
@@ -3348,10 +3333,10 @@ mod tests {
     /// 数据扇区数 < count_sectors（后者含一级/二级间接表块自身）。
     #[test]
     fn test_sectors_accounts_for_indirect_blocks() {
-        use vfs::inode::{FileSystem, Permissions};
+        use vfs::inode::{AccessPolicy, FileSystem};
         let fs = open_writable();
         let root = FileSystem::root(&fs);
-        let f = root.create("sect.bin", Permissions::all()).expect("create");
+        let f = root.create("sect.bin", 0o777, (0, 0)).expect("create");
         // 覆盖一级+二级间接区的大文件（块 1KB，per_block=256）。
         let size = (12 + 256 + 5) * 1024;
         let payload = alloc::vec![0u8; size];
@@ -3392,17 +3377,18 @@ mod tests {
     /// 文件写部分块——新块复用被删块时，未写字节必须为 0（不泄漏旧数据）。
     #[test]
     fn test_file_grow_does_not_leak_stale_data() {
-        use vfs::inode::{FileSystem, Permissions};
-        let perm = Permissions::all();
+        use vfs::inode::{AccessPolicy, FileSystem};
+        let mode = 0o777u32;
+        let owner = (0u32, 0u32);
         let fs = open_writable();
         let root = FileSystem::root(&fs);
         // 1) 建文件写满整个块为 0xAB，删除（free_block 只清位图位，残留保留）。
-        let f = root.create("stale.bin", perm).expect("create");
+        let f = root.create("stale.bin", mode, owner).expect("create");
         let garbage = alloc::vec![0xABu8; 1024];
         f.write_at(0, &garbage).expect("write garbage");
         root.unlink("stale.bin").expect("unlink");
         // 2) 建新文件，truncate 到整块（grow 复用到刚释放的块），再写部分字节。
-        let g = root.create("fresh.bin", perm).expect("create");
+        let g = root.create("fresh.bin", mode, owner).expect("create");
         g.truncate(1024).expect("grow to full block");
         g.write_at(0, b"abc").expect("write partial");
         // 3) 读整块：字节 0..3 为 'abc'，其余必须为 0（不得是残留 0xAB）。

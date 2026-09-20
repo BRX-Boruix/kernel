@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use klib::error::Error;
 use spin::RwLock;
 
-use crate::inode::{DirEntry, FileMetadata, INode, INodeType, Permissions};
+use crate::inode::{AccessPolicy, DirEntry, FileMetadata, INode, INodeType};
 
 /// 动态内容生成器类型（返回生成的字节数据）。
 pub type ContentGenerator = Box<dyn Fn() -> Vec<u8> + Send + Sync>;
@@ -20,7 +20,7 @@ pub type WriteHandler = Box<dyn Fn(&[u8]) -> Result<usize, Error> + Send + Sync>
 pub struct DynamicFileNode {
     generator: Option<ContentGenerator>,
     writer: Option<WriteHandler>,
-    perms: Permissions,
+    perms: AccessPolicy,
 }
 
 /// 手写 Debug（D5 / ADR-023 §7）：安全摘要，不调用生成器/写入器。
@@ -43,7 +43,7 @@ impl DynamicFileNode {
         Self {
             generator: Some(Box::new(generator)),
             writer: None,
-            perms: Permissions::readonly(),
+            perms: AccessPolicy::readonly(),
         }
     }
 
@@ -56,7 +56,7 @@ impl DynamicFileNode {
         Self {
             generator: Some(Box::new(generator)),
             writer: Some(Box::new(writer)),
-            perms: Permissions::read_write(),
+            perms: AccessPolicy::read_write(),
         }
     }
 }
@@ -93,7 +93,7 @@ impl INode for DynamicFileNode {
         Ok(FileMetadata {
             size,
             node_type: INodeType::RegularFile,
-            permissions: self.perms,
+            permissions: self.perms.clone(),
             created_time: 0,
             modified_time: 0,
             changed_time: 0,
@@ -115,11 +115,11 @@ impl INode for DynamicFileNode {
         Err(Error::NotDirectory)
     }
 
-    fn create(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn create(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::NotDirectory)
     }
 
-    fn mkdir(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn mkdir(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::NotDirectory)
     }
 
@@ -135,7 +135,7 @@ impl INode for DynamicFileNode {
 /// 动态/静态混合虚拟目录节点。
 pub struct DynamicDirNode {
     entries: RwLock<Vec<(alloc::string::String, Arc<dyn INode>)>>,
-    perms: Permissions,
+    perms: AccessPolicy,
 }
 
 /// 手写 Debug（D5 / ADR-023 §7）：安全摘要，不枚举目录项内容。
@@ -152,7 +152,7 @@ impl DynamicDirNode {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(Vec::new()),
-            perms: Permissions::all(),
+            perms: AccessPolicy::all(),
         }
     }
 
@@ -179,7 +179,7 @@ impl INode for DynamicDirNode {
         Ok(FileMetadata {
             size: self.entries.read().len() as u64,
             node_type: INodeType::Directory,
-            permissions: self.perms,
+            permissions: self.perms.clone(),
             created_time: 0,
             modified_time: 0,
             changed_time: 0,
@@ -205,11 +205,11 @@ impl INode for DynamicDirNode {
         Err(Error::NotFound)
     }
 
-    fn create(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn create(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::PermissionDenied)
     }
 
-    fn mkdir(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn mkdir(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::PermissionDenied)
     }
 

@@ -30,87 +30,337 @@ pub enum INodeType {
     Socket,
 }
 
-/// 权限披露标签（ADR-011，淘汰 755/644）。
+// ======================================================================
+// A1-1 / ADR-040 §2.1–§2.5：AccessPolicy 访问策略模型（D-MU-C1 消解）。
+// 经典 755/644 与四布尔 `Permissions` 均被本模型取代——全系统只有
+// §2.1 一个求值算法（`evaluate`），不存在第二条判定路径。
+// ======================================================================
+
+/// 权限位集（Read/Write/Execute）。
 ///
-/// **诚实边界（2026-09，todo.md D-MU-C1）**：`readable`/`writable`/`executable`
-/// 当前为**披露字段，不参与访问判定**（唯一强制点是 `system_only`，
-/// 见 kernel `enforce_open_permission`）。称其为"能力"名不副实。
-/// [ADR-040](../../../docs/adr/040-multi-user-access-model.md)（PROPOSED）将把本结构
-/// 重构为有序 ACE 列表并建立真实强制矩阵；落地前请勿依据本字段编写安全逻辑。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Permissions {
-    pub readable: bool,
-    pub writable: bool,
-    pub executable: bool,
-    pub system_only: bool,
+/// 位分配与 classic 三段解耦：本类型是"单一请求所需/单条 ACE 所授"的
+/// 权限集合，不携带属主归属信息（三段归属由 [`AccessPolicy`] 的隐式
+/// 尾部 ACE 表达）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PermBits {
+    bits: u8,
 }
 
-impl Permissions {
-    pub const fn all() -> Self {
+impl PermBits {
+    pub const READ: Self = Self { bits: 1 };
+    pub const WRITE: Self = Self { bits: 2 };
+    pub const EXECUTE: Self = Self { bits: 4 };
+    pub const ALL: Self = Self { bits: 7 };
+
+    pub const fn empty() -> Self {
+        Self { bits: 0 }
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self { bits: self.bits | other.bits }
+    }
+
+    /// 本集合是否**覆盖**所需位集（`required` 的每一位置都在本集合中）。
+    pub const fn contains(self, required: Self) -> bool {
+        self.bits & required.bits == required.bits
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+
+    /// classic 三段中的一段（r=4/w=2/x=1）→ 权限位集。
+    pub const fn from_classic_segment(seg: u32) -> Self {
         Self {
-            readable: true,
-            writable: true,
-            executable: true,
-            system_only: false,
+            bits: (((seg & 4) != 0) as u8) | ((((seg & 2) != 0) as u8) << 1) | ((((seg & 1) != 0) as u8) << 2),
         }
     }
 
-    pub const fn readonly() -> Self {
+    /// 权限位集 → classic 三段中的一段（r=4/w=2/x=1）。
+    pub const fn to_classic_segment(self) -> u32 {
+        (((self.bits & 1) != 0) as u32) << 2 | (((self.bits & 2) != 0) as u32) << 1 | ((self.bits & 4) != 0) as u32
+    }
+}
+
+/// ACE 主体形态（ADR-040 §2.4 单点定义）。
+///
+/// `Owner` 的判据是"调用者 uid == 节点属主 uid"（属主归属见
+/// [`AccessPolicy`] 的 `owner_uid`/`owner_gid`）；`NamedGid` 的判据是
+/// 调用者主组或补充组命中（组成员身份，ADR-040 §2.5）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Principal {
+    Owner,
+    NamedUid(u32),
+    NamedGid(u32),
+    Other,
+}
+
+/// 单条访问控制项（有序列表的元素；位置即优先级）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ace {
+    pub principal: Principal,
+    /// `true` = Allow（放行），`false` = Deny（拒绝，EACCES）。
+    pub allow: bool,
+    /// 本 ACE 授予/拒绝的权限位。
+    pub perms: PermBits,
+    /// 目录继承标记（A1-5 落地目录新建继承语义；求值不解读本位）。
+    pub inherit: bool,
+}
+
+/// 系统门禁 wire 位（bit9）。
+///
+/// **迁址说明**：旧 `Permissions::system_only` 占用 wire bit3，与 classic
+/// 三段（bit0..8）冲突。A1-1 起门禁位迁至 bit9；旧 bit3 在 >`0o7` 输入下
+/// 按 classic group 段位解读（现网无发送方——libsys `system_only` 恒
+/// `false`，见各调用点）。门禁语义与强制点不变（open/exec）。
+pub const GATE_SYSTEM_BIT: u32 = 1 << 9;
+
+/// 访问主体视图（vfs 侧借用形态）。
+///
+/// **为何不是 `task::ProcessIdentity`**：依赖方向是 `task → vfs`，vfs
+/// 反向依赖 task 会成环。本视图只含求值所需最小字段；kernel 强制点
+/// （A1-3 单点 `check_access`）在调用 [`AccessPolicy::evaluate`] 前从
+/// `ProcessIdentity` 借出本视图（`Groups::iter` 零拷贝切片）。
+#[derive(Clone, Copy, Debug)]
+pub struct Subject<'a> {
+    pub uid: u32,
+    pub gid: u32,
+    /// 补充组（`Groups::iter` 借出；不含主组——主组见 `gid`）。
+    pub groups: &'a [u32],
+}
+
+/// 访问策略本体（ADR-040 §2.1/§2.2）。
+///
+/// # 模型
+///
+/// ```text
+/// 有效策略 = [ 显式 ACE 列表... ] ++ [ owner-ACE, group-ACE, other-ACE ]
+/// ```
+///
+/// 三条隐式尾部 ACE 由 `mode`（classic 9 位）派生，经典 0644/0700 语义
+/// 自动保留；显式 ACE 位置表达 deny 优先。全系统只有 [`Self::evaluate`]
+/// 一个求值算法。
+///
+/// # 求值细则（本 ADR 草图 §2.1 的成文化补全）
+///
+/// 决定性 ACE = 有序扫描中**第一条 principal 匹配调用者且 perms 覆盖所需位**
+/// 的 ACE：Allow → 放行；Deny → `PermissionDenied`。perms 不覆盖所需位的
+/// ACE 跳过（NFSv4 applicability 约定——否则"deny W"会连带拒绝无关的 R，
+/// 与经典三段等价性要求冲突）。扫描完毕无决定性 ACE → 拒绝。
+///
+/// # 诚实边界（A1-1 过渡态，S39）
+///
+/// - 属主暂为 `(0,0)`（`from_classic`/`from_wire`）：EXT2 `i_uid`/`i_gid`
+///   真值与 RamFS 真属主存取是 A1-5 项；当前 uid0 进程是事实属主，行为
+///   与过渡期一致。创建点（`create`/`mkdir`）已带属主参数并真实烙印
+///   （RamFS 本体、EXT2 留位待 A1-5 盘上持久化）。
+/// - 内核强制矩阵接线（read/write/readdir/unlink/chmod）是 A1-3 项；
+///   当前强制点仍只有 open/exec。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessPolicy {
+    /// 显式 ACE 列表（有序；空 = 纯经典三段）。
+    aces: Vec<Ace>,
+    /// classic 9 位 mode（隐式尾部真值来源；盘上/wire 直通形态）。
+    mode: u32,
+    /// 属主 uid（Owner principal 的匹配判据；A1-5 接真值）。
+    owner_uid: u32,
+    /// 属主 gid（隐式 group-ACE 的 NamedGid 判据；A1-5 接真值）。
+    owner_gid: u32,
+    /// 系统门禁位（open/exec 强制点使用；wire bit9）。
+    gate_system: bool,
+}
+
+impl AccessPolicy {
+    /// classic 9 位 mode 构造（无显式 ACE；属主过渡态 `(0,0)`）。
+    pub const fn from_classic(mode: u32) -> Self {
         Self {
-            readable: true,
-            writable: false,
-            executable: false,
-            system_only: false,
+            aces: Vec::new(),
+            mode: mode & 0o777,
+            owner_uid: 0,
+            owner_gid: 0,
+            gate_system: false,
         }
     }
 
-    pub const fn read_write() -> Self {
+    /// classic 构造 + 真属主（创建点烙印 / EXT2 读侧 / 单测用）。
+    pub fn from_classic_owned(mode: u32, owner_uid: u32, owner_gid: u32) -> Self {
         Self {
-            readable: true,
-            writable: true,
-            executable: false,
-            system_only: false,
+            aces: Vec::new(),
+            mode: mode & 0o777,
+            owner_uid,
+            owner_gid,
+            gate_system: false,
         }
     }
 
-    pub const fn read_exec() -> Self {
+    /// 显式 ACE 列表 + classic 尾部构造（属主过渡态 `(0,0)`）。
+    pub fn new(aces: Vec<Ace>, classic_mode: u32) -> Self {
         Self {
-            readable: true,
-            writable: false,
-            executable: true,
-            system_only: false,
+            aces,
+            mode: classic_mode & 0o777,
+            owner_uid: 0,
+            owner_gid: 0,
+            gate_system: false,
         }
     }
 
-    pub const fn to_bits(self) -> u32 {
-        let mut bits = 0;
-        if self.readable {
-            bits |= 1 << 0;
-        }
-        if self.writable {
-            bits |= 1 << 1;
-        }
-        if self.executable {
-            bits |= 1 << 2;
-        }
-        if self.system_only {
-            bits |= 1 << 3;
-        }
-        bits
+    /// 置系统门禁位（open/exec 强制点语义；wire bit9）。
+    pub fn with_gate_system(mut self) -> Self {
+        self.gate_system = true;
+        self
     }
 
-    /// 按位解码权限。
+    /// 系统门禁位是否置位。
+    pub const fn gate_system(&self) -> bool {
+        self.gate_system
+    }
+
+    /// classic 9 位（不含门禁位；盘上 mode 直通形态）。
+    pub const fn classic_mode(&self) -> u32 {
+        self.mode
+    }
+
+    /// 属主 uid（A1-4 StatInfo 暴露 / A1-5 接真值）。
+    pub const fn owner_uid(&self) -> u32 {
+        self.owner_uid
+    }
+
+    /// 属主 gid。
+    pub const fn owner_gid(&self) -> u32 {
+        self.owner_gid
+    }
+
+    /// A1-5：以真属主覆写（EXT2 i_uid/i_gid 读侧 / RamFS 属主烙印）。
+    pub fn set_owner(&mut self, uid: u32, gid: u32) {
+        self.owner_uid = uid;
+        self.owner_gid = gid;
+    }
+
+    /// wire 解码（syscall 参数/chmod 的位集入参）。
     ///
-    /// KD7 成文策略（宽松掩码）：未知高位静默忽略（与 OpenFlags::from_bits
-    /// 同一族决策——位集演进不破坏旧二进制）；需要严格语义时调用方自行做
-    /// to_bits 往返比对。位分配见 [`Self::to_bits`]。
-    pub const fn from_bits(bits: u32) -> Self {
+    /// **wire 兼容映射**（KD7 宽松掩码政策的 A1-1 版）：
+    /// - `bits ≤ 0o7`：旧披露位（bit0=r/bit1=w/bit2=x，三段同权）——按旧
+    ///   语义等值展开为三段同值 classic（如 `0o5` → `0o555`）。现网全部
+    ///   发送方（libsys/libc）都落在该区，行为逐位不变；
+    /// - `bits > 0o7`：classic 9 位直通（`bits & 0o777`）+ 门禁位 bit9
+    ///   （[ `GATE_SYSTEM_BIT`]）。新发送方（A1-3+/libc 归真）走该区；
+    /// - 未知高位静默忽略（与 OpenFlags::from_bits 同族决策）。
+    pub fn from_wire(bits: u32) -> Self {
+        let gate = bits & GATE_SYSTEM_BIT != 0;
+        let mode = if bits <= 0o7 {
+            let seg = PermBits::from_classic_segment(bits).to_classic_segment();
+            seg << 6 | seg << 3 | seg
+        } else {
+            bits & 0o777
+        };
         Self {
-            readable: (bits & (1 << 0)) != 0,
-            writable: (bits & (1 << 1)) != 0,
-            executable: (bits & (1 << 2)) != 0,
-            system_only: (bits & (1 << 3)) != 0,
+            aces: Vec::new(),
+            mode,
+            owner_uid: 0,
+            owner_gid: 0,
+            gate_system: gate,
         }
+    }
+
+    /// wire 编码（StatInfo/syscall 回传）。
+    ///
+    /// classic 9 位直通 + 门禁位 bit9（若有）。**恒为 classic 形态**——
+    /// 只有盘上/wire 直通来源的策略会进入本分支；统一披露展开的输入
+    /// 经 `from_wire` 已是三段同值 classic，往返保真。
+    pub const fn to_wire(&self) -> u32 {
+        self.mode | ((self.gate_system as u32) << 9)
+    }
+
+    /// 有效策略：显式列表 ++ 三条隐式尾部 ACE（ADR-040 §2.2）。
+    ///
+    /// **命中即停**由 [`Self::evaluate`] 的首匹配即决保证；本方法只负责
+    /// 序列展开，不做合并、不取并集。
+    pub fn effective_aces(&self) -> impl Iterator<Item = Ace> + '_ {
+        let seg_owner = (self.mode >> 6) & 7;
+        let seg_group = (self.mode >> 3) & 7;
+        let seg_other = self.mode & 7;
+        let tail = [
+            Ace {
+                principal: Principal::Owner,
+                allow: true,
+                perms: PermBits::from_classic_segment(seg_owner),
+                inherit: false,
+            },
+            Ace {
+                principal: Principal::NamedGid(self.owner_gid),
+                allow: true,
+                perms: PermBits::from_classic_segment(seg_group),
+                inherit: false,
+            },
+            Ace {
+                principal: Principal::Other,
+                allow: true,
+                perms: PermBits::from_classic_segment(seg_other),
+                inherit: false,
+            },
+        ];
+        self.aces.iter().copied().chain(tail)
+    }
+
+    /// **唯一求值算法**（ADR-040 §2.1）：首匹配即决 + 隐式尾部兜底。
+    ///
+    /// 规则：
+    /// 1. 按序扫描 [`Self::effective_aces`]，取第一条 principal 匹配
+    ///    `subject` 且 `perms` 覆盖 `required` 的 ACE：Allow → 放行；
+    ///    Deny → [`Error::PermissionDenied`]；
+    /// 2. 扫描完毕无决定性 ACE → [`Error::PermissionDenied`]（安全侧）。
+    ///
+    /// `CAP_OWNER` 绕过（ADR-040 §2.6：持有者在求值前直接放行）由
+    /// **调用方**处理——本方法只看策略，不看能力位（S13 单点：能力
+    /// 豁免属于强制矩阵，不属于策略本体）。
+    pub fn evaluate(&self, subject: &Subject, required: PermBits) -> Result<(), Error> {
+        for ace in self.effective_aces() {
+            if principal_matches(&ace.principal, subject, self) && ace.perms.contains(required) {
+                return if ace.allow {
+                    Ok(())
+                } else {
+                    Err(Error::PermissionDenied)
+                };
+            }
+        }
+        Err(Error::PermissionDenied)
+    }
+}
+
+/// Principal 匹配判据（[`AccessPolicy::evaluate`] 专用）。
+///
+/// `Owner` ⇔ uid 等于属主；`NamedGid` ⇔ 主组或补充组命中（组成员身份，
+/// ADR-040 §2.5）；`Other` 恒匹配（兜底段）。
+fn principal_matches(principal: &Principal, subject: &Subject, policy: &AccessPolicy) -> bool {
+    match *principal {
+        Principal::Owner => subject.uid == policy.owner_uid,
+        Principal::NamedUid(uid) => subject.uid == uid,
+        Principal::NamedGid(gid) => subject.gid == gid || subject.groups.contains(&gid),
+        Principal::Other => true,
+    }
+}
+
+impl AccessPolicy {
+    /// 全权限 classic（0777 三段同值）。
+    ///
+    /// 兼容旧 `Permissions::all()` 的披露语义（r/w/x 对三段同权）。
+    pub const fn all() -> Self {
+        Self::from_classic(0o777)
+    }
+
+    /// 只读 classic（0444）。
+    pub const fn readonly() -> Self {
+        Self::from_classic(0o444)
+    }
+
+    /// 读写 classic（0666）。
+    pub const fn read_write() -> Self {
+        Self::from_classic(0o666)
+    }
+
+    /// 读执行 classic（0555）——内置可执行 payload 的真实形态。
+    pub const fn read_exec() -> Self {
+        Self::from_classic(0o555)
     }
 }
 
@@ -119,7 +369,7 @@ impl Permissions {
 pub struct FileMetadata {
     pub node_type: INodeType,
     pub size: u64,
-    pub permissions: Permissions,
+    pub permissions: AccessPolicy,
     pub created_time: u64,
     pub modified_time: u64,
     pub changed_time: u64,
@@ -146,7 +396,8 @@ pub struct StatInfo {
     pub node_type: u32,
     /// 文件字节大小。
     pub size: u64,
-    /// 权限位（`Permissions::to_bits` 编码：readable=0/writable=1/executable=2/system_only=3）。
+    /// 权限位（classic 9 位 owner/group/other 直通 + 系统门禁 bit9，
+    /// 见 [`AccessPolicy::to_wire`]）。
     pub perms: u32,
     /// 创建时间（Unix 秒；EXT2 rev1 无 crtime 字段时如实 0）。
     pub created_time: u64,
@@ -175,7 +426,7 @@ impl StatInfo {
         Self {
             node_type: Self::type_tag(m.node_type),
             size: m.size,
-            perms: m.permissions.to_bits(),
+            perms: m.permissions.to_wire(),
             created_time: m.created_time,
             modified_time: m.modified_time,
             changed_time: m.changed_time,
@@ -275,13 +526,14 @@ pub trait INode: Send + Sync {
         Err(Error::NotDirectory)
     }
 
-    /// 创建普通文件。
-    fn create(&self, _name: &str, _perm: Permissions) -> Result<Arc<dyn INode>, Error> {
+    /// 创建普通文件（A1-1：`mode` 为 classic 9 位；属主 = 创建者，POSIX 语义
+    /// ——wire 只传 mode，杜绝"冒充他人属主创建"；chown 是唯一改属主通道）。
+    fn create(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::NotDirectory)
     }
 
-    /// 创建子目录。
-    fn mkdir(&self, _name: &str, _perm: Permissions) -> Result<Arc<dyn INode>, Error> {
+    /// 创建子目录（属主语义同 [`Self::create`]）。
+    fn mkdir(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::NotDirectory)
     }
 
@@ -290,12 +542,14 @@ pub trait INode: Send + Sync {
         Err(Error::NotDirectory)
     }
 
-    /// 设置权限（chmod 原语）。
+    /// 设置权限（chmod 原语，A1-1）：整体替换节点 [`AccessPolicy`]。
     ///
-    /// 覆写节点权限为 `perms`（r/w/x/system_only 四布尔）。默认实现返回
-    /// [`Error::NotSupported`]——只读虚拟文件系统（procfs/sysfs/devfs）如实
-    /// 拒绝；本 crate 内 RamFS 与 EXT2 提供实现。
-    fn set_permissions(&self, _perms: Permissions) -> Result<(), Error> {
+    /// **语义边界**：wire chmod 只携带 classic 位集（无 ACE 通道），故整体
+    /// 替换即"重写 classic 段"；显式 ACE 的用户态写入门径属 A2-6（第一阶段
+    /// 经内核测试路径构造，S39 如实披露）。
+    /// 默认实现返回 [`Error::NotSupported`]——只读虚拟文件系统（procfs/
+    /// sysfs/devfs）如实拒绝；本 crate 内 RamFS 与 EXT2 提供实现。
+    fn set_permissions(&self, _policy: &AccessPolicy) -> Result<(), Error> {
         Err(Error::NotSupported)
     }
 

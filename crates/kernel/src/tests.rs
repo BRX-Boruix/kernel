@@ -3856,7 +3856,7 @@ pub fn test_vfs_m61() {
     use crate::vfs_init;
     use alloc::sync::Arc;
     use vfs::file_handle::{FileHandle, OpenFlags, SeekWhence};
-    use vfs::inode::{INodeType, Permissions};
+    use vfs::inode::{AccessPolicy, INodeType};
     use vfs::ramfs::RamFS;
 
     info!("[test-vfs-m61] === M6.1: VFS abstraction and RamFS selftest ===");
@@ -3888,7 +3888,7 @@ pub fn test_vfs_m61() {
     // 会在带盘启动时残留，使下一次运行 `create_file` 收到 AlreadyExists。
     // 测试产物不是配置，归属临时区才是正确语义。
     let file_node = root
-        .create_file("/scratch/kernel.json", Permissions::read_write())
+        .create_file("/scratch/kernel.json", AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create file");
     let handle = FileHandle::new(file_node.clone(), OpenFlags::READ_WRITE)
         .expect("ramfs handle metadata is infallible");
@@ -3967,11 +3967,11 @@ pub fn test_vfs_m61() {
 
     // 5. 挂载独立文件系统到 /volumes/workspace
     let data_fs = Arc::new(RamFS::new());
-    root.mkdir("/volumes/workspace", Permissions::all())
+    root.mkdir("/volumes/workspace", AccessPolicy::all().classic_mode(), (0, 0))
         .expect("mkdir mount point");
     root.mount("/volumes/workspace", data_fs)
         .expect("mount workspace");
-    root.create_file("/volumes/workspace/main.rs", Permissions::all())
+    root.create_file("/volumes/workspace/main.rs", AccessPolicy::all().classic_mode(), (0, 0))
         .expect("create in volume");
     let vol_file = root
         .resolve("/volumes/workspace/main.rs", true)
@@ -3988,9 +3988,9 @@ pub fn test_vfs_m61() {
         INodeType::Directory,
         "/tmp must resolve to /scratch through the official symlink"
     );
-    root.mkdir("/scratch/trash", Permissions::all())
+    root.mkdir("/scratch/trash", AccessPolicy::all().classic_mode(), (0, 0))
         .expect("mkdir trash");
-    root.create_file("/scratch/trash/item1", Permissions::all())
+    root.create_file("/scratch/trash/item1", AccessPolicy::all().classic_mode(), (0, 0))
         .expect("create trash item");
     assert!(
         root.unlink("/scratch/trash").is_err(),
@@ -4013,7 +4013,7 @@ pub fn test_vfs_m61() {
 pub fn test_vfs_volume_collision() {
     use crate::vfs_init;
     use alloc::sync::Arc;
-    use vfs::inode::{INodeType, Permissions};
+    use vfs::inode::{AccessPolicy, INodeType};
     use vfs::ramfs::RamFS;
 
     info!("[test-vfs-volume-collision] === ADR-012-6: volume name collision auto-increment ===");
@@ -4047,11 +4047,11 @@ pub fn test_vfs_volume_collision() {
     assert_eq!(m3.as_str(), "/volumes/data-3", "third colliding volume auto-increments");
 
     // 3. 各卷内容互相隔离：写入 data 不污染 data-2/data-3。
-    root.create_file("/volumes/data/first.rs", Permissions::all())
+    root.create_file("/volumes/data/first.rs", AccessPolicy::all().classic_mode(), (0, 0))
         .expect("create in data");
-    root.create_file("/volumes/data-2/second.rs", Permissions::all())
+    root.create_file("/volumes/data-2/second.rs", AccessPolicy::all().classic_mode(), (0, 0))
         .expect("create in data-2");
-    root.create_file("/volumes/data-3/third.rs", Permissions::all())
+    root.create_file("/volumes/data-3/third.rs", AccessPolicy::all().classic_mode(), (0, 0))
         .expect("create in data-3");
     for (path, absent) in [
         ("/volumes/data/first.rs", "second.rs"),
@@ -4128,7 +4128,7 @@ pub fn test_vfs_volume_collision() {
         um1, um2, um3, um4
     );
     // 未命名卷内容隔离且路径真实可解析。
-    root.create_file("/volumes/disk-2-part1/blob.bin", Permissions::all())
+    root.create_file("/volumes/disk-2-part1/blob.bin", AccessPolicy::all().classic_mode(), (0, 0))
         .expect("create file in hinted unnamed volume");
     root.resolve("/volumes/disk-2-part1/blob.bin", true)
         .expect("hinted unnamed volume path must resolve");
@@ -4301,13 +4301,13 @@ pub fn test_vfs_m62() {
     use mm::user_space::UserAddressSpace;
     use task::Process;
     use vfs::file_handle::{FileHandle, OpenFlags};
-    use vfs::inode::Permissions;
+    use vfs::inode::AccessPolicy;
 
     info!("[test-vfs-m62] === M6.2: Process FD Table and VFS Syscall Integration ===");
 
     let root = vfs_init::root();
     let file = root
-        .create_file("/scratch/fd_test.txt", Permissions::read_write())
+        .create_file("/scratch/fd_test.txt", AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create file");
 
     let us = UserAddressSpace::<X86PageTable>::new().expect("user space");
@@ -4809,11 +4809,14 @@ pub fn test_syscall_seq_large_io() {
     }
 
     // 打开 /scratch/large_seq.bin：write|create|truncate（bit1|bit2|bit3 = 0b1110）。
+    // A1-1：perm 参数 = classic 0644（属主可写）。旧世界 r/w/x 零强制时
+    // 传 0 也能打开；现在 open 强制真实生效——mode 0000 节点按 POSIX
+    // 语义连属主也不可写，夹具必须给属主写位（S19 语义不变）。
     let mut o = frame(
         crate::syscall::SYS_STREAM_CREATE,
         buf,
         (1u32 << 1 | 1u32 << 2 | 1u32 << 3) as u64,
-        0,
+        0o644,
     );
     assert!(crate::syscall::syscall_entry(&mut o));
     assert!(
@@ -4958,7 +4961,7 @@ pub fn test_syscall_entry_update() {
     // 3. 目标已存在 → AlreadyExists（先创建新目标同名文件）。
     {
         let root = crate::vfs_init::root();
-        root.create_file("/scratch/entry_conflict.txt", vfs::inode::Permissions::all())
+        root.create_file("/scratch/entry_conflict.txt", vfs::inode::AccessPolicy::all().classic_mode(), (0, 0))
             .expect("create conflict target");
     }
     let mut ae = frame(crate::syscall::SYS_ENTRY_UPDATE, new_ptr, buf + 0xC0, 0);
@@ -4986,7 +4989,7 @@ pub fn test_syscall_entry_update() {
     // 4. 跨目录 → NotSupported。
     {
         let root = crate::vfs_init::root();
-        root.mkdir("/scratch/other", vfs::inode::Permissions::all())
+        root.mkdir("/scratch/other", vfs::inode::AccessPolicy::all().classic_mode(), (0, 0))
             .expect("mkdir other dir");
     }
     let other_s = b"/scratch/other/entry_new.txt\0";
@@ -5360,7 +5363,7 @@ pub fn test_syscall_entry_read_json() {
     use arch::syscall::SyscallFrame;
     use crate::vfs_init;
     use task::Process;
-    use vfs::inode::Permissions;
+    use vfs::inode::AccessPolicy;
 
     info!("[test-syscall-entry-read-json] === ADR-014: SYS_ENTRY_READ JSON ===");
 
@@ -5380,16 +5383,16 @@ pub fn test_syscall_entry_read_json() {
     }
 
     let root = vfs_init::root();
-    root.mkdir("/json_rd", Permissions::read_write())
+    root.mkdir("/json_rd", AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("mkdir json_rd");
-    root.create_file("/json_rd/alpha.txt", Permissions::read_write())
+    root.create_file("/json_rd/alpha.txt", AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create alpha");
-    root.mkdir("/json_rd/sub", Permissions::read_write())
+    root.mkdir("/json_rd/sub", AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("mkdir sub");
     // 含引号与反斜杠的恶意文件名，验证转义。
-    root.create_file("/json_rd/we\"ird\\n.txt", Permissions::read_write())
+    root.create_file("/json_rd/we\"ird\\n.txt", AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create quoted filename");
-    root.mkdir("/json_rd_empty", Permissions::read_write())
+    root.mkdir("/json_rd_empty", AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("mkdir empty dir");
 
     let irq_flags = arch_x86_64::interrupts::irq_save();
@@ -5610,13 +5613,11 @@ pub fn test_syscall_entry_create_kind() {
         crate::syscall::SYS_ENTRY_CREATE,
         base,
         ENTRY_KIND_DIRECTORY,
-        // ABI 是 `Permissions::to_bits()`，**不是 POSIX mode**。
-        // 此前误传 `0o755`：其 bit2（=4）恰好对应 executable，但 bit3（=1）
-        // 落在 **system_only** 上——创建请求因此带上了"仅系统可访问"。
-        // RamFS 照单全收故长期未暴露；EXT2 无法表达 system_only、如实
-        // 返回 NotSupported 后这个误用才显形。
-        // 用户的真实写法见 `libsys::io::mkdir`（传 `perm.to_bits()`）。
-        vfs::inode::Permissions::read_exec().to_bits() as u64,
+        // A1-1：ABI 即 classic 9 位 mode（POSIX 形态）+ 门禁 bit9。
+        // 历史注记：旧 ABI（四布尔位集）下 0o755 的 bit3 恰是 system_only
+        // ——曾因误传 POSIX mode 而带上"仅系统可访问"，EXT2 如实拒绝后
+        // 才显形。该失配随 AccessPolicy 直通编码（bit0..8=classic）消除。
+        0o755u64,
     );
     assert!(crate::syscall::syscall_entry(&mut mkdir));
     assert!(
@@ -5629,9 +5630,8 @@ pub fn test_syscall_entry_create_kind() {
         crate::syscall::SYS_ENTRY_CREATE,
         base + 0x1000,
         ENTRY_KIND_FILE,
-        // 同上：ABI 是 Permissions 位集（`0o644` 的 bit3 恰为 0，故行为
-        // 本就正确；改用显式位集以免读者把它误读成 POSIX mode）。
-        vfs::inode::Permissions::read_write().to_bits() as u64,
+        // 同上：classic 直通（0644）——A1-1 下这就是 POSIX mode 本义。
+        0o644u64,
     );
     assert!(crate::syscall::syscall_entry(&mut touch));
     assert!(
@@ -5656,7 +5656,7 @@ pub fn test_syscall_entry_create_kind() {
             crate::syscall::SYS_ENTRY_CREATE,
             base + 0x2000,
             bad_kind,
-            vfs::inode::Permissions::read_write().to_bits() as u64,
+            0o644u64,
         );
         assert!(crate::syscall::syscall_entry(&mut spec));
         assert_eq!(
@@ -6222,7 +6222,7 @@ pub fn test_syscall_std_stream_close() {
 /// M6.3：验证特殊文件系统（ProcFS / SysFS / DevFS）与 JSON 第一公民。
 pub fn test_vfs_m63() {
     use crate::vfs_init;
-    use vfs::inode::Permissions;
+    use vfs::inode::AccessPolicy;
 
     info!("[test-vfs-m63] === M6.3: ProcFS, SysFS, DevFS JSON First-Citizen Selftest ===");
 
@@ -6310,7 +6310,7 @@ pub fn test_vfs_m63() {
 
     // 2b. /system 本体为真实可写 RamFS 域目录（ADR-012 §3 #3：swapfile 归属）：
     //     SysFS 只读视图迁移到 /system/info 后，/system 可写、info 只读共存。
-    root.create_file("/system/swapfile", Permissions::all())
+    root.create_file("/system/swapfile", AccessPolicy::all().classic_mode(), (0, 0))
         .expect("create /system/swapfile in writable /system");
     let swap_node = root.resolve("/system/swapfile", true).expect("resolve swapfile");
     let _ = swap_node;
@@ -6710,7 +6710,7 @@ pub fn test_vfs_m64() {
 pub fn test_vfs_m65() {
     use crate::vfs_init;
     use vfs::file_handle::{FileHandle, OpenFlags};
-    use vfs::inode::Permissions;
+    use vfs::inode::AccessPolicy;
     use vfs::page_cache::PageCache;
 
     info!(
@@ -6723,12 +6723,12 @@ pub fn test_vfs_m65() {
     let mut current_dir = alloc::string::String::from("/scratch");
     for i in 0..5 {
         current_dir.push_str(&alloc::format!("/level_{}", i));
-        root.mkdir(&current_dir, Permissions::all())
+        root.mkdir(&current_dir, AccessPolicy::all().classic_mode(), (0, 0))
             .expect("nested mkdir");
     }
     let deep_file_path = alloc::format!("{}/deep_payload.txt", current_dir);
     let deep_node = root
-        .create_file(&deep_file_path, Permissions::read_write())
+        .create_file(&deep_file_path, AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create deep file");
     deep_node
         .write_at(0, b"Deep path verified")
@@ -6741,7 +6741,7 @@ pub fn test_vfs_m65() {
     // 2. 16KB 文件读写与 Page Cache 跨页/大页直通命中
     let big_path = "/scratch/big_payload.dat";
     let big_node = root
-        .create_file(big_path, Permissions::read_write())
+        .create_file(big_path, AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create big file");
     let chunk = [0xAAu8; 4096];
     for i in 0..4 {
@@ -6770,7 +6770,7 @@ pub fn test_vfs_m65() {
     // 3. 文件被打开状态下 unlink 的生命周期验证（延迟释放）
     let unlinked_path = "/scratch/open_and_delete.txt";
     let open_node = root
-        .create_file(unlinked_path, Permissions::read_write())
+        .create_file(unlinked_path, AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create open file");
     open_node
         .write_at(0, b"Live data before unlink")
@@ -6809,7 +6809,7 @@ pub fn test_vfs_m65() {
 pub fn test_bench_ds32() {
     use crate::vfs_init;
     use klib::time::read_cycle_counter;
-    use vfs::inode::Permissions;
+    use vfs::inode::AccessPolicy;
     use vfs::page_cache::PageCache;
 
     info!("[test-bench-ds32] === D-S32: cycle counter + PageCache hit-rate/throughput ===");
@@ -6818,7 +6818,7 @@ pub fn test_bench_ds32() {
     let root = vfs_init::root();
     let path = "/scratch/bench_ds32.dat";
     let node = root
-        .create_file(path, Permissions::read_write())
+        .create_file(path, AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create bench file");
     let chunk = [0x5Au8; 4096];
     for i in 0..4 {
@@ -6892,7 +6892,7 @@ pub fn test_huge_page_direct_r4() {
     use arch::VirtAddr;
     use arch_x86_64::paging::X86PageTable;
     use vfs::huge_page_cache::HugePageDirectCache;
-    use vfs::inode::Permissions;
+    use vfs::inode::AccessPolicy;
     use vfs::page_cache::{HUGE_PAGE_SIZE, READ_BULK_THRESHOLD_BYTES};
 
     info!("[test-huge-r4] === D-VFS1-R4: physical huge-page direct cache (R4-1/R4-2/R4-4) ===");
@@ -6901,7 +6901,7 @@ pub fn test_huge_page_direct_r4() {
     let root = vfs_init::root();
     let path = "/scratch/huge_r4.dat";
     let node = root
-        .create_file(path, Permissions::read_write())
+        .create_file(path, AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create file");
     // 0xA5 = 文件基准数据模式（R4-1 读回校验）；4096 = 4KiB 块粒度。
     let pattern = [0xA5u8; 4096];
@@ -7006,7 +7006,7 @@ pub fn test_huge_page_bench_r43() {
     use crate::vfs_init;
     use klib::time::read_cycle_counter;
     use vfs::huge_page_cache::HugePageDirectCache;
-    use vfs::inode::Permissions;
+    use vfs::inode::AccessPolicy;
     use vfs::page_cache::{PageCache, READ_BULK_THRESHOLD_BYTES, HUGE_PAGE_SIZE};
 
     info!("[test-huge-bench-r43] === D-VFS1-R4: huge-page vs heap-cache cold/hot cycles ===");
@@ -7016,7 +7016,7 @@ pub fn test_huge_page_bench_r43() {
     let root = vfs_init::root();
     let path = "/scratch/huge_bench_r43.dat";
     let node = root
-        .create_file(path, Permissions::read_write())
+        .create_file(path, AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create bench file");
     // 0x7E = 基准文件数据模式；4096 = 4KiB 块粒度。
     let pattern = [0x7Eu8; 4096];
@@ -12612,7 +12612,7 @@ pub fn test_perm_system_only() {
     use alloc::boxed::Box;
     use arch::syscall::SyscallFrame;
     use task::{Process, ProcessIdentity};
-    use vfs::inode::Permissions;
+    use vfs::inode::AccessPolicy;
 
     info!("[test-perm-system-only] === A1/ADR-033: system_only enforcement ====");
 
@@ -12638,38 +12638,42 @@ pub fn test_perm_system_only() {
         arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
     }
 
-    // system_only + normal nodes via root.create_file (test fixture).
+    // 门禁 + normal nodes via root.create_file (test fixture).
     //
-    // 夹具需要**能表达 system_only 的**文件系统。`/scratch` 在两种启动方式下
+    // 夹具需要**能表达门禁位的**文件系统。`/scratch` 在两种启动方式下
     // 落在不同后端：
     //
-    //   - ISO 启动：根为 RamFS（memfs），`Permissions` 逐字段原样保存，
-    //     `system_only` 可表达——本测试的前提成立；
+    //   - ISO 启动：根为 RamFS（memfs），`AccessPolicy` 本体（含 gate_system
+    //     位）原样保存——本测试的前提成立；
     //   - 带盘启动（`--systemdisk`，ADR-029 安装模式）：根就是系统盘的
-    //     **EXT2 分区**，而 EXT2 的 inode mode 里**没有** system_only 位。
-    //     `ext2::create_file` 因此如实返回 `NotSupported`（宁缺毋假，绝不
-    //     静默建出权限不符的节点）。
+    //     **EXT2 分区**，而 EXT2 的 inode mode 里没有门禁位。set_permissions
+    //     如实返回 `NotSupported`（宁缺毋假，绝不静默建出门禁丢失的节点）。
     //
-    // 后者不是缺陷：磁盘格式表达能力有限是客观事实，EXT2 上本来就无法
-    // 表达“禁止普通用户访问”这一内核特有的访问控制位。此时本测试的前提
+    // 后者不是缺陷：磁盘格式表达能力有限是客观事实。此时本测试的前提
     // 不成立，**如实跳过并说明**，而不是断言一个环境无法满足的条件
     //（那样只会得到与病因无关的红色，正是本轮反复踩到的坑）。
-    let sysonly_perm = Permissions { readable: true, writable: true, executable: false, system_only: true };
+    // A1-1：门禁唯一写入门径是 chmod（set_permissions）——创建通道只带
+    // classic mode + 属主，不接收门禁语义。
     {
         let root = crate::vfs_init::root();
-        match root.create_file("/scratch/perm_sysonly.txt", sysonly_perm) {
+        let node = root
+            .create_file("/scratch/perm_sysonly.txt", 0o644, (0, 0))
+            .expect("create gate fixture node");
+        match node.set_permissions(&vfs::inode::AccessPolicy::from_wire(
+            vfs::inode::GATE_SYSTEM_BIT | 0o644,
+        )) {
             Ok(_) => {}
             Err(klib::error::Error::NotSupported) => {
                 info!(
-                    "[test-syscall-perm] SKIP: backing filesystem cannot express system_only \
+                    "[test-syscall-perm] SKIP: backing filesystem cannot express the gate bit \
                      (EXT2 install-mode root has no such inode bit). \
                      This test requires the RamFS root produced by ISO boot."
                 );
                 return;
             }
-            Err(e) => panic!("create system_only node: {:?}", e),
+            Err(e) => panic!("set gate bit: {:?}", e),
         }
-        root.create_file("/scratch/perm_normal.txt", Permissions::read_write())
+        root.create_file("/scratch/perm_normal.txt", 0o644, (0, 0))
             .expect("create normal node");
     }
 
@@ -12728,19 +12732,46 @@ pub fn test_perm_system_only() {
     let fd_norm = o3.result;
     info!("[test-perm-system-only] User opened normal node fd={} OK", fd_norm);
 
-    // 4. V7: User 进程不得创建 system_only 节点（open O_CREAT + system_only perm 位）。
-    //    create=bit2, write=bit1, system_only perm=bit3(=8)。User 身份创建 → EACCES。
+    // 4. A1-1：创建通道只烙印 classic mode + 属主（POSIX 语义），wire 参数
+    //    中的门禁位**无处烙印**——from_wire 虽解析 bit9，但 create/mkdir
+    //    路径只消费 classic 段。断言：User 以 bit9 参数创建成功且节点不带
+    //    门禁（后续 open 可行）。门禁唯一写入门径是 chmod/set_permissions，
+    //    其属主校验是 A1-3 项（本测试以 chmod 通道作夹具即为演示）。
     const CREATE_WRITE: u64 = (1u64 << 1) | (1u64 << 2);
-    const SYSTEM_ONLY_PERM: u64 = 1u64 << 3;
+    const GATE_BIT_A9: u64 = vfs::inode::GATE_SYSTEM_BIT as u64;
     let v7_path = b"/scratch/perm_user_create_sysonly.txt\x00";
     unsafe {
         let pa3 = task::current_proc_mut().expect("proc").addr_space().translate(arch::VirtAddr::new(base + 0x1000)).expect("resident").as_u64();
         core::ptr::copy_nonoverlapping(v7_path.as_ptr(), (pa3 + off) as *mut u8, v7_path.len());
     }
-    let mut o4 = frame(crate::syscall::SYS_STREAM_CREATE, base + 0x1000, CREATE_WRITE, SYSTEM_ONLY_PERM);
+    // perm 参数 = classic 0644 | 门禁位：from_wire 解析出 gate 标志，但
+    // create/mkdir 通道只消费 classic 段烙印节点。传纯 bit9 会造出 mode
+    // 0000 节点（属主写检查如实拒绝）——夹具必须带 classic 位。
+    let mut o4 = frame(
+        crate::syscall::SYS_STREAM_CREATE,
+        base + 0x1000,
+        CREATE_WRITE,
+        0o644 | GATE_BIT_A9,
+    );
     assert!(crate::syscall::syscall_entry(&mut o4));
-    assert_eq!(o4.result, EACCES_U64, "User create of system_only node must be EACCES(13)");
-    info!("[test-perm-system-only] User cannot create system_only node -> EACCES OK");
+    assert!(
+        o4.result & ERR_FLAG == 0,
+        "create with classic|gate wire arg must succeed"
+    );
+    // 精确断言：门禁**未**烙印——节点 classic 0644、gate_system=false。
+    // 门禁唯一写入门径是 chmod/set_permissions（其属主校验属 A1-3）。
+    {
+        let node = crate::vfs_init::root()
+            .resolve("/scratch/perm_user_create_sysonly.txt", true)
+            .expect("resolve created node");
+        let m = node.metadata().expect("created node meta");
+        assert_eq!(m.permissions.classic_mode(), 0o644, "classic mode imprinted");
+        assert!(
+            !m.permissions.gate_system(),
+            "create channel must NOT imprint the gate bit"
+        );
+    }
+    info!("[test-perm-system-only] create channel carries no gate bit OK");
 
     // cleanup: close fds + unlink nodes.
     {
@@ -12753,6 +12784,9 @@ pub fn test_perm_system_only() {
         let root = crate::vfs_init::root();
         root.unlink("/scratch/perm_sysonly.txt").expect("cleanup unlink sysonly");
         root.unlink("/scratch/perm_normal.txt").expect("cleanup unlink normal");
+        // A1-1 测试 4：创建通道不再拒绝，节点真实存在——如实清理。
+        root.unlink("/scratch/perm_user_create_sysonly.txt")
+            .expect("cleanup unlink user-created node");
     }
 
     arch_x86_64::mmio::write_cr3(saved_cr3);
@@ -12986,7 +13020,7 @@ pub fn test_flock_matrix() {
     info!("[test-flock-matrix] === R6 flock conflict matrix ====");
 
     let inode = crate::vfs_init::root()
-        .create_file("/scratch/flock_a.txt", vfs::inode::Permissions::read_write())
+        .create_file("/scratch/flock_a.txt", vfs::inode::AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create flock test inode");
     // 复位 uid=0 的残留锁（隔离本测试；K7）。
     flock_release_all_for_owner(0);
@@ -13074,7 +13108,7 @@ pub fn test_flock_close_release() {
     const UID_OTHER: u32 = 8;
 
     let inode = crate::vfs_init::root()
-        .create_file("/scratch/flock_b.txt", vfs::inode::Permissions::read_write())
+        .create_file("/scratch/flock_b.txt", vfs::inode::AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create flock close inode");
 
     let irq_flags = arch_x86_64::interrupts::irq_save();
@@ -13145,7 +13179,7 @@ pub fn test_flock_identity_is_filesystem_independent() {
     let path = "/scratch/flock_identity.txt";
     // 幂等建文件：带盘启动下可能已存在（/scratch 启动清空，但本测试可能
     // 在同一启动内被调用两次）。
-    let _ = root.create_file(path, vfs::inode::Permissions::read_write());
+    let _ = root.create_file(path, vfs::inode::AccessPolicy::read_write().classic_mode(), (0, 0));
 
     // 两次独立解析——模拟两个进程各自 open 同一路径。
     let a = root.resolve(path, true).expect("resolve #1");
@@ -13186,7 +13220,7 @@ pub fn test_flock_syscall() {
     use alloc::boxed::Box;
     use arch::syscall::SyscallFrame;
     use task::{Caps, Groups, Process, ProcessIdentity};
-    use vfs::inode::Permissions;
+    use vfs::inode::AccessPolicy;
 
     info!("[test-flock-syscall] === R6 flock production syscall ====");
 
@@ -13222,7 +13256,7 @@ pub fn test_flock_syscall() {
     }
 
     // 建真实文件 + 映射一块用户内存放路径串。
-    crate::vfs_init::root().create_file("/scratch/flock_sys.txt", Permissions::read_write())
+    crate::vfs_init::root().create_file("/scratch/flock_sys.txt", AccessPolicy::read_write().classic_mode(), (0, 0))
         .expect("create flock syscall inode");
     let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x3000, 0, 0);
     assert!(crate::syscall::syscall_entry(&mut map));

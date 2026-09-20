@@ -26,7 +26,7 @@ use spin::Once;
 
 use crate::file_handle::{FileHandle, OpenFlags};
 use crate::inode::{FileMetadata, INodeType};
-use crate::inode::{INode, Permissions};
+use crate::inode::{AccessPolicy, INode};
 
 /// stdout 单次写入的块大小（与原 syscall 路径一致的分块粒度）。
 const STDOUT_CHUNK: usize = 4096;
@@ -61,12 +61,12 @@ fn stream_metadata(read: bool, write: bool) -> Result<FileMetadata, Error> {
     Ok(FileMetadata {
         size: 0,
         node_type: INodeType::CharacterDevice,
-        permissions: Permissions {
-            readable: read,
-            writable: write,
-            executable: false,
-            system_only: false,
-        },
+        // A1-1：经典三段同值（读写端能力如实披露；无执行语义）。
+        permissions: AccessPolicy::from_classic({
+            let mut m = 0o444;
+            if write { m |= 0o222; }
+            m
+        }),
         created_time: 0,
         modified_time: 0,
         changed_time: 0,

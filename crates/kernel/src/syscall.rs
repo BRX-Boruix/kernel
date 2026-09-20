@@ -220,7 +220,7 @@ pub const ENTRY_READ_STAT: u64 = 1;
 // ---------- SYS_ENTRY_UPDATE 动作编码（a4 区分 rename/chmod）----------
 /// rename（默认）：a4=0，a1=old_path, a2=new_path。
 pub const ENTRY_UPDATE_RENAME: u64 = 0;
-/// chmod：a4=1，a1=path, a2=mode_bits（`Permissions::to_bits` 编码）。
+/// chmod：a4=1，a1=path, a2=mode_bits（classic 9 位 + 门禁 bit9 编码）。
 pub const ENTRY_UPDATE_CHMOD: u64 = 1;
 
 // ---------- SYS_ENTRY_CREATE kind 编码（ADR-014 §4.4，与 INodeType 对齐）----------
@@ -505,22 +505,54 @@ fn sys_getcwd(frame: &mut SyscallFrame) -> u64 {
 /// A1-2 / ADR-040 §2.3：系统门禁强制（承 ADR-033 的 system_only 语义）。
 ///
 /// 在 `sys_open`（`resolve` 后、`FileHandle::new` 前）与 `sys_exec`（解析
-/// inode 后、装载前）调用。策略位 bit3（`Permissions` wire 投影的
-/// `system_only` 位；A1-1 将把 `Permissions` 重构为 `AccessPolicy`）标记的
-/// **系统门禁节点**仅持 `CAP_SYSTEM` 的进程可打开/执行，其余身份返回
+/// inode 后、装载前）调用。门禁位 wire bit9（A1-1 起原 `system_only` bit3
+/// 迁址于此，`AccessPolicy` 的 `gate_system`）标记的**系统门禁节点**仅持
+/// `CAP_SYSTEM` 的进程可打开/执行，其余身份返回
 /// `Error::PermissionDenied`（EACCES）。
 ///
-/// 诚实边界（ADR-040 §3.4）：r/w/x 的 owner 维度强制属 A1-3（统一矩阵
-/// `check_access`）；本函数当前只比较系统门禁位 + `CAP_SYSTEM`。
+/// A1-1：本函数同时是 open/exec 的策略求值入口（门禁 → `CAP_OWNER` 豁免
+/// → `AccessPolicy::evaluate`，判定序见函数文档）。r/w/x/readdir/
+/// unlink/chmod 的全矩阵接线仍是 A1-3 项（见 `check_access` 规划）。
+/// open/exec 强制点（A1-1 / ADR-040 §2.1+§2.6）。
+///
+/// 判定序（成文）：
+/// 1. **系统门禁**（wire bit9，原 `system_only` 语义迁址）：置位且无
+///    `CAP_SYSTEM` → [`Error::PermissionDenied`]（CAP_OWNER 不豁免门禁——
+///    门禁是系统完整性边界，不是文件属主权）。
+/// 2. **`CAP_OWNER` 绕过**（ADR-040 §2.6，DAC_OVERRIDE 对应物）：持有者
+///    在策略求值前直接放行。
+/// 3. **策略求值**：节点 [`vfs::inode::AccessPolicy`] 对 `required` 位集
+///    求值（唯一算法，见 `AccessPolicy::evaluate`）。
 fn enforce_open_permission(
     identity: ProcessIdentity,
     inode: &alloc::sync::Arc<dyn vfs::inode::INode>,
+    required: vfs::inode::PermBits,
 ) -> Result<(), Error> {
     let meta = inode.metadata()?;
-    if meta.permissions.system_only && !identity.caps.contains(Caps::SYSTEM) {
+    if meta.permissions.gate_system() && !identity.caps.contains(Caps::SYSTEM) {
         return Err(Error::PermissionDenied);
     }
-    Ok(())
+    if identity.caps.contains(Caps::OWNER) {
+        return Ok(());
+    }
+    policy_allows(&identity, &meta.permissions, required)
+}
+
+/// A1-1：`ProcessIdentity` → vfs `Subject` 视图借用转换（`Groups::iter`
+/// 零拷贝收集；依赖方向 task→vfs，vfs 不得反向依赖，见 Subject 文档）。
+/// 调用点均为 syscall 入口（非热路径），收集分配如实付出。
+fn policy_allows(
+    identity: &ProcessIdentity,
+    policy: &vfs::inode::AccessPolicy,
+    required: vfs::inode::PermBits,
+) -> Result<(), Error> {
+    let groups: alloc::vec::Vec<u32> = identity.groups.iter().collect();
+    let subject = vfs::inode::Subject {
+        uid: identity.uid,
+        gid: identity.gid,
+        groups: &groups,
+    };
+    policy.evaluate(&subject, required)
 }
 
 /// `open(path_ptr, flags_bits, perm_bits)`：打开或创建文件，返回 fd。
@@ -540,7 +572,8 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
     };
 
     let flags = vfs::file_handle::OpenFlags::from_bits(flags_bits);
-    let perm = vfs::inode::Permissions::from_bits(perm_bits);
+    // A1-1：wire 位集 → AccessPolicy（兼容映射见 from_wire；创建用）。
+    let perm = vfs::inode::AccessPolicy::from_wire(perm_bits);
 
     // ADR-014 FLAG_PIPE：匿名管道，不落文件系统。路径须为空（"" 或 "/"）。
     if flags.pipe {
@@ -555,17 +588,14 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
 
     let root = crate::vfs_init::root();
 
-    // A1-2 / ADR-040 §2.3（承 ADR-033 V7 fix）：创建授权——无 CAP_SYSTEM 的进程
-    // 不得创建系统门禁节点（策略位 bit3）。否则 PermissionDenied，
-    // 杜绝"低权进程自建系统门禁节点后经强制打开被拒"的边界漏洞。
-    if flags.create && perm.system_only {
-        let creator = current_proc_mut()
-            .map(|p| p.identity())
-            .unwrap_or_else(ProcessIdentity::default_user);
-        if !creator.caps.contains(Caps::SYSTEM) {
-            return pack_err(Error::PermissionDenied);
-        }
-    }
+    // A1-1：创建属主 = 创建者（POSIX 语义；wire 只传 mode，杜绝"冒充他人
+    // 属主创建"）。旧"User 不得创建 system_only 节点"创建门禁随 system_only
+    // 位移除而删除——门禁位现走 bit9，创建路径不再接收门禁语义（A1-3 起由
+    // 父目录 Write + chown 通道重建系统节点的受控创建）。无当前进程时以
+    // 默认身份 (0,0) 创建（内核启动期路径）。
+    let creator = current_proc_mut()
+        .map(|p| p.identity())
+        .unwrap_or_else(ProcessIdentity::default_user);
 
     let inode = match root.resolve(&path, true) {
         Ok(n) => {
@@ -583,20 +613,31 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
             }
             n
         }
-        Err(Error::NotFound) if flags.create => match root.create_file(&path, perm) {
-            Ok(n) => n,
-            Err(e) => return pack_err(e),
-        },
+        Err(Error::NotFound) if flags.create => {
+            match root.create_file(&path, perm.classic_mode(), (creator.uid, creator.gid))
+            {
+                Ok(n) => n,
+                Err(e) => return pack_err(e),
+            }
+        }
         Err(e) => return pack_err(e),
     };
 
-    // A1-2 / ADR-040：权限强制（系统门禁节点仅 CAP_SYSTEM 可开）。
+    // A1-1 / ADR-040：open 强制 = 门禁 + CAP_OWNER 豁免 + 策略求值。
+    // required 由 open 位（S15 语义归调用者声明，读=Read/写=Write）。
     // 无当前进程时回退默认身份（无能力，拒绝最严）。inode 已解析、句柄未构造，
     // 为最低成本的拒绝点。
+    let mut required = vfs::inode::PermBits::empty();
+    if flags.read {
+        required = required.union(vfs::inode::PermBits::READ);
+    }
+    if flags.write {
+        required = required.union(vfs::inode::PermBits::WRITE);
+    }
     let identity = current_proc_mut()
         .map(|p| p.identity())
         .unwrap_or_else(ProcessIdentity::default_user);
-    if let Err(e) = enforce_open_permission(identity, &inode) {
+    if let Err(e) = enforce_open_permission(identity, &inode, required) {
         return pack_err(e);
     }
 
@@ -823,7 +864,13 @@ fn sys_entry_create(frame: &mut SyscallFrame) -> u64 {
         Ok(p) => p,
         Err(e) => return pack_err(e),
     };
-    let perm = vfs::inode::Permissions::from_bits(perm_bits);
+    // A1-1：wire 位集 → classic mode（from_wire 兼容映射统一入口）。
+    // 创建属主 = 当前进程身份（POSIX 语义；内核启动期回退默认 (0,0)）。
+    let mode = vfs::inode::AccessPolicy::from_wire(perm_bits).classic_mode();
+    let creator = current_proc_mut()
+        .map(|p| p.identity())
+        .unwrap_or_else(ProcessIdentity::default_user);
+    let owner = (creator.uid, creator.gid);
     // 相对路径与进程 cwd 拼接（VFS 只接受绝对路径）。
     let path = match absolute_path(&path) {
         Ok(a) => a,
@@ -831,11 +878,11 @@ fn sys_entry_create(frame: &mut SyscallFrame) -> u64 {
     };
     let root = crate::vfs_init::root();
     match kind {
-        crate::syscall::ENTRY_KIND_DIRECTORY => match root.mkdir(&path, perm) {
+        crate::syscall::ENTRY_KIND_DIRECTORY => match root.mkdir(&path, mode, owner) {
             Ok(_) => pack_ok(0),
             Err(e) => pack_err(e),
         },
-        crate::syscall::ENTRY_KIND_FILE => match root.create_file(&path, perm) {
+        crate::syscall::ENTRY_KIND_FILE => match root.create_file(&path, mode, owner) {
             Ok(_) => pack_ok(0),
             Err(e) => pack_err(e),
         },
@@ -906,7 +953,7 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
                 Err(e) => pack_err(e),
             }
         }
-        // chmod：a4=1，a1=path, a2=mode_bits（`Permissions::to_bits` 编码）。
+        // chmod：a4=1，a1=path, a2=mode_bits（A1-1：classic 9 位 + 门禁 bit9）。
         ENTRY_UPDATE_CHMOD => {
             let path_ptr = frame.a1;
             let mode_bits = frame.a2 as u32;
@@ -918,13 +965,14 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
                 Ok(a) => a,
                 Err(e) => return pack_err(e),
             };
-            let perm = vfs::inode::Permissions::from_bits(mode_bits);
+            // A1-1：wire 位集 → 策略本体（整体替换语义见 set_permissions 文档）。
+            let policy = vfs::inode::AccessPolicy::from_wire(mode_bits);
             let root = crate::vfs_init::root();
             let node = match root.resolve(&path, false) {
                 Ok(n) => n,
                 Err(e) => return pack_err(e),
             };
-            match node.set_permissions(perm) {
+            match node.set_permissions(&policy) {
                 Ok(()) => pack_ok(0),
                 Err(e) => pack_err(e),
             }
@@ -1715,12 +1763,16 @@ fn sys_exec(frame: &mut SyscallFrame) -> u64 {
             };
             match root.resolve(&path, true) {
                 Ok(inode) => {
-                    // A1 / ADR-033：执行前强制——system_only 可执行文件仅
-                    // System 特权进程可装载。
+                    // A1-1 / ADR-040：执行前强制——门禁位（原 system_only）
+                    // + CAP_OWNER 豁免 + 策略求值（required = Execute）。
                     let identity = current_proc_mut()
                         .map(|p| p.identity())
                         .unwrap_or_else(ProcessIdentity::default_user);
-                    if let Err(e) = enforce_open_permission(identity, &inode) {
+                    if let Err(e) = enforce_open_permission(
+                        identity,
+                        &inode,
+                        vfs::inode::PermBits::EXECUTE,
+                    ) {
                         return pack_err(e);
                     }
                     let meta = match inode.metadata() {

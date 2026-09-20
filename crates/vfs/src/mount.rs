@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use klib::error::Error;
 use spin::RwLock;
 
-use crate::inode::{FileSystem, INode, INodeType, Permissions};
+use crate::inode::{AccessPolicy, FileSystem, INode, INodeType};
 use crate::path::Path;
 
 /// 最大符号链接跳转深度（防死循环）。
@@ -169,7 +169,7 @@ impl MountTable {
     /// [`validate_name`] 校验，故不再重复校验。
     fn mount_named(&self, base: String, fs: Arc<dyn FileSystem>) -> Result<String, Error> {
         // 创建首个候选挂载点目录（占用时多建几个空目录无害，最终以 mounts 键为准）。
-        if let Err(e) = self.mkdir(&base, Permissions::all()) {
+        if let Err(e) = self.mkdir(&base, 0o777, (0, 0)) {
             match e {
                 // 目录已存在（普通目录或占用前已建）——允许。
                 Error::AlreadyExists => {}
@@ -199,7 +199,7 @@ impl MountTable {
                     }
                 }
                 Err(Error::NotFound) => {
-                    self.mkdir(&candidate, Permissions::all())?;
+                    self.mkdir(&candidate, 0o777, (0, 0))?;
                 }
                 Err(e) => return Err(e),
             }
@@ -331,19 +331,22 @@ impl MountTable {
     }
 
     /// 在指定路径创建普通文件（如果不存在）。
-    pub fn create_file(&self, path_str: &str, perm: Permissions) -> Result<Arc<dyn INode>, Error> {
+    ///
+    /// A1-1：`mode` 为 classic 9 位；`owner` 为创建者 (uid, gid)——POSIX 创建
+    /// 语义（属主=创建者）由调用方（kernel 强制层/A1-3 单点）保证。
+    pub fn create_file(&self, path_str: &str, mode: u32, owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         let (parent_path, file_name) = Self::split_entry(path_str)?;
         validate_name(&file_name)?;
         let parent_node = self.resolve(&parent_path, true)?;
-        parent_node.create(&file_name, perm)
+        parent_node.create(&file_name, mode, owner)
     }
 
-    /// 在指定路径创建目录。
-    pub fn mkdir(&self, path_str: &str, perm: Permissions) -> Result<Arc<dyn INode>, Error> {
+    /// 在指定路径创建目录（属主语义同 [`Self::create_file`]）。
+    pub fn mkdir(&self, path_str: &str, mode: u32, owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         let (parent_path, dir_name) = Self::split_entry(path_str)?;
         validate_name(&dir_name)?;
         let parent_node = self.resolve(&parent_path, true)?;
-        parent_node.mkdir(&dir_name, perm)
+        parent_node.mkdir(&dir_name, mode, owner)
     }
 
     /// 删除指定路径的节点。

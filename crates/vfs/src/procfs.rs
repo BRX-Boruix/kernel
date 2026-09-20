@@ -11,7 +11,7 @@ use klib::error::Error;
 use klib::json::{JsonWriter, VecTarget};
 
 use crate::dynamic::{DynamicDirNode, DynamicFileNode};
-use crate::inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
+use crate::inode::{AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
 
 /// 进程状态快照信息结构体。
 #[derive(Clone, Debug)]
@@ -34,14 +34,14 @@ pub trait ProcessInfoProvider: Send + Sync {
 /// ProcFS 根目录节点。
 pub struct ProcRootNode {
     provider: Arc<dyn ProcessInfoProvider>,
-    perms: Permissions,
+    perms: AccessPolicy,
 }
 
 impl ProcRootNode {
     pub fn new(provider: Arc<dyn ProcessInfoProvider>) -> Self {
         Self {
             provider,
-            perms: Permissions::all(),
+            perms: AccessPolicy::all(),
         }
     }
 }
@@ -59,7 +59,7 @@ impl INode for ProcRootNode {
         Ok(FileMetadata {
             size: 0,
             node_type: INodeType::Directory,
-            permissions: self.perms,
+            permissions: self.perms.clone(),
             created_time: 0,
             modified_time: 0,
             changed_time: 0,
@@ -154,11 +154,11 @@ impl INode for ProcRootNode {
         Err(Error::NotFound)
     }
 
-    fn create(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn create(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::PermissionDenied)
     }
 
-    fn mkdir(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn mkdir(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::PermissionDenied)
     }
 

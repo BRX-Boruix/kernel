@@ -25,7 +25,7 @@ use klib::error::Error;
 use klib::json::{JsonWriter, VecTarget};
 
 use crate::dynamic::{DynamicDirNode, DynamicFileNode};
-use crate::inode::{DirEntry, FileMetadata, INode, INodeType, Permissions};
+use crate::inode::{AccessPolicy, DirEntry, FileMetadata, INode, INodeType};
 
 /// PCM ring 缓冲容量（字节）。
 ///
@@ -704,7 +704,7 @@ impl INode for DspNode {
         Ok(FileMetadata {
             size: 0,
             node_type: INodeType::CharacterDevice,
-            permissions: Permissions::read_write(),
+            permissions: AccessPolicy::read_write(),
             created_time: 0,
             modified_time: 0,
             changed_time: 0,
@@ -748,11 +748,11 @@ impl INode for DspNode {
         self.children.lookup(name)
     }
 
-    fn create(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn create(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::PermissionDenied)
     }
 
-    fn mkdir(&self, _name: &str, _permissions: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn mkdir(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         Err(Error::PermissionDenied)
     }
 

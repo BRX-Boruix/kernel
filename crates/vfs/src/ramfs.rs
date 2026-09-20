@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use klib::error::Error;
 use spin::RwLock;
 
-use crate::inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
+use crate::inode::{AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
 
 /// 单文件最大字节数（KA7/S33 量化：RamFS 内容驻留内核堆，单进程经
 /// SYS_ENTRY_WRITE 循环扩写即可无界吃堆——8MiB 覆盖全部现存用户程序与
@@ -115,7 +115,7 @@ pub struct RamINode {
 }
 
 impl RamINode {
-    pub fn new_file(perm: Permissions) -> Arc<Self> {
+    pub fn new_file(policy: AccessPolicy) -> Arc<Self> {
         // A3（ADR-023 §7）：RamFS 是有出生时刻的真实存储，三时间戳取
         // 单调钟真值；无状态视图节点（procfs/devfs/dynamic/stdio）的恒 0
         // 政策见 crate::inode 模块注释。
@@ -125,7 +125,7 @@ impl RamINode {
             meta: RwLock::new(FileMetadata {
                 node_type: INodeType::RegularFile,
                 size: 0,
-                permissions: perm,
+                permissions: policy,
                 created_time: now,
                 modified_time: now,
                 changed_time: now,
@@ -136,14 +136,14 @@ impl RamINode {
         })
     }
 
-    pub fn new_dir(perm: Permissions) -> Arc<Self> {
+    pub fn new_dir(policy: AccessPolicy) -> Arc<Self> {
         let now = now_ms();
         Arc::new(Self {
             id: alloc_node_id(),
             meta: RwLock::new(FileMetadata {
                 node_type: INodeType::Directory,
                 size: 0,
-                permissions: perm,
+                permissions: policy,
                 created_time: now,
                 modified_time: now,
                 changed_time: now,
@@ -161,7 +161,7 @@ impl RamINode {
             meta: RwLock::new(FileMetadata {
                 node_type: INodeType::Symlink,
                 size: target.len() as u64,
-                permissions: Permissions::all(),
+                permissions: AccessPolicy::all(),
                 created_time: now,
                 modified_time: now,
                 changed_time: now,
@@ -296,7 +296,7 @@ impl INode for RamINode {
         }
     }
 
-    fn create(&self, name: &str, perm: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn create(&self, name: &str, mode: u32, owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         match &self.data {
             RamNodeData::Directory { children } => {
                 let mut c = children.write();
@@ -307,7 +307,7 @@ impl INode for RamINode {
                 if c.len() >= RAMFS_MAX_ENTRIES_PER_DIR {
                     return Err(Error::NoSpace);
                 }
-                let file = RamINode::new_file(perm);
+                let file = RamINode::new_file(AccessPolicy::from_classic_owned(mode, owner.0, owner.1));
                 c.insert(name.to_string(), file.clone());
                 drop(c);
                 self.touch_dir_meta();
@@ -317,7 +317,7 @@ impl INode for RamINode {
         }
     }
 
-    fn mkdir(&self, name: &str, perm: Permissions) -> Result<Arc<dyn INode>, Error> {
+    fn mkdir(&self, name: &str, mode: u32, owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
         match &self.data {
             RamNodeData::Directory { children } => {
                 let mut c = children.write();
@@ -327,7 +327,7 @@ impl INode for RamINode {
                 if c.len() >= RAMFS_MAX_ENTRIES_PER_DIR {
                     return Err(Error::NoSpace);
                 }
-                let dir = RamINode::new_dir(perm);
+                let dir = RamINode::new_dir(AccessPolicy::from_classic_owned(mode, owner.0, owner.1));
                 c.insert(name.to_string(), dir.clone());
                 drop(c);
                 self.touch_dir_meta();
@@ -386,10 +386,11 @@ impl INode for RamINode {
         }
     }
 
-    /// 设置节点权限（chmod 原语）：写回 meta.permissions 并刷新 changed时间。
-    fn set_permissions(&self, perms: Permissions) -> Result<(), Error> {
+    /// 设置节点权限（chmod 原语，A1-1）：整体替换 AccessPolicy（wire chmod
+    /// 只携带 classic 位集，无 ACE 通道——见 trait 文档）并刷新 changed 时间。
+    fn set_permissions(&self, policy: &AccessPolicy) -> Result<(), Error> {
         let mut meta = self.meta.write();
-        meta.permissions = perms;
+        meta.permissions = policy.clone();
         meta.changed_time = now_ms();
         Ok(())
     }
@@ -449,7 +450,7 @@ pub struct RamFS {
 impl RamFS {
     pub fn new() -> Self {
         Self {
-            root: RamINode::new_dir(Permissions::all()),
+            root: RamINode::new_dir(AccessPolicy::all()),
         }
     }
 }

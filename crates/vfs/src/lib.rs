@@ -38,7 +38,10 @@ pub use file_handle::OpenHandle;
 pub use file_handle::SeekWhence;
 pub use flock::{LockMode, LockOwner};
 pub use huge_page_cache::{HugeCacheStats, HugePageDirectCache};
-pub use inode::{DirEntry, FileMetadata, FileSystem, INode, INodeType, Permissions};
+pub use inode::{
+    AccessPolicy, Ace, DirEntry, FileMetadata, FileSystem, GATE_SYSTEM_BIT, INode, INodeType,
+    PermBits, Principal, Subject,
+};
 pub use mount::MountTable;
 pub use page_cache::{
     set_global_page_cache, HUGE_PAGE_SIZE, PAGE_SIZE, PageCache, PageCacheStats,
@@ -53,7 +56,7 @@ pub use sysfs::{SysFS, SystemInfoProvider};
 mod tests {
     use super::*;
     use crate::file_handle::{FileHandle, OpenFlags, SeekWhence};
-    use crate::inode::{INodeType, Permissions};
+    use crate::inode::{AccessPolicy, Ace, GATE_SYSTEM_BIT, INodeType, PermBits, Principal, Subject};
     use crate::mount::MountTable;
     use crate::path::Path;
     use crate::ramfs::RamFS;
@@ -77,15 +80,15 @@ mod tests {
 
         // 创建目录
         mount_table
-            .mkdir("/config", Permissions::all())
+            .mkdir("/config", 0o777, (0, 0))
             .expect("mkdir");
         mount_table
-            .mkdir("/programs", Permissions::all())
+            .mkdir("/programs", 0o777, (0, 0))
             .expect("mkdir");
 
         // 创建文件
         let file = mount_table
-            .create_file("/config/system.toml", Permissions::read_write())
+            .create_file("/config/system.toml", 0o666, (0, 0))
             .expect("create");
         assert_eq!(file.metadata().unwrap().node_type, INodeType::RegularFile);
 
@@ -128,12 +131,12 @@ mod tests {
         let ramfs_root = Arc::new(RamFS::new());
         let mount_table = MountTable::new(ramfs_root);
 
-        mount_table.mkdir("/users", Permissions::all()).unwrap();
+        mount_table.mkdir("/users", 0o777, (0, 0)).unwrap();
         mount_table
-            .mkdir("/users/aixiaoji", Permissions::all())
+            .mkdir("/users/aixiaoji", 0o777, (0, 0))
             .unwrap();
         mount_table
-            .create_file("/users/aixiaoji/notes.txt", Permissions::all())
+            .create_file("/users/aixiaoji/notes.txt", 0o777, (0, 0))
             .unwrap();
 
         // 创建软链接
@@ -150,14 +153,14 @@ mod tests {
 
         // 挂载独立子文件系统到 /volumes/data（A6：挂载目标必须已存在
         // 且为目录——mount(2) 同款语义，杜绝"挂上即不可达"的幽灵项）
-        mount_table.mkdir("/volumes", Permissions::all()).unwrap();
-        mount_table.mkdir("/volumes/data", Permissions::all()).unwrap();
+        mount_table.mkdir("/volumes", 0o777, (0, 0)).unwrap();
+        mount_table.mkdir("/volumes/data", 0o777, (0, 0)).unwrap();
         let data_ramfs = Arc::new(RamFS::new());
         mount_table.mount("/volumes/data", data_ramfs).unwrap();
 
         // 在挂载的文件系统上创建文件
         mount_table
-            .create_file("/volumes/data/project.rs", Permissions::all())
+            .create_file("/volumes/data/project.rs", 0o777, (0, 0))
             .unwrap();
         let proj_file = mount_table
             .resolve("/volumes/data/project.rs", true)
@@ -173,9 +176,9 @@ mod tests {
         let ramfs = Arc::new(RamFS::new());
         let mount_table = MountTable::new(ramfs);
 
-        mount_table.mkdir("/testdir", Permissions::all()).unwrap();
+        mount_table.mkdir("/testdir", 0o777, (0, 0)).unwrap();
         mount_table
-            .create_file("/testdir/file1", Permissions::all())
+            .create_file("/testdir/file1", 0o777, (0, 0))
             .unwrap();
 
         // 试图删除非空目录应失败
@@ -305,10 +308,10 @@ mod tests {
         let ramfs_root = Arc::new(RamFS::new());
         let mount_table = MountTable::new(ramfs_root);
 
-        mount_table.mkdir("/processes", Permissions::all()).unwrap();
-        mount_table.mkdir("/system", Permissions::all()).unwrap();
-        mount_table.mkdir("/system/info", Permissions::all()).unwrap();
-        mount_table.mkdir("/devices", Permissions::all()).unwrap();
+        mount_table.mkdir("/processes", 0o777, (0, 0)).unwrap();
+        mount_table.mkdir("/system", 0o777, (0, 0)).unwrap();
+        mount_table.mkdir("/system/info", 0o777, (0, 0)).unwrap();
+        mount_table.mkdir("/devices", 0o777, (0, 0)).unwrap();
 
         // 1. ProcFS 挂载与 JSON 读取
         let procfs = Arc::new(ProcFS::new(Arc::new(MockProcessProvider)));
@@ -345,7 +348,7 @@ mod tests {
 
         // /system 本体仍是真实可写 RamFS：可容纳 swapfile 等运行时文件。
         mount_table
-            .create_file("/system/swapfile", Permissions::read_write())
+            .create_file("/system/swapfile", 0o666, (0, 0))
             .unwrap();
         let _swap = mount_table.resolve("/system/swapfile", true).unwrap();
         // SysFS 只读视图不应遮蔽 /system 的可写性：swapfile 存在而 info 视图同在。
@@ -517,10 +520,10 @@ mod tests {
     fn test_page_cache_2m_and_4k_eviction() {
         let ramfs = Arc::new(RamFS::new());
         let mount_table = Arc::new(MountTable::new(ramfs));
-        mount_table.mkdir("/programs", Permissions::all()).unwrap();
+        mount_table.mkdir("/programs", 0o777, (0, 0)).unwrap();
 
         let file = mount_table
-            .create_file("/programs/app.elf", Permissions::read_write())
+            .create_file("/programs/app.elf", 0o666, (0, 0))
             .unwrap();
 
         // 写入一段 2MB+ 的数据
@@ -587,8 +590,8 @@ mod tests {
     fn test_dotdot_does_not_traverse_dir_symlink() {
         let ramfs = Arc::new(RamFS::new());
         let mt = MountTable::new(ramfs);
-        mt.mkdir("/d", Permissions::read_write()).unwrap();
-        mt.create_file("/d/secret.txt", Permissions::read_write()).unwrap();
+        mt.mkdir("/d", 0o666, (0, 0)).unwrap();
+        mt.create_file("/d/secret.txt", 0o666, (0, 0)).unwrap();
         mt.symlink("/d", "/lnk").unwrap();
 
         assert_eq!(
@@ -607,9 +610,9 @@ mod tests {
     fn test_relative_symlink_dotdot_resolves_against_link_dir() {
         let ramfs = Arc::new(RamFS::new());
         let mt = MountTable::new(ramfs);
-        mt.mkdir("/sub", Permissions::read_write()).unwrap();
-        mt.create_file("/sub/data.txt", Permissions::read_write()).unwrap();
-        mt.create_file("/top.txt", Permissions::read_write()).unwrap();
+        mt.mkdir("/sub", 0o666, (0, 0)).unwrap();
+        mt.create_file("/sub/data.txt", 0o666, (0, 0)).unwrap();
+        mt.create_file("/top.txt", 0o666, (0, 0)).unwrap();
         // 链接体 "sub/../top.txt"：位于根，词法化后即 /top.txt。
         mt.symlink("sub/../top.txt", "/jump").unwrap();
 
@@ -632,13 +635,13 @@ mod tests {
     fn test_dotdot_skips_mount_point_lexically() {
         let root_fs = Arc::new(RamFS::new());
         let mt = MountTable::new(root_fs.clone());
-        mt.create_file("/escape.txt", Permissions::read_write()).unwrap();
-        mt.mkdir("/mnt", Permissions::read_write()).unwrap();
+        mt.create_file("/escape.txt", 0o666, (0, 0)).unwrap();
+        mt.mkdir("/mnt", 0o666, (0, 0)).unwrap();
 
         let child_fs = Arc::new(RamFS::new());
         child_fs
             .root()
-            .create("m.txt", Permissions::read_write())
+            .create("m.txt", 0o666, (0, 0))
             .unwrap();
         mt.mount("/mnt", child_fs).unwrap();
 
@@ -659,9 +662,9 @@ mod tests {
     fn test_symlink_chain_with_trailing_dotdot() {
         let ramfs = Arc::new(RamFS::new());
         let mt = MountTable::new(ramfs);
-        mt.mkdir("/r", Permissions::read_write()).unwrap();
-        mt.create_file("/r/deep.txt", Permissions::read_write()).unwrap();
-        mt.create_file("/deep2.txt", Permissions::read_write()).unwrap();
+        mt.mkdir("/r", 0o666, (0, 0)).unwrap();
+        mt.create_file("/r/deep.txt", 0o666, (0, 0)).unwrap();
+        mt.create_file("/deep2.txt", 0o666, (0, 0)).unwrap();
         mt.symlink("/r", "/q").unwrap();
         mt.symlink("/q", "/p").unwrap();
 
@@ -693,19 +696,19 @@ mod tests {
         let mt = MountTable::new(ramfs);
         for bad in ["a\u{1}b", "x\n", "\u{7f}", "tab\tchar"] {
             assert_eq!(
-                mt.create_file(bad, Permissions::read_write()).err(),
+                mt.create_file(bad, 0o666, (0, 0)).err(),
                 Some(Error::InvalidParam),
                 "control-char name {:?} must be rejected",
                 bad
             );
             assert_eq!(
-                mt.mkdir(bad, Permissions::read_write()).err(),
+                mt.mkdir(bad, 0o666, (0, 0)).err(),
                 Some(Error::InvalidParam)
             );
             assert_eq!(mt.unlink(bad).err(), Some(Error::InvalidParam));
         }
         // 合法名字不受影响（UTF-8 多字节、空格、点号均允许）。
-        mt.create_file("/数据 文件.v2.txt", Permissions::read_write()).unwrap();
+        mt.create_file("/数据 文件.v2.txt", 0o666, (0, 0)).unwrap();
     }
 
     /// vfs1 M1：MountTable 公共操作拒绝相对路径（显式 InvalidParam，
@@ -715,11 +718,11 @@ mod tests {
         let ramfs = Arc::new(RamFS::new());
         let mt = MountTable::new(ramfs);
         assert_eq!(
-            mt.create_file("relative.txt", Permissions::read_write()).err(),
+            mt.create_file("relative.txt", 0o666, (0, 0)).err(),
             Some(Error::InvalidParam)
         );
         assert_eq!(
-            mt.mkdir("rel/dir", Permissions::read_write()).err(),
+            mt.mkdir("rel/dir", 0o666, (0, 0)).err(),
             Some(Error::InvalidParam)
         );
         assert_eq!(mt.unlink("relative.txt").err(), Some(Error::InvalidParam));
@@ -747,13 +750,13 @@ mod tests {
             Some(Error::NotFound)
         );
         // 存在但是普通文件
-        mt.create_file("/plain.txt", Permissions::read_write()).unwrap();
+        mt.create_file("/plain.txt", 0o666, (0, 0)).unwrap();
         assert_eq!(
             mt.mount("/plain.txt", Arc::new(RamFS::new())).err(),
             Some(Error::NotDirectory)
         );
         // 合法目录成功
-        mt.mkdir("/ok", Permissions::read_write()).unwrap();
+        mt.mkdir("/ok", 0o666, (0, 0)).unwrap();
         assert!(mt.mount("/ok", Arc::new(RamFS::new())).is_ok());
     }
 
@@ -762,12 +765,12 @@ mod tests {
     fn test_rename_same_dir_semantics() {
         let root_fs = Arc::new(RamFS::new());
         let mt = MountTable::new(root_fs.clone());
-        mt.create_file("/a.txt", Permissions::read_write()).unwrap();
+        mt.create_file("/a.txt", 0o666, (0, 0)).unwrap();
         // 同目录重命名成功，内容保 inode 身份（读写经旧名关闭后新名可达）。
         mt.rename("/a.txt", "/b.txt").expect("rename within dir");
         assert!(mt.resolve("/a.txt", true).is_err(), "old name gone");
         assert_eq!(
-            mt.create_file("/b.txt", Permissions::read_write()).err(),
+            mt.create_file("/b.txt", 0o666, (0, 0)).err(),
             Some(Error::AlreadyExists)
         );
         assert!(mt.resolve("/b.txt", true).is_ok(), "new name reachable");
@@ -777,7 +780,7 @@ mod tests {
             Some(Error::NotFound)
         );
         // 目标已存在 → AlreadyExists（绝不静默覆盖）。
-        mt.create_file("/d.txt", Permissions::read_write()).unwrap();
+        mt.create_file("/d.txt", 0o666, (0, 0)).unwrap();
         assert_eq!(
             mt.rename("/b.txt", "/d.txt").err(),
             Some(Error::AlreadyExists)
@@ -786,9 +789,9 @@ mod tests {
         assert_eq!(mt.rename("b.txt", "/e.txt").err(), Some(Error::InvalidParam));
         assert_eq!(mt.rename("/b.txt", "e.txt").err(), Some(Error::InvalidParam));
         // 跨目录 → NotSupported（宁缺毋假，跨 FS 移动未实现）。
-        mt.mkdir("/dir1", Permissions::read_write()).unwrap();
-        mt.mkdir("/dir2", Permissions::read_write()).unwrap();
-        mt.create_file("/dir1/x.txt", Permissions::read_write()).unwrap();
+        mt.mkdir("/dir1", 0o666, (0, 0)).unwrap();
+        mt.mkdir("/dir2", 0o666, (0, 0)).unwrap();
+        mt.create_file("/dir1/x.txt", 0o666, (0, 0)).unwrap();
         assert_eq!(
             mt.rename("/dir1/x.txt", "/dir2/x.txt").err(),
             Some(Error::NotSupported)
@@ -800,14 +803,14 @@ mod tests {
     fn test_unlink_blocked_while_mounted() {
         let root_fs = Arc::new(RamFS::new());
         let mt = MountTable::new(root_fs.clone());
-        mt.mkdir("/mnt", Permissions::read_write()).unwrap();
+        mt.mkdir("/mnt", 0o666, (0, 0)).unwrap();
         mt.mount("/mnt", Arc::new(RamFS::new())).unwrap();
 
         assert_eq!(mt.unlink("/mnt").err(), Some(Error::Busy));
 
         // 祖先目录同理：删除 "/" 之下的直接祖先会孤儿化挂载键。
-        mt.mkdir("/anc", Permissions::read_write()).unwrap();
-        mt.mkdir("/anc/deep", Permissions::read_write()).unwrap();
+        mt.mkdir("/anc", 0o666, (0, 0)).unwrap();
+        mt.mkdir("/anc/deep", 0o666, (0, 0)).unwrap();
         mt.unmount("/mnt").unwrap();
         mt.mount("/anc/deep", Arc::new(RamFS::new())).unwrap();
         assert_eq!(mt.unlink("/anc").err(), Some(Error::Busy));
@@ -827,7 +830,7 @@ mod tests {
         let mt = MountTable::new(ramfs.clone());
         let path = "/log.txt";
         {
-            let f = mt.create_file(path, Permissions::read_write()).unwrap();
+            let f = mt.create_file(path, 0o666, (0, 0)).unwrap();
             f.write_at(0, b"abc").unwrap();
         }
         {
@@ -879,7 +882,7 @@ mod tests {
         let ramfs = Arc::new(RamFS::new());
         let mt = MountTable::new(ramfs);
         let node = mt
-            .create_file("/coh.txt", Permissions::read_write())
+            .create_file("/coh.txt", 0o666, (0, 0))
             .unwrap();
         let h = crate::file_handle::FileHandle::new(
             node.clone(),
@@ -909,8 +912,8 @@ mod tests {
     fn test_page_cache_two_files_same_offset_isolated() {
         let ramfs = Arc::new(RamFS::new());
         let mt = MountTable::new(ramfs);
-        let a = mt.create_file("/A.bin", Permissions::read_write()).unwrap();
-        let b = mt.create_file("/B.bin", Permissions::read_write()).unwrap();
+        let a = mt.create_file("/A.bin", 0o666, (0, 0)).unwrap();
+        let b = mt.create_file("/B.bin", 0o666, (0, 0)).unwrap();
         a.write_at(0, &[0xAA; 128]).unwrap();
         b.write_at(0, &[0xBB; 128]).unwrap();
 
@@ -951,7 +954,7 @@ mod tests {
         let ramfs = Arc::new(RamFS::new());
         let mt = MountTable::new(ramfs.clone());
         let node = mt
-            .create_file("/big.bin", Permissions::read_write())
+            .create_file("/big.bin", 0o666, (0, 0))
             .unwrap();
         let payload: alloc::vec::Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         node.write_at(0, &payload).unwrap();
@@ -978,7 +981,7 @@ mod tests {
     fn test_mount_shadow_impossible_and_unmount_fallback() {
         let root_fs = Arc::new(RamFS::new());
         let mt = MountTable::new(root_fs.clone());
-        mt.mkdir("/mnt", Permissions::read_write()).unwrap();
+        mt.mkdir("/mnt", 0o666, (0, 0)).unwrap();
         mt.mount("/mnt", Arc::new(RamFS::new())).unwrap();
         // 同前缀二次挂载被拒——"谁遮蔽谁"的歧义从未产生。
         assert_eq!(
@@ -988,7 +991,7 @@ mod tests {
 
         let a = Arc::new(RamFS::new());
         a.root()
-            .create("marker.txt", Permissions::read_write())
+            .create("marker.txt", 0o666, (0, 0))
             .unwrap();
         mt.unmount("/mnt").unwrap();
         mt.mount("/mnt", a).unwrap();
@@ -1005,7 +1008,7 @@ mod tests {
         let ramfs = Arc::new(RamFS::new());
         let mt = MountTable::new(ramfs.clone());
         let node = mt
-            .create_file("/race.bin", Permissions::read_write())
+            .create_file("/race.bin", 0o666, (0, 0))
             .unwrap();
 
         let workers: alloc::vec::Vec<_> = (0u64..4)
@@ -1028,7 +1031,7 @@ mod tests {
     #[test]
     fn test_audio_dsp_pipe() {
         let mt = MountTable::new(Arc::new(RamFS::new()));
-        mt.mkdir("/devices", Permissions::all()).unwrap();
+        mt.mkdir("/devices", 0o777, (0, 0)).unwrap();
         let devfs = Arc::new(DevFS::new(Arc::new(MockDeviceProvider {
             baud: core::sync::atomic::AtomicU32::new(115200),
         })));
@@ -1061,7 +1064,7 @@ mod tests {
     #[test]
     fn test_audio_dsp_attrs() {
         let mt = MountTable::new(Arc::new(RamFS::new()));
-        mt.mkdir("/devices", Permissions::all()).unwrap();
+        mt.mkdir("/devices", 0o777, (0, 0)).unwrap();
         let devfs = Arc::new(DevFS::new(Arc::new(MockDeviceProvider {
             baud: core::sync::atomic::AtomicU32::new(115200),
         })));
@@ -1108,7 +1111,7 @@ mod tests {
     #[test]
     fn test_audio_stream_accepts_input_rates_but_dsp_does_not() {
         let mt = MountTable::new(Arc::new(RamFS::new()));
-        mt.mkdir("/devices", Permissions::all()).unwrap();
+        mt.mkdir("/devices", 0o777, (0, 0)).unwrap();
         let devfs = Arc::new(DevFS::new(Arc::new(MockDeviceProvider {
             baud: core::sync::atomic::AtomicU32::new(115200),
         })));
@@ -1607,5 +1610,158 @@ fn test_audio_dsp_backpressure() {
         let s2 = read_status(&node, &mut buf);
         assert!(s2.contains(r#""consumer":null"#), "{s2}");
     }
+    // ------------------------------------------------------------------
+
+    fn a11_ident(uid: u32, gid: u32) -> Subject<'static> {
+        Subject { uid, gid, groups: &[] }
+    }
+
+    /// classic mode 构造助手：三段同值（r=4/w=2/x=1 每段）。
+    fn a11_mode(r: bool, w: bool, x: bool) -> u32 {
+        let seg = (if r { 4 } else { 0 }) | (if w { 2 } else { 0 }) | (if x { 1 } else { 0 });
+        (seg << 6) | (seg << 3) | seg
+    }
+
+    #[test]
+    fn test_access_policy_rule1_first_match_decides() {
+        // 首匹配即决：deny 前置命中 owner 即停，隐式尾部的 allow 不再参与。
+        // from_classic/new 的属主过渡态是 (0,0)：owner 语义用 uid0 身份验证。
+        let policy = AccessPolicy::from_classic(0o777);
+        let ace = Ace { principal: Principal::Owner, allow: false, perms: PermBits::WRITE, inherit: false };
+        let deny_first = AccessPolicy::new(alloc::vec![ace], 0o777);
+        let owner = a11_ident(0, 1000);
+        assert_eq!(policy.evaluate(&owner, PermBits::WRITE), Ok(()), "classic 0777 owner 写放行");
+        assert_eq!(
+            deny_first.evaluate(&owner, PermBits::WRITE),
+            Err(Error::PermissionDenied),
+            "deny 前置：首匹配即决，不合并隐式尾部 allow"
+        );
+    }
+
+    #[test]
+    fn test_access_policy_rule1_hit_stops_scan() {
+        // 命中即停（§2.1）：首条匹配的显式 allow 短路后置 deny——隐式尾部在
+        // 全部显式 ACE 之后（§2.2），不存在"隐式 owner-allow 短路显式 deny"。
+        let policy = AccessPolicy::new(
+            alloc::vec![
+                Ace { principal: Principal::NamedUid(1000), allow: true, perms: PermBits::WRITE, inherit: false },
+                Ace { principal: Principal::Other, allow: false, perms: PermBits::WRITE, inherit: false },
+            ],
+            0o777,
+        );
+        let alice = a11_ident(1000, 1000);
+        assert_eq!(policy.evaluate(&alice, PermBits::WRITE), Ok(()), "首条 NamedUid allow 命中即停，Other deny 不再参与");
+        let stranger = a11_ident(2002, 2002);
+        assert_eq!(policy.evaluate(&stranger, PermBits::WRITE), Err(Error::PermissionDenied), "非 alice 落到 Other deny");
+    }
+
+    #[test]
+    fn test_access_policy_rule2_positional_deny_first() {
+        // 位置表达 deny 优先：两条 ACE 均匹配 owner，先 deny 后 allow → 拒绝。
+        let policy = AccessPolicy::new(
+            alloc::vec![
+                Ace { principal: Principal::Owner, allow: false, perms: PermBits::WRITE, inherit: false },
+                Ace { principal: Principal::Owner, allow: true, perms: PermBits::WRITE, inherit: false },
+            ],
+            0o777,
+        );
+        let owner = a11_ident(0, 0);
+        assert_eq!(policy.evaluate(&owner, PermBits::WRITE), Err(Error::PermissionDenied), "位置 deny 优先：先命中先决");
+    }
+
+    #[test]
+    fn test_access_policy_rule3_implicit_classic_0644() {
+        // 经典 0644（无显式 ACE）：owner rw / group r / other r —— 与 POSIX 一致。
+        // from_classic_owned 烙印真属主 (1000,1000)（A1-1 起构造器支持）。
+        let policy = AccessPolicy::from_classic_owned(0o644, 1000, 1000);
+        let owner = a11_ident(1000, 1000);
+        let peer = a11_ident(1001, 1000);
+        let stranger = a11_ident(2000, 2000);
+        assert_eq!(policy.evaluate(&owner, PermBits::READ.union(PermBits::WRITE)), Ok(()), "0644 owner 可读写");
+        assert_eq!(policy.evaluate(&peer, PermBits::READ), Ok(()), "0644 同组可读");
+        assert_eq!(policy.evaluate(&peer, PermBits::WRITE), Err(Error::PermissionDenied), "0644 同组不可写");
+        assert_eq!(policy.evaluate(&stranger, PermBits::READ), Ok(()), "0644 其他可读");
+        assert_eq!(policy.evaluate(&stranger, PermBits::WRITE), Err(Error::PermissionDenied), "0644 其他不可写");
+    }
+
+    #[test]
+    fn test_access_policy_rule3_implicit_classic_0700() {
+        // 经典 0700：group/other 全拒（隐式三条与 POSIX 一致）。
+        let policy = AccessPolicy::from_classic_owned(0o700, 1000, 1000);
+        let stranger = a11_ident(2000, 2000);
+        assert_eq!(policy.evaluate(&stranger, PermBits::READ), Err(Error::PermissionDenied), "0700 其他不可读");
+        assert_eq!(policy.evaluate(&stranger, PermBits::WRITE), Err(Error::PermissionDenied), "0700 其他不可写");
+        assert_eq!(policy.evaluate(&stranger, PermBits::EXECUTE), Err(Error::PermissionDenied), "0700 其他不可执行");
+        let owner = a11_ident(1000, 1000);
+        assert_eq!(policy.evaluate(&owner, PermBits::ALL), Ok(()), "0700 owner 全放行");
+    }
+
+    #[test]
+    fn test_access_policy_named_uid_gid_and_group_membership() {
+        // NamedUid/NamedGid 精确匹配 + 组成员身份（groups 集合包含即可）。
+        let policy = AccessPolicy::new(
+            alloc::vec![
+                Ace { principal: Principal::NamedUid(1001), allow: true, perms: PermBits::READ, inherit: false },
+                Ace { principal: Principal::NamedGid(2000), allow: true, perms: PermBits::READ, inherit: false },
+            ],
+            0,
+        );
+        let bob = a11_ident(1001, 1001);
+        assert_eq!(policy.evaluate(&bob, PermBits::READ), Ok(()), "NamedUid 精确命中");
+        assert_eq!(policy.evaluate(&bob, PermBits::WRITE), Err(Error::PermissionDenied), "ACE 只授 Read");
+        let group_member = Subject { uid: 3000, gid: 9, groups: &[2000] };
+        assert_eq!(policy.evaluate(&group_member, PermBits::READ), Ok(()), "NamedGid 经组成员命中");
+        let outsider = a11_ident(3000, 9);
+        assert_eq!(policy.evaluate(&outsider, PermBits::READ), Err(Error::PermissionDenied), "非成员落到隐式 other（mode 0000 全拒）");
+    }
+
+    #[test]
+    fn test_access_policy_other_principal_is_catch_all() {
+        // Other 是兜底 principal：显式 Other-ACE 优先于隐式三条。
+        let policy = AccessPolicy::new(
+            alloc::vec![Ace { principal: Principal::Other, allow: true, perms: PermBits::READ, inherit: false }],
+            a11_mode(true, false, false),
+        );
+        let stranger = a11_ident(4321, 4321);
+        assert_eq!(policy.evaluate(&stranger, PermBits::READ), Ok(()), "显式 Other 兜底放行");
+        assert_eq!(policy.evaluate(&stranger, PermBits::WRITE), Err(Error::PermissionDenied), "兜底只授 Read");
+    }
+
+    #[test]
+    fn test_access_policy_owner_semantics_by_uid_not_gid() {
+        // owner 判据是 uid；同 gid 不同 uid 命中 group 段而非 owner。
+        let policy = AccessPolicy::from_classic_owned(0o644, 1000, 1000);
+        let same_gid = Subject { uid: 1001, gid: 1000, groups: &[] };
+        // 0644 的组段只有 r：同组 WRITE 拒绝、READ 放行（命中 group 段的证明）。
+        assert_eq!(policy.evaluate(&same_gid, PermBits::WRITE), Err(Error::PermissionDenied), "同组命中 group 段（仅 r）");
+        assert_eq!(policy.evaluate(&same_gid, PermBits::READ), Ok(()), "同组可读（group 段命中）");
+        let outsider = a11_ident(3000, 9);
+        assert_eq!(policy.evaluate(&outsider, PermBits::WRITE), Err(Error::PermissionDenied), "非属主非同组 → other 段不可写");
+        let same_uid = a11_ident(1000, 9999);
+        assert_eq!(policy.evaluate(&same_uid, PermBits::WRITE), Ok(()), "uid 相同即 owner，gid 无关");
+    }
+
+    #[test]
+    fn test_access_policy_inherit_flag_roundtrip() {
+        // inherit 标志是存储语义位（目录新建继承），求值不解读它——如实往返。
+        let ace = Ace { principal: Principal::Owner, allow: false, perms: PermBits::WRITE, inherit: true };
+        assert!(ace.inherit, "inherit 标志往返保真");
+    }
+
+    #[test]
+    fn test_access_policy_wire_roundtrip() {
+        // wire：classic 9 位直通（不含门禁位），from_wire/to_wire 往返保真。
+        let p = AccessPolicy::from_wire(0o644);
+        assert_eq!(p.classic_mode(), 0o644, "wire 直通往返");
+        assert_eq!(p.to_wire() & !GATE_SYSTEM_BIT, 0o644, "wire 往返（屏蔽门禁位）");
+        let p2 = AccessPolicy::from_classic(0o640);
+        assert_eq!(p2.classic_mode(), 0o640, "classic 构造往返");
+    }
 }
 
+    // ------------------------------------------------------------------
+    // A1-1 / ADR-040 §2.1–§2.2：AccessPolicy 三规则 + 经典三段降级单测。
+    // 求值规则（§2.1 单点）：
+    //   1. 按序扫描 ACE 列表，第一条 principal 匹配调用者即决（Allow→放行，Deny→EACCES）；
+    //   2. 扫描完毕无匹配 → 末尾三条隐式 ACE（owner/group/other）。
+    // deny 优先由「有序 + 首匹配即决」的位置表达，不存在第二条判定路径。
