@@ -20,7 +20,7 @@ use klib::error::Error;
 use mm::user_space::{USER_BASE, USER_TOP, UserAccess};
 
 use task::{
-    current_proc_mut, Privilege, ProcessIdentity,
+    Caps, current_proc_mut, ProcessIdentity,
 };
 
 // ---------- 用户缓冲区资源边界（kernel1.md K7 / arch1.md AR1） ----------
@@ -502,22 +502,22 @@ fn sys_getcwd(frame: &mut SyscallFrame) -> u64 {
     pack_ok(cwd.len() as u64)
 }
 
-/// A1 / ADR-033：权限强制。
+/// A1-2 / ADR-040 §2.3：系统门禁强制（承 ADR-033 的 system_only 语义）。
 ///
 /// 在 `sys_open`（`resolve` 后、`FileHandle::new` 前）与 `sys_exec`（解析
-/// inode 后、装载前）调用。当前只强制 `system_only` 节点的特权门槛：
-/// `Permissions::system_only == true` 的节点仅 `Privilege::System` 进程
-/// 可打开/执行，其余身份返回 `Error::PermissionDenied`（EACCES）。
+/// inode 后、装载前）调用。策略位 bit3（`Permissions` wire 投影的
+/// `system_only` 位；A1-1 将把 `Permissions` 重构为 `AccessPolicy`）标记的
+/// **系统门禁节点**仅持 `CAP_SYSTEM` 的进程可打开/执行，其余身份返回
+/// `Error::PermissionDenied`（EACCES）。
 ///
-/// 诚实边界（PRE-3）：readable/writable/executable 的 owner 维度在多用户
-/// 立项前不做（ABI §4 单用户抹平）；本函数当前只比较 `system_only` 布尔 +
-/// 进程 `Privilege` 两档，无 owner/group/other 矩阵。
+/// 诚实边界（ADR-040 §3.4）：r/w/x 的 owner 维度强制属 A1-3（统一矩阵
+/// `check_access`）；本函数当前只比较系统门禁位 + `CAP_SYSTEM`。
 fn enforce_open_permission(
     identity: ProcessIdentity,
     inode: &alloc::sync::Arc<dyn vfs::inode::INode>,
 ) -> Result<(), Error> {
     let meta = inode.metadata()?;
-    if meta.permissions.system_only && identity.privilege != Privilege::System {
+    if meta.permissions.system_only && !identity.caps.contains(Caps::SYSTEM) {
         return Err(Error::PermissionDenied);
     }
     Ok(())
@@ -555,14 +555,14 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
 
     let root = crate::vfs_init::root();
 
-    // A1 / ADR-033 (V7 fix): 创建授权——User 进程不得创建 system_only=true 节点。
-    // 若创建时请求了 system_only 位，必须是 System 特权；否则 PermissionDenied，
-    // 杜绝"User 自建 system_only 节点后经强制打开被拒"的边界漏洞。
+    // A1-2 / ADR-040 §2.3（承 ADR-033 V7 fix）：创建授权——无 CAP_SYSTEM 的进程
+    // 不得创建系统门禁节点（策略位 bit3）。否则 PermissionDenied，
+    // 杜绝"低权进程自建系统门禁节点后经强制打开被拒"的边界漏洞。
     if flags.create && perm.system_only {
         let creator = current_proc_mut()
             .map(|p| p.identity())
             .unwrap_or_else(ProcessIdentity::default_user);
-        if creator.privilege != Privilege::System {
+        if !creator.caps.contains(Caps::SYSTEM) {
             return pack_err(Error::PermissionDenied);
         }
     }
@@ -590,8 +590,8 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
         Err(e) => return pack_err(e),
     };
 
-    // A1 / ADR-033：权限强制（system_only 节点仅 System 特权可开）。
-    // 无当前进程时回退 User（拒绝最严）。inode 已解析、句柄未构造，
+    // A1-2 / ADR-040：权限强制（系统门禁节点仅 CAP_SYSTEM 可开）。
+    // 无当前进程时回退默认身份（无能力，拒绝最严）。inode 已解析、句柄未构造，
     // 为最低成本的拒绝点。
     let identity = current_proc_mut()
         .map(|p| p.identity())
@@ -1493,9 +1493,9 @@ fn sys_audio_attach(frame: &mut SyscallFrame) -> u64 {
     let _ = frame;
     // 先做权限判定再解析节点：避免把"无权限"与"设备不存在"混为一谈，
     // 也避免让非特权调用者从返回码差异**探测**设备是否存在（信息泄露）。
-    if !current_is_system() {
+    if !current_has_cap(Caps::DEVICE) {
         let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
-        klib::info!("[audio] pid={} AUDIO_ATTACH denied (not Privilege::System)", pid);
+        klib::info!("[audio] pid={} AUDIO_ATTACH denied (no CAP_DEVICE)", pid);
         return pack_err(Error::PermissionDenied);
     }
     let node = match audio_dsp_node() {
@@ -1754,15 +1754,15 @@ pub const BUILTIN_INDEX_INIT: u64 = 0;
 /// 内建程序索引：shell。
 pub const BUILTIN_INDEX_SHELL: u64 = 1;
 
-/// A1 / ADR-033：计算派生子进程身份（单点决策，供 spawn_elf_image 与测试复用）。
+/// A1-2 / ADR-040（承 ADR-033）：计算派生子进程身份（单点决策，供 spawn_elf_image 与测试复用）。
 ///
-/// - `idx_or_tag == BUILTIN_INDEX_INIT`：仅 `System` 特权调用者可派生
-///   `System/uid=1` 子进程；`User` 调用者返回 `Err(PermissionDenied)`——
-///   防"任意 User 经 exec(0,..) 未认证提权"（V2）。
+/// - `idx_or_tag == BUILTIN_INDEX_INIT`：仅持 `CAP_SYSTEM` 的调用者可派生
+///   init 子进程（`uid=1` + 全能力）；无 `CAP_SYSTEM` 者返回
+///   `Err(PermissionDenied)`——防"任意进程经 exec(0,..) 未认证提权"（V2）。
 /// - 其余分支：原样继承调用者身份（caller 已由调用方解析为 current 或默认）。
 pub fn compute_child_identity(idx_or_tag: u64, caller: ProcessIdentity) -> Result<ProcessIdentity, Error> {
     if idx_or_tag == BUILTIN_INDEX_INIT {
-        if caller.privilege != Privilege::System {
+        if !caller.caps.contains(Caps::SYSTEM) {
             return Err(Error::PermissionDenied);
         }
         Ok(ProcessIdentity::system(1))
@@ -2337,7 +2337,7 @@ fn power_prepare_terminal() {
 
 /// `power_off()`（POWER 0x91）：请求 ACPI S5 软关机（整机断电）。
 ///
-/// 属**特权**操作：仅 `Privilege::System` 进程可发起，否则 `PermissionDenied`。
+/// 属**特权**操作：仅持 `CAP_SYSTEM` 的进程可发起，否则 `PermissionDenied`。
 /// S5 电源关停信息未就绪（无 PM1a / DSDT 无 `_S5`）时返回 `NotSupported`——
 /// 我们**绝不**在无凭据下猜测 SLP_TYP 写端口（宁缺毋假）。
 ///
@@ -2345,7 +2345,7 @@ fn power_prepare_terminal() {
 /// 断电后 CPU 停止）。故本条从不带现场回到调用进程。
 fn sys_power_off(_frame: &mut SyscallFrame) -> DispatchResult {
     let priv_ok = current_proc_mut()
-        .map(|p| p.identity().privilege == Privilege::System)
+        .map(|p| p.identity().caps.contains(Caps::SYSTEM))
         .unwrap_or(false);
     if !priv_ok {
         return done(pack_err(Error::PermissionDenied));
@@ -2365,12 +2365,12 @@ fn sys_power_off(_frame: &mut SyscallFrame) -> DispatchResult {
 
 /// `reboot()`（POWER 0x92）：请求系统复位重启。
 ///
-/// 属**特权**操作：仅 `Privilege::System` 进程可发起，否则 `PermissionDenied`。
+/// 属**特权**操作：仅持 `CAP_SYSTEM` 的进程可发起，否则 `PermissionDenied`。
 /// 走 ACPI reset 寄存器（若固件提供，QEMU 通常无）或 8042 快速复位（0x64←0xFE，
 /// QEMU/SeaBIOS 均支持）。终结路径：停其它核 → 触发复位（`reboot` 永不返回）。
 fn sys_reboot(_frame: &mut SyscallFrame) -> DispatchResult {
     let priv_ok = current_proc_mut()
-        .map(|p| p.identity().privilege == Privilege::System)
+        .map(|p| p.identity().caps.contains(Caps::SYSTEM))
         .unwrap_or(false);
     if !priv_ok {
         return done(pack_err(Error::PermissionDenied));
@@ -2571,21 +2571,25 @@ fn sys_signal_mask(frame: &mut SyscallFrame) -> u64 {
         Err(e) => pack_err(e),
     }
 }
-/// UIO/DEVICE 特权门禁（ADR-037 决策 5）：当前进程是否 `Privilege::System`。
+/// 特权门禁单点（A1-2 / ADR-040 §2.3，承 ADR-037 决策 5）：当前进程是否持有
+/// 指定能力位。
 ///
-/// `driver_register`/`driver_claim` 直接授予设备认领与 MMIO 映射（内核级权限），
-/// 非 System 一律 `PermissionDenied`。单点判定，供本族特权 syscall 复用（S13：
+/// `driver_register`/`driver_claim` 等直接授予设备认领与 MMIO 映射（内核级权限），
+/// 无对应能力一律 `PermissionDenied`。单点判定，供本族特权 syscall 复用（S13：
 /// 权限语义成文、不重复硬编码）。`driver_query`(读) / `driver_unregister`(释放自身
 /// 持有) 不授予 MMIO，故不在门禁内。
-fn current_is_system() -> bool {
+///
+/// 能力映射（ADR-040 §2.3 表）：设备认领/中断等待/AUDIO_ATTACH → `CAP_DEVICE`；
+/// DMA 缓冲（设备内存分配与**物理地址披露**）→ `CAP_MEMORY`。
+fn current_has_cap(cap: Caps) -> bool {
     current_proc_mut()
-        .map(|p| p.identity().privilege == Privilege::System)
+        .map(|p| p.identity().caps.contains(cap))
         .unwrap_or(false)
 }
 
 /// `driver_register(name_ptr, len) -> uio_id` (M11.1)
 fn sys_driver_register(frame: &mut SyscallFrame) -> u64 {
-    if !current_is_system() {
+    if !current_has_cap(Caps::DEVICE) {
         return pack_err(Error::PermissionDenied);
     }
     let name_ptr = frame.a1 as *const u8;
@@ -2624,7 +2628,7 @@ fn sys_driver_register(frame: &mut SyscallFrame) -> u64 {
 /// 设备未发布窗口（如无 MMIO BAR 的设备）→ NotSupported；窗口映射失败按
 /// mm 错误如实上抛。绝不以匿名内存伪装映射成功。
 fn sys_driver_claim(frame: &mut SyscallFrame) -> u64 {
-    if !current_is_system() {
+    if !current_has_cap(Caps::DEVICE) {
         return pack_err(Error::PermissionDenied);
     }
     let uio_id = frame.a1 as usize;
@@ -2987,7 +2991,7 @@ fn sys_driver_unregister(frame: &mut SyscallFrame) -> u64 {
 /// 时钟未就绪/超时注册失败：如实退化（见下）。
 fn sys_driver_irq_wait(frame: &mut SyscallFrame) -> DispatchResult {
     const MAX_WAIT_TIMEOUT_NS: u64 = 3_600_000_000_000; // 1h，同事件等待口径
-    if !current_is_system() {
+    if !current_has_cap(Caps::DEVICE) {
         return done(pack_err(Error::PermissionDenied));
     }
     let uio_id = frame.a1 as usize;
@@ -3068,7 +3072,7 @@ fn irq_wait_blocking(frame: &mut SyscallFrame, pid: usize, irq: u8, timeout_ns: 
 /// 0 或超 64MiB → InvalidParam；物理帧分配失败 → OutOfMemory（如实）；虚拟区/
 /// 额度不足 → NoSpace。返回 vaddr；驱动经 SYS_DRIVER_DMA_PHYS 取物理地址。
 fn sys_driver_dma_alloc(frame: &mut SyscallFrame) -> u64 {
-    if !current_is_system() {
+    if !current_has_cap(Caps::MEMORY) {
         return pack_err(Error::PermissionDenied);
     }
     let bytes = frame.a1;
@@ -3088,7 +3092,7 @@ fn sys_driver_dma_alloc(frame: &mut SyscallFrame) -> u64 {
 /// `driver_dma_phys(vaddr) -> phys`（DEVICE 0x5C，阶段二）：返回 DMA 缓冲基物理地址。
 /// vaddr 须为该进程某块 DMA 缓冲的起始；否则如实 NotFound（不泄露任意物理地址）。
 fn sys_driver_dma_phys(frame: &mut SyscallFrame) -> u64 {
-    if !current_is_system() {
+    if !current_has_cap(Caps::MEMORY) {
         return pack_err(Error::PermissionDenied);
     }
     let vaddr = frame.a1;
@@ -3104,7 +3108,7 @@ fn sys_driver_dma_phys(frame: &mut SyscallFrame) -> u64 {
 /// `driver_dma_free(vaddr) -> ()`（DEVICE 0x5B，阶段二）：释放一块 DMA 一致性缓冲。
 /// vaddr 须为该进程某块 DMA 缓冲的起始；非 DMA 区起点 → NotFound。
 fn sys_driver_dma_free(frame: &mut SyscallFrame) -> u64 {
-    if !current_is_system() {
+    if !current_has_cap(Caps::MEMORY) {
         return pack_err(Error::PermissionDenied);
     }
     let vaddr = frame.a1;

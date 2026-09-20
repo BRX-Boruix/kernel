@@ -44,13 +44,12 @@ use klib::sync::irq::{IrqSpinLock, IrqSpinLockGuard};
 use mm::user_space::UserAddressSpace;
 
 use crate::process::{
-    Process, ProcessIdentity, TaskState, clear_current_proc, set_current_proc, user_code_selector,
+    Caps, Process, ProcessIdentity, TaskState, clear_current_proc, set_current_proc, user_code_selector,
     user_data_selector, USER_RFLAGS,
 };
 use crate::signal::{DefaultAction, default_disposition};
 use crate::signals::SIGKILL;
 use crate::signal_set::NSIG;
-use crate::process::Privilege;
 
 /// PCB 内保存的进程名上限；与 shell/ELF 路径缓冲无关，超长名在创建时明确拒绝。
 const PROCESS_NAME_MAX: usize = 63;
@@ -3313,23 +3312,24 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
     if sig == 0 {
         return Ok(0); // 仅校验存在，不发送
     }
-    // S1-10：投递权限强制（ADR-034 §2.7，复用 ProcessIdentity）。
-    // User 不可向 System 投递终止类信号（default_disposition==Terminate）→
-    // PermissionDenied；System 可向任意投递。探活 sig==0 已在上方放行。
+    // S1-10 / A1-2：投递权限强制（ADR-034 §2.7 × ADR-040 §2.3 能力位改判）。
+    // 无 CAP_KILL 的调用者不可向特权进程（CAP_SYSTEM）投递终止类信号
+    // （default_disposition==Terminate）→ PermissionDenied；持 CAP_KILL 者
+    // 可向任意投递。探活 sig==0 已在上方放行。
     {
-        let sender_priv = match current {
+        let sender_can_kill = match current {
             Some(cur) => proc_bucket_lock(cur)
                 .get(&cur)
-                .map(|e| e.proc.identity().privilege)
-                .unwrap_or(Privilege::System),
-            None => Privilege::System, // 无当前进程（内核/驱动）视为 System
+                .map(|e| e.proc.identity().caps.contains(Caps::KILL))
+                .unwrap_or(true), // 无当前进程（内核/驱动）视为特权
+            None => true, // 内核/驱动上下文视为特权（与原 System 语义一致）
         };
-        let target_priv = proc_bucket_lock(target)
+        let target_privileged = proc_bucket_lock(target)
             .get(&target)
-            .map(|e| e.proc.identity().privilege)
-            .unwrap_or(Privilege::User);
-        if sender_priv == Privilege::User
-            && target_priv == Privilege::System
+            .map(|e| e.proc.identity().caps.contains(Caps::SYSTEM))
+            .unwrap_or(false);
+        if !sender_can_kill
+            && target_privileged
             && default_disposition(sig) == DefaultAction::Terminate
         {
             return Err(Error::PermissionDenied);

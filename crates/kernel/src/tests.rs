@@ -12526,9 +12526,10 @@ pub fn test_sync_syscalls() {
     info!("[test-sync] SYNC domain futex syscall semantics OK");
 }
 
-/// A1 / ADR-033：进程身份机制单测（默认身份 / set_identity 往返 / init 引导特权 / 继承决策）。
+/// A1-2 / ADR-040 §2.3/§2.4（承 ADR-033）：身份机制单测
+/// （默认身份 / set_identity 往返 / init 引导全能力 / 继承决策 / 能力位语义）。
 pub fn test_identity_inherit() {
-    use task::{Privilege, Process, ProcessIdentity};
+    use task::{Caps, Groups, Process, ProcessIdentity};
     use mm::user_space::UserAddressSpace;
     use arch_x86_64::paging::X86PageTable;
 
@@ -12553,26 +12554,41 @@ pub fn test_identity_inherit() {
     );
     info!("[test-identity-inherit] set System/uid=1 OK");
 
-    // 3. set_identity 到任意普通用户（uid=42/User）。
-    let user42 = ProcessIdentity { uid: 42, privilege: Privilege::User };
+    // 3. set_identity 到任意普通用户（uid=42，无能力——普通用户的定义）。
+    let user42 = ProcessIdentity { uid: 42, gid: 0, groups: Groups::empty(), caps: Caps::EMPTY };
     proc.set_identity(user42);
-    assert_eq!(proc.identity(), user42, "set uid=42/User round-trip");
-    info!("[test-identity-inherit] set uid=42/User OK");
+    assert_eq!(proc.identity(), user42, "set uid=42 round-trip");
+    assert!(!user42.caps.contains(Caps::SYSTEM), "plain user has no CAP_SYSTEM");
+    info!("[test-identity-inherit] set uid=42/plain-user OK");
+
+    // 3b. 能力位语义（ADR-040 §2.3）：contains/union/EMPTY 与 5 能力无预留位。
+    assert_eq!(Caps::EMPTY.bits(), 0, "EMPTY is all-zero");
+    let full = Caps::SYSTEM.union(Caps::DEVICE).union(Caps::MEMORY).union(Caps::KILL).union(Caps::OWNER);
+    for (c, name) in [
+        (Caps::SYSTEM, "SYSTEM"), (Caps::DEVICE, "DEVICE"), (Caps::MEMORY, "MEMORY"),
+        (Caps::KILL, "KILL"), (Caps::OWNER, "OWNER"),
+    ] {
+        assert!(full.contains(c), "full set contains {}", name);
+    }
+    assert!(!Caps::DEVICE.contains(Caps::SYSTEM), "capabilities are independent bits");
+    assert!(Groups::empty().is_empty(), "Groups::empty is empty");
+    info!("[test-identity-inherit] caps bit semantics OK");
 
     // 4. 派生身份决策 compute_child_identity（单点，非恒真；引用生产常量）。
     use crate::syscall::{BUILTIN_INDEX_INIT, BUILTIN_INDEX_SHELL, compute_child_identity};
-    // 4a. init 索引 + System 调用者 → System/uid=1（真实可提权路径）。
+    // 4a. init 索引 + CAP_SYSTEM 调用者 → init 身份 uid=1 + 全能力。
     let system_caller = ProcessIdentity::system(1);
+    assert!(system_caller.caps.contains(Caps::SYSTEM), "init identity carries CAP_SYSTEM");
     assert_eq!(
         compute_child_identity(BUILTIN_INDEX_INIT, system_caller),
         Ok(ProcessIdentity::system(1)),
         "System caller spawning init gets System/uid=1"
     );
-    // 4b. init 索引 + User 调用者 → Err(PermissionDenied)（V2 提权门禁）。
+    // 4b. init 索引 + 无 CAP_SYSTEM 调用者 → Err(PermissionDenied)（V2 提权门禁）。
     assert_eq!(
         compute_child_identity(BUILTIN_INDEX_INIT, user42),
         Err(klib::error::Error::PermissionDenied),
-        "User caller spawning init must be denied (no privilege escalation)"
+        "caller without CAP_SYSTEM spawning init must be denied (no privilege escalation)"
     );
     // 4c. 非 init 索引（shell）+ 任意调用者 → 原样继承调用者身份。
     assert_eq!(
@@ -12745,8 +12761,8 @@ pub fn test_perm_system_only() {
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-perm-system-only] PASS");
 }
-/// PRE-1 / ADR-037 决策 5：UIO 特权门禁——driver_register/driver_claim 仅
-/// `Privilege::System` 可调用，非 System 一律 `PermissionDenied`（EACCES/13）。
+/// PRE-1 / ADR-037 决策 5 / A1-2 能力位改判：UIO 特权门禁——driver_register/
+/// driver_claim 仅持 `CAP_DEVICE` 者可调用，其余一律 `PermissionDenied`（EACCES/13）。
 ///
 /// 与 test_perm_system_only 同构：真实 syscall 入口（syscall_entry）+ 伪当前进程。
 /// 门禁在 syscall 层，短路径在触碰任何用户内存前即拒绝——User 身份不必提供合法
@@ -12831,7 +12847,7 @@ pub fn test_driver_uio_privilege_gate() {
     info!("[test-driver-uio-gate] PASS");
 }
 
-/// `AUDIO_ATTACH` 特权门禁（批次三补上）：仅 `Privilege::System` 可 attach。
+/// `AUDIO_ATTACH` 特权门禁（批次三补上；A1-2 改判）：仅持 `CAP_DEVICE` 者可 attach。
 ///
 /// **为何需要独立的用户态测试**：内核启动期测试运行在 init 线程上，而 init 由
 /// 内核以 `ProcessIdentity::system(1)` 引导（main.rs），故启动期**天然是 System**——
@@ -12863,12 +12879,12 @@ pub fn test_audio_attach_privilege_gate() {
     // PermissionDenied -> EACCES(13)，同 klib 映射，负 errno 编码。
     const EACCES_U64: u64 = (-13i64) as u64;
 
-    // 前置断言：本测试依赖「默认身份是 User」这一事实。若将来默认值改了，
+    // 前置断言：本测试依赖「默认身份无任何能力」这一事实。若将来默认值改了，
     // 下面的「拒绝」断言会变成假阳性，故在此显式钉死前提（S19 边界）。
     assert_eq!(
-        ProcessIdentity::default_user().privilege,
-        task::Privilege::User,
-        "test premise: default identity must be User"
+        ProcessIdentity::default_user().caps,
+        task::Caps::EMPTY,
+        "test premise: default identity must carry no capabilities"
     );
 
     // 伪当前进程：构造方式与 driver 门禁测试一致，但**pid 必须合法**。
@@ -13043,7 +13059,7 @@ pub fn test_flock_matrix() {
 
 /// R6 flock close 自动释放（Process::close_fd 钩子）。
 pub fn test_flock_close_release() {
-    use task::{Privilege, Process, ProcessIdentity};
+    use task::{Caps, Groups, Process, ProcessIdentity};
     use vfs::file_handle::{FileHandle, OpenFlags, OpenHandle};
     use vfs::flock::{flock_lock, flock_unlock};
     use vfs::LockOwner;
@@ -13064,7 +13080,7 @@ pub fn test_flock_close_release() {
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = UserAddressSpace::<X86PageTable>::new().expect("addr space");
     let proc = Process::new(999, 0, 0, 0, alloc::sync::Arc::new(addr_space));
-    proc.set_identity(ProcessIdentity { uid: UID_LOCKER, privilege: Privilege::User });
+    proc.set_identity(ProcessIdentity { uid: UID_LOCKER, gid: 0, groups: Groups::empty(), caps: Caps::EMPTY });
 
     let fh = FileHandle::new(inode.clone(), OpenFlags::READ_ONLY).expect("open handle");
     let fd = proc.alloc_fd(OpenHandle::File(fh)).expect("alloc fd");
@@ -13169,7 +13185,7 @@ pub fn test_flock_identity_is_filesystem_independent() {
 pub fn test_flock_syscall() {
     use alloc::boxed::Box;
     use arch::syscall::SyscallFrame;
-    use task::{Process, ProcessIdentity};
+    use task::{Caps, Groups, Process, ProcessIdentity};
     use vfs::inode::Permissions;
 
     info!("[test-flock-syscall] === R6 flock production syscall ====");
@@ -13227,7 +13243,7 @@ pub fn test_flock_syscall() {
     // uid=7 打开并取独占锁。
     {
         let p = task::current_proc_mut().expect("proc");
-        p.set_identity(ProcessIdentity { uid: UID_A, privilege: task::Privilege::User });
+        p.set_identity(ProcessIdentity { uid: UID_A, gid: 0, groups: Groups::empty(), caps: Caps::EMPTY });
     }
     let mut op = frame(crate::syscall::SYS_STREAM_CREATE, base, OPEN_READ | OPEN_WRITE, 0);
     assert!(crate::syscall::syscall_entry(&mut op));
@@ -13245,7 +13261,7 @@ pub fn test_flock_syscall() {
     // uid=8 打开同文件，LOCK_EX 必须 Busy（跨 uid 冲突，真实 syscall 路径）。
     {
         let p = task::current_proc_mut().expect("proc");
-        p.set_identity(ProcessIdentity { uid: UID_B, privilege: task::Privilege::User });
+        p.set_identity(ProcessIdentity { uid: UID_B, gid: 0, groups: Groups::empty(), caps: Caps::EMPTY });
     }
     let mut op2 = frame(crate::syscall::SYS_STREAM_CREATE, base, OPEN_READ | OPEN_WRITE, 0);
     assert!(crate::syscall::syscall_entry(&mut op2));
@@ -13259,14 +13275,14 @@ pub fn test_flock_syscall() {
     // uid=7 释放（UNLOCK），uid=8 再取独占锁成功。
     {
         let p = task::current_proc_mut().expect("proc");
-        p.set_identity(ProcessIdentity { uid: UID_A, privilege: task::Privilege::User });
+        p.set_identity(ProcessIdentity { uid: UID_A, gid: 0, groups: Groups::empty(), caps: Caps::EMPTY });
     }
     let mut ul = frame(crate::syscall::SYS_STREAM_LOCK, fd_a, LOCK_UN, 0);
     assert!(crate::syscall::syscall_entry(&mut ul));
     assert!(ul.result & ERR_FLAG == 0, "UNLOCK must succeed");
     {
         let p = task::current_proc_mut().expect("proc");
-        p.set_identity(ProcessIdentity { uid: UID_B, privilege: task::Privilege::User });
+        p.set_identity(ProcessIdentity { uid: UID_B, gid: 0, groups: Groups::empty(), caps: Caps::EMPTY });
     }
     let mut lk4 = frame(crate::syscall::SYS_STREAM_LOCK, fd_b, LOCK_EX, 0);
     assert!(crate::syscall::syscall_entry(&mut lk4));

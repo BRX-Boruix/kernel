@@ -17,7 +17,7 @@ pub mod signal_set;
 pub mod signals;
 
 pub use process::{
-    Privilege, Process, ProcessIdentity, ProcessTable, TaskState, clear_current_proc,
+    Caps, Groups, Process, ProcessIdentity, ProcessTable, TaskState, clear_current_proc,
     current_proc_mut, process_page_fault_handler, set_current_proc,
 };
 pub use scheduler::{

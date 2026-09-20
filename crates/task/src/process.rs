@@ -159,48 +159,123 @@ impl TaskState {
     }
 }
 
-/// 进程身份（A1 / ADR-033）。
+/// 进程能力位（A1-2 / ADR-040 §2.3）。
 ///
-/// 权限强制（`system_only` 节点）与 flock owner 识别（R6）的事实来源。
-/// `Copy`：身份在 PCB 生命周期内不变（exec 派生时由父进程原样继承或
-/// init 引导时强制 `System`）。
+/// 取代 ADR-033 的 `Privilege { User, System }` 两档布尔：粗粒度 **5 个**，
+/// **无预留位**——新增能力必须走 ADR-000 通道（决策级实质变更），防止
+/// "随手加一个位" 的 ioctl 式膨胀（ADR-008 精神）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caps(u8);
+
+impl Caps {
+    pub const EMPTY: Caps = Caps(0);
+
+    /// 系统管理权：吸收 ADR-033 `Privilege::System` 与 `system_only` 门槛、
+    /// power/reboot 等系统管理操作、INIT 派生授权。
+    pub const SYSTEM: Caps = Caps(1 << 0);
+    /// 直接访问/认领设备（driver_register/driver_claim、AUDIO_ATTACH、irq_wait）。
+    pub const DEVICE: Caps = Caps(1 << 1);
+    /// 映射设备内存/物理地址（DMA 缓冲分配与物理地址披露）。
+    pub const MEMORY: Caps = Caps(1 << 2);
+    /// 终止任意进程（跨特权级信号投递）。
+    pub const KILL: Caps = Caps(1 << 3);
+    /// 绕过文件访问策略（DAC_OVERRIDE 对应物；A1-3 强制矩阵启用）。
+    pub const OWNER: Caps = Caps(1 << 4);
+
+    pub const fn bits(self) -> u8 { self.0 }
+
+    pub const fn contains(self, other: Caps) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Caps) -> Caps {
+        Caps(self.0 | other.0)
+    }
+}
+
+/// 进程身份（A1-2 / ADR-040 §2.4；承 ADR-033）。
+///
+/// 权限强制与 flock owner 识别（R6）的事实来源。`Copy`：身份在 PCB
+/// 生命周期内不变（exec 派生时由 `compute_child_identity` 单点决策）。
+///
+/// **不引入 euid/suid/fsuid**（ADR-040 §2.4）：ADR-033 的单一 `uid` 是干净的；
+/// Linux 的四个 uid 是历史伤疤。uid 分配保持 ADR-033 现状
+/// （0=默认/保留、1=init），不改 POSIX 的 root=0。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {
-    /// 用户 id。0 = 保留（未设身份/普通用户默认），1 = init/root 特权。
+    /// 用户 id。0 = 保留（未设身份/普通用户默认），1 = init。
     /// 也是 R6 flock owner token 的来源（同一 uid 的进程共享锁语义）。
     pub uid: u32,
-    /// 特权级。`System` 才可访问 `system_only` 节点（A1 强制比较对象）。
-    pub privilege: Privilege,
+    /// 主组 id。0 = 默认组（与 uid=0 同为"未设身份"的保留值）。
+    pub gid: u32,
+    /// 补充组（有上限，避免无界；ADR-040 §2.4）。当前无生产消费方
+    /// （组账户管理属第二阶段 A2-4），字段先行、语义成文于 ADR-040 §2.1
+    /// `NamedGid`——**诚实边界**：本字段第一阶段恒空集，不参与求值。
+    pub groups: Groups,
+    /// 能力位集合（ADR-040 §2.3 的 5 个粗粒度能力）。
+    pub caps: Caps,
+}
+
+/// 补充组集合（小容量定长，S04/S18 无界防护）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Groups {
+    n: u8,
+    ids: [u32; Groups::MAX],
+}
+
+impl Groups {
+    /// 上限 8：与 Linux NGROUPS_SMALL=64000 相比是玩具内核的诚实量级；
+    /// 超限拒绝而非静默截断（S09）。
+    pub const MAX: usize = 8;
+
+    pub const fn empty() -> Self { Self { n: 0, ids: [0; Groups::MAX] } }
+
+    /// 追加组 id；已满返回 `None`（调用方决定如何如实报错），重复值幂等返回 `Some`。
+    pub fn push(&mut self, gid: u32) -> Option<()> {
+        if self.ids[..self.n as usize].contains(&gid) {
+            return Some(());
+        }
+        if (self.n as usize) >= Groups::MAX {
+            return None;
+        }
+        self.ids[self.n as usize] = gid;
+        self.n += 1;
+        Some(())
+    }
+
+    pub fn contains(&self, gid: u32) -> bool {
+        self.ids[..self.n as usize].contains(&gid)
+    }
+
+    pub fn len(&self) -> usize { self.n as usize }
+
+    pub fn is_empty(&self) -> bool { self.n == 0 }
+
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.ids[..self.n as usize].iter().copied()
+    }
 }
 
 impl ProcessIdentity {
-    /// 默认普通用户身份（`Process::new` 初始值）。
+    /// 默认普通用户身份（`Process::new` 初始值）：uid/gid 0，无能力。
     pub const fn default_user() -> Self {
         Self {
             uid: 0,
-            privilege: Privilege::User,
+            gid: 0,
+            groups: Groups::empty(),
+            caps: Caps::EMPTY,
         }
     }
 
-    /// init/root 特权身份（内核引导第一个进程时使用）。
+    /// init/特权身份（内核引导第一个进程时使用）：全能力。
     pub const fn system(uid: u32) -> Self {
         Self {
             uid,
-            privilege: Privilege::System,
+            gid: 0,
+            groups: Groups::empty(),
+            caps: Caps::SYSTEM.union(Caps::DEVICE).union(Caps::MEMORY).union(Caps::KILL).union(Caps::OWNER),
         }
     }
-}
-
-/// 进程特权级（A1 / ADR-033）。
-///
-/// 单用户内核的两档模型（不臆造 owner/group/other 多用户 ACL——ABI §4
-/// 成文取舍）。`System` 才可通过 `system_only` 节点的权限强制。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Privilege {
-    /// 普通用户进程。
-    User,
-    /// 特权进程（init 及其授权的系统服务）。
-    System,
 }
 
 /// 线程组共享容器（T1-1 / ADR-035 D1/D2 / threads.md T1-1）。
