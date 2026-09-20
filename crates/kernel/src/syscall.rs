@@ -217,11 +217,13 @@ pub const ENTRY_READ_READDIR: u64 = 0;
 /// stat 模式：a4=1，解析路径后把节点元数据以 `StatInfo` 定长结构写入用户缓冲（a2）。
 pub const ENTRY_READ_STAT: u64 = 1;
 
-// ---------- SYS_ENTRY_UPDATE 动作编码（a4 区分 rename/chmod）----------
+// ---------- SYS_ENTRY_UPDATE 动作编码（a4 区分 rename/chmod/chown）----------
 /// rename（默认）：a4=0，a1=old_path, a2=new_path。
 pub const ENTRY_UPDATE_RENAME: u64 = 0;
 /// chmod：a4=1，a1=path, a2=mode_bits（classic 9 位 + 门禁 bit9 编码）。
 pub const ENTRY_UPDATE_CHMOD: u64 = 1;
+/// chown（A1-7 / ADR-014「更新节点元数据」）：a4=2，a1=path, a2=uid, a3=gid。
+pub const ENTRY_UPDATE_CHOWN: u64 = 2;
 
 // ---------- SYS_ENTRY_CREATE kind 编码（ADR-014 §4.4，与 INodeType 对齐）----------
 /// 创建普通文件（kind=REG/FILE）。
@@ -1147,6 +1149,49 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
                 meta.permissions.owner_uid(),
                 meta.permissions.owner_gid(),
             );
+            match node.set_permissions(&policy) {
+                Ok(()) => pack_ok(0),
+                Err(e) => pack_err(e),
+            }
+        }
+        // chown：a4=2，a1=path, a2=uid, a3=gid（A1-7 / ADR-014「更新节点元数据」。
+        // 强制面 = chmod（属主或 CAP_OWNER）+ 易他主需 CAP_SYSTEM）。
+        ENTRY_UPDATE_CHOWN => {
+            let path_ptr = frame.a1;
+            let new_uid = frame.a2 as u32;
+            let new_gid = frame.a3 as u32;
+            let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
+                Ok(p) => p,
+                Err(e) => return pack_err(e),
+            };
+            let path = match absolute_path(&path) {
+                Ok(a) => a,
+                Err(e) => return pack_err(e),
+            };
+            let root = crate::vfs_init::root();
+            let node = match root.resolve(&path, false) {
+                Ok(n) => n,
+                Err(e) => return pack_err(e),
+            };
+            let identity = current_proc_mut()
+                .map(|p| p.identity())
+                .unwrap_or_else(ProcessIdentity::default_user);
+            let meta = match node.metadata() {
+                Ok(m) => m,
+                Err(e) => return pack_err(e),
+            };
+            // 强制面：属主或 CAP_OWNER 可发 chown；**易他主**（新属主 ≠ 调用者
+            // 且调用者非 CAP_SYSTEM）拒绝——POSIX chown 限制面（防权限赠予）。
+            if let Err(e) = check_chmod_access(&identity, &meta.permissions) {
+                return pack_err(e);
+            }
+            let changes_owner = new_uid != meta.permissions.owner_uid();
+            if changes_owner && !identity.caps.contains(Caps::SYSTEM) {
+                return pack_err(Error::PermissionDenied);
+            }
+            // A1-5：with_owner 烙印新属主——显式 ACE 如实整体替换（wire 无 ACE 通道）。
+            let policy = vfs::inode::AccessPolicy::from_wire(meta.permissions.to_wire() & 0o777)
+                .with_owner(new_uid, new_gid);
             match node.set_permissions(&policy) {
                 Ok(()) => pack_ok(0),
                 Err(e) => pack_err(e),

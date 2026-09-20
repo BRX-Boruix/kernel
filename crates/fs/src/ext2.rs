@@ -1737,15 +1737,20 @@ impl Ext2Fs {
     /// classic 9 位整体写回 inode mode（保留类型位 0xF000）。策略携带的
     /// 门禁位（wire bit9）在 EXT2 mode 无存储位：置位时如实
     /// [`Ext2Error::NotSupported`]，不伪造（纪律不变）。
+    ///
+    /// A1-7 分层更正：**属主字段由策略本体携带、整体替换**——保主是
+    /// chmod 调用方（kernel CHMOD 分支 `with_owner` 构造）的职责，本原语
+    /// 不再自盘上 i_uid/i_gid 回填（回填会把 chown 的新属主静默覆盖，
+    /// 曾致 test_chown_e2e 红灯）。
     pub fn set_permissions(&self, ino: u32, policy: &AccessPolicy) -> Result<(), Ext2Error> {
         if policy.gate_system() {
             return Err(Ext2Error::NotSupported);
         }
         let mut inode = self.read_inode(ino)?;
-        // A1-5（chmod 保主）：属主不变——chmod 是写门径而非易主，策略自
-        // 盘上 i_uid/i_gid 补全属主后整体写回（显式 ACE 如实整体替换）。
-        let policy = policy.with_owner(inode.uid as u32, inode.gid as u32);
         inode.mode = (inode.mode & 0xF000) | policy.classic_mode() as u16;
+        // A1-7：属主随策略本体写回（chown 通道复用本原语写新属主）。
+        inode.uid = policy.owner_uid() as u16;
+        inode.gid = policy.owner_gid() as u16;
         inode.ctime = now_timestamp_secs();
         self.write_inode(&inode)
     }
@@ -2594,12 +2599,25 @@ mod tests {
             let dm = d.metadata().expect("dir meta");
             assert_eq!(dm.permissions.classic_mode(), 0o700, "dir 0700 kept (x/r present)");
             assert_eq!(dm.permissions.owner_uid(), 1000, "dir owner stamped");
-            // chmod 保主：非 (0,0) 属主节点 chmod → mode 写入、属主不变。
-            f.set_permissions(&AccessPolicy::from_wire(0o600)).expect("chmod");
+            // A1-7 分层（fs 原语 = 策略本体整体替换）：调用方以 with_owner
+            // 构造保主策略（kernel CHMOD 分支形态）→ mode 写入、属主不变；
+            // chown 通道则以 with_owner(新属主) 构造 → 属主真实变更
+            // （E2E 见 kernel test_chown_e2e）。
+            f.set_permissions(&AccessPolicy::from_wire(0o600).with_owner(1000, 100))
+                .expect("chmod keep-owner form");
             let m2 = f.metadata().expect("meta after chmod");
             assert_eq!(m2.permissions.classic_mode(), 0o600, "chmod writes mode");
-            assert_eq!(m2.permissions.owner_uid(), 1000, "chmod preserves owner uid");
-            assert_eq!(m2.permissions.owner_gid(), 100, "chmod preserves owner gid");
+            assert_eq!(m2.permissions.owner_uid(), 1000, "keep-owner form preserves uid");
+            assert_eq!(m2.permissions.owner_gid(), 100, "keep-owner form preserves gid");
+            // chown 形态：策略携带新属主 → 原语如实易主。
+            f.set_permissions(&AccessPolicy::from_wire(0o600).with_owner(7, 8))
+                .expect("chown form");
+            let m3 = f.metadata().expect("meta after chown-form");
+            assert_eq!(m3.permissions.owner_uid(), 7, "chown form changes owner uid");
+            assert_eq!(m3.permissions.owner_gid(), 8, "chown form changes owner gid");
+            // 还原属主（供阶段 2 重挂断言 1000/100）。
+            f.set_permissions(&AccessPolicy::from_wire(0o600).with_owner(1000, 100))
+                .expect("restore owner");
         }
         // 阶段 2：重挂——盘上 i_uid/i_gid + mode 三段忠实往返。
         {

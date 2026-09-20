@@ -13364,6 +13364,161 @@ pub fn test_stat_owner_fields() {
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-stat-owner] PASS");
 }
+
+
+/// A1-7 / §3.2 #11：chown/chmod 归真 E2E（真实 syscall 链路 + stat 回读）。
+///
+/// 与 test_stat_owner_fields 同构的伪当前进程形态。链路：sys 建 0600 (42,43)
+/// 节点 → uid42 经 libc 语义等价通道（libsys chmod/chown 位/属主直通）——
+/// ① chmod 0644（属主自身，三段写入）→ stat 回读 mode 变、属主不变；
+/// ② chown (1000,100) 易他主（uid42 无 CAP_SYSTEM）→ EACCES（POSIX 赠予面）；
+/// ③ sys（CAP_SYSTEM）chown (1000,100) → 放行 → stat 回读真属主 1000:100。
+#[cfg(feature = "kernel-tests")]
+pub fn test_chown_e2e() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Caps, Groups, Process, ProcessIdentity};
+
+    info!("[test-chown-e2e] === A1-7: chown/chmod truthful chain ====");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3,
+            a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0,
+            aux_pid: 0,
+        }
+    }
+    fn frame4(nr: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> SyscallFrame {
+        let mut f = frame(nr, a1, a2, a3);
+        f.a4 = a4;
+        f
+    }
+
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+    const EACCES_U64: u64 = (-13i64) as u64;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // 用户缓冲：路径槽 + stat 输出页。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
+    let buf = map.result;
+    let mut map2 = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map2));
+    assert!(map2.result < 0x8000_0000_0000_0000, "mmap2 must succeed");
+    let out_buf = map2.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        let mut a = buf;
+        while a < buf + 0x2000 {
+            p.addr_space().handle_page_fault(a, arch_x86_64::paging::PageFaultCode::new(0));
+            a += 0x1000;
+        }
+        let mut b = out_buf;
+        while b < out_buf + 0x1000 {
+            p.addr_space().handle_page_fault(b, arch_x86_64::paging::PageFaultCode::new(0));
+            b += 0x1000;
+        }
+    }
+    let write_path = |slot: u64, s: &[u8]| unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(slot))
+            .expect("slot resident")
+            .as_u64();
+        let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+        core::ptr::copy_nonoverlapping(s.as_ptr(), (pa + off) as *mut u8, s.len());
+    };
+
+    // 夹具：sys 建 0600 (42,43)。
+    let root = crate::vfs_init::root();
+    root.create_file("/scratch/a7_node.txt", 0o600, (42, 43)).expect("fixture");
+    write_path(buf, b"/scratch/a7_node.txt\x00");
+
+    // ① 属主 chmod 0644：mode 三段写入、属主不变（A1-5 保主语义链）。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity { uid: 42, gid: 43, groups: Groups::empty(), caps: Caps::EMPTY });
+    }
+    let mut ch = frame4(crate::syscall::SYS_ENTRY_UPDATE, buf, 0o644, 0, crate::syscall::ENTRY_UPDATE_CHMOD);
+    assert!(crate::syscall::syscall_entry(&mut ch));
+    assert!(ch.result & ERR_FLAG == 0, "owner chmod must pass");
+    let mut st = frame4(crate::syscall::SYS_ENTRY_READ, buf, out_buf, 0x100, crate::syscall::ENTRY_READ_STAT);
+    assert!(crate::syscall::syscall_entry(&mut st));
+    assert!(st.result & ERR_FLAG == 0, "stat after chmod must succeed");
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(out_buf))
+            .expect("stat out resident")
+            .as_u64();
+        let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+        let info = core::ptr::read_unaligned((pa + off) as *const vfs::inode::StatInfo);
+        assert_eq!(info.perms & 0o777, 0o644, "chmod wrote three-segment mode");
+        assert_eq!(info.owner_uid, 42, "chmod preserved owner uid");
+        assert_eq!(info.owner_gid, 43, "chmod preserved owner gid");
+    }
+    info!("[test-chown-e2e] owner chmod 0644 keeps owner OK");
+
+    // ② uid42 chown (1000,100)：易他主且无 CAP_SYSTEM → EACCES。
+    let mut co1 = frame4(crate::syscall::SYS_ENTRY_UPDATE, buf, 1000, 100, crate::syscall::ENTRY_UPDATE_CHOWN);
+    assert!(crate::syscall::syscall_entry(&mut co1));
+    assert_eq!(
+        co1.result, EACCES_U64,
+        "non-CAP_SYSTEM owner cannot chown to another owner (POSIX gift restriction)"
+    );
+    info!("[test-chown-e2e] owner-to-other chown denied OK");
+
+    // ③ sys（CAP_SYSTEM）chown (1000,100) → 放行 → stat 回读真属主。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity { uid: 0, gid: 0, groups: Groups::empty(), caps: Caps::SYSTEM.union(Caps::OWNER) });
+    }
+    let mut co2 = frame4(crate::syscall::SYS_ENTRY_UPDATE, buf, 1000, 100, crate::syscall::ENTRY_UPDATE_CHOWN);
+    assert!(crate::syscall::syscall_entry(&mut co2));
+    assert!(co2.result & ERR_FLAG == 0, "CAP_SYSTEM chown must pass");
+    let mut st2 = frame4(crate::syscall::SYS_ENTRY_READ, buf, out_buf, 0x100, crate::syscall::ENTRY_READ_STAT);
+    assert!(crate::syscall::syscall_entry(&mut st2));
+    assert!(st2.result & ERR_FLAG == 0, "stat after chown must succeed");
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(out_buf))
+            .expect("stat out resident")
+            .as_u64();
+        let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+        let info = core::ptr::read_unaligned((pa + off) as *const vfs::inode::StatInfo);
+        assert_eq!(info.owner_uid, 1000, "chown changed owner uid");
+        assert_eq!(info.owner_gid, 100, "chown changed owner gid");
+        assert_eq!(info.perms & 0o777, 0o644, "chown must not touch mode");
+    }
+    info!("[test-chown-e2e] CAP_SYSTEM chown then stat reads real owner OK");
+
+    // 清理（CAP 通道）。
+    let _ = root.unlink("/scratch/a7_node.txt");
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-chown-e2e] PASS");
+}
 /// PRE-1 / ADR-037 决策 5 / A1-2 能力位改判：UIO 特权门禁——driver_register/
 /// driver_claim 仅持 `CAP_DEVICE` 者可调用，其余一律 `PermissionDenied`（EACCES/13）。
 ///

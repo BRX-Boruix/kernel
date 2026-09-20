@@ -684,6 +684,9 @@ unsafe fn kmain_body() -> ! {
     // A1-4 / ADR-040 §2.4：StatInfo 属主字段真值投影（stat/fstat 通道）。
     #[cfg(feature = "kernel-tests")]
     tests::test_stat_owner_fields();
+    // A1-7 / §3.2 #11：chown/chmod 归真 E2E（真实 syscall 链路）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_chown_e2e();
     // PRE-1 / ADR-037 决策 5：UIO driver_register/driver_claim 特权门禁（System-only）。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_uio_privilege_gate();

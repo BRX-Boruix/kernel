@@ -386,8 +386,13 @@ impl INode for RamINode {
         }
     }
 
-    /// 设置节点权限（chmod 原语，A1-1）：整体替换 AccessPolicy（wire chmod
-    /// 只携带 classic 位集，无 ACE 通道——见 trait 文档）并刷新 changed 时间。
+    /// 设置节点权限（chmod 原语，A1-1）：**策略本体整体替换**（属主含在
+    /// 策略内）并刷新 changed 时间。
+    ///
+    /// A1-7 分层更正：保主**不是**本原语的职责——chmod 是写门径而非易主，
+    /// 保主由 chmod 调用方（kernel ENTRY_UPDATE_CHMOD 分支 `with_owner`
+    /// 构造）负责；chown 走同一原语时需要**写入新属主**，fs 层若再保主
+    /// 会把易主静默覆盖（曾致 test_chown_e2e 红灯，分层教训成文）。
     fn set_permissions(&self, policy: &AccessPolicy) -> Result<(), Error> {
         let mut meta = self.meta.write();
         meta.permissions = policy.clone();
