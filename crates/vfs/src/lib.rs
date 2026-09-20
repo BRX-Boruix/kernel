@@ -1748,6 +1748,49 @@ fn test_audio_dsp_backpressure() {
         assert!(ace.inherit, "inherit 标志往返保真");
     }
 
+    /// A2-8 / ADR-040 §3.5 G3 / §3.5.4 #18：**ACE 继承**派生单测。
+    ///
+    /// 语义（本节裁定，忠实于现有数据结构——"一条 ACE 一个 inherit 位"）：
+    /// 目录上 `inherit: true` 的显式 ACE 在**新建子节点**时被**原样复制**进子节点
+    /// 的显式 ACE 列表；`inherit: false` 的显式 ACE 不复制。父目录的 classic 三段
+    /// **不**复制（子节点的 classic 位来自创建请求本身的 perm 参数，POSIX 语义：
+    /// `mkdir(dir, 0755)` 里的 mode 决定子目录自身三段）。
+    ///
+    /// 不引入第二条求值路径（S13）：子节点拿到的仍是一个普通 `AccessPolicy`，
+    /// 求值照旧走唯一算法 `evaluate`。
+    #[test]
+    fn test_ace_inheritance_derivation() {
+        use alloc::vec;
+        // 父目录：显式 deny(bob, WRITE, inherit) + allow(alice, READ|WRITE, 不继承)
+        let parent = AccessPolicy::new(
+            vec![
+                Ace { principal: Principal::NamedUid(1001), allow: false, perms: PermBits::WRITE, inherit: true },
+                Ace { principal: Principal::NamedUid(1000), allow: true, perms: PermBits::READ.union(PermBits::WRITE), inherit: false },
+            ],
+            0o755,
+        );
+
+        // 派生：只复制 inherit=true 的那条。
+        let child = parent.derive_for_child(0o644);
+        let child_aces: alloc::vec::Vec<Ace> = child.explicit_aces().collect();
+        assert_eq!(child_aces.len(), 1, "only inherit=true ACEs propagate");
+        assert_eq!(child_aces[0].principal, Principal::NamedUid(1001), "inherited principal preserved");
+        assert!(!child_aces[0].allow, "inherited deny stays a deny");
+        assert!(child_aces[0].inherit, "inherited ACE keeps its inherit flag (further propagation)");
+        assert_eq!(child.classic_mode(), 0o644, "child classic mode comes from the create request");
+
+        // 生效：bob 在子节点上被拒写、可读（隐式 other 段 r）。
+        let bob = Subject { uid: 1001, gid: 1001, groups: &[] };
+        assert_eq!(child.evaluate(&bob, PermBits::WRITE), Err(Error::PermissionDenied), "inherited deny is enforced on child");
+        assert_eq!(child.evaluate(&bob, PermBits::READ), Ok(()), "inherited deny only covers WRITE");
+
+        // 父目录**没有** inherit ACE 时，子节点无显式 ACE（纯 classic）。
+        let plain = AccessPolicy::from_classic_owned(0o755, 0, 0);
+        let plain_child = plain.derive_for_child(0o600);
+        assert_eq!(plain_child.explicit_aces().count(), 0, "no inherit ACEs -> no explicit ACEs on child");
+        assert_eq!(plain_child.classic_mode(), 0o600, "classic mode from request");
+    }
+
     #[test]
     fn test_access_policy_wire_roundtrip() {
         // wire：classic 9 位直通（不含门禁位），from_wire/to_wire 往返保真。

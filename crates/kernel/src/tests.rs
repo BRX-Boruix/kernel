@@ -9631,6 +9631,152 @@ pub fn test_volume_domain_cap_gate() {
     info!("[test-volume-gate] === A2-9 pass ===");
 }
 
+/// A2-8（ADR-040 §3.5 G3 / §3.5.4 #18）：**ACE 继承端到端**（真实 create 路径停机验收）。
+///
+/// 缺口事实（审计 §3.5.1 G3）：`Ace.inherit` 仅存储位——`effective_aces` 求值与
+/// `sys_entry_create` 创建路径**均不读取**它。本项补上创建路径的派生。
+///
+/// 验收判据（#18）："在含 `inherit` ACE 的目录下新建文件，子文件策略按继承生效"。
+/// 因此本测试走**真实 syscall 链路**（`SYS_ENTRY_CREATE`），再经 `stat` 读回子节点
+/// 策略、并经**唯一求值算法**验证拒绝确实生效——不止于"字段被复制"这种弱断言。
+pub fn test_ace_inheritance_e2e() {
+    use alloc::boxed::Box;
+    use alloc::vec;
+    use arch::syscall::SyscallFrame;
+    use task::{Groups, Process, ProcessIdentity};
+    use vfs::inode::{Ace, AccessPolicy, Principal};
+
+    info!("[test-ace-inherit] === A2-8: ACE inheritance end-to-end ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3, a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0, aux_pid: 0,
+        }
+    }
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    // 创建者 = system(1)：可建目录（父目录 /scratch 属主 0,0）。
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
+
+    let root = crate::vfs_init::root();
+    // 清理可能残留（测试可能重跑）。
+    let _ = root.unlink("/scratch/a2_8_dir/a2_8_f.txt");
+    let _ = root.unlink("/scratch/a2_8_dir");
+
+    // ---- 1. 建父目录，并植入"带 inherit 的 deny ACE" ----
+    let parent = root
+        .mkdir("/scratch/a2_8_dir", 0o755, (1, 1))
+        .expect("mk parent dir");
+    // 选 **READ** 作为被拒权限：子节点 0644 的 classic other 段**授予**读，
+    // 故"继承的 deny 是否生效"可经与 classic 基线的对比**干净地观测**到
+    // （若用 WRITE，0644 的 other 段本就不授写，两种原因都会拒绝，无法判别）。
+    let deny = Ace {
+        principal: Principal::NamedUid(2002),
+        allow: false,
+        perms: vfs::inode::PermBits::READ,
+        inherit: true,
+    };
+    let non_inherit = Ace {
+        principal: Principal::NamedUid(2003),
+        allow: false,
+        perms: vfs::inode::PermBits::READ,
+        inherit: false,
+    };
+    let mut policy = AccessPolicy::new(vec![deny, non_inherit], 0o755);
+    policy = policy.with_owner(1, 1);
+    parent.set_permissions(&policy).expect("seed parent policy");
+    info!("[test-ace-inherit] parent seeded with 1 inherit + 1 non-inherit ACE OK");
+
+    // ---- 2. 经**真实 syscall** 在父目录下建文件 ----
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    let buf = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space().handle_page_fault(buf, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let ps = b"/scratch/a2_8_dir/a2_8_f.txt\x00";
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(buf)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(ps.as_ptr(), (pa + off) as *mut u8, ps.len());
+    }
+    let mut c = frame(crate::syscall::SYS_ENTRY_CREATE, buf, crate::syscall::ENTRY_KIND_FILE, 0o644);
+    assert!(crate::syscall::syscall_entry(&mut c));
+    assert_eq!(c.result, 0, "create via real syscall must succeed");
+    info!("[test-ace-inherit] child file created via SYS_ENTRY_CREATE OK");
+
+    // ---- 3. 子节点确实继承了 inherit=true 的那条、且**没有**继承 false 的那条 ----
+    let child = root.resolve("/scratch/a2_8_dir/a2_8_f.txt", true).expect("resolve child");
+    let child_policy = child.metadata().expect("child meta").permissions;
+    let inherited: alloc::vec::Vec<Ace> = child_policy.explicit_aces().collect();
+    assert_eq!(inherited.len(), 1, "exactly one ACE must propagate (inherit=true only)");
+    assert_eq!(inherited[0].principal, Principal::NamedUid(2002), "inherited principal preserved");
+    assert!(!inherited[0].allow, "inherited deny remains a deny");
+    assert_eq!(child_policy.classic_mode(), 0o644, "child classic mode from create request");
+    info!("[test-ace-inherit] child policy carries inherited ACE (and only that one) OK");
+
+    // ---- 4. 继承的 ACE 经**唯一求值算法**真实生效（拒绝 2002 读）----
+    let plain_0644 = vfs::inode::AccessPolicy::from_classic(0o644);
+    let denied = vfs::inode::Subject { uid: 2002, gid: 2002, groups: &[] };
+    // 基线：纯 classic 0644 下，other 段授予读 → 放行。
+    assert_eq!(
+        plain_0644.evaluate(&denied, vfs::inode::PermBits::READ),
+        Ok(()),
+        "baseline: plain 0644 grants READ to other (sanity of the discriminator)"
+    );
+    // 继承了 deny 的子节点：同一主体同一权限 → **拒绝**。二者不同即证明继承 ACE 生效。
+    assert_eq!(
+        child_policy.evaluate(&denied, vfs::inode::PermBits::READ),
+        Err(klib::error::Error::PermissionDenied),
+        "inherited deny must be enforced on the child"
+    );
+    // 对照：未继承的 2003 在子节点上的判定与 classic 基线**完全一致**（读仍放行）
+    // ——即那条 non-inherit ACE 确实**没有**出现在子节点上。
+    let not_inherited = vfs::inode::Subject { uid: 2003, gid: 2003, groups: &[] };
+    assert_eq!(
+        child_policy.evaluate(&not_inherited, vfs::inode::PermBits::READ),
+        plain_0644.evaluate(&not_inherited, vfs::inode::PermBits::READ),
+        "non-inherit ACE must NOT appear on child (verdict equals a plain 0644)"
+    );
+    assert_eq!(
+        child_policy.evaluate(&not_inherited, vfs::inode::PermBits::READ),
+        Ok(()),
+        "control: uid 2003 keeps classic-granted READ"
+    );
+    info!("[test-ace-inherit] inherited ACE enforced; non-inherit ACE absent OK");
+
+    // ---- 5. 父目录自身的策略未被派生过程篡改（in-place 污染回归）----
+    let parent_after = parent.metadata().expect("parent meta").permissions;
+    assert_eq!(parent_after.explicit_aces().count(), 2, "parent keeps both ACEs");
+    info!("[test-ace-inherit] parent policy untouched OK");
+
+    // 清理
+    let _ = root.unlink("/scratch/a2_8_dir/a2_8_f.txt");
+    let _ = root.unlink("/scratch/a2_8_dir");
+
+    task::clear_current_proc();
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    unsafe { drop(Box::from_raw(proc_raw)); }
+    info!("[test-ace-inherit] === A2-8 pass ===");
+}
+
+
 
 
 /// 读回 `identity_query` 写出的 `IdentityInfo`（uuid/gid/caps 三个 u32 槽）。

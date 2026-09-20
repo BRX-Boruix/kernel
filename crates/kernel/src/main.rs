@@ -789,6 +789,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_volume_domain_cap_gate();
 
+    // A2-8（ADR-040 §3.5 G3）：ACE 继承端到端（真实 create 路径，返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_ace_inheritance_e2e();
+
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();

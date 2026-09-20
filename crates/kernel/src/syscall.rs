@@ -629,6 +629,21 @@ fn check_chmod_access(identity: &ProcessIdentity, policy: &vfs::inode::AccessPol
 /// A1-3 / §2.6「unlink/mkdir/rename：父目录 Write + 目标属主」的父目录面
 /// 单点。目标属主面（持有 `CAP_OWNER` 者可删他人文件等）待 A1-5 属主
 /// 真值落地后补全（本阶段注释如实记账，不伪称完整）。
+/// A2-8：把【继承派生出的策略】应用到刚建成的子节点。
+///
+/// 单点助手（S13）：`sys_entry_create` 的目录/文件两条分支共用，不各写一份。
+/// 语义注记：这是"先建后落策略"的两步——若第二步失败则子节点保持创建时的
+/// classic 策略（**不会**得到半套继承 ACE）。之所以可接受：`set_permissions`
+/// 由内核内部调用（非用户态通道），失败仅意味着底层 fs 拒绝写元数据（如只读
+/// 挂载），此时调用方收到的错误如实上抛，不存在"静默降级成更宽策略"的面
+/// ——子节点仍是**创建者自己的 classic 策略**，不比请求更宽。
+fn apply_inherited_policy(
+    node: &alloc::sync::Arc<dyn vfs::inode::INode>,
+    policy: &vfs::inode::AccessPolicy,
+) -> Result<(), Error> {
+    node.set_permissions(policy)
+}
+
 fn check_parent_write_access(
     identity: &ProcessIdentity,
     parent: &alloc::sync::Arc<dyn vfs::inode::INode>,
@@ -981,7 +996,9 @@ fn sys_entry_create(frame: &mut SyscallFrame) -> u64 {
     };
     let root = crate::vfs_init::root();
     // A1-3 / ADR-040 §2.6：mkdir/create = **父目录 Write**。
-    match split_parent(&path) {
+    // A2-8 / §3.5 G3：同一处解析父节点，供权限检查与 **ACE 继承派生**共用
+    // （单点解析，不重复 lookup）。
+    let parent = match split_parent(&path) {
         Some((parent_path, _)) => {
             let parent = match root.resolve(&parent_path, true) {
                 Ok(n) => n,
@@ -990,16 +1007,45 @@ fn sys_entry_create(frame: &mut SyscallFrame) -> u64 {
             if let Err(e) = check_parent_write_access(&creator, &parent) {
                 return pack_err(e);
             }
+            parent
         }
         None => return pack_err(Error::InvalidParam),
-    }
+    };
+    // A2-8 / ADR-040 §3.5 G3：**ACE 继承**——新建子节点的策略由父目录显式列表中
+    // `inherit == true` 的 ACE 派生（`derive_for_child` 单点，不引入第二条求值
+    // 路径 S13）。父目录无 inherit ACE 时派生结果与纯 classic 等价，故本步对既有
+    // 行为零影响（无显式 ACE 的父目录派生出的子策略 = 请求 mode 的 classic 三段）。
+    let parent_policy = match parent.metadata() {
+        Ok(m) => m.permissions,
+        Err(e) => return pack_err(e),
+    };
+    let mut child_policy = parent_policy.derive_for_child(mode);
+    // 属主 = 创建者（POSIX；`derive_for_child` 有意不继承父属主，在此烙印）。
+    child_policy = child_policy.with_owner(owner.0, owner.1);
+    let inherited_count = child_policy.explicit_aces().count();
     match kind {
         crate::syscall::ENTRY_KIND_DIRECTORY => match root.mkdir(&path, mode, owner) {
-            Ok(_) => pack_ok(0),
+            Ok(node) => {
+                if let Err(e) = apply_inherited_policy(&node, &child_policy) {
+                    return pack_err(e);
+                }
+                if inherited_count > 0 {
+                    klib::info!("[vfs] inherited {} ACE(s) into new dir {}", inherited_count, path);
+                }
+                pack_ok(0)
+            }
             Err(e) => pack_err(e),
         },
         crate::syscall::ENTRY_KIND_FILE => match root.create_file(&path, mode, owner) {
-            Ok(_) => pack_ok(0),
+            Ok(node) => {
+                if let Err(e) = apply_inherited_policy(&node, &child_policy) {
+                    return pack_err(e);
+                }
+                if inherited_count > 0 {
+                    klib::info!("[vfs] inherited {} ACE(s) into new file {}", inherited_count, path);
+                }
+                pack_ok(0)
+            }
             Err(e) => pack_err(e),
         },
         crate::syscall::ENTRY_KIND_SYMLINK

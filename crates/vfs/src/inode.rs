@@ -322,6 +322,42 @@ impl AccessPolicy {
         self.aces.iter().copied().chain(tail)
     }
 
+    /// 显式 ACE 列表（不含三条隐式尾部 ACE）。
+    ///
+    /// A2-8：继承派生与用户态策略读取都要看**显式**列表本身，故提供本访问器
+    /// （`effective_aces` 会把隐式尾部混进来，不适合做"复制哪些"的判据）。
+    pub fn explicit_aces(&self) -> impl Iterator<Item = Ace> + '_ {
+        self.aces.iter().copied()
+    }
+
+    /// A2-8 / ADR-040 §3.5 G3：**按父目录策略派生新建子节点的策略**。
+    ///
+    /// 语义（忠实于现有数据结构——"一条 ACE 一个 `inherit` 位"，不引入第二条
+    /// 求值路径 S13）：
+    /// - 父目录显式列表中 `inherit == true` 的 ACE **原样复制**进子节点显式列表
+    ///   （含其 `inherit` 位——使继承在多级目录下**继续向下传播**，与 Windows/NFSv4
+    ///   "inheritable 标志随行"一致）；
+    /// - `inherit == false` 的显式 ACE **不复制**（仅对父目录自身生效）；
+    /// - 父目录的 classic 三段**不复制**：`classic_mode` 取**创建请求**给定的 mode
+    ///   （POSIX：`mkdir(dir, 0755)` 的 mode 决定子目录自身三段）。**不**做
+    ///   "父三段 & 请求三段"的隐式掩码——那会造出第二条权限推导路径（S13 禁止），
+    ///   且会静默削弱调用方显式给定的权限。
+    /// - 属主**不**继承父目录：由调用方在创建点按创建者烙印（POSIX，见 `with_owner`）。
+    /// - 门禁位**不**继承：门禁是节点级系统语义，不是目录派生物（不得经"在门禁
+    ///   目录里建文件"来扩散门禁——那是权限放大面）。
+    ///
+    /// 返回的子策略仍是一个普通 `AccessPolicy`，求值照旧走唯一算法 `evaluate`。
+    pub fn derive_for_child(&self, classic_mode: u32) -> Self {
+        let inherited: Vec<Ace> = self.aces.iter().filter(|a| a.inherit).copied().collect();
+        Self {
+            aces: inherited,
+            mode: classic_mode & 0o777,
+            owner_uid: 0, // 由创建点 with_owner 烙印为创建者
+            owner_gid: 0,
+            gate_system: false,
+        }
+    }
+
     /// **唯一求值算法**（ADR-040 §2.1）：首匹配即决 + 隐式尾部兜底。
     ///
     /// 规则：
