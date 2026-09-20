@@ -9516,6 +9516,123 @@ pub fn test_identity_set_and_query() {
     info!("[test-identity-syscall] === A2-1 pass ===");
 }
 
+/// A2-9（ADR-040 §3.5 G6 / §3.5.4 #21）：**资源域权限校验**——volume_mount/unmount。
+///
+/// 缺口事实（审计 ADR-040 §3.5.1 G6）：`sys_volume_mount`（0x61）与
+/// `sys_volume_unmount`（0x66）**无任何权限检查**——任意进程可挂载/卸载文件系统。
+/// 当前全进程同为 System(1) 故不构成越权，但属"机制就绪却未接线"（S13 单点原则）。
+///
+/// 能力位选择（无需新立 ADR）：挂载/卸载文件系统属**系统管理**操作，归
+/// `CAP_SYSTEM`——与 power/reboot、门禁位、INIT 派生同一类（ADR-040 §2.3）。
+/// ADR-040 §2.3 明定 5 个能力位**无预留位**，新增位须走 ADR-000 通道（决策级变更），
+/// 故本项复用既有 `CAP_SYSTEM` 而不新登记位（§3.5.1 G6 原文允许二者择一）。
+///
+/// 真实调用方不受影响（已核）：`volumed` 由 init（`ProcessIdentity::system(1)`）
+/// 经 `compute_child_identity` 继承派生，持全能力，故本门禁不破坏既有启动链。
+pub fn test_volume_domain_cap_gate() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Caps, Process, ProcessIdentity};
+
+    info!("[test-volume-gate] === A2-9: volume domain capability gate ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3, a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0, aux_pid: 0,
+        }
+    }
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+    const EACCES_U64: u64 = (-13i64) as u64;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    // 用户缓冲：设备名 + 挂载路径回传区。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < ERR_FLAG, "mmap must succeed");
+    let buf = map.result;
+    let out_buf = buf + 0x1000;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        let mut a = buf;
+        while a < buf + 0x2000 {
+            p.addr_space().handle_page_fault(a, arch_x86_64::paging::PageFaultCode::new(0));
+            a += 0x1000;
+        }
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let dev = b"ata9nosuchdev\x00";
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(buf)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(dev.as_ptr(), (pa + off) as *mut u8, dev.len());
+    }
+    let upath = b"/volumes/whatever\x00";
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(buf + 0x200)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(upath.as_ptr(), (pa + off) as *mut u8, upath.len());
+    }
+
+    // ---- 1. 普通用户（无 CAP_SYSTEM）mount → EACCES ----
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::user(1000, 1000));
+    let mut m = frame(crate::syscall::SYS_VOLUME_MOUNT, buf, out_buf, 255);
+    assert!(crate::syscall::syscall_entry(&mut m));
+    assert_eq!(m.result, EACCES_U64, "unprivileged mount must EACCES");
+    info!("[test-volume-gate] unprivileged mount -> EACCES OK");
+
+    // ---- 2. 普通用户 unmount → EACCES ----
+    let mut u = frame(crate::syscall::SYS_VOLUME_UNMOUNT, buf + 0x200, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut u));
+    assert_eq!(u.result, EACCES_U64, "unprivileged unmount must EACCES");
+    info!("[test-volume-gate] unprivileged unmount -> EACCES OK");
+
+    // ---- 3. 持 CAP_SYSTEM 者**通过门禁**（不被 EACCES 拦下）----
+    // 设备名不存在，故内核随后如实 NotFound——但**绝不是 PermissionDenied**：
+    // 这证明拒绝来自门禁而非设备缺失，是门禁真实生效的判别性证据。
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
+    let mut m2 = frame(crate::syscall::SYS_VOLUME_MOUNT, buf, out_buf, 255);
+    assert!(crate::syscall::syscall_entry(&mut m2));
+    assert_ne!(m2.result, EACCES_U64, "CAP_SYSTEM must pass the gate, got {:#x}", m2.result);
+    assert!(m2.result & ERR_FLAG != 0, "bogus device honestly errors (not fake success)");
+    info!("[test-volume-gate] CAP_SYSTEM passes gate (honest NotFound) OK");
+
+    // ---- 4. 持 CAP_SYSTEM 者 unmount 不存在的挂载点 → 如实失败（非 EACCES）----
+    let mut u2 = frame(crate::syscall::SYS_VOLUME_UNMOUNT, buf + 0x200, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut u2));
+    assert_ne!(u2.result, EACCES_U64, "CAP_SYSTEM must pass the gate");
+    assert!(u2.result & ERR_FLAG != 0, "nonexistent mountpoint honestly errors");
+    info!("[test-volume-gate] CAP_SYSTEM unmount passes gate OK");
+
+    // ---- 5. 仅 CAP_OWNER（无 CAP_SYSTEM）不足以挂载：证门禁判据是 CAP_SYSTEM ----
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity {
+        uid: 1000, gid: 1000, groups: task::Groups::empty(), caps: Caps::OWNER,
+    });
+    let mut m3 = frame(crate::syscall::SYS_VOLUME_MOUNT, buf, out_buf, 255);
+    assert!(crate::syscall::syscall_entry(&mut m3));
+    assert_eq!(m3.result, EACCES_U64, "CAP_OWNER alone must not mount");
+    info!("[test-volume-gate] CAP_OWNER alone insufficient OK");
+
+    task::clear_current_proc();
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    unsafe { drop(Box::from_raw(proc_raw)); }
+    info!("[test-volume-gate] === A2-9 pass ===");
+}
+
+
+
 /// 读回 `identity_query` 写出的 `IdentityInfo`（uuid/gid/caps 三个 u32 槽）。
 /// 布局与内核 `IdentityInfo` 一致（`#[repr(C)]`，S13 单点）。
 fn read_identity_out(buf: u64) -> (u32, u32, u32) {

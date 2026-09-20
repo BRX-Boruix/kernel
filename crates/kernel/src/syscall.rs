@@ -3597,6 +3597,14 @@ fn sys_driver_dma_free(frame: &mut SyscallFrame) -> u64 {
 /// 字节长度。失败如实上抛（NotFound/Corrupt/NotSupported/ReadOnly），绝不伪挂
 /// 成功。路径长度超内部上限（255）→ `OutOfRange`；超 `out_cap` → `NoSpace`。
 fn sys_volume_mount(frame: &mut SyscallFrame) -> u64 {
+    // A2-9 / ADR-040 §3.5 G6：资源域权限门禁。挂载文件系统属**系统管理**
+    // 操作，与 power/reboot、门禁位、INIT 派生同归 `CAP_SYSTEM`（§2.3）。
+    // 补此门禁前本调用**零检查**——任意进程可挂载任意块设备（"机制就绪却
+    // 未接线"，S13）。真实调用方 volumed 由 init(system(1)) 派生持全能力，
+    // 故不受影响。单点判定（S13），不设第二条路径。
+    if !current_has_cap(Caps::SYSTEM) {
+        return pack_err(Error::PermissionDenied);
+    }
     // 路径上限 255：保证回传路径（含最长卷标后缀）落在 libsys 的 256 字节
     // 缓冲内且留出终结判断余量，与 libsys `n >= 256` 拒绝口径一致（V4）。
     const MAX_MOUNT_PATH_BYTES: usize = 255;
@@ -3730,6 +3738,11 @@ fn sys_volume_format(frame: &mut SyscallFrame) -> u64 {
 /// 卸载指定挂载点（`MountTable::unmount`）。路径须为 `/volumes/...` 绝对路径，
 /// 由用户提供并规范化；不存在的挂载点如实 `NotFound`。
 fn sys_volume_unmount(frame: &mut SyscallFrame) -> u64 {
+    // A2-9 / ADR-040 §3.5 G6：同 `sys_volume_mount` 的资源域门禁（`CAP_SYSTEM`）。
+    // 卸载是对全系统可见的破坏性操作，与挂载同域同判据。
+    if !current_has_cap(Caps::SYSTEM) {
+        return pack_err(Error::PermissionDenied);
+    }
     let path_ptr = frame.a1;
     let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,

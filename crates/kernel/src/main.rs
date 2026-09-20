@@ -785,6 +785,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_identity_set_and_query();
 
+    // A2-9（ADR-040 §3.5 G6）：资源域权限校验（表级+syscall，返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_volume_domain_cap_gate();
+
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();
