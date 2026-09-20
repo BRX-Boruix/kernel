@@ -13519,6 +13519,224 @@ pub fn test_chown_e2e() {
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-chown-e2e] PASS");
 }
+
+
+/// A1-9 / §3.2 #9：ACE 语义三项停机测试（ADR-040 §2.2 决定性 ACE 规则）。
+///
+/// ① deny 前置拒绝：首条 deny 覆盖所需位 → 首匹配即决 EACCES；
+/// ② deny 后置被短路：allow 在前 → 同主体后置 deny 不可达；
+/// ③ 隐式三条经典语义：无显式 ACE 时 0644/0700 与 POSIX classic 一致。
+/// 纯逻辑层（evaluate 单点算法）；E2E 见 test_ace_e2e。
+#[cfg(feature = "kernel-tests")]
+pub fn test_ace_semantics() {
+    use vfs::{AccessPolicy, Ace, PermBits, Principal, Subject};
+
+    info!("[test-ace-semantics] === A1-9: ACE three-rule semantics ====");
+
+    // ---- ① deny 前置拒绝 ----
+    {
+        let policy = AccessPolicy::new(
+            alloc::vec![
+                Ace { principal: Principal::NamedUid(1000), allow: false, perms: PermBits::WRITE, inherit: false },
+                Ace { principal: Principal::NamedUid(1000), allow: true, perms: PermBits::READ.union(PermBits::WRITE), inherit: false },
+            ],
+            0o040,
+        ).with_owner(0, 0);
+        let groups: [u32; 0] = [];
+        let alice = Subject { uid: 1000, gid: 1000, groups: &groups };
+        assert_eq!(
+            policy.evaluate(&alice, PermBits::WRITE),
+            Err(klib::error::Error::PermissionDenied),
+            "front deny W must reject despite later allow RW"
+        );
+        assert_eq!(policy.evaluate(&alice, PermBits::READ), Ok(()), "deny W must not cascade to R");
+        assert_eq!(
+            policy.evaluate(&alice, PermBits::READ.union(PermBits::WRITE)),
+            Ok(()),
+            "deny W skipped on combined R+W: first decisive ACE covering ALL required bits is the allow RW"
+        );
+    }
+    info!("[test-ace-semantics] front-deny decides, no cascade OK");
+
+    // ---- ② deny 后置被短路 ----
+    {
+        let policy = AccessPolicy::new(
+            alloc::vec![
+                Ace { principal: Principal::NamedUid(1000), allow: true, perms: PermBits::READ.union(PermBits::WRITE), inherit: false },
+                Ace { principal: Principal::NamedUid(1000), allow: false, perms: PermBits::WRITE, inherit: false },
+            ],
+            0o000,
+        ).with_owner(0, 0);
+        let groups: [u32; 0] = [];
+        let alice = Subject { uid: 1000, gid: 1000, groups: &groups };
+        assert_eq!(policy.evaluate(&alice, PermBits::WRITE), Ok(()), "first-match allow short-circuits later deny");
+        assert_eq!(policy.evaluate(&alice, PermBits::READ), Ok(()));
+    }
+    info!("[test-ace-semantics] first-match allow short-circuits later deny OK");
+
+    // ---- ③ 隐式三条经典语义 ----
+    {
+        let groups: [u32; 0] = [];
+        let p644 = AccessPolicy::from_classic_owned(0o644, 1000, 100);
+        let owner = Subject { uid: 1000, gid: 100, groups: &groups };
+        let peer = Subject { uid: 7, gid: 100, groups: &groups };
+        let stranger = Subject { uid: 8, gid: 200, groups: &groups };
+        assert_eq!(p644.evaluate(&owner, PermBits::READ.union(PermBits::WRITE)), Ok(()), "0644 owner rw");
+        assert_eq!(p644.evaluate(&peer, PermBits::READ), Ok(()), "0644 group/other r");
+        assert_eq!(
+            p644.evaluate(&stranger, PermBits::WRITE),
+            Err(klib::error::Error::PermissionDenied),
+            "0644 other no w"
+        );
+        let p700 = AccessPolicy::from_classic_owned(0o700, 1000, 100);
+        assert_eq!(p700.evaluate(&owner, PermBits::EXECUTE), Ok(()), "0700 owner x");
+        assert_eq!(
+            p700.evaluate(&peer, PermBits::READ),
+            Err(klib::error::Error::PermissionDenied),
+            "0700 group none"
+        );
+    }
+    info!("[test-ace-semantics] implicit classic trio matches POSIX OK");
+
+    info!("[test-ace-semantics] PASS");
+}
+
+
+/// A1-9 / §3.2 #9 E2E：alice 家目录真实 open 链路（ADR-040 首要收益证明）。
+///
+/// 节点 /scratch/a9_home.txt 经 set_permissions（A1-7 分层：策略本体整体替换）
+/// 写入两条显式 ACE：NamedUid(1000 alice) Allow R+W；NamedUid(1001 bob) Allow R；
+/// 隐式尾部 0600。POSIX classic 无法直接表达（0644 会给 other 读位）——
+/// stranger 恒拒。断言走真实 sys_open 强制链（门禁 → CAP_OWNER → evaluate）。
+/// 伪当前进程形态与 test_chown_e2e 同构。
+#[cfg(feature = "kernel-tests")]
+pub fn test_ace_e2e() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Caps, Groups, Process, ProcessIdentity};
+
+    info!("[test-ace-e2e] === A1-9: alice home ACE E2E (real open chain) ====");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3,
+            a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0,
+            aux_pid: 0,
+        }
+    }
+
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+    const EACCES_U64: u64 = (-13i64) as u64;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // 用户缓冲：路径槽。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
+    let buf = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        let mut a = buf;
+        while a < buf + 0x2000 {
+            p.addr_space().handle_page_fault(a, arch_x86_64::paging::PageFaultCode::new(0));
+            a += 0x1000;
+        }
+    }
+    let write_path = |slot: u64, s: &[u8]| unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(slot))
+            .expect("slot resident")
+            .as_u64();
+        let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+        core::ptr::copy_nonoverlapping(s.as_ptr(), (pa + off) as *mut u8, s.len());
+    };
+
+    // 夹具：建 0600 节点（属主 System(1,1)），经 set_permissions 写两条显式 ACE。
+    let root = crate::vfs_init::root();
+    root.create_file("/scratch/a9_home.txt", 0o600, (1, 1)).expect("fixture");
+    {
+        let node = root.resolve("/scratch/a9_home.txt", true).expect("resolve");
+        let ace_policy = vfs::AccessPolicy::new(
+            alloc::vec![
+                vfs::Ace { principal: vfs::Principal::NamedUid(1000), allow: true, perms: vfs::PermBits::READ.union(vfs::PermBits::WRITE), inherit: false },
+                vfs::Ace { principal: vfs::Principal::NamedUid(1001), allow: true, perms: vfs::PermBits::READ, inherit: false },
+            ],
+            0o600,
+        ).with_owner(1, 1);
+        node.set_permissions(&ace_policy).expect("install ace policy");
+    }
+    write_path(buf, b"/scratch/a9_home.txt\x00");
+
+
+    // open 位语义：RDONLY=0 / WRONLY=1（ADR-014 §4.1）。
+    const O_RDONLY: u64 = 1; // to_bits: read=bit0（0=无读无写→required=empty→恒放行）
+    const O_WRONLY: u64 = 2; // to_bits: write=bit1（read=bit0）
+
+    fn open_as(uid: u32, gid: u32, caps: task::Caps, path: u64, flags: u64, f: &mut SyscallFrame) -> u64 {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity { uid, gid, groups: Groups::empty(), caps });
+        f.nr = crate::syscall::SYS_STREAM_CREATE as u64;
+        f.a1 = path;
+        f.a2 = flags;
+        f.a3 = 0o600;
+        f.a4 = 0; f.a5 = 0; f.result = 0; f.switched = false;
+        assert!(crate::syscall::syscall_entry(f), "syscall_entry must run");
+        f.result
+    }
+
+
+    let mut f = frame(0, 0, 0, 0);
+
+    // alice(1000)：读写均 OK。
+    assert_eq!(open_as(1000, 1000, Caps::EMPTY, buf, O_RDONLY, &mut f) & ERR_FLAG, 0, "alice RDONLY ok");
+    assert_eq!(open_as(1000, 1000, Caps::EMPTY, buf, O_WRONLY, &mut f) & ERR_FLAG, 0, "alice WRONLY ok");
+    info!("[test-ace-e2e] alice(1000) read+write OK");
+
+    // bob(1001)：只读 OK；写 EACCES。
+    assert_eq!(open_as(1001, 1001, Caps::EMPTY, buf, O_RDONLY, &mut f) & ERR_FLAG, 0, "bob RDONLY ok");
+    assert_eq!(
+        open_as(1001, 1001, Caps::EMPTY, buf, O_WRONLY, &mut f),
+        EACCES_U64,
+        "bob WRONLY denied"
+    );
+    info!("[test-ace-e2e] bob(1001) read-only OK, write denied OK");
+
+    // stranger(777)：读写均 EACCES——classic 0644 会放行其读（首要收益对照）。
+    assert_eq!(open_as(777, 777, Caps::EMPTY, buf, O_RDONLY, &mut f), EACCES_U64, "stranger RDONLY denied");
+    assert_eq!(open_as(777, 777, Caps::EMPTY, buf, O_WRONLY, &mut f), EACCES_U64, "stranger WRONLY denied");
+    info!("[test-ace-e2e] stranger(777) fully denied (POSIX 0644 would leak read) OK");
+
+    // CAP_OWNER 绕过回归（判定序第 2 步）。
+    assert_eq!(
+        open_as(1, 1, Caps::SYSTEM.union(Caps::OWNER), buf, O_WRONLY, &mut f) & ERR_FLAG,
+        0,
+        "CAP_OWNER bypass regression"
+    );
+
+    // 清理（CAP 通道）。
+    let _ = root.unlink("/scratch/a9_home.txt");
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-ace-e2e] PASS");
+}
 /// PRE-1 / ADR-037 决策 5 / A1-2 能力位改判：UIO 特权门禁——driver_register/
 /// driver_claim 仅持 `CAP_DEVICE` 者可调用，其余一律 `PermissionDenied`（EACCES/13）。
 ///
