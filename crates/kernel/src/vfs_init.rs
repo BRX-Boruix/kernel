@@ -1042,6 +1042,42 @@ fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
     // 符号链接长期稳定存在，但文档与代码主路径一律写正名。
     ensure_link();
 
+    // ---- A1-8（ADR-040 §2.8）：种子账户表 /config/users.json ----
+    //
+    // userd 的输入。内核**不解析**账户表（Q6：账户即文件，解析归用户态）；
+    // 这里只以 VFS 原语创建文件，内容 schema 与 userd::parse_accounts 对齐：
+    // {"users":[{"name":"alice","uid":1000,"gid":1000}, ...]}
+    //
+    // 种子账户 alice 是 ADR-040 验收（§3.2）与 A1-9 ACE E2E 的固定夹具：
+    // 非特权 (1000,1000)，与 System(1)/root(0) 三足分立。幂等：已存在容忍
+    // （内容以**启动期重写**为准——账户表是系统配置，内核种子为权威初值，
+    // 避免上一轮测试遗留的畸形表卡死验收）。
+    {
+        const SEED_USERS_JSON: &[u8] =
+            b"{\"users\":[{\"name\":\"alice\",\"uid\":1000,\"gid\":1000}]}";
+        match mount_table.create_file("/config/users.json", 0o644, (0, 0)) {
+            Ok(f) => {
+                // 启动期权威重写（truncate 语义由 RamFS/EXT2 write_at 覆盖路径保证：
+                // 先建空文件再从 0 写满——EXT2 侧 create_entry 建的是空文件，
+                // 这里写入即初值；重复启动时文件已存在，create_file 返回
+                // AlreadyExists，走下面 read 校验分支兜底）。
+                if let Err(e) = f.write_at(0, SEED_USERS_JSON) {
+                    panic!("seed users.json write: {:?}", e);
+                }
+            }
+            Err(klib::error::Error::AlreadyExists) => {
+                // 已存在（上轮启动/用户手写）：校验可读即可，不覆盖（用户数据优先）。
+                if let Ok(f) = mount_table.resolve("/config/users.json", true) {
+                    let mut probe = [0u8; 4];
+                    if matches!(f.read_at(0, &mut probe), Err(_)) {
+                        klib::error!("[mu] /config/users.json unreadable; userd will report");
+                    }
+                }
+            }
+            Err(e) => panic!("seed users.json create: {:?}", e),
+        }
+    }
+
     // 挂载特殊文件系统
     let procfs = Arc::new(ProcFS::new(Arc::new(KernelProcessProvider)));
     mount_table
