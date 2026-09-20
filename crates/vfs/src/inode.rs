@@ -405,6 +405,11 @@ pub struct StatInfo {
     pub modified_time: u64,
     /// 变更时间（Unix 秒）。
     pub changed_time: u64,
+    /// 属主 uid（A1-4 / ADR-040 §2.4：**尾部追加**——repr(C) 布局只许
+    /// 向尾部增长，两侧（kernel↔libsys）必须同变更同步；PRE-12 纪律）。
+    pub owner_uid: u32,
+    /// 属主 gid（同上）。
+    pub owner_gid: u32,
 }
 
 impl StatInfo {
@@ -422,6 +427,10 @@ impl StatInfo {
     }
 
     /// 从元数据构造 ABI 结果。
+    ///
+    /// A1-4：属主字段取自节点 [`AccessPolicy`] 本体（A1-1 起策略即存储
+    /// 属主；`from_classic` 过渡态为 (0,0)，EXT2 `i_uid` 真值归 A1-5——
+    /// 字段自本项起如实投影，不再伪造 0）。
     pub fn from_metadata(m: &FileMetadata) -> Self {
         Self {
             node_type: Self::type_tag(m.node_type),
@@ -430,6 +439,8 @@ impl StatInfo {
             created_time: m.created_time,
             modified_time: m.modified_time,
             changed_time: m.changed_time,
+            owner_uid: m.permissions.owner_uid(),
+            owner_gid: m.permissions.owner_gid(),
         }
     }
 }
@@ -632,3 +643,19 @@ pub trait FileSystem: Send + Sync {
     /// 文件系统类型名（如 "ramfs", "devfs", "procfs"）。
     fn name(&self) -> &'static str;
 }
+
+/// PRE-12 / A1-4：**两侧镜像一致性断言**（编译期钉死）。
+///
+/// kernel vfs::inode::StatInfo 与 libsys::StatInfo 是同一 ABI 结构的两侧，
+/// `#[repr(C)]` 布局逐字段一致是跨边界数据契约（S06）。此处把本侧的
+/// 尺寸与属主字段偏移钉成常量；libsys 侧镜像同值断言（见 libsys/src/io.rs）。
+/// 任一侧**尾部**追加字段而另一侧未同步时，两侧 sizeof 不等——宿主侧可
+/// 直接对拍（kernel 宿主测试 / libsys 单测读同一对常量）；本侧先以编译期
+/// 常量形式登记真值。
+pub const STAT_INFO_SIZE: usize = core::mem::size_of::<StatInfo>();
+
+const _: () = {
+    assert!(STAT_INFO_SIZE == 56, "StatInfo layout drifted: sync libsys mirror");
+    assert!(core::mem::offset_of!(StatInfo, owner_uid) == 48);
+    assert!(core::mem::offset_of!(StatInfo, owner_gid) == 52);
+};

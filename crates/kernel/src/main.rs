@@ -680,6 +680,9 @@ unsafe fn kmain_body() -> ! {
     // A1-3 / ADR-040 §2.6：统一强制矩阵停机级验收（§3.2 #4/#5/#6）。
     #[cfg(feature = "kernel-tests")]
     tests::test_access_enforcement_matrix();
+    // A1-4 / ADR-040 §2.4：StatInfo 属主字段真值投影（stat/fstat 通道）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_stat_owner_fields();
     // PRE-1 / ADR-037 决策 5：UIO driver_register/driver_claim 特权门禁（System-only）。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_uio_privilege_gate();

@@ -13054,6 +13054,171 @@ pub fn test_access_enforcement_matrix() {
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-access-matrix] PASS");
 }
+
+/// A1-4 / ADR-040 §2.4 + PRE-12：StatInfo 属主字段停机级验收。
+///
+/// 真实 syscall 入口（SYS_ENTRY_READ + ENTRY_READ_STAT / SYS_STREAM_FSTAT）+
+/// 伪当前进程：验证 stat/fstat 通道输出的属主字段与节点策略本体一致——
+/// libc 第三侧归真（st_uid/st_gid 硬编码 0 的消除）在 A1-7（libc 独立仓库）。
+/// 布局一致性（sizeof=56 / owner 偏移 48/52）由两侧编译期字面断言钉死。
+#[cfg(feature = "kernel-tests")]
+pub fn test_stat_owner_fields() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Process, ProcessIdentity};
+
+    info!("[test-stat-owner] === A1-4: StatInfo owner fields ====");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3,
+            a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0,
+            aux_pid: 0,
+        }
+    }
+    fn frame4(nr: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> SyscallFrame {
+        let mut f = frame(nr, a1, a2, a3);
+        f.a4 = a4;
+        f
+    }
+
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // 夹具：属主 (42, 43) 的 0644 节点 + 属主 (0,0) 的对照节点。
+    let root = crate::vfs_init::root();
+    root.create_file("/scratch/a4_owner.txt", 0o644, (42, 43)).expect("fixture owned node");
+    root.create_file("/scratch/a4_zero.txt", 0o644, (0, 0)).expect("fixture zero node");
+
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
+    let buf = map.result;
+    let mut map2 = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map2));
+    assert!(map2.result < 0x8000_0000_0000_0000, "mmap2 must succeed");
+    let out_buf = map2.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        let mut a = buf;
+        while a < buf + 0x1000 {
+            p.addr_space().handle_page_fault(a, arch_x86_64::paging::PageFaultCode::new(0));
+            a += 0x1000;
+        }
+        let mut b = out_buf;
+        while b < out_buf + 0x1000 {
+            p.addr_space().handle_page_fault(b, arch_x86_64::paging::PageFaultCode::new(0));
+            b += 0x1000;
+        }
+    }
+    // 路径槽独立（buf / buf+0x100），不与输出缓冲重叠——fstat 的 open
+    // 必须精确指向被测节点（曾因路径槽复用读了 zero 节点而红，教训成文）。
+    let path = b"/scratch/a4_owner.txt\x00";
+    let path2 = b"/scratch/a4_zero.txt\x00";
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let slots: [&[u8]; 2] = [path, path2];
+    for (i, ps) in slots.iter().enumerate() {
+        unsafe {
+            let pa = task::current_proc_mut()
+                .expect("proc")
+                .addr_space()
+                .translate(arch::VirtAddr::new(buf + (i as u64) * 0x100))
+                .expect("path slot resident")
+                .as_u64();
+            core::ptr::copy_nonoverlapping(ps.as_ptr(), (pa + off) as *mut u8, ps.len());
+        }
+    }
+
+    // stat 通道（SYS_ENTRY_READ + ENTRY_READ_STAT）：属主真值投影。
+    let mut st = frame4(crate::syscall::SYS_ENTRY_READ, buf, out_buf, 0x100, crate::syscall::ENTRY_READ_STAT);
+    assert!(crate::syscall::syscall_entry(&mut st));
+    assert!(st.result & ERR_FLAG == 0, "stat must succeed");
+    assert_eq!(st.result as usize, 56, "StatInfo ABI size must be 56");
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(out_buf))
+            .expect("stat out resident")
+            .as_u64();
+        let info = core::ptr::read_unaligned((pa + off) as *const vfs::inode::StatInfo);
+        assert_eq!(info.owner_uid, 42, "stat must report real owner uid");
+        assert_eq!(info.owner_gid, 43, "stat must report real owner gid");
+        assert_eq!(info.perms & 0o777, 0o644, "classic mode encoded");
+    }
+    info!("[test-stat-owner] stat channel real owners OK");
+
+    // 对照节点：属主 (0,0) 如实 0（语义是"真值是 0"，非伪造——与旧硬编码
+    // 的区别在数据来源：现在来自节点策略本体）。路径槽 1（buf+0x100）
+    // 已在夹具写入 a4_zero——**不得**再覆盖槽 0（曾致 fstat 打错节点）。
+    let mut st2 = frame4(crate::syscall::SYS_ENTRY_READ, buf + 0x100, out_buf, 0x100, crate::syscall::ENTRY_READ_STAT);
+    assert!(crate::syscall::syscall_entry(&mut st2));
+    assert!(st2.result & ERR_FLAG == 0, "stat of zero-owned node must succeed");
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(out_buf))
+            .expect("stat out resident")
+            .as_u64();
+        let info = core::ptr::read_unaligned((pa + off) as *const vfs::inode::StatInfo);
+        assert_eq!(info.owner_uid, 0, "zero-owner node reports 0 (from policy, not hardcode)");
+        assert_eq!(info.owner_gid, 0, "zero-owner node reports 0");
+    }
+    info!("[test-stat-owner] zero-owner control node OK");
+
+    // fstat 通道：fd 句柄路径同样投影真属主。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity { uid: 42, gid: 43, groups: task::Groups::empty(), caps: task::Caps::EMPTY });
+    }
+    const OPEN_READ: u64 = 1 << 0;
+    let mut o = frame(crate::syscall::SYS_STREAM_CREATE, buf, OPEN_READ, 0);
+    assert!(crate::syscall::syscall_entry(&mut o));
+    assert!(o.result & ERR_FLAG == 0, "owner READ open on 0644 must succeed");
+    let fd = o.result;
+    let mut fs_ = frame(crate::syscall::SYS_STREAM_FSTAT, fd, out_buf, 0);
+    assert!(crate::syscall::syscall_entry(&mut fs_));
+    assert!(fs_.result & ERR_FLAG == 0, "fstat must succeed");
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(out_buf))
+            .expect("fstat out resident")
+            .as_u64();
+        let info = core::ptr::read_unaligned((pa + off) as *const vfs::inode::StatInfo);
+        assert_eq!(info.owner_uid, 42, "fstat must report real owner uid");
+        assert_eq!(info.owner_gid, 43, "fstat must report real owner gid");
+    }
+    info!("[test-stat-owner] fstat channel real owners OK");
+
+    // 清理（CAP 通道）。
+    {
+        let root = crate::vfs_init::root();
+        let _ = root.unlink("/scratch/a4_owner.txt");
+        let _ = root.unlink("/scratch/a4_zero.txt");
+    }
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-stat-owner] PASS");
+}
 /// PRE-1 / ADR-037 决策 5 / A1-2 能力位改判：UIO 特权门禁——driver_register/
 /// driver_claim 仅持 `CAP_DEVICE` 者可调用，其余一律 `PermissionDenied`（EACCES/13）。
 ///

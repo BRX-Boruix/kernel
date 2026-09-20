@@ -820,6 +820,11 @@ fn sys_fstat(frame: &mut SyscallFrame) -> u64 {
     let Some(vfs::file_handle::OpenHandle::File(fh)) = proc.get_fd(fd) else {
         return pack_err(Error::NotFound); // fd 缺失或 pipe 端（fstat 仅文件）
     };
+    // A1-3 / §2.6：元数据读随 readdir 归 Read 语义——fstat 也强制。
+    let identity = proc.identity();
+    if let Err(e) = check_access(&identity, fh.inode.as_ref(), vfs::inode::PermBits::READ) {
+        return pack_err(e);
+    }
     let meta = match fh.inode.metadata() {
         Ok(m) => m,
         Err(e) => return pack_err(e),
