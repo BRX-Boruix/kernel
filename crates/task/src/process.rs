@@ -182,6 +182,18 @@ impl Caps {
     /// 绕过文件访问策略（DAC_OVERRIDE 对应物；A1-3 强制矩阵启用）。
     pub const OWNER: Caps = Caps(1 << 4);
 
+    /// 全部合法能力位的并集（ADR-040 2.3「5 个、**无预留位**」）。
+    ///
+    /// 用于**位域合法性校验**：A2-1 身份变更接收用户给定 caps 位时，必须拒绝
+    /// 越出本掩码的位，而不是静默丢弃（静默丢弃会让调用方以为拿到了不存在的
+    /// 权限——典型能力谎言 S06/S09）。新增能力位时此处**必须**同步（否则新位
+    /// 永远无法经 ABI 设置，且旧值会被误判非法）。
+    pub const ALL: Caps = Caps(Self::SYSTEM.0 | Self::DEVICE.0 | Self::MEMORY.0 | Self::KILL.0 | Self::OWNER.0);
+
+    /// 由裸位构造。**调用方须先以 [`Caps::ALL`] 校验位域合法**，否则得到的 Caps
+    /// 携带未定义位，会静默影响所有 `contains` 判定。
+    pub const fn from_bits(bits: u8) -> Caps { Caps(bits) }
+
     pub const fn bits(self) -> u8 { self.0 }
 
     pub const fn contains(self, other: Caps) -> bool {

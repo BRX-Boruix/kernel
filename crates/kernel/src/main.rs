@@ -781,6 +781,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_kill_cross_user_owner_check();
 
+    // A2-1（ADR-040 §3.5 G1）：身份查询/变更（表级+syscall，返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_identity_set_and_query();
+
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();

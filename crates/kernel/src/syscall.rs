@@ -191,6 +191,58 @@ pub const SYS_TASK_GETPID: u32 = nr(domain::TASK, 0x09); // 0x39
 /// `nr.rs::SYS_TASK_DERIVE` 同值、注释互指。
 pub const SYS_TASK_DERIVE: u32 = nr(domain::TASK, 0x0A); // 0x3A
 
+/// `identity_query(out_ptr) -> 0`：把调用进程的**真实** uid/gid/caps 写入用户缓冲
+/// （[`IdentityInfo`]，12 字节）。
+///
+/// A2-1 / ADR-040 §3.5 G1（承 ADR-033 遗留 T-A1b）。**只读**，无权限门禁——进程
+/// 查自己的身份不构成越权；不提供"查任意 pid"形态（那需要额外的授权语义，本项
+/// 不做，避免开出未被裁定的越权面）。TASK 域扩展动词 0x0B；双侧镜像（S13）：
+/// 与 libsys `nr.rs::SYS_TASK_IDENTITY_QUERY` 同值、注释互指。
+pub const SYS_TASK_IDENTITY_QUERY: u32 = nr(domain::TASK, 0x0B); // 0x3B
+
+/// `identity_set(uid, gid, reserved, caps) -> 0`：变更调用进程组的身份。
+///
+/// **路线 B：完整 setuid 语义**（ADR-040 §3.5.4 #14 的对称完整形态；项目所有者
+/// 2026-09 裁定）。授权按 `CAP_SYSTEM` 二分：
+/// - 无 `CAP_SYSTEM`：只允许**降权或保持不变**（uid/gid 不得改变，caps 只能
+///   去掉已有位）；任何提权或改 uid → `PermissionDenied`。
+/// - 持 `CAP_SYSTEM`：可设为**任意** uid/gid（login 校验通过后据此把 shell
+///   变成目标用户——这是 A2-7 登录闭环的唯一通道）。
+///
+/// 身份变更是**进程组级**（`ThreadGroup` 共享 `identity`，承现有
+/// `Process::set_identity` 组锁），故本调用影响调用线程所在组的全部成员。
+/// 参数只用定长数字（ADR-018 三层校验零改动 / ADR-040 §2.10）；
+/// TASK 域扩展动词 0x0C；双侧镜像（S13）：与 libsys
+/// `nr.rs::SYS_TASK_IDENTITY_SET` 同值、注释互指。
+pub const SYS_TASK_IDENTITY_SET: u32 = nr(domain::TASK, 0x0C); // 0x3C
+
+/// `SYS_TASK_IDENTITY_SET` 的保留参数（`a3`）唯一合法取值。
+/// 用命名常量而非字面量 0，使"保留位"是一处成文语义而非魔法值（S13）。
+pub const IDENTITY_SET_RESERVED_NONE: u64 = 0;
+
+/// 身份查询/变更的 ABI 结果结构（A2-1；与 libsys `io::IdentityInfo` 同布局镜像）。
+///
+/// `#[repr(C)]` 固定布局，跨边界真实数据合约；任一侧改字段必须同变更同步
+/// （PRE-12 纪律）。字段全为定长数字（ADR-018/ADR-040 §2.10）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdentityInfo {
+    /// 真实 uid（**不得**伪造、不得兜底）。
+    pub uid: u32,
+    /// 真实 gid。
+    pub gid: u32,
+    /// 能力位（`Caps::bits()` 零扩展）。
+    pub caps: u32,
+}
+
+/// A2-1：两侧（kernel ↔ libsys）镜像一致性断言（编译期钉死，PRE-12 纪律）。
+const _: () = {
+    assert!(core::mem::size_of::<IdentityInfo>() == 12, "IdentityInfo layout drifted: sync libsys mirror");
+    assert!(core::mem::offset_of!(IdentityInfo, uid) == 0);
+    assert!(core::mem::offset_of!(IdentityInfo, gid) == 4);
+    assert!(core::mem::offset_of!(IdentityInfo, caps) == 8);
+};
+
 /// `SYS_TASK_DERIVE` 的保留位域（ADR-038 §2 决策 1）。
 ///
 /// 首期只接受 [`DERIVE_FLAGS_NONE`]；任何其它位如实 `InvalidParam`。
@@ -2469,6 +2521,107 @@ fn sys_getpid(_frame: &mut SyscallFrame) -> u64 {
     pack_ok(tgid as u64)
 }
 
+/// `identity_query` 处理器（A2-1 / SYS_TASK_IDENTITY_QUERY / 0x3B）：把调用进程的
+/// **真实** uid/gid/caps 写入用户缓冲。
+///
+/// 无权限门禁——查自己的身份不构成越权。**不提供**"查任意 pid"形态：那需要一套
+/// 本项未被裁定的额外授权语义，开出来即是未被审计的越权面（S39 不做无据扩展）。
+///
+/// 失败模式（S20）：无当前进程（内核/驱动上下文）→ `PermissionDenied`（内核自身
+/// 不是"进程"，不返回伪身份 0/0/0）；缓冲不可写 → ADR-018 三层校验如实 EFAULT。
+fn sys_identity_query(frame: &mut SyscallFrame) -> u64 {
+    let out_ptr = frame.a1;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::PermissionDenied);
+    };
+    let id = proc.identity();
+    let info = IdentityInfo {
+        uid: id.uid,
+        gid: id.gid,
+        caps: id.caps.bits() as u32,
+    };
+    let bytes = core::mem::size_of::<IdentityInfo>();
+    if let Err(e) = validate_user_range(out_ptr, bytes as u64, UserAccess::Write) {
+        return pack_err(e);
+    }
+    // 定长结构经 **SMAP 安全**的 copy_to_user 拷出（ADR-018 三层校验已在
+    // 上方完成，此处不再有用户侧长度参与）。不得用裸指针直写用户地址：
+    // 内核态直访用户页在 SMAP 下触发 #PF，而 arch 层对内核态 #PF 一律停机
+    // ——放过一处就是放过整机死机（validate_user_range 文档 §406 同诫）。
+    let raw = info;
+    let kbuf = unsafe {
+        core::slice::from_raw_parts(&raw as *const IdentityInfo as *const u8, bytes)
+    };
+    unsafe { arch_x86_64::mmio::copy_to_user(out_ptr, kbuf.as_ptr(), bytes) };
+    pack_ok(0)
+}
+
+/// `identity_set` 处理器（A2-1 / SYS_TASK_IDENTITY_SET / 0x3C）：变更调用进程组身份。
+///
+/// **路线 B：完整 setuid 语义**（项目所有者 2026-09 裁定）。授权按 `CAP_SYSTEM` 二分，
+/// 单点判定（S13）：
+///
+/// - **持 `CAP_SYSTEM`**：可设为任意 uid/gid/caps（login 认证通过后降权至目标用户——
+///   这是 A2-7 登录闭环的唯一通道）。
+/// - **无 `CAP_SYSTEM`**：只允许**降权或不变**——
+///   ① uid 必须保持不变（改 uid = 变成别人，属提权，一律拒绝）；
+///   ② caps 必须是原 caps 的**子集**（只减不增）。
+///   注意 gid：同 uid 前提下允许变更 gid（组是 uid 内的归属再划分，不构成跨用户
+///   越权）；若将来引入组账户表（A2-4）再收紧。
+///
+/// 任何不满足者一律 `PermissionDenied`，且**在写身份之前**拒绝——不许先写后校验。
+///
+/// 参数：`a1`=uid、`a2`=gid、`a3`=保留（必须 [`IDENTITY_SET_RESERVED_NONE`]）、
+/// `a4`=目标 caps 位（定长数字，ADR-018/ADR-040 §2.10 零拷贝面）。保留位非 0 一律
+/// `InvalidParam`（**绝不静默忽略**，同 DERIVE 纪律：静默忽略是能力谎言 S06/S09）。
+fn sys_identity_set(frame: &mut SyscallFrame) -> u64 {
+    let target_uid = frame.a1 as u32;
+    let target_gid = frame.a2 as u32;
+    let reserved = frame.a3;
+    let target_caps_bits = frame.a4;
+
+    if reserved != IDENTITY_SET_RESERVED_NONE {
+        return pack_err(Error::InvalidParam);
+    }
+    // caps 位域只有 5 位（ADR-040 §2.3「无预留位」）：超出即为非法请求，如实拒绝
+    // 而不是静默截断（后者会让调用方以为拿到了不存在的权限）。
+    if target_caps_bits > u8::MAX as u64 {
+        return pack_err(Error::InvalidParam);
+    }
+    let requested = Caps::from_bits(target_caps_bits as u8);
+    // 位域合法性：越出 ALL 掩码的位是非法请求，如实拒绝（不静默丢弃）。
+    if requested.bits() & !Caps::ALL.bits() != 0 {
+        return pack_err(Error::InvalidParam);
+    }
+
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::PermissionDenied);
+    };
+    let current = proc.identity();
+    if !current.caps.contains(Caps::SYSTEM) {
+        // 无 CAP_SYSTEM：只许降权。uid 不得改变、caps 不得新增位。
+        if target_uid != current.uid {
+            return pack_err(Error::PermissionDenied);
+        }
+        if requested.bits() & !current.caps.bits() != 0 {
+            return pack_err(Error::PermissionDenied);
+        }
+    }
+    // 组级写入（ThreadGroup 共享 identity，承 set_identity 组锁）。
+    proc.set_identity(ProcessIdentity {
+        uid: target_uid,
+        gid: target_gid,
+        groups: current.groups,
+        caps: requested,
+    });
+    klib::info!(
+        "[syscall] identity_set pid {}: {}:{} caps={} -> {}:{} caps={}",
+        proc.pid(), current.uid, current.gid, current.caps.bits(),
+        target_uid, target_gid, requested.bits()
+    );
+    pack_ok(0)
+}
+
 /// `derive` 处理器（ADR-038 / SYS_TASK_DERIVE / 0x3A）：**COW 派生子进程**。
 ///
 /// # 返回语义（POSIX fork 铁律）
@@ -3717,6 +3870,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         // gettid/getpid：非阻塞，返回本线程 pid / 组长 tgid（T2-6 / 0x38/0x39）。
         SYS_TASK_GETTID => done(sys_gettid(frame)),
         SYS_TASK_GETPID => done(sys_getpid(frame)),
+        SYS_TASK_IDENTITY_QUERY => done(sys_identity_query(frame)),
+        SYS_TASK_IDENTITY_SET => done(sys_identity_set(frame)),
         // derive：COW 派生子进程（ADR-038 / 0x3A）。非阻塞、返回两次语义
         // （父 rax=pid、子 rax=0），不切换——故返回 done。
         SYS_TASK_DERIVE => done(sys_task_derive(frame)),

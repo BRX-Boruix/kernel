@@ -9371,6 +9371,169 @@ pub fn test_kill_cross_user_owner_check() {
     info!("[test-kill-owner] === A2-0 pass ===");
 }
 
+/// A2-1（ADR-040 §3.5 G1 / §3.5.4 #14）：**身份查询与身份变更**（表级+syscall 停机验收）。
+///
+/// 语义裁定（项目所有者 2026-09 定，**路线 B：完整 setuid 语义**）：
+/// - **查询**：返回调用进程真实 uid/gid/caps（不含任何伪造/兜底）。
+/// - **变更**授权按 `CAP_SYSTEM` 二分：
+///   - 无 `CAP_SYSTEM`：只能**降权或保持不变**；任何提权/改 uid → `PermissionDenied`；
+///   - 持 `CAP_SYSTEM`：可设为**任意** uid/gid（login 认证通过后据此把 shell 变成 alice）。
+/// - 身份变更是**进程组级**（`ThreadGroup` 共享 `identity`，承现有 `set_identity` 组锁）。
+///
+/// 本测试同时是「降权后按降级身份判定」的端到端证据（验收 #14 第 1 条）：
+/// 降权后用同一个受强制路径（unlink 父目录写面）验证新身份**立即生效**。
+pub fn test_identity_set_and_query() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Caps, Groups, Process, ProcessIdentity};
+
+    info!("[test-identity-syscall] === A2-1: identity query + change (route B) ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3, a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0, aux_pid: 0,
+        }
+    }
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+    const EACCES_U64: u64 = (-13i64) as u64;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // 用户缓冲：一页用于 IdentityInfo 回传。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < ERR_FLAG, "mmap must succeed");
+    let out_buf = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space().handle_page_fault(out_buf, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+
+    // ---- 1. 查询返回真身份（初始 = 普通用户 alice(1000,1000) 无能力）----
+    let alice = ProcessIdentity::user(1000, 1000);
+    task::current_proc_mut().expect("proc").set_identity(alice);
+    let mut q = frame(crate::syscall::SYS_TASK_IDENTITY_QUERY, out_buf, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut q));
+    assert_eq!(q.result, 0, "identity_query must succeed");
+    let (uid, gid, caps) = read_identity_out(out_buf);
+    assert_eq!(uid, 1000, "query must report true uid");
+    assert_eq!(gid, 1000, "query must report true gid");
+    assert_eq!(caps, 0, "alice holds no caps");
+    info!("[test-identity-syscall] query true identity OK");
+
+    // ---- 2. 无 CAP_SYSTEM 不得提权（改 uid 到别人）----
+    let mut s = frame(crate::syscall::SYS_TASK_IDENTITY_SET, 1001, 1001, 0);
+    assert!(crate::syscall::syscall_entry(&mut s));
+    assert_eq!(s.result, EACCES_U64, "unprivileged uid change must EACCES");
+    let after = task::current_proc_mut().expect("proc").identity();
+    assert_eq!(after.uid, 1000, "denied change must not mutate identity");
+    info!("[test-identity-syscall] unprivileged escalation denied OK");
+
+    // ---- 3. 无 CAP_SYSTEM 不得加能力位（提权面）----
+    let mut s2 = frame(crate::syscall::SYS_TASK_IDENTITY_SET, 1000, 1000, 0);
+    s2.a4 = Caps::SYSTEM.bits() as u64;
+    assert!(crate::syscall::syscall_entry(&mut s2));
+    assert_eq!(s2.result, EACCES_U64, "unprivileged cap gain must EACCES");
+    info!("[test-identity-syscall] unprivileged cap gain denied OK");
+
+    // ---- 4. 无 CAP_SYSTEM **可以**降权（uid 不变、丢弃能力）----
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity { uid: 1000, gid: 1000, groups: Groups::empty(), caps: Caps::OWNER });
+    }
+    let mut s3 = frame(crate::syscall::SYS_TASK_IDENTITY_SET, 1000, 1000, 0);
+    s3.a4 = 0; // 目标能力集 = 空（纯降权）
+    assert!(crate::syscall::syscall_entry(&mut s3));
+    assert_eq!(s3.result, 0, "privilege drop must be allowed");
+    let dropped = task::current_proc_mut().expect("proc").identity();
+    assert_eq!(dropped.caps.bits(), 0, "caps must be dropped");
+    info!("[test-identity-syscall] privilege drop allowed OK");
+
+    // ---- 5. 持 CAP_SYSTEM 可设为任意 uid（login 路径）----
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity::system(1));
+    }
+    let mut s4 = frame(crate::syscall::SYS_TASK_IDENTITY_SET, 1000, 1000, 0);
+    s4.a4 = 0;
+    assert!(crate::syscall::syscall_entry(&mut s4));
+    assert_eq!(s4.result, 0, "CAP_SYSTEM may set arbitrary uid");
+    let now = task::current_proc_mut().expect("proc").identity();
+    assert_eq!(now.uid, 1000, "identity became alice");
+    assert_eq!(now.caps.bits(), 0, "and dropped caps (login downgrade)");
+    info!("[test-identity-syscall] CAP_SYSTEM arbitrary uid OK (login path)");
+
+    // ---- 6. 降权后按降级身份判定（验收 #14 首条，真实强制路径）----
+    // fixture：/scratch 属主 (0,0) 0755；alice(1000) 对其 create/unlink 应被父目录写面拒。
+    let root = crate::vfs_init::root();
+    let _ = root.create_file("/scratch/a2_1_probe.txt", 0o644, (0, 0));
+    let mut bp = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut bp));
+    let path_buf = bp.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space().handle_page_fault(path_buf, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let ps = b"/scratch/a2_1_probe.txt\x00";
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(path_buf)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(ps.as_ptr(), (pa + off) as *mut u8, ps.len());
+    }
+    // 当前已是降权后的 alice(1000, 无能力) → unlink /scratch 下文件应 EACCES。
+    let mut u = frame(crate::syscall::SYS_ENTRY_DELETE, path_buf, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut u));
+    assert_eq!(u.result, EACCES_U64, "downgraded identity must be enforced");
+    info!("[test-identity-syscall] post-downgrade enforcement OK");
+
+    // ---- 7. 同一路径在 CAP_SYSTEM 身份下放行（对照，证明是身份差异而非路径错误）----
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity::system(1));
+    }
+    let mut u2 = frame(crate::syscall::SYS_ENTRY_DELETE, path_buf, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut u2));
+    assert_eq!(u2.result, 0, "CAP_OWNER/system may unlink (control)");
+    info!("[test-identity-syscall] control unlink allowed OK");
+
+    task::clear_current_proc();
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    unsafe { drop(Box::from_raw(proc_raw)); }
+    info!("[test-identity-syscall] === A2-1 pass ===");
+}
+
+/// 读回 `identity_query` 写出的 `IdentityInfo`（uuid/gid/caps 三个 u32 槽）。
+/// 布局与内核 `IdentityInfo` 一致（`#[repr(C)]`，S13 单点）。
+fn read_identity_out(buf: u64) -> (u32, u32, u32) {
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let pa = task::current_proc_mut().expect("proc").addr_space()
+        .translate(arch::VirtAddr::new(buf)).expect("identity out resident").as_u64();
+    unsafe {
+        let p = (pa + off) as *const u32;
+        (
+            core::ptr::read_unaligned(p),
+            core::ptr::read_unaligned(p.add(1)),
+            core::ptr::read_unaligned(p.add(2)),
+        )
+    }
+}
+
+
+
 
 
 pub fn test_waitpid_core() {
