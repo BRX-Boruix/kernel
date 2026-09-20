@@ -56,7 +56,7 @@ pub use sysfs::{SysFS, SystemInfoProvider};
 mod tests {
     use super::*;
     use crate::file_handle::{FileHandle, OpenFlags, SeekWhence};
-    use crate::inode::{AccessPolicy, Ace, GATE_SYSTEM_BIT, INodeType, PermBits, Principal, Subject};
+    use crate::inode::{AccessPolicy, Ace, AceWire, GATE_SYSTEM_BIT, INodeType, PermBits, Principal, Subject, ACE_PRINCIPAL_NAMED_UID, ACE_PRINCIPAL_OWNER, ACE_WIRE_SIZE};
     use crate::mount::MountTable;
     use crate::path::Path;
     use crate::ramfs::RamFS;
@@ -1739,6 +1739,49 @@ fn test_audio_dsp_backpressure() {
         assert_eq!(policy.evaluate(&outsider, PermBits::WRITE), Err(Error::PermissionDenied), "非属主非同组 → other 段不可写");
         let same_uid = a11_ident(1000, 9999);
         assert_eq!(policy.evaluate(&same_uid, PermBits::WRITE), Ok(()), "uid 相同即 owner，gid 无关");
+    }
+
+    /// A2-6：`AceWire` 布局与编解码往返保真（PRE-12 双侧镜像的 vfs 侧断言）。
+    #[test]
+    fn test_ace_wire_layout_and_roundtrip() {
+        assert_eq!(core::mem::size_of::<AceWire>(), ACE_WIRE_SIZE, "AceWire size");
+        assert_eq!(core::mem::align_of::<AceWire>(), 4, "AceWire align");
+        assert_eq!(core::mem::offset_of!(AceWire, principal_kind), 0);
+        assert_eq!(core::mem::offset_of!(AceWire, principal_id), 4);
+        assert_eq!(core::mem::offset_of!(AceWire, allow), 8);
+        assert_eq!(core::mem::offset_of!(AceWire, perms), 12);
+        assert_eq!(core::mem::offset_of!(AceWire, inherit), 16);
+        assert_eq!(core::mem::offset_of!(AceWire, reserved), 20);
+        // 往返：四种主体 + 任意 allow/inherit/perms 组合都必须保真。
+        let cases = [
+            (Principal::Owner, true, PermBits::READ, false),
+            (Principal::NamedUid(1000), false, PermBits::WRITE, true),
+            (Principal::NamedGid(1001), true, PermBits::READ.union(PermBits::EXECUTE), true),
+            (Principal::Other, false, PermBits::ALL, false),
+        ];
+        for (principal, allow, perms, inherit) in cases {
+            let ace = Ace { principal, allow, perms, inherit };
+            let back = AceWire::from_ace(ace).to_ace().expect("roundtrip must decode");
+            assert_eq!(back, ace, "ACE wire roundtrip fidelity: {:?}", ace);
+        }
+    }
+
+    /// A2-6：非法 wire 必须**如实拒绝**（S09——不静默忽略）。
+    #[test]
+    fn test_ace_wire_rejects_malformed() {
+        let good = AceWire { principal_kind: ACE_PRINCIPAL_NAMED_UID, principal_id: 7, allow: 1, perms: 1, inherit: 0, reserved: 0 };
+        assert!(good.to_ace().is_ok(), "baseline valid");
+        for bad in [
+            AceWire { reserved: 1, ..good },
+            AceWire { allow: 2, ..good },
+            AceWire { inherit: 2, ..good },
+            AceWire { perms: 8, ..good },
+            AceWire { principal_kind: 9, ..good },
+        ] {
+            assert_eq!(bad.to_ace(), Err(Error::InvalidParam), "malformed wire must be rejected: {:?}", bad);
+        }
+        let owner_with_id = AceWire { principal_kind: ACE_PRINCIPAL_OWNER, principal_id: 5, allow: 1, perms: 1, inherit: 0, reserved: 0 };
+        assert_eq!(owner_with_id.to_ace(), Err(Error::InvalidParam), "Owner must not carry id");
     }
 
     #[test]

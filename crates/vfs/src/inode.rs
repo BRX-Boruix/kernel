@@ -107,6 +107,141 @@ pub struct Ace {
     pub inherit: bool,
 }
 
+// ======================================================================
+// A2-6 / ADR-040 §3.5.1 G4：显式 ACE 的 **wire 通道**（用户态读写门径）。
+//
+// 背景：`to_wire`/`from_wire` 是**单个 u32** 的 classic 直通形态，无 ACE 通道
+// ——用户态既读不到也写不了显式 ACE，本 ADR 的核心创新（deny 优先/按主体授权）
+// 只能由内核侧构造。
+//
+// 设计裁定（本项，按 S38 记录，可复议）：采用**独立定长 ACE 数组**形态，而
+// **不**扩展 `StatInfo` 内联块。理由（皆为本仓既有规范约束，非偏好）：
+//   1. ADR-040 §2.10 要求「参数只用定长数字」——定长数组满足，变长 blob 不满足；
+//   2. §2.4 PRE-12 纪律规定 `StatInfo` 是定长 `#[repr(C)]` 且**只许向尾部增长**。
+//      把 ACE 内联进 `StatInfo` 会让**每一次 stat** 都背负约 256B 拷贝（多数调用
+//      方并不需要 ACE），且迫使全部既有 stat 调用点与两侧镜像断言同变更——代价
+//      与收益不成比例；
+//   3. 读写可分离：`perms` 字段保持单 u32 classic 直通**不变**（既有 ABI 零破坏），
+//      ACE 经独立的读/写动词进出。
+//
+// 编码（双侧镜像，PRE-12：任一侧改字段必须同变更同步）：
+//   wire ACE 定长 24 字节 = { principal_kind, principal_id, allow, perms,
+//                            inherit, reserved } 各 u32
+//   principal_kind: 0=Owner, 1=NamedUid, 2=NamedGid, 3=Other（Owner/Other 时 id 须为 0）
+// 本模块是**唯一**编解码点（S13）。
+// ======================================================================
+
+/// wire 上的单条 ACE（定长 24 字节；`#[repr(C)]`）。
+///
+/// 与 `libsys` 侧同名镜像结构逐字段一致（PRE-12）：任一侧改字段必须同变更同步。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AceWire {
+    /// 主体类别：0=Owner, 1=NamedUid, 2=NamedGid, 3=Other。
+    pub principal_kind: u32,
+    /// 主体 id（NamedUid/NamedGid 的 uid/gid；Owner/Other 须为 0）。
+    pub principal_id: u32,
+    /// 1=Allow，0=Deny。
+    pub allow: u32,
+    /// 权限位（Read=1/Write=2/Execute=4 的位集，取值范围 0..=7）。
+    pub perms: u32,
+    /// 目录继承标记（0/1）。
+    pub inherit: u32,
+    /// 保留（须为 0；**不**做静默忽略——非 0 即 InvalidParam）。
+    pub reserved: u32,
+}
+
+/// 单条 wire ACE 的字节大小（双侧断言用）。
+pub const ACE_WIRE_SIZE: usize = 24;
+
+/// 一次 ACE 传输允许的**最大条数**（定长数组上界）。
+///
+/// 取值理由：ACE 是「按主体授权」的精细表达，实际策略规模在个位数～十几条；
+/// 64 条（1536 字节）已远超真实需要，同时把单次系统调用拷贝量钉在可控范围
+/// （ADR-018 用户缓冲上限之内），避免用户态以「超大 ACE 表」制造资源压力。
+pub const ACE_WIRE_MAX: usize = 64;
+
+/// wire 主体类别编码（与 `AceWire::principal_kind` 同点定义，S13）。
+pub const ACE_PRINCIPAL_OWNER: u32 = 0;
+pub const ACE_PRINCIPAL_NAMED_UID: u32 = 1;
+pub const ACE_PRINCIPAL_NAMED_GID: u32 = 2;
+pub const ACE_PRINCIPAL_OTHER: u32 = 3;
+
+impl AceWire {
+    /// wire → [`Ace`]。**严格校验**：未知主体类别 / 越界权限位 / 非 0 保留位 /
+    /// 非 0/1 的 allow/inherit 一律 `InvalidParam`。
+    ///
+    /// 为何严格而非「尽力解读」（S09）：静默忽略未知位会让**用户态以为自己设了
+    /// 限制、实际没有生效**——那是安全面的伪成功。宁可如实报错。
+    pub fn to_ace(self) -> Result<Ace, Error> {
+        if self.reserved != 0 {
+            return Err(Error::InvalidParam);
+        }
+        if self.allow > 1 || self.inherit > 1 {
+            return Err(Error::InvalidParam);
+        }
+        if self.perms > 7 {
+            return Err(Error::InvalidParam);
+        }
+        let principal = match self.principal_kind {
+            ACE_PRINCIPAL_OWNER => Principal::Owner,
+            ACE_PRINCIPAL_NAMED_UID => Principal::NamedUid(self.principal_id),
+            ACE_PRINCIPAL_NAMED_GID => Principal::NamedGid(self.principal_id),
+            ACE_PRINCIPAL_OTHER => Principal::Other,
+            _ => return Err(Error::InvalidParam),
+        };
+        // Owner/Other 不带 id；非 0 视为调用方理解错误，如实拒绝（不静默丢弃）。
+        if matches!(principal, Principal::Owner | Principal::Other) && self.principal_id != 0 {
+            return Err(Error::InvalidParam);
+        }
+        let mut perms = PermBits::empty();
+        if self.perms & 1 != 0 {
+            perms = perms.union(PermBits::READ);
+        }
+        if self.perms & 2 != 0 {
+            perms = perms.union(PermBits::WRITE);
+        }
+        if self.perms & 4 != 0 {
+            perms = perms.union(PermBits::EXECUTE);
+        }
+        Ok(Ace {
+            principal,
+            allow: self.allow == 1,
+            perms,
+            inherit: self.inherit == 1,
+        })
+    }
+
+    /// [`Ace`] → wire（逆映射；`Owner`/`Other` 的 `principal_id` 恒 0）。
+    pub fn from_ace(ace: Ace) -> Self {
+        let (kind, id) = match ace.principal {
+            Principal::Owner => (ACE_PRINCIPAL_OWNER, 0),
+            Principal::NamedUid(uid) => (ACE_PRINCIPAL_NAMED_UID, uid),
+            Principal::NamedGid(gid) => (ACE_PRINCIPAL_NAMED_GID, gid),
+            Principal::Other => (ACE_PRINCIPAL_OTHER, 0),
+        };
+        let b = ace.perms;
+        let mut perms = 0u32;
+        if b.contains(PermBits::READ) {
+            perms |= 1;
+        }
+        if b.contains(PermBits::WRITE) {
+            perms |= 2;
+        }
+        if b.contains(PermBits::EXECUTE) {
+            perms |= 4;
+        }
+        Self {
+            principal_kind: kind,
+            principal_id: id,
+            allow: ace.allow as u32,
+            perms,
+            inherit: ace.inherit as u32,
+            reserved: 0,
+        }
+    }
+}
+
 /// 系统门禁 wire 位（bit9）。
 ///
 /// **迁址说明**：旧 `Permissions::system_only` 占用 wire bit3，与 classic
