@@ -777,6 +777,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_kill_extension_and_perm();
 
+    // A2-0（ADR-040 §3.5 G2）：跨用户 kill 属主校验（表级，返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_kill_cross_user_owner_check();
+
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();

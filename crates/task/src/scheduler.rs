@@ -3312,27 +3312,68 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
     if sig == 0 {
         return Ok(0); // 仅校验存在，不发送
     }
-    // S1-10 / A1-2：投递权限强制（ADR-034 §2.7 × ADR-040 §2.3 能力位改判）。
-    // 无 CAP_KILL 的调用者不可向特权进程（CAP_SYSTEM）投递终止类信号
-    // （default_disposition==Terminate）→ PermissionDenied；持 CAP_KILL 者
-    // 可向任意投递。探活 sig==0 已在上方放行。
+    // 投递权限强制——两个维度合成**一次**判定（S13 单点，不设第二条路径）：
+    //
+    // ① **属主维度**（A2-0 / ADR-040 §3.5 G2，POSIX `kill(2)` 语义）：
+    //    非同一 uid 的调用者向目标投递信号（含非终止类）需 `CAP_KILL`。
+    //    补此维度前的旧规则只比较**特权级**，故普通用户 alice(1000) 可杀
+    //    普通用户 bob(1001)——这正是「认证者若可被普通用户 kill，认证即
+    //    形同虚设」的可执行面，故 ADR-040 §3.5.2 要求本项**先于 G1 落地**。
+    //    属主比较对**全部信号**生效（POSIX：异 uid 无 CAP_KILL 一律 EPERM，
+    //    不区分信号号），探活 `sig==0` 已在上方放行、不受本项约束。
+    //
+    // ② **特权级维度**（承 ADR-034 §2.7 × ADR-040 §2.3 能力位改判）：
+    //    无 `CAP_KILL` 的调用者不可向特权进程（`CAP_SYSTEM`）投递**终止类**
+    //    信号（`default_disposition==Terminate`）。
+    //
+    // 二者是**独立必要条件的并集**：任一维度判定拒绝即拒绝。持 `CAP_KILL`
+    // 者两维度同时豁免，可向任意进程投递（与原语义一致）。
     {
-        let sender_can_kill = match current {
+        // 仅当**确知**存在当前进程且其确不持 CAP_KILL 时才走受限分支（单点判定）。
+        // 诚实边界（S39）：两条"Do not check"路径均为**历史语义的保留**，非安全取舍：
+        // - `current == None`：内核/驱动上下文（引导期、中断内投递），无可比较 uid；
+        // - `current` 有值但槽位已消失（种族：该进程正被回收）：本函数**跳过**判定。
+        //   该窗口在 SMP 下理论上存在，但发送方此刻自身正在退出路径上，无法构造
+        //   可利用的跨用户投递；若将来需要硬化，应在此处改为 fail-closed 并补
+        //   SMP 并发用例——现已如实登记，不谎称已 fail-closed。
+        let sender = match current {
+            None => None, // 内核上下文：不受本判定约束
             Some(cur) => proc_bucket_lock(cur)
                 .get(&cur)
-                .map(|e| e.proc.identity().caps.contains(Caps::KILL))
-                .unwrap_or(true), // 无当前进程（内核/驱动）视为特权
-            None => true, // 内核/驱动上下文视为特权（与原 System 语义一致）
+                .map(|e| {
+                    let id = e.proc.identity();
+                    (id.caps.contains(Caps::KILL), id.uid)
+                }),
         };
-        let target_privileged = proc_bucket_lock(target)
-            .get(&target)
-            .map(|e| e.proc.identity().caps.contains(Caps::SYSTEM))
-            .unwrap_or(false);
-        if !sender_can_kill
-            && target_privileged
-            && default_disposition(sig) == DefaultAction::Terminate
-        {
-            return Err(Error::PermissionDenied);
+        // 仅"查得到且不持 CAP_KILL"进入受限判定；其余（内核上下文 / 槽位消失 /
+        // 持 CAP_KILL）跳过——见上方诚实边界。
+        let restricted_by_uid = match sender {
+            None => None,
+            Some((true, _)) => None,
+            Some((false, uid)) => Some(uid),
+        };
+        if let Some(sender_uid) = restricted_by_uid {
+            let target_id = proc_bucket_lock(target)
+                .get(&target)
+                .map(|e| {
+                    let id = e.proc.identity();
+                    (id.uid, id.caps.contains(Caps::SYSTEM))
+                });
+            // 目标槽位不可读（其间被回收）→ fail-closed：拒绝。此处与既有
+            // "target 不存在 → InvalidParam" 不冲突——那条已在更早处判定过，
+            // 走到这里说明目标刚刚消失，拒绝是安全侧。
+            let Some((target_uid, target_privileged)) = target_id else {
+                return Err(Error::PermissionDenied);
+            };
+            // ① 属主维度：异 uid → 拒绝（POSIX：异 uid 无 CAP_KILL 一律 EPERM）。
+            if sender_uid != target_uid {
+                return Err(Error::PermissionDenied);
+            }
+            // ② 特权级维度：同 uid 但目标特权且信号为终止类 → 拒绝
+            //    （普通用户不得终止特权进程，即使 uid 巧合相同）。
+            if target_privileged && default_disposition(sig) == DefaultAction::Terminate {
+                return Err(Error::PermissionDenied);
+            }
         }
     }
     // 若是键盘 waiter，清空避免悬挂唤醒。

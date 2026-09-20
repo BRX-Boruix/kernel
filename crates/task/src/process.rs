@@ -267,6 +267,18 @@ impl ProcessIdentity {
         }
     }
 
+    /// 普通用户身份（无任何能力位）——A2-0 跨用户 kill 校验与 A2-1 身份变更的
+    /// 基准构造点。**不得**用 `system(uid)` 表达普通用户：那会连带授予
+    /// CAP_SYSTEM/KILL/OWNER，静默绕过全部强制面（S13 反例）。
+    pub const fn user(uid: u32, gid: u32) -> Self {
+        Self {
+            uid,
+            gid,
+            groups: Groups::empty(),
+            caps: Caps::EMPTY,
+        }
+    }
+
     /// init/特权身份（内核引导第一个进程时使用）：全能力。
     pub const fn system(uid: u32) -> Self {
         Self {

@@ -9284,6 +9284,94 @@ pub fn test_kill_extension_and_perm() {
     th::reset_all();
     info!("[test-kill] === S1-9/S1-10 通过 ===");
 }
+/// A2-0（ADR-040 §3.5 G2）：**跨用户 kill 属主校验**（表级停机验收）。
+///
+/// 缺口事实：ADR-034 §2.7 的投递权限**只按特权级判定**（"User 不可向 System
+/// 投递终止类"），从未比较 **uid 属主**。故在 A1 交付后，普通用户 alice(1000)
+/// 可 SIGKILL 普通用户 bob(1001)——二者同无 CAP_SYSTEM，旧规则直接放行。
+/// 这正是 ADR-040 §3.5.2 所指"认证者若可被普通用户 kill，认证即形同虚设"的
+/// 可执行面（认证者不必持 CAP_SYSTEM，它只需是一个普通身份的可信程序）。
+///
+/// POSIX 语义（本项对齐目标）：
+/// - 同 uid（或同 real/effective uid 之一）→ 放行；
+/// - 异 uid：需 CAP_KILL；
+/// - init 保护与 sig=0 探活语义不变（承 ADR-034）。
+pub fn test_kill_cross_user_owner_check() {
+    use klib::error::Error;
+    use task::ProcessIdentity;
+    use task::scheduler::test_hooks as th;
+    use task::signals::{SIGKILL, SIGTERM};
+
+    info!("[test-kill-owner] === A2-0: cross-user kill owner check ===");
+
+    // ---- 1. 同 uid 放行（alice 杀 alice 的另一个进程）----
+    let alice_a = th::spawn_child_with_identity(0, "alice_a.elf", ProcessIdentity::user(1000, 1000))
+        .expect("spawn alice_a");
+    let alice_b = th::spawn_child_with_identity(0, "alice_b.elf", ProcessIdentity::user(1000, 1000))
+        .expect("spawn alice_b");
+    assert!(th::set_current(alice_a), "set alice_a as current");
+    let r = task::kill_pid(alice_b, SIGTERM, &mut dummy_frame());
+    assert!(r.is_ok(), "same-uid SIGTERM must be allowed, got {:?}", r);
+    info!("[test-kill-owner] same uid SIGTERM allowed OK");
+
+    th::clear_current();
+    th::reset_all();
+
+    // ---- 2. 跨 uid 拒绝（核心缺口断言）----
+    let alice = th::spawn_child_with_identity(0, "alice.elf", ProcessIdentity::user(1000, 1000))
+        .expect("spawn alice");
+    let bob = th::spawn_child_with_identity(0, "bob.elf", ProcessIdentity::user(1001, 1001))
+        .expect("spawn bob");
+    assert!(th::set_current(alice), "set alice as current");
+    let r = task::kill_pid(bob, SIGTERM, &mut dummy_frame());
+    assert!(
+        matches!(r, Err(Error::PermissionDenied)),
+        "cross-uid SIGTERM must be denied, got {:?}",
+        r
+    );
+    info!("[test-kill-owner] cross-uid SIGTERM -> PermissionDenied OK");
+
+    // 目标必须毫发无损（拒绝发生在投递之前）。
+    let still_alive = th::probe(bob)
+        .map(|(st, _, _, _, _)| st != task::TaskState::Exit)
+        .unwrap_or(false);
+    assert!(still_alive, "denied kill must not touch target state");
+    info!("[test-kill-owner] denied kill left target untouched OK");
+
+    // ---- 3. 跨 uid SIGKILL 同样拒绝（终止类中最强的一个）----
+    let r = task::kill_pid(bob, SIGKILL, &mut dummy_frame());
+    assert!(
+        matches!(r, Err(Error::PermissionDenied)),
+        "cross-uid SIGKILL must be denied, got {:?}",
+        r
+    );
+    info!("[test-kill-owner] cross-uid SIGKILL -> PermissionDenied OK");
+
+    // ---- 4. 持 CAP_KILL 放行跨 uid ----
+    let killer = th::spawn_child_with_identity(0, "killer.elf", ProcessIdentity::system(1))
+        .expect("spawn killer");
+    assert!(th::set_current(killer), "set killer as current");
+    let r = task::kill_pid(bob, SIGTERM, &mut dummy_frame());
+    assert!(r.is_ok(), "CAP_KILL owner must cross-uid kill, got {:?}", r);
+    info!("[test-kill-owner] CAP_KILL cross-uid allowed OK");
+
+    // ---- 5. sig=0 探活仍放行（不构成投递，承 ADR-034 §2.7）----
+    th::clear_current();
+    let prober = th::spawn_child_with_identity(0, "prober.elf", ProcessIdentity::user(2000, 2000))
+        .expect("spawn prober");
+    let probe_target = th::spawn_child_with_identity(0, "probe_t.elf", ProcessIdentity::user(3000, 3000))
+        .expect("spawn probe target");
+    assert!(th::set_current(prober), "set prober as current");
+    let r = task::kill_pid(probe_target, 0, &mut dummy_frame());
+    assert!(r.is_ok(), "sig=0 liveness probe stays allowed, got {:?}", r);
+    info!("[test-kill-owner] sig=0 cross-uid probe allowed OK");
+
+    th::clear_current();
+    th::reset_all();
+    info!("[test-kill-owner] === A2-0 pass ===");
+}
+
+
 
 pub fn test_waitpid_core() {
     use klib::error::Error;
