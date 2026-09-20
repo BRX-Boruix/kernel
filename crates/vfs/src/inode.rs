@@ -547,6 +547,9 @@ pub trait INode: Send + Sync {
     /// **语义边界**：wire chmod 只携带 classic 位集（无 ACE 通道），故整体
     /// 替换即"重写 classic 段"；显式 ACE 的用户态写入门径属 A2-6（第一阶段
     /// 经内核测试路径构造，S39 如实披露）。
+    ///
+    /// A1-3 / ADR-040 §2.6：**调用方**（sys_entry_update 的 chmod 动作）须
+    /// 先过属主校验（属主或 `CAP_OWNER`，见 kernel `check_chmod_access`）。
     /// 默认实现返回 [`Error::NotSupported`]——只读虚拟文件系统（procfs/
     /// sysfs/devfs）如实拒绝；本 crate 内 RamFS 与 EXT2 提供实现。
     fn set_permissions(&self, _policy: &AccessPolicy) -> Result<(), Error> {

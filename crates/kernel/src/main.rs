@@ -677,6 +677,9 @@ unsafe fn kmain_body() -> ! {
     tests::test_identity_inherit();
     #[cfg(feature = "kernel-tests")]
     tests::test_perm_system_only();
+    // A1-3 / ADR-040 §2.6：统一强制矩阵停机级验收（§3.2 #4/#5/#6）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_access_enforcement_matrix();
     // PRE-1 / ADR-037 决策 5：UIO driver_register/driver_claim 特权门禁（System-only）。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_uio_privilege_gate();

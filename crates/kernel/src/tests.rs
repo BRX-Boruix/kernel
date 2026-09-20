@@ -12795,6 +12795,265 @@ pub fn test_perm_system_only() {
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-perm-system-only] PASS");
 }
+
+/// A1-3 / ADR-040 §2.6 + §3.2 #4/#5/#6：统一强制矩阵停机级验收。
+///
+/// 与 test_perm_system_only 同构：真实 syscall 入口（syscall_entry）+
+/// 伪当前进程 + RamFS 根（ISO 启动）。覆盖：
+/// - #4 r/w 真实强制：0400 节点 User 读/写均 EACCES；属主 0644 写放行；
+/// - #5 强制点覆盖：拿到 fd 后属主 chmod 收紧权限，后续 read 被拒；
+///   恢复权限后同 fd 再读放行（证每次调用都强制、策略实时生效）；
+/// - #6 chmod 属主校验：非属主 EACCES、CAP_OWNER 放行；
+/// - 父目录 Write 面：create/unlink 对非属主目录 EACCES、CAP_OWNER 放行；
+/// - readdir 面：0700 目录他人 EACCES、CAP_OWNER 放行；
+/// - exec 面：0400 程序对 User EACCES（Execute 位强制）。
+///
+/// 判定序锚点：门禁 → CAP_OWNER 绕过 → AccessPolicy::evaluate（唯一算法）。
+#[cfg(feature = "kernel-tests")]
+pub fn test_access_enforcement_matrix() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Caps, Groups, Process, ProcessIdentity};
+
+    info!("[test-access-matrix] === A1-3/ADR-040 §2.6: enforcement matrix ====");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3,
+            a4: 0, a5: 0,
+            result: 0, switched: false, arch_frame: 0,
+            aux_pid: 0,
+        }
+    }
+    fn frame4(nr: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> SyscallFrame {
+        let mut f = frame(nr, a1, a2, a3);
+        f.a4 = a4;
+        f
+    }
+
+    const OPEN_READ: u64 = 1 << 0;
+    const OPEN_WRITE: u64 = 1 << 1;
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+    const EACCES_U64: u64 = (-13i64) as u64;
+    // 身份三态（let 构造，同 flock 测试形态）：裸 User / 带 CAP_OWNER 的
+    // User（§2.6 绕过面）/ System（CAP_SYSTEM+CAP_OWNER）。
+    let user = ProcessIdentity { uid: 1000, gid: 1000, groups: Groups::empty(), caps: Caps::EMPTY };
+    let user_owner = ProcessIdentity { uid: 1000, gid: 1000, groups: Groups::empty(), caps: Caps::OWNER };
+    let sys = ProcessIdentity { uid: 0, gid: 0, groups: Groups::empty(), caps: Caps::SYSTEM.union(Caps::OWNER) };
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // ---- 夹具：直接经 root() 建（VFS 原语不强制；被测是 syscall 层）----
+    // /scratch 本体 0755 属主 (0,0)：User 对其 create/unlink 应被父目录写面拒绝。
+    let root = crate::vfs_init::root();
+    root.create_file("/scratch/a3_f0644.txt", 0o644, (0, 0)).expect("fixture 0644");
+    root.create_file("/scratch/a3_f0400.txt", 0o400, (0, 0)).expect("fixture 0400");
+    root.mkdir("/scratch/a3_d0700", 0o700, (0, 0)).expect("fixture dir 0700");
+    root.create_file("/programs/a3_nox.elf", 0o400, (0, 0)).expect("fixture no-exec program");
+
+    // 用户缓冲：路径串槽位（0x100 间隔）+ readdir 输出页。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
+    let buf = map.result;
+    let mut map2 = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map2));
+    assert!(map2.result < 0x8000_0000_0000_0000, "mmap2 must succeed");
+    let out_buf = map2.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        let mut a = buf;
+        while a < buf + 0x2000 {
+            p.addr_space().handle_page_fault(a, arch_x86_64::paging::PageFaultCode::new(0));
+            a += 0x1000;
+        }
+        let mut b = out_buf;
+        while b < out_buf + 0x1000 {
+            p.addr_space().handle_page_fault(b, arch_x86_64::paging::PageFaultCode::new(0));
+            b += 0x1000;
+        }
+    }
+    let paths: [&[u8]; 4] = [
+        b"/scratch/a3_f0644.txt\x00",
+        b"/scratch/a3_f0400.txt\x00",
+        b"/scratch/a3_d0700\x00",
+        b"/programs/a3_nox.elf\x00",
+    ];
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    for (i, ps) in paths.iter().enumerate() {
+        unsafe {
+            let pa = task::current_proc_mut()
+                .expect("proc")
+                .addr_space()
+                .translate(arch::VirtAddr::new(buf + (i as u64) * 0x100))
+                .expect("path slot resident")
+                .as_u64();
+            core::ptr::copy_nonoverlapping(ps.as_ptr(), (pa + off) as *mut u8, ps.len());
+        }
+    }
+    let p0 = buf;
+    let p1 = buf + 0x100;
+    let p2 = buf + 0x200;
+    let p3 = buf + 0x300;
+
+    // ---- #4：0400 节点——User 读/写均 EACCES（r/w 真实强制）----
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(user);
+    }
+    let mut o = frame(crate::syscall::SYS_STREAM_CREATE, p1, OPEN_READ, 0);
+    assert!(crate::syscall::syscall_entry(&mut o));
+    assert_eq!(o.result, EACCES_U64, "#4: user READ on 0400 must EACCES");
+    let mut o = frame(crate::syscall::SYS_STREAM_CREATE, p1, OPEN_WRITE, 0);
+    assert!(crate::syscall::syscall_entry(&mut o));
+    assert_eq!(o.result, EACCES_U64, "#4: user WRITE on 0400 must EACCES");
+    info!("[test-access-matrix] #4 read/write denied on 0400 OK");
+
+    // ---- #4 正向基线：属主 0644 写打开放行（防全拒假绿）----
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(sys);
+    }
+    let mut o = frame(crate::syscall::SYS_STREAM_CREATE, p0, OPEN_WRITE, 0);
+    assert!(crate::syscall::syscall_entry(&mut o));
+    assert!(o.result & ERR_FLAG == 0, "owner WRITE on 0644 must open");
+    info!("[test-access-matrix] #4 owner write on 0644 opens OK");
+
+    // ---- #5：拿到 fd 后权限收紧——后续 read 被拒；恢复后同 fd 再读放行 ----
+    // User 读 fd（0644 other=r 放行）→ 属主 chmod 0000 → User 同 fd 再读
+    // EACCES（每次 read 都强制，§2.6）→ 属主恢复 0644 → 同 fd 再读放行。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(user);
+    }
+    let mut fd_o = frame(crate::syscall::SYS_STREAM_CREATE, p0, OPEN_READ, 0);
+    assert!(crate::syscall::syscall_entry(&mut fd_o));
+    assert!(fd_o.result & ERR_FLAG == 0, "user READ open on 0644 (other=r) must open");
+    let user_fd = fd_o.result;
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(sys);
+    }
+    let mut c0 = frame4(crate::syscall::SYS_ENTRY_UPDATE, p0, 0, 0, crate::syscall::ENTRY_UPDATE_CHMOD);
+    assert!(crate::syscall::syscall_entry(&mut c0));
+    assert!(c0.result & ERR_FLAG == 0, "owner chmod to 0000 must succeed");
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(user);
+    }
+    let mut rd = frame(crate::syscall::SYS_STREAM_READ, user_fd, buf, 16);
+    assert!(crate::syscall::syscall_entry(&mut rd));
+    assert_eq!(rd.result, EACCES_U64, "#5: read after chmod-tighten must EACCES");
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(sys);
+    }
+    let mut c1 = frame4(crate::syscall::SYS_ENTRY_UPDATE, p0, 0o644, 0, crate::syscall::ENTRY_UPDATE_CHMOD);
+    assert!(crate::syscall::syscall_entry(&mut c1));
+    assert!(c1.result & ERR_FLAG == 0, "owner chmod restore 0644");
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(user);
+    }
+    let mut rd2 = frame(crate::syscall::SYS_STREAM_READ, user_fd, buf, 16);
+    assert!(crate::syscall::syscall_entry(&mut rd2));
+    assert!(rd2.result & ERR_FLAG == 0, "read after restore must succeed again");
+    info!("[test-access-matrix] #5 fd survives tighten/restore cycle OK");
+
+    // ---- #6：chmod 属主校验：非属主 EACCES；CAP_OWNER 放行 ----
+    let mut c2 = frame4(crate::syscall::SYS_ENTRY_UPDATE, p0, 0o666, 0, crate::syscall::ENTRY_UPDATE_CHMOD);
+    assert!(crate::syscall::syscall_entry(&mut c2));
+    assert_eq!(c2.result, EACCES_U64, "#6: non-owner chmod must EACCES");
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(user_owner);
+    }
+    let mut c3 = frame4(crate::syscall::SYS_ENTRY_UPDATE, p0, 0o600, 0, crate::syscall::ENTRY_UPDATE_CHMOD);
+    assert!(crate::syscall::syscall_entry(&mut c3));
+    assert!(c3.result & ERR_FLAG == 0, "#6: CAP_OWNER chmod must pass");
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(sys);
+    }
+    info!("[test-access-matrix] #6 chmod owner checks OK");
+
+    // ---- 父目录 Write 面：create/unlink ----
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(user);
+    }
+    // User 在 /scratch（0755 属主 (0,0)）下 mkdir → 父目录写面 EACCES。
+    let mut mk = frame(crate::syscall::SYS_ENTRY_CREATE, p2, crate::syscall::ENTRY_KIND_DIRECTORY, 0o755);
+    assert!(crate::syscall::syscall_entry(&mut mk));
+    assert_eq!(mk.result, EACCES_U64, "parent-write: user mkdir in /scratch must EACCES");
+    // User unlink 他人目录下文件 → 父目录写面 EACCES。
+    let mut ul = frame(crate::syscall::SYS_ENTRY_DELETE, p0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut ul));
+    assert_eq!(ul.result, EACCES_U64, "parent-write: user unlink in /scratch must EACCES");
+    // CAP_OWNER 越过父目录策略 → unlink 放行（§2.6 绕过语义）。
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(user_owner);
+    }
+    let mut ul2 = frame(crate::syscall::SYS_ENTRY_DELETE, p0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut ul2));
+    assert!(ul2.result & ERR_FLAG == 0, "parent-write: CAP_OWNER unlink must pass");
+    info!("[test-access-matrix] parent-write face (create/unlink) OK");
+
+    // ---- readdir 面：0700 目录他人 EACCES、CAP_OWNER 放行 ----
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(user);
+    }
+    let mut ls = frame4(crate::syscall::SYS_ENTRY_READ, p2, out_buf, 0x800, 0);
+    assert!(crate::syscall::syscall_entry(&mut ls));
+    assert_eq!(ls.result, EACCES_U64, "readdir: user list of 0700 dir must EACCES");
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(sys);
+    }
+    let mut ls2 = frame4(crate::syscall::SYS_ENTRY_READ, p2, out_buf, 0x800, 0);
+    assert!(crate::syscall::syscall_entry(&mut ls2));
+    assert!(ls2.result & ERR_FLAG == 0, "readdir: system list of 0700 dir must pass");
+    info!("[test-access-matrix] readdir face OK");
+
+    // ---- exec 面：0400 程序对 User EACCES（Execute 位强制；拒绝发生在
+    // 装载前，无进程副作用）----
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(user);
+    }
+    let mut ex = frame(crate::syscall::SYS_TASK_SPAWN, p3, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut ex));
+    assert_eq!(ex.result, EACCES_U64, "exec: user exec of 0400 program must EACCES");
+    info!("[test-access-matrix] exec face (0400 denied) OK");
+
+    // ---- 清理：直接 VFS（CAP 通道，不经 syscall 强制面）----
+    {
+        let root = crate::vfs_init::root();
+        let _ = root.unlink("/scratch/a3_f0644.txt");
+        let _ = root.unlink("/scratch/a3_f0400.txt");
+        let _ = root.unlink("/scratch/a3_d0700");
+        let _ = root.unlink("/programs/a3_nox.elf");
+    }
+
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    task::clear_current_proc();
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-access-matrix] PASS");
+}
 /// PRE-1 / ADR-037 决策 5 / A1-2 能力位改判：UIO 特权门禁——driver_register/
 /// driver_claim 仅持 `CAP_DEVICE` 者可调用，其余一律 `PermissionDenied`（EACCES/13）。
 ///

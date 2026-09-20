@@ -511,8 +511,7 @@ fn sys_getcwd(frame: &mut SyscallFrame) -> u64 {
 /// `Error::PermissionDenied`（EACCES）。
 ///
 /// A1-1：本函数同时是 open/exec 的策略求值入口（门禁 → `CAP_OWNER` 豁免
-/// → `AccessPolicy::evaluate`，判定序见函数文档）。r/w/x/readdir/
-/// unlink/chmod 的全矩阵接线仍是 A1-3 项（见 `check_access` 规划）。
+/// → `AccessPolicy::evaluate`，判定序见函数文档）。
 /// open/exec 强制点（A1-1 / ADR-040 §2.1+§2.6）。
 ///
 /// 判定序（成文）：
@@ -528,6 +527,31 @@ fn enforce_open_permission(
     inode: &alloc::sync::Arc<dyn vfs::inode::INode>,
     required: vfs::inode::PermBits,
 ) -> Result<(), Error> {
+    check_access(&identity, inode.as_ref(), required)
+}
+
+/// A1-3 / ADR-040 §2.6：**统一强制矩阵单点**。
+///
+/// 所有访问路径（open/create、read/write、readdir/stat、unlink/mkdir/
+/// rename 的父目录写面、chmod 的属主面、exec）在唯一位置调用本函数，
+/// 禁止各 syscall 散装判定（PRE-6：零强制正是散装的后果）。
+///
+/// 判定序（与 [`enforce_open_permission`] 一致，成文）：
+/// 1. **系统门禁**（wire bit9）：置位且无 `CAP_SYSTEM` → EACCES（
+///    `CAP_OWNER` 不豁免门禁——系统完整性边界，非属主权）。
+/// 2. **`CAP_OWNER` 绕过**（§2.6，Linux `CAP_DAC_OVERRIDE` 对应物）：
+///    持有者在策略求值前直接放行。
+/// 3. **策略求值**：节点 [`vfs::inode::AccessPolicy`] 对 `required` 求值。
+///
+/// A1-3 语义注记：门禁对 chmod **不适用**（`set_permissions` 是门禁唯一
+/// 写入门径；门禁位本身无属主概念，属主校验独立于节点内容策略）。
+/// unlink/mkdir/rename 的**目标属主面**属 A1-5（属主真值落地）后才有
+/// 完整数据，本阶段先接线父目录 Write 面。
+fn check_access(
+    identity: &ProcessIdentity,
+    inode: &dyn vfs::inode::INode,
+    required: vfs::inode::PermBits,
+) -> Result<(), Error> {
     let meta = inode.metadata()?;
     if meta.permissions.gate_system() && !identity.caps.contains(Caps::SYSTEM) {
         return Err(Error::PermissionDenied);
@@ -535,7 +559,27 @@ fn enforce_open_permission(
     if identity.caps.contains(Caps::OWNER) {
         return Ok(());
     }
-    policy_allows(&identity, &meta.permissions, required)
+    policy_allows(identity, &meta.permissions, required)
+}
+
+/// A1-3 / §2.6「chmod：属主或 CAP_OWNER」单点（此前完全缺失——PRE-6
+/// 独立高危项）。判定序：门禁**不适用**（chmod 是门禁写入门径，见
+/// `check_access` 注记）→ 属主 uid 命中或 `CAP_OWNER` → 放行；其余 EACCES。
+fn check_chmod_access(identity: &ProcessIdentity, policy: &vfs::inode::AccessPolicy) -> Result<(), Error> {
+    if identity.uid == policy.owner_uid() || identity.caps.contains(Caps::OWNER) {
+        return Ok(());
+    }
+    Err(Error::PermissionDenied)
+}
+
+/// A1-3 / §2.6「unlink/mkdir/rename：父目录 Write + 目标属主」的父目录面
+/// 单点。目标属主面（持有 `CAP_OWNER` 者可删他人文件等）待 A1-5 属主
+/// 真值落地后补全（本阶段注释如实记账，不伪称完整）。
+fn check_parent_write_access(
+    identity: &ProcessIdentity,
+    parent: &alloc::sync::Arc<dyn vfs::inode::INode>,
+) -> Result<(), Error> {
+    check_access(identity, parent.as_ref(), vfs::inode::PermBits::WRITE)
 }
 
 /// A1-1：`ProcessIdentity` → vfs `Subject` 视图借用转换（`Groups::iter`
@@ -877,6 +921,19 @@ fn sys_entry_create(frame: &mut SyscallFrame) -> u64 {
         Err(e) => return pack_err(e),
     };
     let root = crate::vfs_init::root();
+    // A1-3 / ADR-040 §2.6：mkdir/create = **父目录 Write**。
+    match split_parent(&path) {
+        Some((parent_path, _)) => {
+            let parent = match root.resolve(&parent_path, true) {
+                Ok(n) => n,
+                Err(e) => return pack_err(e),
+            };
+            if let Err(e) = check_parent_write_access(&creator, &parent) {
+                return pack_err(e);
+            }
+        }
+        None => return pack_err(Error::InvalidParam),
+    }
     match kind {
         crate::syscall::ENTRY_KIND_DIRECTORY => match root.mkdir(&path, mode, owner) {
             Ok(_) => pack_ok(0),
@@ -908,10 +965,43 @@ fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
         Err(e) => return pack_err(e),
     };
     let root = crate::vfs_init::root();
+    // A1-3 / ADR-040 §2.6：unlink = **父目录 Write**（经父目录路径求值）。
+    match split_parent(&path) {
+        Some((parent_path, _)) => {
+            let parent = match root.resolve(&parent_path, true) {
+                Ok(n) => n,
+                Err(e) => return pack_err(e),
+            };
+            let identity = current_proc_mut()
+                .map(|p| p.identity())
+                .unwrap_or_else(ProcessIdentity::default_user);
+            if let Err(e) = check_parent_write_access(&identity, &parent) {
+                return pack_err(e);
+            }
+        }
+        None => return pack_err(Error::InvalidParam),
+    }
     match root.unlink(&path) {
         Ok(()) => pack_ok(0),
         Err(e) => pack_err(e),
     }
+}
+
+/// A1-3：路径拆分（父目录路径, 末端名）。根路径 `"/"` 返回 None——
+/// 根无父目录可校验（根操作走 CAP 语义，见 vfs_init 引导身份）。
+fn split_parent(path: &str) -> Option<(alloc::string::String, alloc::string::String)> {
+    let p = path.trim_end_matches('/');
+    let idx = p.rfind('/')?;
+    let name = alloc::string::String::from(&p[idx + 1..]);
+    if name.is_empty() {
+        return None;
+    }
+    let parent = if idx == 0 {
+        alloc::string::String::from("/")
+    } else {
+        alloc::string::String::from(&p[..idx])
+    };
+    Some((parent, name))
 }
 
 /// `entry_update(a1, a2, a3, a4)`：按 `a4` 区分两种动作（ADR-014 0x43）。
@@ -948,6 +1038,24 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
                 Err(e) => return pack_err(e),
             };
             let root = crate::vfs_init::root();
+            // A1-3 / ADR-040 §2.6：rename = **父目录 Write**。源与目标同父
+            // 是本 syscall 的既有约束（跨目录如实 NotSupported），故对父
+            // 目录求值一次即覆盖读写两面。
+            match split_parent(&old_path) {
+                Some((parent_path, _)) => {
+                    let parent = match root.resolve(&parent_path, true) {
+                        Ok(n) => n,
+                        Err(e) => return pack_err(e),
+                    };
+                    let identity = current_proc_mut()
+                        .map(|p| p.identity())
+                        .unwrap_or_else(ProcessIdentity::default_user);
+                    if let Err(e) = check_parent_write_access(&identity, &parent) {
+                        return pack_err(e);
+                    }
+                }
+                None => return pack_err(Error::InvalidParam),
+            }
             match root.rename(&old_path, &new_path) {
                 Ok(()) => pack_ok(0),
                 Err(e) => pack_err(e),
@@ -972,6 +1080,18 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
                 Ok(n) => n,
                 Err(e) => return pack_err(e),
             };
+            // A1-3 / ADR-040 §2.6：chmod = **属主或 CAP_OWNER**（此前完全
+            // 缺失——PRE-6 独立高危项）。门禁不适用（chmod 是门禁写入门径）。
+            let identity = current_proc_mut()
+                .map(|p| p.identity())
+                .unwrap_or_else(ProcessIdentity::default_user);
+            let meta = match node.metadata() {
+                Ok(m) => m,
+                Err(e) => return pack_err(e),
+            };
+            if let Err(e) = check_chmod_access(&identity, &meta.permissions) {
+                return pack_err(e);
+            }
             match node.set_permissions(&policy) {
                 Ok(()) => pack_ok(0),
                 Err(e) => pack_err(e),
@@ -1014,6 +1134,13 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
             Ok(n) => n,
             Err(e) => return pack_err(e),
         };
+        // A1-3 / §2.6：stat 面随 readdir 归目录读语义——对节点求 Read。
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_access(&identity, node.as_ref(), vfs::inode::PermBits::READ) {
+            return pack_err(e);
+        }
         let meta = match node.metadata() {
             Ok(m) => m,
             Err(e) => return pack_err(e),
@@ -1041,6 +1168,13 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
         Ok(n) => n,
         Err(e) => return pack_err(e),
     };
+    // A1-3 / ADR-040 §2.6：readdir 面强制——目录 Read。
+    let identity = current_proc_mut()
+        .map(|p| p.identity())
+        .unwrap_or_else(ProcessIdentity::default_user);
+    if let Err(e) = check_access(&identity, dir_node.as_ref(), vfs::inode::PermBits::READ) {
+        return pack_err(e);
+    }
 
     let entries = match dir_node.list_dir() {
         Ok(list) => list,
@@ -1150,6 +1284,18 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
         Some(vfs::file_handle::OpenHandle::File(_)) => None,
         None => return pack_err(Error::InvalidParam),
     };
+    if pipe_id.is_none() {
+        // A1-3 / ADR-040 §2.6：**每次** write 调用都强制（非仅 open）——
+        // 拿到 fd 后权限收紧必须即刻生效（§3.2 #5）。
+        let identity = proc.identity();
+        let handle = match proc.get_fd(fd as usize) {
+            Some(vfs::file_handle::OpenHandle::File(h)) => h,
+            _ => unreachable!("pipe branch handled above"),
+        };
+        if let Err(e) = check_access(&identity, handle.inode.as_ref(), vfs::inode::PermBits::WRITE) {
+            return pack_err(e);
+        }
+    }
     if let Some(id) = pipe_id {
         if offset != STREAM_OFFSET_CURRENT {
             return pack_err(Error::IllegalSeek);
@@ -1273,6 +1419,18 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
         Some(vfs::file_handle::OpenHandle::File(_)) => None,
         None => return done(pack_err(Error::InvalidParam)),
     };
+    if pipe_id.is_none() {
+        // A1-3 / ADR-040 §2.6：**每次** read 调用都强制（非仅 open）——
+        // 拿到 fd 后权限收紧必须即刻生效（§3.2 #5）。
+        let identity = proc.identity();
+        let handle = match proc.get_fd(fd as usize) {
+            Some(vfs::file_handle::OpenHandle::File(h)) => h,
+            _ => unreachable!("pipe branch handled above"),
+        };
+        if let Err(e) = check_access(&identity, handle.inode.as_ref(), vfs::inode::PermBits::READ) {
+            return done(pack_err(e));
+        }
+    }
     if let Some(id) = pipe_id {
         if offset != STREAM_OFFSET_CURRENT {
             return done(pack_err(Error::IllegalSeek));
