@@ -413,6 +413,21 @@ impl AccessPolicy {
     /// （wire 只有一个 u32，无 ACE 通道），于是**一次 chmod 就把全部显式 ACE 清零**。
     /// 显式 deny 被清空后主体会落到 classic 尾部段，可能**由拒绝变放行**——
     /// 静默策略降级。本方法提供"只改 mode、其余原样"的正确写回形态（S13 单点）。
+    /// 只替换 **显式 ACE 列表**、其余维度原样（A2-6）。
+    ///
+    /// 与 [`Self::with_classic_mode`] 对称：`chmod` 只动 mode，`set_aces` 只动
+    /// 显式列表。两者都**不**碰属主与门禁位——"一次只改一维"是防止写门径之间
+    /// 互相静默削弱的关键纪律（§3.5.3 的病因正是 chown/chmod 顺手重建了整份策略）。
+    pub fn with_explicit_aces(&self, aces: Vec<Ace>) -> Self {
+        Self {
+            aces,
+            mode: self.mode,
+            owner_uid: self.owner_uid,
+            owner_gid: self.owner_gid,
+            gate_system: self.gate_system,
+        }
+    }
+
     pub fn with_classic_mode(&self, mode: u32) -> Self {
         Self {
             aces: self.aces.clone(),

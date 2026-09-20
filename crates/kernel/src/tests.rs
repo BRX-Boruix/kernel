@@ -9923,6 +9923,174 @@ pub fn test_chown_preserves_explicit_aces() {
     info!("[test-chown-ace] === A2-6 pre pass ===");
 }
 
+/// A2-6（ADR-040 §3.5.1 G4 / §3.5.4 #19 #20）：**显式 ACE 用户态读写门径**。
+///
+/// 验收判据：
+/// #19 —— 用户态可写入含显式 deny 的策略并**经求值生效**；非属主/无 `CAP_OWNER` 被拒；
+/// #20 —— 显式 ACE 经 ABI **往返保真**（读回含 ACE，不被 `from_wire` 清零）。
+///
+/// 本测试走**真实 syscall 链路**（`SYS_ENTRY_UPDATE` a4=3 写 / `SYS_ENTRY_READ`
+/// a4=2 读），并用**唯一求值算法** `evaluate` 独立验证写入的策略确实生效——
+/// 不止于"字节被搬过去"这种弱断言。
+pub fn test_ace_abi_roundtrip() {
+    use alloc::boxed::Box;
+    use alloc::vec;
+    use arch::syscall::SyscallFrame;
+    use task::{Process, ProcessIdentity};
+    use vfs::inode::{AceWire, ACE_PRINCIPAL_NAMED_UID, ACE_WIRE_MAX, ACE_WIRE_SIZE};
+
+    info!("[test-ace-abi] === A2-6: explicit ACE ABI round-trip ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3, a4, a5: 0,
+            result: 0, switched: false, arch_frame: 0, aux_pid: 0,
+        }
+    }
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+    let is_err = |r: u64| r & ERR_FLAG != 0;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    // 创建者 = system(1)：属主自己，故 set_aces 授权面（属主或 CAP_OWNER）通过。
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
+
+    let root = crate::vfs_init::root();
+    let _ = root.unlink("/scratch/a2_6_abi.txt");
+    let _ = root.create_file("/scratch/a2_6_abi.txt", 0o644, (1, 1)).expect("fixture");
+
+    // 两块用户缓冲：路径 + ACE 数组。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    let buf = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space().handle_page_fault(buf, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let path_at = buf;
+    let aces_at = buf + 0x1000;
+    let ps = b"/scratch/a2_6_abi.txt\x00";
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(path_at)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(ps.as_ptr(), (pa + off) as *mut u8, ps.len());
+    }
+    // 写内核侧一份 wire 数组，再整块搬进用户缓冲（模拟真实用户态写入）。
+    let wire: alloc::vec::Vec<AceWire> = vec![
+        AceWire { principal_kind: ACE_PRINCIPAL_NAMED_UID, principal_id: 2002, allow: 0, perms: 1, inherit: 0, reserved: 0 },
+        AceWire { principal_kind: ACE_PRINCIPAL_NAMED_UID, principal_id: 2003, allow: 1, perms: 3, inherit: 1, reserved: 0 },
+    ];
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(aces_at)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(wire.as_ptr() as *const u8, (pa + off) as *mut u8, wire.len() * ACE_WIRE_SIZE);
+    }
+
+    // ---- 1. 写入两条显式 ACE ----
+    let mut w = frame(
+        crate::syscall::SYS_ENTRY_UPDATE,
+        path_at,
+        aces_at,
+        2,
+        crate::syscall::ENTRY_UPDATE_SET_ACES,
+    );
+    assert!(crate::syscall::syscall_entry(&mut w));
+    assert_eq!(w.result, 0, "set_aces via real syscall must succeed");
+    info!("[test-ace-abi] set_aces (2 ACEs) accepted OK");
+
+    // ---- 2. 读回：**往返保真**（#20）----
+    let mut rd = frame(crate::syscall::SYS_ENTRY_READ, path_at, aces_at, ACE_WIRE_MAX as u64, crate::syscall::ENTRY_READ_ACES);
+    assert!(crate::syscall::syscall_entry(&mut rd));
+    assert!(!is_err(rd.result), "read_aces must succeed, got {:#x}", rd.result);
+    assert_eq!(rd.result, 2, "read_aces returns the true ACE count");
+    let back: alloc::vec::Vec<AceWire> = unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(aces_at)).expect("resident").as_u64();
+        core::slice::from_raw_parts((pa + off) as *const AceWire, 2).to_vec()
+    };
+    assert_eq!(back[0], wire[0], "ACE #0 round-trip fidelity (deny:2002:R)");
+    assert_eq!(back[1], wire[1], "ACE #1 round-trip fidelity (allow:2003:RW+inherit)");
+    info!("[test-ace-abi] ABI round-trip fidelity OK (2/2 ACEs byte-identical)");
+
+    // ---- 3. 写入的策略**经唯一求值算法独立生效**（#19）----
+    let node = root.resolve("/scratch/a2_6_abi.txt", true).expect("resolve");
+    let policy = node.metadata().expect("meta").permissions;
+    let s2002 = vfs::inode::Subject { uid: 2002, gid: 2002, groups: &[] };
+    assert_eq!(
+        policy.evaluate(&s2002, vfs::inode::PermBits::READ),
+        Err(klib::error::Error::PermissionDenied),
+        "explicit deny ACE written from user space must be enforced"
+    );
+    // 对照：classic 三段未被写 ACE 动作改动（0644 未变）——写门径"只改一维"。
+    assert_eq!(policy.classic_mode(), 0o644, "set_aces must not disturb classic mode");
+    assert_eq!(policy.owner_uid(), 1, "set_aces must not disturb owner");
+    info!("[test-ace-abi] written policy enforced by evaluate; classic/owner untouched OK");
+
+    // ---- 4. 容量探测（cap=0）与容量不足（NoSpace，**不截断**S09）----
+    let mut probe = frame(crate::syscall::SYS_ENTRY_READ, path_at, aces_at, 0, crate::syscall::ENTRY_READ_ACES);
+    assert!(crate::syscall::syscall_entry(&mut probe));
+    assert_eq!(probe.result, 2, "cap=0 is a legal probe returning the count");
+    let mut small = frame(crate::syscall::SYS_ENTRY_READ, path_at, aces_at, 1, crate::syscall::ENTRY_READ_ACES);
+    assert!(crate::syscall::syscall_entry(&mut small));
+    assert_eq!(
+        small.result,
+        (-(klib::error::Error::NoSpace.to_errno() as i64)) as u64,
+        "insufficient capacity must be honest NoSpace, never a truncated list"
+    );
+    info!("[test-ace-abi] probe(cap=0)=2 and insufficient cap -> NoSpace (no truncation) OK");
+
+    // ---- 5. 清空（count=0）与畸形输入如实拒绝 ----
+    let mut clr = frame(crate::syscall::SYS_ENTRY_UPDATE, path_at, aces_at, 0, crate::syscall::ENTRY_UPDATE_SET_ACES);
+    assert!(crate::syscall::syscall_entry(&mut clr));
+    assert_eq!(clr.result, 0, "count=0 clears explicit ACEs");
+    let cleared = root.resolve("/scratch/a2_6_abi.txt", true).expect("resolve").metadata().expect("meta").permissions;
+    assert_eq!(cleared.explicit_aces().count(), 0, "explicit list cleared");
+    assert_eq!(cleared.classic_mode(), 0o644, "clearing ACEs keeps classic mode");
+    // 畸形：权限位越界（perms=8）必须如实 InvalidParam，绝不静默忽略。
+    let bad = vec![AceWire { principal_kind: ACE_PRINCIPAL_NAMED_UID, principal_id: 9, allow: 1, perms: 8, inherit: 0, reserved: 0 }];
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(aces_at)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(bad.as_ptr() as *const u8, (pa + off) as *mut u8, ACE_WIRE_SIZE);
+    }
+    let mut bd = frame(crate::syscall::SYS_ENTRY_UPDATE, path_at, aces_at, 1, crate::syscall::ENTRY_UPDATE_SET_ACES);
+    assert!(crate::syscall::syscall_entry(&mut bd));
+    assert_eq!(
+        bd.result,
+        (-(klib::error::Error::InvalidParam.to_errno() as i64)) as u64,
+        "malformed ACE must be rejected honestly (S09), never silently ignored"
+    );
+    // 且拒绝后列表仍为空（**未**写回半套）。
+    let after_bad = root.resolve("/scratch/a2_6_abi.txt", true).expect("resolve").metadata().expect("meta").permissions;
+    assert_eq!(after_bad.explicit_aces().count(), 0, "rejected write must not leave partial state");
+    info!("[test-ace-abi] clear + malformed-rejected-atomically OK");
+
+    // ---- 6. count 越界（> ACE_WIRE_MAX）拒绝 ----
+    let mut over = frame(crate::syscall::SYS_ENTRY_UPDATE, path_at, aces_at, (ACE_WIRE_MAX + 1) as u64, crate::syscall::ENTRY_UPDATE_SET_ACES);
+    assert!(crate::syscall::syscall_entry(&mut over));
+    assert_eq!(over.result, (-(klib::error::Error::InvalidParam.to_errno() as i64)) as u64, "count > ACE_WIRE_MAX must be rejected");
+    info!("[test-ace-abi] oversized count rejected OK");
+
+    let _ = root.unlink("/scratch/a2_6_abi.txt");
+    task::clear_current_proc();
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    unsafe { drop(Box::from_raw(proc_raw)); }
+    info!("[test-ace-abi] === A2-6 pass ===");
+}
+
+
 
 
 

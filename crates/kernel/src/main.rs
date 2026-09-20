@@ -797,6 +797,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_chown_preserves_explicit_aces();
 
+    // A2-6（ADR-040 §3.5.1 G4）：显式 ACE ABI 读写往返（返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_ace_abi_roundtrip();
+
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();

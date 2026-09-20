@@ -276,6 +276,22 @@ pub const ENTRY_UPDATE_RENAME: u64 = 0;
 pub const ENTRY_UPDATE_CHMOD: u64 = 1;
 /// chown（A1-7 / ADR-014「更新节点元数据」）：a4=2，a1=path, a2=uid, a3=gid。
 pub const ENTRY_UPDATE_CHOWN: u64 = 2;
+/// A2-6 / ADR-040 §3.5.1 G4：`ENTRY_UPDATE` 动作 3 —— **设置显式 ACE 列表**。
+///
+/// 参数：`a1=path_ptr`、`a2=aces_ptr`（指向用户态 `[AceWire; n]` 定长数组）、
+/// `a3=count`（条数，`0` 表示清空显式列表）、`a4=ENTRY_UPDATE_SET_ACES`。
+/// 整表替换语义（与 chmod 的"写门径"同类）：`count=0` 即清空。
+/// **不**改 classic 三段、**不**改属主、**不**改门禁位——与 `with_classic_mode`
+/// 同一纪律（只改本动作负责的那一维）。
+pub const ENTRY_UPDATE_SET_ACES: u64 = 3;
+
+/// A2-6：`ENTRY_READ` 子动作 —— **读取节点显式 ACE 列表**。
+///
+/// 参数：`a1=path_ptr`、`a2=out_ptr`（收 `[AceWire; cap]`）、`a3=cap`
+/// （调用方容量，0 合法——用于**探测条数**）、`a4=ENTRY_READ_ACES`。
+/// 返回：成功时为**写入的条数**（`<= cap`）；若节点 ACE 数 > `cap` 则
+/// 返回 `Error::NoSpace`（**不**截断——截断会让用户态误以为拿到了全部策略）。
+pub const ENTRY_READ_ACES: u64 = 2;
 
 // ---------- SYS_ENTRY_CREATE kind 编码（ADR-014 §4.4，与 INodeType 对齐）----------
 /// 创建普通文件（kind=REG/FILE）。
@@ -642,6 +658,153 @@ fn apply_inherited_policy(
     policy: &vfs::inode::AccessPolicy,
 ) -> Result<(), Error> {
     node.set_permissions(policy)
+}
+
+/// A2-6 / ADR-040 §3.5.1 G4：**设置节点显式 ACE 列表**（整表替换）。
+///
+/// 授权面（与 chmod 同源，单点 `check_chmod_access`）：属主或 `CAP_OWNER`。
+/// 理由：ACE 列表就是访问策略本体——能改它等于能改节点权限，故与 chmod 同权限。
+/// 门禁**不**适用（同 chmod：这是策略写入门径，不是策略求值对象）。
+///
+/// 校验分层（ADR-018 三层 + 编码层）：
+/// 1. `count <= ACE_WIRE_MAX` → 越界 `InvalidParam`（防超长表制造资源压力）；
+/// 2. `validate_user_range(aces_ptr, count*24, Read)` → 数组整体在窗口内且页表就绪；
+/// 3. 逐条 `AceWire::to_ace()` 严格解码（畸形即 `InvalidParam`，绝不静默忽略 S09）；
+/// 4. **全部解码成功后才写回**——避免「前几条写进去、后面解码失败」的半套策略。
+///
+/// 只改显式 ACE：classic 三段 / 属主 / 门禁位一律原样（与 chmod 的纪律对称）。
+fn sys_entry_set_aces(path_ptr: u64, aces_ptr: u64, count: u64) -> u64 {
+    let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    if count > vfs::inode::ACE_WIRE_MAX as u64 {
+        return pack_err(Error::InvalidParam);
+    }
+    let path = match absolute_path(&path) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
+    let root = crate::vfs_init::root();
+    let node = match root.resolve(&path, false) {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    let identity = current_proc_mut()
+        .map(|p| p.identity())
+        .unwrap_or_else(ProcessIdentity::default_user);
+    let meta = match node.metadata() {
+        Ok(m) => m,
+        Err(e) => return pack_err(e),
+    };
+    if let Err(e) = check_chmod_access(&identity, &meta.permissions) {
+        return pack_err(e);
+    }
+    // 先整体解码到内核侧 Vec（零副作用）——任一条畸形即整体拒绝，不写回半套。
+    let mut aces: alloc::vec::Vec<vfs::inode::Ace> = alloc::vec::Vec::new();
+    if count > 0 {
+        let bytes = count as usize * vfs::inode::ACE_WIRE_SIZE;
+        if let Err(e) = validate_user_range(aces_ptr, bytes as u64, UserAccess::Read) {
+            return pack_err(e);
+        }
+        for i in 0..count as usize {
+            let mut wire = vfs::inode::AceWire {
+                principal_kind: 0,
+                principal_id: 0,
+                allow: 0,
+                perms: 0,
+                inherit: 0,
+                reserved: 0,
+            };
+            // 定长结构整体读入（copy_from_user 走 STAC 窗口；SMAP 下不可直接解引用）。
+            let dst = (&mut wire as *mut vfs::inode::AceWire) as *mut u8;
+            unsafe {
+                arch_x86_64::mmio::copy_from_user(
+                    dst,
+                    aces_ptr + (i * vfs::inode::ACE_WIRE_SIZE) as u64,
+                    vfs::inode::ACE_WIRE_SIZE,
+                );
+            }
+            match wire.to_ace() {
+                Ok(a) => aces.push(a),
+                Err(e) => return pack_err(e),
+            }
+        }
+    }
+    // 写回：只替换显式 ACE 列表，其余维度原样（S13 单点）。
+    let policy = meta.permissions.with_explicit_aces(aces);
+    match node.set_permissions(&policy) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// A2-6 / ADR-040 §3.5.1 G4：**读取节点显式 ACE 列表**。
+///
+/// 授权面（与 stat 同源）：**READ** 权限。ACE 列表是策略的可见部分，读它
+/// 与读元数据同级——能看到策略不等于能改策略（改的授权见 `sys_entry_set_aces`）。
+///
+/// `a4=cap` 为调用方容量；返回**实际条数**。三条路径：
+/// 1. 节点 ACE 数 > `cap` → `NoSpace`（**不截断**：截断会让用户态误以为
+///    拿到全部策略，是安全面的伪成功 S09）；
+/// 2. 成功 → 返回条数，写回 `count*24` 字节；
+/// 3. `cap=0` → 合法的**探测**调用：不写任何字节，只返回条数。
+fn sys_entry_read_aces(path_ptr: u64, out_ptr: u64, cap: u64) -> u64 {
+    let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    if cap > vfs::inode::ACE_WIRE_MAX as u64 {
+        return pack_err(Error::InvalidParam);
+    }
+    let path = match absolute_path(&path) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
+    let root = crate::vfs_init::root();
+    let node = match root.resolve(&path, false) {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    let identity = current_proc_mut()
+        .map(|p| p.identity())
+        .unwrap_or_else(ProcessIdentity::default_user);
+    if let Err(e) = check_access(&identity, node.as_ref(), vfs::inode::PermBits::READ) {
+        return pack_err(e);
+    }
+    let meta = match node.metadata() {
+        Ok(m) => m,
+        Err(e) => return pack_err(e),
+    };
+    let aces: alloc::vec::Vec<vfs::inode::Ace> = meta.permissions.explicit_aces().collect();
+    // `cap=0` 是**合法的探测调用**：只回报条数、不写任何字节。必须早于容量检查
+    // ——否则 0 会先被"容量不足"截住，探测路径永远不可达（实现期实测发现）。
+    if cap == 0 {
+        return pack_ok(aces.len() as u64);
+    }
+    // 容量不足：如实 NoSpace，绝不截断（截断＝用户态误以为拿到全部策略）。
+    if aces.len() as u64 > cap {
+        return pack_err(Error::NoSpace);
+    }
+    if aces.is_empty() {
+        return pack_ok(0);
+    }
+    let bytes = aces.len() * vfs::inode::ACE_WIRE_SIZE;
+    if let Err(e) = validate_user_range(out_ptr, bytes as u64, UserAccess::Write) {
+        return pack_err(e);
+    }
+    for (i, ace) in aces.iter().enumerate() {
+        let wire = vfs::inode::AceWire::from_ace(*ace);
+        let src = (&wire as *const vfs::inode::AceWire) as *const u8;
+        unsafe {
+            arch_x86_64::mmio::copy_to_user(
+                out_ptr + (i * vfs::inode::ACE_WIRE_SIZE) as u64,
+                src,
+                vfs::inode::ACE_WIRE_SIZE,
+            );
+        }
+    }
+    pack_ok(aces.len() as u64)
 }
 
 fn check_parent_write_access(
@@ -1299,6 +1462,14 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
                 Err(e) => pack_err(e),
             }
         }
+        // A2-6 / ADR-040 §3.5.1 G4：设置显式 ACE 列表（整表替换）。
+        // a4=3，a1=path, a2=aces_ptr（`[AceWire; count]`）, a3=count。
+        ENTRY_UPDATE_SET_ACES => {
+            let aces_path_ptr = frame.a1;
+            let aces_ptr = frame.a2;
+            let count = frame.a3;
+            sys_entry_set_aces(aces_path_ptr, aces_ptr, count)
+        }
         _ => pack_err(Error::InvalidParam),
     }
 }
@@ -1326,6 +1497,13 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
         Ok(a) => a,
         Err(e) => return pack_err(e),
     };
+
+    // A2-6 / ADR-040 §3.5.1 G4：第三原语 —— 读取显式 ACE 列表（a4 == ENTRY_READ_ACES）。
+    // 早于 stat/readdir 分派：本模式**不**解析为目录项列表，而是把节点显式 ACE
+    // 以 `AceWire` 定长数组写入用户缓冲（a2=out_ptr，a3=cap）。
+    if frame.a4 == ENTRY_READ_ACES {
+        return sys_entry_read_aces(path_ptr, frame.a2, frame.a3);
+    }
 
     // 第二原语：stat 模式（a4 == ENTRY_READ_STAT）。解析路径后把
     // 节点元数据以 StatInfo 定长结构整块拷入用户缓冲（a2），返回结构字节数。
