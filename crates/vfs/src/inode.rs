@@ -30,7 +30,13 @@ pub enum INodeType {
     Socket,
 }
 
-/// 现代能力权限标签（ADR-011，淘汰 755/644）。
+/// 权限披露标签（ADR-011，淘汰 755/644）。
+///
+/// **诚实边界（2026-09，todo.md D-MU-C1）**：`readable`/`writable`/`executable`
+/// 当前为**披露字段，不参与访问判定**（唯一强制点是 `system_only`，
+/// 见 kernel `enforce_open_permission`）。称其为"能力"名不副实。
+/// [ADR-040](../../../docs/adr/040-multi-user-access-model.md)（PROPOSED）将把本结构
+/// 重构为有序 ACE 列表并建立真实强制矩阵；落地前请勿依据本字段编写安全逻辑。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Permissions {
     pub readable: bool,
