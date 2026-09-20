@@ -3209,6 +3209,49 @@ pub fn process_snapshots() -> Vec<vfs::ProcessSnapshot> {
     list
 }
 
+/// A2-2 / ADR-040 §3.5 G5 配套：**活跃用户快照**（供 SysFS `/system/info/users` 使用）。
+///
+/// 由真实进程表归并而来：遍历全部存活进程，按 uid 去重，并收集每个 uid 的进程数与
+/// 进程名样本。**只反映"此刻有进程在跑的 uid"**——绝不冒充完整账户表（账户表是用户态
+/// 的 `/config/users.json`，内核不参与，ADR-040 §2.9）。视图语义边界由此成文。
+///
+/// 与 `/processes` 的一致性：同一份 `PROCESSES` 表、同一次弱一致快照遍历，故两者不会
+/// 互相矛盾（例如 `/processes` 里有的 pid 其 uid 必然出现在本视图）。
+///
+/// 去重策略：以小容量的定长数组收集（uid 空间在单机实际使用中远小于该上限），避免
+/// 引入 `BTreeMap` 分配；超过上限时**如实截断并报告**，不静默丢弃（S09）。
+pub fn active_user_snapshots() -> vfs::ActiveUserView {
+    /// 视图上限。现实单机同时活跃的 uid 数远小于此；超出则如实标记截断。
+    const MAX_ACTIVE_USERS: usize = 64;
+    let mut out: alloc::vec::Vec<vfs::UserSnapshot> = alloc::vec::Vec::new();
+    let mut truncated = false;
+    for bucket in PROCESSES.iter() {
+        let entry = bucket.lock();
+        for (_, e) in entry.iter() {
+            if e.proc.state() == TaskState::Exit {
+                continue;
+            }
+            let uid = e.proc.identity().uid;
+            // 线性查重（表极小，且避免额外分配）。
+            if let Some(slot) = out.iter_mut().find(|u| u.uid == uid) {
+                slot.process_count += 1;
+            } else if out.len() < MAX_ACTIVE_USERS {
+                out.push(vfs::UserSnapshot {
+                    uid,
+                    process_count: 1,
+                });
+            } else {
+                truncated = true;
+            }
+        }
+    }
+    // 稳定输出：按 uid 升序，便于消费方与测试比对（不依赖表遍历顺序）。
+    out.sort_by_key(|u| u.uid);
+    // 截断**如实上报**（S09）：放进返回值而非仅打日志——日志不可断言，
+    // 而消费方必须能区分"活跃用户就这么多"与"视图被上限截断了"。
+    vfs::ActiveUserView { users: out, truncated }
+}
+
 /// 获取单个进程的快照信息（供 ProcFS 使用）。
 pub fn get_process_snapshot(pid: usize) -> Option<vfs::ProcessSnapshot> {
     // 分桶化：pid 在册则持其所在桶读快照（弱一致）。

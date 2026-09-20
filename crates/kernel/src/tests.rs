@@ -10102,6 +10102,127 @@ pub fn test_ace_abi_roundtrip() {
 ///
 /// 为何"补 x 后成功"这一对照不可或缺：只断言"EACCES"无法区分是遍历检查生效、
 /// 还是路径/文件根本不存在（两者都返回一个错误）。对照把它钉死。
+/// A2-2（ADR-040 §3.5 G5 配套）：`/system/info/users` **全局活跃用户视图**。
+///
+/// 验收判据（multi-user.md A2-2 原文）：「视图列出活跃 uid 且与 `/processes` 一致；
+/// 不遮蔽 `/config/users.json`」。
+///
+/// 三点分别验证：
+/// 1. **列出的 uid 真实**——视图中的每个 uid 都能在 `/processes` 的对应进程身份里找到
+///    （两视图同源同表，不得互相矛盾）；
+/// 2. **不做伪数据**——视图不包含"没有任何进程在跑的 uid"（它只反映活跃，S09）；
+/// 3. **不遮蔽账户表**——`/config/users.json` 是用户态文件，SysFS 视图挂载于
+///    `/system/info`，两者路径与语义均不重叠；且视图 JSON 自带语义边界标记。
+pub fn test_active_users_view() {
+    info!("[test-users-view] === A2-2: /system/info/users active-user view ===");
+
+    let root = crate::vfs_init::root();
+
+    // ---- 0. 视图可解析、可读（真实挂载点存在）----
+    let node = match root.resolve("/system/info/users", true) {
+        Ok(n) => n,
+        Err(e) => panic!("A2-2: /system/info/users must exist, resolve failed: {:?}", e),
+    };
+    let data = match node.read_at(0, &mut [0u8; 4096]) {
+        Ok(_) => {
+            // 再读一次取长度（read_at 返回实际读取字节数）。
+            let mut buf = alloc::vec![0u8; 4096];
+            match node.read_at(0, &mut buf) {
+                Ok(n) => { buf.truncate(n); buf }
+                Err(e) => panic!("A2-2: read users view failed: {:?}", e),
+            }
+        }
+        Err(e) => panic!("A2-2: read users view failed: {:?}", e),
+    };
+    let text = core::str::from_utf8(&data).expect("users view must be UTF-8 JSON");
+    info!("[test-users-view] /system/info/users = {}", text.trim());
+
+    // ---- 1. 诚实边界标记必须出现在输出中（可被任何消费方直接看见，无需读文档）----
+    assert!(text.contains("\"not_account_table\":true")
+        , "A2-2: view must self-declare it is NOT an account table (S09), got: {}", text);
+    assert!(text.contains("\"scope\":\"active-processes-only\""),
+        "A2-2: view must self-declare its scope, got: {}", text);
+    assert!(text.contains("/config/users.json"),
+        "A2-2: view must point at the real account table path, got: {}", text);
+    info!("[test-users-view] honesty markers present (scope + not_account_table + account_table) OK");
+
+    // ---- 2. 与 /processes 一致：视图里每个 uid 都来自真实进程身份 ----
+    let view = task::active_user_snapshots();
+    let procs = task::process_snapshots();
+    // **一致性判据（可判定且不依赖新增 API）**：视图把存活进程按 uid 归并，故
+    // 「视图各条目 process_count 之和」必须**恰好等于**「进程表中的存活进程数」。
+    // 这同时排除了两类缺陷：漏计（归并丢进程）与虚增（列出无进程的 uid）。
+    let total: u64 = view.users.iter().map(|u| u.process_count).sum();
+    assert_eq!(
+        total,
+        procs.len() as u64,
+        "A2-2: sum of per-uid process_count ({}) must equal live process count ({}) -- \
+         the two views read the same table and must not disagree",
+        total,
+        procs.len()
+    );
+    // 每个列出的 uid 至少有一个真实进程（否则就是"列了不活跃的 uid"，S09 伪数据）。
+    for u in &view.users {
+        assert!(u.process_count >= 1,
+            "A2-2: uid {} listed with process_count 0 (must not list inactive uids)", u.uid);
+    }
+    // uid 不得重复（归并必须真正去重）。
+    for w in view.users.windows(2) {
+        assert!(w[0].uid != w[1].uid, "A2-2: duplicate uid {} in view", w[0].uid);
+    }
+    // 升序稳定性（便于消费方/测试比对，不依赖表遍历顺序）。
+    for w in view.users.windows(2) {
+        assert!(w[0].uid < w[1].uid, "A2-2: users must be sorted ascending by uid");
+    }
+    info!("[test-users-view] view matches process table ({} distinct active uids) OK", view.users.len());
+
+    // ---- 3. 不截断（本测试环境活跃 uid 极少，远低于上限）----
+    assert!(!view.truncated, "A2-2: view unexpectedly truncated in test environment");
+    info!("[test-users-view] not truncated OK");
+
+    // ---- 3b. **真实增益验证**：起一个带独立 uid 的进程，视图必须随之出现该 uid ----
+    //   上面 "count=0" 只是"当前确实没有进程"，本身是弱证据（空集总是自洽）。
+    //   本节把"活跃 uid 会被列出来"从**可能为真的空断言**变成**可判定的行为验证**：
+    //   派生一个 uid=4242 的进程，视图必须出现 4242 且 process_count>=1；
+    //   其退出后再次读取视图，该 uid 必须**消失**（证明视图确为动态投影，非缓存快照）。
+    let before = task::active_user_snapshots();
+    assert!(!before.users.iter().any(|u| u.uid == 4242),
+        "A2-2: precondition -- uid 4242 must not be active yet");
+
+    let ident = task::ProcessIdentity::user(4242, 4242);
+    // 手工 restorer + 真实 spawn 路径（test 夹具专用钩子）。
+    // ppid=0（独立进程，同 A2-0 停机测试的约定）——不依赖 init 是否已 spawn。
+    let pid = task::spawn_child_with_identity(0, "a2_2_probe", ident).expect("spawn uid-4242 process");
+    let after = task::active_user_snapshots();
+    let entry = after.users.iter().find(|u| u.uid == 4242);
+    assert!(entry.is_some(),
+        "A2-2: newly spawned uid 4242 must appear in the active-user view (got {:?})",
+        after.users.iter().map(|u| u.uid).collect::<alloc::vec::Vec<_>>());
+    assert!(entry.map(|u| u.process_count).unwrap_or(0) >= 1,
+        "A2-2: uid 4242 must report at least one live process");
+    info!("[test-users-view] spawned uid=4242 (pid {}) appears in view OK", pid);
+
+    // 视图与进程表仍一致（新增进程后该不变式继续成立）。
+    let total2: u64 = after.users.iter().map(|u| u.process_count).sum();
+    assert_eq!(total2, task::process_snapshots().len() as u64,
+        "A2-2: consistency invariant must hold after spawning");
+
+    // 收尸，随后该 uid 必须从视图消失（动态性验证）。
+    let _ = task::kill_pid(pid, 9, &mut unsafe { core::mem::zeroed() });
+    let gone = task::active_user_snapshots();
+    assert!(!gone.users.iter().any(|u| u.uid == 4242),
+        "A2-2: uid 4242 must disappear from the view once its process is gone \
+         (the view is a live projection, not a cached snapshot)");
+    info!("[test-users-view] uid=4242 disappears after reap (live projection) OK");
+
+    // ---- 4. 不遮蔽账户表：/config/users.json 是独立路径，SysFS 不占用它 ----
+    //   （前者属用户态文件域，后者是挂载在 /system/info 下的只读虚视图。）
+    assert!(!text.contains("\"password\""),
+        "A2-2: kernel view must not expose account-table fields (it is not the account table)");
+    //   （不断言 /config/users.json 是否存在——那是用户态建的文件，内核测试环境不保证；
+
+    info!("[test-users-view] === A2-2 pass ===");
+}
 pub fn test_dir_traverse_execute_check() {
     use alloc::boxed::Box;
     use alloc::vec;

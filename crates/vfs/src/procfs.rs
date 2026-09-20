@@ -25,6 +25,31 @@ pub struct ProcessSnapshot {
     pub memory_bytes: u64,
 }
 
+/// A2-2 / ADR-040 §3.5 G5 配套：**活跃用户**条目（供 SysFS `/system/info/users`）。
+///
+/// 语义边界（**必须**与视图一同成文，S09）：本结构描述的是"此刻有存活进程的 uid"，
+/// **不是**账户表。完整账户名单属用户态 `/config/users.json`（ADR-040 §2.9），内核不参与。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserSnapshot {
+    /// 用户 id（真实值，来自进程身份，不伪造）。
+    pub uid: u32,
+    /// 该 uid 当前存活的进程数（真实计数）。
+    pub process_count: u64,
+}
+
+/// 活跃用户视图的**完整结果**（含诚实边界标记）。
+///
+/// 为何不只返回 `Vec`：视图有硬上限（防止无界分配），一旦命中上限就必须**如实上报
+/// 截断**而不是静默少列——静默截断会让消费方误以为"活跃用户就这么多"（S09）。
+/// 把标记放进返回值使其**可测试**（日志不可断言）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveUserView {
+    /// 按 uid 升序的活跃用户条目。
+    pub users: alloc::vec::Vec<UserSnapshot>,
+    /// 是否因上限而截断（`true` 时 `users` 不完整，消费方**不得**当作全集）。
+    pub truncated: bool,
+}
+
 /// 进程查询回调 Provider Trait（由内核 process / scheduler 注入实现）。
 pub trait ProcessInfoProvider: Send + Sync {
     fn list_processes(&self) -> Vec<ProcessSnapshot>;

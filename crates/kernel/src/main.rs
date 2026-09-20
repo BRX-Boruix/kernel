@@ -801,6 +801,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_ace_abi_roundtrip();
 
+    // A2-2（ADR-040 §3.5 G5 配套）：/system/info/users 活跃用户视图（返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_active_users_view();
+
     // A2-3（ADR-040 §3.4）：目录遍历权限（父目录 Execute 位，返回主流程）。
     #[cfg(feature = "kernel-tests")]
     tests::test_dir_traverse_execute_check();

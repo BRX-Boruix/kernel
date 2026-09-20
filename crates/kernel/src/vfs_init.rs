@@ -287,6 +287,58 @@ impl SystemInfoProvider for KernelSystemProvider {
             .into_string()
             .expect("time JSON keys are ASCII")
     }
+
+    /// A2-2 / ADR-040 §3.5 G5 配套：`/system/info/users` 活跃用户视图。
+    ///
+    /// 数据源 = **真实进程表**（`task::active_user_snapshots()`，单点；与 `/processes`
+    /// 同源同表，故两者必然一致）。内核只做 JSON 编码。
+    ///
+    /// **诚实边界（S09，必须与输出一同可见）**：视图描述"此刻有存活进程的 uid"，
+    /// 而**非**账户表。完整账户名单在用户态 `/config/users.json`（ADR-040 §2.9，
+    /// 内核不参与）——故本视图**不遮蔽**也不等同于账户表；`users` 字段旁显式给出
+    /// `"scope": "active-processes-only"` 与 `"not_account_table": true` 两项，
+    /// 使任何消费方（含人）无需读文档即可看出语义边界。
+    fn users_json(&self) -> String {
+        let view = task::active_user_snapshots();
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        let mut object = writer
+            .start_object()
+            .expect("Vec-backed users JSON serialization cannot fail");
+        object
+            .field_str("scope", "active-processes-only")
+            .expect("Vec-backed users JSON serialization cannot fail");
+        object
+            .field_bool("not_account_table", true)
+            .expect("Vec-backed users JSON serialization cannot fail");
+        object
+            .field_str("account_table", "/config/users.json")
+            .expect("Vec-backed users JSON serialization cannot fail");
+        object
+            .field_bool("truncated", view.truncated)
+            .expect("Vec-backed users JSON serialization cannot fail");
+        object
+            .field_u64("count", view.users.len() as u64)
+            .expect("Vec-backed users JSON serialization cannot fail");
+        object
+            .sub_array("users", |arr| {
+                for u in &view.users {
+                    arr.push_object(|o| {
+                        o.field_u64("uid", u.uid as u64)?;
+                        o.field_u64("process_count", u.process_count)?;
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            })
+            .expect("Vec-backed users JSON serialization cannot fail");
+        object
+            .end()
+            .expect("Vec-backed users JSON serialization cannot fail");
+        target
+            .into_string()
+            .expect("users JSON keys are ASCII")
+    }
 }
 
 /// 内核 DevFS Provider 实现。

@@ -4,7 +4,9 @@
 //! - `/system/info/cpu`：CPU 架构、核心数、频率及特性列表 JSON；
 //! - `/system/info/memory`：LazyBuddy 内存容量、已分配、空闲及紧急预留池状态 JSON；
 //! - `/system/info/kernel`：内核版本、启动时间及构建元数据 JSON；
-//! - `/system/info/time`：CMOS/BIOS 硬件墙钟时间（真实年月日时分秒）JSON。
+//! - `/system/info/time`：CMOS/BIOS 硬件墙钟时间（真实年月日时分秒）JSON；
+//! - `/system/info/users`：**活跃用户**视图（A2-2/G5）——只列此刻有存活进程的 uid，
+//!   **不是**账户表（账户表属用户态 `/config/users.json`，ADR-040 §2.9）。
 //!
 //! `/system` 本身是真实可写 RamFS 域目录（ADR-012 swapfile 归属），SysFS 只读
 //! 视图挂载在其 `info` 子目录下，避免虚视图遮蔽真实存储。本 FS 为纯只读投影，
@@ -22,6 +24,9 @@ pub trait SystemInfoProvider: Send + Sync {
     fn memory_json(&self) -> String;
     fn kernel_json(&self) -> String;
     fn time_json(&self) -> String;
+    /// A2-2 / G5：活跃用户视图（只列「此刻有存活进程的 uid」，**不**冒充完整账户表——
+    /// 账户表属用户态 `/config/users.json`，ADR-040 §2.9）。
+    fn users_json(&self) -> String;
 }
 
 /// SysFS 文件系统实现。
@@ -72,6 +77,18 @@ impl SysFS {
             s.into_bytes()
         }));
         root.add_child("time", time_node);
+
+        // A2-2：活跃用户视图（G5 配套）。数据源是**真实进程表**（经 provider 注入），
+        // 内核只做 JSON 编码、不持有账户表（ADR-040 §2.9）。
+        let p5 = provider.clone();
+        let users_node = Arc::new(DynamicFileNode::read_only(move || {
+            let mut s = p5.users_json();
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.into_bytes()
+        }));
+        root.add_child("users", users_node);
 
         Self { root }
     }

@@ -48,7 +48,7 @@ pub use page_cache::{
     READ_BULK_THRESHOLD_BYTES,
 };
 pub use path::Path;
-pub use procfs::{ProcFS, ProcessInfoProvider, ProcessSnapshot};
+pub use procfs::{ActiveUserView, ProcFS, ProcessInfoProvider, ProcessSnapshot, UserSnapshot};
 pub use ramfs::{set_ramfs_memory_tight_hook, RamFS};
 pub use stdio::{set_stdin_source, set_stdout_sink, stderr_handle, stdin_handle, stdout_handle};
 pub use sysfs::{SysFS, SystemInfoProvider};

@@ -20,10 +20,13 @@ pub use process::{
     Caps, Groups, Process, ProcessIdentity, ProcessTable, TaskState, clear_current_proc,
     current_proc_mut, process_page_fault_handler, set_current_proc,
 };
+pub use scheduler::test_hooks::spawn_child_with_identity;
 pub use scheduler::{
     SwitchOutcome, Waited, block_current, block_current_with, block_for_event, block_for_kbd,
-    exit_current, get_process_snapshot, init_pid, kill_pid, process_snapshots, ps_snapshot,
-    set_init_pid, spawn, spawn_derived, spawn_thread_with, spawn_with_ppid, spawn_with_ppid_fds,
+    active_user_snapshots, exit_current, get_process_snapshot, init_pid, kill_pid,
+    process_snapshots, ps_snapshot,
+    set_init_pid, spawn, spawn_derived, spawn_thread_with,
+    spawn_with_ppid, spawn_with_ppid_fds,
     start, tick,
     group_members, group_live_count, group_all_exited, is_group_leader,
     waitpid, wake, wake_event, wake_event_timeout, wake_kbd, wake_with_value, set_event_timeout_timer,
