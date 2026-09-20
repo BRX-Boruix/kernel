@@ -672,11 +672,12 @@ unsafe fn kmain_body() -> ! {
     // ADR-032 SYNC 域 (0x70)：通用 futex 等待/唤醒 syscall 验收。
     #[cfg(feature = "kernel-tests")]
     tests::test_sync_syscalls();
-    // A1/ADR-033 进程身份模型：身份机制单测 + system_only 权限强制停机级验收。
+    // A1/ADR-033 进程身份模型：身份机制单测 + 系统门禁能力位停机级验收。
     #[cfg(feature = "kernel-tests")]
     tests::test_identity_inherit();
+    // A1-6 / ADR-040 §2.3：门禁能力位版（由 test_perm_system_only 改写，Q2 承诺）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_perm_system_only();
+    tests::test_cap_system_gate();
     // A1-3 / ADR-040 §2.6：统一强制矩阵停机级验收（§3.2 #4/#5/#6）。
     #[cfg(feature = "kernel-tests")]
     tests::test_access_enforcement_matrix();

@@ -12607,14 +12607,20 @@ pub fn test_identity_inherit() {
 }
 
 
-/// A1 / ADR-033: system_only permission enforcement stop-the-world acceptance.
-pub fn test_perm_system_only() {
+/// A1-6 / ADR-040 §2.3/§2.6：系统门禁能力位停机级验收（`test_cap_system_gate`）。
+///
+/// 由 ADR-033 时代的 `test_perm_system_only` 改写（Q2 承诺）：旧测试保护的
+/// `Privilege::System` 两档语义已被 `CAP_SYSTEM` 能力位吸收——测试对象从
+/// 「身份档位」改为「能力位」：无 `CAP_SYSTEM` 开门禁节点 → EACCES；
+/// 有 `CAP_SYSTEM` 放行；门禁判定序中 `CAP_OWNER` **不**豁免（§2.6 成文）；
+/// 创建通道不烙印门禁位（A1-1 回归锚保留）。
+pub fn test_cap_system_gate() {
     use alloc::boxed::Box;
     use arch::syscall::SyscallFrame;
     use task::{Process, ProcessIdentity};
     use vfs::inode::AccessPolicy;
 
-    info!("[test-perm-system-only] === A1/ADR-033: system_only enforcement ====");
+    info!("[test-cap-system-gate] === A1-6/ADR-040 §2.3: CAP_SYSTEM gate ====");
 
     fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
         SyscallFrame {
@@ -12665,7 +12671,7 @@ pub fn test_perm_system_only() {
             Ok(_) => {}
             Err(klib::error::Error::NotSupported) => {
                 info!(
-                    "[test-syscall-perm] SKIP: backing filesystem cannot express the gate bit \
+                    "[test-cap-system-gate] SKIP: backing filesystem cannot express the gate bit \
                      (EXT2 install-mode root has no such inode bit). \
                      This test requires the RamFS root produced by ISO boot."
                 );
@@ -12699,29 +12705,80 @@ pub fn test_perm_system_only() {
     const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
     const EACCES_U64: u64 = (-13i64) as u64;
 
-    // 1. User identity opens system_only node -> EACCES.
+    // 1. 无 CAP_SYSTEM（uid0 但能力为空）开门禁节点 → EACCES。
+    //    判据是**能力位**而非 uid/身份档位：uid0 无 CAP_SYSTEM 同样被拒。
     {
         let p = task::current_proc_mut().expect("proc");
-        assert_eq!(p.identity(), ProcessIdentity::default_user(), "default is User");
+        let uid0_nocap = ProcessIdentity {
+            uid: 0,
+            gid: 0,
+            groups: task::Groups::empty(),
+            caps: task::Caps::EMPTY,
+        };
+        p.set_identity(uid0_nocap);
+        assert!(p.identity().uid == 0, "uid0 sanity");
+        assert!(!p.identity().caps.contains(task::Caps::SYSTEM), "no CAP_SYSTEM sanity");
     }
     let mut o1 = frame(crate::syscall::SYS_STREAM_CREATE, base, OPEN_READ, 0);
     assert!(crate::syscall::syscall_entry(&mut o1));
-    assert!(o1.result & ERR_FLAG != 0, "User open of system_only must fail");
-    assert_eq!(o1.result, EACCES_U64, "User open of system_only must be EACCES(13)");
-    info!("[test-perm-system-only] User denied system_only -> EACCES OK");
+    assert!(o1.result & ERR_FLAG != 0, "uid0 without CAP_SYSTEM open of gated node must fail");
+    assert_eq!(o1.result, EACCES_U64, "gate denial must be EACCES(13)");
+    info!("[test-cap-system-gate] uid0 without CAP_SYSTEM denied -> EACCES OK");
 
-    // 2. Same proc set_identity(System) opens same node -> Ok.
+    // 2a. 置 CAP_SYSTEM（uid 不变仍为 0）→ 放行：判据是能力位。
     {
         let p = task::current_proc_mut().expect("proc");
-        p.set_identity(ProcessIdentity::system(1));
+        p.set_identity(ProcessIdentity {
+            uid: 0,
+            gid: 0,
+            groups: task::Groups::empty(),
+            caps: task::Caps::SYSTEM,
+        });
     }
     let mut o2 = frame(crate::syscall::SYS_STREAM_CREATE, base, OPEN_READ, 0);
     assert!(crate::syscall::syscall_entry(&mut o2));
-    assert!(o2.result & ERR_FLAG == 0, "System open of system_only must succeed");
+    assert!(o2.result & ERR_FLAG == 0, "uid0 with CAP_SYSTEM open of gated node must succeed");
     let fd_sys = o2.result;
-    info!("[test-perm-system-only] System opened system_only fd={} OK", fd_sys);
+    info!("[test-cap-system-gate] CAP_SYSTEM opened gated node fd={} OK", fd_sys);
 
-    // 3. Regression: normal node opens for User identity.
+    // 2b. 门禁判定序中 CAP_OWNER **不**豁免（ADR-040 §2.6 成文：CAP_OWNER
+    //     绕过的是 classic 段判定，门禁独立于其前）。0700+gate 节点：
+    //     无 CAP_SYSTEM、仅 CAP_OWNER 的属主 → 门禁先拒。
+    {
+        let node = crate::vfs_init::root()
+            .create_file("/scratch/perm_gate_ownonly.txt", 0o700, (1000, 1000))
+            .expect("create owner-gate fixture");
+        node.set_permissions(&AccessPolicy::from_wire(
+            vfs::inode::GATE_SYSTEM_BIT | 0o700,
+        ))
+        .expect("gate fixture supports set_permissions");
+    }
+    {
+        let p = task::current_proc_mut().expect("proc");
+        p.set_identity(ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+            groups: task::Groups::empty(),
+            caps: task::Caps::OWNER,
+        });
+    }
+    let ownonly_path = b"/scratch/perm_gate_ownonly.txt\x00";
+    // 槽位纪律：normal 节点占 base+0x1000（步骤 3/4 复用），ownonly 用
+    // 同页内偏移 base+0x1100——**不得覆盖** normal 槽（曾致步骤 3 误开门禁
+    // 节点而红；页 1 覆盖 base+0x1000..+0x2000，无需额外缺页）。
+    unsafe {
+        let pa4 = task::current_proc_mut().expect("proc").addr_space().translate(arch::VirtAddr::new(base + 0x1000)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(ownonly_path.as_ptr(), (pa4 + 0x100 + off) as *mut u8, ownonly_path.len());
+    }
+    let mut o5 = frame(crate::syscall::SYS_STREAM_CREATE, base + 0x1100, OPEN_READ, 0);
+    assert!(crate::syscall::syscall_entry(&mut o5));
+    assert_eq!(
+        o5.result, EACCES_U64,
+        "CAP_OWNER without CAP_SYSTEM must NOT bypass the gate (owner would pass classic eval)"
+    );
+    info!("[test-cap-system-gate] CAP_OWNER does not exempt the gate OK");
+
+    // 3. 回归：无门禁 classic 0644 节点对普通身份照常可开。
     {
         let p = task::current_proc_mut().expect("proc");
         p.set_identity(ProcessIdentity::default_user());
@@ -12730,13 +12787,12 @@ pub fn test_perm_system_only() {
     assert!(crate::syscall::syscall_entry(&mut o3));
     assert!(o3.result & ERR_FLAG == 0, "User open of normal node must succeed");
     let fd_norm = o3.result;
-    info!("[test-perm-system-only] User opened normal node fd={} OK", fd_norm);
+    info!("[test-cap-system-gate] User opened normal node fd={} OK", fd_norm);
 
-    // 4. A1-1：创建通道只烙印 classic mode + 属主（POSIX 语义），wire 参数
-    //    中的门禁位**无处烙印**——from_wire 虽解析 bit9，但 create/mkdir
-    //    路径只消费 classic 段。断言：User 以 bit9 参数创建成功且节点不带
-    //    门禁（后续 open 可行）。门禁唯一写入门径是 chmod/set_permissions，
-    //    其属主校验是 A1-3 项（本测试以 chmod 通道作夹具即为演示）。
+    // 4. A1-1 回归锚（保留）：创建通道只烙印 classic mode + 属主（POSIX
+    //    语义），wire 参数中的门禁位**无处烙印**——from_wire 虽解析 bit9，
+    //    但 create/mkdir 路径只消费 classic 段。门禁唯一写入门径是
+    //    chmod/set_permissions（其属主校验已由 A1-3 落地）。
     const CREATE_WRITE: u64 = (1u64 << 1) | (1u64 << 2);
     const GATE_BIT_A9: u64 = vfs::inode::GATE_SYSTEM_BIT as u64;
     let v7_path = b"/scratch/perm_user_create_sysonly.txt\x00";
@@ -12771,7 +12827,7 @@ pub fn test_perm_system_only() {
             "create channel must NOT imprint the gate bit"
         );
     }
-    info!("[test-perm-system-only] create channel carries no gate bit OK");
+    info!("[test-cap-system-gate] create channel carries no gate bit OK");
 
     // cleanup: close fds + unlink nodes.
     {
@@ -12787,18 +12843,21 @@ pub fn test_perm_system_only() {
         // A1-1 测试 4：创建通道不再拒绝，节点真实存在——如实清理。
         root.unlink("/scratch/perm_user_create_sysonly.txt")
             .expect("cleanup unlink user-created node");
+        // A1-6 步骤 2b 的属主门禁夹具。
+        root.unlink("/scratch/perm_gate_ownonly.txt")
+            .expect("cleanup unlink owner-gate fixture");
     }
 
     arch_x86_64::mmio::write_cr3(saved_cr3);
     task::clear_current_proc();
     unsafe { drop(Box::from_raw(proc_raw)) };
     arch_x86_64::interrupts::irq_restore(irq_flags);
-    info!("[test-perm-system-only] PASS");
+    info!("[test-cap-system-gate] PASS");
 }
 
 /// A1-3 / ADR-040 §2.6 + §3.2 #4/#5/#6：统一强制矩阵停机级验收。
 ///
-/// 与 test_perm_system_only 同构：真实 syscall 入口（syscall_entry）+
+/// 与 test_cap_system_gate 同构：真实 syscall 入口（syscall_entry）+
 /// 伪当前进程 + RamFS 根（ISO 启动）。覆盖：
 /// - #4 r/w 真实强制：0400 节点 User 读/写均 EACCES；属主 0644 写放行；
 /// - #5 强制点覆盖：拿到 fd 后属主 chmod 收紧权限，后续 read 被拒；
@@ -13308,7 +13367,7 @@ pub fn test_stat_owner_fields() {
 /// PRE-1 / ADR-037 决策 5 / A1-2 能力位改判：UIO 特权门禁——driver_register/
 /// driver_claim 仅持 `CAP_DEVICE` 者可调用，其余一律 `PermissionDenied`（EACCES/13）。
 ///
-/// 与 test_perm_system_only 同构：真实 syscall 入口（syscall_entry）+ 伪当前进程。
+/// 与 test_cap_system_gate 同构：真实 syscall 入口（syscall_entry）+ 伪当前进程。
 /// 门禁在 syscall 层，短路径在触碰任何用户内存前即拒绝——User 身份不必提供合法
 /// 设备名/指针即可证拒绝；System 身份则应越过门禁、落到下一步（野指针 →
 /// BadAddress，而非 PermissionDenied），证门禁对 System 放行。
@@ -13440,7 +13499,7 @@ pub fn test_audio_attach_privilege_gate() {
     // `usize::MAX` 恰好 `>= u32::MAX`，于是被 ring 合法拒掉。
     // 其它测试用 pid 只做内存/调度断言，不校验 pid 值域，故不受影响；
     // 本测试会把它注册进 ring，必须用一个**真实合法**的 pid。
-    // 取 999（同 test_perm_system_only 惯例）：合法且不撞真实进程槽。
+    // 取 999（同 test_cap_system_gate 惯例）：合法且不撞真实进程槽。
     const TEST_PID: usize = 999;
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
