@@ -13737,6 +13737,69 @@ pub fn test_ace_e2e() {
     arch_x86_64::interrupts::irq_restore(irq_flags);
     info!("[test-ace-e2e] PASS");
 }
+
+
+/// SMP per-CPU 用户态地基回归测试（ADR-040 附带修复）。
+///
+/// 缺陷：`syscall` 的三个前提全部是 **per-CPU** 的，BSP 建好后 AP 缺失——
+/// (a) `EFER.SCE`/`STAR`/`FMASK`/`LSTAR` 四个 MSR（未置 SCE 时 `syscall` 指令
+///     本身即 #UD）；(b) GS per-CPU 结构（入口 stub 用 `gs:[16]`/`gs:[48]`
+///     切栈，缺失则切到地址 0）。后果：4 核下任何被调度到 AP 的用户进程在
+/// 首个 syscall 处 #UD → SIGILL → 退出码 4，shell 无限重生（实测 7437 次），
+/// 而单核完全正常。
+///
+/// 本测试钉住**本核**（BSP，测试运行核）的地基不变量与 AP 编程函数的契约：
+/// ① BSP 的 `SCE` 已置位、`STAR`/`LSTAR`/`FMASK` 非零；
+/// ② `lstar_entry()` 已发布（AP 靠它取 LSTAR 目标，未发布则 AP 自停）；
+/// ③ `program_syscall_msrs_current_cpu` **无全局幂等守卫**——重复调用仍
+///    实际写 MSR（这正是 AP 路径成立的前提；若退回全局幂等，本断言失败）。
+///
+/// 诚实边界：本测试在 BSP 上运行，**不能**直接读 AP 的 MSR（跨核 MSR 无
+/// 读取路径）。AP 侧的真实验证由 `br` 多核启动的串口证据承担（三个 AP 各
+/// 打印 `syscall MSRs programmed`/`percpu enabled` 且用户态全栈存活）。
+#[cfg(feature = "kernel-tests")]
+pub fn test_smp_percpu_syscall_foundation() {
+    use arch_x86_64::syscall;
+
+    info!("[test-smp-percpu] === SMP per-CPU user-mode foundation ====");
+
+    // ① 地基已就绪（本核）：SCE 位 + 三个非零 MSR。
+    assert!(syscall::is_ready(), "syscall MSR foundation must be initialized");
+    let st = syscall::msr_state();
+    assert!(st.sce_enabled, "EFER.SCE must be set (else syscall => #UD)");
+    assert_ne!(st.star, 0, "STAR must be programmed");
+    assert_ne!(st.lstar, 0, "LSTAR must be programmed");
+    assert_ne!(st.fmask, 0, "FMASK must be programmed (IF/TF masking)");
+    // STAR 低 32 位的 [47:32] 必须是内核代码段（syscall 装载 CS）。
+    let cs_bits = ((st.star >> 32) & 0xFFFF) as u16;
+    assert_eq!(cs_bits, syscall::KERNEL_CS, "STAR[47:32] must be KERNEL_CS");
+    info!("[test-smp-percpu] BSP foundation: SCE=1 STAR={:#x} LSTAR={:#x} FMASK={:#x} OK", st.star, st.lstar, st.fmask);
+
+    // ② LSTAR 入口已发布（AP 编程 MSR 时取用；未发布则 AP 自停，
+    //    表现为用户态完全起不来）。
+    let entry = syscall::lstar_entry();
+    assert_ne!(entry, 0, "LSTAR entry must be published for APs to reuse");
+    assert_eq!(entry, st.lstar, "published entry must equal programmed LSTAR");
+    info!("[test-smp-percpu] LSTAR entry published = {:#x} OK", entry);
+
+    // ③ 关键契约：per-CPU 编程函数**不得**带全局幂等守卫。
+    //    若有人把它退回 `init_syscall_msrs` 的幂等形态，AP 调用会被跳过，
+    //    缺陷复发。此处重复调用并要求 MSR 值保持正确。
+    syscall::program_syscall_msrs_current_cpu(entry);
+    let st2 = syscall::msr_state();
+    assert!(st2.sce_enabled, "SCE must remain set after re-programming");
+    assert_eq!(st2.lstar, entry, "LSTAR must equal entry after re-programming");
+    assert_eq!(st2.star, st.star, "STAR must be stable across re-programming");
+    assert_eq!(st2.fmask, st.fmask, "FMASK must be stable across re-programming");
+    info!("[test-smp-percpu] per-CPU re-programming is effective (no global idempotence guard) OK");
+
+    // ④ GS per-CPU 地基在本核可用（AP 侧由 init_current 各自建立）。
+    assert!(arch_x86_64::percpu::is_enabled(), "GS per-CPU foundation must be enabled");
+    assert_ne!(arch_x86_64::percpu::read_gs_base(), 0, "GS base must be non-zero");
+    info!("[test-smp-percpu] GS per-CPU foundation enabled (gs_base={:#x}) OK", arch_x86_64::percpu::read_gs_base());
+
+    info!("[test-smp-percpu] PASS");
+}
 /// PRE-1 / ADR-037 决策 5 / A1-2 能力位改判：UIO 特权门禁——driver_register/
 /// driver_claim 仅持 `CAP_DEVICE` 者可调用，其余一律 `PermissionDenied`（EACCES/13）。
 ///

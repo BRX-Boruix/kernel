@@ -399,6 +399,52 @@ extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
     // 立硬件前提，不得再置 TS。
     crate::interrupts::enable_fpu();
 
+    // ---- ADR-040/SMP 修复：AP 上补齐两处 per-CPU 用户态地基 ----
+    //
+    // BSP 在 `kmain` 中依次建立「GS per-CPU 地基」→「syscall MSR」两件前提，
+    // 但两者**都是每核私有的**，AP 不补做即残缺：
+    //
+    //   (a) GS per-CPU 结构：`syscall` 入口 stub 第一步 `swapgs` 后立即用
+    //       `gs:[16]`（内核栈顶）与 `gs:[48]`（专用 syscall 栈顶）切栈。AP 若不
+    //       `init_current`，这两个字段恒为 **0** → 切栈到地址 0 → 压帧时 #PF/#DF。
+    //   (b) syscall MSR（EFER.SCE/STAR/FMASK/LSTAR）：未置 SCE 时 `syscall`
+    //       指令本身即 **#UD** → SIGILL → 进程以退出码 4 立即终止。
+    //
+    // 两者合起来正是「4 核下用户程序一启动就死/卡死、单核完全正常」的成因。
+    // 顺序与 BSP 一致（GS 地基在前，MSR 在后），且必须在开中断与进入调度之前。
+    {
+        // (a) GS 地基：内核栈顶取本 AP 的常驻内核栈（`kstack_top`，本函数早前
+        //     已用于 `gdt::setup_cpu`）；专用 syscall 栈由 `init_current` 内部自取。
+        let ok = crate::percpu::init_current(slot, kstack_top);
+        if !ok {
+            AP_SELF_HALTED.fetch_add(1, Ordering::AcqRel);
+            klib::info!("[smp] AP slot {}: percpu init FAILED, halting", slot as u64);
+            loop {
+                crate::interrupts::halt();
+            }
+        }
+        klib::info!(
+            "[smp] AP slot {} percpu enabled (gs_base={:#x}, kstack_top={:#x})",
+            slot as u64,
+            crate::percpu::read_gs_base(),
+            kstack_top
+        );
+
+        // (b) syscall MSR：LSTAR 目标全核一致，取自 BSP 已发布的地址。
+        let entry = crate::syscall::lstar_entry();
+        if entry == 0 {
+            // BSP 尚未发布入口：AP 无法安全编程 LSTAR。如实上报并自停，
+            // 绝不带着半套 syscall 地基进入调度（否则本核每进程都以 #UD 死）。
+            AP_SELF_HALTED.fetch_add(1, Ordering::AcqRel);
+            klib::info!("[smp] AP slot {}: LSTAR entry not published, halting", slot as u64);
+            loop {
+                crate::interrupts::halt();
+            }
+        }
+        crate::syscall::program_syscall_msrs_current_cpu(entry);
+        klib::info!("[smp] AP slot {} syscall MSRs programmed (EFER.SCE=1)", slot as u64);
+    }
+
     // 开启中断
     crate::interrupts::enable();
 

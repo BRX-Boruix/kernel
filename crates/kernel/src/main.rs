@@ -692,6 +692,9 @@ unsafe fn kmain_body() -> ! {
     tests::test_ace_semantics();
     #[cfg(feature = "kernel-tests")]
     tests::test_ace_e2e();
+    // SMP per-CPU 用户态地基回归（syscall MSR + GS per-CPU 每核必备）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_smp_percpu_syscall_foundation();
     // PRE-1 / ADR-037 决策 5：UIO driver_register/driver_claim 特权门禁（System-only）。
     #[cfg(feature = "kernel-tests")]
     tests::test_driver_uio_privilege_gate();

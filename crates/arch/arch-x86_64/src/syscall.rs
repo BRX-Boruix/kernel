@@ -150,31 +150,73 @@ pub const fn is_canonical(addr: u64) -> bool {
     }
 }
 
-/// `syscall` 入口地基是否已启用。
+/// `syscall` 入口地基是否已启用（**BSP 视角的一次性初始化**标志）。
+///
+/// 注意：本标志**只**表达"入口地址已算出且 BSP 已编程"，
+/// **不**表达"所有 CPU 都已编程"——EFER.STAR/FMASK/LSTAR 均为
+/// **per-CPU MSR**（见 [`program_syscall_msrs_current_cpu`]）。
 static SYSCALL_MSR_READY: AtomicUsize = AtomicUsize::new(0);
 
-/// 配置 `syscall`/`sysret` 所需的 MSR（EFER.SCE + STAR + FMASK + LSTAR）。
+/// 编程**当前 CPU** 的 `syscall`/`sysret` MSR（EFER.SCE + STAR + FMASK + LSTAR）。
 ///
-/// `entry` 是 `syscall` 指令要跳转到的入口地址（LSTAR）。
+/// # 为什么必须 per-CPU
 ///
-/// **必须在 `syscall` 指令第一次执行前调用**，且只能调用一次（幂等保护）。
-pub fn init_syscall_msrs(entry: u64) -> bool {
-    if SYSCALL_MSR_READY.load(Ordering::Acquire) != 0 {
-        return true; // 幂等
-    }
+/// `IA32_EFER`、`IA32_STAR`、`IA32_FMASK`、`IA32_LSTAR` 四个 MSR 全部是
+/// **每核私有寄存器**：BSP 编程后 AP 的对应寄存器**仍是复位值**。
+/// 此时 AP 上的用户态一旦执行 `syscall` 指令，因 `EFER.SCE=0` 直接 **#UD**
+/// （invalid opcode）→ 映射 SIGILL → 进程以退出码 4 终止。表现为
+/// "SMP 下用户程序一启动就死、单核完全正常"。
+///
+/// # 调用纪律
+///
+/// - BSP：`init_syscall_msrs` 算出入口后内部调用本函数；
+/// - 每个 AP：在 `ap_entry` 中、**开中断与进入调度空闲循环之前**各自调用一次
+///   （与 `enable_fpu` / `reload_idt_current_cpu` 同款 per-CPU 前提）。
+///
+/// `entry` 为 `LSTAR` 目标（`syscall` 入口 stub 地址），由 BSP 算出后
+/// 经全局共享（该地址全核一致，无需各自重算）。
+///
+/// 本函数**刻意不带全局幂等守卫**：守卫会跳过 AP 的编程，正是本缺陷成因。
+pub fn program_syscall_msrs_current_cpu(entry: u64) {
     unsafe {
-        // 1) EFER.SCE：启用 syscall/sysret。
+        // 1) EFER.SCE：启用 syscall/sysret（per-CPU）。
         let efer = rdmsr(IA32_EFER);
         if efer & EFER_SCE == 0 {
             wrmsr(IA32_EFER, efer | EFER_SCE);
         }
-        // 2) STAR：段选择子。
+        // 2) STAR：段选择子（per-CPU）。
         wrmsr(IA32_STAR, compute_star_value());
         // 3) FMASK：进入内核时自动清 IF/TF（换栈前先关中断，见常量注释）。
         wrmsr(IA32_FMASK, SYSCALL_RFLAGS_MASK);
         // 4) LSTAR：入口地址。最后写——前三个就绪后入口才可安全跳入。
         wrmsr(IA32_LSTAR, entry);
     }
+}
+
+/// `syscall` 入口 stub 的地址（`LSTAR` 目标），由 BSP 在 `init_syscall_msrs`
+/// 时记录，供 AP 编程自己的 MSR 时复用（全核同一地址）。
+static LSTAR_ENTRY: AtomicUsize = AtomicUsize::new(0);
+
+/// 供 AP 侧取回 `LSTAR` 目标地址；未初始化时返回 0。
+#[inline]
+pub fn lstar_entry() -> u64 {
+    LSTAR_ENTRY.load(Ordering::Acquire) as u64
+}
+
+/// 配置 `syscall`/`sysret` 所需的 MSR（EFER.SCE + STAR + FMASK + LSTAR）。
+///
+/// `entry` 是 `syscall` 指令要跳转到的入口地址（LSTAR）。
+///
+/// **必须在 `syscall` 指令第一次执行前调用**。本函数为 BSP 的入口：
+/// 记录 `entry` 供 AP 复用，并编程 **BSP 自己**的 MSR。AP 不调用本函数
+/// （全局幂等守卫会早退），而是调用 [`program_syscall_msrs_current_cpu`]。
+pub fn init_syscall_msrs(entry: u64) -> bool {
+    if SYSCALL_MSR_READY.load(Ordering::Acquire) != 0 {
+        return true; // 幂等（BSP 重复调用安全）
+    }
+    // 先记录入口地址：AP 可能在任何时刻取用，故先发布再编程本核。
+    LSTAR_ENTRY.store(entry as usize, Ordering::Release);
+    program_syscall_msrs_current_cpu(entry);
     SYSCALL_MSR_READY.store(1, Ordering::Release);
     true
 }
