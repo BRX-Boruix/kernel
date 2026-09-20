@@ -801,6 +801,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_ace_abi_roundtrip();
 
+    // A2-3（ADR-040 §3.4）：目录遍历权限（父目录 Execute 位，返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_dir_traverse_execute_check();
+
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();

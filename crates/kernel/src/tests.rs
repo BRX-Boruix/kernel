@@ -5695,7 +5695,7 @@ pub fn test_syscall_entry_create_kind() {
 pub fn test_syscall_driver_query_unregister() {
     use alloc::boxed::Box;
     use arch::syscall::SyscallFrame;
-    use task::{Process, ProcessIdentity};
+    use task::{Caps, Process, ProcessIdentity};
 
     info!("[test-syscall-driver-query] === ADR-014: DRIVER 0x52/0x54 ===");
 
@@ -10089,6 +10089,160 @@ pub fn test_ace_abi_roundtrip() {
     unsafe { drop(Box::from_raw(proc_raw)); }
     info!("[test-ace-abi] === A2-6 pass ===");
 }
+
+/// A2-3（ADR-040 §3.4 未落地承诺）：**目录遍历权限**（父目录 Execute 位）。
+///
+/// 验收判据（multi-user.md A2-3 原文）：「无 x 的目录下文件即使 0644 也不可达
+/// （EACCES）」。POSIX 语义：路径解析的**每一级父目录**都要求 Execute（搜索）位；
+/// 缺 x 则无法穿越该目录抵达其下的任何条目，**与目标文件自身权限无关**。
+///
+/// 本测试走真实 syscall 链路：建 /scratch/a2_3_dir/（**无 x**）→ 在其下建文件
+/// （0644）→ 由**非属主**身份尝试 stat/open 该文件 → 必须 EACCES；随后给目录补 x
+/// → 同一调用应转为成功（证明判据确为"目录 x 位"而非其它原因）。
+///
+/// 为何"补 x 后成功"这一对照不可或缺：只断言"EACCES"无法区分是遍历检查生效、
+/// 还是路径/文件根本不存在（两者都返回一个错误）。对照把它钉死。
+pub fn test_dir_traverse_execute_check() {
+    use alloc::boxed::Box;
+    use alloc::vec;
+    use arch::syscall::SyscallFrame;
+    use task::{Caps, Process, ProcessIdentity};
+
+    info!("[test-traverse] === A2-3: directory traversal requires Execute ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3, a4, a5: 0,
+            result: 0, switched: false, arch_frame: 0, aux_pid: 0,
+        }
+    }
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+    let eacces = (-(klib::error::Error::PermissionDenied.to_errno() as i64)) as u64;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+    // 以 system(1) 准备夹具（建目录/文件、设权限）。
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
+
+    let root = crate::vfs_init::root();
+    let _ = root.unlink("/scratch/a2_3_dir/a2_3_f.txt");
+    let _ = root.unlink("/scratch/a2_3_dir");
+    // 目录 mode 0700（属主 rwx，**other 无 x**）——用于验证非属主无法穿越。
+    let dir = root.mkdir("/scratch/a2_3_dir", 0o700, (1, 1)).expect("mk dir");
+    root.create_file("/scratch/a2_3_dir/a2_3_f.txt", 0o644, (1, 1)).expect("mk file");
+    info!("[test-traverse] fixture: /scratch/a2_3_dir(0700) + file(0644) OK");
+
+    // 用户缓冲：路径。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    let buf = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space().handle_page_fault(buf, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let ps = b"/scratch/a2_3_dir/a2_3_f.txt\x00";
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(buf)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(ps.as_ptr(), (pa + off) as *mut u8, ps.len());
+    }
+
+    // ---- 1. 非属主（uid 2002）访问：目录 0700 无 other-x → 必须 EACCES ----
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::user(2002, 2002));
+    let mut st = frame(crate::syscall::SYS_ENTRY_READ, buf, buf + 0x800, 128, crate::syscall::ENTRY_READ_STAT);
+    assert!(crate::syscall::syscall_entry(&mut st));
+    assert_eq!(
+        st.result, eacces,
+        "non-owner stat through a dir without x must be EACCES (file is 0644!)"
+    );
+    info!("[test-traverse] non-owner stat through 0700 dir -> EACCES OK");
+
+    // ---- 2. 对照：目录补上 other-x（0755）后，同一调用应成功 ----
+    //   （证明上一步的 EACCES 确因缺 x，而非路径不存在或其它原因。）
+    dir.set_permissions(&vfs::inode::AccessPolicy::from_classic_owned(0o755, 1, 1))
+        .expect("chmod dir to 0755");
+    // 自检（保留为证据，非临时诊断）：经**重新解析**确认新的 x 位真的落在 resolve
+    // 所见的节点上——排除"改的是副本、resolve 看到的是旧权限"这类会造成假对照的缺陷。
+    let re_resolved = root.resolve("/scratch/a2_3_dir", true).expect("re-resolve dir");
+    let re_perms = re_resolved.metadata().expect("meta").permissions.classic_mode();
+    assert_eq!(re_perms & 0o111, 0o111, "control precondition: dir must actually have x now");
+    let mut st2 = frame(crate::syscall::SYS_ENTRY_READ, buf, buf + 0x800, 128, crate::syscall::ENTRY_READ_STAT);
+    assert!(crate::syscall::syscall_entry(&mut st2));
+    assert!(
+        st2.result & ERR_FLAG == 0,
+        "after granting x, the same stat must succeed (proves the criterion is the x bit), got {:#x}",
+        st2.result
+    );
+    info!("[test-traverse] after granting x on the dir -> stat succeeds (control) OK");
+
+    // ---- 3. 属主自己不受影响（属主有 x，rwx）----
+    dir.set_permissions(&vfs::inode::AccessPolicy::from_classic_owned(0o700, 1, 1)).expect("back to 0700");
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
+    let mut st3 = frame(crate::syscall::SYS_ENTRY_READ, buf, buf + 0x800, 128, crate::syscall::ENTRY_READ_STAT);
+    assert!(crate::syscall::syscall_entry(&mut st3));
+    assert!(st3.result & ERR_FLAG == 0, "owner (has x) must still traverse, got {:#x}", st3.result);
+    info!("[test-traverse] owner traversal still works OK");
+
+    // ---- 4. 多级路径：**中间**目录缺 x 即拦（证明逐级生效，非只看直接父目录）----
+    //   结构：/scratch/a2_3_out(0755, 有 x) / a2_3_in(0700 无 other-x) / f2(0644)。
+    //   非属主应被中间的 a2_3_in 拦住——即使直接父目录 a2_3_out 有 x。
+    let _ = root.unlink("/scratch/a2_3_out/a2_3_in/a2_3_f2.txt");
+    let _ = root.unlink("/scratch/a2_3_out/a2_3_in");
+    let _ = root.unlink("/scratch/a2_3_out");
+    let _out2 = root.mkdir("/scratch/a2_3_out", 0o755, (1, 1)).expect("mk out");
+    let _in2 = root.mkdir("/scratch/a2_3_out/a2_3_in", 0o700, (1, 1)).expect("mk in");
+    root.create_file("/scratch/a2_3_out/a2_3_in/a2_3_f2.txt", 0o644, (1, 1)).expect("mk f2");
+    let ps2 = b"/scratch/a2_3_out/a2_3_in/a2_3_f2.txt\x00";
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(buf)).expect("resident").as_u64();
+        core::ptr::copy_nonoverlapping(ps2.as_ptr(), (pa + off) as *mut u8, ps2.len());
+    }
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::user(2002, 2002));
+    let mut st4 = frame(crate::syscall::SYS_ENTRY_READ, buf, buf + 0x800, 128, crate::syscall::ENTRY_READ_STAT);
+    assert!(crate::syscall::syscall_entry(&mut st4));
+    assert_eq!(st4.result, eacces, "a *middle* dir without x must block traversal");
+    info!("[test-traverse] middle dir (not just direct parent) without x -> EACCES OK");
+
+    // ---- 5. CAP_OWNER 持有者可穿越（与 check_access 豁免一致，不另立判定）----
+    //   复用同一 check_access 单点，故 CAP_OWNER 的既有豁免自动生效——此处验证
+    //   它确实生效（否则 A2-3 会**收紧**既有特权行为，属回归）。
+    // 显式构造"普通用户 + 仅 CAP_OWNER"（不以 system() 表达普通用户，S13）。
+    let cap_owner_ident = ProcessIdentity {
+        caps: Caps::OWNER,
+        ..ProcessIdentity::user(2003, 2003)
+    };
+    task::current_proc_mut().expect("proc").set_identity(cap_owner_ident);
+    let mut st5 = frame(crate::syscall::SYS_ENTRY_READ, buf, buf + 0x800, 128, crate::syscall::ENTRY_READ_STAT);
+    assert!(crate::syscall::syscall_entry(&mut st5));
+    assert!(st5.result & ERR_FLAG == 0, "CAP_OWNER holder must still traverse (no regression), got {:#x}", st5.result);
+    info!("[test-traverse] CAP_OWNER holder can traverse OK");
+
+    // 清理
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
+    let _ = root.unlink("/scratch/a2_3_out/a2_3_in/a2_3_f2.txt");
+    let _ = root.unlink("/scratch/a2_3_out/a2_3_in");
+    let _ = root.unlink("/scratch/a2_3_out");
+    let _ = root.unlink("/scratch/a2_3_dir/a2_3_f.txt");
+    let _ = root.unlink("/scratch/a2_3_dir");
+    task::clear_current_proc();
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    unsafe { drop(Box::from_raw(proc_raw)); }
+    info!("[test-traverse] === A2-3 pass ===");
+}
+
 
 
 

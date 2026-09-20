@@ -516,6 +516,60 @@ fn absolute_path(path: &str) -> Result<alloc::string::String, Error> {
     Ok(vfs::path::Path::canonicalize(&abs))
 }
 
+/// A2-3 / ADR-040 §3.4：**目录遍历权限单点**——逐级父目录要求 Execute（搜索）位。
+///
+/// POSIX 语义：路径解析的**每一级父目录**都需要 x 位；缺 x 则无法穿越该目录抵达
+/// 其下任何条目，**与目标条目自身权限无关**（一个 0644 的文件在无 x 的父目录下
+/// 同样不可达）。这是"搜索权限"与"读权限"的正交性。
+///
+/// 为何有独立 helper 而非在 `resolve` 内做（S13 单点说明）：`resolve` 是 vfs 层
+/// 纯路径函数，**没有身份参数**（依赖方向 task→vfs，vfs 不得反向依赖身份）。
+/// 故遍历检查属**强制矩阵**，与 `check_access` 同理落在 kernel 侧。
+///
+/// 判定面：对 `abs_path` 的每一级**中间目录**（不含最后一段——最后一段是调用方
+/// 自己的操作对象，其权限由各调用点按语义判定）求 Execute。实施要点：
+/// - 根 `/` 亦参与检查（POSIX：`/` 通常 0755，但若被改窄则应当拦截）；
+/// - 任一中间目录缺失/不可解析 → 如实 `NotFound`（不伪造成 EACCES）；
+/// - 权限不足 → `PermissionDenied`（EACCES）；
+/// - `CAP_OWNER` 豁免与门禁位语义与 `check_access` 一致（复用同一单点，不另起判定）。
+///
+/// 调用时机：各 path-taking syscall 在 `absolute_path` 之后、`resolve` 之前调用。
+fn check_traverse_access(
+    identity: &ProcessIdentity,
+    abs_path: &str,
+) -> Result<(), Error> {
+    let root = crate::vfs_init::root();
+    // 逐级构造中间目录前缀并求 Execute。末段（含尾随空段）不检查。
+    let comps: alloc::vec::Vec<&str> = vfs::path::Path::new(abs_path).components().collect();
+    if comps.is_empty() {
+        return Ok(());
+    }
+    let mut prefix = alloc::string::String::new();
+    // prefix 代表「进入 comps[i] 之前所在目录」。
+    // 只检查 **中间目录**：根 `/` 与 comps[0..len-1] 构成的每级父目录。
+    // **不检查最后一段**——它是调用方的操作对象本身，其权限（读/写/执行）由各
+    // 调用点按自己的语义判定（如 stat 求 Read、mkdir 求父目录 Write）。把末段也
+    // 按 Execute 检查会造成语义重复与错误拒绝（例：对文件 stat 会因文件无 x 被拒）。
+    for i in 0..comps.len() {
+        let node = match root.resolve(if prefix.is_empty() { "/" } else { &prefix }, true) {
+            Ok(n) => n,
+            Err(e) => return Err(e),
+        };
+        if !matches!(node.node_type(), Ok(vfs::inode::INodeType::Directory)) {
+            // 中间段不是目录 → 无法穿越。如实 InvalidParam（本仓 Error 无 NotDir，
+            // 取语义最近的参数类错误；不伪造成 NotFound/EACCES）。
+            return Err(Error::InvalidParam);
+        }
+        check_access(identity, node.as_ref(), vfs::inode::PermBits::EXECUTE)?;
+        // 前进：只有还有下一段时才前进（最后一段为操作对象，不参与穿越）。
+        if i + 1 < comps.len() {
+            prefix.push_str("/");
+            prefix.push_str(comps[i]);
+        }
+    }
+    Ok(())
+}
+
 /// `chdir(path_ptr)`：切换当前进程工作目录（VFS 域 0x45）。
 ///
 /// 目标必须是存在的目录（用 VFS `ENTRY_READ` 解析确认），否则不改动 cwd
@@ -529,6 +583,15 @@ fn sys_chdir(frame: &mut SyscallFrame) -> u64 {
         Ok(a) => a,
         Err(e) => return pack_err(e),
     };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &abs) {
+            return pack_err(e);
+        }
+    }
     // 确认目标是目录；非目录或不存在如实报错（宁缺毋假）。
     let root = crate::vfs_init::root();
     let node = match root.resolve(&abs, true) {
@@ -685,6 +748,15 @@ fn sys_entry_set_aces(path_ptr: u64, aces_ptr: u64, count: u64) -> u64 {
         Ok(a) => a,
         Err(e) => return pack_err(e),
     };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &path) {
+            return pack_err(e);
+        }
+    }
     let root = crate::vfs_init::root();
     let node = match root.resolve(&path, false) {
         Ok(n) => n,
@@ -761,6 +833,15 @@ fn sys_entry_read_aces(path_ptr: u64, out_ptr: u64, cap: u64) -> u64 {
         Ok(a) => a,
         Err(e) => return pack_err(e),
     };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &path) {
+            return pack_err(e);
+        }
+    }
     let root = crate::vfs_init::root();
     let node = match root.resolve(&path, false) {
         Ok(n) => n,
@@ -861,6 +942,15 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
         Ok(a) => a,
         Err(e) => return pack_err(e),
     };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &path) {
+            return pack_err(e);
+        }
+    }
 
     let root = crate::vfs_init::root();
 
@@ -1157,6 +1247,15 @@ fn sys_entry_create(frame: &mut SyscallFrame) -> u64 {
         Ok(a) => a,
         Err(e) => return pack_err(e),
     };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &path) {
+            return pack_err(e);
+        }
+    }
     let root = crate::vfs_init::root();
     // A1-3 / ADR-040 §2.6：mkdir/create = **父目录 Write**。
     // A2-8 / §3.5 G3：同一处解析父节点，供权限检查与 **ACE 继承派生**共用
@@ -1232,6 +1331,15 @@ fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
         Ok(a) => a,
         Err(e) => return pack_err(e),
     };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &path) {
+            return pack_err(e);
+        }
+    }
     let root = crate::vfs_init::root();
     // A1-3 / ADR-040 §2.6：unlink = **父目录 Write**（经父目录路径求值）。
     match split_parent(&path) {
@@ -1320,10 +1428,28 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
                 Ok(a) => a,
                 Err(e) => return pack_err(e),
             };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &old_path) {
+            return pack_err(e);
+        }
+    }
             let new_path = match absolute_path(&new_path) {
                 Ok(a) => a,
                 Err(e) => return pack_err(e),
             };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &new_path) {
+            return pack_err(e);
+        }
+    }
             let root = crate::vfs_init::root();
             // A1-3 / ADR-040 §2.6：rename = **父目录 Write**。源与目标同父
             // 是本 syscall 的既有约束（跨目录如实 NotSupported），故对父
@@ -1386,6 +1512,15 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
                 Ok(a) => a,
                 Err(e) => return pack_err(e),
             };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &path) {
+            return pack_err(e);
+        }
+    }
             let root = crate::vfs_init::root();
             let node = match root.resolve(&path, false) {
                 Ok(n) => n,
@@ -1429,6 +1564,15 @@ fn sys_entry_update(frame: &mut SyscallFrame) -> u64 {
                 Ok(a) => a,
                 Err(e) => return pack_err(e),
             };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &path) {
+            return pack_err(e);
+        }
+    }
             let root = crate::vfs_init::root();
             let node = match root.resolve(&path, false) {
                 Ok(n) => n,
@@ -1497,6 +1641,15 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
         Ok(a) => a,
         Err(e) => return pack_err(e),
     };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &path) {
+            return pack_err(e);
+        }
+    }
 
     // A2-6 / ADR-040 §3.5.1 G4：第三原语 —— 读取显式 ACE 列表（a4 == ENTRY_READ_ACES）。
     // 早于 stat/readdir 分派：本模式**不**解析为目录项列表，而是把节点显式 ACE
@@ -1509,15 +1662,17 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
     // 节点元数据以 StatInfo 定长结构整块拷入用户缓冲（a2），返回结构字节数。
     // follow_symlink=true（POSIX stat 跟软链符），与 readdir 同路径解析。
     if frame.a4 == ENTRY_READ_STAT {
+        // A2-3 / §3.4：遍历检查已由本函数入口（readdir 之上）统一完成，此处不重复。
+        // 单点纪律：同一次调用只检查一次，避免"两个地方各查一半"导致的不一致。
         let root = crate::vfs_init::root();
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
         let node = match root.resolve(&path, true) {
             Ok(n) => n,
             Err(e) => return pack_err(e),
         };
         // A1-3 / §2.6：stat 面随 readdir 归目录读语义——对节点求 Read。
-        let identity = current_proc_mut()
-            .map(|p| p.identity())
-            .unwrap_or_else(ProcessIdentity::default_user);
         if let Err(e) = check_access(&identity, node.as_ref(), vfs::inode::PermBits::READ) {
             return pack_err(e);
         }
@@ -2299,6 +2454,15 @@ fn sys_exec(frame: &mut SyscallFrame) -> u64 {
                 Ok(a) => a,
                 Err(e) => return pack_err(e),
             };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &path) {
+            return pack_err(e);
+        }
+    }
             match root.resolve(&path, true) {
                 Ok(inode) => {
                     // A1-1 / ADR-040：执行前强制——门禁位（原 system_only）
@@ -3980,6 +4144,15 @@ fn sys_volume_unmount(frame: &mut SyscallFrame) -> u64 {
         Ok(a) => a,
         Err(e) => return pack_err(e),
     };
+    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &path) {
+            return pack_err(e);
+        }
+    }
     let root = crate::vfs_init::root();
     match root.unmount(&path) {
         Ok(()) => {
