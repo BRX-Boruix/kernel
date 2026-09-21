@@ -15888,3 +15888,143 @@ pub fn test_hda_device_dma_probe() {
 
 
 
+
+/// A2-4（ADR-040 §2.1 `NamedGid` / §3.5 G6 组账户）：补充组集合的设置、授权与**真实求值**。
+///
+/// 覆盖：
+/// ① `SYS_TASK_GROUPS_SET` 持 `CAP_SYSTEM` 可设为任意集合；
+/// ② 无 `CAP_SYSTEM` 时**只能收缩或不变**——新增自己不属于的组 → EACCES；
+/// ③ 超过 `Groups::MAX` **如实** OutOfRange，绝不静默截断（S09）；
+/// ④ **真实求值**：同一文件、同一 uid 主体，未加入组时被 `NamedGid` deny 拒绝，
+///    加入组后同一操作通过——证明补充组确实是权限判据，而非装饰性字段。
+pub fn test_groups_and_named_gid() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Caps, Groups, Process, ProcessIdentity};
+    use vfs::inode::{AccessPolicy, Ace, PermBits, Principal};
+
+    info!("[test-groups] === A2-4: supplementary groups + NamedGid evaluation ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3, a4, a5: 0,
+            result: 0, switched: false, arch_frame: 0, aux_pid: 0,
+        }
+    }
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+    fn errno(e: klib::error::Error) -> u64 { (-(e.to_errno() as i64)) as u64 }
+    let eacces = errno(klib::error::Error::PermissionDenied);
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // 用户缓冲：一个 0x1000 页，用于组数组。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    let buf = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space().handle_page_fault(buf, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    // 写组数组 {100, 200} 到用户缓冲。
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(buf)).expect("resident").as_u64();
+        let ks = (pa + off) as *mut u8;
+        core::ptr::copy_nonoverlapping(100u32.to_le_bytes().as_ptr(), ks, 4);
+        core::ptr::copy_nonoverlapping(200u32.to_le_bytes().as_ptr(), ks.add(4), 4);
+    }
+
+    // ---- ① 持 CAP_SYSTEM：设为 {100, 200} 必须成功 ----
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
+    let mut f1 = frame(crate::syscall::SYS_TASK_GROUPS_SET, buf, 2,
+        crate::syscall::GROUPS_SET_RESERVED_NONE, crate::syscall::GROUPS_SET_REPLACE);
+    assert!(crate::syscall::syscall_entry(&mut f1));
+    assert_eq!(f1.result & ERR_FLAG, 0, "A2-4: CAP_SYSTEM holder must be able to set groups");
+    // 真实生效（读回进程身份，而非只看返回值——返回值可能说谎）。
+    {
+        let id = task::current_proc_mut().expect("proc").identity();
+        assert_eq!(id.groups.len(), 2, "A2-4: groups must actually be stored on the process");
+        assert!(id.groups.contains(100) && id.groups.contains(200),
+            "A2-4: the exact ids requested must be present");
+    }
+    info!("[test-groups] CAP_SYSTEM set {{100,200}} -> stored on process OK");
+
+    // ---- ② 无 CAP_SYSTEM：**新增**组 300 → EACCES（且原集合不得被改动）----
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity {
+        caps: Caps::EMPTY,
+        ..ProcessIdentity::user(2003, 2003)
+    });
+    unsafe {
+        let pa = task::current_proc_mut().expect("proc").addr_space()
+            .translate(arch::VirtAddr::new(buf)).expect("resident").as_u64();
+        let ks = (pa + off) as *mut u8;
+        core::ptr::copy_nonoverlapping(300u32.to_le_bytes().as_ptr(), ks, 4);
+    }
+    let before = task::current_proc_mut().expect("proc").identity().groups;
+    let mut f2 = frame(crate::syscall::SYS_TASK_GROUPS_SET, buf, 1,
+        crate::syscall::GROUPS_SET_RESERVED_NONE, crate::syscall::GROUPS_SET_REPLACE);
+    assert!(crate::syscall::syscall_entry(&mut f2));
+    assert_eq!(f2.result, eacces,
+        "A2-4: unprivileged process adding a group it does not belong to must be EACCES");
+    let after = task::current_proc_mut().expect("proc").identity().groups;
+    assert_eq!(before, after,
+        "A2-4: a rejected groups_set must NOT have mutated identity (no partial write)");
+    info!("[test-groups] unprivileged add-group -> EACCES, identity unchanged OK");
+
+    // ---- ③ 超限：9 >> MAX(8) 如实 OutOfRange，绝不截断 ----
+    task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
+    let mut f3 = frame(crate::syscall::SYS_TASK_GROUPS_SET, buf, (Groups::MAX + 1) as u64,
+        crate::syscall::GROUPS_SET_RESERVED_NONE, crate::syscall::GROUPS_SET_REPLACE);
+    assert!(crate::syscall::syscall_entry(&mut f3));
+    assert_eq!(f3.result, errno(klib::error::Error::OutOfRange),
+        "A2-4: exceeding Groups::MAX must be an honest OutOfRange, never silent truncation");
+    info!("[test-groups] over-limit -> OutOfRange (no silent truncation) OK");
+
+    // ---- ④ 真实求值：NamedGid ACE 必须按**补充组**命中 ----
+    //   夹具：文件属主 uid=1000；策略 = 显式 NamedGid(4242) allow Read，
+    //   再加一条显式 Other deny（放在 NamedGid 之后，用于证明命中顺序）。
+    //   主体 uid=2000、gid=2000：既非属主、主组也不是 4242。
+    //   → 未加入 4242：NamedGid 不命中，落到 Other deny → 拒绝；
+    //   → 加入 4242 后：NamedGid 命中 allow → 通过。
+    let root = crate::vfs_init::root();
+    let _ = root.unlink("/scratch/a2_4_gfile");
+    let node = root.create_file("/scratch/a2_4_gfile", 0o000, (1000, 1000))
+        .expect("create A2-4 fixture file");
+    let aces = alloc::vec![
+        Ace { principal: Principal::NamedGid(4242), allow: true, perms: PermBits::READ, inherit: false },
+        Ace { principal: Principal::Other, allow: false, perms: PermBits::READ, inherit: false },
+    ];
+    node.set_permissions(&AccessPolicy::from_classic_owned(0o000, 1000, 1000).with_explicit_aces(aces))
+        .expect("install NamedGid policy");
+
+    let policy = node.metadata().expect("meta").permissions;
+    let outsider: alloc::vec::Vec<u32> = alloc::vec![];
+    let member: alloc::vec::Vec<u32> = alloc::vec![4242];
+    let subj_out = vfs::inode::Subject { uid: 2000, gid: 2000, groups: &outsider };
+    let subj_in = vfs::inode::Subject { uid: 2000, gid: 2000, groups: &member };
+    let v_out = policy.evaluate(&subj_out, PermBits::READ);
+    let v_in = policy.evaluate(&subj_in, PermBits::READ);
+    assert!(v_out.is_err(), "A2-4: a non-member must NOT be granted read via NamedGid(4242)");
+    assert!(v_in.is_ok(), "A2-4: a supplementary-group member MUST be granted read via NamedGid(4242)");
+    info!("[test-groups] NamedGid(4242): non-member denied / member allowed (real effect) OK");
+
+    // 清理与还原。
+    let _ = root.unlink("/scratch/a2_4_gfile");
+    task::clear_current_proc();
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    unsafe { drop(Box::from_raw(proc_raw)); }
+    info!("[test-groups] === A2-4 pass ===");
+}

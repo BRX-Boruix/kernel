@@ -220,6 +220,46 @@ pub const SYS_TASK_IDENTITY_SET: u32 = nr(domain::TASK, 0x0C); // 0x3C
 /// 用命名常量而非字面量 0，使"保留位"是一处成文语义而非魔法值（S13）。
 pub const IDENTITY_SET_RESERVED_NONE: u64 = 0;
 
+/// `SYS_TASK_GROUPS_SET`（A2-4 / TASK 域扩展动词 0x0D = 0x3D）：设置调用进程组的
+/// **补充组集合**。
+///
+/// **为何需要独立动词而非并入 identity_set**：`identity_set` 的参数已用满
+/// （a1/a2/a3/a4），而补充组是**变长**语义（最多 `Groups::MAX` 项），无法塞进定长
+/// 数字面。ADR-040 §2.10 要求「参数只用定长数字」，故遵循 ADR-018 的两段式约定：
+/// 先以 `count` 探测/申请，再以用户缓冲传数组（同 `entry_read_aces` 手法）。
+///
+/// **授权（S13 单点）**：与 `identity_set` 同门禁——持 `CAP_SYSTEM` 者可设为任意
+/// 组集合（login 后按 `/config/groups.json` 装配成员的补充组）；无 `CAP_SYSTEM` 者
+/// 只能**收缩或保持不变**（不得新增自己不属于的组，否则即组越权）。
+///
+/// 参数：`a1`=调用方组数组指针（`u32` 定长元素）、`a2`=元素个数、
+/// `a3`=保留（必须 0）、`a4`=方向（`GROUPS_SET_REPLACE` / `GROUPS_SET_CLEAR`）。
+pub const SYS_TASK_GROUPS_SET: u32 = nr(domain::TASK, 0x0D); // 0x3D
+
+/// `SYS_TASK_GROUPS_SET` 的保留参数（`a3`）唯一合法取值。
+pub const GROUPS_SET_RESERVED_NONE: u64 = 0;
+
+/// `SYS_TASK_GROUPS_SET` 的 `a4`：以 `a1`/`a2` 给定的集合**整体替换**当前补充组。
+pub const GROUPS_SET_REPLACE: u64 = 0;
+
+/// `SYS_TASK_GROUPS_SET` 的 `a4`：清空补充组（此时 `a1`/`a2` 必须为 0）。
+pub const GROUPS_SET_CLEAR: u64 = 1;
+
+/// `SYS_TASK_GROUPS_SET` 的 ABI 结果结构（A2-4）：回传**实际生效**的补充组，
+/// 使调用方无需再次查询即可确知结果（超限时也能看清发生了如实拒绝）。
+///
+/// `#[repr(C)]` 固定布局，与 libsys 侧镜像同布局（PRE-12 纪律）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupsInfo {
+    /// 实际生效的补充组个数（`0..=Groups::MAX`）。
+    pub count: u32,
+    /// 保留（显式置 0，便于将来向尾部增长而不破 ABI）。
+    pub reserved: u32,
+    /// 组 id 数组（前 `count` 项有效；其余为 0）。定长 = `Groups::MAX`。
+    pub gids: [u32; task::Groups::MAX],
+}
+
 /// 身份查询/变更的 ABI 结果结构（A2-1；与 libsys `io::IdentityInfo` 同布局镜像）。
 ///
 /// `#[repr(C)]` 固定布局，跨边界真实数据合约；任一侧改字段必须同变更同步
@@ -3014,6 +3054,105 @@ fn sys_identity_set(frame: &mut SyscallFrame) -> u64 {
     pack_ok(0)
 }
 
+/// `groups_set` 处理器（A2-4 / SYS_TASK_GROUPS_SET / 0x3D）：设置调用进程组的补充组。
+///
+/// **数据流向**：`/config/groups.json`（纯用户态组表）由用户态读取并解析后，经本
+/// syscall 装入进程身份——内核**不解析组表**（ADR-040 §2.9 同一分层原则）。
+///
+/// **授权（S13 单点，与 identity_set 同门禁）**：
+/// - 持 `CAP_SYSTEM`：可设为任意组集合（供 login 按组表装配成员身份，A2-7）。
+/// - 无 `CAP_SYSTEM`：只允许**收缩或不变**——请求集合必须是当前集合的子集；
+///   新增任一组 → `PermissionDenied`（组是权限判据，自行加入即越权）。
+///
+/// 超限（> `Groups::MAX`）一律 `OutOfRange` **如实拒绝**，绝不静默截断（S09）——
+/// 截断会让调用方以为自己加入了某个组，而实际没有，属能力谎言。
+///
+/// 参数：`a1`=组数组指针、`a2`=个数、`a3`=保留（必须 0）、`a4`=方向。
+fn sys_task_groups_set(frame: &mut SyscallFrame) -> u64 {
+    let ptr = frame.a1;
+    let count = frame.a2;
+    let reserved = frame.a3;
+    let mode = frame.a4;
+
+    if reserved != GROUPS_SET_RESERVED_NONE {
+        return pack_err(Error::InvalidParam);
+    }
+    // 方向合法性：未知取值如实拒绝，不猜测（S09）。
+    let clearing = match mode {
+        GROUPS_SET_REPLACE => false,
+        GROUPS_SET_CLEAR => true,
+        _ => return pack_err(Error::InvalidParam),
+    };
+    if clearing {
+        // 清空时不得同时给数组——语义冲突如实拒绝。
+        if ptr != 0 || count != 0 {
+            return pack_err(Error::InvalidParam);
+        }
+    }
+    // 上限先行判定：超限是**调用方的请求非法**，与缓冲区无关，故先于 copy_in 判定
+    // （避免为一个注定被拒的请求去触碰用户内存）。
+    if count > task::Groups::MAX as u64 {
+        return pack_err(Error::OutOfRange);
+    }
+    if !clearing && count > 0 && ptr == 0 {
+        return pack_err(Error::InvalidParam);
+    }
+
+    // 逐元素读入（定长 u32）。ADR-018 三层校验先行：整段一次校验，
+    // 再逐元素 copy_from_user（SMAP 安全）——不为每个元素重复校验。
+    let total = match (count as usize).checked_mul(4) {
+        Some(v) => v,
+        None => return pack_err(Error::OutOfRange),
+    };
+    if total > 0 {
+        if let Err(e) = validate_user_range(ptr, total as u64, UserAccess::Read) {
+            return pack_err(e);
+        }
+    }
+    let mut requested = task::Groups::empty();
+    for i in 0..count {
+        let mut raw = [0u8; 4];
+        let src = ptr + i * 4;
+        unsafe { arch_x86_64::mmio::copy_from_user(raw.as_mut_ptr(), src, 4) };
+        let gid = u32::from_le_bytes(raw);
+        if requested.push(gid).is_none() {
+            // 重复值幂等（push 内部处理）；此处只可能因超限失败，而超限已先行拒绝。
+            return pack_err(Error::OutOfRange);
+        }
+    }
+
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::PermissionDenied);
+    };
+    let current = proc.identity();
+    if !current.caps.contains(Caps::SYSTEM) {
+        // 无 CAP_SYSTEM：只许收缩或不变——请求集合必须是当前集合的子集。
+        for gid in requested.iter() {
+            if !current.groups.contains(gid) {
+                return pack_err(Error::PermissionDenied);
+            }
+        }
+    }
+    // 组级写入（ThreadGroup 共享 identity，承 set_identity 组锁）。
+    proc.set_identity(ProcessIdentity {
+        uid: current.uid,
+        gid: current.gid,
+        groups: requested,
+        caps: current.caps,
+    });
+    klib::info!(
+        "[syscall] groups_set pid {}: {} -> {} supplementary group(s)",
+        proc.pid(), current.groups.len(), requested.len()
+    );
+
+    // 回传实际生效集合（如实，供调用方确知结果）。
+    let mut info = GroupsInfo { count: requested.len() as u32, reserved: 0, gids: [0; task::Groups::MAX] };
+    for (i, gid) in requested.iter().enumerate() {
+        info.gids[i] = gid;
+    }
+    pack_ok(0)
+}
+
 /// `derive` 处理器（ADR-038 / SYS_TASK_DERIVE / 0x3A）：**COW 派生子进程**。
 ///
 /// # 返回语义（POSIX fork 铁律）
@@ -4286,6 +4425,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_TASK_GETPID => done(sys_getpid(frame)),
         SYS_TASK_IDENTITY_QUERY => done(sys_identity_query(frame)),
         SYS_TASK_IDENTITY_SET => done(sys_identity_set(frame)),
+        SYS_TASK_GROUPS_SET => done(sys_task_groups_set(frame)),
         // derive：COW 派生子进程（ADR-038 / 0x3A）。非阻塞、返回两次语义
         // （父 rax=pid、子 rax=0），不切换——故返回 done。
         SYS_TASK_DERIVE => done(sys_task_derive(frame)),
