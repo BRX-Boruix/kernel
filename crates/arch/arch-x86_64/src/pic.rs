@@ -80,6 +80,23 @@ pub fn unmask_irq(irq: u8) -> u16 {
     set_mask(mask);
     mask
 }
+
+/// 【本仓修订】屏蔽单条 IRQ（读-改-写，其它位不变）。与 unmask_irq 成对：
+/// 用于**用户态驱动电平中断的交付纪律**——中断 handler 唤醒归属驱动后立即屏蔽该线（电平触发的设备在用户态驱动完成 MMIO 应答前不会释放该线；若
+/// 不屏蔽，中断门重开 irq_restore/sti 的瞬间即重投递，CPU 全程困在中断
+/// 上下文，用户态驱动永远得不到运行——QEMU intel-hda 实测整系统冻结于
+/// irq_restore+6，IF=0，两秒采样 RIP 纹丝不动）。驱动下一次进入
+/// driver_irq_wait 时再解屏蔽（彼时设备状态已在其服务例程中清掉，或驱动
+/// 本就要重新等待新事件）。
+pub fn mask_irq(irq: u8) -> u16 {
+    if irq as usize >= 16 {
+        return get_mask();
+    }
+    let mut mask = get_mask();
+    mask |= 1u16 << irq;
+    set_mask(mask);
+    mask
+}
 /// 发送 EOI（中断结束）给主片（和从片）。
 pub fn end_of_interrupt(irq: u8) {
     if irq >= 8 {
@@ -99,8 +116,15 @@ pub fn end_of_interrupt(irq: u8) {
 /// 其到达 CPU。IRQ0（timer）由 LAPIC 自身定时器接管，故保持屏蔽。
 pub fn init() {
     remap();
-    // 仅 IRQ1（键盘）使能（bit1=0），其余（含 IRQ0 timer、IRQ2 级联）屏蔽。
-    const MASK_ALL_EXCEPT_IRQ1: u16 = !(1u16 << 1);
-    set_mask(MASK_ALL_EXCEPT_IRQ1);
-    klib::info!("[pic] 8259 remapped, IRQ1 (kbd) unmasked");
+    // 使能 IRQ1（键盘）+ IRQ2（级联线）。
+    //
+    // 【本仓修订】IRQ2 必须常开：IRQ8-15 全部走 8259 从片，从片输出接在主片
+    // IRQ2 上——IRQ2 被屏蔽 = 从片所有中断（含 PCI 设备常用的 IRQ11）永远
+    // 到不了 CPU。旧掩码只开 IRQ1：用户态驱动认领 IRQ11 后，即便等待端解屏
+    // 蔽了 IRQ11 本身，从片出来的中断仍被主片级联位挡住。实测：35 秒内设备
+    // 侧拉线 321 次、CPU 只收到 2 次（都是解屏蔽写 IMR 的竞态窗口恰好撞上
+    // 线为高的瞬间），音频流转 2 轮后永久断流。IRQ0（LAPIC 定时器）保持屏蔽。
+    const MASK_ALL_EXCEPT_IRQ1_IRQ2: u16 = !((1u16 << 1) | (1u16 << 2));
+    set_mask(MASK_ALL_EXCEPT_IRQ1_IRQ2);
+    klib::info!("[pic] 8259 remapped, IRQ1 (kbd) + IRQ2 (cascade) unmasked");
 }

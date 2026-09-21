@@ -4013,6 +4013,12 @@ fn sys_driver_irq_wait(frame: &mut SyscallFrame) -> DispatchResult {
         // 非阻塞且无待服务中断：返回 0（空），调用方稍后重试。
         return done(pack_ok(0));
     }
+    // 【本仓修订】等待端入口**每次**解屏蔽该 IRQ 线（与 device_irq_handler
+    // 交付后的 mask_irq 成对，构成电平中断 half-drop 协议：交付即屏蔽，
+    // 重等即解屏蔽）。8259 上电全屏蔽 + 内核只开键盘 IRQ1：用户态驱动此前
+    // 从未真正收到设备中断。解屏蔽必须发生在等待端——认领时刻设备可能已有
+    // 电平锁存，过早解屏蔽会在驱动就位前引发风暴（QEMU 实测启动卡死）。
+    driver::irq_owner::unmask_irq(irq);
     // 阻塞等待：挂起直到设备中断或超时。
     irq_wait_blocking(frame, pid, irq, timeout_ns)
 }

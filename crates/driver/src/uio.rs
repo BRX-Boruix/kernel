@@ -247,6 +247,12 @@ pub fn uio_claim_device(uio_id: usize, caller_pid: usize) -> Result<(), Error> {
                     "[uio] device irq owner set: pid={} dev={} irq={}",
                     caller_pid, dev_str, irq
                 );
+                // 【根因修复·uio 中断断供第三环——移到 wait 端】原计划在认领后
+                // 立即解屏蔽 IRQ 线，但 QEMU 实测：认领此刻控制器可能已因此前
+                // 编程（RIRBSTS 等）锁存了电平未清的状态，过早解屏蔽会在驱动
+                // 尚未进入等待循环前引发中断重投递风暴（启动卡死）。解屏蔽
+                // 因此移到 `sys_driver_irq_wait` 首次等待时执行——彼时驱动
+                // 已准备好立刻服务中断（见 driver/syscall 侧 IRQ_UNMASKED 表）。
             }
             Err(e) => {
                 klib::warn!(

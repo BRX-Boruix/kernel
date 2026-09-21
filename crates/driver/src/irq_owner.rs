@@ -208,6 +208,15 @@ extern "C" fn device_irq_handler(irq: u8) -> bool {
     // 指针来自 set_irq_wake_callback 写入的合法 'static 函数地址。
     let f: fn(usize) = unsafe { core::mem::transmute(cb) };
     f(pid as usize);
+    // 【本仓修订·电平中断交付纪律】唤醒用户态归属驱动后**立即屏蔽该线**。
+    // 电平触发的设备在用户态驱动完成 MMIO 应答（清 W1C 状态）之前不会释放
+    // 中断线；若不屏蔽，中断门重开（irq_restore/sti）的瞬间线仍有效即重投递，
+    // CPU 永远困在中断上下文，用户态驱动拿不到 CPU 去应答——死锁（QEMU
+    // intel-hda 实测：冻结于 irq_restore+6，IF=0，RIP 两秒纹丝不动）。屏蔽后，
+    // 驱动下一次 driver_irq_wait 入口再解屏蔽（wait 端每次 unmask ＋ 本处每次
+    // 交付后 mask，构成完整的电平中断 half-drop 协议）。内核态驱动（ack 回调
+    // 已在设备侧应答、线已释放的）不受本屏蔽影响——其等待用闩锁，不依赖线。
+    arch_x86_64::pic::mask_irq(irq);
     true
 }
 
@@ -234,6 +243,31 @@ pub fn irq_pending_consume(irq: u8) -> bool {
         return false;
     }
     IRQ_PENDING[irq as usize].swap(0, Ordering::AcqRel) == 1
+}
+
+/// 【本仓修订】等待端解屏蔽该 IRQ 线（每次 driver_irq_wait 入口调用）。
+///
+/// 与 device_irq_handler 交付后的 mask_irq 成对：电平中断 half-drop 协议——
+/// 交付即屏蔽（防重投递风暴），重等即解屏蔽。8259 上电全屏蔽（内核只开
+/// 键盘 IRQ1；AHCI 作为内核驱动自行 unmask），用户态驱动此前从未真正收到
+/// 设备中断——intel-hda 实测：DMA 在跑（LPIB 前进、CBL 回绕）但 host 永远
+/// 收不到 BCIS，写者 EAGAIN stall。
+///
+/// 时机纪律：解屏蔽必须发生在**等待端**而非认领时——认领时刻设备可能已有
+/// 电平锁存，过早解屏蔽会在驱动就位前引发中断重投递风暴（QEMU 实测启动
+/// 卡死）。等待端此刻已准备立即服务中断，语义即刻闭合。
+pub fn unmask_irq(irq: u8) {
+    if irq as usize >= PIC_IRQ_COUNT {
+        return;
+    }
+    let after = arch_x86_64::pic::unmask_irq(irq);
+    // debug 级：本函数每次 driver_irq_wait 入口都会调用（活跃流约每 85ms 一次），
+    // info 级实测刷屏（每分钟数 MB）。默认 Info 级不可见；需要观察时
+    // klib::log::set_level(LogLevel::Debug)。
+    klib::debug!(
+        "[uio] unmasked IRQ {} for user driver (PIC mask now {:#06x})",
+        irq, after
+    );
 }
 
 /// 只读某 IRQ 的待服务闩锁（不清除）。供阻塞路径在 per-pid 锁内复检使用。
