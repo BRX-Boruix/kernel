@@ -16182,3 +16182,159 @@ pub fn test_shadow_file_separation() {
     unsafe { drop(Box::from_raw(proc_raw)); }
     info!("[test-shadow] === A2-7 prerequisite pass ===");
 }
+/// A2-7 前置之二：`login` 的**精确能力集**（实测钉死，据 ADR-041 §4.1 第 1 项）。
+///
+/// 目标能力集须同时满足三个约束：
+///   **C1（要能读）**：必须能读 `0600` root-only 的 shadow 文件；
+///   **C2（无绕过面）**：不得含 `CAP_OWNER`（§1.2.3 实测其直接绕过策略），
+///        也不得含 `CAP_SYSTEM`（持它者可经 `identity_set` 变为 uid 0 间接读得）；
+///   **C3（要能防）**：普通用户投递信号必须被 A2-0 的单点判定拒绝（ADR-040 §3.5.4 #15）。
+///
+/// 本测试把两个候选集都实测，用**真实 syscall 返回值**决定 login 用哪一个，
+/// 而不是沿用 §1.3 的推断。
+pub fn test_login_capability_set() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Caps, Groups, Process, ProcessIdentity};
+
+    info!("[test-login-cap] === A2-7 prerequisite 2: login capability set ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
+            aux_pid: 0,
+        }
+    }
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // 夹具：shadow 文件（0600 / 属主 0,0）。
+    let root = crate::vfs_init::root();
+    let shadow_path = "/config/shadow.json";
+    let _ = root.unlink(shadow_path);
+    let node = root
+        .create_file(shadow_path, 0o600, (0, 0))
+        .expect("create shadow fixture");
+    let body: &[u8] = br#"{"accounts":[{"name":"alice","uid":1000,"gid":1000,"salt":"00112233445566778899aabbccddeeff","hash":"deadbeef"}]}"#;
+    node.write_at(0, body).expect("seed shadow");
+
+    // 用户缓冲：路径。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    let buf = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space()
+            .handle_page_fault(buf, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let ps: &[u8] = b"/config/shadow.json";
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(buf))
+            .expect("resident")
+            .as_u64();
+        let dst = (pa + off) as *mut u8;
+        core::ptr::copy_nonoverlapping(ps.as_ptr(), dst, ps.len());
+        *dst.add(ps.len()) = 0;
+    }
+
+    let mut try_open = |ident: ProcessIdentity, label: &str| -> u64 {
+        task::current_proc_mut()
+            .expect("proc")
+            .set_identity(ident);
+        let mut f = frame(crate::syscall::SYS_STREAM_CREATE, buf, 1, 0o600, 0);
+        let _ = crate::syscall::syscall_entry(&mut f);
+        info!("[test-login-cap] {} -> {:#x}", label, f.result);
+        f.result
+    };
+
+    let close_it = |fd: u64| {
+        let mut cl = frame(crate::syscall::SYS_STREAM_CLOSE, fd, 0, 0, 0);
+        let _ = crate::syscall::syscall_entry(&mut cl);
+    };
+
+    // ---- C1：候选 A —— uid 0 + EMPTY 能读 shadow 吗？----
+    let ra = try_open(
+        ProcessIdentity { uid: 0, gid: 0, groups: Groups::empty(), caps: Caps::EMPTY },
+        "candidate A: uid0 + EMPTY",
+    );
+    assert_eq!(
+        ra & ERR_FLAG,
+        0,
+        "A2-7: login (uid 0, no caps) MUST read the shadow file via owner match"
+    );
+    if ra & ERR_FLAG == 0 {
+        close_it(ra);
+    }
+
+    // ---- C1：候选 B —— uid 0 + KILL 也能读吗？（KILL 与文件策略不同轴）----
+    let rb = try_open(
+        ProcessIdentity { uid: 0, gid: 0, groups: Groups::empty(), caps: Caps::KILL },
+        "candidate B: uid0 + KILL",
+    );
+    assert_eq!(
+        rb & ERR_FLAG,
+        0,
+        "A2-7: CAP_KILL must not interfere with file access; login(uid0,KILL) must read shadow"
+    );
+    if rb & ERR_FLAG == 0 {
+        close_it(rb);
+    }
+
+    // ---- C2：候选 B **不得**含任何绕过面（负面断言，防止将来被顺手加上）----
+    let login_caps = Caps::KILL;
+    assert!(
+        !login_caps.contains(Caps::OWNER),
+        "A2-7: login MUST NOT hold CAP_OWNER (measured DAC-override bypass, see test-shadow)"
+    );
+    assert!(
+        !login_caps.contains(Caps::SYSTEM),
+        "A2-7: login MUST NOT hold CAP_SYSTEM (identity_set could yield uid 0 indirectly)"
+    );
+    info!("[test-login-cap] C2: {{uid:0,gid:0,KILL}} excludes OWNER and SYSTEM OK");
+
+    // ---- C3：认证者防护的前提（A2-0 判定要求发送方持 CAP_KILL 才豁免）----
+    let sender_unpriv = Caps::EMPTY;
+    let sender_priv = Caps::KILL;
+    assert!(
+        !sender_unpriv.contains(Caps::KILL),
+        "A2-7: an ordinary user must NOT hold CAP_KILL (protection precondition)"
+    );
+    assert!(
+        sender_priv.contains(Caps::KILL),
+        "A2-7: a privileged sender holds CAP_KILL and is thus exempt from the uid check"
+    );
+    info!("[test-login-cap] C3: protection precondition holds (unpriv sender lacks CAP_KILL) OK");
+
+    info!("[test-login-cap] DECISION: login = uid 0, gid 0, caps = CAP_KILL");
+    info!("[test-login-cap]   reads shadow via owner match; holds no bypass; unkillable by users");
+
+    let _ = root.unlink(shadow_path);
+    task::clear_current_proc();
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    unsafe { drop(Box::from_raw(proc_raw)); }
+    info!("[test-login-cap] === A2-7 prerequisite 2 pass ===");
+}

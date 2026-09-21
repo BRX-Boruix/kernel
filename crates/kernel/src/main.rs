@@ -813,6 +813,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_shadow_file_separation();
 
+    // A2-7 前置之二：login 的精确能力集（返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_login_capability_set();
+
     // A2-3（ADR-040 §3.4）：目录遍历权限（父目录 Execute 位，返回主流程）。
     #[cfg(feature = "kernel-tests")]
     tests::test_dir_traverse_execute_check();
