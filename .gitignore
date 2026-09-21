@@ -1,27 +1,11 @@
 /target
 
-# 用户程序 ELF 构建产物（SDK 编译生成，不提交）
-/crates/kernel/init.elf
-/crates/kernel/shell.elf
-/crates/kernel/volumed.elf
-/crates/kernel/synce2e.elf
-/crates/kernel/fpcheck.elf
-/crates/kernel/spinburn.elf
-/crates/kernel/threaddemo.elf
-/crates/kernel/userdrv.elf
-/crates/kernel/driverd.elf
-/crates/kernel/intel-hda.elf
-/crates/kernel/chelldemo.elf
-/crates/kernel/pthreaddemo.elf
-/crates/kernel/pthread_syncdemo.elf
+# 用户程序 ELF 构建产物（SDK 编译生成，不提交）。
+# 原为逐个列举，A2-3..A2-7 新增的 acee2e/login/pwde2e/trave2e/userd 曾漏登记，
+# 导致 5 个未跟踪残留（2026-09 改为通配，一劳永逸）。
+*.elf
+
 # 内核符号表生成文件（SDK 二次编译生成，不提交）
 /crates/kernel/src/symbols_generated.rs
 # liveCD 内置用户程序 payload（SDK 构建生成，不提交）
 /crates/kernel/src/binaries_payload.rs
-/crates/kernel/pthread_bench.elf
-/crates/kernel/audiod.elf
-/crates/kernel/audioe2e.elf
-/crates/kernel/audiofile.elf
-/crates/kernel/selftest.elf
-# ADR-038 U1：真实 C 用户态 fork() 端到端验收程序（csrc/prog/forkdemo.c 经 SDK 编译）。
-/crates/kernel/forkdemo.elf
