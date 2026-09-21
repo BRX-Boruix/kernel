@@ -898,8 +898,8 @@ pub fn is_group_leader(pid: usize) -> bool {
 ///
 /// vruntime 存放于 **per-pid 桶锁** 保护的 `ProcEntry.vruntime`，不做全局原子。
 /// 记账必须在该 pid 的桶锁内完成，避免与他核的唤醒/收尸交错。
-/// nice 0 的基准权重（SCHED-EEVDF-3：权重表与折算在 `sched_eevdf` 内单一来源）。
-use crate::sched_eevdf::NICE_0_WEIGHT;
+/// nice 0 的基准权重由 `sched_eevdf` 单点提供（S13）——本模块不再直接引用该常量，
+/// 折算全部经 `sched_eevdf` 的接口完成，避免权重语义出现第二个来源。
 
 /// 单次 tick 折算出的 vruntime 增量（**按进程权重**）。
 ///

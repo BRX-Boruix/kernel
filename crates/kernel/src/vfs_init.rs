@@ -18,7 +18,6 @@ use spin::Mutex;
 use spin::Once;
 
 use vfs::devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
-use vfs::inode::AccessPolicy;
 use vfs::mount::MountTable;
 use vfs::procfs::{ProcFS, ProcessInfoProvider, ProcessSnapshot};
 use vfs::ramfs::RamFS;
