@@ -16028,3 +16028,157 @@ pub fn test_groups_and_named_gid() {
     unsafe { drop(Box::from_raw(proc_raw)); }
     info!("[test-groups] === A2-4 pass ===");
 }
+/// A2-7 前置核实（**实测，非推理**）：shadow 式口令文件分离在本内核是否可强制。
+///
+/// 要回答的问题：`0600` + 属主 `(0,0)` 的文件，能否做到「root 读得到、普通用户读不到」，
+/// 且**不被能力位绕过**？覆盖五种主体，其结论即 ADR-041「login 该持哪些能力」的判据来源。
+///
+/// 关键产出是第 (3) 组：把「`CAP_OWNER` 会整个绕过策略」从**代码阅读的推断**变成
+/// **实测事实**——它否证了"给 login 加 `CAP_OWNER`"这一做法。
+pub fn test_shadow_file_separation() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Caps, Groups, Process, ProcessIdentity};
+
+    info!("[test-shadow] === A2-7 prerequisite: shadow-style separation ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1, a2, a3, a4, a5: 0,
+            result: 0, switched: false, arch_frame: 0, aux_pid: 0,
+        }
+    }
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+    let eacces = (-(klib::error::Error::PermissionDenied.to_errno() as i64)) as u64;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    // 夹具：shadow 式文件 —— 0600、属主 (0,0)。
+    let root = crate::vfs_init::root();
+    let shadow_path = "/config/shadow.json";
+    let _ = root.unlink(shadow_path);
+    let node = root
+        .create_file(shadow_path, 0o600, (0, 0))
+        .expect("create shadow fixture");
+    let body: &[u8] = br#"{"alice":"sha256:PLACEHOLDER"}"#;
+    node.write_at(0, body).expect("seed shadow");
+
+    // 覆盖语义自检（保留为证据）：经**重新解析**确认 0600/属主真的落在 resolve 所见节点上。
+    let re = root.resolve(shadow_path, true).expect("re-resolve");
+    let rm = re.metadata().expect("meta");
+    assert_eq!(
+        rm.permissions.classic_mode() & 0o777,
+        0o600,
+        "fixture precondition: shadow file must really be 0600"
+    );
+    assert_eq!(rm.permissions.owner_uid(), 0, "fixture precondition: owner uid 0");
+    assert_eq!(rm.permissions.owner_gid(), 0, "fixture precondition: owner gid 0");
+    info!("[test-shadow] fixture 0600 owner(0,0) OK");
+
+    // 用户缓冲：路径（含 NUL 结尾）。
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    let buf = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space().handle_page_fault(buf, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let ps: &[u8] = b"/config/shadow.json";
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(buf))
+            .expect("resident")
+            .as_u64();
+        let dst = (pa + off) as *mut u8;
+        core::ptr::copy_nonoverlapping(ps.as_ptr(), dst, ps.len());
+        *dst.add(ps.len()) = 0;
+    }
+
+    // 只读打开夹具，返回 result。
+    let mut try_open = |ident: ProcessIdentity, label: &str| -> u64 {
+        task::current_proc_mut().expect("proc").set_identity(ident);
+        let mut f = frame(crate::syscall::SYS_STREAM_CREATE, buf, 1, 0o600, 0);
+        let _ = crate::syscall::syscall_entry(&mut f);
+        info!("[test-shadow] {} -> {:#x}", label, f.result);
+        f.result
+    };
+
+    // ---- (1) 普通用户 (1000,1000)、无能力 → 必须 EACCES ----
+    let r1 = try_open(ProcessIdentity::user(1000, 1000), "(1) unprivileged (1000,1000)");
+    assert_eq!(
+        r1, eacces,
+        "A2-7: an unprivileged user must NOT read a 0600 root-owned file"
+    );
+
+    // ---- (2) 普通用户 + CAP_SYSTEM → 门禁位与属主面是两根轴，仍须 EACCES ----
+    let r2 = try_open(
+        ProcessIdentity { uid: 1000, gid: 1000, groups: Groups::empty(), caps: Caps::SYSTEM },
+        "(2) +CAP_SYSTEM",
+    );
+    assert_eq!(
+        r2, eacces,
+        "A2-7: CAP_SYSTEM must NOT bypass the ownership policy (gate bit is a separate axis)"
+    );
+
+    // ---- (3) 普通用户 + CAP_OWNER → **实测放行**（豁免先于策略求值）----
+    let r3 = try_open(
+        ProcessIdentity { uid: 1000, gid: 1000, groups: Groups::empty(), caps: Caps::OWNER },
+        "(3) +CAP_OWNER",
+    );
+    assert_eq!(
+        r3 & ERR_FLAG,
+        0,
+        "A2-7 MEASURED FACT: CAP_OWNER (DAC-override analogue) bypasses the policy entirely, so a login holding it could read the shadow file; login must NOT hold it."
+    );
+    if r3 & ERR_FLAG == 0 {
+        let mut cl = frame(crate::syscall::SYS_STREAM_CLOSE, r3, 0, 0, 0);
+        let _ = crate::syscall::syscall_entry(&mut cl);
+    }
+
+    // ---- (4) uid 0、无任何能力 → 属主自读，必须放行 ----
+    let r4 = try_open(
+        ProcessIdentity { uid: 0, gid: 0, groups: Groups::empty(), caps: Caps::EMPTY },
+        "(4) uid 0 no-caps",
+    );
+    assert_eq!(
+        r4 & ERR_FLAG,
+        0,
+        "A2-7: the owner (uid 0) with NO capabilities must still read its own 0600 file"
+    );
+    if r4 & ERR_FLAG == 0 {
+        let mut cl = frame(crate::syscall::SYS_STREAM_CLOSE, r4, 0, 0, 0);
+        let _ = crate::syscall::syscall_entry(&mut cl);
+    }
+
+    // ---- (5) 组外用户（gid 不匹配、补充组不含 0）→ 必须 EACCES ----
+    let r5 = try_open(
+        ProcessIdentity { uid: 1000, gid: 1000, groups: Groups::empty(), caps: Caps::EMPTY },
+        "(5) outside owning group",
+    );
+    assert_eq!(
+        r5, eacces,
+        "A2-7: a user outside the owning group must still be denied"
+    );
+
+    // 清理与还原。
+    let _ = root.unlink(shadow_path);
+    task::clear_current_proc();
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    unsafe { drop(Box::from_raw(proc_raw)); }
+    info!("[test-shadow] === A2-7 prerequisite pass ===");
+}

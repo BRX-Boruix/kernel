@@ -809,6 +809,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_groups_and_named_gid();
 
+    // A2-7 前置：shadow 式口令文件分离是否可强制（返回主流程）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_shadow_file_separation();
+
     // A2-3（ADR-040 §3.4）：目录遍历权限（父目录 Execute 位，返回主流程）。
     #[cfg(feature = "kernel-tests")]
     tests::test_dir_traverse_execute_check();
