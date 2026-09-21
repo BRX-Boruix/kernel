@@ -1843,6 +1843,20 @@ pub fn wake_kbd() {
         let slot = g.get_mut(&(p as usize));
         match slot {
             Some(slot) if slot.waiting_for.is_none() => {
+                // 【R13 修复（实测定案）】唤醒方必须**预置 saved.rax = -EAGAIN 哨兵**，
+                // 与 [`wake_event`] 同款纪律。此前本函数只置 Ready 不写 rax——
+                // 被唤醒进程带回用户态的 rax 仍是阻塞时的 **nr（SYS_STREAM_READ=12）**，
+                // 用户态 `libsys::call` 按返回值协议把 12 解读成"成功读到 12 字节"。
+                // 后果实测：login 的 `read(STDIN,&mut one)` 拿到 Ok(12) 后只看 one[0]——
+                // 缓冲未写、保持 0x00，于是把 NUL 当作读到的字符**回显**（串口线实测
+                // `00 61`：多出的 0x00 即此来源），并把 0x00 存入用户名/口令缓冲——
+                // **正确口令 alice/alicepw 必然认证失败**（所有者报告"不知道 alice 的
+                // 密码是什么"的真实根因）。shell 侥幸未受影响只因它的读取循环忽略非
+                // 1 字节的 Ok（`Ok(got) if got == 1`）。
+                // 哨兵 errno 取自集中定义（S13 单点），与 EVENT_WAKE_RETRY_SENTINEL
+                // 同口径；用户态 `libsys::call` 解码 -11 → WouldBlock → 登记方
+                // （sys_read 交互分支）唤醒后重试 pop，如实交付 0x61。
+                slot.saved.rax = KBD_WAKE_RETRY_SENTINEL;
                 slot.proc.set_state(TaskState::Ready);
                 Some(slot.home_cpu)
             }
@@ -1851,6 +1865,12 @@ pub fn wake_kbd() {
     };
     if let Some(home) = enqueue { wake_enqueue(p as usize, home); }
 }
+
+/// 键盘唤醒的 `-EAGAIN` 重试哨兵（写入被唤醒者的 `saved.rax`）。
+/// errno 值取自集中定义 [`Error::WouldBlock`]（S13 单点），与
+/// [`EVENT_WAKE_RETRY_SENTINEL`] 同口径——用户态 `libsys::call` 解码为
+/// `Err(WouldBlock)`，读取循环据此重试，绝不把陈旧 rax 当真实读到的字节数。
+const KBD_WAKE_RETRY_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as u64;
 
 // ---------------------------------------------------------------------------
 // interrupt-to-futex：设备事件驱动的用户态阻塞等待（interrupt→publish_event→
