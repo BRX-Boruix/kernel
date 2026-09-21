@@ -353,6 +353,10 @@ unsafe fn kmain_body() -> ! {
     info!("[kmain] enabling interrupts (LAPIC timer ~100Hz)");
     arch_x86_64::lapic::init();
     <arch_x86_64::interrupt::X86InterruptController as InterruptController>::enable();
+    // 光标闪烁定时器（本仓修订）：时钟源已在 lapic::init 内注入，从此处
+    // 自续驱动。放在 drivers::init 之后是有意为之——帧缓冲终端先就绪，
+    // blink_tick 对未初始化终端是空操作，此调用不依赖注册顺序。
+    term::start_cursor_blink();
     // 中断现已开启：重新武装 AHCI 的中断完成路径。`late_storage_init` 跑在
     // `sti` **之前**，那段窗口内等不到中断会触发自适应退让；此处让中断优先
     // 在真正可用的阶段重新生效（幂等；无控制器时为空操作）。

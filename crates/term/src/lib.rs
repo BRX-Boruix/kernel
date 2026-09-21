@@ -380,6 +380,43 @@ fn drain_pending_cr<F: FnMut(&[u8])>(mut emit: F) {
     }
 }
 
+// ---------- 光标闪烁（本仓修订） ----------
+
+/// 闪烁半周期（毫秒）：500ms 亮 / 500ms 灭，与主流终端手感一致。
+const CURSOR_BLINK_PERIOD_MS: u64 = 500;
+
+/// 闪烁定时器自续驱动的回调（klib::time 队列，IRQ 上下文执行）。
+///
+/// - **自续**：set_timeout 是一次性定时器，回调尾部重挂下一拍——klib::time
+///   文档明确回调在锁外执行、回调内重挂合法；
+/// - **锁纪律**：回调持 TERM_LOCK 调 vendor 的 flanterm_fb_blink_toggle；
+///   IRQ 上下文 + IrqSpinLock 组合安全（持有者必已关中断，本回调自旋
+///   等待时间有界）；锁内只做定点绘制，无分配、无日志（锁序纪律见
+///   TERM_LOCK 头注）；
+/// - **诚实降级**：时钟源未就绪时 set_timeout 返回 None——闪烁静默
+///   不生效（光标退化为静态块），不 panic、不打日志刷屏（IRQ 上下文），
+///   初始化路径已保证时钟源先于本模块注册。
+fn blink_tick(_arg: usize) {
+    let p = TERMINAL_PTR.load(Ordering::Acquire);
+    if p != 0 {
+        let _guard = TERM_LOCK.lock();
+        // SAFETY：指针由 init 经 Box::leak 固定为静态生命周期，锁内独占访问。
+        let ctx = unsafe { &mut *(p as *mut FlantermContext) };
+        flanterm_rust::flanterm_fb_blink_toggle(ctx);
+    }
+    // 重挂下一拍（一次性定时器自续）。时钟失效时返回 None，闪烁停止
+    // 而非空转重试。
+    let _ = klib::time::set_timeout(CURSOR_BLINK_PERIOD_MS * 1_000_000, blink_tick, 0);
+}
+
+/// 启动光标闪烁定时器（终端初始化完成后调用一次）。
+///
+/// 时钟源未注入时 set_timeout 如实返回 None——不闪烁、不伪造成功；
+/// 静态光标（常亮反转块）仍由既有 flush 路径绘制，可用性不受影响。
+pub fn start_cursor_blink() {
+    let _ = klib::time::set_timeout(CURSOR_BLINK_PERIOD_MS * 1_000_000, blink_tick, 0);
+}
+
 /// framebuffer 终端控制台：`klib::console::Console` 的实现
 pub struct TerminalConsole;
 

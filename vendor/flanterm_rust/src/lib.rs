@@ -17,6 +17,7 @@ pub use flanterm::{
 };
 
 pub use flanterm_backends::fb::{
-    fb_null_seen, flanterm_fb_init, flanterm_fb_set_flush_callback, FbBackend, FlantermContext,
-    FLANTERM_FB_ROTATE_0, FLANTERM_FB_ROTATE_180, FLANTERM_FB_ROTATE_270, FLANTERM_FB_ROTATE_90,
+    fb_null_seen, flanterm_fb_blink_toggle, flanterm_fb_init, flanterm_fb_set_flush_callback,
+    FbBackend, FlantermContext, FLANTERM_FB_ROTATE_0, FLANTERM_FB_ROTATE_180,
+    FLANTERM_FB_ROTATE_270, FLANTERM_FB_ROTATE_90,
 };

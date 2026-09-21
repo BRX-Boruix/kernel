@@ -129,6 +129,11 @@ pub struct FbBackend {
     old_cursor_x: usize,
     old_cursor_y: usize,
 
+    /// 【本仓修订：光标闪烁】当前闪烁相位（true = 光标格显示反转色）。
+    /// 由 [`flanterm_fb_blink_toggle`] 周期翻转；`draw_cursor` 仅在相位为
+    /// true 时绘制反转光标。非闪烁语义（本修订前）恒为 true 等价。
+    cursor_blink_on: bool,
+
     /// S32：滚动快照复用缓冲——每次滚动都新建 Vec 是热路径上的常驻分配
     /// 且堆耗尽会 OOM abort。此缓冲按需增长一次后复用，消除逐次分配。
     scroll_scratch: Vec<FlantermFbChar>,
@@ -831,6 +836,11 @@ fn draw_cursor(ctx: &mut FlantermContext) {
     let rows = ctx.rows;
     let cols = ctx.cols;
     let fb = &mut ctx.backend;
+    // 【本仓修订：闪烁相位】相位为 off 时不画反转光标（该格保持真实字符，
+    // 由下方 erase/restore 路径保证已擦除此前画上的反转色）。
+    if !fb.cursor_blink_on {
+        return;
+    }
     if fb.cursor_x >= cols || fb.cursor_y >= rows {
         return;
     }
@@ -840,9 +850,24 @@ fn draw_cursor(ctx: &mut FlantermContext) {
     } else {
         fb.grid[i]
     };
-    let tmp = c.fg;
-    c.fg = c.bg;
-    c.bg = tmp;
+    // 【本仓修订：反转前先落实颜色】旧实现直接交换 fg/bg：默认色字符的
+    // fg 是 TRANSPARENT（0xffff_ffff），交换后落入 plot_char 的 NoCanvas
+    // 透明分支——glyph 用 default_fg 绘在 default_fg 背景上，**字形与背景
+    // 同色即不可见**（提示符/普通输入全是默认色，正是"光标所在处文字
+    // 不显示"的病灶）。先透明→默认色落实，再交换，得到真正的反转：
+    // default_bg 底 + default_fg 字 → default_fg 底 + default_bg 字。
+    let fg = if c.fg == FLANTERM_FB_TRANSPARENT {
+        fb.default_fg
+    } else {
+        c.fg
+    };
+    let bg = if c.bg == FLANTERM_FB_TRANSPARENT {
+        fb.default_bg
+    } else {
+        c.bg
+    };
+    c.fg = bg;
+    c.bg = fg;
     unsafe {
         plot_char(fb, cols, rows, &c, fb.cursor_x, fb.cursor_y);
     }
@@ -899,6 +924,43 @@ fn flanterm_fb_double_buffer_flush(ctx: &mut FlantermContext) {
             unsafe {
                 cb(fb.framebuffer as *const u8, fb.pitch * fb.phys_height);
             }
+        }
+    }
+}
+
+/// 【本仓修订：光标闪烁】翻转闪烁相位并重绘受影响的两格。
+///
+/// 由表现层（term crate）经周期定时器调用（当前 500ms）。步骤：
+/// 1. 先在 (old_cursor_x, old_cursor_y) 重画**真实字符**——无条件擦除该格
+///    可能残留的反转光标（相位 on→off 时这是唯一的擦除路径；普通 flush 的
+///    restore 分支只在光标移动时触发，覆盖不到原地闪烁）；
+/// 2. 翻转 `cursor_blink_on`；
+/// 3. 相位翻为 on 时在当前光标位画反转色。
+///
+/// 调用方须自行持有终端锁（term 侧 TERM_LOCK）；本函数不碰队列状态，
+/// 与 `flanterm_write` 的 flush 语义正交。中断上下文调用安全：只做
+/// framebuffer 定点写与回调，无分配、无自旋等待。
+pub fn flanterm_fb_blink_toggle(ctx: &mut FlantermContext) {
+    let rows = ctx.rows;
+    let cols = ctx.cols;
+    {
+        let fb = &mut ctx.backend;
+        if fb.old_cursor_x < cols && fb.old_cursor_y < rows {
+            let idx = fb.old_cursor_x + fb.old_cursor_y * cols;
+            let c = fb.grid[idx];
+            unsafe {
+                plot_char(fb, cols, rows, &c, fb.old_cursor_x, fb.old_cursor_y);
+            }
+        }
+        fb.cursor_blink_on = !fb.cursor_blink_on;
+    }
+    if ctx.cursor_enabled {
+        draw_cursor(ctx);
+    }
+    let cb = ctx.backend.flush_callback;
+    if let Some(cb) = cb {
+        unsafe {
+            cb(ctx.backend.framebuffer as *const u8, ctx.backend.pitch * ctx.backend.phys_height);
         }
     }
 }
@@ -1236,6 +1298,7 @@ pub unsafe fn flanterm_fb_init(
         saved_state_cursor_y: 0,
         old_cursor_x: 0,
         old_cursor_y: 0,
+        cursor_blink_on: true,
         scroll_scratch: Vec::new(),
     };
 
@@ -1446,6 +1509,7 @@ mod tests {
             saved_state_cursor_y: 0,
             old_cursor_x: 0,
             old_cursor_y: 0,
+            cursor_blink_on: true,
             scroll_scratch: Vec::new(),
         };
         (backend, fb_buf)
