@@ -247,6 +247,12 @@ mod tests {
                 r#"{"year":2026,"month":1,"day":1,"hour":0,"minute":0,"second":0}"#,
             )
         }
+        /// A2-2：活跃用户视图（本 mock 如实报告"无活跃进程"，不编造用户）。
+        fn users_json(&self) -> alloc::string::String {
+            alloc::string::String::from(
+                r#"{"scope":"active-processes-only","not_account_table":true,"account_table":"/config/users.json","truncated":false,"count":0,"users":[]}"#,
+            )
+        }
     }
 
     struct MockDeviceProvider {
