@@ -1129,6 +1129,49 @@ fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
         }
     }
 
+    // ---- A2-7（ADR-041 §1.2）：种子口令表 /config/shadow.json ----
+    //
+    // 【为何与 users.json 分离】ADR-041 §1.2.0：加盐哈希的安全前提是"攻击者拿不到
+    // 哈希串"。users.json 用户态可读写（0644），若把哈希放进去，攻击者直接读串做
+    // 离线爆破即可，哈希即失去意义。故口令入**独立**文件，权限 0600 + 属主 (0,0)：
+    // 普通用户读不到（A2-7 前置已实测：kernel e04e60e 的 test_shadow_file_separation）。
+    //
+    // 【uid 权威来源】ADR-041 §1.2.6：uid/gid/name **以本文件为权威**，users.json 的
+    // 同名字段退化为展示信息（因后者可写，不得用于降权）。
+    //
+    // 【schema】{"accounts":[{"name","uid","gid","salt","hash"}]}
+    //   hash = SHA-256(salt_bytes || password_bytes) 的十六进制（小写）。
+    //   缺口令或空 hash ⇒ **该账户不可登录**（ADR-041 §1.2.6；明确不采用 shadow(5)
+    //   的"空口令可登录"语义——本项目语境下不可接受）。
+    //
+    // 【种子内容】alice 的口令为 "alicepw"、root 的为 "rootpw"。明文写在本注释里是
+    // **刻意**的：本内核无网络栈、无远程攻击面，且口令若不可在源码中读到，则 A2-7 的
+    // 验收无法在自动化中复现。不得据"注释里有明文"推断哈希无意义——哈希防的是
+    // "读到 shadow 文件后直接得到明文"，该防护正是本节的目的。
+    //   哈希值经**独立实现**（Node crypto）与本仓 SHA-256 的逻辑转写双向复算确认，非手写。
+    {
+        const SEED_SHADOW_JSON: &[u8] =
+            b"{\"accounts\":[{\"name\":\"alice\",\"uid\":1000,\"gid\":1000,\"salt\":\"00112233445566778899aabbccddeeff\",\"hash\":\"02d53e336cdcee24bf2c789c0077299de408ef10252e3c3795cf012cbcb268fb\"},{\"name\":\"root\",\"uid\":0,\"gid\":0,\"salt\":\"ffeeddccbbaa99887766554433221100\",\"hash\":\"6ac28893a4ecaddf563dad536628fcfa47956f13b69ef99f6229a13753586392\"}]}";
+        // **0600 + 属主 (0,0)**：本文件的全部安全价值所在（见上方说明）。
+        match mount_table.create_file("/config/shadow.json", 0o600, (0, 0)) {
+            Ok(f) => {
+                if let Err(e) = f.write_at(0, SEED_SHADOW_JSON) {
+                    panic!("seed shadow.json write: {:?}", e);
+                }
+            }
+            Err(klib::error::Error::AlreadyExists) => {
+                // 已存在：**不改权限**（避免把用户手工收紧的权限改宽），仅校验可读。
+                if let Ok(f) = mount_table.resolve("/config/shadow.json", true) {
+                    let mut probe = [0u8; 4];
+                    if matches!(f.read_at(0, &mut probe), Err(_)) {
+                        klib::error!("[mu] /config/shadow.json unreadable; login will report");
+                    }
+                }
+            }
+            Err(e) => panic!("seed shadow.json create: {:?}", e),
+        }
+    }
+
     // 挂载特殊文件系统
     let procfs = Arc::new(ProcFS::new(Arc::new(KernelProcessProvider)));
     mount_table
