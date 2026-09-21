@@ -16338,3 +16338,176 @@ pub fn test_login_capability_set() {
     unsafe { drop(Box::from_raw(proc_raw)); }
     info!("[test-login-cap] === A2-7 prerequisite 2 pass ===");
 }
+/// A2-7 前置之三：**降权路径与 CAP_SYSTEM 的真实语义**（实测，修正 ADR-041 §1.2.3 的过度禁令）。
+///
+/// ## 为何必须实测（S06/S09）
+///
+/// ADR-041 §1.2.3 曾断言"login 不得持 CAP_SYSTEM，因为持它者可经 identity_set 变为 uid 0
+/// 间接读得 shadow"。但 A2-1 的 `sys_identity_set` 文档（`syscall.rs:2996`）明文写着
+/// "持 CAP_SYSTEM：可设为任意 uid/gid/caps（**login 认证通过后降权至目标用户**）"。
+/// 两者冲突，且**谁能降权是 login 能否工作的前提**。故以实测定论，不靠推理。
+///
+/// ## 三个待测事实
+///
+/// 1. `{uid:0, caps:KILL}` 能否降权到 uid 1000？（若能，则 login 无需 CAP_SYSTEM）
+/// 2. `{uid:0, caps:SYSTEM|KILL}` 读 shadow 是否同样成功？（CAP_SYSTEM 不干扰文件策略）
+/// 3. **关键安全问**：非 root（uid 1000）持 CAP_SYSTEM 时，能否经 identity_set 变为 uid 0
+///    **再**读得 shadow？这决定 CAP_SYSTEM 是否真是"间接读表"的绕过面。
+pub fn test_login_downgrade_path() {
+    use alloc::boxed::Box;
+    use arch::syscall::SyscallFrame;
+    use task::{Caps, Groups, Process, ProcessIdentity};
+
+    info!("[test-login-drop] === A2-7 prerequisite 3: downgrade path & CAP_SYSTEM ===");
+
+    fn frame(nr: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5: 0,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
+            aux_pid: 0,
+        }
+    }
+    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(Process::new(usize::MAX, 0, 0, 0, alloc::sync::Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    {
+        let p = task::current_proc_mut().expect("proc installed");
+        arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
+    }
+
+    let root = crate::vfs_init::root();
+    let shadow_path = "/config/shadow.json";
+    let _ = root.unlink(shadow_path);
+    let node = root
+        .create_file(shadow_path, 0o600, (0, 0))
+        .expect("create shadow fixture");
+    node.write_at(0, b"{\"accounts\":[]}").expect("seed");
+
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    assert!(crate::syscall::syscall_entry(&mut map));
+    let buf = map.result;
+    {
+        let p = task::current_proc_mut().expect("test proc");
+        p.addr_space()
+            .handle_page_fault(buf, arch_x86_64::paging::PageFaultCode::new(0));
+    }
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let ps: &[u8] = b"/config/shadow.json";
+    unsafe {
+        let pa = task::current_proc_mut()
+            .expect("proc")
+            .addr_space()
+            .translate(arch::VirtAddr::new(buf))
+            .expect("resident")
+            .as_u64();
+        let dst = (pa + off) as *mut u8;
+        core::ptr::copy_nonoverlapping(ps.as_ptr(), dst, ps.len());
+        *dst.add(ps.len()) = 0;
+    }
+
+    let set_id = |ident: ProcessIdentity| {
+        task::current_proc_mut()
+            .expect("proc")
+            .set_identity(ident);
+    };
+    let now = || task::current_proc_mut().expect("proc").identity();
+    let mut open_shadow = || -> u64 {
+        let mut f = frame(crate::syscall::SYS_STREAM_CREATE, buf, 1, 0o600, 0);
+        let _ = crate::syscall::syscall_entry(&mut f);
+        f.result
+    };
+
+    // ---- 事实 1：{uid:0, caps:KILL} 能否降权到 uid 1000？----
+    set_id(ProcessIdentity {
+        uid: 0,
+        gid: 0,
+        groups: Groups::empty(),
+        caps: Caps::KILL,
+    });
+    let mut df = frame(crate::syscall::SYS_TASK_IDENTITY_SET, 1000, 1000, 0, 0);
+    let dr = crate::syscall::syscall_entry(&mut df);
+    let dres = df.result;
+    let _ = dr;
+    info!(
+        "[test-login-drop] (1) {{uid0,KILL}} -> identity_set(1000,1000,0) = {:#x}",
+        dres
+    );
+    info!("[test-login-drop]     resulting identity: uid={}", now().uid);
+
+    // ---- 事实 2：{uid:0, caps:SYSTEM|KILL} 读 shadow 是否同样成功？----
+    set_id(ProcessIdentity {
+        uid: 0,
+        gid: 0,
+        groups: Groups::empty(),
+        caps: Caps::KILL.union(Caps::SYSTEM),
+    });
+    let r2 = open_shadow();
+    info!("[test-login-drop] (2) {{uid0,SYSTEM|KILL}} open shadow = {:#x}", r2);
+    if r2 & ERR_FLAG == 0 {
+        let mut cl = frame(crate::syscall::SYS_STREAM_CLOSE, r2, 0, 0, 0);
+        let _ = crate::syscall::syscall_entry(&mut cl);
+    }
+
+    // ---- 事实 3（关键）：非 root 持 CAP_SYSTEM 能否变为 uid 0 再读 shadow？----
+    set_id(ProcessIdentity {
+        uid: 1000,
+        gid: 1000,
+        groups: Groups::empty(),
+        caps: Caps::SYSTEM,
+    });
+    let mut e1 = frame(crate::syscall::SYS_TASK_IDENTITY_SET, 0, 0, 0, 0);
+    let _ = crate::syscall::syscall_entry(&mut e1);
+    info!(
+        "[test-login-drop] (3a) uid1000+SYSTEM -> identity_set(0,0,0) = {:#x}  now uid={}",
+        e1.result,
+        now().uid
+    );
+    let r3 = open_shadow();
+    info!("[test-login-drop] (3b) then open shadow = {:#x}", r3);
+    if r3 & ERR_FLAG == 0 {
+        let mut cl = frame(crate::syscall::SYS_STREAM_CLOSE, r3, 0, 0, 0);
+        let _ = crate::syscall::syscall_entry(&mut cl);
+    }
+
+    // ---- 事实 4：无 CAP_SYSTEM 的非 root 能否自行变成 uid 0？（必须失败）----
+    set_id(ProcessIdentity {
+        uid: 1000,
+        gid: 1000,
+        groups: Groups::empty(),
+        caps: Caps::EMPTY,
+    });
+    let mut e2 = frame(crate::syscall::SYS_TASK_IDENTITY_SET, 0, 0, 0, 0);
+    let _ = crate::syscall::syscall_entry(&mut e2);
+    info!(
+        "[test-login-drop] (4) uid1000+no-caps -> identity_set(0,0,0) = {:#x}  now uid={}",
+        e2.result,
+        now().uid
+    );
+    assert_eq!(
+        e2.result & ERR_FLAG,
+        ERR_FLAG,
+        "A2-7: an unprivileged user MUST NOT be able to setuid(0)"
+    );
+    assert_eq!(now().uid, 1000, "A2-7: unprivileged identity must be unchanged");
+    info!("[test-login-drop] (4) verified: no escalation without CAP_SYSTEM OK");
+
+    let _ = root.unlink(shadow_path);
+    task::clear_current_proc();
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    unsafe { drop(Box::from_raw(proc_raw)); }
+    info!("[test-login-drop] === A2-7 prerequisite 3 done ===");
+}
