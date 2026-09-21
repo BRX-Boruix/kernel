@@ -20,6 +20,8 @@ pub use process::{
     Caps, Groups, Process, ProcessIdentity, ProcessTable, TaskState, clear_current_proc,
     current_proc_mut, process_page_fault_handler, set_current_proc,
 };
+/// 测试夹具钩子仅在 `kernel-tests` 构建存在（与 `scheduler::test_hooks` 同门禁）。
+#[cfg(feature = "kernel-tests")]
 pub use scheduler::test_hooks::spawn_child_with_identity;
 pub use scheduler::{
     SwitchOutcome, Waited, block_current, block_current_with, block_for_event, block_for_kbd,
