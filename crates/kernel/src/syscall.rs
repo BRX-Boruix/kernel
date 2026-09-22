@@ -1191,7 +1191,13 @@ fn sys_fstat(frame: &mut SyscallFrame) -> u64 {
         Ok(m) => m,
         Err(e) => return pack_err(e),
     };
-    let info = vfs::inode::StatInfo::from_metadata(&meta);
+    // J-TOKEN-A / ADR-044 §1.2：终端真值由**节点**自述（`is_terminal()`）。
+    // 本函数是唯一能看到 inode 的地方，故在此补写；`from_metadata` 只看得见
+    // `FileMetadata`（无节点身份），故它本身不得虚报。
+    let info = vfs::inode::StatInfo::with_terminal(
+        vfs::inode::StatInfo::from_metadata(&meta),
+        fh.inode.is_terminal(),
+    );
     let bytes = core::mem::size_of::<vfs::inode::StatInfo>();
     if let Err(e) = validate_user_range(buf_ptr, bytes as u64, UserAccess::Write) {
         return pack_err(e);
@@ -1720,7 +1726,13 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
             Ok(m) => m,
             Err(e) => return pack_err(e),
         };
-        let info = vfs::inode::StatInfo::from_metadata(&meta);
+        // 同 `sys_fstat`：终端真值取自节点自述（J-TOKEN-A）。
+        // `stat(path)` 与 `fstat(fd)` 对同一节点必须给出相同答案，
+        // 否则两条查询通道会互相矛盾。
+        let info = vfs::inode::StatInfo::with_terminal(
+            vfs::inode::StatInfo::from_metadata(&meta),
+            node.is_terminal(),
+        );
         let bytes = core::mem::size_of::<vfs::inode::StatInfo>();
         if max_bytes < bytes {
             return pack_err(Error::InvalidParam); // 缓冲过小，如实拒绝

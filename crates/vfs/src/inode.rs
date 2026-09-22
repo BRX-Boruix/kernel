@@ -633,6 +633,15 @@ pub struct StatInfo {
     pub owner_uid: u32,
     /// 属主 gid（同上）。
     pub owner_gid: u32,
+    /// 本 fd 是否为终端（ADR-044 §1.2 / J-TOKEN-A）：`1` = 是，`0` = 否/未知。
+    ///
+    /// **尾部追加**（与 `owner_uid`/`owner_gid` 同一纪律）：`repr(C)` 布局只许
+    /// 向尾部增长，既有字段偏移不变。kernel↔libsys 两侧必须同变更同步。
+    ///
+    /// **为何不是 `bool`**：跨 ABI 边界用定长整数，避免依赖两侧对 `bool` 的
+    /// 表示约定（Rust `bool` 是 1 字节但有效值仅 0/1——显式 `u32` 更稳）。
+    /// `0` 兼作「未知」：`from_metadata` 无节点身份，不得虚报，故默认 0。
+    pub is_terminal: u32,
 }
 
 impl StatInfo {
@@ -647,6 +656,16 @@ impl StatInfo {
             INodeType::Fifo => 6,
             INodeType::Socket => 7,
         }
+    }
+
+    /// 补写终端真值（供 syscall 层：拿到 inode 后调 `is_terminal()`）。
+    ///
+    /// 拆为独立构造器而非给 `from_metadata` 加参数：后者的契约是
+    /// 「从元数据忠实投影」，而终端性不在元数据里（它是节点的自我描述）。
+    /// 混在一起会让「元数据有什么就报什么」这一安全性质变模糊。
+    pub fn with_terminal(mut si: Self, is_terminal: bool) -> Self {
+        si.is_terminal = u32::from(is_terminal);
+        si
     }
 
     /// 从元数据构造 ABI 结果。
@@ -664,6 +683,10 @@ impl StatInfo {
             changed_time: m.changed_time,
             owner_uid: m.permissions.owner_uid(),
             owner_gid: m.permissions.owner_gid(),
+            // 终端性由**节点**自述，而本函数只看得见 `FileMetadata`（无
+            // 节点身份）——故此处**不得虚报**，统一为 0（未知）。
+            // 真值由 syscall 层（`sys_fstat`）拿到 inode 后补写。
+            is_terminal: 0,
         }
     }
 }
@@ -712,6 +735,19 @@ pub trait INode: Send + Sync {
     /// 是安全侧——需要阻塞的节点明确覆写，漏写只会导致"如实 WouldBlock"，
     /// 不会导致"莫名其妙挂起"。
     fn blocks_when_empty(&self) -> bool {
+        false
+    }
+    /// 本节点是否为**终端**（ADR-044 §1.2，决策 2）：`isatty` 的真值依据。
+    ///
+    /// **默认 `false`**（S17 安全侧）：绝大多数节点（ramfs/procfs/sysfs/块设备/
+    /// 普通文件）都不是终端，漏写覆写只会导致 `isatty` 如实返回 0，**不会**把
+    /// 一个普通文件误报成终端。只有标准流节点覆写为 `true`。
+    ///
+    /// **为何是节点真值而非调用方特判**（S15）：这是 `interactive_input()` /
+    /// `blocks_when_empty()` 的同款模式——语义归节点所有，调用方只做转发。
+    /// 此前 `libc` 的 `isatty` 硬编码 `fd ∈ {0,1,2} → 1`，那是**按 fd 号猜测**
+    /// 而非询问真值：stdout 被重定向到普通文件后仍是 fd 1，却依旧被报成终端。
+    fn is_terminal(&self) -> bool {
         false
     }
 
@@ -878,7 +914,9 @@ pub trait FileSystem: Send + Sync {
 pub const STAT_INFO_SIZE: usize = core::mem::size_of::<StatInfo>();
 
 const _: () = {
-    assert!(STAT_INFO_SIZE == 56, "StatInfo layout drifted: sync libsys mirror");
+    assert!(STAT_INFO_SIZE == 64, "StatInfo layout drifted: sync libsys mirror");
     assert!(core::mem::offset_of!(StatInfo, owner_uid) == 48);
     assert!(core::mem::offset_of!(StatInfo, owner_gid) == 52);
+    // J-TOKEN-A：终端真值尾部追加，偏移钉死。
+    assert!(core::mem::offset_of!(StatInfo, is_terminal) == 56);
 };

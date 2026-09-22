@@ -125,6 +125,10 @@ impl INode for StdinNode {
     fn blocks_when_empty(&self) -> bool {
         true
     }
+    /// ADR-044 §1.2（J-TOKEN-A）：stdin 是**终端**（键盘 + console）。
+    fn is_terminal(&self) -> bool {
+        true
+    }
 }
 
 /// 标准输出 / 标准错误：console 字节流的只写端（K5 完全体：字节透明）。
@@ -159,6 +163,15 @@ impl INode for StdoutNode {
     /// A5：字符设备判型零成本。
     fn node_type(&self) -> Result<INodeType, Error> {
         Ok(INodeType::CharacterDevice)
+    }
+    /// ADR-044 §1.2（J-TOKEN-A）：stdout 是**终端**。
+    ///
+    /// **诚实边界**：本节点被 fd 1/2 共用（stderr 见 `stderr_handle`）。
+    /// 当前实现下 fd 1/2 **永远是本节点**（重定向只经 `dup2` 换成别的节点，
+    /// 换掉后 `is_terminal()` 就是那个新节点的真值——这正是本设计的意义：
+    /// 终端性跟着**节点**走，不跟着 fd 号走）。
+    fn is_terminal(&self) -> bool {
+        true
     }
 }
 

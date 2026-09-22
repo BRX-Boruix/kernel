@@ -14503,7 +14503,7 @@ pub fn test_stat_owner_fields() {
     let mut st = frame4(crate::syscall::SYS_ENTRY_READ, buf, out_buf, 0x100, crate::syscall::ENTRY_READ_STAT);
     assert!(crate::syscall::syscall_entry(&mut st));
     assert!(st.result & ERR_FLAG == 0, "stat must succeed");
-    assert_eq!(st.result as usize, 56, "StatInfo ABI size must be 56");
+    assert_eq!(st.result as usize, 64, "StatInfo ABI size must be 64 (J-TOKEN-A tail append)");
     unsafe {
         let pa = task::current_proc_mut()
             .expect("proc")
@@ -14563,6 +14563,85 @@ pub fn test_stat_owner_fields() {
     }
     info!("[test-stat-owner] fstat channel real owners OK");
 
+
+    // ---- J-TOKEN-A ≡ T-ISATTY（ADR-044 §1.2）：终端真值穿过同一条 stat 通道 ----
+    // 上面的节点是**普通文件**，故真值必须为 0——这正是旧硬编码
+    // （`fd ∈ {0,1,2} → 1`）做不到的：同一条 fstat、按节点给出不同答案。
+    {
+        let mut fs2 = frame(crate::syscall::SYS_STREAM_FSTAT, fd, out_buf, 0);
+        assert!(crate::syscall::syscall_entry(&mut fs2));
+        assert!(fs2.result & ERR_FLAG == 0, "fstat on regular file must succeed");
+        assert_eq!(fs2.result as usize, 64, "StatInfo ABI size must be 64 (J-TOKEN-A tail append)");
+        unsafe {
+            let pa = task::current_proc_mut()
+                .expect("proc")
+                .addr_space()
+                .translate(arch::VirtAddr::new(out_buf))
+                .expect("fstat out resident")
+                .as_u64();
+            let info = core::ptr::read_unaligned((pa + off) as *const vfs::inode::StatInfo);
+            assert_eq!(info.is_terminal, 0, "a regular file is NOT a terminal");
+        }
+        info!("[test-stat-owner] regular file is_terminal=0 OK");
+    }
+
+    // **真正的终端**：fd 0/1/2 是标准流节点（用户态真实可触及的那三个 fd），
+    // 必须自述为终端。这里走的是真实 `sys_fstat` 入口 + 真实 fd 表。
+    for (fd_no, label) in [(0usize, "stdin"), (1, "stdout"), (2, "stderr")] {
+        let mut fst = frame(crate::syscall::SYS_STREAM_FSTAT, fd_no as u64, out_buf, 0);
+        assert!(crate::syscall::syscall_entry(&mut fst));
+        assert!(fst.result & ERR_FLAG == 0, "fstat on std fd must succeed");
+        unsafe {
+            let pa = task::current_proc_mut()
+                .expect("proc")
+                .addr_space()
+                .translate(arch::VirtAddr::new(out_buf))
+                .expect("fstat out resident")
+                .as_u64();
+            let info = core::ptr::read_unaligned((pa + off) as *const vfs::inode::StatInfo);
+            assert_eq!(info.is_terminal, 1, "std fd must report terminal (node truth)");
+        }
+        info!("[test-stat-owner] std fd is_terminal=1 OK");
+        let _ = label;
+    }
+
+    // **定性证据**：把 fd 1 重定向到一个**普通文件**，fd 号仍然是 1，
+    // 但终端真值必须翻成 0。**这正是旧硬编码 `fd ∈ {0,1,2} → 1`
+    // 永远做不到的事**——它只看 fd 号，看不见背后是什么节点。
+    {
+        // 用真实 `open` 拿一个普通文件 fd，再 `dup2` 到 1。
+        let mut of = frame(crate::syscall::SYS_STREAM_CREATE, buf, OPEN_READ, 0);
+        assert!(crate::syscall::syscall_entry(&mut of));
+        assert!(of.result & ERR_FLAG == 0, "open scratch file for redirect");
+        let file_fd = of.result;
+        let mut dp = frame(crate::syscall::SYS_STREAM_DUP, file_fd, 1, 0);
+        assert!(crate::syscall::syscall_entry(&mut dp));
+        assert!(dp.result & ERR_FLAG == 0, "dup2(file_fd, 1) must succeed");
+
+        // fd 号仍然是 1，但真值已变：这是本项的决定性证据。
+        let mut fsr = frame(crate::syscall::SYS_STREAM_FSTAT, 1, out_buf, 0);
+        assert!(crate::syscall::syscall_entry(&mut fsr));
+        assert!(fsr.result & ERR_FLAG == 0, "fstat(fd=1) after redirect");
+        unsafe {
+            let pa = task::current_proc_mut()
+                .expect("proc")
+                .addr_space()
+                .translate(arch::VirtAddr::new(out_buf))
+                .expect("out resident")
+                .as_u64();
+            let info = core::ptr::read_unaligned((pa + off) as *const vfs::inode::StatInfo);
+            assert_eq!(
+                info.is_terminal, 0,
+                "fd 1 redirected to a regular file must NOT be a terminal",
+            );
+            assert_eq!(info.node_type, 1, "redirected fd 1 is a regular file");
+        }
+        info!("[test-stat-owner] redirected fd1 is_terminal=0 OK (the decisive case)");
+
+        // 还原：把 fd 1 指回真正的终端节点，再次短路验证。
+        let mut dr = frame(crate::syscall::SYS_STREAM_DUP, 1, file_fd, 0);
+        let _ = crate::syscall::syscall_entry(&mut dr);
+    }
     // 清理（CAP 通道）。
     {
         let root = crate::vfs_init::root();

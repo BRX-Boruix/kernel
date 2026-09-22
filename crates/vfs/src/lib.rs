@@ -73,6 +73,80 @@ mod tests {
         assert_eq!(Path::canonicalize("/a/../../.."), "/");
     }
 
+
+    // =======================================================================
+    // J-TOKEN-A ≡ T-ISATTY（ADR-044 §1.2）：节点真值 is_terminal
+    //
+    // 契约先行（S23）。要钉死的是：**终端性由节点自述**，不是调用方按 fd 号
+    // 猜。这正是既有 interactive_input/blocks_when_empty 的同款模式。
+    // =======================================================================
+
+    /// 标准流三节点自述为终端；普通 RamFS 文件自述**不是**。
+    #[test]
+    fn test_is_terminal_std_nodes_true_fs_nodes_false() {
+        let stdin = crate::stdio::stdin_handle();
+        let stdout = crate::stdio::stdout_handle();
+        let stderr = crate::stdio::stderr_handle();
+        assert!(stdin.inode.as_ref().is_terminal(), "stdin must be a terminal");
+        assert!(stdout.inode.as_ref().is_terminal(), "stdout must be a terminal");
+        assert!(stderr.inode.as_ref().is_terminal(), "stderr must be a terminal");
+
+        // 普通文件：绝不是终端。
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs);
+        mt.create_file("/plain.txt", AccessPolicy::read_write().classic_mode(), (0, 0))
+            .expect("create file");
+        let node = mt.resolve("/plain.txt", false).expect("resolve");
+        assert!(!node.is_terminal(), "a regular file is not a terminal");
+        // 目录同样不是。
+        mt.mkdir("/adir", AccessPolicy::read_write().classic_mode(), (0, 0))
+            .expect("mkdir");
+        let dir = mt.resolve("/adir", false).expect("resolve dir");
+        assert!(!dir.is_terminal(), "a directory is not a terminal");
+    }
+
+    /// **默认值是 `false`（S17 安全侧）**：未覆写的节点不得被当成终端。
+    /// 漏写覆写只会导致「如实说不是终端」，不会导致「把文件当终端」。
+    #[test]
+    fn test_is_terminal_default_is_false() {
+        // 用一个最小节点直接验默认实现（不经任何覆写路径）。
+        struct Bare;
+        impl INode for Bare {
+            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<usize, Error> {
+                Err(Error::NotSupported)
+            }
+            fn write_at(&self, _o: u64, _b: &[u8]) -> Result<usize, Error> {
+                Err(Error::NotSupported)
+            }
+            fn metadata(&self) -> Result<crate::inode::FileMetadata, Error> {
+                Err(Error::NotSupported)
+            }
+        }
+        assert!(!Bare.is_terminal(), "default must be false (safe side)");
+    }
+
+    /// ABI：`StatInfo` 携带终端真值。**尾部追加**纪律——既有字段偏移不变。
+    #[test]
+    fn test_statinfo_carries_is_terminal_tail_appended() {
+        let stdin = crate::stdio::stdin_handle();
+        let m = stdin.inode.as_ref().metadata().expect("metadata");
+        let si = crate::inode::StatInfo::from_metadata(&m);
+        // from_metadata 只看得见 FileMetadata（无节点身份），故此处**不得**虚报；
+        // 真值由 syscall 层补写。默认必须是 0（未知/非终端）。
+        assert_eq!(si.is_terminal, 0, "from_metadata must not fabricate terminality");
+
+        let si2 = crate::inode::StatInfo::with_terminal(si, true);
+        assert_eq!(si2.is_terminal, 1);
+        let si3 = crate::inode::StatInfo::with_terminal(si, false);
+        assert_eq!(si3.is_terminal, 0);
+
+        // 尾部追加：旧字段值不受影响。
+        assert_eq!(si2.node_type, si.node_type);
+        assert_eq!(si2.size, si.size);
+        assert_eq!(si2.perms, si.perms);
+        assert_eq!(si2.owner_uid, si.owner_uid);
+        assert_eq!(si2.owner_gid, si.owner_gid);
+    }
     #[test]
     fn test_ramfs_basic_file_ops() {
         let ramfs = Arc::new(RamFS::new());
