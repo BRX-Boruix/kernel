@@ -5519,6 +5519,113 @@ pub fn test_syscall_entry_read_json() {
     info!("[test-syscall-entry-read-json] PASS");
 }
 
+/// ADR-043 支柱 1（J-TREE）前置：`/processes/list` 的 `ppid` 真值端到端可用。
+///
+/// **为何是内核停机测试而非用户态单测**：`ppid` 的真值链是
+/// 「`ProcEntry.ppid` → `procfs` JSON → 用户态解析」。用户态的 `parse_proc_list`
+/// 已由 `cargo test -p libsys` 覆盖（含对抗输入），但那条链路的**源头**
+/// （内核真的把真实亲子关系写进 JSON）只能在真实内核里验证（S06/S29）。
+///
+/// **为何自己 spawn 父子链**：本测试运行在 `kmain` 早期（`start_init` 之前），
+/// 此时进程表为空——不能依赖『总有进程存在』。故用 `spawn_with_ppid` 建立
+/// **真实**父子关系（与 `test_waitpid_e2e` 同款手法），再验证 JSON。
+///
+/// 覆盖：
+/// 1. 真实派生的子进程，其 `ppid` 必须等于父 pid（真派生链，非构造数据）。
+/// 2. `/processes/list` 的 JSON **确实包含** `ppid` 字段，且逐条与内核真值一致。
+/// 3. 每个存活进程都能在 JSON 中找到对应条目（无遗漏、无虚构）。
+/// 4. 根父进程的 `ppid` 为 0（无父），不是被顶替的值。
+pub fn test_proc_list_ppid_truth() {
+    use crate::vfs_init;
+    use vfs::inode::INode;
+    use usermode_waitpid::*;
+
+    info!("[test-proc-list-ppid-truth] === ADR-043 pillar 1: ppid truth chain ===");
+
+    // --- 1. 建立真实父子链：父 ppid=0，子 ppid=父 pid ---
+    let (parent_us, _p) = waitpid_build_space(&waitpid_child_code(0), b"P");
+    let parent_pid = task::spawn_with_ppid(0, "ppid-parent.elf", CODE_ADDR, STACK_TOP, parent_us)
+        .expect("spawn ppid parent");
+    let (child_us, _c) = waitpid_build_space(&waitpid_child_code(0), b"C");
+    let child_pid = task::spawn_with_ppid(
+        parent_pid,
+        "ppid-child.elf",
+        CODE_ADDR,
+        STACK_TOP,
+        child_us,
+    )
+    .expect("spawn ppid child");
+    assert_ne!(parent_pid, child_pid, "pids must differ");
+    info!(
+        "[test-proc-list-ppid-truth] spawned parent={} child={}",
+        parent_pid, child_pid
+    );
+
+    // --- 2. 内核真值：调度器的进程快照（J-TREE 的数据源头） ---
+    let truth = task::process_snapshots();
+    assert!(truth.len() >= 2, "both spawned processes must be live");
+    let child = truth
+        .iter()
+        .find(|p| p.pid == child_pid)
+        .expect("child must be in the snapshot");
+    assert_eq!(
+        child.ppid, parent_pid,
+        "child ppid must equal the real parent pid (derivation chain, not fabricated)"
+    );
+    let parent = truth
+        .iter()
+        .find(|p| p.pid == parent_pid)
+        .expect("parent must be in the snapshot");
+    assert_eq!(parent.ppid, 0, "root parent must have ppid=0");
+
+    // --- 3. 真实 VFS 路径读 /processes/list（用户态看到的就是这一份字节） ---
+    let root = vfs_init::root();
+    let node = root
+        .resolve("/processes/list", false)
+        .expect("resolve /processes/list");
+    let mut buf = alloc::vec![0u8; 16384];
+    let n = node.read_at(0, &mut buf).expect("read /processes/list");
+    let json = core::str::from_utf8(&buf[..n]).expect("procfs JSON must be valid UTF-8");
+    info!("[test-proc-list-ppid-truth] json={}", json);
+
+    // --- 4. 契约一：JSON 必须含 ppid 字段（J-TREE 的数据源契约） ---
+    assert!(
+        json.contains("\"ppid\":"),
+        "procfs JSON must expose ppid (needed by J-TREE); got: {json}"
+    );
+
+    // --- 5. 契约二：JSON 与内核真值逐条一致（不得遗漏、不得虚构） ---
+    // 逐对象切开，避免跨对象误匹配（ppid 值可能等于另一个 pid）。
+    let objects: alloc::vec::Vec<&str> = json.split("},").collect();
+    for p in &truth {
+        let pid_needle = alloc::format!("\"pid\":{}", p.pid);
+        let ppid_needle = alloc::format!("\"ppid\":{}", p.ppid);
+        let obj = objects
+            .iter()
+            .find(|o| o.contains(&pid_needle))
+            .unwrap_or_else(|| panic!("live pid={} missing from /processes/list", p.pid));
+        assert!(
+            obj.contains(&ppid_needle),
+            "pid={} object must report ppid={}; object was: {}",
+            p.pid,
+            p.ppid,
+            obj
+        );
+    }
+
+    // --- 收尾（S18）：回收两个派生的测试进程，进程表回基线 ---
+    assert!(
+        task::test_hooks::reclaim_entry(child_pid),
+        "child entry must be reclaimable"
+    );
+    assert!(
+        task::test_hooks::reclaim_entry(parent_pid),
+        "parent entry must be reclaimable"
+    );
+
+    info!("[test-proc-list-ppid-truth] PASS");
+}
+
 /// ADR-014 SYS_ENTRY_CREATE (0x41)：kind 参数解析（目录/文件/特殊节点/未知）。
 ///
 /// 覆盖：
@@ -12795,7 +12902,7 @@ pub fn test_task_block_fpu_handoff() {
 }
 
 /// C7.1/#7 E2E 停机验收的常量地址（随 `kernel-test-waitpid` feature 编译）。
-#[cfg(feature = "kernel-test-waitpid")]
+#[cfg(any(feature = "kernel-test-waitpid", feature = "kernel-tests"))]
 mod usermode_waitpid {
     /// 用户代码页。
     pub const CODE_ADDR: u64 = 0x0000_0000_9000_0000;
@@ -12812,7 +12919,7 @@ mod usermode_waitpid {
 ///
 /// 睡眠期间被 LAPIC tick 抢占切换是必然事件（50 tick >> 时间片），父进程
 /// 得以在子进程退出前阻塞登记，从而走"阻塞 → 交付"全链路。
-#[cfg(feature = "kernel-test-waitpid")]
+#[cfg(any(feature = "kernel-test-waitpid", feature = "kernel-tests"))]
 fn waitpid_child_code(sleep_ns: u64) -> [u8; 96] {
     let mut c = [0x90u8; 96];
     let mut i = 0;
@@ -12842,7 +12949,7 @@ fn waitpid_child_code(sleep_ns: u64) -> [u8; 96] {
 /// E2E 父进程机器码：`task_wait(child_pid)` 阻塞等待 → 校验 rax==42 →
 /// 成功经 stream write 输出 '*'（ASCII 42，退出码逐字节可见）；失败输出 '!'
 /// 后 `exit(7)`。最后 `exit(0)` 停机。
-#[cfg(feature = "kernel-test-waitpid")]
+#[cfg(any(feature = "kernel-test-waitpid", feature = "kernel-tests"))]
 fn waitpid_parent_code(child_pid: usize) -> [u8; 224] {
     use usermode_waitpid::{MSG_ADDR, STACK_TOP};
     let mut c = [0x90u8; 224];
@@ -12915,7 +13022,7 @@ fn waitpid_parent_code(child_pid: usize) -> [u8; 224] {
 
 /// E2E 公共：构造独立用户地址空间（代码/消息/栈各一物理帧）。
 /// 返回 (地址空间, 代码帧物理基址) —— 供调用方回填内建立即数。
-#[cfg(feature = "kernel-test-waitpid")]
+#[cfg(any(feature = "kernel-test-waitpid", feature = "kernel-tests"))]
 fn waitpid_build_space(
     code: &[u8],
     msg: &[u8],

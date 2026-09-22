@@ -726,6 +726,9 @@ unsafe fn kmain_body() -> ! {
     // ADR-014 SYS_ENTRY_READ (0x42)：标准紧凑 JSON 输出。
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_entry_read_json();
+    // ADR-043 支柱 1（J-TREE）：/processes/list 的 ppid 真值是用户态作业树的数据源。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_proc_list_ppid_truth();
     // ADR-014 SYS_ENTRY_CREATE (0x41)：kind 参数解析。
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_entry_create_kind();
