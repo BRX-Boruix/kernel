@@ -147,6 +147,102 @@ mod tests {
         assert_eq!(si2.owner_uid, si.owner_uid);
         assert_eq!(si2.owner_gid, si.owner_gid);
     }
+
+    // =======================================================================
+    // J-TOKEN-B（ADR-044 §1.3）：console owner 是**节点真值**
+    // 契约先行（S23）。要钉死的是：「谁持令牌」由节点自述（S15），
+    // 内核不隐式更新，且 **0 表示无主/未知** 而不是「pid 0 持有控制台」。
+    // =======================================================================
+
+    /// 无主句柄（既有调用点的默认）如实报 0（无主/未知）。
+    ///
+    /// 这防的是**误读**：0 必须被解释为「没有人持有」，绝不能是
+    /// 「pid 0（内核/init 占位）持有控制台」。init 的真实 pid 是 1。
+    #[test]
+    fn test_console_owner_default_is_unowned() {
+        let stdin = crate::stdio::stdin_handle();
+        assert_eq!(stdin.inode.as_ref().console_owner(), 0, "default stdin is unowned");
+        let stdout = crate::stdio::stdout_handle();
+        assert_eq!(stdout.inode.as_ref().console_owner(), 0, "default stdout is unowned");
+        let stderr = crate::stdio::stderr_handle();
+        assert_eq!(stderr.inode.as_ref().console_owner(), 0, "default stderr is unowned");
+    }
+
+    /// 带 owner 的句柄如实报出该 owner（**输入与输出两端一致**）。
+    #[test]
+    fn test_console_owner_reports_the_pid_it_was_built_with() {
+        let si = crate::stdio::stdin_handle_owned(42);
+        let so = crate::stdio::stdout_handle_owned(42);
+        let se = crate::stdio::stderr_handle_owned(42);
+        assert_eq!(si.inode.as_ref().console_owner(), 42);
+        assert_eq!(so.inode.as_ref().console_owner(), 42);
+        assert_eq!(se.inode.as_ref().console_owner(), 42);
+    }
+
+    /// **每个句柄一份独立 owner**（ADR-044 §0.1 的关键性质）：
+    /// 两个句柄是**不同的节点实例**，各自持有自己的 owner，
+    /// 改一个不影响另一个。这证明「每打开实例一份状态」无需新通道。
+    #[test]
+    fn test_console_owner_is_per_node_instance_not_global() {
+        let a = crate::stdio::stdin_handle_owned(7);
+        let b = crate::stdio::stdin_handle_owned(9);
+        assert_eq!(a.inode.as_ref().console_owner(), 7);
+        assert_eq!(b.inode.as_ref().console_owner(), 9);
+        // 二者不是同一个 Arc（各自新建），故互不影响。
+        assert!(!Arc::ptr_eq(&a.inode, &b.inode), "each handle must own its own node");
+    }
+
+    /// **默认 `0`（S17 安全侧）**：未覆写 `console_owner` 的节点不得
+    /// 被当成有主。漏写覆写只会导致「如实报无主」，不会把某进程误报成持有者。
+    #[test]
+    fn test_console_owner_default_is_zero_for_bare_nodes() {
+        struct Bare;
+        impl INode for Bare {
+            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<usize, Error> {
+                Err(Error::NotSupported)
+            }
+            fn write_at(&self, _o: u64, _b: &[u8]) -> Result<usize, Error> {
+                Err(Error::NotSupported)
+            }
+            fn metadata(&self) -> Result<crate::inode::FileMetadata, Error> {
+                Err(Error::NotSupported)
+            }
+        }
+        assert_eq!(Bare.console_owner(), 0, "default must be 0 = unowned (safe side)");
+    }
+
+    /// ABI：`StatInfo` 携带 console owner。**尾部追加**纪律——既有字段偏移不变。
+    #[test]
+    fn test_statinfo_carries_console_owner_tail_appended() {
+        let stdin = crate::stdio::stdin_handle();
+        let m = stdin.inode.as_ref().metadata().expect("metadata");
+        let si = crate::inode::StatInfo::from_metadata(&m);
+        // from_metadata 无节点身份，不得虚报；真值由 syscall 层补写。
+        assert_eq!(si.console_owner, 0, "from_metadata must not fabricate an owner");
+
+        let si2 = crate::inode::StatInfo::with_console_owner(si, 1000);
+        assert_eq!(si2.console_owner, 1000);
+
+        // 尾部追加：旧字段值不受影响。
+        assert_eq!(si2.is_terminal, si.is_terminal);
+        assert_eq!(si2.node_type, si.node_type);
+        assert_eq!(si2.size, si.size);
+        assert_eq!(si2.perms, si.perms);
+        assert_eq!(si2.owner_uid, si.owner_uid);
+        assert_eq!(si2.owner_gid, si.owner_gid);
+    }
+
+    /// 两个补写器**可组合**且互不干扰（syscall 层正是这么用的）。
+    #[test]
+    fn test_statinfo_terminal_and_owner_compose() {
+        let stdin = crate::stdio::stdin_handle_owned(5);
+        let m = stdin.inode.as_ref().metadata().expect("metadata");
+        let si = crate::inode::StatInfo::from_metadata(&m);
+        let si = crate::inode::StatInfo::with_terminal(si, stdin.inode.as_ref().is_terminal());
+        let si = crate::inode::StatInfo::with_console_owner(si, stdin.inode.as_ref().console_owner());
+        assert_eq!(si.is_terminal, 1, "stdin is a terminal");
+        assert_eq!(si.console_owner, 5, "and it says who owns it");
+    }
     #[test]
     fn test_ramfs_basic_file_ops() {
         let ramfs = Arc::new(RamFS::new());

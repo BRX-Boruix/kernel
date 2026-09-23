@@ -78,7 +78,39 @@ fn stream_metadata(read: bool, write: bool) -> Result<FileMetadata, Error> {
 // ---------------------------------------------------------------------------
 
 /// 标准输入：键盘字符流的只读端。
-pub struct StdinNode;
+///
+/// **J-TOKEN-B（ADR-044 §1.3）**：本节点现持有 `owner`——即**当前持有该
+/// console 令牌的 pid**（`0` = 无主/未知）。
+///
+/// **为何是「节点持 owner」而不是拆全局单例**（实核更正）：本节点**从来不是
+/// 单例**——`stdin_handle()` 每次都 `Arc::new` 新建（见下方句柄构造节）。
+/// 故本项是**把无状态单元结构体改为持 owner 的节点**，让「每打开实例一份
+/// owner」真正有地方放；不是把某个共享对象拆开。
+///
+/// **owner 由谁改**：内核**不隐式更新**（ADR-044 §1.4 / ADR-043 决策 2a）。
+/// 用户态经既有路径决定谁持令牌、何时移交（J-TOKEN-C 策略层）。
+pub struct StdinNode {
+    /// 当前持有本 console 令牌的 pid；`0` = 无主/未知（S17 安全侧默认）。
+    owner: u64,
+}
+
+impl StdinNode {
+    /// 无主的标准输入节点（向后兼容既有调用点；行为与改造前一致）。
+    pub fn new() -> Self {
+        Self { owner: 0 }
+    }
+
+    /// 指定 owner 的标准输入节点（J-TOKEN-B：console 令牌的落点）。
+    pub fn with_owner(owner: u64) -> Self {
+        Self { owner }
+    }
+}
+
+impl Default for StdinNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl INode for StdinNode {
     /// 审计 B29 语义边界：`buf` 为空（len==0）与"键盘缓冲空"在本层共用
@@ -129,10 +161,42 @@ impl INode for StdinNode {
     fn is_terminal(&self) -> bool {
         true
     }
+    /// ADR-044 §1.3（J-TOKEN-B）：本 console 令牌的持有者（节点自述，S15）。
+    ///
+    /// 用户态经既有 stat/fstat 读到本值；`0` = 无主/未知。
+    fn console_owner(&self) -> u64 {
+        self.owner
+    }
 }
 
 /// 标准输出 / 标准错误：console 字节流的只写端（K5 完全体：字节透明）。
-pub struct StdoutNode;
+///
+/// **J-TOKEN-B（ADR-044 §1.3）**：持 `owner`，语义同 [`StdinNode`]。
+/// 输出权与输入权是**同一个 console 对象**的两端，故 owner 概念共用；
+/// 但当前实现**不做**「输入 owner 与输出 owner 必须一致」的强制——
+/// 用户态可分别持有（ADR-043 §2.1 把该策略留给用户态）。
+pub struct StdoutNode {
+    /// 当前持有本 console 输出令牌的 pid；`0` = 无主/未知。
+    owner: u64,
+}
+
+impl StdoutNode {
+    /// 无主的标准输出节点（向后兼容既有调用点）。
+    pub fn new() -> Self {
+        Self { owner: 0 }
+    }
+
+    /// 指定 owner 的标准输出节点。
+    pub fn with_owner(owner: u64) -> Self {
+        Self { owner }
+    }
+}
+
+impl Default for StdoutNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl INode for StdoutNode {
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, Error> {
@@ -173,6 +237,10 @@ impl INode for StdoutNode {
     fn is_terminal(&self) -> bool {
         true
     }
+    /// ADR-044 §1.3（J-TOKEN-B）：本 console 输出令牌的持有者（节点自述）。
+    fn console_owner(&self) -> u64 {
+        self.owner
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,18 +253,51 @@ impl INode for StdoutNode {
 /// 无错误路径），`FileHandle::new` 的 Result 化（vfs1 M3/M4）不为其引入
 /// 可达失败分支。若未来该不变式被破坏，此处 panic 即契约违反的诚实暴露。
 pub fn stdin_handle() -> FileHandle {
-    FileHandle::new(Arc::new(StdinNode), OpenFlags::READ_ONLY)
+    FileHandle::new(Arc::new(StdinNode::new()), OpenFlags::READ_ONLY)
         .expect("stdin stream metadata is structurally infallible")
 }
 
 /// fd 1：标准输出句柄（只写）。不变式论证同 [`stdin_handle`]。
 pub fn stdout_handle() -> FileHandle {
-    FileHandle::new(Arc::new(StdoutNode), OpenFlags::WRITE_ONLY)
+    FileHandle::new(Arc::new(StdoutNode::new()), OpenFlags::WRITE_ONLY)
         .expect("stdout stream metadata is structurally infallible")
 }
 
 /// fd 2：标准错误句柄（只写；当前与 stdout 共享 console 通道）。
 pub fn stderr_handle() -> FileHandle {
-    FileHandle::new(Arc::new(StdoutNode), OpenFlags::WRITE_ONLY)
+    FileHandle::new(Arc::new(StdoutNode::new()), OpenFlags::WRITE_ONLY)
         .expect("stderr stream metadata is structurally infallible")
 }
+
+// ---------------------------------------------------------------------------
+// J-TOKEN-B：带 owner 的标准流句柄（ADR-044 §1.3）
+//
+// **与上面三个的区别**：上面是「无主」句柄（owner=0），行为与改造前完全一致，
+// 供既有调用点继续使用；下面三者为 console 令牌的**落点**——调用方在创建
+// 标准流时把「谁持令牌」写进节点。
+//
+// **为何不需要新通道**（ADR-044 §0.1）：`FileHandle` 已持 `Arc<dyn INode>`，
+// 「每个打开实例一份 owner」天然就是节点的一个字段，不需要额外映射或同步机制。
+//
+// **内核不隐式更新 owner**（ADR-044 §1.4）：本函数只**照调用方给的 pid 落笔**，
+// 不做「谁读键盘谁是前台」的推断（ADR-043 决策 2a 拒绝隐式魔法）。
+// ---------------------------------------------------------------------------
+
+/// fd 0（带 owner）：标准输入句柄，owner = `owner`。
+pub fn stdin_handle_owned(owner: u64) -> FileHandle {
+    FileHandle::new(Arc::new(StdinNode::with_owner(owner)), OpenFlags::READ_ONLY)
+        .expect("stdin stream metadata is structurally infallible")
+}
+
+/// fd 1（带 owner）：标准输出句柄，owner = `owner`。
+pub fn stdout_handle_owned(owner: u64) -> FileHandle {
+    FileHandle::new(Arc::new(StdoutNode::with_owner(owner)), OpenFlags::WRITE_ONLY)
+        .expect("stdout stream metadata is structurally infallible")
+}
+
+/// fd 2（带 owner）：标准错误句柄，owner = `owner`。
+pub fn stderr_handle_owned(owner: u64) -> FileHandle {
+    FileHandle::new(Arc::new(StdoutNode::with_owner(owner)), OpenFlags::WRITE_ONLY)
+        .expect("stderr stream metadata is structurally infallible")
+}
+

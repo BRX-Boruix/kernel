@@ -14503,7 +14503,11 @@ pub fn test_stat_owner_fields() {
     let mut st = frame4(crate::syscall::SYS_ENTRY_READ, buf, out_buf, 0x100, crate::syscall::ENTRY_READ_STAT);
     assert!(crate::syscall::syscall_entry(&mut st));
     assert!(st.result & ERR_FLAG == 0, "stat must succeed");
-    assert_eq!(st.result as usize, 64, "StatInfo ABI size must be 64 (J-TOKEN-A tail append)");
+        // J-TOKEN-B：ABI 尾部追加 console_owner（u64）后 sizeof 64 → 72。
+    // 同时钉**字面量**与 size_of：字面量捕“无意的布局漂移”，
+    // size_of 捕“两侧定义不一致”（S06 跨边界数据契约）。
+    assert_eq!(core::mem::size_of::<vfs::inode::StatInfo>(), 72, "StatInfo sizeof must be 72 (J-TOKEN-B)");
+    assert_eq!(st.result as usize, core::mem::size_of::<vfs::inode::StatInfo>(), "stat must return the compiled StatInfo size (J-TOKEN-B)");
     unsafe {
         let pa = task::current_proc_mut()
             .expect("proc")
@@ -14571,7 +14575,7 @@ pub fn test_stat_owner_fields() {
         let mut fs2 = frame(crate::syscall::SYS_STREAM_FSTAT, fd, out_buf, 0);
         assert!(crate::syscall::syscall_entry(&mut fs2));
         assert!(fs2.result & ERR_FLAG == 0, "fstat on regular file must succeed");
-        assert_eq!(fs2.result as usize, 64, "StatInfo ABI size must be 64 (J-TOKEN-A tail append)");
+                assert_eq!(fs2.result as usize, core::mem::size_of::<vfs::inode::StatInfo>(), "fstat must return the compiled StatInfo size (J-TOKEN-B)");
         unsafe {
             let pa = task::current_proc_mut()
                 .expect("proc")
@@ -14581,6 +14585,10 @@ pub fn test_stat_owner_fields() {
                 .as_u64();
             let info = core::ptr::read_unaligned((pa + off) as *const vfs::inode::StatInfo);
             assert_eq!(info.is_terminal, 0, "a regular file is NOT a terminal");
+            // J-TOKEN-B：普通文件不是 console，故 owner 必须是 **0（无主）**。
+            // 这项钉死了「不按 fd 号虚报 owner」：同一条 fstat 在标准流上
+            // 报真实 owner、在普通文件上报无主，两者不可能同时为真。
+            assert_eq!(info.console_owner, 0, "a regular file has no console owner");
         }
         info!("[test-stat-owner] regular file is_terminal=0 OK");
     }

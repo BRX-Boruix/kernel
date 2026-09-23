@@ -349,9 +349,9 @@ pub(crate) struct ThreadGroup<PT: PageTable> {
 impl<PT: PageTable> ThreadGroup<PT> {
     /// 构造一个独立组（组长独占）：默认标准流 fd 表 + `/` cwd + 默认身份 +
     /// 传入的地址空间 `Arc`。组长进程在其 PCB 构造时经此自建并持有本组。
-    fn new(addr_space: Arc<UserAddressSpace<PT>>) -> Self {
+    fn new(addr_space: Arc<UserAddressSpace<PT>>, owner: usize) -> Self {
         Self {
-            fd_table: klib::sync::spin::SpinMutex::new(default_stdio_table()),
+            fd_table: klib::sync::spin::SpinMutex::new(default_stdio_table(owner)),
             cwd: klib::sync::spin::SpinMutex::new(alloc::string::String::from("/")),
             identity: klib::sync::spin::SpinMutex::new(ProcessIdentity::default_user()),
             addr_space,
@@ -361,11 +361,25 @@ impl<PT: PageTable> ThreadGroup<PT> {
 
 /// 进程表与 PCB 初始化的默认标准流表（0=stdin 键盘源、1=stdout、2=stderr）。
 /// 独立组（组长 spawn）与测试直构 [`Process`] 共用此单点，避免跨处复制。
-fn default_stdio_table() -> Vec<Option<vfs::file_handle::OpenHandle>> {
+///
+/// **J-TOKEN-B（ADR-044 §1.3）**：`owner` 是**新进程自己的 pid**——三节点在
+/// 创建时即把自己登记为该 console 的持有者。
+///
+/// **为何由内核在建进程时落笔、而不算「隐式魔法」**（对照 ADR-044 §1.4）：
+/// 「新进程的 fd 0/1/2 指向本 console 且自己是持有者」是**创建时的静态事实**，
+/// 不是内核事后根据行为（如「谁在读键盘」）反推的策略。真正的**移交**
+/// （谁该持令牌、何时移交、非 owner 输出如何处置）仍全部由用户态决定
+/// （ADR-043 决策 2 / J-TOKEN-C）。
+///
+/// **为何 `owner` 取 pid 而非任意值**：首个持有者就是刚被创建的这个进程；
+/// 这与「令牌的初始归属」一致，且 `0` 得以保留为**无主/未知**的专用值
+/// （S17：不会与「pid 0 = init 持有控制台」混淆——init 是真实 pid 1）。
+fn default_stdio_table(owner: usize) -> Vec<Option<vfs::file_handle::OpenHandle>> {
+    let o = owner as u64;
     alloc::vec![
-        Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stdin_handle())),
-        Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stdout_handle())),
-        Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stderr_handle())),
+        Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stdin_handle_owned(o))),
+        Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stdout_handle_owned(o))),
+        Some(vfs::file_handle::OpenHandle::File(vfs::stdio::stderr_handle_owned(o))),
     ]
 }
 
@@ -422,7 +436,7 @@ impl<PT: PageTable> Process<PT> {
     ) -> Self {
         // 组长自建独立组（KM1 标准流表单点在 ThreadGroup::new 内构造）。
         Self::with_group(pid, pid, entry_rip, user_stack_top, kernel_stack_top,
-            Arc::new(ThreadGroup::new(addr_space)),
+            Arc::new(ThreadGroup::new(addr_space, pid)),
         )
     }
 

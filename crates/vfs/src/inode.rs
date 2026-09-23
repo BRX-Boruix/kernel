@@ -642,6 +642,17 @@ pub struct StatInfo {
     /// 表示约定（Rust `bool` 是 1 字节但有效值仅 0/1——显式 `u32` 更稳）。
     /// `0` 兼作「未知」：`from_metadata` 无节点身份，不得虚报，故默认 0。
     pub is_terminal: u32,
+    /// 本节点所属 console 的 **owner pid**（ADR-044 §1.3 / J-TOKEN-B）：
+    /// `0` = **无主/未知**（S17 安全侧默认，与 `is_terminal` 的 0 同一约定）。
+    ///
+    /// **尾部追加**（与 `owner_uid`/`owner_gid`/`is_terminal` 同一纪律）：
+    /// `repr(C)` 布局只许向尾部增长，既有字段偏移不变；kernel↔libsys 两侧
+    /// 必须同变更同步（PRE-12 纪律）。
+    ///
+    /// **`0` 兼作「未知」而非「属于 pid 0」**：`from_metadata` 无节点身份，
+    /// 不得虚报，故默认 0；真值由 syscall 层拿到 inode 后补写。
+    /// 这堵死了「0 被误读成 init 持有控制台」这一错误解释。
+    pub console_owner: u64,
 }
 
 impl StatInfo {
@@ -668,6 +679,20 @@ impl StatInfo {
         si
     }
 
+    /// 补写 console owner（供 syscall 层：拿到 inode 后调 `console_owner()`）。
+    ///
+    /// 与 [`with_terminal`](Self::with_terminal) 同一拆法、同一理由：
+    /// `from_metadata` 的契约是「从元数据忠实投影」，而 owner 不在元数据里
+    /// （它是节点的自我描述）。混进 `from_metadata` 会让「元数据有什么就报
+    /// 什么」这一安全性质变模糊。
+    ///
+    /// **`0` 表示无主/未知**，调用方不得把它解释成「pid 0 持有控制台」——
+    /// 该约定在 trait 方法 `INode::console_owner` 的文档里单点定义（S13）。
+    pub fn with_console_owner(mut si: Self, owner: u64) -> Self {
+        si.console_owner = owner;
+        si
+    }
+
     /// 从元数据构造 ABI 结果。
     ///
     /// A1-4：属主字段取自节点 [`AccessPolicy`] 本体（A1-1 起策略即存储
@@ -687,6 +712,9 @@ impl StatInfo {
             // 节点身份）——故此处**不得虚报**，统一为 0（未知）。
             // 真值由 syscall 层（`sys_fstat`）拿到 inode 后补写。
             is_terminal: 0,
+            // 同理：owner 也由**节点**自述，本函数只看得见 `FileMetadata`，
+            // 故统一为 0（无主/未知），绝不虚报。
+            console_owner: 0,
         }
     }
 }
@@ -749,6 +777,27 @@ pub trait INode: Send + Sync {
     /// 而非询问真值：stdout 被重定向到普通文件后仍是 fd 1，却依旧被报成终端。
     fn is_terminal(&self) -> bool {
         false
+    }
+    /// 本节点所属控制台的 **owner pid**（ADR-044 §1.3 / J-TOKEN-B）。
+    ///
+    /// 语义：**谁现在持有这个 console 对象的令牌**。`0` = **无主/未知**
+    /// （S17 安全侧默认，与 `is_terminal` 的 0 同一约定）。
+    ///
+    /// **为何是节点真值而非调用方特判**（S15）：与 `is_terminal()` /
+    /// `interactive_input()` 完全同构——「谁在用这个终端」是**节点的自我描述**，
+    /// 不是调用方按 fd 号或进程名去猜的东西。
+    ///
+    /// **为何 `u64` 而非更窄的类型**：跨 ABI 边界用定长整数；pid 在当前实现中
+    /// 是 `usize`，用 `u64` 与 `StatInfo` 侧字段宽度一致，避免两侧宽度假设分歧。
+    ///
+    /// **默认 `0`（无主）**：绝大多数节点（ramfs/procfs/sysfs/块设备/普通文件）
+    /// 根本不是 console，没有 owner 可言。漏写覆写只会导致「如实报无主」，
+    /// **不会**把某个进程误报成终端持有者。只有标准流节点覆写为真实 owner。
+    ///
+    /// **边界（ADR-044 §1.4）**：内核**不隐式更新** owner（不做「谁读键盘谁是
+    /// 前台」的魔法）；谁该持令牌、何时移交由用户态策略决定（ADR-043 决策 2a）。
+    fn console_owner(&self) -> u64 {
+        0
     }
 
     /// 若本节点暴露音频 PCM ring，返回其共享句柄；否则 `None`（A2）。
@@ -914,9 +963,11 @@ pub trait FileSystem: Send + Sync {
 pub const STAT_INFO_SIZE: usize = core::mem::size_of::<StatInfo>();
 
 const _: () = {
-    assert!(STAT_INFO_SIZE == 64, "StatInfo layout drifted: sync libsys mirror");
+    assert!(STAT_INFO_SIZE == 72, "StatInfo layout drifted: sync libsys mirror");
     assert!(core::mem::offset_of!(StatInfo, owner_uid) == 48);
     assert!(core::mem::offset_of!(StatInfo, owner_gid) == 52);
     // J-TOKEN-A：终端真值尾部追加，偏移钉死。
     assert!(core::mem::offset_of!(StatInfo, is_terminal) == 56);
+    // J-TOKEN-B：console owner 尾部追加，偏移钉死（u32 后需 4 字节对齐到 64）。
+    assert!(core::mem::offset_of!(StatInfo, console_owner) == 64);
 };
