@@ -2759,6 +2759,10 @@ fn reap_child_locked(cur: usize, child: usize) -> Option<(usize, u64)> {
 pub enum Waited {
     /// 同步收尸：目标已是 zombie，被收尸子进程的 pid 与退出码随值返回。
     Reaped { pid: usize, code: u64 },
+    /// 已超时唤醒（**仅** [`waitpid_timeout`] 路径会产生）：
+    /// 子进程**仍在运行**，等待已到期。调用方据此**如实**向用户态
+    /// 交付 `WouldBlock`（而非编造一个退出码）。
+    TimedOut,
     /// 已真阻塞并切换走：退出码写入调用者保存帧 `rax`、pid 写入 `r10`
     /// （子进程终止路径直接交付），唤醒后 iretq 即得；CPU 不再回到等待方
     /// 内核调用点。
@@ -2783,6 +2787,132 @@ pub fn waitpid(target_pid: usize, frame: &mut InterruptFrame) -> Result<Waited, 
     let cur = run.current.ok_or(Error::NotFound)?;
     waitpid_inner(&mut run, cur, target_pid, Some(frame))
 }
+
+/// `waitpid(target)` 的**有界**形态（§6.11 所有者裁决 B / 2026-10-04）：
+/// 最多等待 `timeout_ns`，到期时子进程**仍在运行**则**如实**返回
+/// [`Waited::TimedOut`]，由 syscall 层译为 `WouldBlock` 交还用户态。
+///
+/// ## 为什么不是「键盘唤醒 waitpid」（裁决时否决的方案 A）
+///
+/// [`wake`] / [`wake_with_value`] 都带 `waiting_for.is_none()` 守卫，其文档
+/// 明确写着：由 waitpid 机制独占管理的进程**不得经此唤醒**——其 `saved.rax`
+/// **只能由子进程终止路径填写**，提前唤醒会让用户态把占位值当真实退出码。
+/// 方案 A（键盘中断里唤醒 waitpid 等待者）正撞上这条不变量，必须为守卫开例外，
+/// 等于**削弱一条现有正确防线**。方案 B 改的是**等待语义**（等多久）而非
+/// **唤醒语义**（谁该醒），与那条不变量**正交**——超时是**合法的等待结束**，
+/// 不是「假唤醒」，故 `saved.rax` 由本路径**显式**写成 `-EAGAIN` 哨兵，
+/// 语义清晰、无歧义。
+///
+/// ## 与 `sleep_blocking` 的关系
+///
+/// 复用同一套「一次性定时器 + 到期回调唤醒」机制（`klib::time::set_timeout`），
+/// 但回调**不能**用 [`wake`]（会被 `waiting_for` 守卫拒绝），故用专用回调
+/// [`wake_waitpid_timeout`]。
+///
+/// 定时器表满时**如实返回 `WouldBlock`**（不退化忙等）——因为本动词的语义就是
+/// 「至多等这么久」，立即返回「没等到」是**正确**的，不是降级。
+pub fn waitpid_timeout(
+    target_pid: usize,
+    frame: &mut InterruptFrame,
+    timeout_ns: u64,
+) -> Result<Waited, Error> {
+    // 本核当前进程（waitpid 的等待者）。取不到（无当前进程）如实 NotFound。
+    let cur = {
+        let run = run_mut(my_cpu_slot());
+        run.current.ok_or(Error::NotFound)?
+    };
+    // 先做一次**非阻塞**的收尸尝试（frame=None：只做表级迁移，不做物理切换）。
+    // 子进程已是 zombie 时立即收尸返回，**不**注册定时器——
+    // 既省一个定时器槽，也避免「刚注册就立刻要取消」的竞态窗口。
+    // 这一步完整复用 waitpid_inner 的语义（含 WAIT_ANY 分支与 NotFound 判定）。
+    let pre = {
+        let mut run = run_mut(my_cpu_slot());
+        waitpid_inner(&mut run, cur, target_pid, None)
+    };
+    match pre {
+        // 已收尸：交付退出码与 pid 到调用者帧（与阻塞路径同一交付口径：
+        // rax=code、r10=pid），且**不**注册定时器。
+        Ok(Waited::Reaped { pid, code }) => {
+            frame.rax = code;
+            frame.r10 = pid as u64;
+            return Ok(Waited::Reaped { pid, code });
+        }
+        // 真错误（非亲生/不存在）：如实上抛，不注册定时器。
+        Err(e) if e != Error::WouldBlock => return Err(e),
+        // WouldBlock = 子进程仍在运行（waitpid_inner 在 frame=None 下的
+        // 「无可切进程」也归此），继续走有界等待。
+        _ => {}
+    }
+    // 注册一次性定时器：到期由专用回调 `wake_waitpid_timeout` 清除等待登记、
+    // 写入 -EAGAIN 哨兵并唤醒本进程。
+    let Some(_timer_id) = klib::time::set_timeout(timeout_ns, wake_waitpid_timeout, cur)
+    else {
+        // 定时器表满（或时钟未就绪）：**如实**返回 WouldBlock——本动词语义是
+        // 「至多等这么久」，立即报「没等到」是**正确**结果而非降级。
+        // 绝不静默退化成无限等（S09：宁可如实报未等到，也不给错误行为）。
+        return Err(Error::WouldBlock);
+    };
+    // 走既有阻塞登记路径（waiting_for + Blocked + 切换）。
+    let r = {
+        let mut run = run_mut(my_cpu_slot());
+        waitpid_inner(&mut run, cur, target_pid, Some(frame))
+    };
+    match r {
+        // 已阻塞并切走：此后由**两条互斥路径**之一唤醒本进程——
+        //   ① 子进程退出路径：写真实退出码（既有交付机制，未改）；
+        //   ② 本函数的定时器回调：写 -EAGAIN 哨兵。
+        // 二者都显式写 `saved.rax`，故用户态**绝不会**拿到占位值。
+        Ok(Waited::Blocked) => Ok(Waited::Blocked),
+        // 未能阻塞（就绪队列空、无法安全让出）：撤销已注册的定时器，
+        // 并如实报「没等到」。
+        Err(e) => {
+            klib::time::cancel_timeout(_timer_id);
+            Err(e)
+        }
+        Ok(other) => Ok(other),
+    }
+}
+
+/// [`waitpid_timeout`] 的超时回调：把等待者如实体面为「没等到」。
+///
+/// **与 [`wake`] 的关键差异**：本函数**专为** `waiting_for.is_some()` 的进程设计，
+/// 故**不**套用那条守卫，而是**显式**完成守卫所保护的两件事：
+///
+/// 1. 清 `waiting_for`（该进程不再是 waitpid 的等待者，回归普通可唤醒态）；
+/// 2. 写 `saved.rax = -EAGAIN` 哨兵——**这正是守卫存在的理由**：
+///    绝不能让用户态拿到占位值 0 并当成真实退出码。此处写入的是**明确的**
+///    「超时、没等到」错误码，语义与守卫的意图一致（防伪退出码），不违背其精神。
+///
+/// 只有在「仍在等待**同一个**目标」时才动作，避免竞态下误伤已经收尸/改等的进程。
+pub fn wake_waitpid_timeout(pid: usize) {
+    let enqueue = {
+        let mut g = proc_bucket_lock(pid);
+        match g.get_mut(&pid) {
+            // 仍处于 waitpid 等待中才处理：已 Ready/Exit/已改等别的目标则忽略。
+            Some(slot)
+                if slot.proc.state() == TaskState::Blocked
+                    && slot.waiting_for.is_some() =>
+            {
+                slot.waiting_for = None;
+                slot.saved.rax = WAITPID_TIMEOUT_SENTINEL;
+                slot.proc.set_state(TaskState::Ready);
+                Some(slot.home_cpu)
+            }
+            _ => None,
+        }
+    };
+    if let Some(home) = enqueue {
+        wake_enqueue(pid, home);
+    }
+}
+
+/// 有界 waitpid 超时的 `-EAGAIN` 重试哨兵（写入等待者 `saved.rax`）。
+///
+/// errno 取自集中定义 [`Error::WouldBlock`]（S13 单点），与
+/// [`KBD_WAKE_RETRY_SENTINEL`] / [`EVENT_WAKE_RETRY_SENTINEL`] 同口径——
+/// 用户态 `libsys::call` 解码为 `Err(WouldBlock)`，据此知道「没等到、可重试」，
+/// **绝不**把陈旧或占位 rax 当成子进程退出码。
+const WAITPID_TIMEOUT_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as u64;
 
 /// [`waitpid`] 的锁内主体。`frame = None` 为测试钩子形态：只做表级登记与
 /// 状态迁移，不做 CPU 切换（物理切换路径由 m41/m42/kbd 既有验收与
@@ -3808,6 +3938,25 @@ pub mod test_hooks {
 
     /// 非阻塞收尸尝试（真实核心路径）：NotFound=非亲生/不存在/已收尸；
     /// WouldBlock=子进程仍在运行；Ok((pid,code))=已收尸（槽位已释放）。
+    /// §6.11 B（有界 waitpid）测试钩子：**表级**触发超时回调。
+    ///
+    /// 真实路径由 `klib::time::set_timeout` 在 tick 中断里驱动；宿主测试不跑
+    /// 中断，故直接调 [`super::wake_waitpid_timeout`] 验表级语义（这正是该回调
+    /// 的全部职责）。与既有 `try_reap`/`block_on_child` 同款「只验表级、不做
+    /// 物理切换」的测试纪律。
+    pub fn fire_waitpid_timeout(pid: usize) {
+        super::wake_waitpid_timeout(pid);
+    }
+
+    /// §6.11 B：登记一个有界等待（表级，不做物理切换），返回登记结果。
+    ///
+    /// `frame=None` 形态下 `waitpid_inner` 不做物理切换，故本钩子只验证
+    /// 「表级等待登记是否成立」，超时后的表级效果由
+    /// [`fire_waitpid_timeout`] + [`probe`] 验证。
+    pub fn block_on_child_table(parent: usize, target: usize) -> Result<Waited, Error> {
+        let mut run = run_mut(my_cpu_slot());
+        waitpid_inner(&mut run, parent, target, None)
+    }
     pub fn try_reap(parent: usize, target: usize) -> Result<(usize, u64), Error> {
         // 分桶化：先校验 target 是 parent 的亲生子（持 target 所在桶判），再收尸。
         let is_mine = proc_bucket_lock(target)
@@ -4278,6 +4427,63 @@ pub mod test_hooks {
                 Ok(Waited::Reaped { pid, code }) if pid == rc && code == 3 => {}
                 _ => return false,
             }
+            reset_all();
+        }
+
+        // ---- §6.11 B：有界 waitpid 超时语义（所有者裁决 B / 2026-10-04）----
+        //
+        // 钉死的是**本决策的核心保证**：超时必须让等待者**如实体面为「没等到」**，
+        // 而不是被误当成「子进程已退出」。具体三条：
+        //   1. 超时**清除** `waiting_for`（不再由 waitpid 机制独占管理）；
+        //   2. 超时把 `saved.rax` 写成 **-EAGAIN 哨兵**（绝不是 0/占位值）；
+        //   3. 超时把进程置回 `Ready` 并**保留子进程存活**（子仍应在表中）。
+        // 另加一条**负控**：已 Ready 的进程再触发超时回调必须无副作用
+        //（防「定时器迟到」把已收尸/已改等的进程误伤）。
+        {
+            reset_all();
+            let Ok(p) = spawn_named_child_of(0, "bounded-parent") else { return false; };
+            let Ok(c) = spawn_named_child_of(p, "bounded-child") else { return false; };
+            // 父登记等待仍在运行的子：表级形态返回 Blocked。
+            if !matches!(block_on_child_table(p, c), Ok(Waited::Blocked)) { return false; }
+            // 登记后：父应处于 Blocked 且 waiting_for == Some(子)。
+            let (s0, _, wf0, _, _) = probe(p).expect("parent registered");
+            if s0 != TaskState::Blocked || wf0 != Some(c) { return false; }
+            // 子仍存活（超时**不得**收走子进程）。
+            if probe(c).is_none() { return false; }
+            // 触发超时回调。
+            fire_waitpid_timeout(p);
+            let (s1, _, wf1, rax1, _) = probe(p).expect("parent after timeout");
+            // 1) 已置回 Ready；2) waiting_for 已清；
+            if s1 != TaskState::Ready { return false; }
+            if wf1 != None { return false; }
+            // 3) rax 必须是 -EAGAIN 哨兵（即 WouldBlock 的 errno 取负），
+            //    **不是** 0、**不是**任何真实退出码。
+            let want = -(super::Error::WouldBlock.to_errno() as i64) as u64;
+            if rax1 != want { return false; }
+            // 子进程仍在表中（超时不是收尸）。
+            if probe(c).is_none() { return false; }
+            // 负控：再次触发超时回调不得有副作用（父已 Ready，不再是等待者）。
+            fire_waitpid_timeout(p);
+            let (s2, _, wf2, rax2, _) = probe(p).expect("parent still there");
+            if s2 != TaskState::Ready || wf2 != None || rax2 != want { return false; }
+            // 超时后子进程**仍可正常收尸**——这正是「超时不是收尸」的实证。
+            //
+            // 注意：超时已清 `waiting_for`，故父**不再是**等待者，
+            // `terminate` 此时**不会**走「交付」路径（无人等待），而是走
+            // 「保留 zombie」路径——这是**正确**行为，不是缺陷。
+            // 故这里断言的是：子成为 zombie 且父仍能**主动**收尸取到真实退出码。
+            if terminate(c, 9) != "zombie" { return false; }
+            // 父主动收尸：拿到真实退出码 9（与超时哨兵 -EAGAIN 明显不同）。
+            match try_reap(p, c) {
+                Ok((pid, code)) if pid == c && code == 9 => {}
+                _ => return false,
+            }
+            if probe(c).is_some() { return false; } // 收尸后槽位释放
+            // 父的 saved.rax 仍是超时哨兵（收尸经 try_reap 返回，不写 saved.rax），
+            // 且 waiting_for 保持为空——证明超时后父已**完全脱离** waitpid 机制。
+            let (_, _, wf3, rax3, _) = probe(p).expect("parent after reap");
+            if wf3 != None { return false; }
+            if rax3 != want { return false; } // 仍是超时哨兵，未被污染
             reset_all();
         }
         // 场景 (b)：组长 exit（非自杀 SIGKILL）→ 整组随退 + notify 父。

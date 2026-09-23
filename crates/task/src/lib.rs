@@ -31,7 +31,8 @@ pub use scheduler::{
     spawn_with_ppid, spawn_with_ppid_fds,
     start, tick,
     group_members, group_live_count, group_all_exited, is_group_leader,
-    waitpid, wake, wake_event, wake_event_timeout, wake_kbd, wake_with_value, set_event_timeout_timer,
+    waitpid, waitpid_timeout, wake, wake_event, wake_event_timeout, wake_kbd, wake_with_value,
+    wake_waitpid_timeout, set_event_timeout_timer,
     clear_event_timeout_timer, clear_event_waiter_if, yield_now, set_distribute_across_cpus,
     block_for_irq, wake_irq_timeout,
     // A2：音频等待者（plan_audio_vfs.md 批次二）。

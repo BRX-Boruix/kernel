@@ -2895,7 +2895,19 @@ fn sys_task_wait(frame: &mut SyscallFrame) -> DispatchResult {
         return sleep_blocking(frame, timeout_ns);
     }
 
-    match task::waitpid(target_pid, arch_frame(frame)) {
+    // §6.11 所有者裁定 B（2026-10-04）：`target>0 && timeout>0` 是**有界等待**——
+    // 最多等 `timeout_ns`，到期子进程仍在运行则**如实**返回 `WouldBlock`。
+    //
+    // **修掉一个 S09 诚实性缺陷**：此前本函数只处理 `target==0 && timeout>0`，
+    // 故 `target>0 && timeout>0` 会**直接落到普通阻塞 waitpid，`timeout` 被静默忽略**
+    // ——传超时进去不超时、也不报错，无限等下去。现该组合真正生效。
+    let bounded = target_pid != 0 && timeout_ns > 0;
+    let waited = if bounded {
+        task::waitpid_timeout(target_pid, arch_frame(frame), timeout_ns)
+    } else {
+        task::waitpid(target_pid, arch_frame(frame))
+    };
+    match waited {
         Ok(task::Waited::Reaped { pid, code }) => {
             // 同步收尸：rax 交付退出码（既有语义），r10 经 aux_pid 交付被收尸
             // 子进程 pid——架构层在写回 rax 的同时把 aux_pid 写进返回帧 r10，
@@ -2905,6 +2917,11 @@ fn sys_task_wait(frame: &mut SyscallFrame) -> DispatchResult {
             done(pack_ok(code))
         }
         Ok(task::Waited::Blocked) => DispatchResult::Switched,
+        // §6.11 B：有界等待**超时**（仅 waitpid_timeout 路径产生）。
+        // 子进程仍在运行，故**如实**交付 WouldBlock（errno 11 EAGAIN），
+        // **绝不**编造退出码：用户态据此知道「没等到、可重试」，
+        // 而不是把子进程误判为已退出。
+        Ok(task::Waited::TimedOut) => done(pack_err(Error::WouldBlock)),
         Err(e) => done(pack_err(e)),
     }
 }
@@ -3260,6 +3277,11 @@ fn sys_thread_join(frame: &mut SyscallFrame) -> DispatchResult {
             done(pack_ok(code))
         }
         Ok(task::Waited::Blocked) => DispatchResult::Switched,
+        // §6.11 B：有界等待**超时**（仅 waitpid_timeout 路径产生）。
+        // 子进程仍在运行，故**如实**交付 WouldBlock（errno 11 EAGAIN），
+        // **绝不**编造退出码：用户态据此知道「没等到、可重试」，
+        // 而不是把子进程误判为已退出。
+        Ok(task::Waited::TimedOut) => done(pack_err(Error::WouldBlock)),
         Err(e) => done(pack_err(e)),
     }
 }
