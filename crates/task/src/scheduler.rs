@@ -3948,6 +3948,52 @@ pub mod test_hooks {
         super::wake_waitpid_timeout(pid);
     }
 
+    /// §6.12.6 死锁复现夹具：在**持有本核 RUN 域锁**的前提下，检查超时回调
+    /// `wake_waitpid_timeout` 内部要取的锁是否已**不可获取**。
+    ///
+    /// # 为什么必须这样测（现有 `fire_waitpid_timeout` 测不到它）
+    ///
+    /// 既有夹具的纪律是「只验表级、不做物理切换」，且注释自陈「宿主测试不跑
+    /// 中断，故直接调」。**这恰好绕开了真正的故障前提**：真实路径里回调是在
+    /// IRQ0 中断上下文执行的，而调用者（`waitpid_timeout`）可能正持有同一把
+    /// `RUN[slot]` 锁。
+    ///
+    /// `IrqSpinLock` → `SpinMutex` 是**纯自旋、无重入检测**的实现：同核重入
+    /// 必然永久自旋（锁由自己持有，等不到释放）。故真实故障序列是：
+    ///
+    /// 1. shell 在内核态 `waitpid_timeout` 持有 `RUN[0]`；
+    /// 2. IRQ0 到达 → `poll_timeouts` → `wake_waitpid_timeout`；
+    /// 3. 回调内 `wake_enqueue` → `run_mut(home)` → `RUN[0].lock()` 自旋；
+    /// 4. IRQ0 handler **永不返回** → EOI 永不发出 → BSP 定时器永久停止；
+    /// 5. 于是第 3 个及之后的超时定时器**永不触发**，shell 永久卡在等待里。
+    ///
+    /// 实测症状（可信 `-serial file:` 捕获）：`bsp_tick` 停在 1200、
+    /// `poll_timeouts` 停在 n=1000，此后 BSP 再无 IRQ0；shell 停在等待循环
+    /// 第 ~5 次迭代，`^C` 完全无效。
+    ///
+    /// # 判据
+    ///
+    /// 持锁期间用 `try_lock`（非阻塞）探测：真实死锁下它**必然返回 `None`**。
+    /// 用 `try_lock` 而非 `lock()` 是刻意的——后者会把「断言失败」变成
+    /// 「测试永久挂死」，那是不可诊断的（S21：失败要如实且可定位）。
+    ///
+    /// 返回 `true` = 复现了同核重入不可获取（即死锁前提成立）。
+    /// `hold = true`：先持锁再探测（模拟 `waitpid_timeout` 持锁被 IRQ0 打断）；
+    /// `hold = false`：不持锁直接探测（对照，证明锁本身工作正常）。
+    ///
+    /// 两种形态都返回「再次获取是否被拒」。持锁形态必然 `true`，不持锁形态
+    /// 必然 `false`——由调用方（测试）分别断言，避免把两种语义混在一个
+    /// 恒真返回值里（初版即因此写错了对照断言）。
+    #[cfg(feature = "kernel-tests")]
+    pub fn debug_run_lock_try_acquire_rejected(hold: bool) -> bool {
+        let slot = my_cpu_slot() & (MAX_SCHED_CPUS - 1);
+        let held = if hold { Some(RUN[slot].lock()) } else { None };
+        // **非阻塞**探测：纯自旋锁无重入检测，锁被自己持有时必然拿不到。
+        let rejected = RUN[slot].try_lock().is_none();
+        drop(held);
+        rejected
+    }
+
     /// §6.11 B：登记一个有界等待（表级，不做物理切换），返回登记结果。
     ///
     /// `frame=None` 形态下 `waitpid_inner` 不做物理切换，故本钩子只验证

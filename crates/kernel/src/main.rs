@@ -843,6 +843,9 @@ unsafe fn kmain_body() -> ! {
     // §6.12.5（裁决甲）：STREAM_READ a5 标志位判定（纯函数，无副作用）。
     #[cfg(feature = "kernel-tests")]
     tests::test_read_nonblock_flag();
+    // §6.12.6：RUN 域锁同核重入死锁复现（纯锁语义，返回主流程继续启动）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_run_lock_reentrancy_deadlock();
 
     // 跨核收尸竞态（DESIGN §3.2/§9）：就绪进程被选中后被另一核收尸/置 Exit，
     // 切换路径丢弃重选不 panic（纯表级，返回主流程继续启动）。

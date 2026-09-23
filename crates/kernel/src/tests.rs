@@ -10541,6 +10541,58 @@ pub fn test_read_nonblock_flag() {
 
     info!("[test-read-nonblock] all assertions passed");
 }
+
+/// §6.12.6：**同核重入死锁**复现（BSP 定时器永久停止的根因）。
+///
+/// # 被复现的真实故障
+///
+/// 前台子进程运行期间，shell 的等待循环数次进入内核 `waitpid_timeout`。
+/// 该函数注册一次性定时器后**持有本核 RUN 域锁**并阻塞切走。定时器到期时，
+/// 回调在 **IRQ0 中断上下文**执行 `wake_waitpid_timeout` → `wake_enqueue`
+/// → `run_mut(home)`，即**再次获取同一把 `RUN[slot]` 锁**。
+///
+/// `IrqSpinLock` 底层 `SpinMutex` 是**纯自旋、无重入检测**的实现：锁由本核
+/// 自己持有，同核重入必然永久自旋。于是 IRQ0 handler **永不返回**、EOI 永不
+/// 发出、BSP 周期性中断永久停止——第 3 个及之后的超时定时器永不触发。
+///
+/// 用户可见症状：前台子进程启动后提示符永不返回、`^C` 完全无效。
+///
+/// 实测证据（可信 `-serial file:` 捕获，独立复现两次）：
+/// `[SET]` 注册 3 个 10ms 定时器、`[TMO]` 只触发 2 次、`[POLL]` 停在 n=1000、
+/// `[IRQ0] bsp_tick` 停在 1200；shell 等待循环停在第 ~5 次迭代。
+///
+/// # 本测试的判据
+///
+/// 在**持有本核 RUN 域锁**的前提下，用 `try_lock`（非阻塞）探测同一把锁：
+/// 死锁前提成立时它必然返回 `None`。刻意不用 `lock()`——那会把「断言失败」
+/// 变成「测试永久挂死」，不可诊断（S21：失败必须可定位）。
+#[cfg(feature = "kernel-tests")]
+pub fn test_run_lock_reentrancy_deadlock() {
+    use task::scheduler::test_hooks as th;
+
+    info!("[test-run-lock-reentrancy] === §6.12.6: RUN 域锁同核重入不可获取 ===");
+
+    // 关中断：本测试只验锁语义，不应被真实 tick 干扰（与 test_waitpid_core 同纪律）。
+    arch_x86_64::interrupts::disable();
+
+    // 判据：持锁状态下，同一把锁的**再次获取必然被拒**。
+    // 这正是 IRQ0 回调路径 `run_mut(home)` 在中断上下文里的处境。
+    assert!(
+        th::debug_run_lock_try_acquire_rejected(true),
+        "同核重入 RUN 域锁必须不可获取（否则 §6.12.6 的故障前提不成立，\
+         说明锁已具备重入保护——届时本测试与对应修复都应重新评估）"
+    );
+
+    // 对照：锁释放后必须立即可获取（证明锁本身工作正常，
+    // 上一条断言失败≠「锁坏了」而是「重入语义如此」）。
+    assert!(
+        !th::debug_run_lock_try_acquire_rejected(false),
+        "非持锁状态下 RUN 域锁必须可获取"
+    );
+
+    info!("[test-run-lock-reentrancy] PASS：重入确被拒、非重入可取");
+}
+
 pub fn test_waitpid_core() {
     use klib::error::Error;
     use task::TaskState;
