@@ -10497,6 +10497,50 @@ fn read_identity_out(buf: u64) -> (u32, u32, u32) {
 
 
 
+/// §6.12.5（所有者裁决甲）：`SYS_STREAM_READ` 的 `a5` 标志位判定。
+///
+/// # 为什么这是**必须**的测试（而不是可选的）
+///
+/// 本标志是「看一眼」与「等着要」两种语义的**唯一**区分手段。若判定写错：
+///
+/// * 少认一位 → `read_nonblocking` 退化成**阻塞读**，前台等待循环回到
+///   「先探键 = 先阻塞」的挂死状态（这正是裁决甲要消灭的缺陷）；
+/// * 多认一位 → 普通 `read` 被静默变成非阻塞，行编辑空转（语义漂移）。
+///
+/// 两个方向都是**用户可见**的行为错误，故必须逐位钉死。
+pub fn test_read_nonblock_flag() {
+    use crate::syscall::{read_is_nonblock, read_is_peek, STREAM_READ_NONBLOCK, STREAM_READ_PEEK};
+
+    info!("[test-read-nonblock] === §6.12.5: STREAM_READ a5 flag decode ===");
+
+    // 常量取值本身是 ABI 合约：内核与 libsys 必须逐位一致（PRE-12）。
+    assert_eq!(STREAM_READ_NONBLOCK, 1, "NONBLOCK 位必须是 1（libsys 同步依赖）");
+    assert_eq!(STREAM_READ_PEEK, 2, "PEEK 位必须是 2（libsys 同步依赖）");
+
+    // `a5 == 0` 必须是既有**阻塞**语义（安全侧默认，S17）。
+    assert!(!read_is_nonblock(0), "a5=0（旧调用方）必须仍是阻塞读");
+    assert!(!read_is_peek(0), "a5=0 不得被当成预览");
+
+    // 单标志位精确识别。
+    assert!(read_is_nonblock(STREAM_READ_NONBLOCK), "a5=1 必须判为非阻塞");
+    assert!(!read_is_nonblock(STREAM_READ_PEEK), "a5=2 不得判为非阻塞");
+    assert!(read_is_peek(STREAM_READ_PEEK), "a5=2 必须判为预览");
+    assert!(!read_is_peek(STREAM_READ_NONBLOCK), "a5=1 不得判为预览");
+
+    // shell 探键的真实取值：NONBLOCK|PEEK = 3，两个判定都必须为真。
+    let both = STREAM_READ_NONBLOCK | STREAM_READ_PEEK;
+    assert_eq!(both, 3, "shell 探键的组合值必须是 3");
+    assert!(read_is_nonblock(both), "a5=3 必须判为非阻塞");
+    assert!(read_is_peek(both), "a5=3 必须判为预览");
+
+    // 未定义高位**不得**被误认（显式按位与，而非 `a5 != 0`）。
+    // 这钉死「将来新增标志不会静默变成非阻塞」这条设计承诺。
+    assert!(!read_is_nonblock(0x4), "未定义位 0x4 不得判为非阻塞");
+    assert!(!read_is_nonblock(0x100), "未定义位 0x100 不得判为非阻塞");
+    assert!(!read_is_peek(0x4), "未定义位 0x4 不得判为预览");
+
+    info!("[test-read-nonblock] all assertions passed");
+}
 pub fn test_waitpid_core() {
     use klib::error::Error;
     use task::TaskState;

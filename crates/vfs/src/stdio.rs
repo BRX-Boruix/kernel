@@ -32,10 +32,18 @@ use crate::inode::{AccessPolicy, INode};
 const STDOUT_CHUNK: usize = 4096;
 
 type StdinSource = fn(&mut [u8]) -> usize;
+/// 预览源：返回下一个输入字节不消费，无输入为 `None`。
+///
+/// 与 [`StdinSource`] **分开注入**（而不是把后者扩成两个能力）：
+/// 两者是**不同的节点能力**（取走 vs 只看），合并会让
+/// “能不能预览”变成运行时旷野猜测（S15：能力应被声明，不应被探测）。
+/// 未注入时如实返回 `None`（不可预览）。
+type StdinPeek = fn() -> Option<u8>;
 type StdoutSink = fn(&[u8]);
 
 static STDIN_SOURCE: Once<StdinSource> = Once::new();
 static STDOUT_SINK: Once<StdoutSink> = Once::new();
+static STDIN_PEEK: Once<StdinPeek> = Once::new();
 
 /// 注入键盘源（内核启动路径调用一次）。`src` 返回本次读到的字节数，0 = 暂无输入。
 pub fn set_stdin_source(src: StdinSource) {
@@ -45,6 +53,15 @@ pub fn set_stdin_source(src: StdinSource) {
 /// 注入 console 输出通道（内核启动路径调用一次）。
 pub fn set_stdout_sink(sink: StdoutSink) {
     let _ = STDOUT_SINK.call_once(|| sink);
+}
+
+/// 注入键盘预览源（§6.12.5，裁决甲）。
+pub fn set_stdin_peek(p: StdinPeek) {
+    let _ = STDIN_PEEK.call_once(|| p);
+}
+
+fn stdin_peek() -> Option<StdinPeek> {
+    STDIN_PEEK.get().copied()
 }
 
 fn stdin_source() -> Option<StdinSource> {
@@ -145,6 +162,18 @@ impl INode for StdinNode {
     /// A5：字符设备判型零成本。
     fn node_type(&self) -> Result<INodeType, Error> {
         Ok(INodeType::CharacterDevice)
+    }
+
+    /// §6.12.5（裁决甲）：stdin 可**不消费地**预览下一个输入字节。
+    ///
+    /// 与 `read_at` 的本质区别：**不推进读取位置**。调用方看完若决定
+    /// 不处理，字节仍在键盘缓冲里，下一个读者（子进程或行编辑）
+    /// 照样取得到。若用消费式探键，子进程的输入会被静默吃掉
+    /// （实测：`/programs/...` 变成 `/prams/...`）。
+    ///
+    /// 实现直接委派到键盘驱动的 [`peek`]（与 `pop` 对称，不推进读指针）。
+    fn peek_input(&self) -> Option<u8> {
+        stdin_peek().and_then(|f| f())
     }
 
     fn interactive_input(&self) -> bool {

@@ -216,6 +216,7 @@ unsafe fn kmain_body() -> ! {
     // term1 T8：产品横幅由调用方持有（表现层库不做产品文案），经统一
     // console 下发——串口与屏幕同步可见。
     klib::console::write_str("Hello, BORUIX!\r\n");
+
     klib::console::write_str("Kernel M0 is running.\r\n");
     info!(
         "[kmain] serial & driver hub initialized (arch={})",
@@ -603,6 +604,10 @@ unsafe fn kmain_body() -> ! {
     // 行缓冲的 CPU 序号来源：接 arch 的当前核槽位（每 CPU 一份缓冲的前提）。
     klib::console::set_line_cpu_hint(arch_x86_64::lapic::my_slot);
     vfs::stdio::set_stdin_source(stdin_source);
+    // §6.12.5（裁决甲）：预览源（不消费）。
+    // 与上行**分开注入**：取走与只看是两种不同能力（S15）。
+    // 探键路径用它，才能不把属于子进程的按键吃掉。
+    vfs::stdio::set_stdin_peek(stdin_peek);
     // stdout sink 用**行缓冲**版（修复多核输出互相插行）：
     // 用户程序按片段写（文本/数字/换行分多次 write），write_bytes 的原子
     // 边界是单次调用，另一核的输出会插进一行中间（实测横幅被切成碎片、
@@ -835,6 +840,9 @@ unsafe fn kmain_body() -> ! {
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_waitpid_core();
+    // §6.12.5（裁决甲）：STREAM_READ a5 标志位判定（纯函数，无副作用）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_read_nonblock_flag();
 
     // 跨核收尸竞态（DESIGN §3.2/§9）：就绪进程被选中后被另一核收尸/置 Exit，
     // 切换路径丢弃重选不 panic（纯表级，返回主流程继续启动）。
@@ -1136,6 +1144,16 @@ pub(crate) fn halt_other_cpus_via_ipi() {
 // 故不存在同一数据源被两条消费点并发排空的竞态；回退仅在 ps2-keyboard
 // 注册之前的早期阶段可达（届时 Hub 尚未登记该设备）。内核内部不存在
 // 第二条绕过设备的隐藏通道。
+/// §6.12.5（裁决甲）：预览下一个输入字节，**不消费**。
+///
+/// 与 [`stdin_source`] 共用同一个键盘队列，但语义相反：
+/// 前者取走（消费），本函数只看不动。
+/// 若用取走式探键，子进程的输入会被静默丢弃
+/// （实测：`/programs/spinburn.elf` 变成 `/prams/spinburn.elf`）。
+fn stdin_peek() -> Option<u8> {
+    arch_x86_64::keyboard::peek()
+}
+
 fn stdin_source(buf: &mut [u8]) -> usize {
     use driver::drivers::keyboard::PS2_KEYBOARD_DEVICE_NAME;
 

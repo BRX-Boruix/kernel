@@ -417,6 +417,38 @@ pub fn pop() -> Option<u8> {
 }
 
 /// 缓冲是否非空。
+/// 窥视下一个字符但**不消费**（`read` syscall 的非阻塞「探键」路径调用）。
+///
+/// # 为什么必须存在这个函数（裁决甲，§6.12.5）
+///
+/// shell 在前台子进程运行期间需要「看一眼有没有 `^C`」。若用 `pop()`，
+/// 取到的若是普通字符（属于**子进程**的输入，例如 `cat` 的用户输入），
+/// 该字节就**永久丢失**了——没有 pushback 设施可以放回。
+///
+/// 实测症状（真实 QEMU + 真实 PS/2 按键）：输入 `/programs/spinburn.elf`
+/// 会变成 `/prams/spinburn.elf`——`o` 与 `g` 在 shell 等待循环里被探键吃掉。
+/// 这是**真实的用户可见缺陷**，不是理论问题。
+///
+/// [`peek`] 与 [`pop`] 的唯一差别：**不推进** `READ_INDEX`。故调用方看完
+/// 若决定不处理，字节仍在缓冲里，下一个读者（子进程或行编辑）照样能取到。
+///
+/// # 内存序
+///
+/// 与 [`pop`] 相同的 Acquire 读 `WRITE_INDEX`——窥视同样必须看到生产者
+/// 已发布的完整状态（`BUF_DATA` 写入先于 `WRITE_INDEX` 的 Release 存储）。
+pub fn peek() -> Option<u8> {
+    if BUF_INIT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let r = READ_INDEX.load(Ordering::Relaxed);
+    let w = WRITE_INDEX.load(Ordering::Acquire);
+    if r == w {
+        return None;
+    }
+    // 只读不推进：本函数对缓冲状态**无副作用**，可安全重复调用。
+    Some(BUF_DATA[r % BUF_CAP].load(Ordering::Relaxed) as u8)
+}
+
 pub fn has_input() -> bool {
     READ_INDEX.load(Ordering::Relaxed) != WRITE_INDEX.load(Ordering::Acquire)
 }

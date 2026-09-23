@@ -109,6 +109,53 @@ const fn nr(d: u32, o: u32) -> u32 {
 // ---------- 1. STREAM Domain (0x10) ----------
 pub const SYS_STREAM_CREATE: u32 = nr(domain::STREAM, op::CREATE); // 0x11
 pub const SYS_STREAM_READ: u32 = nr(domain::STREAM, op::READ); // 0x12
+
+/// `SYS_STREAM_READ` 的 `a5` 标志位：**非阻塞读**（§6.12.5，所有者裁决甲）。
+///
+/// # 为什么需要它
+///
+/// 「**看一眼**键盘，有没有都立刻回来」与「**等着要**一个字符」是**两种不同
+/// 的语义**，但此前共用一个系统调用、且无法区分。后果是一个真实缺陷：
+/// 前台等待循环里的 `probe_interrupt` 只能用阻塞 `read`，而交互 stdin 空读
+/// 会**登记 `KBD_WAITER` 并切走**——子进程被 `^C` 杀死后，shell 回到循环开头
+/// 又立刻阻塞在探键上，**永远走不到 `waitpid`**（实测挂死）。
+///
+/// 本标志把这两种语义分开：**置位时不登记 `KBD_WAITER`**，故本进程绝不会
+/// 为它切走。不登记是「永不阻塞」的**充分**条件。
+///
+/// # 取值与兼容
+///
+/// `a5` 此前**恒为 0**（`libsys::read`/`pread` 都传 0），故 `0` 保持既有
+/// **阻塞**语义逐位不变——即「安全侧默认」（S17）。
+pub const STREAM_READ_NONBLOCK: u64 = 1;
+
+/// `SYS_STREAM_READ` 的 `a5` 标志位：**预览（不消费）**（§6.12.5）。
+///
+/// 置位时本次读**不推进节点读取位置**。
+///
+/// # 为何必须有它（而不是只有 NONBLOCK）
+///
+/// 探键只想知道「下一个是不是 `^C`」。若只能取走才能看，
+/// 那么属于子进程的普通按键就会被静默丢弃。
+/// 实测：`/programs/spinburn.elf` 变成 `/prams/spinburn.elf`（`o`/`g` 丢失）。
+pub const STREAM_READ_PEEK: u64 = 2;
+
+/// `SYS_STREAM_READ` 的 `a5` 是否要求**预览**（S13 单点判定）。
+#[inline]
+pub const fn read_is_peek(flags: u64) -> bool {
+    flags & STREAM_READ_PEEK != 0
+}
+
+/// `SYS_STREAM_READ` 的 `a5` 是否要求**非阻塞**（S13 单点判定）。
+///
+/// 只有 `a5` 的**最低位**（[`STREAM_READ_NONBLOCK`]）被认定为非阻塞。
+/// 其余位当前**未定义**：为了不把未来可能新增的标志误判成非阻塞，
+/// 本函数**显式**按位与判定，而非 `a5 != 0`——后者会把将来的任何新标志
+/// 都悄悄变成「非阻塞」，属静默语义漂移（S09 精神）。
+#[inline]
+pub const fn read_is_nonblock(flags: u64) -> bool {
+    flags & STREAM_READ_NONBLOCK != 0
+}
 pub const SYS_STREAM_WRITE: u32 = nr(domain::STREAM, op::WRITE); // 0x13
 pub const SYS_STREAM_CLOSE: u32 = nr(domain::STREAM, op::DELETE); // 0x14
 /// SYS_STREAM_DUP（0x15，dup2）：把 `old_fd` 句柄复制到 `new_fd`（pipe-features
@@ -1996,6 +2043,11 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
     let buf = frame.a2;
     let len = frame.a3;
     let offset = frame.a4;
+    // §6.12.5（所有者裁决甲）：`a5` 为非阻塞标志。
+    // 此前恒为 0，故不带该位时行为逐位不变（S17 安全侧默认）。
+    // 判定单点在 `read_is_nonblock`（S13），不在此处硬编码位运算。
+    let nonblock = read_is_nonblock(frame.a5);
+    let peek = read_is_peek(frame.a5);
     if len == 0 {
         return done(pack_ok(0));
     }
@@ -2046,6 +2098,24 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
         return done(pack_err(Error::IllegalSeek));
     }
 
+    // §6.12.5（裁决甲）：**预览**路径——节点声明了预览能力时，
+    // 只读不推进：把看到的那一字节交付给调用方，而它仍留在队列里给下一个读者。
+    //
+    // 为何这样对：前台子进程运行期间，shell 的探键**不得**消费
+    // 属于子进程的按键（那些是 `cat` 之类的正当输入）。
+    // 旧实现只能取走再判断，故静默丢弃
+    // （实测：`/programs/spinburn.elf` → `/prams/spinburn.elf`）。
+    if peek {
+        if let Some(ch) = handle.inode.peek_input() {
+            let one = [ch];
+            unsafe {
+                arch_x86_64::mmio::copy_to_user(buf, one.as_ptr(), 1);
+            }
+            return done(pack_ok(1));
+        }
+        // 无数据：如实告诉调用方「现在没有」，**不登记等待者**。
+        return done(pack_err(Error::WouldBlock));
+    }
     let want = core::cmp::min(len, SYSCALL_COPY_CHUNK_BYTES) as usize;
     let mut kbuf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     if kbuf.try_reserve_exact(want).is_err() {
@@ -2111,6 +2181,18 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
                 // 能看到即时回显（否则盲打无回显，Enter 后整行突然吐出——
                 // 实测缺陷）。冲刷的是整行片段，行原子性不变。
                 klib::console::flush_all_line_buffers();
+                // §6.12.5（裁决甲）：**非阻塞探键**路径。
+                //
+                // `peek_input()` 是节点真值（S15）：能不能预览由节点自述。
+                // 预览到的字节写进调用方缓冲并如实交付（长度 1），
+                // 但**不推进读指针**——故此处还需真正取走那一字节（否则
+                // 调用方会看到同一字节无限次）。
+                //
+                // 故本分支只做一件事：**如实告诉调用方「现在无数据」**，
+                // 而不登记等待者。调用方（shell 探键）自己决定是否取走。
+                if nonblock && total == 0 && e == Error::WouldBlock {
+                    return done(pack_err(Error::WouldBlock));
+                }
                 if total == 0 && e == Error::WouldBlock && handle.inode.interactive_input() {
                     return match task::block_for_kbd(arch_frame(frame)) {
                         task::scheduler::BlockKbdOutcome::Switched => DispatchResult::Switched,
