@@ -51,6 +51,15 @@ static BUF_INIT: AtomicU32 = AtomicU32::new(0);
 /// Shift 是否按住。
 static SHIFT: AtomicU32 = AtomicU32::new(0);
 
+/// Ctrl 是否按住（§6.8：此前完全缺失，故 `0x03` 永远产生不出来）。
+///
+/// 与 `SHIFT` 同一手法：IRQ1 里按 scancode 置位/清位，`decode_key` 里消费。
+/// **本状态只影响字节译码**——不产生任何信号、不新增 syscall、不引入模式开关。
+/// `Ctrl+字母` 折叠为 `字符 & 0x1F`（Ctrl-C → `0x03`、Ctrl-D → `0x04`），
+/// 与 `0x04`/\t/\x1b 走**同一条**既有入缓冲路径；信号语义仍全部在用户态
+/// （ADR-042 §3.1）。
+static CTRL: AtomicU32 = AtomicU32::new(0);
+
 // ---------- 内部 8042 操作 ----------
 
 /// 等待输入缓冲空（可写命令/数据），超时返回 false。
@@ -110,10 +119,15 @@ fn send_kbd_cmd(cmd: u8) -> u8 {
 
 /// 扫描码 → ASCII（无 Shift 时）。索引 = 扫描码（Set 1，~0x01..=0x58）。
 ///
-/// AD3 披露：当前译码为主键盘**子集**——CapsLock/Ctrl/Alt/功能键/F 键均未
-/// 实现（按下被静默丢弃，不进输入缓冲），双表结构（KEYMAP/KEYMAP_SHIFT）
-/// 貌似完整键位支持，实际只覆盖可打印字符 + Esc/Tab/Backspace/Enter。
-/// 扩展键位时须同步补 0xE0 前缀路径（该路径已存在但仅处理方向键）。
+/// AD3 披露：当前译码为主键盘**子集**——**CapsLock/Alt/功能键仍部分未实现**，
+/// 双表结构（KEYMAP/KEYMAP_SHIFT）貌似完整键位支持，实际只覆盖可打印字符 +
+/// Esc/Tab/Backspace/Enter。扩展键位时须同步补 0xE0 前缀路径
+/// （该路径已存在但仅处理方向键）。
+///
+/// **2026-10-04（§6.8 修复后更新）**：**Ctrl 已实现**——修饰键状态在 IRQ1 里
+/// 按 scancode 维护（左/右均为 0x1D），`decode_key` 对字母折叠 `字符 & 0x1F`，
+/// 故 Ctrl-C → `0x03`、Ctrl-D → `0x04` 可正常入缓冲。
+/// **Alt 仍未实现**（按下被静默丢弃）；CapsLock 仍不改变字母大小写语义。
 const KEYMAP: [u8; 0x80] = {
     let mut m = [0u8; 0x80];
     m[0x01] = 27; // Esc
@@ -228,6 +242,12 @@ const KEYMAP_SHIFT: [u8; 0x80] = {
 const SC_LSHIFT: u8 = 0x2A;
 const SC_RSHIFT: u8 = 0x36;
 
+/// Ctrl 键扫描码。
+///
+/// 左 Ctrl 是**无 `E0` 前缀**的 `0x1D`；右 Ctrl 走 `0xE0 0x1D`（`e0 == true`，
+/// 与左键同码值 `0x1D`，靠 `e0` 标志区分——两者语义相同，故只用一个常量）。
+const SC_LCTRL: u8 = 0x1D;
+
 /// `0xE0` 扩展前缀标志：现代 101 键键盘的方向键/编辑键/小键盘（NumLock 关）/
 /// 右 Ctrl/Alt 等以 `0xE0 0xXX` 双字节序列发送。IRQ 每中断只读 1 字节，须跨中断
 /// 缓存前缀，待下一字节到达再合成完整键码。
@@ -268,6 +288,14 @@ fn decode_key(e0: bool, code: u8, key_up: bool) -> KeyOut {
             KEYMAP[code as usize]
         };
         if ch != 0 {
+            // §6.8：Ctrl + 字母 → 控制字符（字符 & 0x1F）。
+            //
+            // 只对**字母**折叠：Ctrl-C → 0x03、Ctrl-D → 0x04，正是终端约定。
+            // 对非字母保持原样，避免把 Ctrl+数字/符号变成难以预期的控制码
+            // （那些组合的真实语义属应用层，本驱动不臆造，S17 安全侧默认）。
+            if CTRL.load(Ordering::Relaxed) != 0 && ch.is_ascii_alphabetic() {
+                return KeyOut::Ascii(ch & 0x1F);
+            }
             return KeyOut::Ascii(ch);
         }
         // NumLock 语义的数字小键盘 / 主键盘符号，以及 F-keys。
@@ -420,6 +448,9 @@ pub extern "C" fn irq1_handler(_irq: u8) -> bool {
 
     if code == SC_LSHIFT || code == SC_RSHIFT {
         SHIFT.store(if key_up { 0 } else { 1 }, Ordering::Relaxed);
+    } else if code == SC_LCTRL {
+        // §6.8：左右 Ctrl 同为 0x1D（右键靠 E0 前缀区分），语义相同。
+        CTRL.store(if key_up { 0 } else { 1 }, Ordering::Relaxed);
     } else {
         match decode_key(e0, code, key_up) {
             KeyOut::None => {}
