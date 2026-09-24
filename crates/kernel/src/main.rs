@@ -1035,8 +1035,18 @@ unsafe fn kmain_body() -> ! {
     // 控制器的 0x3C 才知道，故由 AHCI 驱动在 `late_storage_init` 中按实测值
     // 解屏蔽（见 `arch_x86_64::pic::unmask_irq` 与 ahci.rs 的调用点）。
     // 此处只保证键盘可用。
-    const PIC_MASK_ALL_EXCEPT_IRQ1: u16 = !(1u16 << 1);
-    arch_x86_64::pic::set_mask(PIC_MASK_ALL_EXCEPT_IRQ1);
+    //
+    // 【缺陷修正】此前这里是 `set_mask(PIC_MASK_ALL_EXCEPT_IRQ1)`——**整字覆盖**。
+    // 它无条件把 IMR 写成一个只开 IRQ1 的常量，于是：
+    //   * 清掉 `pic::init()` 刚设好的级联位 IRQ2；
+    //   * 更严重的是，它把「掩码」这个**共享资源**当成「本处私有状态」来写——
+    //     任何在这之前由别的子系统解屏蔽的线都被静默抹掉。
+    // 实测后果：intel-hda 的 BCIS 事件持续产生（bcis_total 单调上涨），而交付到
+    // 用户态只有 ~1.7%（irq_hits=34 / irq_timeouts=1967）。
+    //
+    // 正确做法是**增量**操作：只声明「我需要哪条线」，由 `unmask_irq` 在锁内基于
+    // 端口回读的最新掩码改那一位（S15/S21）。此处只需键盘。
+    arch_x86_64::pic::unmask_irq(arch_x86_64::pic::PIC_KEYBOARD_IRQ);
     arch_x86_64::keyboard::init();
     // 注册键盘输入回调：有按键时唤醒阻塞在 `read` 的进程（如 shell）。arch 层
     // 不反向依赖 kernel，经函数指针解耦（指向 `task::wake_kbd`）。

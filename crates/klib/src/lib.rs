@@ -23,6 +23,7 @@ pub mod console;
 pub mod error;
 pub mod json;
 pub mod log;
+pub mod pic_mask;
 pub mod random;
 pub mod serial;
 pub mod sync;
