@@ -10548,6 +10548,111 @@ pub fn test_event_buffer_empty_contract() {
     info!("[test-event-buffer] PASS");
 }
 
+/// I-EVENTS 阶段 1（ADR-047）：`InputEventsNode::read_at` 的**记录对齐契约**。
+///
+/// 假 provider 投递已知事件序列，断言：
+/// 1. 各种缓冲尺寸（含 512=32 条整、非 16 倍数尺寸、不足 16）返回值恒为 16 的倍数；
+/// 2. 记录内容与 ADR-047 §2.1 布局逐字段一致（kind/flags/code/timestamp）；
+/// 3. 源空后返回 0（EOF 语义）。
+/// 背景：真机验收曾观测 ev.bin size=2049（16×128+1）——本测试用于隔离
+/// 「读侧产出半条」假设：若 read_at 本身对齐，则 1 字节来自写侧/显示层。
+struct FakeEventProvider {
+    pending: core::sync::atomic::AtomicUsize,
+}
+
+impl vfs::devfs::DeviceInfoProvider for FakeEventProvider {
+    fn list_devices(&self) -> alloc::vec::Vec<vfs::devfs::DeviceInfo> {
+        alloc::vec::Vec::new()
+    }
+    fn serial_read(&self, _buf: &mut [u8]) -> Result<usize, klib::error::Error> {
+        Ok(0)
+    }
+    fn serial_write(&self, _buf: &[u8]) -> Result<usize, klib::error::Error> {
+        Ok(0)
+    }
+    fn get_serial_baudrate(&self) -> Result<u32, klib::error::Error> {
+        Ok(115200)
+    }
+    fn set_serial_baudrate(&self, _baud: u32) -> Result<(), klib::error::Error> {
+        Ok(())
+    }
+    fn input_event_read(&self, buf: &mut [u8]) -> usize {
+        use core::sync::atomic::Ordering;
+        if buf.len() < 16 {
+            return 0;
+        }
+        let left = self.pending.load(Ordering::Relaxed);
+        if left == 0 {
+            return 0;
+        }
+        self.pending.store(left - 1, Ordering::Relaxed);
+        // 一条已知记录：kind=1(按下) flags=E0 code=0x1D value=0 ts=0x1122334455667788
+        buf[0] = 1;
+        buf[1] = 1;
+        buf[2] = 0x1D;
+        buf[3] = 0;
+        buf[4..8].copy_from_slice(&0u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        16
+    }
+}
+
+pub fn test_input_events_node_alignment() {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use vfs::inode::INode as _;
+    info!("[test-events-node] === ADR-047 阶段1: read_at 记录对齐契约 ===");
+
+    let node = vfs::devfs::InputEventsNode::new(Arc::new(FakeEventProvider {
+        pending: core::sync::atomic::AtomicUsize::new(200),
+    }));
+
+    // 512 字节（= 32 条整）：返回 512。
+    let mut buf = [0u8; 512];
+    let n = node.read_at(0, &mut buf).expect("read_at failed");
+    assert_eq!(n % 16, 0, "返回字节数必须是 16 的倍数（记录流不半条切割）");
+    assert_eq!(n, 512, "源充足时 512 字节缓冲应读满 32 条");
+    // 内容抽检：第一条记录的布局（ADR-047 §2.1）。
+    assert_eq!(buf[0], 1, "kind=键按下");
+    assert_eq!(buf[1], 1, "flags=E0");
+    assert_eq!(buf[2], 0x1D, "code=0x1D");
+    assert_eq!(
+        u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        0x1122_3344_5566_7788,
+        "timestamp 小端 u64"
+    );
+
+    // 非 16 倍数缓冲（513）：只能容纳 32 条整，返回 ≤512 且为 16 倍数。
+    let mut buf2 = [0u8; 513];
+    let n2 = node.read_at(0, &mut buf2).expect("read_at failed");
+    assert_eq!(n2 % 16, 0, "非对齐缓冲的返回值仍须 16 倍数");
+    assert_eq!(n2, 512, "513 缓冲应容纳 32 条整（512），余 1 字节不浪费给半条");
+
+    // 不足 16：返回 0（不是错误——消费者给对齐缓冲即可）。
+    let mut tiny = [0u8; 8];
+    assert_eq!(node.read_at(0, &mut tiny).unwrap(), 0, "<16 缓冲读走 0 条");
+
+    // 源耗尽：**循环读尽**（pending 剩 136 条，须再读 5 次 512 才空），然后 EOF(0)。
+    // 死循环防护：累计读出不得超过 provider 投递总量 200 条 + 一次读的余量。
+    let mut buf3 = [0u8; 512];
+    let mut total_read: usize = 0;
+    loop {
+        let got = node.read_at(0, &mut buf3).expect("read_at failed");
+        if got == 0 {
+            break;
+        }
+        assert_eq!(got % 16, 0, "耗尽过程也不得产出半条");
+        total_read += got;
+        assert!(
+            total_read <= 201 * 16,
+            "读出事件超过投递总量 200 条（读侧凭空造事件，S09 红线）",
+        );
+    }
+    assert_eq!(node.read_at(0, &mut buf3).unwrap(), 0, "耗尽后再次读必须 EOF(0)");
+
+    info!("[test-events-node] PASS");
+}
+
 pub fn test_read_nonblock_flag() {
     use crate::syscall::{read_is_nonblock, read_is_peek, STREAM_READ_NONBLOCK, STREAM_READ_PEEK};
 

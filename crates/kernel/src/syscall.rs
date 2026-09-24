@@ -643,9 +643,23 @@ fn check_traverse_access(
             Err(e) => return Err(e),
         };
         if !matches!(node.node_type(), Ok(vfs::inode::INodeType::Directory)) {
-            // 中间段不是目录 → 无法穿越。如实 InvalidParam（本仓 Error 无 NotDir，
-            // 取语义最近的参数类错误；不伪造成 NotFound/EACCES）。
-            return Err(Error::InvalidParam);
+            // I-EVENTS 阶段 1（ADR-047）发现的既有缺陷修复：带子文件的字符设备
+            // 节点（`/devices/input/events`、`/devices/random`——各有 status 子文件）
+            // 是**可穿越的复合节点**，却因非 Directory 被这里一刀切拒绝，
+            // 其子文件路径永远 InvalidParam（实测）。判据：非目录中间段若
+            // **lookup 实际子名成功**即放行——这里无法预知子名，改用等价探测：
+            // lookup 任意名，`NotDirectory`（DynamicFileNode 等纯文件节点的恒定
+            // 应答）→ 维持拒绝；`NotFound`（有子节点空间的容器型节点）→ 放行，
+            // 并继续走下方 EXECUTE 检查（x 位语义不放松：0444 的设备节点仍拒）。
+            let traversable = matches!(
+                node.lookup("__probe_nonexistent__"),
+                Err(Error::NotFound) | Err(Error::PermissionDenied),
+            );
+            if !traversable {
+                // 中间段不是目录 → 无法穿越。如实 InvalidParam（本仓 Error 无 NotDir，
+                // 取语义最近的参数类错误；不伪造成 NotFound/EACCES）。
+                return Err(Error::InvalidParam);
+            }
         }
         check_access(identity, node.as_ref(), vfs::inode::PermBits::EXECUTE)?;
         // 前进：只有还有下一段时才前进（最后一段为操作对象，不参与穿越）。

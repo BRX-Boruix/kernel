@@ -54,6 +54,18 @@ pub trait DeviceInfoProvider: Send + Sync {
     /// 返回 UART divisor latch 对应的实际速率；硬件回读失败必须返回错误。
     fn get_serial_baudrate(&self) -> Result<u32, Error>;
     fn set_serial_baudrate(&self, baud: u32) -> Result<(), Error>;
+    /// `/devices/input/events`（I-EVENTS 阶段 1，ADR-047）：取走至多填满 `buf` 的
+    /// 事件记录字节。返回实际字节数（16 的倍数，或 0 = 无事件）；**不半条切割**——
+    /// 每次恰好取整条 16 字节记录（§2.5 原子入流的读侧对偶）。
+    /// 默认实现返回 0：无事件源时节点如实表现为「恒空」，不伪造事件。
+    fn input_event_read(&self, _buf: &mut [u8]) -> usize {
+        0
+    }
+    /// `/devices/input/events/status` JSON：如实披露事件缓冲遥测
+    /// （丢弃计数等）。默认实现显式 error（宁缺毋假，S09）。
+    fn input_events_status_json(&self) -> String {
+        alloc::string::String::from(r#"{"error":"no_input_event_source"}"#)
+    }
     fn telemetry_json(&self) -> String {
         // vfs1 R2：无真实健康数据源时禁止断言 "healthy"——与 storage/net 默认
         // 实现同一诚实化策略，未覆写的 Provider 得到显式错误而非伪状态。
@@ -309,7 +321,108 @@ impl INode for RandomDeviceNode {
         Ok(FileMetadata {
             size: 0,
             node_type: INodeType::CharacterDevice,
-            permissions: AccessPolicy::readonly(),
+            // 0555（read_exec）而非 0444：本节点是 `status` 子文件的**遍历父级**，
+            // A2-3 要求每级父目录有 x 位——0444 使 `/devices/random/status` 的
+            // resolve 在遍历检查处报 InvalidParam（实测 errno 22）。读内容语义
+            // 由 read_at 保留；x 只放行「穿过本节点找子文件」。
+            permissions: AccessPolicy::read_exec(),
+            created_time: 0,
+            modified_time: 0,
+            changed_time: 0,
+        })
+    }
+
+    fn node_type(&self) -> Result<INodeType, Error> {
+        Ok(INodeType::CharacterDevice)
+    }
+
+    /// 字符流无截断语义（M17）。
+    fn truncate(&self, _size: u64) -> Result<(), Error> {
+        Err(Error::NotSupported)
+    }
+
+    fn lookup(&self, name: &str) -> Result<Arc<dyn INode>, Error> {
+        self.children.lookup(name)
+    }
+
+    fn create(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
+        Err(Error::PermissionDenied)
+    }
+
+    fn mkdir(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
+        Err(Error::PermissionDenied)
+    }
+
+    fn unlink(&self, _name: &str) -> Result<(), Error> {
+        Err(Error::PermissionDenied)
+    }
+
+    fn list_dir(&self) -> Result<Vec<DirEntry>, Error> {
+        self.children.list_dir()
+    }
+}
+
+/// 输入事件流节点（I-EVENTS 阶段 1，[ADR-047]）。
+///
+/// 主节点是**只读字符设备**：`read` 返回 16 字节定长事件记录流（ADR-047 §2.1
+/// 布局；§2.5 记录流语义——读侧按整条取，不半条切割）。事件→字节的转换
+/// （keymap/转义/折叠）**不在本节点**——那是用户态转换层的事（ADR-045 决策 3）。
+/// 写路径如实拒绝：内核不接受「伪造事件」（S09）。
+/// `status` 子文件如实披露缓冲遥测（丢弃计数等，S09 可观察）。
+pub struct InputEventsNode {
+    provider: Arc<dyn DeviceInfoProvider>,
+    children: DynamicDirNode,
+}
+
+impl InputEventsNode {
+    pub fn new(provider: Arc<dyn DeviceInfoProvider>) -> Self {
+        let children = DynamicDirNode::new();
+        let p_status = provider.clone();
+        let status_node = DynamicFileNode::read_only(move || {
+            let mut json = p_status.input_events_status_json().into_bytes();
+            json.push(b'\n');
+            json
+        });
+        children.add_child("status", Arc::new(status_node));
+        Self { provider, children }
+    }
+}
+
+impl INode for InputEventsNode {
+    /// 忽略 offset（事件流无定位语义——过去的事件不可重放，ADR-047 §2.5）。
+    ///
+    /// 按**整条记录**读取：`buf.len() >= 16` 时循环取记录直到 buf 装不下
+    /// （剩余 < 16 字节的空间不浪费给半条）或源空。返回字节数恒为 16 的倍数。
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        if buf.len() < 16 {
+            // 装不下一整条：不是错误而是「读走 0 条」（消费者给对齐缓冲即可）。
+            return Ok(0);
+        }
+        let mut total = 0usize;
+        while total + 16 <= buf.len() {
+            let n = self.provider.input_event_read(&mut buf[total..total + 16]);
+            if n == 0 {
+                break; // 源空（或源无事件源）
+            }
+            total += n;
+        }
+        Ok(total)
+    }
+
+    /// 只读：事件由硬件产生，用户态写入伪造事件没有语义（S09）。
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Error> {
+        Err(Error::NotSupported)
+    }
+
+    fn metadata(&self) -> Result<FileMetadata, Error> {
+        Ok(FileMetadata {
+            size: 0,
+            node_type: INodeType::CharacterDevice,
+            // 0555（read_exec）而非 0444：本节点是 `status` 子文件的**遍历父级**，
+            // A2-3 要求每级父目录有 x 位——0444 使 `/devices/input/events/status`
+            // 的 resolve 在遍历检查处报 InvalidParam（实测 errno 22，与本文件
+            // RandomDeviceNode 同病，一并修复）。
+            permissions: AccessPolicy::read_exec(),
             created_time: 0,
             modified_time: 0,
             changed_time: 0,
@@ -420,6 +533,12 @@ impl DevFS {
         // 4.5 /devices/random (ADR-014 随机数设备：字符流 + status 诚实披露)
         let random_node = Arc::new(RandomDeviceNode::new(provider.clone()));
         root.add_child("random", random_node);
+
+        // 4.55 /devices/input/events（I-EVENTS 阶段 1，ADR-047：字符流 + status 遥测）
+        let input_dir = Arc::new(DynamicDirNode::new());
+        let events_node = Arc::new(InputEventsNode::new(provider.clone()));
+        input_dir.add_child("events", events_node);
+        root.add_child("input", input_dir);
 
         // 4.6 /devices/audio/dsp（plan_audio_vfs.md 批次一 A1）
         // 音频 PCM 哑管道：内核对音频零知识，只搬字节。写者与音频驱动

@@ -846,6 +846,9 @@ unsafe fn kmain_body() -> ! {
     // I-EVENTS 阶段 1（ADR-047）：事件缓冲空态契约与布局常量（无副作用）。
     #[cfg(feature = "kernel-tests")]
     tests::test_event_buffer_empty_contract();
+    // I-EVENTS 阶段 1（ADR-047）：InputEventsNode::read_at 记录对齐契约（假 provider，无副作用）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_input_events_node_alignment();
     // §6.12.6：RUN 域锁同核重入死锁复现（纯锁语义，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_run_lock_reentrancy_deadlock();

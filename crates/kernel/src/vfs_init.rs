@@ -459,6 +459,45 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         arch_x86_64::serial::set_baudrate(baud)
     }
 
+    /// `/devices/input/events` 读侧（I-EVENTS 阶段 1，ADR-047）。
+    ///
+    /// 恰好取**整条** 16 字节记录：`buf` 不足 16 字节返回 0（不半条切割，
+    /// §2.5 读侧对偶）；否则循环 pop 直到源空或 buf 满。无半条、无伪造。
+    fn input_event_read(&self, buf: &mut [u8]) -> usize {
+        if buf.len() < arch_x86_64::keyboard::EVENT_RECORD_SIZE {
+            return 0;
+        }
+        let mut rec = [0u8; arch_x86_64::keyboard::EVENT_RECORD_SIZE];
+        if arch_x86_64::keyboard::pop_event(&mut rec) {
+            buf[..rec.len()].copy_from_slice(&rec);
+            rec.len()
+        } else {
+            0
+        }
+    }
+
+    /// `/devices/input/events/status`：事件缓冲遥测（S09 可观察——丢弃计数
+    /// 是「输入是否有损」的唯一真值）。KM9 JsonWriter 统一风格。
+    fn input_events_status_json(&self) -> String {
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        writer
+            .start_object()
+            .and_then(|mut o| {
+                o.field_bool("source", true)?;
+                o.field_u64(
+                    "dropped_events",
+                    arch_x86_64::keyboard::dropped_events(),
+                )?;
+                o.field_bool("has_pending", arch_x86_64::keyboard::has_event())?;
+                o.end()
+            })
+            .expect("Vec-backed input-events status JSON serialization cannot fail");
+        target
+            .into_string()
+            .expect("input-events status JSON keys are ASCII")
+    }
+
     fn telemetry_json(&self) -> String {
         // K3：本内核不存在设备健康检查子系统，"status":"healthy" 是凭空捏造。
         // 遵循同文件 storage/net 的诚实纪律（DMYGH #16）：只输出真实可得
