@@ -1235,6 +1235,176 @@ mod tests {
             assert!(names.contains(&want), "missing attribute sub-file: {want}");
         }
     }
+    /// **可穿越性**必须由节点能否真的列出/查找到子项决定，而不是由 `node_type()`
+    /// 是否等于 `Directory` 决定。
+    ///
+    /// # 本测试钉死的真实缺陷
+    ///
+    /// `DspNode` 是"字符设备 **且** 容器"：它有 `read_at`/`write_at`（PCM 管道），
+    /// 同时覆写了 `lookup`/`list_dir` 并 `add_child` 了 `format`/`channels`/`rate`/
+    /// `status` 四个属性子文件。但 `node_type()` 只能返回一个值，它返回
+    /// `CharacterDevice`。
+    ///
+    /// `INodeType` 把**两个正交维度**压成了一维："它是什么"（设备/文件/目录）与
+    /// "它能否被穿越"（能否作为路径中间段）。二者不是同一个问题，`dsp` 正是
+    /// 反例。后果是整个 `/devices/audio/dsp/<attr>` 子树在**真实 open 路径**上
+    /// 不可达——`init` 因此永远读不到 `attached`，判定为"无音频消费者"并**永久
+    /// 跳过 audiod**，PCM ring 从此无人写数据，驱动只能播静音并持续刷屏。
+    ///
+    /// # 为何既有绿灯没能拦住它
+    ///
+    /// `test_audio_dsp_pipe` 与 `test_audio_dsp_attrs` 都用 `mt.resolve(...)` 取证，
+    /// 而 `resolve` 直接调 `lookup`、**从不问"你允许被穿越吗"**；`syscall` 层的
+    /// `check_traverse_access` 才做那个判定，测试却从不经过它。于是"测试通过"
+    /// 与"用户可用"之间出现了缝隙。本测试直接对 `allows_traversal()` 取证，
+    /// 堵住这条缝隙（S23：缺陷先转红灯）。
+    #[test]
+    fn test_container_device_allows_traversal() {
+        let dsp = DspNode::with_capacity(256);
+
+        // 前提：它确实是字符设备——不是靠改类型来"修好"的。
+        assert_eq!(dsp.node_type().unwrap(), INodeType::CharacterDevice);
+
+        // 前提：它确实能查找子项（否则下面的断言就是无意义的）。
+        assert!(dsp.lookup("status").is_ok(), "premise: dsp has children");
+
+        // 结论：因此它必须允许被穿越。
+        assert!(
+            dsp.allows_traversal(),
+            "a node that can lookup() children must be traversable, regardless of its INodeType"
+        );
+    }
+
+    /// **默认实现**必须从"能否枚举子项"推导可穿越性，而**不是**看 `node_type()`。
+    ///
+    /// # 为什么这条必须单独存在
+    ///
+    /// `DspNode`/`RandomDeviceNode` 覆写了 `allows_traversal()` 直接返回 `true`
+    /// （零成本优化）。于是只测它们的话，**把默认实现改回按类型判定也不会转红**
+    /// ——复现缺陷的路径被覆写绕过了。本测试用一个**不覆写**的容器型节点取证，
+    /// 把默认实现本身钉死。
+    ///
+    /// 这正是"测试只覆盖了修好的那一份、没覆盖会退回的那一份"的典型形态，
+    /// 若不补上，未来任何新出现的容器型设备节点都会静默退回缺陷。
+    #[test]
+    fn test_default_traversal_derives_from_capability_not_type() {
+        // 一个刻意**不覆写** allows_traversal 的容器：字符设备 + 子项。
+        // 它在结构上与 DspNode 同型，但没有那条优化覆写。
+        struct BareContainerDevice {
+            children: crate::dynamic::DynamicDirNode,
+        }
+        impl INode for BareContainerDevice {
+            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<usize, Error> {
+                Err(Error::NotSupported)
+            }
+            fn write_at(&self, _o: u64, _b: &[u8]) -> Result<usize, Error> {
+                Err(Error::NotSupported)
+            }
+            fn metadata(&self) -> Result<FileMetadata, Error> {
+                Ok(FileMetadata {
+                    size: 0,
+                    node_type: INodeType::CharacterDevice,
+                    permissions: AccessPolicy::readonly(),
+                    created_time: 0,
+                    modified_time: 0,
+                    changed_time: 0,
+                })
+            }
+            fn node_type(&self) -> Result<INodeType, Error> {
+                Ok(INodeType::CharacterDevice)
+            }
+            fn lookup(&self, name: &str) -> Result<Arc<dyn INode>, Error> {
+                self.children.lookup(name)
+            }
+            fn list_dir(&self) -> Result<alloc::vec::Vec<DirEntry>, Error> {
+                self.children.list_dir()
+            }
+        }
+
+        let mut children = crate::dynamic::DynamicDirNode::new();
+        children.add_child(
+            "status",
+            Arc::new(crate::dynamic::DynamicFileNode::read_only(|| b"ok".to_vec())),
+        );
+        let node = BareContainerDevice { children };
+
+        // 类型如实报字符设备——不得为通过遍历判定而伪造 Directory。
+        assert_eq!(node.node_type().unwrap(), INodeType::CharacterDevice);
+        // 它有真实子项。
+        assert!(node.lookup("status").is_ok());
+        // 因此默认实现必须判定为可穿越。把默认实现改回按 `node_type()` 判定
+        // （`matches!(self.node_type(), Ok(INodeType::Directory))`）即转红。
+        assert!(
+            node.allows_traversal(),
+            "default must derive traversal from real capability, not from node_type()"
+        );
+    }
+
+    /// 反向：普通文件**不得**允许穿越。
+    ///
+    /// 与上一条构成一对——只有两个方向都被钉死，才证明 `allows_traversal`
+    /// 是真判定而非恒 `true`（S23 对抗测试）。
+    #[test]
+    fn test_regular_file_refuses_traversal() {
+        let mt = MountTable::new(Arc::new(RamFS::new()));
+        mt.create_file("/plain.txt", 0o666, (0, 0)).unwrap();
+        let f = mt.resolve("/plain.txt", true).unwrap();
+        assert_eq!(f.node_type().unwrap(), INodeType::RegularFile);
+        assert!(
+            !f.allows_traversal(),
+            "a regular file must not be traversable"
+        );
+    }
+
+    /// 目录必须允许穿越（回归锁：新判定不得把既有正确行为改坏）。
+    #[test]
+    fn test_directory_allows_traversal() {
+        let mt = MountTable::new(Arc::new(RamFS::new()));
+        mt.mkdir("/sub", 0o777, (0, 0)).unwrap();
+        let d = mt.resolve("/sub", true).unwrap();
+        assert_eq!(d.node_type().unwrap(), INodeType::Directory);
+        assert!(d.allows_traversal(), "a directory must be traversable");
+    }
+    /// **端到端回归锁**：`/devices/audio/dsp/status` 的**每一级中间段**都必须
+    /// 允许穿越——这正是 `syscall` 层 `check_traverse_access` 在做的事。
+    ///
+    /// # 为什么必须单独有这一条
+    ///
+    /// 既有的 `test_audio_dsp_pipe` / `test_audio_dsp_attrs` 用 `mt.resolve(...)`
+    /// 取证，而 `resolve` **逐段调 `lookup`、从不问"能否穿越"**。于是它们全绿，
+    /// 真实 `open` 却因 `check_traverse_access` 的类型判定而失败——测试与用户
+    /// 之间存在缝隙，缺陷在其中潜伏。
+    ///
+    /// 本测试**复刻该判定的逐段语义**：对每一级前缀求节点并断言 `allows_traversal()`。
+    /// 它与 `test_container_device_allows_traversal` 的分工是：后者钉死"容器型
+    /// 字符设备可穿越"这一**单元**事实，本条钉死"目标路径在实际穿越语义下
+    /// 全程可达"这一**整体**事实。任一被改坏都会转红。
+    #[test]
+    fn test_every_ancestor_of_dsp_status_is_traversable() {
+        let mt = MountTable::new(Arc::new(RamFS::new()));
+        mt.mkdir("/devices", 0o777, (0, 0)).unwrap();
+        let devfs = Arc::new(DevFS::new(Arc::new(MockDeviceProvider {
+            baud: core::sync::atomic::AtomicU32::new(115200),
+        })));
+        mt.mount("/devices", devfs).unwrap();
+
+        // 逐级中间段（不含最后一段 `status`——它是操作对象本身，不参与穿越，
+        // 与 `check_traverse_access` 的"末段不检查"设计一致）。
+        let ancestors = ["/", "/devices", "/devices/audio", "/devices/audio/dsp"];
+        for p in ancestors {
+            let node = mt.resolve(p, true).unwrap_or_else(|e| {
+                panic!("ancestor {p} must resolve, got {e:?}")
+            });
+            assert!(
+                node.allows_traversal(),
+                "ancestor {p} must be traversable or every path below it is unreachable"
+            );
+        }
+
+        // 目标本身必须可达（末段）。这一步在旧实现下是**唯一**能通过的，
+        // 故单靠它无法暴露缺陷——它在此处的作用是确认目标确实存在。
+        assert!(mt.resolve("/devices/audio/dsp/status", true).is_ok());
+    }
 
     /// A1 属性子文件：合法值往返 + 非法值如实拒绝（不静默 clamp/转换）。
     #[test]

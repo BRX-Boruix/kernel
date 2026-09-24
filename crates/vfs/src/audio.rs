@@ -744,6 +744,20 @@ impl INode for DspNode {
         Err(Error::NotSupported)
     }
 
+    /// 可穿越性零成本覆写：`dsp` 是**容器型字符设备**，`/devices/audio/dsp/<attr>`
+    /// 必须可达。
+    ///
+    /// 默认实现要试一次 `list_dir()`；本节点明确知道自己有子项，直接答 `true`。
+    /// （判定依据与代价分析见 [`INode::allows_traversal`]。）
+    /// 可穿越性零成本覆写：`dsp` 是**容器型字符设备**，`/devices/audio/dsp/<attr>`
+    /// 必须可达。
+    ///
+    /// 默认实现要试一次 `list_dir()`；本节点明确知道自己有子项，直接答 `true`。
+    /// （判定依据与代价分析见 [`INode::allows_traversal`]。）
+    fn allows_traversal(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, name: &str) -> Result<Arc<dyn INode>, Error> {
         self.children.lookup(name)
     }

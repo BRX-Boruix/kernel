@@ -237,21 +237,51 @@ mod tests {
     }
 
     /// 对照：**不同**执行流先后加锁不得误报（锁正常工作时不得 panic）。
+    ///
+    /// # 原实现断言了一个不存在的不变量（flaky，实测复现）
+    ///
+    /// 原断言 `assert_eq!(*g, i)` 假定 4 个线程按 `i` 递增的顺序依次取得锁。
+    /// 而 `std::thread::spawn` 的调度顺序**无任何保证**——线程 1 完全可能先于
+    /// 线程 0 拿到锁，于是读到 `*g == 0` 而 `i == 1`。实测失败输出：
+    ///
+    /// ```text
+    /// thread '<unnamed>' panicked at spin.rs:248:
+    ///   assertion `left == right` failed
+    ///     left: 0
+    ///    right: 1
+    /// ```
+    ///
+    /// 它是**间歇性**的（取决于调度，多次运行才复现一次），故更危险：
+    /// 会被当作"偶发"忽略，而实际上门禁每一次都可能是红的。
+    ///
+    /// 这是测试自身的错误，与锁无关：锁要保证的是**互斥**，不是**按创建顺序
+    /// 排队**。把一个调度顺序假设写进断言，等于让测试依赖它不拥有的保证。
+    ///
+    /// # 修正
+    ///
+    /// 断言改为**与顺序无关**的互斥性：每个线程只做"读-改-写"各一次，无论
+    /// 谁先谁后，互斥成立则总和必为 4；若锁失效导致两个线程同时进入临界区，
+    /// 丢失更新会让结果小于 4。对照目的（不产生误报 panic）完整保留，
+    /// 但不再依赖调度顺序。
+    ///
+    /// 断言一律留在主线程：线程内 panic 会被 `join` 包装成 `Any { .. }`，
+    /// 掩盖真实原因（原实现的报错正是如此——只看到 "no thread may panic"）。
     #[test]
     fn sequential_across_threads_no_false_positive() {
         let m = Arc::new(SpinMutex::new(0u32));
         let mut handles = Vec::new();
-        for i in 0..4u32 {
+        for _ in 0..4u32 {
             let m_ref = m.clone();
             handles.push(std::thread::spawn(move || {
+                // 读-改-写：互斥成立则每线程各贡献 +1，与顺序无关。
                 let mut g = m_ref.lock();
-                assert_eq!(*g, i);
-                *g = i + 1;
+                *g += 1;
             }));
         }
         for h in handles {
             h.join().expect("no thread may panic (no false reentry report)");
         }
+        // 4 个线程各 +1。锁失效导致丢失更新时此处会小于 4。
         assert_eq!(*m.lock(), 4);
     }
 

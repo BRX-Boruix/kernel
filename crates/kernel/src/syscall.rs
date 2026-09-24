@@ -642,24 +642,41 @@ fn check_traverse_access(
             Ok(n) => n,
             Err(e) => return Err(e),
         };
-        if !matches!(node.node_type(), Ok(vfs::inode::INodeType::Directory)) {
-            // I-EVENTS 阶段 1（ADR-047）发现的既有缺陷修复：带子文件的字符设备
-            // 节点（`/devices/input/events`、`/devices/random`——各有 status 子文件）
-            // 是**可穿越的复合节点**，却因非 Directory 被这里一刀切拒绝，
-            // 其子文件路径永远 InvalidParam（实测）。判据：非目录中间段若
-            // **lookup 实际子名成功**即放行——这里无法预知子名，改用等价探测：
-            // lookup 任意名，`NotDirectory`（DynamicFileNode 等纯文件节点的恒定
-            // 应答）→ 维持拒绝；`NotFound`（有子节点空间的容器型节点）→ 放行，
-            // 并继续走下方 EXECUTE 检查（x 位语义不放松：0444 的设备节点仍拒）。
-            let traversable = matches!(
-                node.lookup("__probe_nonexistent__"),
-                Err(Error::NotFound) | Err(Error::PermissionDenied),
-            );
-            if !traversable {
-                // 中间段不是目录 → 无法穿越。如实 InvalidParam（本仓 Error 无 NotDir，
-                // 取语义最近的参数类错误；不伪造成 NotFound/EACCES）。
-                return Err(Error::InvalidParam);
-            }
+        // **可穿越性**必须问节点自己，而不是问 `node_type()` 是否等于 Directory。
+        //
+        // 二者是两个正交问题：`node_type()` 答"它**是**什么"，穿越判定答"能否
+        // **穿过**它"。绝大多数节点上答案一致，于是极易被合并；而下面这些节点
+        // 是反例——它们都是**容器型字符设备**（`node_type()` 如实报
+        // `CharacterDevice`，同时又 `add_child` 了子文件并覆写 `lookup`/`list_dir`）：
+        //
+        //   - `/devices/audio/dsp`        —— `format`/`channels`/`rate`/`status`
+        //   - `/devices/input/events`     —— I-EVENTS 阶段 1（ADR-047）
+        //   - `/devices/random`           —— `status`
+        //
+        // 旧的类型判定让它们的整棵子树在真实 `open` 路径上不可达。音频那一路的
+        // 后果最重：`init` 永远读不到 `attached`，判定"无音频消费者"并**永久跳过
+        // audiod**，PCM ring 从此无人写数据，驱动只能播静音并持续空转。
+        //（详见 `vfs::INode::allows_traversal` 与 `test_container_device_allows_traversal`。）
+        //
+        // 【与 fix/hda-bcis 合并前的两版修法取舍】本分支曾用"lookup 一个魔数名
+        // 再看返回错码"的等价探测（魔数 `__probe_nonexistent__`），并保留
+        // `InvalidParam`。那是**权宜**——注释自身也写道"这里无法预知子名"。
+        // 它有两个结构性问题：其一，判定依赖一个必须**永不成为真实子项**的魔数名
+        // （这个约束无处强制，将来若有人恰好创建该名字即静默失效）；其二，
+        // "能否穿越"这个事实因此有了**两份来源**（`node_type()` 与 lookup 行为），
+        // 而合并前它已经因两份来源不一致而失效过一次。
+        //
+        // 现改为 `allows_traversal()`（`vfs::INode` 上的单点定义，默认按"能否真的
+        // 枚举子项"推导）：事实只剩一份，且与 `lookup`/`list_dir` 的既有能力声明
+        // 同源，不存在可能与它冲突的副本。
+        //
+        // 【错误码更正】此处原写"本仓 Error 无 NotDir"故退回 `InvalidParam`。
+        // 该说法**不成立**：`klib::Error::NotDirectory` 存在且映射 errno 20（ENOTDIR）。
+        // 错报 `InvalidParam`（EINVAL）把一个"路径穿不过去"谎报成"参数非法"，
+        // 属 S09 意义上的伪信息——排查时会把注意力引向调用方参数而非路径结构。
+        // 现按 POSIX 语义返回 `NotDirectory`。
+        if !node.allows_traversal() {
+            return Err(Error::NotDirectory);
         }
         check_access(identity, node.as_ref(), vfs::inode::PermBits::EXECUTE)?;
         // 前进：只有还有下一段时才前进（最后一段为操作对象，不参与穿越）。
