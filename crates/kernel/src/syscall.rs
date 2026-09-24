@@ -595,10 +595,24 @@ fn check_traverse_access(
             Ok(n) => n,
             Err(e) => return Err(e),
         };
-        if !matches!(node.node_type(), Ok(vfs::inode::INodeType::Directory)) {
-            // 中间段不是目录 → 无法穿越。如实 InvalidParam（本仓 Error 无 NotDir，
-            // 取语义最近的参数类错误；不伪造成 NotFound/EACCES）。
-            return Err(Error::InvalidParam);
+        // **可穿越性**必须问节点自己，而不是问 `node_type()` 是否等于 Directory。
+        //
+        // 二者是两个正交问题：`node_type()` 答"它**是**什么"，穿越判定答"能否
+        // **穿过**它"。绝大多数节点上答案一致，于是极易被合并；而
+        // `/devices/audio/dsp` 是反例——它是字符设备（`node_type()` 如实报
+        // `CharacterDevice`）**且**是容器（有 `format`/`channels`/`rate`/`status`
+        // 四个属性子文件）。旧的类型判定让整棵 `/devices/audio/dsp/<attr>` 子树在
+        // 真实 `open` 路径上不可达：`init` 永远读不到 `attached`，判定"无音频
+        // 消费者"并永久跳过 audiod，PCM ring 从此无人写数据（详见
+        // `vfs::INode::allows_traversal` 与 `test_container_device_allows_traversal`）。
+        //
+        // 【旧注释的更正】此处原写"本仓 Error 无 NotDir"，故退回 `InvalidParam`。
+        // 该说法**不成立**：`klib::Error::NotDirectory` 存在且映射 errno 20（ENOTDIR）。
+        // 错报 `InvalidParam`（EINVAL）把一个"路径穿不过去"谎报成"参数非法"，
+        // 属 S09 意义上的伪信息——排查时会把注意力引向调用方参数而非路径结构。
+        // 现按 POSIX 语义返回 `NotDirectory`。
+        if !node.allows_traversal() {
+            return Err(Error::NotDirectory);
         }
         check_access(identity, node.as_ref(), vfs::inode::PermBits::EXECUTE)?;
         // 前进：只有还有下一段时才前进（最后一段为操作对象，不参与穿越）。

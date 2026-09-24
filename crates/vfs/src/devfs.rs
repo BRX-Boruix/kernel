@@ -325,6 +325,16 @@ impl INode for RandomDeviceNode {
         Err(Error::NotSupported)
     }
 
+    /// 可穿越性零成本覆写：与 `DspNode` 同型——**容器型字符设备**，
+    /// `/devices/random/status` 必须可达。
+    ///
+    /// 它是本缺陷的第二个实例：`node_type()` 如实报 `CharacterDevice`，
+    /// 同时又 `add_child("status")` 并覆写了 `lookup`/`list_dir`。
+    /// 修 `dsp` 时一并修此处，避免同一形态的错误在别处复发（S41）。
+    fn allows_traversal(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, name: &str) -> Result<Arc<dyn INode>, Error> {
         self.children.lookup(name)
     }
