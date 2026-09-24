@@ -16,6 +16,34 @@
 use super::spin::{SpinMutex, SpinMutexGuard};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+/// 当前 CPU 槽位查询回调（`fn() -> usize`）。
+pub type CpuSlotFn = fn() -> usize;
+
+static CPU_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+/// 由架构层注入「当前 CPU 槽位」查询函数（§6.12.6 重入检测用）。
+///
+/// 与 [`set_irq_guard`] 同一模式：`klib` 保持零依赖，不直接认识 LAPIC/percpu。
+/// 未注入时所有调用方被视为同一 CPU（单核/宿主测试语义），重入检测仍然成立
+/// 且不会误报——同核重入本就该死锁。
+pub fn set_cpu_slot_guard(f: CpuSlotFn) {
+    CPU_SLOT.store(f as usize, Ordering::SeqCst);
+}
+
+/// 取当前 CPU 槽位；**未注入时返回 [`usize::MAX`]** 表示「无架构身份」。
+///
+/// 特意不用 `0` 表示「未注入」：`0` 是合法槽位（BSP），调用方无法区分
+/// 「BSP」与「没注入」——那正是宿主多线程误报的根因。
+#[inline]
+pub(crate) fn cpu_slot_for_lock() -> usize {
+    let v = CPU_SLOT.load(Ordering::Acquire);
+    if v != 0 {
+        unsafe { core::mem::transmute::<usize, CpuSlotFn>(v)() }
+    } else {
+        usize::MAX
+    }
+}
+
 /// 保存当前中断状态并关中断，返回保存的旧状态（不透明 token）。
 pub type IrqSaveFn = fn() -> usize;
 /// 恢复此前保存的中断状态。

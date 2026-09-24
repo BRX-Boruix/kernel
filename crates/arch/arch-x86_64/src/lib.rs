@@ -48,6 +48,10 @@ impl Platform for X86_64Arch {
     fn init() {
         // 注入中断状态保存/恢复函数（供 klib 中断安全锁使用；须在任何日志输出前）。
         klib::sync::irq::set_irq_guard(interrupts::irq_save, interrupts::irq_restore);
+        // §6.12.6（丙）：注入当前 CPU 槽位查询，供 klib 自旋锁做**同核重入检测**。
+        // 无此注入时锁把全机视为单核——重入仍会被检出（这是正确且安全的），
+        // 但多核下会把「另一核持有」误判为重入，故必须尽早注入。
+        klib::sync::irq::set_cpu_slot_guard(crate::cpu::my_cpu_slot_array_path);
         serial::init();
         gdt::init();
         interrupts::init();
