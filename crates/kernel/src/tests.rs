@@ -10508,6 +10508,46 @@ fn read_identity_out(buf: u64) -> (u32, u32, u32) {
 /// * 多认一位 → 普通 `read` 被静默变成非阻塞，行编辑空转（语义漂移）。
 ///
 /// 两个方向都是**用户可见**的行为错误，故必须逐位钉死。
+/// I-EVENTS 阶段 1（ADR-047）：事件缓冲的**空态契约**与**布局常量**。
+///
+/// 真实投递（打键 → 读记录）由 `/devices/input/events` 节点接线后的
+/// 真实 QEMU 交互验收覆盖；本测试钉死不依赖硬件的部分：
+/// 1. 布局常量（ADR-047 §2.1 的 ABI 合约——节点实现与未来转换层都依赖它）；
+/// 2. 空态语义（无事件时 `has_event()==false`、`pop_event()==false` 且不触碰 out、
+///    `dropped_events()==0`）——读侧在无消费者积压时必须是无副作用的。
+pub fn test_event_buffer_empty_contract() {
+    use arch_x86_64::keyboard;
+
+    info!("[test-event-buffer] === ADR-047 阶段1: 事件缓冲空态契约 ===");
+
+    // 布局常量是 ABI 合约（ADR-047 §2.1 表格的代码化）。
+    assert_eq!(keyboard::EVENT_RECORD_SIZE, 16, "记录必须定长 16 字节（§2.1 决策）");
+    assert_eq!(keyboard::EVENT_KIND_KEY_DOWN, 1, "kind=1 键按下");
+    assert_eq!(keyboard::EVENT_KIND_KEY_UP, 2, "kind=2 键释放（释放事件必须保留，§2.2）");
+    assert_eq!(keyboard::EVENT_FLAG_E0, 1, "flags.bit0 = e0 前缀");
+    assert_eq!(keyboard::EVENT_FLAG_NO_TIME, 2, "flags.bit1 = 时间戳不可得标注");
+
+    // 空态：开机后尚无消费者、尚无打键——三个观察点都必须如实为「空」。
+    // 若 has_event() 在空态误报 true，节点读路径会读出全零伪记录（S09 红线）。
+    assert!(!keyboard::has_event(), "开机空态下事件缓冲必须为空");
+    assert_eq!(
+        keyboard::dropped_events(),
+        0,
+        "空态下不可能发生满丢弃——非 0 说明计数器被污染"
+    );
+    let mut out = [0u8; 16];
+    assert!(!keyboard::pop_event(&mut out), "空态 pop_event 必须返回 false");
+    assert!(
+        out.iter().all(|&b| b == 0),
+        "空态 pop_event 不得触碰 out（false 时调用方的缓冲必须保持原样）"
+    );
+    // 过短缓冲必须被拒绝（防调用方给小缓冲读出越界/半条记录）。
+    let mut tiny = [0u8; 15];
+    assert!(!keyboard::pop_event(&mut tiny), "out < 16 字节必须拒绝");
+
+    info!("[test-event-buffer] PASS");
+}
+
 pub fn test_read_nonblock_flag() {
     use crate::syscall::{read_is_nonblock, read_is_peek, STREAM_READ_NONBLOCK, STREAM_READ_PEEK};
 

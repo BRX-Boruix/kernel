@@ -453,6 +453,139 @@ pub fn has_input() -> bool {
     READ_INDEX.load(Ordering::Relaxed) != WRITE_INDEX.load(Ordering::Acquire)
 }
 
+// ---------- 原始键事件缓冲（I-EVENTS 阶段 1，ADR-047；双轨，旧字节路径不动） ----------
+
+/// 事件记录布局（ADR-047 §2.1）：定长 16 字节、小端。
+///
+/// | offset | size | 字段 | 说明 |
+/// | --- | --- | --- | --- |
+/// | 0 | 1 | kind | 1=键按下 2=键释放（本阶段只产键事件；3/4/5 指针类预留） |
+/// | 1 | 1 | flags | bit0=e0 前缀；bit1=时间戳不可得标注；其余保留恒 0 |
+/// | 2 | 2 | code | scancode set 1 键码（不含 bit7；释放语义在 kind） |
+/// | 4 | 4 | value | 键事件恒 0（指针/滚轮字段预留） |
+/// | 8 | 8 | timestamp | HPET ns；不可得时恒 0 且 flags.bit1=1（S09） |
+pub const EVENT_RECORD_SIZE: usize = 16;
+
+/// 事件 kind：键按下（ADR-047 §2.1）。
+pub const EVENT_KIND_KEY_DOWN: u8 = 1;
+/// 事件 kind：键释放。字节流形态下被丢弃的释放事件自此保留
+/// （组合键/修饰键语义需要两侧——ADR-047 §2.2）。
+pub const EVENT_KIND_KEY_UP: u8 = 2;
+
+/// flags bit0：`0xE0` 扩展前缀标志（右 Ctrl/Alt、方向键/编辑键区）。
+pub const EVENT_FLAG_E0: u8 = 1 << 0;
+/// flags bit1：时间戳不可得（`now_nanos()` 返回 `None`）——timestamp 恒 0 且带此标注，
+/// 不伪装成真实时间（S09/S17：0 是合法 HPET 值，单独的 0 有歧义）。
+pub const EVENT_FLAG_NO_TIME: u8 = 1 << 1;
+
+/// 事件环形缓冲容量（**记录数**，非字节数）。
+///
+/// 与字节缓冲（`BUF_CAP=128` 字节）不同的量纲：128 条 16B 记录 = 2 KiB。
+/// 消费者（/devices/input/events 节点，后续小点接线）读得慢时最多积压 128 条。
+const EVQ_CAP: usize = 128;
+
+/// SPSC 环形缓冲：写=IRQ1 中断上下文（单生产者），读=内核读取路径（单消费者）。
+/// 索引单调递增（wrapping），槽位取模；与字节缓冲同一手法。
+static EVQ_WRITE: AtomicUsize = AtomicUsize::new(0);
+static EVQ_READ: AtomicUsize = AtomicUsize::new(0);
+/// 事件存储：每条记录 16 字节，按 [u64; 2] 两字存放（避免 per-byte 原子操作）。
+///
+/// 内存序纪律：`EVQ_DATA` 的写入先于 `EVQ_WRITE` 的 Release 存储；读者以
+/// `EVQ_WRITE` 的 Acquire 读配对——与字节缓冲（`BUF_DATA`/`WRITE_INDEX`）同一约定。
+static EVQ_DATA: [AtomicU64; EVQ_CAP * 2] = [const { AtomicU64::new(0) }; EVQ_CAP * 2];
+/// 首条事件写入后置 1（读侧快速判空，与 BUF_INIT 同款）。
+static EVQ_INIT: AtomicU32 = AtomicU32::new(0);
+
+/// 因事件缓冲满而被丢弃的事件总数（单调递增）。
+///
+/// AM4 同款纪律（S09）：满时丢弃不覆盖未读，但**必须留下计数痕迹**——
+/// 「输入无损」不是假设，是可观察的事实。
+static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// 投递一条原始键事件（IRQ1 中断上下文调用；ADR-047 §2.5「原子入流」：
+/// 单条事件 16 字节一次写完，读者不会看到半条）。
+///
+/// `code` 传**原始键码**（scancode set 1，已剥 bit7），`e0` 为扩展前缀标志，
+/// `key_up` 决定 kind。**不译 ASCII、不折叠 Ctrl**——那是用户态转换层的事
+/// （ADR-047 §2.2 / ADR-045 决策 3）。Shift/Ctrl 键自身也投递（`0x2A/0x36/0x1D`），
+/// 转换层要靠它们维护修饰键状态机。
+fn push_event(e0: bool, code: u8, key_up: bool) {
+    let w = EVQ_WRITE.load(Ordering::Relaxed);
+    let r = EVQ_READ.load(Ordering::Relaxed);
+    if w.wrapping_sub(r) >= EVQ_CAP {
+        DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // 时间戳：不可得时恒 0 + 显式标注（S09）。
+    let (ts, no_time) = match klib::time::now_nanos() {
+        Some(t) => (t, false),
+        None => (0u64, true),
+    };
+    let mut flags = 0u8;
+    if e0 {
+        flags |= EVENT_FLAG_E0;
+    }
+    if no_time {
+        flags |= EVENT_FLAG_NO_TIME;
+    }
+    let kind = if key_up { EVENT_KIND_KEY_UP } else { EVENT_KIND_KEY_DOWN };
+    // 记录低 8 字节：kind | flags | code(u16 LE) | value(u32 LE，键事件恒 0)。
+    let lo = (kind as u64)
+        | ((flags as u64) << 8)
+        | ((code as u64) << 16)
+        | (0u64 << 32);
+    let base = (w % EVQ_CAP) * 2;
+    EVQ_DATA[base].store(lo, Ordering::Relaxed);
+    EVQ_DATA[base + 1].store(ts, Ordering::Relaxed);
+    EVQ_WRITE.store(w + 1, Ordering::Release);
+    EVQ_INIT.store(1, Ordering::Release);
+    // 事件缓冲不参与旧字节路径的 notify_input——本小点尚无消费者，
+    // 有界积压由 EVQ_CAP 承接；节点接线小点再把唤醒接上。
+}
+
+/// 因事件缓冲满被丢弃的事件总数（诊断接口，AM4 同款）。
+pub fn dropped_events() -> u64 {
+    DROPPED_EVENTS.load(Ordering::Relaxed)
+}
+
+/// 弹出一条事件记录，写入 `out`（须 ≥ 16 字节；ADR-047 §2.1 布局）。
+/// 无事件返回 `false`（out 不被触碰）。
+///
+/// 读取路径（后续小点接 `/devices/input/events` 节点）调用；
+/// 单消费者纪律：与字节缓冲相同——只有这一处 pop。
+pub fn pop_event(out: &mut [u8]) -> bool {
+    if out.len() < EVENT_RECORD_SIZE {
+        return false;
+    }
+    if EVQ_INIT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let r = EVQ_READ.load(Ordering::Relaxed);
+    let w = EVQ_WRITE.load(Ordering::Acquire);
+    if r == w {
+        return false;
+    }
+    let base = (r % EVQ_CAP) * 2;
+    let lo = EVQ_DATA[base].load(Ordering::Relaxed);
+    let ts = EVQ_DATA[base + 1].load(Ordering::Relaxed);
+    EVQ_READ.store(r + 1, Ordering::Release);
+    out[0] = (lo & 0xFF) as u8;
+    out[1] = ((lo >> 8) & 0xFF) as u8;
+    out[2] = ((lo >> 16) & 0xFF) as u8;
+    out[3] = ((lo >> 24) & 0xFF) as u8;
+    out[4] = ((lo >> 32) & 0xFF) as u8;
+    out[5] = ((lo >> 40) & 0xFF) as u8;
+    out[6] = ((lo >> 48) & 0xFF) as u8;
+    out[7] = ((lo >> 56) & 0xFF) as u8;
+    out[8..16].copy_from_slice(&ts.to_le_bytes());
+    true
+}
+
+/// 事件缓冲是否非空。
+pub fn has_event() -> bool {
+    EVQ_READ.load(Ordering::Relaxed) != EVQ_WRITE.load(Ordering::Acquire)
+}
+
 // ---------- IRQ1 中断 handler ----------
 
 /// IRQ1 键盘中断：读扫描码、处理 `0xE0` 扩展前缀、译码并压入缓冲。
@@ -478,12 +611,16 @@ pub extern "C" fn irq1_handler(_irq: u8) -> bool {
     let key_up = scancode & 0x80 != 0; // bit7=1 表示释放
     let code = scancode & 0x7F;
 
+    // I-EVENTS 阶段 1（ADR-047；双轨）：**全部**键事件（含 Shift/Ctrl 自身、含释放）
+    // 以原始键码投递到事件缓冲——不译 ASCII、不折叠 Ctrl（转换层归用户态，ADR-047 §2.2）。
+    // 位于状态位维护之后、字节译码之外：旧字节路径（下方 match）零改动。
+    push_event(e0, code, key_up);
     if code == SC_LSHIFT || code == SC_RSHIFT {
         SHIFT.store(if key_up { 0 } else { 1 }, Ordering::Relaxed);
     } else if code == SC_LCTRL {
         // §6.8：左右 Ctrl 同为 0x1D（右键靠 E0 前缀区分），语义相同。
         CTRL.store(if key_up { 0 } else { 1 }, Ordering::Relaxed);
-    } else {
+    } else if !key_up {
         match decode_key(e0, code, key_up) {
             KeyOut::None => {}
             KeyOut::Ascii(c) => push(c),

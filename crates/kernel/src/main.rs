@@ -843,6 +843,9 @@ unsafe fn kmain_body() -> ! {
     // §6.12.5（裁决甲）：STREAM_READ a5 标志位判定（纯函数，无副作用）。
     #[cfg(feature = "kernel-tests")]
     tests::test_read_nonblock_flag();
+    // I-EVENTS 阶段 1（ADR-047）：事件缓冲空态契约与布局常量（无副作用）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_event_buffer_empty_contract();
     // §6.12.6：RUN 域锁同核重入死锁复现（纯锁语义，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_run_lock_reentrancy_deadlock();
