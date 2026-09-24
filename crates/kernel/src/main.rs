@@ -1061,6 +1061,10 @@ unsafe fn kmain_body() -> ! {
     // 注册键盘输入回调：有按键时唤醒阻塞在 `read` 的进程（如 shell）。arch 层
     // 不反向依赖 kernel，经函数指针解耦（指向 `task::wake_kbd`）。
     arch_x86_64::keyboard::set_input_callback(task::wake_kbd);
+    // 注册键盘**事件记录**回调（I-EVENTS 阶段 2）：`push_event` 投递记录后唤醒
+    // 阻塞在 `/devices/input/events` 读上的进程。与上面的 stdin 字节路径回调
+    // 分开（等待者语义不同，见 arch 层 `EVENT_CB` 说明）——旧路径零改动。
+    arch_x86_64::keyboard::set_event_callback(task::wake_input_event);
     // 注册设备事件唤醒回调（interrupt-to-futex）：`driver::event::publish_event`
     // 发布硬件拓扑事件时唤醒阻塞在事件等待的进程（volumed 的 SYS_DRIVER_EVENT_NEXT
     // 阻塞态）。driver 不反向依赖 task，经函数指针解耦（指向 `task::wake_event`）。

@@ -765,6 +765,26 @@ pub trait INode: Send + Sync {
     fn blocks_when_empty(&self) -> bool {
         false
     }
+
+    /// 本节点的读是否是**键盘事件记录流**（I-EVENTS 阶段 2，ADR-047）。
+    ///
+    /// **为何需要**：事件节点的空读语义与普通节点不同——`read_at` 返回
+    /// `Ok(0)` 表示「此刻没有键事件」，而**稍后一定会有**（等待源是 IRQ1）。
+    /// 但 `blocks_when_empty` 的既有消费路径要求节点以 `Err(WouldBlock)`
+    /// 表达「稍后会有」，事件节点如实返回 `Ok(0)`（空读不是错误，是「读走 0
+    /// 条」），故需要独立的节点真值把「空读应入睡等 IRQ」这一语义显式声明
+    /// 出来，而不是让 syscall 层按 fd 号或路径字符串猜测（S15 单点定义）。
+    ///
+    /// 与 `blocks_when_empty` 的分工：后者是**通用**的「空读应睡」声明
+    /// （音频 dsp 用，等待源是 PCM 数据到达）；本方法是**键盘记录流**的
+    /// 专用声明（等待源是 IRQ1 的 EVQ 环），syscall 层据此接
+    /// `task::block_for_input_event` 与 `task::wake_input_event` 的回调。
+    ///
+    /// **默认 `false`**（S17 安全侧）：漏写覆写只会让事件节点的空读如实
+    /// 返回 0（消费者退化为轮询），**不会**让普通文件的 EOF 变成无限挂起。
+    fn input_event_stream(&self) -> bool {
+        false
+    }
     /// 本节点是否为**终端**（ADR-044 §1.2，决策 2）：`isatty` 的真值依据。
     ///
     /// **默认 `false`**（S17 安全侧）：绝大多数节点（ramfs/procfs/sysfs/块设备/

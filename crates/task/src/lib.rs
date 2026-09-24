@@ -38,6 +38,8 @@ pub use scheduler::{
     // A2：音频等待者（plan_audio_vfs.md 批次二）。
     block_for_audio, wake_audio, wake_audio_timeout, set_audio_timeout_timer,
     clear_audio_timeout_timer, clear_audio_waiter_if,
+    // I-EVENTS 阶段 2：键盘事件记录等待者（ADR-047）。
+    InputEventBlock, block_for_input_event, wake_input_event, clear_input_event_waiter_if,
 };
 #[cfg(feature = "kernel-tests")]
 pub use scheduler::test_hooks;

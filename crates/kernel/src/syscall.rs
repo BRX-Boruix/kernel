@@ -2168,7 +2168,29 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
             handle.pread(fpos, chunk)
         };
         match got {
-            Ok(0) => break, // EOF（total==0 时即原始 EOF 语义）
+            // I-EVENTS 阶段 2（ADR-047）：键盘事件记录流的**空读不是 EOF**，
+            // 而是「此刻没有键事件」——等待源是 IRQ1，稍后必有。故在
+            // total==0 时登记等待者并挂起（`push_event` → `wake_input_event`
+            // 唤醒后用户态经哨兵重试取记录），而不是把 Ok(0) 当 EOF 交付。
+            //
+            // 已在本次 read 交付过部分记录（total>0）则按短读如实返回：
+            // 让调用方先消费已到的记录，避免"为了凑满一次调用而扣住数据"。
+            // 节点真值判定（S15）：仅 `input_event_stream()` 自述为真的节点走
+            // 此路，普通文件/其它设备的 Ok(0) 仍逐位保持原 EOF 语义。
+            Ok(0) => {
+                if total == 0 && handle.inode.input_event_stream() {
+                    match input_event_blocking(frame) {
+                        // 已挂起切走（`Switched`）或已如实交付（等待者被占
+                        // 时的 0 字节）：本帧结果已定，入口不得再写返回值。
+                        Some(r) => return r,
+                        // 复检发现记录已到：回到循环顶部重读并交付。
+                        // 循环有进展的保证见 `input_event_blocking` 的注释
+                        // （仅事件环非空时返回本支）。
+                        None => continue,
+                    }
+                }
+                break; // EOF（total==0 时即原始 EOF 语义）
+            }
             Ok(r) => {
                 if let Err(e) = validate_user_range(ubuf, r as u64, UserAccess::Write) {
                     if total == 0 {
@@ -2236,6 +2258,72 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
         }
     }
     done(pack_ok(total))
+}
+
+/// 键盘事件记录流空读的阻塞路径（I-EVENTS 阶段 2，ADR-047）。
+///
+/// 与 [`event_wait_blocking`] 同构（S15 单点：同一套登记→复检→挂起纪律，
+/// 不另造一套）：登记 `IN_EVENT_WAITER` → 在锁内复检事件环 → 仍空则挂起
+/// 本进程并切走；IRQ1 的 `push_event` 经 `task::wake_input_event` 唤醒。
+///
+/// **不做超时**（与 `event_wait_blocking` / `audio_fetch_blocking` 的差异，
+/// 是刻意的）：键盘事件等待是**无限期**语义——`read` 一个键盘设备本就应当
+/// 阻塞到有按键为止（POSIX 终端/输入设备语义）。音频取超时是因为其生产者
+/// 可能是已死的驱动（无限等待会让调用者永久挂死）；键盘的生产者是 IRQ1，
+/// 硬件中断永不「退出」，故无限等待不会变成挂死。用户态若需非阻塞语义，
+/// 走 `read_nonblocking`（探键）或 `yield` 自旋——那是调用方的选择，
+/// 不是节点的默认。
+///
+/// 返回 `Some(result)` 表示**本帧已被接管或已交付**（调用方须直接返回该
+/// 结果）；`None` 表示「记录已到、请调用方重读交付」（调用方 `continue`）。
+/// 三态语义与成因一一对应：
+/// - `Some(Switched)`：已挂起切走，用户态经 `-EAGAIN` 哨兵重试；
+/// - `Some(Done(0))`：`IN_EVENT_WAITER` 已被别的进程占用，如实交付
+///   「读走 0 条」——不抢别人的记录、也不谎报数据（KM15 单读者仲裁）；
+/// - `None`：锁内复检发现记录**确已到达**（登记与到达的竞争由本复检闭合，
+///   见 `block_for_input_event` 的 lost-wakeup 论证），重读即可交付。
+///
+/// **诊断日志**：仅在「真的切走」时留一条运行期痕迹（同 audio 路径纪律）——
+/// 事件阻塞是本批次无法在启动期测试覆盖的路径，e2e 需要能区分
+/// 「挂在等键」与「卡在别处」。
+/// 事件流空读导致的内核阻塞次数（S09 可观察）。
+///
+/// **为何是原子计数而非日志**：本计数在**切换路径上**递增，而日志会取控制台/
+/// 串口锁——切换会整体替换中断帧，锁可能随被切走的帧一起悬挂（实测缺陷：
+/// 加日志后 evdemo 固定在第 6 轮冻结）。计数器无锁、无分配，切换前安全。
+/// 真机验收以「evdemo 的 `waits=` 与连续阻塞-唤醒循环」为判据，不依赖日志。
+pub static BLOCKED_ON_EVENTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+fn input_event_blocking(frame: &mut SyscallFrame) -> Option<DispatchResult> {
+    let Some(pid) = current_proc_mut().map(|p| p.pid()) else {
+        // 无当前进程（内核启动期）：如实返回「读走 0 条」。
+        return Some(done(pack_ok(0)));
+    };
+    // 重新登记前清理本进程残留的等待者身份：唤醒哨兵重试的路径不清
+    // IN_EVENT_WAITER（只有真正的按键唤醒经 swap 清），残留会让本次 CAS 失败
+    // 并被误判为「已有并发等待者」，退化成空读。只在仍指向本 pid 时清，
+    // 不误伤指向其它 pid 的并发等待者（与 clear_event_waiter_if 同纪律）。
+    task::clear_input_event_waiter_if(pid);
+    match task::block_for_input_event(arch_frame(frame)) {
+        // 已挂起切走：本帧整体交棒，用户态经 `-EAGAIN` 哨兵重试 read。
+        task::InputEventBlock::Switched => {
+            // 运行期痕迹（同 audio 阻塞路径纪律）：事件阻塞无法在启动期
+            // 测试覆盖，e2e 需能区分「挂在等键」与「卡在别处」。
+            // S09 可观察：以**不持控制台锁**的方式留痕。此处位于切换路径上，
+            // 不能用 `klib::info!`——它在切换前取控制台/串口锁，而现场即将被
+            // 整体替换，锁可能随被切走的帧一起「悬挂」（实测：加了这条日志后
+            // evdemo 在第 6 轮冻结）。故只累加一个原子计数，由 status 遥测读取。
+            BLOCKED_ON_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let _ = pid;
+            Some(DispatchResult::Switched)
+        }
+        // 锁内复检发现记录已到：令调用方重读交付（本轮由复检观察到，
+        // 不会空转——`.0` 为 true 即「重读」信号，见函数与调用点契约）。
+        task::InputEventBlock::RecordsReady => None,
+        // 已有并发等待者：如实返回「读走 0 条」，不抢别人的记录。
+        task::InputEventBlock::WaiterBusy => Some(done(pack_ok(0))),
+    }
 }
 
 /// `AUDIO_FETCH` 的无数据阻塞路径（A2，plan §3.4）。

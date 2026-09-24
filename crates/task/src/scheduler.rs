@@ -1886,6 +1886,22 @@ const KBD_WAKE_RETRY_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as u
 /// KM15 单读者仲裁）。
 static EVENT_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
+/// 阻塞等待**键盘事件记录**（`/devices/input/events`）的进程 pid
+/// （`u32::MAX` 表示无）。I-EVENTS 阶段 2：`block_for_input_event` 以 CAS 登记
+/// 唯一等待者，IRQ1 的 `push_event` 经回调 [`wake_input_event`] 唤醒。
+///
+/// **为何不复用 EVENT_WAITER**（S15 单点语义）：`EVENT_WAITER` 的等待源是
+/// `driver::event` 的**设备拓扑事件队列**（`publish_event` 发布、`peek_event`
+/// 消费），等待者的用户态契约是 `-EAGAIN` 哨兵重试 `SYS_DRIVER_EVENT_NEXT`。
+/// 本等待者的等待源是 arch 层的 **EVQ 键盘记录环**（`push_event` 生产、
+/// `pop_event` 消费），用户态契约是「`read` 重试取记录」。两者生产者、消费者、
+/// 唤醒回调、用户态重试协议全不同；共用一个槽会让热插拔事件唤醒正在等键盘的
+/// 进程（反之亦然），把「误唤醒」变成用户态可见的错误交付。
+///
+/// 与 `KBD_WAITER` 的分工同理：后者是 stdin **字节**流的等待者（`push` 唤醒），
+/// 本槽是**记录**流的等待者（`push_event` 唤醒）。
+static IN_EVENT_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
 /// 阻塞当前进程等待设备事件（`driver::event` 队列非空），或事件到达前一直挂起。
 ///
 /// 返回 [`SwitchOutcome`]：
@@ -1991,6 +2007,167 @@ pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
             }
         }
     }
+}
+
+/// [`block_for_input_event`] 的结果。
+///
+/// **为何需要三态**（而非复用 [`SwitchOutcome`]）：调用方必须能区分
+/// 「已挂起」「记录已到、重读即可交付」「等待者被别的进程占用」——
+/// 三者对应的动作完全不同（交棒 / 重读 / 如实返回 0）。若把后两者混为
+/// `NotSwitched`，调用方只能靠再查一次 `has_event()` 猜测，而「查询」与
+/// 「当时那次读返回空」之间存在竞态：猜错就会变成**内核态紧循环**
+/// （实测缺陷：`continue` 重读仍空、反复进入本函数而不让出 CPU）。
+pub enum InputEventBlock {
+    /// 已挂起切走：调用方须以 `DispatchResult::Switched` 收尾，不得再写返回值。
+    Switched,
+    /// 锁内复检发现记录**确已到达**：调用方应重读一次并如实交付。
+    RecordsReady,
+    /// `IN_EVENT_WAITER` 已被别的进程占用：调用方应如实返回「读走 0 条」
+    /// （KM15 单读者仲裁——不抢别人的记录，也不谎报数据）。
+    WaiterBusy,
+}
+
+/// 阻塞当前进程等待**键盘事件记录**（`/devices/input/events` 空读，I-EVENTS
+/// 阶段 2）。与 [`block_for_event`] 同构（S15 单点：同一套登记/复检/挂起纪律，
+/// 不另造一套），差异仅在**等待源判定**与**等待槽/唤醒回调**。
+///
+/// 返回 [`InputEventBlock`] 三态（成因与动作一一对应，见该类型说明）：
+/// - `Switched`：已置 Blocked 切走。唤醒后经中断路径回归用户态，
+///   `slot.saved.rax` 由唤醒方预置 `-EAGAIN` 哨兵，用户态据此**重试**
+///   `read` 取记录。
+/// - `RecordsReady`：锁内复检发现记录已到 → 调用方重读交付。
+/// - `WaiterBusy`：已有并发等待者 → 调用方如实返回「读走 0 条」。
+///
+/// **lost-wakeup 论证**：登记（CAS 写 `IN_EVENT_WAITER`）先于 per-pid 临界区；
+/// 置 Blocked 在 cur 的 per-pid 锁内完成；[`wake_input_event`] 也取目标 pid 锁
+/// 才改 Ready。故「记录到达（IRQ1 → `push_event` → `wake_input_event`）」与
+/// 「本进程登记」二者被锁完全串行——事件先到则本进程复检 `has_event()` 为真、
+/// 不阻塞；本进程先登记则 IRQ 必在登记后（锁内）读到 pid 并唤醒。
+/// `push_event` **先入队再唤醒**，保证唤醒者复检时必见记录。
+///
+/// **中断上下文安全性**：`wake_input_event` 由 IRQ1 调用，故其临界区只取
+/// per-pid 锁（`IrqSpinLock` 在取锁期间屏蔽中断），与本函数同款；登记槽操作
+/// 全为单次原子读改写，不含阻塞/分配。
+pub fn block_for_input_event(frame: &mut InterruptFrame) -> InputEventBlock {
+    let cur_pid = {
+        // 纯 RUN 读取（b）：短暂取本核 RUN 域读 current 即可，无需 pid 锁。
+        let run = run_mut(my_cpu_slot());
+        let cur = run.current.expect("block_for_input_event outside process");
+        assert!(
+            cur < u32::MAX as usize,
+            "pid {} collides with IN_EVENT_WAITER sentinel",
+            cur
+        );
+        cur
+    };
+    if IN_EVENT_WAITER
+        .compare_exchange(
+            u32::MAX,
+            cur_pid as u32,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // 已有并发等待者：不阻塞（调用方如实返回空读，不顶掉既有等待者）。
+        return InputEventBlock::WaiterBusy;
+    }
+    // 登记后复检事件环：若已非空，撤销登记、不阻塞（调用方立即重读交付）。
+    // 这是 lost-wakeup 的关键防线：记录先到则此处直接观察到，绝不错过。
+    if arch_x86_64::keyboard::has_event() {
+        IN_EVENT_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+        return InputEventBlock::RecordsReady;
+    }
+    // 置 Blocked 并保存现场（同 block_for_event：浮点现场由 commit_next 路径
+    // 在唤醒后显式保存，此处不重复归档，K2 纪律）。
+    let cpu_slot = my_cpu_slot();
+    // per-pid（a）：只取本核 RUN 域；cur 槽访问逐 pid 锁。
+    let mut run = run_mut(cpu_slot);
+    {
+        let mut g = proc_bucket_lock(cur_pid);
+        if let Some(slot) = g.get_mut(&cur_pid) {
+            slot.saved = *frame;
+            fpu::save(&mut slot.fpu);
+            slot.fs_base = gdt::read_fs_base();
+            slot.proc.set_state(TaskState::Blocked);
+        }
+    }
+    run.current = None;
+    clear_current_proc();
+
+    match pop_and_commit_switch(&mut run, frame, None, usize::MAX) {
+        NextCommit::Switched => {
+            // **不清登记**（同 block_for_event 的 Switched 分支纪律）：
+            // IN_EVENT_WAITER 的清除由唤醒方（wake_input_event 的 swap）负责。
+            // 此处若清掉，后续按键的 push_event 会读到 MAX、无法唤醒本进程。
+            InputEventBlock::Switched
+        }
+        NextCommit::Empty | NextCommit::NothingSelf => {
+            drop(run);
+            match schedule_from_block(frame, cur_pid) {
+                // 切到其它就绪进程：自己仍 Blocked + 登记不变。
+                BlockResume::SwitchedOther => InputEventBlock::Switched,
+                // 自己被按键唤醒入队：切回自身。清理登记（事件唤醒已 swap 走
+                // IN_EVENT_WAITER，本 pid 不在，CAS 无效；此处保留为对称防御，
+                // 与 block_for_event 同构）。
+                BlockResume::SwitchedSelf => {
+                    let _ = IN_EVENT_WAITER.compare_exchange(
+                        cur_pid as u32,
+                        u32::MAX,
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                    );
+                    InputEventBlock::Switched
+                }
+            }
+        }
+    }
+}
+
+/// 键盘事件记录入队后唤醒等待者（IRQ1 → `push_event` 经回调调用）。
+///
+/// 取走唯一等待者 `IN_EVENT_WAITER`，若其仍处 `Blocked`，把保存帧 rax 预置为
+/// 「曾阻塞、请重试」哨兵（`EVENT_WAKE_RETRY_SENTINEL` = `-EAGAIN`）并置 Ready
+/// 入就绪队列——用户态 `read` 封装识别哨兵后重试取记录（与 `wake_event`
+/// 的同款重试协议）。
+///
+/// **中断上下文**：本函数在 IRQ1 内执行，只取 per-pid 锁（IrqSpinLock 屏蔽
+/// 中断）且不做分配/阻塞；`wake_enqueue` 负责跨核 IPI 的延迟唤醒。
+pub fn wake_input_event() {
+    let p = IN_EVENT_WAITER.swap(u32::MAX, core::sync::atomic::Ordering::AcqRel);
+    if p == u32::MAX {
+        return; // 无等待者：绝大多数按键都走这条快路径。
+    }
+    // per-pid（a）：只在该 pid 仍 Blocked 且非 waitpid 等待者时才唤醒——
+    // 已因其它途径醒来的进程不重复入队（同 wake_event 的判据）。
+    let enqueue = {
+        let mut g = proc_bucket_lock(p as usize);
+        match g.get_mut(&(p as usize)) {
+            Some(slot) if slot.waiting_for.is_none() && slot.proc.state() == TaskState::Blocked => {
+                slot.saved.rax = EVENT_WAKE_RETRY_SENTINEL;
+                slot.proc.set_state(TaskState::Ready);
+                Some(slot.home_cpu)
+            }
+            _ => None,
+        }
+    };
+    if let Some(home) = enqueue {
+        wake_enqueue(p as usize, home);
+    }
+}
+
+/// 清 `IN_EVENT_WAITER` 中残留的本进程登记（仅当仍指向 `pid`）。
+///
+/// 与 [`clear_event_waiter_if`] 同构：`read` 路径在**重新登记前**调用，清掉
+/// 上一次「已就绪但登记未清」的残留，避免本次 CAS 失败被误判为「已有并发
+/// 等待者」而退化成空读轮询。绝不误伤指向其它 pid 的并发等待者。
+pub fn clear_input_event_waiter_if(pid: usize) {
+    let _ = IN_EVENT_WAITER.compare_exchange(
+        pid as u32,
+        u32::MAX,
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Acquire,
+    );
 }
 
 /// 有设备事件入队时唤醒阻塞等待的进程（由 `driver::event::publish_event` 经

@@ -393,6 +393,35 @@ fn push(ch: u8) {
     notify_input(); // 唤醒阻塞在 read 的进程
 }
 
+/// 事件记录入队后通知等待方的回调（I-EVENTS 阶段 2）。由内核在启动时经
+/// [`set_event_callback`] 注册（指向 `task::wake_input_event`）。arch 层不反向
+/// 依赖 task，故与 [`INPUT_CB`] 同样用函数指针解耦。
+///
+/// **为何与 `INPUT_CB` 分开**：`INPUT_CB`（[`notify_input`]）挂的是 stdin 字节
+/// 路径的唯一等待者（`KBD_WAITER`），由每次 `push()` 调用；本回调挂的是
+/// `/devices/input/events` 事件流路径的等待者（`IN_EVENT_WAITER`），由
+/// [`push_event`] 调用。两条路径的等待者语义不同（字节 vs 16 字节记录），
+/// 共用回调会把「事件到达」误当成「stdin 有字符」唤醒错误的进程。
+static mut EVENT_CB: Option<fn()> = None;
+
+/// 注册事件记录入队回调（内核启动时调用一次）。
+pub fn set_event_callback(cb: fn()) {
+    // SAFETY: 早期单线程注册，之后仅只读访问。
+    unsafe {
+        EVENT_CB = Some(cb);
+    }
+}
+
+/// 通知事件等待方：有记录入队（IRQ1 中断上下文调用）。
+fn notify_event() {
+    // SAFETY: 回调只读，且已注册（未注册时为 None，静默跳过）。
+    unsafe {
+        if let Some(cb) = EVENT_CB {
+            cb();
+        }
+    }
+}
+
 /// 因缓冲满而被丢弃的键字节总数（单调递增）。
 static DROPPED_KEYS: AtomicU64 = AtomicU64::new(0);
 
@@ -539,8 +568,10 @@ fn push_event(e0: bool, code: u8, key_up: bool) {
     EVQ_DATA[base + 1].store(ts, Ordering::Relaxed);
     EVQ_WRITE.store(w + 1, Ordering::Release);
     EVQ_INIT.store(1, Ordering::Release);
-    // 事件缓冲不参与旧字节路径的 notify_input——本小点尚无消费者，
-    // 有界积压由 EVQ_CAP 承接；节点接线小点再把唤醒接上。
+    // I-EVENTS 阶段 2：唤醒阻塞在 `/devices/input/events` 读上的进程。
+    // 与旧字节路径的 `notify_input` 分开（两条路径的等待者语义不同，见
+    // `EVENT_CB` 说明）——旧路径零改动（双轨红线）。
+    notify_event();
 }
 
 /// 因事件缓冲满被丢弃的事件总数（诊断接口，AM4 同款）。
@@ -581,8 +612,18 @@ pub fn pop_event(out: &mut [u8]) -> bool {
     true
 }
 
-/// 事件缓冲是否非空。
+/// 事件缓冲是否**可读**（即 `pop_event` 此刻是否会返回 `true`）。
+///
+/// **必须与 [`pop_event`] 判据逐位一致**（S15 单点真值）：`pop_event` 先查
+/// `EVQ_INIT`、再查 `r == w`，本函数也必须两者都查。否则「`has_event()` 为真
+/// 而 `pop_event` 返回空」的矛盾态会让调用方（`block_for_input_event` 的锁内
+/// 复检 → `sys_read` 重读）陷入**内核态紧循环**——实测缺陷：evdemo 在事件环
+/// 为空后固定冻结（该矛盾态出现在 `push_event` 尚未完成 `EVQ_INIT` 置位的
+/// 极早窗口，以及 `EVQ_READ` 被推进到与 `EVQ_WRITE` 相等的瞬间）。
 pub fn has_event() -> bool {
+    if EVQ_INIT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
     EVQ_READ.load(Ordering::Relaxed) != EVQ_WRITE.load(Ordering::Acquire)
 }
 

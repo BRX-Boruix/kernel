@@ -414,6 +414,15 @@ impl INode for InputEventsNode {
         Err(Error::NotSupported)
     }
 
+    /// 本节点是键盘**事件记录流**（I-EVENTS 阶段 2 的节点真值）：空读
+    /// 表示「此刻无键事件」而**非**「永久不可读」——等待源是 IRQ1 的 EVQ 环，
+    /// 记录到达由 `push_event` → `task::wake_input_event` 唤醒。syscall 层的
+    /// `read` 据此在空读时登记等待者并挂起，而不是退回用户态轮询
+    /// （轮询会让事件消费者在忙等的调度环境里被饿死，实测缺陷）。
+    fn input_event_stream(&self) -> bool {
+        true
+    }
+
     fn metadata(&self) -> Result<FileMetadata, Error> {
         Ok(FileMetadata {
             size: 0,
