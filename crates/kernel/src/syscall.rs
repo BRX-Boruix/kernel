@@ -3403,19 +3403,57 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
     // 回调在 tick 中断的 `poll_timeouts`（锁外）执行，取调度 per-pid 锁安全。
     if klib::time::set_timeout(timeout_ns, task::wake, cur_pid).is_none() {
         // 定时器表满（klib time.rs：有界静态槽位，MAX_TIMERS）：退化忙等，
-        // 不丢 sleep 语义。
-        klib::time::sleep_nanos(timeout_ns);
+        // 不丢 sleep 语义。表满是**瞬时**状态（poll 持续回收到期槽），与
+        // NotSwitched 修复同理，此处也在关中断窗口内——分段忙等 + 表位重试。
+        const TFULL_SLICE_NS: u64 = 1_000_000;
+        let deadline = klib::time::now_nanos()
+            .expect("clock_ready checked")
+            .saturating_add(timeout_ns);
+        while klib::time::now_nanos().map_or(false, |n| n < deadline) {
+            if klib::time::set_timeout(timeout_ns, task::wake, cur_pid).is_some() {
+                // 拿到表位：到期由 wake 唤醒。但本进程此刻仍处 Running（未
+                // 阻塞），wake 对非 Blocked 进程是 no-op——所以仍需自行等到
+                // deadline。走下方的分段忙等（拿到的表位到期后回调 no-op，
+                // 无副作用；表位由 poll 正常回收）。
+            }
+            klib::time::sleep_nanos(TFULL_SLICE_NS);
+        }
+        while klib::time::now_nanos().map_or(false, |n| n < deadline) {
+            klib::time::sleep_nanos(TFULL_SLICE_NS);
+        }
         return done(pack_ok(0));
     }
     // 原子阻塞：register 在调度锁内复检 deadline，消除 lost-wakeup。
+    //
+    // §6.12.6 修复：**禁止**在 NotSwitched 分支一次性忙等全部 timeout_ns。
+    // 该忙等发生在 syscall 的关中断窗口内（syscall 经 IA32_FMASK 清 IF）——
+    // 实测 userd 的 10s 对账睡眠恰逢就绪队列空时在此忙等 10 秒，IRQ0/IRQ1
+    // 全程被屏蔽：BSP 周期中断停止、软件定时器全部停摆、键盘毫无响应，
+    // 系统表现为间歇性「死机」（判定实验：[WAIT10] pid=4 ns=10s +
+    // [SLP] remain=4.3s + 冻结期 RIP 98% 落在 sleep_nanos，RFL IF=0）。
+    //
+    // 正确做法：**重试阻塞**。NotSwitched 只表示「此刻就绪队列空/仅自身」，
+    // 但其它核的进程仍在推进、中断仍在投递，队列随时可能被填充；每次重试
+    // 前用 register 复检 deadline（已过则立即收工，定时器 wake 对 Running
+    // 进程是 no-op，无重复唤醒风险）。两次重试之间**不再**自旋耗尽时长，
+    // 而是让出多次机会，保证 IRQ 一直能进来。
+    // 兜底：若系统确实单进程独跑（连重试多次都无法切走），用**分段**短忙等
+    // （每段 ≤1ms，段间复检 deadline 并重试阻塞），单段最长关中断 1ms，
+    // 远小于一个调度 tick（10ms），不会饿死中断。
     let register = &mut || klib::time::now_nanos().map_or(false, |n| n < deadline);
-    match task::block_current_with(arch_frame(frame), register) {
-        task::SwitchOutcome::Switched => DispatchResult::Switched,
-        task::SwitchOutcome::NotSwitched => {
-            // 就绪队列空 / 仅自身（阻塞会自锁），或 deadline 已过（定时器已
-            // 触发）：退化为忙等剩余时间（deadline 已过时立即返回，占 CPU 无害）。
-            klib::time::sleep_nanos(timeout_ns);
-            done(pack_ok(0))
+    const FALLBACK_SLICE_NS: u64 = 1_000_000; // 兜底忙等单段上限：1ms ≪ 1 tick
+    loop {
+        // deadline 已过：立即返回（sleep 语义已完成；定时器 no-op 无副作用）。
+        if !register() {
+            return done(pack_ok(0));
+        }
+        match task::block_current_with(arch_frame(frame), register) {
+            task::SwitchOutcome::Switched => return DispatchResult::Switched,
+            task::SwitchOutcome::NotSwitched => {
+                // 此刻无法安全切走：短忙等一小段（≤1ms，IRQ 可打断后续轮次），
+                // 然后回循环顶重试阻塞/复检 deadline。
+                klib::time::sleep_nanos(FALLBACK_SLICE_NS);
+            }
         }
     }
 }
