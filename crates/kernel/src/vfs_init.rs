@@ -490,6 +490,17 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                     arch_x86_64::keyboard::dropped_events(),
                 )?;
                 o.field_bool("has_pending", arch_x86_64::keyboard::has_event())?;
+                // §6.13 定位用真值（S09 可观察）：环深度与 read 阻塞次数并列，
+                // 用来区分「内核态紧循环」与「环里有一条永不消费的记录」——
+                // 二者的 `has_pending` 都是 true，唯有这两个计数能分开。
+                o.field_u64(
+                    "pending_events",
+                    arch_x86_64::keyboard::pending_events(),
+                )?;
+                o.field_u64(
+                    "blocked_on_events",
+                    crate::syscall::BLOCKED_ON_EVENTS.load(core::sync::atomic::Ordering::Relaxed),
+                )?;
                 o.end()
             })
             .expect("Vec-backed input-events status JSON serialization cannot fail");

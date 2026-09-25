@@ -578,6 +578,23 @@ fn push_event(e0: bool, code: u8, key_up: bool) {
 pub fn dropped_events() -> u64 {
     DROPPED_EVENTS.load(Ordering::Relaxed)
 }
+/// 事件环当前**待读记录数**（诊断接口，§6.13 定位用）。
+///
+/// **为何需要这个读数**：§6.13 的缺陷表现为「有进程阻塞在事件节点上时烧满一个核」。
+/// 判定它是「`has_event()` 为真而 `read_at` 交付 0 字节」的内核态紧循环，
+/// 还是「环里真有一条永不消费的记录」，需要**同时**看到「环深度」与
+/// 「`read` 是否在推进」两个真值。仅凭 `has_pending` 布尔无法区分二者。
+///
+/// **无副作用**：只读两个原子索引，不推进 `EVQ_READ`（与 [`has_event`] 同纪律，
+/// 可安全重复调用，不会像 `pop_event` 那样消费记录而改变被观察系统）。
+pub fn pending_events() -> u64 {
+    if EVQ_INIT.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    let r = EVQ_READ.load(Ordering::Relaxed);
+    let w = EVQ_WRITE.load(Ordering::Acquire);
+    w.wrapping_sub(r) as u64
+}
 
 /// 弹出一条事件记录，写入 `out`（须 ≥ 16 字节；ADR-047 §2.1 布局）。
 /// 无事件返回 `false`（out 不被触碰）。
