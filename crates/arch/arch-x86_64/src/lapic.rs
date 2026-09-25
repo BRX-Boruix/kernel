@@ -231,11 +231,24 @@ pub extern "C" fn lapic_timer_handler(_irq: u8) -> bool {
         // klib::log::set_level(LogLevel::Debug)。
         klib::debug!("[lapic] tick cpu_slot={} count={}", slot, t);
     }
+    // ---- EOI 先于软件定时器回调（顺序原则，非 §6.12.5 主根因）----
+    //
+    // EOI 的语义是「本次中断受理完毕，可以再投递了」——它与「软件回调要
+    // 做什么、做多久」无关。若把 `poll_timeouts()` 放在 EOI 之前，回调的
+    // 耗时（如 `wake_enqueue` 取 `RUN` 锁的自旋等待，实测可达毫秒级）会
+    // 直接变成本核对 LAPIC「仍在受理」的时间：期间不投递任何后续中断。
+    // 回调属于软件逻辑，不该成为硬件中断重新使能的前提，故 EOI 先发。
+    //
+    // 注意：这只是**顺序卫生**。§6.12.5「前台 `^C` 失效」的真正根因是
+    // `sleep_blocking` 兜底忙等的关中断占空比（syscall.rs §6.12.5 追加
+    // 修复）与 `waitpid_timeout` pre 检查的测试形态泄漏（scheduler.rs
+    // `waitpid_probe`），不在本函数——彼处修复后，无论本函数回调多久，
+    // 系统中断都由那一侧保证不被饿死。
+    end_of_interrupt();
     // 软件定时器队列仅由 BSP（槽 0）驱动；AP 空转不碰（阶段 1 纪律）。
     if slot == 0 {
         klib::time::poll_timeouts();
     }
-    end_of_interrupt();
     true
 }
 
