@@ -3521,24 +3521,27 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
     // 注册一次性定时器，到期以 `task::wake(cur_pid)` 唤醒本进程。
     // 回调在 tick 中断的 `poll_timeouts`（锁外）执行，取调度 per-pid 锁安全。
     if klib::time::set_timeout(timeout_ns, task::wake, cur_pid).is_none() {
-        // 定时器表满（klib time.rs：有界静态槽位，MAX_TIMERS）：退化忙等，
-        // 不丢 sleep 语义。表满是**瞬时**状态（poll 持续回收到期槽），与
-        // NotSwitched 修复同理，此处也在关中断窗口内——分段忙等 + 表位重试。
-        const TFULL_SLICE_NS: u64 = 1_000_000;
+        // 定时器表满（klib time.rs：有界静态槽位，MAX_TIMERS）：退化「开中断
+        // 睡等」重试，不丢 sleep 语义。表满是**瞬时**状态（poll 持续回收到期
+        // 槽），重试拿表位即可。
+        // §6.12.5：此处与 FALLBACK 同处 syscall 关中断窗口，**绝不可**用
+        // `sleep_nanos` 纯自旋（历史缺陷：1ms 分段忙等在单核独跑时间接
+        // 闷死 IRQ0/IRQ1）。同款 `sti; hlt`：每个等待段都中断可投递。
         let deadline = klib::time::now_nanos()
             .expect("clock_ready checked")
             .saturating_add(timeout_ns);
         while klib::time::now_nanos().map_or(false, |n| n < deadline) {
             if klib::time::set_timeout(timeout_ns, task::wake, cur_pid).is_some() {
                 // 拿到表位：到期由 wake 唤醒。但本进程此刻仍处 Running（未
-                // 阻塞），wake 对非 Blocked 进程是 no-op——所以仍需自行等到
-                // deadline。走下方的分段忙等（拿到的表位到期后回调 no-op，
-                // 无副作用；表位由 poll 正常回收）。
+                // 阻塞），wake 对非 Blocked 进程是 no-op——继续走到 deadline，
+                // 拿到的表位到期后回调 no-op，无副作用；表位由 poll 正常回收。
             }
-            klib::time::sleep_nanos(TFULL_SLICE_NS);
-        }
-        while klib::time::now_nanos().map_or(false, |n| n < deadline) {
-            klib::time::sleep_nanos(TFULL_SLICE_NS);
+            // SAFETY: sti/hlt/cli 恒在 Ring0；sti-hlt 不丢中断窗由硬件保证。
+            // `cli` 必须在 hlt 返回后立刻恢复 IF=0——理由同 FALLBACK 分支：
+            // syscall 全程建立在「IF=0、持锁临界区不被中断」这条不变量上。
+            unsafe {
+                core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack, preserves_flags));
+            }
         }
         return done(pack_ok(0));
     }
@@ -3556,11 +3559,26 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
     // 前用 register 复检 deadline（已过则立即收工，定时器 wake 对 Running
     // 进程是 no-op，无重复唤醒风险）。两次重试之间**不再**自旋耗尽时长，
     // 而是让出多次机会，保证 IRQ 一直能进来。
-    // 兜底：若系统确实单进程独跑（连重试多次都无法切走），用**分段**短忙等
-    // （每段 ≤1ms，段间复检 deadline 并重试阻塞），单段最长关中断 1ms，
-    // 远小于一个调度 tick（10ms），不会饿死中断。
+    //
+    // §6.12.5 追加修复（^C 失效的真正根因）：上述 1ms 分段忙等**自身仍处在
+    // 关中断窗口内**——syscall 进入时 IA32_FMASK 已清 IF，`sleep_nanos` 是
+    // 纯 `spin_loop` 自旋、从不开中断。单核 + 「系统此刻只有本进程可运行」
+    // 时（典型：前台子进程 `sleep` 的 Blocked 期），分段忙等**背靠背衔接**，
+    // 关中断占空比 100%：实测 spinburn 每 40ms 睡眠期间 BSP 的 IRQ0/IRQ1
+    // **全部停止**（kdbg-irq0 slot0_ticks 冻结、poll_timeouts 冻结、
+    // shell 的 10ms 定时器永不 fire、`^C` 永远无人消费）。文档原称
+    // 「单段 ≤1ms 不会饿死中断」只在**多核**或**段间有其它进程插队**时
+    // 成立，单核独跑场景不成立——这是该论证的盲区。
+    //
+    // 修法：NotSwitched 时不再自旋，改用 **`sti; hlt; cli` 开中断睡等**——
+    // `sti` 从下一条指令边界才生效（硬件保证不丢中断窗），`hlt` 让核
+    // 睡到下一个中断到达（IRQ0 tick / IRQ1 键盘 / 其它 IRQ 都能唤醒），
+    // **`cli` 立刻把 IF 关回 0**。中断返回后回到本循环顶：复检 deadline
+    // 并重试阻塞。这样**每一段等待都是中断可投递的**，单核独跑不再闷死
+    // 系统，而段间的内核代码仍严格保持 IF=0。
+    // hlt 的唤醒源不保证是定时器 tick（可能是别的 IRQ），故唤醒后先
+    // 复检 deadline，未到就再睡——语义仍是「至多睡到 deadline」。
     let register = &mut || klib::time::now_nanos().map_or(false, |n| n < deadline);
-    const FALLBACK_SLICE_NS: u64 = 1_000_000; // 兜底忙等单段上限：1ms ≪ 1 tick
     loop {
         // deadline 已过：立即返回（sleep 语义已完成；定时器 no-op 无副作用）。
         if !register() {
@@ -3569,9 +3587,31 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
         match task::block_current_with(arch_frame(frame), register) {
             task::SwitchOutcome::Switched => return DispatchResult::Switched,
             task::SwitchOutcome::NotSwitched => {
-                // 此刻无法安全切走：短忙等一小段（≤1ms，IRQ 可打断后续轮次），
-                // 然后回循环顶重试阻塞/复检 deadline。
-                klib::time::sleep_nanos(FALLBACK_SLICE_NS);
+                // 此刻无法安全切走（就绪队列空/仅自身）。**开中断睡等**：
+                // `sti; hlt` 让本核睡到任一中断到达，随后**立刻 `cli`**。
+                //
+                // 【为何必须 cli 回来】syscall 经 `IA32_FMASK` 进入时 IF=0，
+                // 内核**整段**建立在这条不变量上：`IrqSpinLock::irq_save`
+                // 保存的旧状态恒为 IF=0，guard 析构的 `irq_restore` 也只恢复
+                // IF=0，故持锁临界区**永不被中断打断**。若只 sti 而不 cli，
+                // IF 会一直开到 sysret——后续每次 `irq_restore` 都把中断重新
+                // 打开，等于**在持 `RUN`/`PROCESSES` 锁的临界区里放进 IRQ0**；
+                // tick 链再进调度器取同一把锁 → 单核自旋死锁（持有者被中断
+                // 挂起，永远无法释放）。实测证据：故障冻结现场的栈回溯含
+                // `syscall_entry → sys_task_wait → yield_now → interrupt_dispatch
+                // → soft_interrupt_bridge → syscall_entry → ... → yield_now →
+                // enqueue_ready`，即 **syscall 在持锁态被中断重入**；RIP 停在
+                // 锁的同核重入检测（`my_cpu_slot_array_path`），IF=0 且不前进。
+                //
+                // 中断到来（IRQ0 tick 喂 poll_timeouts → 定时器到期回；
+                // IRQ1 键盘；或其它 IRQ）唤醒 hlt 后，本循环回顶部复检
+                // deadline 并重试阻塞——段与段之间仍严格保持 IF=0。
+                // SAFETY: sti/hlt/cli 是特权指令，本处恒在 Ring0；sti-hlt 的
+                // 「不丢失中断窗」由硬件保证（SDM Vol.3 §8.10.2）——sti 后的
+                // 下一条指令边界才生效，恰好让紧随的 hlt 不会漏掉中断。
+                unsafe {
+                    core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack, preserves_flags));
+                }
             }
         }
     }
