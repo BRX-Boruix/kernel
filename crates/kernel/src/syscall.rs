@@ -2312,6 +2312,23 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
 pub static BLOCKED_ON_EVENTS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// **临时诊断（§6.14.4n）**：`SYS_STREAM_READ`（nr=12）的累计进入次数。
+///
+/// 用来**区分「真阻塞」与「用户态空转」**：
+/// - 真阻塞：进程挂起在 read 里，计数**几乎不增**；
+/// - 空转：每轮都重新 read，计数**持续增长**（这正是我们怀疑的）。
+///
+/// 之所以必须用**内核侧**计数：该进程**自身的串口输出不可靠**（§6.14.4l），
+/// 且 QEMU monitor 的 RIP 采样**偏向内核**、采不到用户态（§6.14.4m）。
+/// 计数经现成的 `/devices/input/events/status` 暴露（S15 复用既有遥测通道）。
+pub static READ_SYSCALLS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// **临时诊断（§6.14.4n）**：非阻塞 read（a5≠0，shell 探键轮询）的进入次数。
+/// 与 [`READ_SYSCALLS`]（阻塞 read）分开，二者相加才是 read 总量。
+pub static READ_SYSCALLS_NB: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 fn input_event_blocking(frame: &mut SyscallFrame) -> Option<DispatchResult> {
     let Some(pid) = current_proc_mut().map(|p| p.pid()) else {
         // 无当前进程（内核启动期）：如实返回「读走 0 条」。
@@ -4829,6 +4846,10 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
 /// 返回 `true` 让 `iretq` 把（可能的）新现场带回目标用户态。
 pub extern "C" fn syscall_entry(frame: &mut SyscallFrame) -> bool {
     let nr = frame.nr;
+    // 临时诊断（§6.14.4n）：统计 read 进入次数，用于区分真阻塞 vs 用户态空转。
+    if nr == SYS_STREAM_READ as u64 {
+        READ_SYSCALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     // 进入/返回 trace 仅在自检构建开启（避免每条 syscall 生产刷屏）。
     #[cfg(feature = "kernel-tests")]
     klib::info!(

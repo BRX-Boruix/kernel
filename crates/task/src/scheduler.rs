@@ -1952,6 +1952,8 @@ static EVENT_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 ///
 /// 与 `KBD_WAITER` 的分工同理：后者是 stdin **字节**流的等待者（`push` 唤醒），
 /// 本槽是**记录**流的等待者（`push_event` 唤醒）。
+/// **临时诊断（§6.14.4n）**：`block_for_input_event` 返回 `WaiterBusy` 的次数。
+pub static EVENT_WAITER_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static IN_EVENT_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// 阻塞当前进程等待设备事件（`driver::event` 队列非空），或事件到达前一直挂起。
@@ -2122,6 +2124,10 @@ pub fn block_for_input_event(frame: &mut InterruptFrame) -> InputEventBlock {
         .is_err()
     {
         // 已有并发等待者：不阻塞（调用方如实返回空读，不顶掉既有等待者）。
+        // 临时诊断（§6.14.4n）：统计 WaiterBusy 次数。
+        // 若该计数暴涨而 BLOCKED_ON_EVENTS 不涨，即「waiter 被残留占用 →
+        // 所有 read 立即空读 → 用户态快循环」的直接证据。
+        EVENT_WAITER_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return InputEventBlock::WaiterBusy;
     }
     // 登记后复检事件环：若已非空，撤销登记、不阻塞（调用方立即重读交付）。

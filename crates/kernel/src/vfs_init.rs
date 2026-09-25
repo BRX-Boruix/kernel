@@ -501,6 +501,27 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                     "blocked_on_events",
                     crate::syscall::BLOCKED_ON_EVENTS.load(core::sync::atomic::Ordering::Relaxed),
                 )?;
+                // 临时诊断（§6.14.4n）：read 进入总次数。
+                // 判据：真阻塞时该值**几乎不增**；用户态空转时**持续增长**。
+                // 两者单调不减，故取差即可区分（无需清零语义）。
+                o.field_u64(
+                    "read_syscalls",
+                    crate::syscall::READ_SYSCALLS.load(core::sync::atomic::Ordering::Relaxed),
+                )?;
+                // 临时诊断（§6.14.4n）：WaiterBusy 次数。
+                o.field_u64(
+                    "waiter_busy",
+                    task::scheduler::EVENT_WAITER_BUSY.load(core::sync::atomic::Ordering::Relaxed),
+                )?;
+                // 临时诊断（§6.14.4n）：阻塞 read 与非阻塞 read 分开计数。
+                o.field_u64(
+                    "read_blocking",
+                    crate::syscall::READ_SYSCALLS.load(core::sync::atomic::Ordering::Relaxed),
+                )?;
+                o.field_u64(
+                    "read_nonblocking",
+                    crate::syscall::READ_SYSCALLS_NB.load(core::sync::atomic::Ordering::Relaxed),
+                )?;
                 o.end()
             })
             .expect("Vec-backed input-events status JSON serialization cannot fail");
