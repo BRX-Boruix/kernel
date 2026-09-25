@@ -28,6 +28,9 @@ pub use scheduler::{
     active_user_snapshots, exit_current, get_process_snapshot, init_pid, kill_pid,
     process_snapshots, ps_snapshot,
     set_init_pid, spawn, spawn_derived, spawn_thread_with,
+    // S1-8 触发点 4：中断返回边界对「刚被切入的进程」投递待决信号
+    // （修复「睡眠型前台子进程的 ^C 永久失效」，详见该函数文档）。
+    deliver_pending_on_return,
     spawn_with_ppid, spawn_with_ppid_fds,
     start, tick,
     group_members, group_live_count, group_all_exited, is_group_leader,

@@ -522,6 +522,15 @@ unsafe fn kmain_body() -> ! {
     // 生产化后无条件注册（用户进程依赖 tick 轮转）；每个核自己的 IRQ0 都会触发。
     arch_x86_64::interrupts::register_scheduler_tick(task::tick);
 
+    // S1-8 触发点 4：中断返回边界的待决信号投递。
+    //
+    // tick 可能把中断帧整体改成**被切入进程**的用户现场；那条切换路径不经过
+    // 任何投递检查，导致「睡眠型前台子进程」（如 spinburn 每 40ms 睡满 40ms）
+    // 的 SIGINT 永久滞留 pending：它的用户态窗口太短，10ms 一次的 IRQ0 几乎
+    // 不可能正好落在里面。注册本回调后，每次 IRQ0 返回用户态前都会对**当前**
+    // 进程（含刚被切入的那个）投递一次待决信号。
+    arch_x86_64::interrupts::register_pending_deliver(task::deliver_pending_on_return);
+
     // M4.2 调度验收：多进程 RR 轮转（停机验收，不返回主流程），单独 gate。
     #[cfg(feature = "kernel-test-m42")]
     tests::test_scheduler();

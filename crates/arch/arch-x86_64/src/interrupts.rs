@@ -858,6 +858,22 @@ pub fn register_scheduler_tick(h: SchedulerTickHandler) {
     SCHEDULER_TICK.store(h as usize, Ordering::SeqCst);
 }
 
+/// 中断返回边界的「待决信号投递」回调（S1-8 触发点 4）。
+///
+/// `arch` 不认识 `task`/信号语义（保持分层），故与 tick、软中断 handler 同模式：
+/// 由内核层注入 `task::deliver_pending_on_return`。返回 `false` 表示当前进程已被
+/// 默认终止、`*frame` 已由调度接管，调用方不得再触碰该帧。
+///
+/// ABI 用 Rust `fn`（非 `extern "C"`）与 [`SchedulerTickHandler`] 的既有约定保持
+/// 一致，避免内核侧注册点出现 ABI 不匹配。
+pub type PendingDeliverHandler = fn(&mut InterruptFrame) -> bool;
+static PENDING_DELIVER: AtomicUsize = AtomicUsize::new(0);
+
+/// 注册待决信号投递回调（内核引导期调用一次）。
+pub fn register_pending_deliver(h: PendingDeliverHandler) {
+    PENDING_DELIVER.store(h as usize, Ordering::SeqCst);
+}
+
 /// IPI 邮箱向量（MA1b）：跨核请求的投递通道（当前唯一用途 = per-CPU 缓存
 /// 排空请求）。避开 32..47（8259 IRQ 重映射区）与 0x80（syscall）。
 pub const IPI_VECTOR: u8 = 0x40;
@@ -1282,6 +1298,21 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
                 let h: SchedulerTickHandler =
                     unsafe { core::mem::transmute::<usize, SchedulerTickHandler>(f) };
                 h(frame);
+            }
+            // S1-8 触发点 4：tick 可能已把 `*frame` 整体改写为**被切入进程**的
+            // 用户现场（`commit_same_lock` 的 `*frame = slot.saved`）。那条路径
+            // 不经过任何投递检查——本处补上：投递该进程的待决信号。
+            //
+            // 为何必须在这里而不能只在 tick 内部：`tick` 顶部的投递以「被中断的
+            // 上下文属于要投递的进程」为前提，切点之后这个前提就换了人；且
+            // `commit_same_lock` 持着 RUN 与 per-pid 桶锁，不得在其临界区内投递
+            // （默认终止路径会经 `exit_current` 取同一批锁）。此处所有调度锁均已
+            // 释放，正是投递的安全点。
+            let dh = PENDING_DELIVER.load(Ordering::Acquire);
+            if dh != 0 {
+                let d: PendingDeliverHandler = unsafe { core::mem::transmute::<usize, PendingDeliverHandler>(dh) };
+                // 返回 false = 进程已终止且 `*frame` 已交调度接管，不得再触碰。
+                let _ = d(frame);
             }
         }
     }

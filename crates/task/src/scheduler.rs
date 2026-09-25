@@ -1135,6 +1135,58 @@ pub extern "C" fn tick(frame: &mut InterruptFrame) {
     }
 }
 
+/// 中断返回边界的信号投递收口（S1-8 触发点 4）。
+///
+/// # 为什么需要它（实测缺陷：`^C` 对「阻塞型前台子进程」永久失效）
+///
+/// 既有三处投递触发点全部以「**被中断的那个上下文**属于要投递的进程」为前提：
+///
+/// 1. `tick()` 顶部 —— 只查 `current_proc_mut()`，且要求 `frame.cs & 3 == 3`；
+/// 2. syscall 返回（kernel `deliver_pending_signal`）—— 只查**发起该次 syscall 的**进程；
+/// 3. 异常返回 —— 只查**触发该异常的**进程。
+///
+/// 三者共同漏掉了第四种情形：**进程是「被切入」的**——由调度器经
+/// [`commit_same_lock`] 的 `*frame = slot.saved` 直接把用户现场整体恢复并
+/// iretq 回用户态。这条路径**不经过任何投递检查**。
+///
+/// 对「睡眠型」前台程序（spinburn：每 40ms 睡满 40ms）后果是致命的：它绝大部分
+/// 时间处于 `Blocked`，仅在唤醒后极短暂地跑用户码（µs~低 ms 量级），而 IRQ0 是
+/// 10ms 一次——tick 几乎不可能落在它那段短暂的用户态窗口里。于是 SIGINT 一直躺在
+/// `pending` 里：实测 `p8=Blocked pend8=1` → `p8=Ready pend8=1` → `p8=Blocked
+/// `pend8=1` 循环十几秒不变，进程永不终止、shell 的 `waitpid` 永不返回、提示符
+/// 永不回来。注意 `RUN` 锁的 `locked/owner` 在此期间是**活的**（正常加解锁），
+/// 证明这不是死锁而是**投递点缺失**。
+///
+/// # 调用时机与前置条件
+///
+/// 由中断分发在 `tick()`（可能已改写 `*frame` 为切入进程的现场）**返回之后**调用。
+/// 此刻不得持有任何调度锁（`deliver_on_return` 的默认终止路径经 `exit_current`
+/// 自行取 per-pid 桶锁与 `RUN`），故本函数只做「取当前进程 + 查 pending + 投递」。
+///
+/// # 语义
+///
+/// - 当前无进程（内核/idle 上下文）、非用户态帧、无 pending：原样返回，零副作用；
+/// - 有 pending：按 ADR-034 §2.4 派发。默认终止 → `exit_current` 改写 `*frame`
+///   为下一进程现场，返回 `false` 告知调用方**不要再触碰 `*frame`**；
+/// - 其余情形返回 `true`（帧有效，可继续 iretq）。
+pub fn deliver_pending_on_return(frame: &mut InterruptFrame) -> bool {
+    // 仅真实用户态帧可投递（内核态帧无权改写为 handler 入口）。
+    if frame.cs & 3 != 3 {
+        return true;
+    }
+    let Some(cur) = crate::process::current_proc_mut() else {
+        return true; // 内核/idle 上下文，无用户信号可派发。
+    };
+    // 廉价预检：无 pending 时不触碰信号状态机。
+    if cur.signal().pending().is_empty() {
+        return true;
+    }
+    match crate::signal::deliver_on_return(cur, frame) {
+        crate::signal::DeliveryOutcome::Continue => true,
+        crate::signal::DeliveryOutcome::Terminated => false,
+    }
+}
+
 /// 切入 next 进程的共享收口：以已持有的 next per-pid 锁完成 FPU 恢复、CR3/RSP0
 /// 切换与 CURRENT/current 更新。调用方（[`commit_same_lock`]）须已持 next 所在桶锁，
 /// 并已在该锁内完成"校验存在+Ready、置 Running、*frame=saved"——本函数只做物理切换。
