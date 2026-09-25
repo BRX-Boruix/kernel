@@ -2965,6 +2965,71 @@ pub fn waitpid(target_pid: usize, frame: &mut InterruptFrame) -> Result<Waited, 
     waitpid_inner(&mut run, cur, target_pid, Some(frame))
 }
 
+/// [`waitpid_timeout`] 的 pre 探测（§6.12.5 ^C 根因修复 · 第二层）。
+///
+/// **只读**回答两件事，绝不迁移任何调度状态（对比 [`waitpid_inner`] 的
+/// frame=None 测试形态会标记 Blocked / 弹出他进程置 Running / 改写
+/// `run.current`——那三者对 pre 语境全是破坏性的，见 [`waitpid_timeout`] 注释）：
+///
+/// 1. 目标（或 WAIT_ANY 的任一直接子进程）已是 zombie → **就地收割**并返回
+///    `Ok(Reaped)`（收割本身是收尸语义的一部分，与阻塞路径一致，非破坏性）；
+/// 2. 单目标不存在/非亲生 → `Err(NotFound)`（与 inner 同判据）；
+/// 3. 其余（有子进程但都在跑）→ `Err(WouldBlock)`（调用方继续注册定时器+真阻塞）。
+fn waitpid_probe(cur: usize, target_pid: usize) -> Result<Waited, Error> {
+    if target_pid == WAIT_ANY {
+        // 扫描所有直接子进程：首个 zombie 即收割（与 inner 的 R1 口径一致：
+        // 排除组员——组员 ppid==组长但不是进程子）。
+        let mut first_zombie_child: Option<usize> = None;
+        for bucket in PROCESSES.iter() {
+            let gi = bucket.lock();
+            for (p, e) in gi.iter() {
+                if e.proc.tgid() == *p && e.ppid == cur && e.proc.state() == TaskState::Exit {
+                    first_zombie_child = Some(*p);
+                    break;
+                }
+            }
+            if first_zombie_child.is_some() {
+                break;
+            }
+        }
+        if let Some(c) = first_zombie_child {
+            let (pid, code) = reap_child_locked(cur, c).expect("zombie confirmed");
+            return Ok(Waited::Reaped { pid, code });
+        }
+        // 无 zombie：有子进程 → WouldBlock（等）；无子进程 → NotFound（ECHILD）。
+        let has_children = {
+            let mut found = false;
+            for bucket in PROCESSES.iter() {
+                let gi = bucket.lock();
+                if gi.iter().any(|(p, e)| e.proc.tgid() == *p && e.ppid == cur) {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_children {
+            return Err(Error::NotFound);
+        }
+        return Err(Error::WouldBlock);
+    }
+    // ---- 单目标 ----
+    if target_pid == 0 {
+        return Err(Error::NotFound);
+    }
+    let is_mine = {
+        let gi = proc_bucket_lock(target_pid);
+        matches!(gi.get(&target_pid), Some(e) if e.ppid == cur)
+    };
+    if !is_mine {
+        return Err(Error::NotFound);
+    }
+    if let Some((pid, code)) = reap_child_locked(cur, target_pid) {
+        return Ok(Waited::Reaped { pid, code });
+    }
+    Err(Error::WouldBlock)
+}
+
 /// `waitpid(target)` 的**有界**形态（§6.11 所有者裁决 B / 2026-10-04）：
 /// 最多等待 `timeout_ns`，到期时子进程**仍在运行**则**如实**返回
 /// [`Waited::TimedOut`]，由 syscall 层译为 `WouldBlock` 交还用户态。
@@ -2998,17 +3063,24 @@ pub fn waitpid_timeout(
         let run = run_mut(my_cpu_slot());
         run.current.ok_or(Error::NotFound)?
     };
-    // 先做一次**非阻塞**的收尸尝试（frame=None：只做表级迁移，不做物理切换）。
-    // 子进程已是 zombie 时立即收尸返回，**不**注册定时器——
-    // 既省一个定时器槽，也避免「刚注册就立刻要取消」的竞态窗口。
-    // 这一步完整复用 waitpid_inner 的语义（含 WAIT_ANY 分支与 NotFound 判定）。
-    let pre = {
-        let mut run = run_mut(my_cpu_slot());
-        waitpid_inner(&mut run, cur, target_pid, None)
-    };
+    // 先做一次**非阻塞**的收尸尝试。子进程已是 zombie 时立即收尸返回，
+    // **不**注册定时器——既省一个定时器槽，也避免「刚注册就立刻要取消」的竞态窗口。
+    // §6.12.5 根因修复（^C 前台失效 · 第二层）：pre 检查**绝不能**走
+    // `waitpid_inner(None)`。该 None 形态是给测试钩子用的「表级迁移」：
+    // 无 zombie 可收时会**真实执行**阻塞登记（标记 cur=Blocked+waiting_for、
+    // 弹出别的就绪进程置 Running、改写 `run.current`）再返回 Ok(Blocked)——
+    // 在 pre 语境里这些**全部是破坏性副作用**：shell 被标记 Blocked 却仍在
+    // 跑、被弹出的进程置 Running 却永远不被调度（进程被「吃掉」）、
+    // `run.current` 指向一个假 Running 槽。实测（kdbg-pre）：shell 的第一次
+    // 有界等待 pre 即返回 Blocked，此后前台子进程被逐次吞掉，`^C` 探键循环
+    // 随之瓦解。
+    //
+    // 修复：pre 用**只读**探测函数——只回答两件事：「有无可收 zombie」与
+    // 「有没有子进程」。都不满足阻塞条件时返回 WouldBlock 语义（继续走
+    // 注册定时器+真阻塞），绝不做任何状态迁移。
+    let pre = waitpid_probe(cur, target_pid);
     match pre {
-        // 已收尸：交付退出码与 pid 到调用者帧（与阻塞路径同一交付口径：
-        // rax=code、r10=pid），且**不**注册定时器。
+        // 可收割（pre 内已同步收尸）：交付退出码与 pid，不注册定时器。
         Ok(Waited::Reaped { pid, code }) => {
             frame.rax = code;
             frame.r10 = pid as u64;
@@ -3016,8 +3088,7 @@ pub fn waitpid_timeout(
         }
         // 真错误（非亲生/不存在）：如实上抛，不注册定时器。
         Err(e) if e != Error::WouldBlock => return Err(e),
-        // WouldBlock = 子进程仍在运行（waitpid_inner 在 frame=None 下的
-        // 「无可切进程」也归此），继续走有界等待。
+        // WouldBlock = 子进程仍在运行（或 probe 无权判定），继续走有界等待。
         _ => {}
     }
     // 注册一次性定时器：到期由专用回调 `wake_waitpid_timeout` 清除等待登记、
@@ -3081,6 +3152,7 @@ pub fn wake_waitpid_timeout(pid: usize) {
     if let Some(home) = enqueue {
         wake_enqueue(pid, home);
     }
+
 }
 
 /// 有界 waitpid 超时的 `-EAGAIN` 重试哨兵（写入等待者 `saved.rax`）。
