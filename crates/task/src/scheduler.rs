@@ -3008,13 +3008,108 @@ pub enum Waited {
 ///   队列），切换到下一就绪进程，返回 [`Waited::Blocked`]（退出码与 pid 由
 ///   子进程终止路径写入保存帧 rax/r10）——入口据此跳过
 ///   rax 回写，保住子进程终止路径交付到保存帧的退出码；
-/// - 无其他**就绪**进程（阻塞后无人能接盘 CPU 唤醒自己）→ 拒绝阻塞，如实
-///   返回 [`Error::WouldBlock`]（errno 11 EAGAIN），绝不自锁死系统。
+/// - 无其他**就绪**进程但等待目标仍**可唤醒**（如阻塞在键盘/事件上的子进程）
+///   → **不**立即认输，而是 park 本核等中断（§6.13 修复；原实现在此直接拒绝，
+///   导致调用方紧循环烧满一个核）；
+/// - 等待目标**根本不可唤醒**（真死锁）→ 拒绝阻塞，如实返回
+///   [`Error::WouldBlock`]（errno 11 EAGAIN），绝不自锁死系统。
+///
+/// §6.13 修复见 [`park_for_waitpid`] 与 [`blocked_wakeable`]。
+///
+/// ---
+///
+/// §6.13 修复的核心动作：**在拥有 RUN guard 的调用方**停车等中断，直到可唤醒。
+///
+/// # 为什么必须由调用方做
+///
+/// [`waitpid_inner`] 收到的是 `run: &mut PerCpuRun` —— 一个**借用**。它内部的
+/// `drop(run)` 是空操作，调用方的 `run_mut` guard 仍然持有。而
+/// [`schedule_from_block`] 自己要 `run()` 取同一把 `IrqSpinLock`，
+/// 于是同核重入自锁（实测 panic：`schedule_from_block+0x2d0` ←
+/// `waitpid_inner+0xbe3` ← `waitpid`）。故 park 只能在**持有 guard 且能释放**
+/// 的调用方执行：此处先 `drop` guard，再 park。
+///
+/// # 语义
+///
+/// 前置条件（调用方保证）：`cur` 已是 `Blocked` 且 `waiting_for` 已登记，
+/// CPU 上仍运行着 `cur`。本函数让出 CPU 并 `halt`，直到任一中断使就绪队列
+/// 非空（`cur` 被子进程终止路径唤醒，或其它进程变为可运行）。
+///
+/// 返回 `true` 表示已切走（`frame` 已被改写为下一进程帧，调用方**不得**再写
+/// `frame`）；被唤醒后调用方须**重新**调用 [`waitpid_inner`] 复判状态
+/// （子进程可能已退出→收尸，或仍在跑→再次阻塞）。
+///
+/// # 为什么不是忙等
+///
+/// [`schedule_from_block`] 内层是 `enable(); halt();` —— CPU 停机直到中断，
+/// **不消耗**运算。这正是 §6.13 缺陷（用户态 `yield_now(); continue;` 紧循环
+/// 100% 占用一个核）与正确行为的分界。
+fn park_for_waitpid(frame: &mut InterruptFrame, cur: usize) -> bool {
+    // 关键：调用方必须先释放 RUN guard（见函数注释）。
+    match schedule_from_block(frame, cur) {
+        BlockResume::SwitchedSelf | BlockResume::SwitchedOther => true,
+    }
+}
+
 pub fn waitpid(target_pid: usize, frame: &mut InterruptFrame) -> Result<Waited, Error> {
-    // per-pid（a）：只取本核 RUN 域；表访问经 waitpid_inner 内逐 pid 锁。
-    let mut run = run_mut(my_cpu_slot());
-    let cur = run.current.ok_or(Error::NotFound)?;
-    waitpid_inner(&mut run, cur, target_pid, Some(frame))
+    // §6.13：无界等待也须能 park。原实现只调用一次 `waitpid_inner`，
+    // 若此刻没有其它**就绪**进程（前台唯一子进程阻塞于 I/O 的常见情形），
+    // 就回滚并抛 `WouldBlock` —— 调用方（shell）随即重试，形成 100% CPU 的
+    // 紧循环。正确行为是**停车等中断**（子进程被 IRQ 唤醒→退出→唤醒本进程）。
+    loop {
+        // per-pid（a）：只取本核 RUN 域；表访问经 waitpid_inner 内逐 pid 锁。
+        let (cur, r) = {
+            let mut run = run_mut(my_cpu_slot());
+            let cur = run.current.ok_or(Error::NotFound)?;
+            (cur, waitpid_inner(&mut run, cur, target_pid, Some(frame)))
+        };
+        match r {
+            Ok(w) => return Ok(w),
+            Err(Error::WouldBlock) => {
+                // 回滚已发生（cur 恢复 Running、登记已清）。仅当等待目标仍**可唤醒**
+                // 时才 park——否则就是真死锁，如实上抛（保留既有安全语义）。
+                if !blocked_wakeable_for(target_pid, cur) {
+                    return Err(Error::WouldBlock);
+                }
+                // 重新登记后 park（park 要求 cur 已 Blocked+登记）。
+                {
+                    let mut gc = proc_bucket_lock(cur);
+                    if let Some(slot) = gc.get_mut(&cur) {
+                        slot.waiting_for = Some(target_pid);
+                        slot.proc.set_state(TaskState::Blocked);
+                        slot.saved = *frame;
+                    }
+                }
+                if park_for_waitpid(frame, cur) {
+                    // 已切走；被唤醒后回到循环顶部复判（可能已收尸或需再等）。
+                    continue;
+                }
+                return Err(Error::WouldBlock);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `blocked_wakeable` 的「按等待目标」形态：`WAIT_ANY` 时任一子进程可唤醒即可。
+///
+/// 与 `waitpid_inner` 内的判据同源（S15）：两者都归结到 [`blocked_wakeable`]。
+fn blocked_wakeable_for(target_pid: usize, cur: usize) -> bool {
+    if target_pid != WAIT_ANY {
+        return blocked_wakeable(target_pid);
+    }
+    for bucket in PROCESSES.iter() {
+        let gi = bucket.lock();
+        for (p, e) in gi.iter() {
+            if e.proc.tgid() == *p
+                && e.ppid == cur
+                && blocked_wakeable_parts(*p, e.proc.state() != TaskState::Exit, e.waiting_for.is_some())
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// [`waitpid_timeout`] 的 pre 探测（§6.12.5 ^C 根因修复 · 第二层）。
@@ -3139,7 +3234,9 @@ pub fn waitpid_timeout(
             return Ok(Waited::Reaped { pid, code });
         }
         // 真错误（非亲生/不存在）：如实上抛，不注册定时器。
-        Err(e) if e != Error::WouldBlock => return Err(e),
+        Err(e) if e != Error::WouldBlock => {
+            return Err(e);
+        }
         // WouldBlock = 子进程仍在运行（或 probe 无权判定），继续走有界等待。
         _ => {}
     }
@@ -3162,9 +3259,43 @@ pub fn waitpid_timeout(
         //   ① 子进程退出路径：写真实退出码（既有交付机制，未改）；
         //   ② 本函数的定时器回调：写 -EAGAIN 哨兵。
         // 二者都显式写 `saved.rax`，故用户态**绝不会**拿到占位值。
-        Ok(Waited::Blocked) => Ok(Waited::Blocked),
-        // 未能阻塞（就绪队列空、无法安全让出）：撤销已注册的定时器，
-        // 并如实报「没等到」。
+        Ok(Waited::Blocked) => {
+            Ok(Waited::Blocked)
+        }
+        // ---- §6.13 修复：就绪队列空**不等于**无人会醒来 ----
+        //
+        // 【缺陷】原实现在此无条件 `cancel_timeout` + 返回 `WouldBlock`。
+        // 前台唯一子进程**阻塞于 I/O** 时它不在就绪队列，于是每次都走到这里
+        // → 调用方（`shell` 的 `commands.rs:2852`）`yield_now(); continue;`
+        // → **100% 占用一个核**（实测 `wp_refused` 19378 次 / 8 秒，docs §6.13）。
+        //
+        // 【为何原实现错】「此刻无人可切」不代表「无人会醒来」：子进程登记在
+        // 等待源上，IRQ（键盘/事件/定时器）到达即唤醒它，退出后终止路径
+        // `wake_enqueue(ppid, ...)` 唤醒本进程。故正确动作是**停车等中断**。
+        //
+        // 【为何在此处做】`run` guard 由本函数的块作用域持有，块结束即释放；
+        // 随后 [`schedule_from_block`] 才能安全取 RUN（不可重入，见
+        // [`park_for_waitpid`] 注释）。绝不能放进 `waitpid_inner`（借用形态）。
+        //
+        // 【定时器处理】park 期间**保留**已注册的定时器：它正是本动词「至多等
+        // 这么久」的兑现者——到期回调会唤醒本进程并写 -EAGAIN 哨兵，
+        // 于是有界语义**逐字不变**（这是与「无界 park」的关键区别）。
+        Err(Error::WouldBlock) if blocked_wakeable_for(target_pid, cur) => {
+            // 重新登记（inner 的 revert 已清）：park 要求 cur 已 Blocked+登记。
+            {
+                let mut gc = proc_bucket_lock(cur);
+                if let Some(slot) = gc.get_mut(&cur) {
+                    slot.waiting_for = Some(target_pid);
+                    slot.proc.set_state(TaskState::Blocked);
+                    slot.saved = *frame;
+                }
+            }
+            let _ = park_for_waitpid(frame, cur);
+            // 已切走：唤醒后的结果由保存帧 rax 交付（真实退出码或 -EAGAIN），
+            // 与 `Ok(Waited::Blocked)` 路径**同一条**交付机制（S13 单一路径）。
+            Ok(Waited::Blocked)
+        }
+        // 真死锁（目标根本不可唤醒）：撤销定时器并如实报「没等到」。
         Err(e) => {
             klib::time::cancel_timeout(_timer_id);
             Err(e)
@@ -3218,6 +3349,85 @@ const WAITPID_TIMEOUT_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as 
 /// [`waitpid`] 的锁内主体。`frame = None` 为测试钩子形态：只做表级登记与
 /// 状态迁移，不做 CPU 切换（物理切换路径由 m41/m42/kbd 既有验收与
 /// kernel-test-waitpid 停机验收覆盖）。
+/// 判定进程 `pid` 是否「已阻塞但**仍会被唤醒**」——§6.13 修复的核心判据。
+///
+/// # 为什么需要这个判据
+///
+/// [`waitpid_inner`] 让出 CPU 前必须确认「让出后有人能让我再跑起来」。
+/// 原判据只认 Ready/Running 的进程，于是**前台子进程阻塞于 I/O** 这一最常见的
+/// 情形被判为「无人可运行」→ 拒绝阻塞 → `shell` 立刻重试 → 烧满一个核
+/// （实测 ~99%，见 docs/TODO/terminal-input.md §6.13）。
+///
+/// 关键在于：阻塞的进程**不是死掉的**——它登记在某个等待源上，硬件中断到达时
+/// 会被唤醒、继续推进、最终退出，而子进程终止路径 `wake_enqueue(ppid, ...)`
+/// 会唤醒本进程。故「子进程已阻塞」**不等于**「无人可推进」。
+///
+/// # 为什么不能简单判 `state != Exit`
+///
+/// 「存活」不等于「会醒来」。一个 `Blocked` 却**未登记任何等待源**的进程
+/// 永远不会被唤醒（真实系统中的永久泄漏）。若把它也算作可唤醒，
+/// 父进程就会真的自锁。停机测试 `test-waitpid-core` 的第 8 项
+/// （`deadlock-refusal`）正是用 `simulate_blocked` 构造这个情形来钉死
+/// 「真死锁必须如实拒绝」的语义——简单放宽会破坏它。
+///
+/// 故判据是**两段**：进程存在且非 Exit，**且**它登记在某个等待源上。
+///
+/// # 等待源清单（**新增等待源时必须同步此处**）
+///
+/// 当前内核的阻塞等待源及其登记槽：
+///
+/// | 等待源 | 登记槽 | 唤醒方 |
+/// | --- | --- | --- |
+/// | 键盘字节（`stdin`） | `KBD_WAITER` | IRQ1 |
+/// | 通用事件（`event_wait`） | `EVENT_WAITER` / `EVENT_TIMER` | 事件投递 / 定时器 |
+/// | 键盘**事件记录**（`/devices/input/events`） | `IN_EVENT_WAITER` | IRQ1 |
+/// | 音频 PCM 数据 | `AUDIO_WAITER` | PCM 写入 / 定时器 |
+/// | `waitpid` | `slot.waiting_for` | 子进程终止路径 |
+///
+/// # 维护纪律（S15 单一真值）
+///
+/// 本函数是**多个全局单槽 + 一个 per-process 字段的「或」**，是一处
+/// **已知的耦合点**：将来新增等待源而忘记在此登记，会让 §6.13 的缺陷
+/// **重新出现**（表现为「新等待源上的阻塞子进程导致父进程烧 CPU」）。
+///
+/// 更彻底的形态是在 PCB 上加一个显式 `blocked_wakeable` 标记，由各阻塞路径置位、
+/// 各唤醒路径清除——那才是真正的单点定义。本轮**未**采用（需改动 4+ 条
+/// 阻塞/唤醒路径，超出本小点范围），故在此显式登记该技术债。
+fn blocked_wakeable(pid: usize) -> bool {
+    // 取锁形态：仅用于**未持有**任何桶锁的语境（单目标路径）。
+    let (alive, waiting_for) = {
+        let g = proc_bucket_lock(pid);
+        match g.get(&pid) {
+            Some(e) if e.proc.state() != TaskState::Exit => (true, e.waiting_for.is_some()),
+            _ => (false, false),
+        }
+    };
+    blocked_wakeable_parts(pid, alive, waiting_for)
+}
+
+/// [`blocked_wakeable`] 的**已持锁**形态：供调用方在持有该进程所在桶锁时使用。
+///
+/// **存在的唯一理由**：`SpinMutex` 同核重入即死锁。`waitpid_inner` 的 `WAIT_ANY`
+/// 扫描**已持桶锁**，此时再 `proc_bucket_lock(pid)` 会自锁——实测 panic：
+/// `SpinMutex 同核重入死锁`（栈 `blocked_wakeable -> waitpid_inner -> waitpid_timeout`）。
+/// 故必须复用已取到的条目，由调用方把两个真值读出来传入。
+///
+/// 全局单槽检查是原子读、不涉锁，故两种形态共用同一收尾逻辑（S15）。
+fn blocked_wakeable_parts(pid: usize, alive: bool, waiting_for: bool) -> bool {
+    use core::sync::atomic::Ordering;
+    if !alive {
+        return false;
+    }
+    if waiting_for {
+        return true;
+    }
+    let p = pid as u32;
+    KBD_WAITER.load(Ordering::Acquire) == p
+        || EVENT_WAITER.load(Ordering::Acquire) == p
+        || IN_EVENT_WAITER.load(Ordering::Acquire) == p
+        || AUDIO_WAITER.load(Ordering::Acquire) == p
+}
+
 fn waitpid_inner(
     run: &mut PerCpuRun,
     cur: usize,
@@ -3333,7 +3543,77 @@ fn waitpid_inner(
         }
         Error::WouldBlock
     };
-    if !others_ready {
+    // ---- §6.13 修复：阻塞安全性第二判据 ----
+    //
+    // 【缺陷】上方的 `others_ready` 只认「Ready/Running」的进程。前台子进程
+    // **阻塞于 I/O**（读键盘 / 读事件节点 / 等音频）时它**不在** ready 队列，
+    // 于是「前台唯一子进程阻塞」这一**最常见**的情形被判为「无人可运行」→
+    // 拒绝阻塞 → 调用方（`shell` 的 `commands.rs:2852`）拿到 `WouldBlock` 后
+    // `yield_now(); continue;` **立刻重试** → 用户态紧循环烧满一个核。
+    //
+    // 实测（docs/TODO/terminal-input.md §6.13）：前台跑 `blkdemo`（阻塞读 stdin）
+    // 或 `evdemo`（阻塞读事件节点）时宿主 CPU ≈ 100%，而 `shell` 空闲仅 ≈ 6%。
+    // 二者与「事件流」无关——缺陷在**本判据**，与等待源无关。
+    //
+    // 【为何可以让出】原判据的顾虑是「让出后无人可运行 ⇒ 自锁」。该顾虑在
+    // 本情形下**不成立**，因为唤醒本进程的路径**不依赖 ready 队列**：
+    //
+    //   1. 子进程退出 → 终止路径 `wake_enqueue(ppid, ppid_home)`
+    //      （本文件 :2900）直接入队并投 IPI 唤醒本进程——与「本核队列里有没有
+    //      别人」完全无关；
+    //   2. 子进程虽 Blocked，但其等待源（IRQ1 键盘 / 事件回调 / 音频 / 定时器）
+    //      **仍会到达**：中断一旦到达，子进程被唤醒→最终退出→走 (1) 唤醒本进程；
+    //   3. 即使全系统真的无人可运行，本核进入 `idle_loop_body` 用的是
+    //      **`hlt`**（`arch-x86_64/src/scheduler` 的 idle 循环），CPU 停机待中断，
+    //      **不会空转烧 CPU**；IRQ0 tick 亦会周期性重查。故「让出」的最小代价
+    //      只是「等一个中断」，远优于**100% 占用一个核**。
+    //
+    // 【判据】「存在可被唤醒的等待目标」= 本进程仍有直接子进程**且该子进程
+    // 登记了等待源**（判定集中在 [`blocked_wakeable`]，此处不另造口径，S15）。
+    //
+    // **不能**简化成「子进程存活（非 Exit）」：存活不等于会醒来，
+    // 一个无等待源的 Blocked 进程永不被唤醒，那样会让父进程真自锁，
+    // 并被 `test-waitpid-core` 第 8 项（`deadlock-refusal`）钉死。
+    //
+    // 【为何不必担心「子进程永远不退出」】那不是本判据的责任：`shell` 用的是
+    // **有界**等待（`waitpid_any_timeout` + 定时器），到期由
+    // `wake_waitpid_timeout` 唤醒并如实返回「没等到」，调用方可重试或放弃。
+    // 本判据只需回答「让出后有没有人/有没有中断能让我再跑起来」。
+    let target_wakeable = if others_ready {
+        true
+    } else if target_pid == WAIT_ANY {
+        // WAIT_ANY：任一直接子进程「注册了等待源」即可（见下方判据说明）。
+        let mut ok = false;
+        for bucket in PROCESSES.iter() {
+            let gi = bucket.lock();
+            for (p, e) in gi.iter() {
+                // **必须**用 `_parts` 形态：此处已持桶锁，再取同桶锁会自锁
+                // （S21 显式并发；实测 panic 见 `blocked_wakeable_parts` 注释）。
+                if e.proc.tgid() == *p && e.ppid == cur {
+                    if blocked_wakeable_parts(
+                        *p,
+                        e.proc.state() != TaskState::Exit,
+                        e.waiting_for.is_some(),
+                    ) {
+                        ok = true;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                break;
+            }
+        }
+        ok
+    } else {
+        // 单目标：该子进程仍存活且注册了等待源。
+        let mine = {
+            let gi = proc_bucket_lock(target_pid);
+            gi.get(&target_pid).is_some_and(|e| e.proc.tgid() == target_pid)
+        };
+        mine && blocked_wakeable(target_pid)
+    };
+    if !target_wakeable {
         return Err(revert(cur)); // 尚未标记，直接拒绝
     }
     {
@@ -3358,6 +3638,12 @@ fn waitpid_inner(
         match pop_and_commit_switch(run, f, Some(cur), cur) {
             NextCommit::Switched => Ok(Waited::Blocked),
             // NothingSelf 不可达(cur 已被 exclude 排除)；Empty=无其它可切 -> revert。
+            //
+            // **§6.13**：此处**不能** park —— `run` 是调用方持有的 `&mut` 借用，
+            // 本函数 `drop(run)` 是空操作，`schedule_from_block` 自取 RUN 会
+            // 同核重入自锁（实测 panic：`schedule_from_block+0x2d0` ←
+            // `waitpid_inner`）。park 必须由**拥有 guard 的调用方**执行，
+            // 见 [`park_until_wakeable`]。
             NextCommit::Empty | NextCommit::NothingSelf => Err(revert(cur)),
         }
     } else {
