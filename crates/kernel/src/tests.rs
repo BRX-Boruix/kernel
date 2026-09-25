@@ -10687,6 +10687,120 @@ pub fn test_read_nonblock_flag() {
     info!("[test-read-nonblock] all assertions passed");
 }
 
+/// I-EVENTS（ADR-047）：read 遥测计数器转正验收（§6.14.4n 裁决 Ⅰ，S09 可观察）。
+///
+/// 断言四件事：
+/// 1. `sys_read` 顶部计数按 `a5` 非阻塞位分流——阻塞读走 `STREAM_READS`，
+///    非阻塞读走 `STREAM_READS_NONBLOCK`（d2a4e85 初版 NB 无自增点的缺陷
+///    在此被永久钉死：本测试在它回归时必红）；
+/// 2. 分流判定用 `read_is_nonblock`（S13 单点）——PEEK-only（a5=2）不得计入 NB；
+/// 3. `len == 0` 也计数——计数点是「进入」而非「读到」（与 Linux
+///    sys_enter_read tracepoint 同语义）；
+/// 4. `/devices/input/events/status` JSON schema 完整（8 键齐备，含遥测键）。
+///
+/// 纪律：伪当前进程 + 全程关中断（KM16，与 test_syscall_munmap 同构）；
+/// 结束时卸载伪进程。计数断言全部用**窗口增量**（`STREAM_READS` 是内核级
+/// 单调累计，绝对值无意义——语义已钉死在计数器文档）。
+#[cfg(feature = "kernel-tests")]
+pub fn test_read_telemetry_counters() {
+    use crate::syscall::{syscall_entry, STREAM_READS, STREAM_READS_NONBLOCK, SYS_STREAM_READ};
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use arch::syscall::SyscallFrame;
+    use mm::user_space::UserAddressSpace;
+    use vfs::devfs::DeviceInfoProvider as _;
+
+    info!("[test-read-telemetry] === §6.14.4n Ⅰ: read telemetry counters ===");
+
+    fn frame(nr: u32, a5: u64) -> SyscallFrame {
+        SyscallFrame {
+            nr: nr as u64,
+            a1: 0,   // fd —— len==0 早退，不触达 fd 查找
+            a2: 0,   // buf
+            a3: 0,   // len == 0：保证纯 Done 路径，无真实 IO
+            a4: 0,
+            a5,
+            result: 0,
+            switched: false,
+            arch_frame: 0,
+            aux_pid: 0,
+        }
+    }
+
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let addr_space = UserAddressSpace::<X86PageTable>::new()
+        .expect("create test user address space");
+    let proc = Box::new(task::Process::new(usize::MAX, 0, 0, 0, Arc::new(addr_space)));
+    let proc_raw = Box::into_raw(proc);
+    task::set_current_proc(proc_raw);
+
+    let before_blk = STREAM_READS.load(core::sync::atomic::Ordering::Relaxed);
+    let before_nb = STREAM_READS_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed);
+
+    // ① 阻塞形态：a5=0 → STREAM_READS++，NB 不动。
+    let mut f = frame(SYS_STREAM_READ, 0);
+    assert!(syscall_entry(&mut f), "blocking read (len=0) must be Done");
+    assert_eq!(f.result & 0x8000_0000_0000_0000, 0, "len=0 必须成功返回 0");
+    assert_eq!(
+        STREAM_READS.load(core::sync::atomic::Ordering::Relaxed),
+        before_blk + 1,
+        "阻塞 read 必须恰好使 STREAM_READS 增 1"
+    );
+    assert_eq!(
+        STREAM_READS_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed),
+        before_nb,
+        "阻塞 read 不得污染 STREAM_READS_NONBLOCK"
+    );
+
+    // ② 非阻塞形态：a5=1（NONBLOCK）→ NB++，阻塞计数不动。
+    let mut f = frame(SYS_STREAM_READ, 1);
+    assert!(syscall_entry(&mut f), "nonblocking read (len=0) must be Done");
+    assert_eq!(
+        STREAM_READS_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed),
+        before_nb + 1,
+        "非阻塞 read 必须恰好使 STREAM_READS_NONBLOCK 增 1"
+    );
+    assert_eq!(
+        STREAM_READS.load(core::sync::atomic::Ordering::Relaxed),
+        before_blk + 1,
+        "非阻塞 read 不得污染 STREAM_READS"
+    );
+
+    // ③ PEEK-only（a5=2）：分流判定必须用 read_is_nonblock（S13），
+    //    只置 PEEK 不算非阻塞 → 计入阻塞桶。这是对「位与判定而非 a5!=0」
+    //    的运行时验证（与 test_read_nonblock_flag 的纯函数断言互补）。
+    let mut f = frame(SYS_STREAM_READ, 2);
+    assert!(syscall_entry(&mut f), "peek read (len=0) must be Done");
+    assert_eq!(
+        STREAM_READS.load(core::sync::atomic::Ordering::Relaxed),
+        before_blk + 2,
+        "PEEK-only 必须计入阻塞桶（分流判定 = read_is_nonblock，S13）"
+    );
+    assert_eq!(
+        STREAM_READS_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed),
+        before_nb + 1,
+        "PEEK-only 不得计入 NB"
+    );
+
+    // ④ status JSON schema：9 键齐备（真值语义见各计数器文档）。
+    let json = crate::vfs_init::KernelDeviceProvider.input_events_status_json();
+    for key in [
+        "source", "dropped_events", "has_pending", "pending_events",
+        "blocked_on_events", "read_syscalls", "waiter_busy",
+        "read_blocking", "read_nonblocking",
+    ] {
+        let quoted = alloc::format!("\"{}\"", key);
+        assert!(json.contains(&quoted), "status JSON 缺键: {} — full={}", key, json);
+    }
+
+    // 收尾（S18）：卸载伪当前进程（Box::into_raw 的对称回收）。
+    task::set_current_proc(core::ptr::null_mut());
+    unsafe { drop(Box::from_raw(proc_raw)) };
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+
+    info!("[test-read-telemetry] PASS");
+}
+
 /// §6.12.6：**同核重入死锁**复现（BSP 定时器永久停止的根因）。
 ///
 /// # 被复现的真实故障

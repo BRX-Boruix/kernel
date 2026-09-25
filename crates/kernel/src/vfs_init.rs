@@ -341,7 +341,11 @@ impl SystemInfoProvider for KernelSystemProvider {
 }
 
 /// 内核 DevFS Provider 实现。
-struct KernelDeviceProvider;
+///
+/// `pub(crate)`：selftest（tests.rs）经它验收 `/devices/input/events/status`
+/// 的 JSON schema 完整性（§6.14.4n 裁决 Ⅰ 转正）——测试与实现同 crate，
+/// 收窄到 crate 可见即可，不必对外部暴露。
+pub(crate) struct KernelDeviceProvider;
 
 
 impl DeviceInfoProvider for KernelDeviceProvider {
@@ -501,26 +505,28 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                     "blocked_on_events",
                     crate::syscall::BLOCKED_ON_EVENTS.load(core::sync::atomic::Ordering::Relaxed),
                 )?;
-                // 临时诊断（§6.14.4n）：read 进入总次数。
-                // 判据：真阻塞时该值**几乎不增**；用户态空转时**持续增长**。
-                // 两者单调不减，故取差即可区分（无需清零语义）。
+                // 永久遥测（§6.14.4n 裁决 Ⅰ 转正）：read 进入计数，真值与判读
+                // 规则见 `STREAM_READS` 文档。真阻塞时**几乎不增**；用户态空转时
+                // **持续增长**。计数单调不减，比较用窗口增量（无需清零语义）。
+                // 键名保持初版稳定：`read_syscalls` 与 `read_blocking` 自转正起
+                // 同源（均为 STREAM_READS，含文件/管道流读），保留两键仅为兼容
+                // 既有验收脚本；`read_nonblocking` = STREAM_READS_NONBLOCK
+                //（d2a4e85 初版漏接自增点，转正时在 sys_read 补上，S09）。
                 o.field_u64(
                     "read_syscalls",
-                    crate::syscall::READ_SYSCALLS.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::syscall::STREAM_READS.load(core::sync::atomic::Ordering::Relaxed),
                 )?;
-                // 临时诊断（§6.14.4n）：WaiterBusy 次数。
                 o.field_u64(
                     "waiter_busy",
                     task::scheduler::EVENT_WAITER_BUSY.load(core::sync::atomic::Ordering::Relaxed),
                 )?;
-                // 临时诊断（§6.14.4n）：阻塞 read 与非阻塞 read 分开计数。
                 o.field_u64(
                     "read_blocking",
-                    crate::syscall::READ_SYSCALLS.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::syscall::STREAM_READS.load(core::sync::atomic::Ordering::Relaxed),
                 )?;
                 o.field_u64(
                     "read_nonblocking",
-                    crate::syscall::READ_SYSCALLS_NB.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::syscall::STREAM_READS_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed),
                 )?;
                 o.end()
             })

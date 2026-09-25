@@ -852,6 +852,10 @@ unsafe fn kmain_body() -> ! {
     // §6.12.5（裁决甲）：STREAM_READ a5 标志位判定（纯函数，无副作用）。
     #[cfg(feature = "kernel-tests")]
     tests::test_read_nonblock_flag();
+    // §6.14.4n（裁决 Ⅰ 转正）：read 遥测计数器验收（分流自增 + status
+    // schema，纯 Done 路径，返回主流程继续启动）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_read_telemetry_counters();
     // I-EVENTS 阶段 1（ADR-047）：事件缓冲空态契约与布局常量（无副作用）。
     #[cfg(feature = "kernel-tests")]
     tests::test_event_buffer_empty_contract();

@@ -2079,6 +2079,16 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
     // 判定单点在 `read_is_nonblock`（S13），不在此处硬编码位运算。
     let nonblock = read_is_nonblock(frame.a5);
     let peek = read_is_peek(frame.a5);
+    // 遥测（§6.14.4n→Ⅰ 转正）：read 进入计数，按 a5 非阻塞位分流。
+    // **单点在 sys_read**（S13）——此前放在 `syscall_entry` 按 nr 判，计数器只应
+    // 由本函数增减。计数频率为键盘/流读量级，Relaxed 原子加可忽略（判定见
+    // `STREAM_READS` 文档）。 `nr == SYS_STREAM_READ` 的等价性：`sys_read` 仅由
+    // `dispatch` 的 `SYS_STREAM_READ` 分支调用（单一调用点，S28）。
+    if nonblock {
+        STREAM_READS_NONBLOCK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        STREAM_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     if len == 0 {
         return done(pack_ok(0));
     }
@@ -2303,7 +2313,9 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
 /// **诊断日志**：仅在「真的切走」时留一条运行期痕迹（同 audio 路径纪律）——
 /// 事件阻塞是本批次无法在启动期测试覆盖的路径，e2e 需要能区分
 /// 「挂在等键」与「卡在别处」。
-/// 事件流空读导致的内核阻塞次数（S09 可观察）。
+///
+/// 事件流空读导致的内核阻塞次数（S09 可观察，永久遥测，§6.14.4n 裁决 Ⅰ 转正；
+/// 由 `input_event_blocking` 的 `Switched` 分支递增）。
 ///
 /// **为何是原子计数而非日志**：本计数在**切换路径上**递增，而日志会取控制台/
 /// 串口锁——切换会整体替换中断帧，锁可能随被切走的帧一起悬挂（实测缺陷：
@@ -2312,21 +2324,35 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
 pub static BLOCKED_ON_EVENTS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// **临时诊断（§6.14.4n）**：`SYS_STREAM_READ`（nr=12）的累计进入次数。
+/// `SYS_STREAM_READ`（阻塞形态，a5 无 NONBLOCK 位）的累计进入次数（S09 可观察）。
+///
+/// **永久遥测**（§6.14.4n 立功后所有者裁决 Ⅰ 转正；原名 `READ_SYSCALLS`，
+/// 因语义是**全部流读**而非全部 read，更名以求名实相符，S15）。本进程未
+/// 重启时**单调不减**（内核级累计，**不区分来源进程**）；跨时间比较必须用
+/// **窗口增量**，绝对值无意义。
 ///
 /// 用来**区分「真阻塞」与「用户态空转」**：
 /// - 真阻塞：进程挂起在 read 里，计数**几乎不增**；
-/// - 空转：每轮都重新 read，计数**持续增长**（这正是我们怀疑的）。
+/// - 空转：每轮都重新 read，计数**持续增长**。
 ///
-/// 之所以必须用**内核侧**计数：该进程**自身的串口输出不可靠**（§6.14.4l），
+/// 之所以必须用**内核侧**计数：被测进程**自身的串口输出不可靠**（§6.14.4l），
 /// 且 QEMU monitor 的 RIP 采样**偏向内核**、采不到用户态（§6.14.4m）。
 /// 计数经现成的 `/devices/input/events/status` 暴露（S15 复用既有遥测通道）。
-pub static READ_SYSCALLS: core::sync::atomic::AtomicU64 =
+///
+/// 单点约束：**仅 `sys_read` 的非阻塞分支之外**递增（S13）。覆盖范围含普通
+/// 文件/管道等一切 `SYS_STREAM_READ` 阻塞读——按读源归因须结合窗口内行为
+/// （如 `read_nonblocking` 同窗为 0 才能排除 shell 探键污染）。
+pub static STREAM_READS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// **临时诊断（§6.14.4n）**：非阻塞 read（a5≠0，shell 探键轮询）的进入次数。
-/// 与 [`READ_SYSCALLS`]（阻塞 read）分开，二者相加才是 read 总量。
-pub static READ_SYSCALLS_NB: core::sync::atomic::AtomicU64 =
+/// `SYS_STREAM_READ` 非阻塞形态（a5 置 [`STREAM_READ_NONBLOCK`]）的累计进入
+/// 次数（S09 可观察）。与 [`STREAM_READS`] 相加即流读总量。
+///
+/// **永久遥测**（同上，裁决 Ⅰ 转正；原名 `READ_SYSCALLS_NB`）。
+/// 【缺陷记录（§6.14.4n 收尾实测）】d2a4e85 初版**只有定义没有自增点**——
+/// 计数器恒为 0，当时「rnb=0 ⇒ 无 shell 探键污染」的结论是**空真**（S09 红线：
+/// 测量工具本身没接电）。转正时在 `sys_read` 补上单点自增（S13）。
+pub static STREAM_READS_NONBLOCK: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 fn input_event_blocking(frame: &mut SyscallFrame) -> Option<DispatchResult> {
@@ -4846,10 +4872,6 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
 /// 返回 `true` 让 `iretq` 把（可能的）新现场带回目标用户态。
 pub extern "C" fn syscall_entry(frame: &mut SyscallFrame) -> bool {
     let nr = frame.nr;
-    // 临时诊断（§6.14.4n）：统计 read 进入次数，用于区分真阻塞 vs 用户态空转。
-    if nr == SYS_STREAM_READ as u64 {
-        READ_SYSCALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
     // 进入/返回 trace 仅在自检构建开启（避免每条 syscall 生产刷屏）。
     #[cfg(feature = "kernel-tests")]
     klib::info!(
