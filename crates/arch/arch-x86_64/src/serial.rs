@@ -321,6 +321,11 @@ fn com_base() -> u16 {
 /// 轮询上限 [`TX_POLL_LIMIT`]：耗尽说明 UART 硬件挂死，放弃本字节以释放
 /// 串口锁（持锁永久自旋会让多核全部卡死，arch1.md AM2）。正常 UART 在
 /// 波特率级别的时间内必然腾空，远达不到上限。
+///
+/// **丢弃必须留痕（§6.15.6 defect #7，2026-09-27 修复）**：放弃的字节计入
+/// [`DROPPED_TX`]（经 [`dropped_tx()`] 观察）——**此处绝不打日志**：日志本身
+/// 走串口输出，在 TX 挂死场景下打日志 = 递归丢弃 + 持锁自旋，正是本分支
+/// 要避免的死锁形态（S09：计数器是不递归的诚实形态）。
 #[inline]
 fn putc_wait(byte: u8) {
     let com = com_base();
@@ -328,11 +333,25 @@ fn putc_wait(byte: u8) {
     while inb(com + REG_LINE_STATUS) & LSR_TX_EMPTY == 0 {
         polled += 1;
         if polled >= TX_POLL_LIMIT {
+            // 丢弃留痕：递增计数器后立即返回（与上文同理由，不打印）。
+            DROPPED_TX.fetch_add(1, Ordering::Relaxed);
             return;
         }
         core::hint::spin_loop();
     }
     outb(com, byte);
+}
+
+/// 因 TX 轮询超限而被**静默丢弃**的字节总数（单调递增）。
+///
+/// 观察接口 [`dropped_tx()`]；诊断/自检可在系统恢复后对比前后差值量化丢失。
+/// 计数用 Relaxed：本计数器只做事后诊断聚合，不参与任何同步判定。
+static DROPPED_TX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 返回至今因 TX 轮询超限而丢弃的字节数（诊断接口，与 [`dropped_keys()`]
+/// 同款形态）。
+pub fn dropped_tx() -> u64 {
+    DROPPED_TX.load(Ordering::Relaxed)
 }
 
 /// 发送单个字节（带锁 + 关中断，防中断上下文重入死锁）。
