@@ -785,6 +785,21 @@ pub trait INode: Send + Sync {
     fn input_event_stream(&self) -> bool {
         false
     }
+    /// 本节点若是**每读者事件流**（I-EVENTS P1，§6.15），返回其流后端
+    /// （Provider 共享克隆）——`sys_open` 据此铸造 [`crate::stream::EventReaderToken`]
+    /// （游标 = 句柄的读位置），关闭即收敛。默认 `None`（绝大多数节点）。
+    ///
+    /// 与 [`Self::input_event_stream`]（阶段 2 的阻塞语义真值）**分立**：
+    /// 后者回答「空读该不该阻塞」，本钩子回答「读位置该不该按读者分账」。
+    /// 分立而非合并的理由（S15）：两问的正交组合都真实存在——音频 dsp 是
+    /// 「阻塞但单流」，事件节点是「阻塞且每读者」，普通文件是「既不阻塞也非流」。
+    ///
+    /// **默认 `None`**（S17 安全侧）：漏写覆写只会让节点退回 backlog 单径语义，
+    /// 不会给普通文件凭空造出读者身份。`InputEventsNode` 与 Fake 事件流节点
+    /// 覆写为 `Some(provider)`。
+    fn event_stream_reader(&self) -> Option<alloc::sync::Arc<dyn crate::devfs::DeviceInfoProvider>> {
+        None
+    }
     /// 本节点是否为**终端**（ADR-044 §1.2，决策 2）：`isatty` 的真值依据。
     ///
     /// **默认 `false`**（S17 安全侧）：绝大多数节点（ramfs/procfs/sysfs/块设备/

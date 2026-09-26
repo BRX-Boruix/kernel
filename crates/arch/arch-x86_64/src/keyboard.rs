@@ -563,6 +563,20 @@ fn push_event(e0: bool, code: u8, key_up: bool) {
         | ((flags as u64) << 8)
         | ((code as u64) << 16)
         | (0u64 << 32);
+    // 入环 + 唤醒（S13 单点：流控/存储/唤醒唯一在 `enqueue_record`）。
+    let _ = enqueue_record(lo, ts);
+}
+
+/// 环操作单点（S13）：流控（满则丢新并计数）→ 存记录两字 → Release 发布写
+/// 指针 → 置 INIT → 唤醒事件读者。`push_event`（生产）与
+/// `test_push_raw_event`（测试注流）共用；返回 `false` = 满丢弃。
+fn enqueue_record(lo: u64, ts: u64) -> bool {
+    let w = EVQ_WRITE.load(Ordering::Relaxed);
+    let r = EVQ_READ.load(Ordering::Relaxed);
+    if w.wrapping_sub(r) >= EVQ_CAP {
+        DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     let base = (w % EVQ_CAP) * 2;
     EVQ_DATA[base].store(lo, Ordering::Relaxed);
     EVQ_DATA[base + 1].store(ts, Ordering::Relaxed);
@@ -572,6 +586,7 @@ fn push_event(e0: bool, code: u8, key_up: bool) {
     // 与旧字节路径的 `notify_input` 分开（两条路径的等待者语义不同，见
     // `EVENT_CB` 说明）——旧路径零改动（双轨红线）。
     notify_event();
+    true
 }
 
 /// 因事件缓冲满被丢弃的事件总数（诊断接口，AM4 同款）。
@@ -599,8 +614,10 @@ pub fn pending_events() -> u64 {
 /// 弹出一条事件记录，写入 `out`（须 ≥ 16 字节；ADR-047 §2.1 布局）。
 /// 无事件返回 `false`（out 不被触碰）。
 ///
-/// 读取路径（后续小点接 `/devices/input/events` 节点）调用；
-/// 单消费者纪律：与字节缓冲相同——只有这一处 pop。
+/// **P1（§6.15）起为 legacy 单读者消费点**：多读者层不再逐条 pop（改用
+/// 下方环视图 `evq_peek`/`evq_advance`，每读者一把游标）；本函数保留为
+/// trait 默认读路径的实现（未覆写该缝的 Provider 仍走它）。全局读指针
+/// 的推进点自 P1 起有两处：本函数与 `evq_advance`（受控、不越写指针）。
 pub fn pop_event(out: &mut [u8]) -> bool {
     if out.len() < EVENT_RECORD_SIZE {
         return false;
@@ -627,6 +644,99 @@ pub fn pop_event(out: &mut [u8]) -> bool {
     out[7] = ((lo >> 56) & 0xFF) as u8;
     out[8..16].copy_from_slice(&ts.to_le_bytes());
     true
+}
+
+// ---------- 事件环视图（I-EVENTS P1 多读者，§6.15） ----------
+//
+// `pop_event` 是 SPSC 的唯一消费点；多读者层（`vfs::stream`）不再逐条 pop，
+// 而是「每读者一把游标 + 全局读指针按最慢读者推进」。这里导出环的**视图**
+// 与**受控推进**，供 Provider 缝（vfs_init.rs 的 `KernelDeviceProvider`）
+// 反射——vfs 不依赖 arch_x86_64（KM1），全部经 trait 方法间接到达。
+//
+// 内存序与 `pop_event` 同纪律：先 Acquire 写指针，再读槽（记录数据先于
+// `EVQ_WRITE` 的 Release 存储可见，Acquire 配对后槽内容必然完整）。
+
+/// wrapping 序比较：`x` 是否落在 `[lo, hi)` 内（三值同一单调域；域跨度
+/// 远小于 2^63——环深 128，游标差不可能进入高位歧义区）。
+fn evq_in_range(x: u64, lo: u64, hi: u64) -> bool {
+    let dx = x.wrapping_sub(lo);
+    let dh = hi.wrapping_sub(lo);
+    dx < dh && (dh >> 63) == 0
+}
+
+/// 全局读指针（回收墙下游；只读不推进）。本环恒存在，恒 `Some`。
+pub fn evq_read_index() -> Option<u64> {
+    Some(EVQ_READ.load(Ordering::Relaxed) as u64)
+}
+
+/// 全局写指针（已投递记录总数；只读不推进）。本环恒存在，恒 `Some`。
+pub fn evq_write_index() -> Option<u64> {
+    Some(EVQ_WRITE.load(Ordering::Acquire) as u64)
+}
+
+/// 环容量（记录数）；本环恒存在，恒 `Some`。
+pub fn evq_capacity() -> Option<u64> {
+    Some(EVQ_CAP as u64)
+}
+
+/// 读游标 `cursor` 处的记录**但不消费**（多读者 peek）。
+///
+/// 可用判据与 `pop_event` 同纪律（S15）：`cursor ∈ [读墙, 写指针)`。
+/// 越过读墙的槽位可能已被覆盖——交付覆盖中的槽位 = 伪造数据（S09）；
+/// 越过写指针 = 尚未就绪。两种情况都返回 `false`（out 不被触碰）。
+pub fn evq_peek(cursor: u64, out: &mut [u8]) -> bool {
+    if out.len() < EVENT_RECORD_SIZE {
+        return false;
+    }
+    let r = EVQ_READ.load(Ordering::Relaxed) as u64;
+    let w = EVQ_WRITE.load(Ordering::Acquire) as u64;
+    if !evq_in_range(cursor, r, w) {
+        return false;
+    }
+    let base = (cursor as usize % EVQ_CAP) * 2;
+    let lo = EVQ_DATA[base].load(Ordering::Relaxed);
+    let ts = EVQ_DATA[base + 1].load(Ordering::Relaxed);
+    out[..8].copy_from_slice(&lo.to_le_bytes());
+    out[8..16].copy_from_slice(&ts.to_le_bytes());
+    true
+}
+
+/// 受控推进全局读指针（回收墙回馈；绝不越过写指针，CAS 防并发重推）。
+/// 由最慢读者下界驱动（`vfs::stream`）；`pop_event` 之外的唯一推进点。
+pub fn evq_advance(n: u64) {
+    if n == 0 {
+        return;
+    }
+    let w = EVQ_WRITE.load(Ordering::Acquire) as u64;
+    let mut cur = EVQ_READ.load(Ordering::Relaxed) as u64;
+    loop {
+        // 目标 = min(写指针, 当前 + n)：宁可少推，不可越界（S17）。
+        let target = core::cmp::min(w, cur.wrapping_add(n));
+        if target <= cur {
+            return;
+        }
+        match EVQ_READ.compare_exchange(
+            cur as usize,
+            target as usize,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => cur = actual as u64, // 并发重推：以最新值重来
+        }
+    }
+}
+
+/// 测试/自检注流：向事件环投递一条原始 16 字节记录（kernel-tests 用；
+/// 生产投递路径是 IRQ1 → `push_event`，从不经过这里）。与 `push_event`
+/// 走同一条环、同一条流控（满则丢弃并计数）与同一条唤醒回调（S13：
+/// 唯一在 `enqueue_record`）。
+pub fn test_push_raw_event(rec: &[u8; EVENT_RECORD_SIZE]) -> bool {
+    let mut lo = [0u8; 8];
+    lo.copy_from_slice(&rec[..8]);
+    let mut ts = [0u8; 8];
+    ts.copy_from_slice(&rec[8..16]);
+    enqueue_record(u64::from_le_bytes(lo), u64::from_le_bytes(ts))
 }
 
 /// 事件缓冲是否**可读**（即 `pop_event` 此刻是否会返回 `true`）。

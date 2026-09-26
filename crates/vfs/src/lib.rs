@@ -22,6 +22,7 @@ pub mod path;
 pub mod procfs;
 pub mod ramfs;
 pub mod stdio;
+pub mod stream;
 pub mod sysfs;
 
 pub use audio::{AudioRing, DspNode, WriteGate, AUDIO_RING_CAPACITY, AUDIO_STREAM_COUNT};
@@ -51,6 +52,7 @@ pub use path::Path;
 pub use procfs::{ActiveUserView, ProcFS, ProcessInfoProvider, ProcessSnapshot, UserSnapshot};
 pub use ramfs::{set_ramfs_memory_tight_hook, RamFS};
 pub use stdio::{set_stdin_source, set_stdout_sink, stderr_handle, stdin_handle, stdout_handle};
+pub use stream::{open_reader as open_event_reader, EventReaderToken};
 pub use sysfs::{SysFS, SystemInfoProvider};
 #[cfg(test)]
 mod tests {

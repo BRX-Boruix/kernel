@@ -123,6 +123,13 @@ impl OpenFlags {
 /// `AtomicU64 offset` 共享，`OpenFlags` 值拷贝）——Unix dup2 语义：副本与
 /// 原句柄指向同一文件、共享读写偏移（pipe-features 方案 A）。
 pub struct FileHandle {
+    /// 事件流读者令牌（I-EVENTS P1，§6.15）：仅当本句柄是对**每读者流**节点
+    /// （当前 = `/devices/input/events`）执行过 `open_stream` 时为 `Some`。
+    /// 游标语义：句柄的读位置——`Clone`（dup2/fork）共享同一游标（读走过的
+    /// 就是读走了），最后一个克隆消失（close）时游标收敛、读者出局。
+    /// 非事件流句柄恒 `None`，零额外开销。铸造单点在 `sys_open`（S15），
+    /// 故除该点外本字段恒为 `None`——构造点零改动。
+    pub stream_token: Option<crate::stream::EventReaderToken>,
     pub inode: Arc<dyn INode>,
     /// 读写偏移量。用 `Arc<AtomicU64>` 承载：dup2 副本共享**同一**文件描述
     /// （同一偏移计数器，跨副本同步推进）——Unix dup2 语义（pipe-features
@@ -134,8 +141,10 @@ pub struct FileHandle {
 impl Clone for FileHandle {
     fn clone(&self) -> Self {
         // dup2 语义：副本共享同一 INode（Arc）与同一读写偏移（Arc<AtomicU64>
-        // 共享，跨副本读写推进同一计数器）。
+        // 共享，跨副本读写推进同一计数器）。事件流令牌（若在）同样克隆：
+        // 共享同一游标 Arc——与 offset 同一继承哲学。
         Self {
+            stream_token: self.stream_token.clone(),
             inode: Arc::clone(&self.inode),
             offset: Arc::clone(&self.offset),
             flags: self.flags,
@@ -182,16 +191,57 @@ impl FileHandle {
             0
         };
         Ok(Self {
+            stream_token: None,
             inode,
             offset: Arc::new(AtomicU64::new(initial_offset)),
             flags,
         })
     }
 
+    /// 把本句柄登记为**每读者事件流**的读者（I-EVENTS P1，§6.15）。
+    ///
+    /// 仅对自述 `event_stream_reader()` 有流后端的节点有效；铸造
+    /// [`EventReaderToken`]（游标 = `min(写指针, 最慢读者)`，见
+    /// `vfs::stream::open_reader`）并挂在句柄上。重复铸造以
+    /// `AlreadyExists` 拒绝——一个句柄一名读者；`Err` 原样透传（流后端
+    /// 缺失等），调用方决定语义。
+    ///
+    /// 失败时**不留半登记态**：铸造成功才写回字段；字段为 None 时 Drop 无事
+    /// 发生，注册/收敛天然配平（S21 显式化）。
+    pub fn attach_event_reader(&mut self) -> Result<(), Error> {
+        if self.stream_token.is_some() {
+            return Err(Error::AlreadyExists);
+        }
+        let backend = self.inode.event_stream_reader().ok_or(Error::NotSupported)?;
+        self.stream_token = Some(crate::stream::open_reader(backend));
+        Ok(())
+    }
+
     /// 流式读（自动推进 offset）。
+    ///
+    /// **每读者事件流分支（I-EVENTS P1）**：持有 `stream_token` 的句柄走
+    /// 令牌的独立游标（读位置语义），不触 offset、不触 `read_at`；返回 0 =
+    /// 本读者游标处暂无新记录（syscall 层按节点真值接阻塞/非阻塞语义）。
+    /// 其余句柄逐位保持原语义。
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
         if !self.flags.read {
             return Err(Error::PermissionDenied);
+        }
+        if let Some(tok) = &self.stream_token {
+            // 整环填满（与 read_at 的 backlog 形态同款「读走尽可能多的整条」）：
+            // 每次取一条，直到源空或装不下。返回 0 = 本读者游标处暂无记录。
+            if buf.len() < 16 {
+                return Ok(0);
+            }
+            let mut total = 0usize;
+            while total + 16 <= buf.len() {
+                let got = tok.take(&mut buf[total..]);
+                if got == 0 {
+                    break;
+                }
+                total += got;
+            }
+            return Ok(total);
         }
         let cur = self.offset.load(Ordering::SeqCst);
         let n = self.inode.read_at(cur, buf)?;

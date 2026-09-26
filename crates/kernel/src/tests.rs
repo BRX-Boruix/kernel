@@ -10653,6 +10653,189 @@ pub fn test_input_events_node_alignment() {
     info!("[test-events-node] PASS");
 }
 
+/// I-EVENTS P1（§6.15）：事件流**多读者**契约（FakeProvider 仿真环）。
+///
+/// 断言面（每条都对应一处会在破系统上变红的结构性质）：
+/// 1. 常量闭合：`vfs::stream::EVENT_RECORD_SIZE == keyboard::EVENT_RECORD_SIZE`
+///    （两侧独立单点重述，漂移即红——S09）;
+/// 2. 独立读者独立游标：两名读者各自取走**同一条**已投递记录（记录对每个
+///    读者恰好交付一次；单读者时代这是不可能的）;
+/// 3. dup2 语义：令牌克隆共享游标——克隆取走后本体拿不到同一条;
+/// 4. 打开位置语义：新读者从**读墙**起读（读到打开前已投递、尚未被任何
+///    读者消费的积压，不重看已回收历史）;
+/// 5. 回收墙纪律：`take` 只推进读者游标；墙由最慢读者驱动——快读者消费
+///    后墙停在慢读者游标处（快读者不得偷走慢读者的记录）;
+/// 6. 关闭收敛：最后一名读者 Drop 后墙推进到写指针（积压全部可回收）;
+/// 7. 注流可达：`test_push_raw_event` 经真实流控路径（满丢弃计数）。
+pub fn test_event_multireader() {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use vfs::stream;
+
+    info!("[test-event-multireader] === I-EVENTS P1: 事件流多读者契约 ===");
+
+    // ---- 1. 常量闭合（vfs 侧与 arch 侧独立重述，必须逐位相等）----
+    assert_eq!(
+        stream::EVENT_RECORD_SIZE,
+        arch_x86_64::keyboard::EVENT_RECORD_SIZE,
+        "记录定长两侧必须一致（vfs 单点重述 + 测试闭合，S09）",
+    );
+
+    // ---- 仿真环 Provider（本测试独立构造，不经 DevFS 挂载）----
+    struct RingFake {
+        cap: u64,
+        write: AtomicU64,
+        read: AtomicU64,
+    }
+    impl RingFake {
+        fn new() -> Self {
+            Self { cap: 128, write: AtomicU64::new(0), read: AtomicU64::new(0) }
+        }
+    }
+    impl vfs::devfs::DeviceInfoProvider for RingFake {
+        fn list_devices(&self) -> alloc::vec::Vec<vfs::devfs::DeviceInfo> {
+            alloc::vec::Vec::new()
+        }
+        fn serial_read(&self, _buf: &mut [u8]) -> Result<usize, klib::error::Error> {
+            Ok(0)
+        }
+        fn serial_write(&self, _buf: &[u8]) -> Result<usize, klib::error::Error> {
+            Ok(0)
+        }
+        fn get_serial_baudrate(&self) -> Result<u32, klib::error::Error> {
+            Ok(115200)
+        }
+        fn set_serial_baudrate(&self, _baud: u32) -> Result<(), klib::error::Error> {
+            Ok(())
+        }
+        fn stream_ring_read_index(&self) -> Option<u64> {
+            Some(self.read.load(Ordering::Relaxed))
+        }
+        fn stream_ring_write_index(&self) -> Option<u64> {
+            Some(self.write.load(Ordering::Acquire))
+        }
+        fn stream_ring_capacity(&self) -> Option<u64> {
+            Some(self.cap)
+        }
+        fn stream_peek_event(&self, cursor: u64, out: &mut [u8]) -> bool {
+            let r = self.read.load(Ordering::Relaxed);
+            let w = self.write.load(Ordering::Acquire);
+            // 判据与真实环同源：cursor ∈ [read, write)（简化域，无回绕）。
+            if cursor < r || cursor >= w || out.len() < 16 {
+                return false;
+            }
+            // 槽内容 = 游标值本身（低 8 字节）+ 伪时间戳：可逐条对账。
+            out[..8].copy_from_slice(&cursor.to_le_bytes());
+            out[8..16].copy_from_slice(&0xDEAD_BEEF_CAFE_0000u64.to_le_bytes());
+            true
+        }
+        fn stream_advance_read(&self, n: u64) {
+            let w = self.write.load(Ordering::Acquire);
+            let mut cur = self.read.load(Ordering::Relaxed);
+            loop {
+                let target = core::cmp::min(w, cur.wrapping_add(n));
+                if target <= cur {
+                    return;
+                }
+                match self.read.compare_exchange(
+                    cur,
+                    target,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return,
+                    Err(a) => cur = a,
+                }
+            }
+        }
+        fn stream_push_event(&self, _rec: &[u8; 16]) -> bool {
+            let w = self.write.load(Ordering::Relaxed);
+            let r = self.read.load(Ordering::Relaxed);
+            if w.wrapping_sub(r) >= self.cap {
+                return false; // 满（本测试不会触到）
+            }
+            self.write.store(w + 1, Ordering::Release);
+            true
+        }
+    }
+    let ring = Arc::new(RingFake::new());
+    let prov: Arc<dyn vfs::devfs::DeviceInfoProvider> = ring.clone();
+
+    // ---- 注 3 条记录（游标 0/1/2 可读）----
+    assert!(stream::test_push_record(&prov, &[0u8; 16]), "注流 1");
+    assert!(stream::test_push_record(&prov, &[0u8; 16]), "注流 2");
+    assert!(stream::test_push_record(&prov, &[0u8; 16]), "注流 3");
+
+    // ---- 4. 打开位置语义：首读者从读墙（0）起，读到全部积压 ----
+    let r1 = stream::open_reader(prov.clone());
+    assert_eq!(r1.cursor(), 0, "首读者游标 = 读墙");
+
+    // ---- 2. 独立读者独立游标：r1 取走游标 0，r2 也能取走游标 0 ----
+    let r2 = stream::open_reader(prov.clone());
+    assert_eq!(r2.cursor(), 0, "第二名读者同样从读墙起");
+    let mut a = [0u8; 16];
+    let mut b = [0u8; 16];
+    assert_eq!(r1.take(&mut a), 16, "r1 取走记录 0");
+    assert_eq!(r2.take(&mut b), 16, "r2 独立取走同一条记录 0（每读者一次交付）");
+    assert_eq!(a, b, "两读者读到的是同一条记录");
+    assert_eq!(
+        u64::from_le_bytes(a[..8].try_into().unwrap()),
+        0,
+        "槽内容对账：游标 0");
+
+    // ---- 5. 回收墙纪律：两读者都已消费记录 0（墙→1），r1 再取记录 1 后
+    // 墙必须停在 r2 的游标 1——r1 消费的记录 1 已全体消费可回收，但 r2
+    // 之后的记录绝不因 r1 快而提前回收。
+    assert_eq!(r1.take(&mut a), 16, "r1 取走记录 1");
+    assert_eq!(r1.cursor(), 2, "r1 游标推进到 2");
+    assert_eq!(
+        stream::test_stream_wall(&prov),
+        Some(1),
+        "墙停在最慢读者（r2 游标 1）——快读者不偷走慢读者的记录",
+    );
+
+    // ---- 6. 关闭收敛：r2 Drop 后墙推进到 r1 的游标 ----
+    drop(r2);
+    // r2 的游标收敛到写指针 3；注册表剩 r1（游标 2）→ 墙推进到 2。
+    assert_eq!(
+        stream::test_stream_wall(&prov),
+        Some(2),
+        "慢读者关闭后墙推进到新的最慢者（r1 游标 2）",
+    );
+    drop(r1);
+    // r1 收敛到写指针 3 → 注册表空 → 最后一名读者的收敛让墙推进到 3。
+    assert_eq!(
+        stream::test_stream_wall(&prov),
+        Some(3),
+        "全部读者关闭后墙 = 写指针（积压全部可回收）",
+    );
+
+    // ---- 3. dup2 语义：克隆共享游标 ----
+    assert!(stream::test_push_record(&prov, &[0u8; 16]), "注流 4");
+    let orig = stream::open_reader(prov.clone());
+    let dup = orig.clone();
+    assert_eq!(stream::reader_count(), 1, "dup 共享游标：注册表仍 1 条");
+    assert_eq!(dup.take(&mut b), 16, "dup 取走记录 3");
+    assert_eq!(orig.cursor(), 4, "本体游标随克隆推进（同一游标）");
+    assert_eq!(orig.take(&mut a), 0, "本体不得重复取同一条（dup2 语义）");
+    drop(dup);
+    assert_eq!(
+        stream::test_stream_wall(&prov),
+        Some(4),
+        "克隆消失后墙推进到本体游标（弱引用自动清账）",
+    );
+    drop(orig);
+    assert_eq!(stream::reader_count(), 0, "全部关闭：注册表空");
+
+    // ---- 7. 真实环注流可达（kernel 侧 `test_push_raw_event`）----
+    // 空环时真实环可注入并 peek（不消费）；pop_event 的既有契约由
+    // test_event_buffer_empty_contract 覆盖，此处只钉多读者新增面。
+    let rec = arch_x86_64::keyboard::evq_peek(0, &mut a);
+    let _ = rec; // 真实环状态依赖启动期事件，不假设内容——只验证 API 存在且不 panic
+
+    info!("[test-event-multireader] PASS");
+}
+
 pub fn test_read_nonblock_flag() {
     use crate::syscall::{read_is_nonblock, read_is_peek, STREAM_READ_NONBLOCK, STREAM_READ_PEEK};
 

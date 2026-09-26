@@ -467,6 +467,10 @@ impl DeviceInfoProvider for KernelDeviceProvider {
     ///
     /// 恰好取**整条** 16 字节记录：`buf` 不足 16 字节返回 0（不半条切割，
     /// §2.5 读侧对偶）；否则循环 pop 直到源空或 buf 满。无半条、无伪造。
+    ///
+    /// **P1（§6.15）起本方法不再是节点读路径**：多读者层（`vfs::stream`）
+    /// 经下方环视图方法（peek/advance）驱动 EVQ；保留本方法仅为维持
+    /// trait 默认实现的覆写完整性（trait API 不留「实现了却名不符实」的洞）。
     fn input_event_read(&self, buf: &mut [u8]) -> usize {
         if buf.len() < arch_x86_64::keyboard::EVENT_RECORD_SIZE {
             return 0;
@@ -478,6 +482,33 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         } else {
             0
         }
+    }
+
+    // ----- 事件环视图反射（I-EVENTS P1 多读者，§6.15）-----
+    //
+    // 本实现是 `vfs::stream` 与 `arch_x86_64::keyboard` EVQ 之间唯一的桥：
+    // vfs 不依赖 arch_x86_64（KM1 注入纪律），环视图经这些方法间接到达。
+    // 判据/内存序纪律见 keyboard 侧各函数文档（与 `pop_event` 同源，S15）。
+    /// peek：读游标处记录但不消费（判据 = 游标 ∈ [读墙, 写指针)）。
+    fn stream_peek_event(&self, cursor: u64, out: &mut [u8]) -> bool {
+        arch_x86_64::keyboard::evq_peek(cursor, out)
+    }
+    /// 回收墙回馈（受控推进；绝不越过写指针）。
+    fn stream_advance_read(&self, n: u64) {
+        arch_x86_64::keyboard::evq_advance(n)
+    }
+    /// 测试/自检注流（与生产同一环、同一流控、同一唤醒）。
+    fn stream_push_event(&self, rec: &[u8; 16]) -> bool {
+        arch_x86_64::keyboard::test_push_raw_event(rec)
+    }
+    fn stream_ring_read_index(&self) -> Option<u64> {
+        arch_x86_64::keyboard::evq_read_index()
+    }
+    fn stream_ring_write_index(&self) -> Option<u64> {
+        arch_x86_64::keyboard::evq_write_index()
+    }
+    fn stream_ring_capacity(&self) -> Option<u64> {
+        arch_x86_64::keyboard::evq_capacity()
     }
 
     /// `/devices/input/events/status`：事件缓冲遥测（S09 可观察——丢弃计数
@@ -527,6 +558,30 @@ impl DeviceInfoProvider for KernelDeviceProvider {
                 o.field_u64(
                     "read_nonblocking",
                     crate::syscall::STREAM_READS_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed),
+                )?;
+                // P1 多读者遥测（§6.15，S09 可观察）：`stream_readers` 是
+                // 当前活跃的每读者令牌数（dup2 共享游标计 1）；`stream_dropped`
+                // 与 `dropped_events` 同源（环满丢新），并列保留以便「单读者
+                // 时代 vs 多读者时代」的对照判读。
+                o.field_u64("stream_readers", vfs::stream::reader_count())?;
+                o.field_u64(
+                    "stream_wall",
+                    arch_x86_64::keyboard::evq_read_index().unwrap_or(u64::MAX),
+                )?;
+                o.field_u64(
+                    "stream_produced",
+                    arch_x86_64::keyboard::evq_write_index().unwrap_or(u64::MAX),
+                )?;
+                o.field_u64(
+                    "stream_slowest",
+                    vfs::stream::debug_slowest_cursor().unwrap_or(u64::MAX),
+                )?;
+                let (tkc, tkb) = vfs::stream::take_stats();
+                o.field_u64("tk_calls", tkc)?;
+                o.field_u64("tk_bytes", tkb)?;
+                o.field_u64(
+                    "stream_dropped",
+                    arch_x86_64::keyboard::dropped_events(),
                 )?;
                 o.end()
             })

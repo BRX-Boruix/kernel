@@ -1127,10 +1127,18 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
 
     // vfs1 M4/M3：O_DIRECTORY 强制与 append 起点真值在 FileHandle::new
     // 内完成；失败（目标非目录等）如实上抛，不再静默产出坏句柄。
-    let handle = match vfs::file_handle::FileHandle::new(inode, flags) {
+    let mut handle = match vfs::file_handle::FileHandle::new(inode, flags) {
         Ok(h) => h,
         Err(e) => return pack_err(e),
     };
+    // I-EVENTS P1（§6.15）：**每读者事件流**节点在打开时铸造读者令牌
+    // （游标 = 读墙，见 vfs::stream::open_reader）——读位置按读者分账，
+    // dup2/fork 继承同一游标，关闭收敛。铸造失败（后端缺失等）不上抛：
+    // 句柄退回 backlog 读形态（stream_token 恒 None → read_at 单径），
+    // 语义仍是真实的，只是不分账（S17 保守侧）。
+    if handle.inode.event_stream_reader().is_some() {
+        let _ = handle.attach_event_reader();
+    }
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
@@ -2168,7 +2176,7 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
     let mut total = 0u64;
     while total < len {
         let n = core::cmp::min(len - total, chunk_cap);
-        // S19：同 write 路径——用户可控 u64 加法一律 checked。
+        // S19：同 read 路径——用户可控 u64 加法一律 checked。
         let Some(ubuf) = buf.checked_add(total) else {
             if total == 0 {
                 return done(pack_err(Error::InvalidParam));
@@ -2206,7 +2214,27 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
             // 此路，普通文件/其它设备的 Ok(0) 仍逐位保持原 EOF 语义。
             Ok(0) => {
                 if total == 0 && handle.inode.input_event_stream() {
-                    match input_event_blocking(frame) {
+                    // P1（§6.15）：锁内复检探针按**本读者的判定**注入——
+                    // 有令牌（每读者）用 `tok.has_data()`（游标 vs 写指针）；
+                    // 无令牌（backlog 形态）用 `backlog_probe_cursor`（与
+                    // stream_pop_next 判据同源）；都不可用则退全局真值。
+                    // 全局 `has_event()` 在多读者下会把被慢读者钉住的记录
+                    // 算作本读者的数据，造成复检-重读死循环（§6.13 同族）。
+                    let probe = || -> bool {
+                        if let Some(tok) = handle.stream_token.as_ref() {
+                            tok.has_data()
+                        } else if let Some(prov) = handle.inode.event_stream_reader() {
+                            vfs::stream::backlog_probe_cursor(&prov).is_some()
+                        } else {
+                            arch_x86_64::keyboard::has_event()
+                        }
+                    };
+                    // 交互输入阻塞前的行缓冲冲刷（与 stdin 支路同一纪律，
+                    // S13 单径）：事件流读者停车前可能刚写过**无换行**的部分行
+                    // （如 demo 的 `[CHAR a]`）——不冲刷则输出滞留行缓冲，用户
+                    // 在进程停车的整个期间什么都看不到（r8 实测缺陷）。
+                    klib::console::flush_all_line_buffers();
+                    match input_event_blocking(frame, probe) {
                         // 已挂起切走（`Switched`）或已如实交付（等待者被占
                         // 时的 0 字节）：本帧结果已定，入口不得再写返回值。
                         Some(r) => return r,
@@ -2355,17 +2383,20 @@ pub static STREAM_READS: core::sync::atomic::AtomicU64 =
 pub static STREAM_READS_NONBLOCK: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-fn input_event_blocking(frame: &mut SyscallFrame) -> Option<DispatchResult> {
+fn input_event_blocking(
+    frame: &mut SyscallFrame,
+    probe: impl Fn() -> bool,
+) -> Option<DispatchResult> {
     let Some(pid) = current_proc_mut().map(|p| p.pid()) else {
         // 无当前进程（内核启动期）：如实返回「读走 0 条」。
         return Some(done(pack_ok(0)));
     };
     // 重新登记前清理本进程残留的等待者身份：唤醒哨兵重试的路径不清
-    // IN_EVENT_WAITER（只有真正的按键唤醒经 swap 清），残留会让本次 CAS 失败
-    // 并被误判为「已有并发等待者」，退化成空读。只在仍指向本 pid 时清，
-    // 不误伤指向其它 pid 的并发等待者（与 clear_event_waiter_if 同纪律）。
+    // 等待者表（只有真正的按键唤醒经 swap 清），残留会白占槽，槽被占满后
+    // 本次登记被误判为「表已满」，退化成空读。只在仍指向本 pid 的槽清，
+    // 不误伤其它读者的并发等待（与 clear_event_waiter_if 同纪律）。
     task::clear_input_event_waiter_if(pid);
-    match task::block_for_input_event(arch_frame(frame)) {
+    match task::block_for_input_event(arch_frame(frame), probe) {
         // 已挂起切走：本帧整体交棒，用户态经 `-EAGAIN` 哨兵重试 read。
         task::InputEventBlock::Switched => {
             // 运行期痕迹（同 audio 阻塞路径纪律）：事件阻塞无法在启动期

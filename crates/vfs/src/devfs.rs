@@ -61,6 +61,46 @@ pub trait DeviceInfoProvider: Send + Sync {
     fn input_event_read(&self, _buf: &mut [u8]) -> usize {
         0
     }
+
+    // ----- 事件流多读者缝（I-EVENTS P1，§6.15；vfs 不直连 arch_x86_64，KM1 同纪律）-----
+    //
+    // 语义契约（真实内核经 `KernelDeviceProvider` 反射到 `arch_x86_64::keyboard`
+    // 的 EVQ 环视图；FakeProvider 反射到仿真环——见 vfs::stream 模块文档）：
+    //
+    // * `stream_peek_event`：读游标 `cursor` 处的记录**但不消费**。可用判据：
+    //   `cursor ∈ [读墙, 写指针)` 且环已就绪——越过读墙的槽位可能已被覆盖
+    //   （交付覆盖中的槽位 = 伪造数据，S09）；越过写指针 = 尚未就绪。
+    //   内存序与 `pop_event` 同纪律：先 Acquire 写指针，再读槽。
+    // * `stream_advance_read(n)`：推进全局读指针至多 `n` 条（绝不越过写指针；
+    //   CAS 防并发重推）。由 `vfs::stream` 的最慢读者下界单点驱动。
+    // * `stream_push_event`：投递一条记录（测试/自检注流；走真实流控与唤醒
+    //   路径）。生产投递路径是 IRQ1，从不经过这里。
+    // * 两个索引读取器 + 容量：诊断/游标铸造/满判定用，只读不推进。
+    //
+    // 默认实现全为「不可用」：未接线的 Provider 如实表现为空流（宁缺毋假，
+    // S09），与既有 `input_event_read` 默认实现同一纪律。
+    /// 读 `cursor` 处记录但不消费；不可用返回 `false`（out 不被触碰）。
+    fn stream_peek_event(&self, _cursor: u64, _out: &mut [u8]) -> bool {
+        false
+    }
+    /// 推进全局读指针至多 `n` 条（不可越过写指针）。
+    fn stream_advance_read(&self, _n: u64) {}
+    /// 投递一条 16 字节记录（测试/自检注流；走真实流控与唤醒路径）。
+    fn stream_push_event(&self, _rec: &[u8; 16]) -> bool {
+        false
+    }
+    /// 全局读指针（回收墙下游）；环不存在时 `None`。
+    fn stream_ring_read_index(&self) -> Option<u64> {
+        None
+    }
+    /// 全局写指针（已投递记录总数）；环不存在时 `None`。
+    fn stream_ring_write_index(&self) -> Option<u64> {
+        None
+    }
+    /// 环容量（记录数）；环不存在时 `None`。
+    fn stream_ring_capacity(&self) -> Option<u64> {
+        None
+    }
     /// `/devices/input/events/status` JSON：如实披露事件缓冲遥测
     /// （丢弃计数等）。默认实现显式 error（宁缺毋假，S09）。
     fn input_events_status_json(&self) -> String {
@@ -362,13 +402,20 @@ impl INode for RandomDeviceNode {
     }
 }
 
-/// 输入事件流节点（I-EVENTS 阶段 1，[ADR-047]）。
+/// 输入事件流节点（I-EVENTS 阶段 1，[ADR-047]；P1 起升级为**每读者流**）。
 ///
 /// 主节点是**只读字符设备**：`read` 返回 16 字节定长事件记录流（ADR-047 §2.1
 /// 布局；§2.5 记录流语义——读侧按整条取，不半条切割）。事件→字节的转换
 /// （keymap/转义/折叠）**不在本节点**——那是用户态转换层的事（ADR-045 决策 3）。
 /// 写路径如实拒绝：内核不接受「伪造事件」（S09）。
 /// `status` 子文件如实披露缓冲遥测（丢弃计数等，S09 可观察）。
+///
+/// **P1 多读者（§6.15）**：有句柄读者（shell/evsrcdemo/未来的 consoled）经
+/// `event_stream_reader()` 钩子铸造 [`crate::stream::EventReaderToken`]——
+/// 游标即句柄的读位置，dup2 继承同一游标、关闭即收敛（见 `vfs::stream`）。
+/// **无句柄读**（`read_at`）是 **backlog 一次性读者**：从全局读墙向前消费、
+/// 不注册、不占等待者（`cat`/自检「一口吃掉历史」），且绝不越过最慢有句柄
+/// 读者（偷读即违约）。两种读者共用同一环，互不偷记录。
 pub struct InputEventsNode {
     provider: Arc<dyn DeviceInfoProvider>,
     children: DynamicDirNode,
@@ -391,20 +438,36 @@ impl InputEventsNode {
 impl INode for InputEventsNode {
     /// 忽略 offset（事件流无定位语义——过去的事件不可重放，ADR-047 §2.5）。
     ///
-    /// 按**整条记录**读取：`buf.len() >= 16` 时循环取记录直到 buf 装不下
-    /// （剩余 < 16 字节的空间不浪费给半条）或源空。返回字节数恒为 16 的倍数。
+    /// **P1 起：backlog 一次性读者**——经 [`crate::stream::stream_pop_next`]
+    /// 从全局读墙逐条交付（把**此刻已投递且无读者认领**的记录一次读走）。
+    /// 不注册读者、不参与最慢下界、不占事件等待者（`cat events.bin` 与自检
+    /// 工具的形态）。返回 16 的倍数；空流返回 0（此后由阻塞分支接管等待语义）。
+    /// 有句柄读者不走此路（它们读自己的游标）——见类型文档。
+    ///
+    /// **回退**：Provider 未接环视图（`stream_ring_write_index` 为 `None`，
+    /// 如只实现了阶段 1 pop 缝的 Fake/旧实现）时退回 [`DeviceInfoProvider::
+    /// input_event_read`] 单读者 pop——S17 保守侧，绝不因新缝缺失而假装空流。
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         if buf.len() < 16 {
             // 装不下一整条：不是错误而是「读走 0 条」（消费者给对齐缓冲即可）。
             return Ok(0);
         }
+        let stream_mode = self.provider.stream_ring_write_index().is_some();
         let mut total = 0usize;
         while total + 16 <= buf.len() {
-            let n = self.provider.input_event_read(&mut buf[total..total + 16]);
-            if n == 0 {
-                break; // 源空（或源无事件源）
+            if stream_mode {
+                let mut rec = [0u8; 16];
+                if !crate::stream::stream_pop_next(&self.provider, &mut rec) {
+                    break; // 源空，或有句柄读者把读墙钉在此刻之前
+                }
+                buf[total..total + 16].copy_from_slice(&rec);
+            } else {
+                let n = self.provider.input_event_read(&mut buf[total..total + 16]);
+                if n == 0 {
+                    break; // 源空（阶段 1 pop 缝）
+                }
             }
-            total += n;
+            total += 16;
         }
         Ok(total)
     }
@@ -421,6 +484,14 @@ impl INode for InputEventsNode {
     /// （轮询会让事件消费者在忙等的调度环境里被饿死，实测缺陷）。
     fn input_event_stream(&self) -> bool {
         true
+    }
+
+    /// P1（§6.15）：本节点是每读者事件流——流后端就是本节点持有的
+    /// Provider 克隆（真实内核 = 反射到 EVQ 的 KernelDeviceProvider）。
+    fn event_stream_reader(
+        &self,
+    ) -> Option<alloc::sync::Arc<dyn DeviceInfoProvider>> {
+        Some(self.provider.clone())
     }
 
     fn metadata(&self) -> Result<FileMetadata, Error> {
