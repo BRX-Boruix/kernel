@@ -3976,7 +3976,19 @@ pub fn exit_current(frame: &mut InterruptFrame, code: u64) {
     };
     // PID 1 契约：init 不得退出（自杀即 panic）。
     if cur_pid == init_pid() {
-        panic!("attempted to kill init (self-exit pid={})", cur_pid);
+        // 常驻取证（§6.16.6，defect #2）：panic 消息附带异常帧三元组
+        // (vector, rip, error_code)。init 自杀的来路是「init 用户态异常 →
+        // 异常信号 Default 处置 → exit_current」或 init 主动 exit syscall，
+        // `frame` 此刻仍是 init 的现场——vector/rip 是定位**哪条指令、哪类
+        // 异常**触发的唯一真值。此处是 panic 路径（本来就要停机），多打印
+        // 零风险、无探针（§6.12.8：探针会让 1/12 复现消失，取证必须常驻）。
+        panic!(
+            "attempted to kill init (self-exit pid={}, vector={}, rip={:#x}, error_code={:#x})",
+            cur_pid,
+            frame.vector,
+            frame.rip,
+            frame.error_code,
+        );
     }
     let _ = terminate_locked(cur_pid, code);
     let mut run = run_mut(cpu_slot);
