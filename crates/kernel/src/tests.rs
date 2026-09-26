@@ -10863,6 +10863,29 @@ pub fn test_console_byte_ring() {
         .as_console_ring()
         .expect("console 节点必须声明自己的环（探针真值源）");
 
+    // ---- 8. 权限形态契约（P3 补钉）：节点必须 0777——三角色各需一位（S15）。
+    // 写端（consoled）需要 w：sys_open 对写打开强制求值 WRITE 位（A1-1 open
+    // 强制）；0555 形态会让写端被 PermissionDenied 拒掉。status 子文件的遍历
+    // 父级需要 x（A2-3）。此断言钉死形态，回归时必红。
+    {
+        use vfs::inode::{PermBits, Subject};
+        let md = node.metadata().expect("console 节点 metadata 必须可得");
+        let mode = md.permissions.classic_mode();
+        assert_eq!(
+            mode, 0o777,
+            "console 节点权限必须是 0777（读端 r + 写端 w + 遍历 x），实际 {:o}",
+            mode
+        );
+        // 属主过渡态 (0,0)（from_classic 成文）——uid 0 即属主，owner-ACE 生效。
+        let subject = Subject { uid: 0, gid: 0, groups: &[] };
+        md.permissions
+            .evaluate(&subject, PermBits::WRITE)
+            .expect("写打开（consoled）必须被放行——WRITE 位求值");
+        md.permissions
+            .evaluate(&subject, PermBits::READ)
+            .expect("读打开（fd 0）必须被放行——READ 位求值");
+    }
+
     // ---- 1. 空环读返回 0 ----
     let mut buf = [0u8; 8];
     assert_eq!(node.read_at(0, &mut buf).unwrap(), 0, "空环读 = 0（不伪造）");

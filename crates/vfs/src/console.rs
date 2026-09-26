@@ -258,11 +258,18 @@ impl INode for ConsoleNode {
         Ok(FileMetadata {
             size: 0,
             node_type: INodeType::CharacterDevice,
-            // read_exec（0555 形态）：本节点是 `status` 子文件的**遍历父级**——
-            // A2-3 要求每级父目录有 x 位；0444 会让 `/devices/console/status`
-            // 的 resolve 在遍历检查处报 InvalidParam（InputEventsNode 同病，
-            // S41：新节点直接带上正确形态）。
-            permissions: AccessPolicy::read_exec(),
+            // 0777 形态（rw + 遍历 x）：本节点身兼**三个角色**，每个角色
+            // 各需一位（S15 一处成文）——
+            //   读端（P4 切换后 fd 0）需要 r；
+            //   写端（consoled）需要 w：sys_open 对写打开强制求值 WRITE 位
+            //   （A1-1 open 强制，syscall.rs「required 由 open 位」），
+            //   0555 会让 consoled 的写端被 PermissionDenied 拒掉——
+            //   P3 真机验收时发现（S09：设计审查阶段揪出，未浪费一次真机跑）；
+            //   status 子文件的**遍历父级**需要 x（A2-3：每级父目录要求 x 位，
+            //   0444/0555 均已含 x，但前两位角色要求扩到 0777）。
+            // DspNode 是 0666：它没有子文件，不需要遍历位——形态差异如实反映
+            // 节点职责差异，不是不一致（S41：新节点直接带上正确形态）。
+            permissions: AccessPolicy::from_classic(0o777),
             created_time: 0,
             modified_time: 0,
             changed_time: 0,
