@@ -2303,25 +2303,20 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
                     return done(pack_err(Error::WouldBlock));
                 }
                 if total == 0 && e == Error::WouldBlock && handle.inode.interactive_input() {
-                    // I-EVENTS P4 单径切换（§6.15）：节点自述 console_stream 为真
-                    // → 等待源是 console 环（consoled 落环唤醒），登记
-                    // CONSOLE_WAITER；否则维持键盘等待（P4 后 stdin 无此形态，
-                    // 旧路径留存至 P5 退役清理）。
-                    if handle.inode.console_stream() {
-                        if let Some(r) = console_blocking(frame, &handle.inode) {
-                            return r;
-                        }
-                        // DataReady（None）：复检发现字节已到——回循环顶部重读
-                        // 交付（与 Ok(0) console 支路的 `None => continue` 同一
-                        // 契约；落穿会被 2337 的 total==0 误判成 WouldBlock 返回，
-                        // 把「有数据」谎报成「无数据」，S09 红线）。
-                        continue;
-                    } else {
-                        return match task::block_for_kbd(arch_frame(frame)) {
-                            task::scheduler::BlockKbdOutcome::Switched => DispatchResult::Switched,
-                            task::scheduler::BlockKbdOutcome::Busy => done(pack_err(Error::WouldBlock)),
-                        };
+                    // I-EVENTS P4 单径切换（§6.15）→ P5 轨道 A 退役：stdin 的
+                    // 唯一等待源是 console 环（consoled 落环唤醒），登记
+                    // CONSOLE_WAITER。旧 KBD_WAITER 键盘等待路径已整体退役
+                    // （本分支的 else 臂曾直呼 task::block_for_kbd，P5-a 移除；
+                    // 节点真值 `console_stream()` 唯一实现是 StdinNode=true，
+                    // 故此处即 stdin 全部阻塞形态，无第二形态）。DataReady
+                    // （None）：复检发现字节已到——回循环顶部重读交付（与
+                    // Ok(0) console 支路的 `None => continue` 同一契约；落穿
+                    // 会被 total==0 误判成 WouldBlock 返回，把「有数据」谎报成
+                    // 「无数据」，S09 红线）。
+                    if let Some(r) = console_blocking(frame, &handle.inode) {
+                        return r;
                     }
+                    continue;
                 }
                 // A2：音频 dsp 节点的空读（Waiting 源是 PCM 数据到达，非键盘）。
                 // 与上一分支**互斥**：`interactive_input` 仅 stdin 为真，本分支

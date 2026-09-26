@@ -24,7 +24,7 @@ pub use process::{
 #[cfg(feature = "kernel-tests")]
 pub use scheduler::test_hooks::spawn_child_with_identity;
 pub use scheduler::{
-    SwitchOutcome, Waited, block_current, block_current_with, block_for_event, block_for_kbd,
+    SwitchOutcome, Waited, block_current, block_current_with, block_for_event,
     active_user_snapshots, exit_current, get_process_snapshot, init_pid, kill_pid,
     process_snapshots, ps_snapshot,
     set_init_pid, spawn, spawn_derived, spawn_thread_with,
@@ -34,7 +34,7 @@ pub use scheduler::{
     spawn_with_ppid, spawn_with_ppid_fds,
     start, tick,
     group_members, group_live_count, group_all_exited, is_group_leader,
-    waitpid, waitpid_timeout, wake, wake_event, wake_event_timeout, wake_kbd, wake_with_value,
+    waitpid, waitpid_timeout, wake, wake_event, wake_event_timeout, wake_with_value,
     wake_waitpid_timeout, set_event_timeout_timer,
     clear_event_timeout_timer, clear_event_waiter_if, yield_now, set_distribute_across_cpus,
     block_for_irq, wake_irq_timeout,

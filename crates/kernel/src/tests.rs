@@ -6240,7 +6240,6 @@ pub fn test_syscall_memquery_and_stdin_busy() {
     // 处即返回，pid 无需对应真实槽位）——必须先装上，否则 `expect(current)`
     // 先炸（实测：缺此调用 → "block_for_console outside process" PANIC）。
     task::scheduler::debug_set_scheduler_current(0);
-    let eagain = (-(klib::error::Error::WouldBlock.to_errno() as i64)) as u64;
     // 读缓冲用 page_a（已驻留；Busy 分支在缓冲校验之后、读之前返回）。
     // stdin 不可定位：offset 必须为顺序读哨兵 STREAM_OFFSET_CURRENT，否则
     // 在 WouldBlock 之前就被 ESPIPE 拒绝。
@@ -9771,7 +9770,6 @@ pub fn test_ace_inheritance_e2e() {
             result: 0, switched: false, arch_frame: 0, aux_pid: 0,
         }
     }
-    const ERR_FLAG: u64 = 0x8000_0000_0000_0000;
 
     let irq_flags = arch_x86_64::interrupts::irq_save();
     let addr_space = mm::user_space::UserAddressSpace::<X86PageTable>::new()

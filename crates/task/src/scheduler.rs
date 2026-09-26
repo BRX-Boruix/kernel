@@ -112,7 +112,7 @@ struct ProcEntry {
     ///
     /// 不变式：`waiting_for.is_some()` ⇒ 本进程 `TaskState::Blocked` 且由
     /// waitpid 机制独占管理（唤醒、清登记、写 `saved.rax` 都在子进程终止
-    /// 路径单点完成）。通用 [`wake`]/[`wake_kbd`] 不得触碰此类进程，
+    /// 路径单点完成）。通用 [`wake`] 不得触碰此类进程，
     /// 防止提前唤醒导致其带着未填写的 `saved.rax` 返回用户态。
     waiting_for: Option<usize>,
     /// 本进程的 home（常驻）CPU 槽位（阶段2 对称多处理）：spawn 时按 least-loaded
@@ -1479,7 +1479,7 @@ fn extract_from_ready(run: &mut PerCpuRun, target: usize) -> Option<usize> {
 /// [`schedule_from_block`] 的切走结果（K1-1，ADR-031 决策-改造要点 1 的
 /// frame-based 落地）。两分支都表示 `frame` 已被改写为下一进程的保存帧，
 /// 调用方必须以 `Switched` 纪律收尾（不再触碰 frame）；差异仅在于等待者登记
-/// （KBD_WAITER / EVENT_WAITER）是否需要在切回后清理。
+/// （EVENT_WAITER 等；原 KBD_WAITER 已随 I-EVENTS P5 退役。）是否需要在切回后清理。
 enum BlockResume {
     /// 切到**另一个**就绪进程（cur_pid 保持 Blocked + 等待者登记不变）。等待者
     /// 尚未被唤醒，登记必须保留（否则后续事件/键盘到达时无人唤醒它）。
@@ -1491,7 +1491,7 @@ enum BlockResume {
 
 /// (K1-1, ADR-031) 阻塞等待者的 idle-halt None 分支统一切换原语。
 ///
-/// `block_for_kbd` / `block_for_event` 的"无就绪进程可切"分支（`pop_ready` 返回
+/// `block_for_event` 的"无就绪进程可切"分支（`pop_ready` 返回
 /// None）不再"halt 只等自己"（旧实现仅检查 `ready.contains(&cur_pid)`），而是：
 /// **当就绪队列出现任一进程（自己或其它）时，用 frame-based 切换让出 CPU**——
 /// 与既有 `Some(next)` 分支完全同构（`pop_and_commit_switch(None, _)` + iret），
@@ -1605,7 +1605,7 @@ pub fn block_current(frame: &mut InterruptFrame) -> SwitchOutcome {
 /// 这把"登记等待者"与"置 Blocked"合并为对唤醒方不可分割的单步。lost-wakeup
 /// 的两侧论证：唤醒方的 "消费 + drain + wake" 若发生在本方循环条件检查之后、
 /// 登记之前，登记点持同一把锁的**条件复检**会看见翻转并拒绝入睡；若发生在
-/// 置 Blocked 之后，wake 正常生效。窗口不存在——与 `block_for_kbd` 的 CAS
+/// 置 Blocked 之后，wake 正常生效。窗口不存在——与 `block_for_console`/`block_for_event` 的 CAS
 /// 纪律同源。
 ///
 /// 锁序：本函数持当前进程的 per-pid 锁期间回调可能取 IPC 表锁（pid → IPC 表，
@@ -1735,109 +1735,9 @@ fn block_current_locked(
     SwitchOutcome::NotSwitched
 }
 
-/// 阻塞等待键盘输入的进程 pid（`u32::MAX` 表示无）。`block_for_kbd` 以 CAS
-/// 登记唯一等待者，键盘中断经回调 [`wake_kbd`] 唤醒；第二个并发 stdin 读者
-/// 得到 Busy（EAGAIN），不顶掉既有等待者。
-static KBD_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
-
-/// [`block_for_kbd`] 的结果。
-pub enum BlockKbdOutcome {
-    /// 已切走：`frame` **整体**变为下一进程的保存帧。调用方必须以
-    /// `DispatchResult::Switched` 收尾，不得再写返回值（kernel1.md K1a：
-    /// 写 rax 会污染目标进程现场）。
-    Switched,
-    /// 键盘已有并发等待者：本进程未阻塞、帧未动，调用方应返回 WouldBlock
-    /// （kernel1.md KM15：stdin 单读者仲裁）。
-    Busy,
-}
-
-/// 阻塞当前进程等待键盘输入（`read` syscall 缓冲空时调用）。
-///
-/// 以 CAS 登记 [`KBD_WAITER`]（唯一等待者）：已有等待者时不阻塞、返回
-/// [`BlockKbdOutcome::Busy`]——第二个并发 stdin 读者得到 EAGAIN 而不是把
-/// 第一个等待者顶掉（KM15）。CAS 在调度锁内完成，消除"登记后、置 Blocked
-/// 前"被 wake_kbd 抢先唤醒的丢失唤醒窗口；该窗口内若真被唤醒，本进程已带
-/// Ready 状态在就绪队列里，pop_ready 取回自身时走"仅当前进程"分支恢复
-/// 运行，语义收敛为一次空 read 重试。
-///
-/// 登记成功后把当前进程置 `Blocked`（不回就绪队列），切到下一个就绪进程；
-/// 若**无其他就绪进程**（单 shell 场景），进入 idle halt 等待键盘中断唤醒——
-/// 键盘 handler 经 [`wake_kbd`] 把本进程放回就绪队列，idle 循环检测到后切回。
-/// 被唤醒后用户态 `read` 重试即可取到字符（消除空转 + 刷屏）。
-pub fn block_for_kbd(frame: &mut InterruptFrame) -> BlockKbdOutcome {
-    let cpu_slot = my_cpu_slot(); // 阶段2 地基：本核槽位（BSP=0）。
-    // per-pid（a）：只取本核 RUN 域；cur 的 pid 槽访问逐 pid 锁。
-    let mut run = run_mut(cpu_slot);
-    // task1 KM4：本 expect 是**编程错误契约**的受控 abort（ADR-010 边界）——
-    // 键盘阻塞只可能由 stdin read 的内核路径发起，“无当前进程时到达此处”
-    // 意味着调用方违反了入口约定，属不可恢复的内核 bug；按全项目错误策略
-    // 这不是运行期可上抛的错误（区别于有界资源耗尽的 Result 家族）。
-    let cur_pid = run.current.expect("block_for_kbd outside process");
-    // 审计 B19：pid → u32 截断论证。pid 即进程槽表下标（固定容量，远小于
-    // 2^32），恒可无损装入 u32；u32::MAX 是 KBD_WAITER 的"空槽"哨兵，与
-    // 任何合法 pid 不相交。断言即哨兵撞车防线——若未来放宽 pid 空间先改
-    // 此处语义。
-    assert!(
-        cur_pid < u32::MAX as usize,
-        "pid {} collides with KBD_WAITER sentinel",
-        cur_pid
-    );
-    if KBD_WAITER
-        .compare_exchange(
-            u32::MAX,
-            cur_pid as u32,
-            core::sync::atomic::Ordering::AcqRel,
-            core::sync::atomic::Ordering::Acquire,
-        )
-        .is_err()
-    {
-        return BlockKbdOutcome::Busy;
-    }
-    {
-        let mut g = proc_bucket_lock(cur_pid);
-        if let Some(slot) = g.get_mut(&cur_pid) {
-            slot.saved = *frame;
-            // K2：等待者此刻仍持有 CPU 的浮点现场，必须在切走前快照进自己的
-            // PCB（Blocked 进程的 FPU 区在唤醒后由恢复路径如实还原）。
-            fpu::save(&mut slot.fpu);
-            // T2-0：同步归档当前单元用户态 FS 基址（镜像 FPU 归档；唤醒恢复时回写）。
-            slot.fs_base = gdt::read_fs_base();
-            slot.proc.set_state(TaskState::Blocked);
-        }
-    }
-    run.current = None;
-    clear_current_proc();
-
-    // 统一"选 next + 原子提交切换"原语（DESIGN §3.2）：cur 已 Blocked+脱机(prev=None、
-    // current=None、浮点现场已在上方显式 save)。候选被跨核 reap(槽 None)/置 Exit 时被丢弃
-    // 重选，绝不 .expect panic、不切进已回收槽；next 桶锁贯穿切换结束(杜绝窗口 B)。
-    // 队列耗尽(无就绪可切)则 drop RUN 走 schedule_from_block——park 本核等任一就绪进程
-    // (cur 被键盘唤醒即 resume)，只有就绪队列确实为空才 halt(ADR-031，绝无忙转)。
-    match pop_and_commit_switch(&mut run, frame, None, usize::MAX) {
-        NextCommit::Switched => BlockKbdOutcome::Switched, // frame 已改，由 syscall_entry iret 切换
-        NextCommit::Empty | NextCommit::NothingSelf => {
-            drop(run);
-            match schedule_from_block(frame, cur_pid) {
-                // 切到其它就绪进程：自己仍 Blocked + KBD_WAITER 登记不变。
-                // 不清理登记——键盘尚未到达，后续 wake_kbd 仍需借登记唤醒本进程。
-                BlockResume::SwitchedOther => BlockKbdOutcome::Switched,
-                // 自己被键盘唤醒（wake_kbd 已 swap 取走 KBD_WAITER）：切回自身。
-                // 保留对称的条件清理作为防御——只在 KBD_WAITER 仍指向本 pid 时
-                // 清除，绝不误伤后续可能的新等待者（与 block_for_event 同构）。
-                BlockResume::SwitchedSelf => {
-                    let _ = KBD_WAITER.compare_exchange(
-                        cur_pid as u32,
-                        u32::MAX,
-                        core::sync::atomic::Ordering::AcqRel,
-                        core::sync::atomic::Ordering::Acquire,
-                    );
-                    BlockKbdOutcome::Switched // frame 已改，由 syscall_entry iret 切换
-                }
-            }
-        }
-    }
-}
-
+// I-EVENTS P5 轨道 A 退役（§6.15.5）：KBD_WAITER/block_for_kbd/wake_kbd 整体移除——
+// stdin 阻塞等待源自 P4 起唯一是 CONSOLE_WAITER（console 环），键盘直读字节路径
+// 已无调用方；保留同构参照 block_for_event / block_for_console（各自真值源未变）。
 /// 把被唤醒进程 pid 塞入 home 核就绪队列，并在跨核唤醒到空闲核时发一次
 /// reschedule IPI（阶段2 M5）：让驻留进程在别核、而该核此刻调度空闲 halt 等队列
 /// 的场合即时醒来重查，把时延从等目标核下一 IRQ0 tick (~16ms) 压到即时。
@@ -1883,49 +1783,7 @@ fn wake_enqueue(pid: usize, home: usize) {
     }
 }
 
-/// 键盘有输入时唤醒阻塞的进程（由 arch 键盘 handler 经回调调用）。
-///
-/// 取出 [`KBD_WAITER`] 登记的 pid，将其置 `Ready` 并入就绪队列。调度器下次调度/// （tick ≤10ms 或 idle 循环立即）切回该进程，使其 `read` 重试取到字符。
-/// 在中断上下文调用，持锁时间极短（仅入队）。
-pub fn wake_kbd() {
-    let p = KBD_WAITER.swap(u32::MAX, core::sync::atomic::Ordering::AcqRel);
-    if p == u32::MAX {
-        return;
-    }
-    // per-pid（a）：键盘 IRQ 路径取目标 pid 锁（IrqSpinLock ⇒ 临界区 IF 屏蔽）。
-    let enqueue = {
-        let mut g = proc_bucket_lock(p as usize);
-        let slot = g.get_mut(&(p as usize));
-        match slot {
-            Some(slot) if slot.waiting_for.is_none() => {
-                // 【R13 修复（实测定案）】唤醒方必须**预置 saved.rax = -EAGAIN 哨兵**，
-                // 与 [`wake_event`] 同款纪律。此前本函数只置 Ready 不写 rax——
-                // 被唤醒进程带回用户态的 rax 仍是阻塞时的 **nr（SYS_STREAM_READ=12）**，
-                // 用户态 `libsys::call` 按返回值协议把 12 解读成"成功读到 12 字节"。
-                // 后果实测：login 的 `read(STDIN,&mut one)` 拿到 Ok(12) 后只看 one[0]——
-                // 缓冲未写、保持 0x00，于是把 NUL 当作读到的字符**回显**（串口线实测
-                // `00 61`：多出的 0x00 即此来源），并把 0x00 存入用户名/口令缓冲——
-                // **正确口令 alice/alicepw 必然认证失败**（所有者报告"不知道 alice 的
-                // 密码是什么"的真实根因）。shell 侥幸未受影响只因它的读取循环忽略非
-                // 1 字节的 Ok（`Ok(got) if got == 1`）。
-                // 哨兵 errno 取自集中定义（S13 单点），与 EVENT_WAKE_RETRY_SENTINEL
-                // 同口径；用户态 `libsys::call` 解码 -11 → WouldBlock → 登记方
-                // （sys_read 交互分支）唤醒后重试 pop，如实交付 0x61。
-                slot.saved.rax = KBD_WAKE_RETRY_SENTINEL;
-                slot.proc.set_state(TaskState::Ready);
-                Some(slot.home_cpu)
-            }
-            _ => None,
-        }
-    };
-    if let Some(home) = enqueue { wake_enqueue(p as usize, home); }
-}
 
-/// 键盘唤醒的 `-EAGAIN` 重试哨兵（写入被唤醒者的 `saved.rax`）。
-/// errno 值取自集中定义 [`Error::WouldBlock`]（S13 单点），与
-/// [`EVENT_WAKE_RETRY_SENTINEL`] 同口径——用户态 `libsys::call` 解码为
-/// `Err(WouldBlock)`，读取循环据此重试，绝不把陈旧 rax 当真实读到的字节数。
-const KBD_WAKE_RETRY_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as u64;
 
 // ---------------------------------------------------------------------------
 // interrupt-to-futex：设备事件驱动的用户态阻塞等待（interrupt→publish_event→
@@ -1937,8 +1795,8 @@ const KBD_WAKE_RETRY_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as u
 
 /// 阻塞等待设备事件的进程 pid（`u32::MAX` 表示无）。`block_for_event` 以 CAS
 /// 登记唯一等待者，`publish_event` 经回调 [`wake_event`] 唤醒；第二个并发
-/// 事件读者得到 NotSwitched（EAGAIN），不顶掉既有等待者（与 KBD_WAITER 同款
-/// KM15 单读者仲裁）。
+/// 事件读者得到 NotSwitched（EAGAIN），不顶掉既有等待者（KM15 单读者仲裁；
+/// 同款形态原见 KBD_WAITER，已随 I-EVENTS P5 退役）。
 static EVENT_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// 阻塞等待**键盘事件记录**（`/devices/input/events`）的进程 pid
@@ -1953,7 +1811,7 @@ static EVENT_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 /// 唤醒回调、用户态重试协议全不同；共用一个槽会让热插拔事件唤醒正在等键盘的
 /// 进程（反之亦然），把「误唤醒」变成用户态可见的错误交付。
 ///
-/// 与 `KBD_WAITER` 的分工同理：后者是 stdin **字节**流的等待者（`push` 唤醒），
+/// 与**已退役的** `KBD_WAITER`（P5 前 stdin 字节流等待者，`push` 唤醒）分工同理：
 /// 本槽是**记录**流的等待者（`push_event` 唤醒）。
 /// `block_for_input_event` 返回 `WaiterBusy` 的次数（S09 可观察，永久遥测，
 /// §6.14.4n 裁决 Ⅰ 转正；单点递增在 `block_for_input_event` 的 Busy 返回处）。
@@ -2033,7 +1891,7 @@ pub fn block_for_event(frame: &mut InterruptFrame) -> SwitchOutcome {
         return SwitchOutcome::NotSwitched;
     }
     // 置 Blocked 并保存现场。浮点现场由 commit_next(prev=None) 路径在
-    // 唤醒后显式保存（同 block_for_kbd，K2 纪律），此处不重复归档。
+    // 唤醒后显式保存（同 block_for_console，K2 纪律），此处不重复归档。
     let cpu_slot = my_cpu_slot();
     // per-pid（a）：只取本核 RUN 域；cur 槽访问逐 pid 锁。
     let mut run = run_mut(cpu_slot);
@@ -2293,7 +2151,8 @@ pub fn clear_input_event_waiter_if(pid: usize) {
 
 /// console 字节等待者槽（`u32::MAX` = 空闲）（§6.15 P2，第 4 个等待者）。
 ///
-/// **S21 并发显式化**：与 `KBD_WAITER`/`AUDIO_WAITER` 同构的**单槽**设计。
+/// **S21 并发显式化**：与 `AUDIO_WAITER` 同构的**单槽**设计（同款原见
+/// KBD_WAITER，已随 I-EVENTS P5 退役）。
 /// console 的字节生产者是常驻用户态转换者 consoled（甲-a 架构），读者是
 /// fd 0（stdin 换源后的前台 shell/login）——同一时刻至多一个前台进程在
 /// `read(0)` 阻塞，单槽语义与业务模型吻合（`/devices/input/events` 的
@@ -2618,7 +2477,8 @@ static EVENT_TIMER: core::sync::atomic::AtomicU64 =
 
 /// 音频消费者的唯一等待者槽（`u32::MAX` = 空闲）。
 ///
-/// **S21 并发显式化**：与 `KBD_WAITER`/`EVENT_WAITER` 同构的**单槽**设计。
+/// **S21 并发显式化**：与 `EVENT_WAITER` 同构的**单槽**设计（同款原见
+/// KBD_WAITER，已随 I-EVENTS P5 退役）。
 /// 音频管道的消费者是**独占**的（同一时刻至多一个驱动在 `AUDIO_FETCH`），
 /// 故单槽语义与业务模型天然吻合：并发第二个等待者本就该被拒绝（`AUDIO_ATTACH`
 /// 已先行拒绝第二个消费者），此处单槽是**防御性冗余**而非能力限制。
@@ -2831,26 +2691,8 @@ const EVENT_WAKE_RETRY_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as
 
 // ---------- B21/KM15 测试钩子（仅 kernel-tests 构建存在）----------
 
-/// 预占 KBD_WAITER（审计 B21：使 `block_for_kbd` 的 Busy 分支在单核测试中
-/// 可达——Busy 语义 = 第二并发 stdin 读者得到 EAGAIN，此前零测试佐证）。
-/// 仅编译进 kernel-tests；运行时路径零足迹。
-#[cfg(feature = "kernel-tests")]
-pub fn debug_occupy_kbd_waiter(pid: u32) -> bool {
-    KBD_WAITER
-        .compare_exchange(
-            u32::MAX,
-            pid,
-            core::sync::atomic::Ordering::AcqRel,
-            core::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
-}
-
-/// 释放 [`debug_occupy_kbd_waiter`] 的占用（恢复空槽哨兵）。
-#[cfg(feature = "kernel-tests")]
-pub fn debug_release_kbd_waiter() {
-    KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
-}
+// I-EVENTS P5：KBD_WAITER 已退役，B21 审计钩子随之移除（CONSOLE_WAITER 钩子
+// debug_occupy_console_waiter/debug_release_console_waiter 是现役形态）。
 
 /// 预占 CONSOLE_WAITER（I-EVENTS P4：stdin 阻塞源切到 console 环后，B21 的
 /// 「第二并发 stdin 读者 EAGAIN」语义随之迁移到本槽——旧 KBD 钩子对 P4 后
@@ -3620,7 +3462,7 @@ pub fn wake_waitpid_timeout(pid: usize) {
 /// 有界 waitpid 超时的 `-EAGAIN` 重试哨兵（写入等待者 `saved.rax`）。
 ///
 /// errno 取自集中定义 [`Error::WouldBlock`]（S13 单点），与
-/// [`KBD_WAKE_RETRY_SENTINEL`] / [`EVENT_WAKE_RETRY_SENTINEL`] 同口径——
+/// [`EVENT_WAKE_RETRY_SENTINEL`] 同口径——
 /// 用户态 `libsys::call` 解码为 `Err(WouldBlock)`，据此知道「没等到、可重试」，
 /// **绝不**把陈旧或占位 rax 当成子进程退出码。
 const WAITPID_TIMEOUT_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as u64;
@@ -3657,7 +3499,7 @@ const WAITPID_TIMEOUT_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as 
 ///
 /// | 等待源 | 登记槽 | 唤醒方 |
 /// | --- | --- | --- |
-/// | 键盘字节（`stdin`） | `KBD_WAITER` | IRQ1 |
+/// | ~~键盘字节（`stdin`）~~ | ~~`KBD_WAITER`~~ | ~~IRQ1~~ | I-EVENTS P5 退役：stdin 等待源 = `CONSOLE_WAITER`（console 环） |
 /// | 通用事件（`event_wait`） | `EVENT_WAITER` / `EVENT_TIMER` | 事件投递 / 定时器 |
 /// | 键盘**事件记录**（`/devices/input/events`） | `IN_EVENT_WAITERS` 表 | IRQ1 |
 /// | 音频 PCM 数据 | `AUDIO_WAITER` | PCM 写入 / 定时器 |
@@ -3701,10 +3543,9 @@ fn blocked_wakeable_parts(pid: usize, alive: bool, waiting_for: bool) -> bool {
         return true;
     }
     let p = pid as u32;
-    if KBD_WAITER.load(Ordering::Acquire) == p
-        || EVENT_WAITER.load(Ordering::Acquire) == p
-        || AUDIO_WAITER.load(Ordering::Acquire) == p
-    {
+    // I-EVENTS P5：KBD_WAITER 已退役（stdin 等待源唯一是 CONSOLE_WAITER，其清理
+    // 由 clear_console_waiter_if 在进程退出路径完成），此处不再核对键盘槽。
+    if EVENT_WAITER.load(Ordering::Acquire) == p || AUDIO_WAITER.load(Ordering::Acquire) == p {
         return true;
     }
     // P1 多槽表：任一槽仍登记本 pid 即视为「有未完成的等待登记」。
@@ -4302,7 +4143,7 @@ pub fn get_process_snapshot(pid: usize) -> Option<vfs::ProcessSnapshot> {
 /// - 目标为其它进程：经 [`terminate_locked`] 统一终止（zombie/唤醒父进程/
 ///   孤儿级联/UIO 清理单点），退出码记为信号号；被杀进程若有阻塞 waitpid
 ///   的父进程，父进程同样拿到真实退出码。若其为键盘 waiter，一并清除
-///   `KBD_WAITER` 避免悬挂唤醒。
+///   对应等待槽（原 `KBD_WAITER` 已退役；现役 EVENT_WAITER 等）避免悬挂唤醒。
 /// PID 1 契约：该信号若投递给 init 是否会**终止** init（从而应被拒绝）。
 /// 依 ADR-034「init 可捕获非致命信号」：仅当默认处置为 Terminate 且 init
 /// 未为该信号设 handler（不可捕获）时才判定为终止 → 拒绝。
@@ -4441,14 +4282,11 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
             }
         }
     }
-    // 若是键盘 waiter，清空避免悬挂唤醒。
-    if KBD_WAITER.load(core::sync::atomic::Ordering::Acquire) == target as u32 {
-        KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
-    }
-    // 若是设备事件 waiter（interrupt-to-futex），清空登记并取消其超时定时器：
+    // I-EVENTS P5：键盘 waiter（KBD_WAITER）清理段随轨道 A 退役移除——stdin
+    // 不再有该形态的等待登记。若是设备事件 waiter（interrupt-to-futex），清空登记并取消其超时定时器：
     // 被杀进程正阻塞在 block_for_event（EVENT_WAITER=pid）时，残留的死 pid 会让
     // 后继事件读者的 CAS 失败、永久 NotSwitched，事件等待功能损坏（S18/S21，V3）。
-    // 与 KBD_WAITER 清理路径对称。EVENT_TIMER 同时清空并 cancel，防 stale 定时器
+    // 与上方各等待槽清理路径同一纪律。EVENT_TIMER 同时清空并 cancel，防 stale 定时器
     // 到期唤醒一个已死进程。
     if EVENT_WAITER.load(core::sync::atomic::Ordering::Acquire) == target as u32 {
         EVENT_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
@@ -4918,10 +4756,10 @@ pub mod test_hooks {
 
     /// 清空全部测试进程，返回清除数量（防跨测试泄漏；next_pid 保持单调）。
     ///
-    /// task1 KD3：同步复位 `KBD_WAITER`——否则上一个用例登记的键盘等待者
-    /// 会泄漏到后续用例（Busy 误报 / 悬挂唤醒）。task1 K3：哑进程从未进入
+    /// task1 K3：哑进程从未进入
     /// 过其内核栈，帧可**就地**归还（延迟队列的"将死栈在执行中"前提对
     /// 哑进程不成立）；顺带清空回收队列保证帧计数断言的确定性。
+    /// （I-EVENTS P5：原 KD3 的 KBD_WAITER 同步复位随轨道 A 退役移除。）
     pub fn reset_all() -> usize {
         // S4：清零跨核投递尝试标志，避免用例间残留导致假阳。
         WAKE_ATTEMPTED_CROSS_CORE.store(false, core::sync::atomic::Ordering::Release);
@@ -4946,7 +4784,7 @@ pub mod test_hooks {
             slot.ready.clear();
             slot.current = None;
         }
-        KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+        // （I-EVENTS P5：原 KBD_WAITER 复位随轨道 A 退役移除。）
         // 同步复位事件等待全局（S18/S21，V3/V6）：EVENT_WAITER 残留会让后继
         // 用例的 block_for_event 永久 NotSwitched；EVENT_TIMER 残留的 stale id
         // 会污染新等待的定时器取消。P1：记录等待者多槽表同款全清（残留死 pid
