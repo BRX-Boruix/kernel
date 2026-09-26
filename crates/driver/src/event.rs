@@ -100,7 +100,8 @@ static EVENT_QUEUE: Mutex<EventRingBuffer> = Mutex::new(EventRingBuffer::new());
 /// 其唤醒。kernel 经 [`set_event_wake_callback`] 注入（指向 `task::wake_event`）。
 ///
 /// 用函数指针而非直接依赖 task crate：driver 不反向依赖 task（与键盘
-/// `set_input_callback(task::wake_kbd)` 同款解耦）。直接以 `Mutex<Option<fn()>>`
+/// 同 arch 键盘驱动的函数指针解耦手法；原 `set_input_callback(task::wake_kbd)`
+/// 已随 I-EVENTS P5 退役，本回调是同款解耦的现役形态）。直接以 `Mutex<Option<fn()>>`
 /// 承载 `fn()` 本身（函数指针是 `Copy + Send + Sync`），**不做任何函数指针↔数据
 /// 指针/整数的 transmute 或强转**（S04/S21：不依赖平台指针宽巧合）。初始化后在
 /// 启动早期设置一次，此后每次发布只读。持锁时间极短（仅拷贝一个 fn 指针）。

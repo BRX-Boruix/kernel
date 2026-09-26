@@ -1850,7 +1850,8 @@ const IN_EVENT_WAITER_SLOTS: usize = 8;
 ///   `DispatchResult::Switched` 收尾。
 /// - `NotSwitched`：**事件已在登记复检时就绪**（调用方应立即返回事件）、或已有
 ///   并发等待者（EVENT_WAITER 被占）。现场未动、无副作用。**不再因"无同伴可切"
-///   返回 NotSwitched**——与 block_for_kbd 同构，无就绪进程时走 idle halt 真实
+///   返回 NotSwitched**——与 block_for_console 同构（同款原见已退役的
+///   block_for_kbd），无就绪进程时走 idle halt 真实
 ///   挂起（绝不忙转，见 None 分支）。
 ///
 /// **lost-wakeup 论证**：登记（CAS 写 EVENT_WAITER）先于 per-pid 临界区；置 Blocked
@@ -2715,7 +2716,7 @@ pub fn debug_release_console_waiter() {
     CONSOLE_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
 }
 
-/// 设置调度器视角的当前进程（审计 B21：`block_for_kbd` 从本核 RUN 域的
+/// 设置调度器视角的当前进程（审计 B21：`block_for_console` 从本核 RUN 域的
 /// `current` 取等待者 pid——仅装 per-cpu current 不够）。Busy 分支在触达
 /// 进程槽表之前即返回，pid 无需对应真实槽位。
 #[cfg(feature = "kernel-tests")]

@@ -121,11 +121,10 @@ static mut E0_PREFIX: bool = false;
 /// [`set_event_callback`] 注册（指向 `task::wake_input_event`）。arch 层不反向
 /// 依赖 task，故与 [`INPUT_CB`] 同样用函数指针解耦。
 ///
-/// **为何与 `INPUT_CB` 分开**：`INPUT_CB`（[`notify_input`]）挂的是 stdin 字节
-/// 路径的唯一等待者（`KBD_WAITER`），由每次 `push()` 调用；本回调挂的是
-/// `/devices/input/events` 事件流路径的等待者（`IN_EVENT_WAITER`），由
-/// [`push_event`] 调用。两条路径的等待者语义不同（字节 vs 16 字节记录），
-/// 共用回调会把「事件到达」误当成「stdin 有字符」唤醒错误的进程。
+/// 本回调挂 `/devices/input/events` 事件流路径的等待者（`IN_EVENT_WAITER`），
+/// 由 [`push_event`] 调用，在 IRQ1 上下文只做入队级轻工作。
+/// （I-EVENTS P5：原 stdin 字节路径回调 `INPUT_CB`/`notify_input`——挂
+/// `KBD_WAITER`、由 `push()` 调用——已随轨道 A 退役移除。）
 static mut EVENT_CB: Option<fn()> = None;
 
 /// 注册事件记录入队回调（内核启动时调用一次）。
