@@ -120,6 +120,27 @@ impl ConsoleRing {
         n
     }
 
+    /// 写入字节的**公开门径**（内核自检用；生产写路径走 `ConsoleNode::
+    /// write_at` → 本环 `write`——单一实现，S13）：返回实际写入数（短写）。
+    pub fn write_bytes(&self, data: &[u8]) -> usize {
+        self.write(data)
+    }
+
+    /// **非消费**预览下一字节（§6.12.5 裁决甲的 console 形态）。
+    ///
+    /// 与 [`read`](Self::read) 的本质区别：不推进 `read_pos`——shell 的
+    /// 探键（peek_input）路径靠它，探完不处理时字节仍归下一个读者。
+    /// 空环 `None`。
+    pub fn peek(&self) -> Option<u8> {
+        let r = self.read_pos.load(Ordering::Acquire);
+        if self.used() == 0 {
+            return None;
+        }
+        // SAFETY：used()>0 保证 [r] 在可达区间内，只读不写。
+        let base = unsafe { &*self.buf.get() };
+        Some(base[r % self.capacity])
+    }
+
     /// 取走至多 `out.len()` 字节；空环返回 0（不消费、不伪造）。
     fn read(&self, out: &mut [u8]) -> usize {
         let r = self.read_pos.load(Ordering::Relaxed);
@@ -178,6 +199,42 @@ fn notify_data_ready() {
     }
 }
 
+// ---------- 内核侧单例访问（I-EVENTS P4 单径切换，§6.15） ----------
+
+/// 全系统唯一的 console 环句柄（`ConsoleNode::new` 注册；系统只有一个
+/// console 设备——`Once` 与 `CONSOLE_WAKE_HOOK` 同型）。
+///
+/// **谁是合法读者**：内核 `stdin_source`（fd 0 的字节源）——P4 切换后
+/// stdin 的取字路径与 consoled 的写入路径在此环上配对，**同一真值源**
+/// （S13/S15：与 `/devices/console` 节点读写、status 遥测共用一个环，
+/// 绝不另设第二字节通道）。
+static CONSOLE_RING: Once<Arc<ConsoleRing>> = Once::new();
+
+/// 注册单例环（`ConsoleNode::new` 调用一次；重复注册不覆盖）。
+fn register_ring(ring: Arc<ConsoleRing>) {
+    CONSOLE_RING.call_once(|| ring);
+}
+
+/// 返回单例环句柄（未注册时 `None`——devfs 尚未挂载 console 的启动极早期）。
+pub fn console_ring() -> Option<Arc<ConsoleRing>> {
+    CONSOLE_RING.get().cloned()
+}
+
+/// stdin 字节取走路径（内核 `stdin_source` 委派）：取走至多 `buf.len()`
+/// 字节，空环 0（StdinNode 层照旧转 WouldBlock）。未注册时 0（S17：
+/// 早期无环 = 暂无输入，不是错误）。
+pub fn input_read(buf: &mut [u8]) -> usize {
+    match CONSOLE_RING.get() {
+        Some(r) => r.read(buf),
+        None => 0,
+    }
+}
+
+/// stdin 非消费预览路径（内核 `stdin_peek` 委派，§6.12.5）。
+pub fn input_peek() -> Option<u8> {
+    CONSOLE_RING.get().and_then(|r| r.peek())
+}
+
 // ---------- 节点 ----------
 
 /// console 设备节点（§6.15 P2）。
@@ -215,6 +272,9 @@ impl ConsoleNode {
             bytes
         });
         children.add_child("status", Arc::new(status_node));
+        // P4 单径切换：把环登记为内核 stdin 源的单例句柄（先于 start_init
+        // 完成——devfs 挂载在内核启动期，早于任何用户态 stdin 读）。
+        register_ring(ring.clone());
         Self { ring, children }
     }
 }

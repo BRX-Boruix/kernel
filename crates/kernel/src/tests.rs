@@ -6140,8 +6140,8 @@ pub fn test_syscall_memory_map_shared() {
 ///
 /// - **B14**：已映射页查询返回 PRESENT|USER|WRITABLE 位图；未触碰 demand
 ///   页如实报未映射（只读页表、绝不触发补页）；out_ptr 无效 → EFAULT。
-/// - **B21**：KBD_WAITER 被占时第二个 stdin 读者得到 EAGAIN（errno 11），
-///   而不是顶掉唯一等待者（KM15）——此前该分支零测试佐证。
+/// - **B21**：CONSOLE_WAITER（P4 前 KBD_WAITER）被占时第二个 stdin 读者得到
+///   EAGAIN（errno 11），而不是顶掉唯一等待者（KM15）——此前该分支零测试佐证。
 pub fn test_syscall_memquery_and_stdin_busy() {
     use alloc::boxed::Box;
     use arch::syscall::SyscallFrame;
@@ -6228,21 +6228,26 @@ pub fn test_syscall_memquery_and_stdin_busy() {
     assert!(crate::syscall::syscall_entry(&mut q3));
     assert_eq!(q3.result, efault, "invalid out_ptr must be EFAULT");
 
-    // ---- B21：KBD_WAITER 被占 → 第二个 stdin 读者 EAGAIN ----
+    // ---- B21：CONSOLE_WAITER 被占 → 第二个 stdin 读者 EAGAIN ----
+    // （I-EVENTS P4 单径切换：stdin 阻塞源从 KBD_WAITER 迁到 CONSOLE_WAITER，
+    // KM15「不顶掉既有等待者」的仲裁语义不变，登记槽换位——旧 KBD 钩子
+    // 对 P4 后的 stdin 路径不再可达，其占用/释放钩子留待 P5 退役清理。）
     assert!(
-        task::scheduler::debug_occupy_kbd_waiter(999),
+        task::scheduler::debug_occupy_console_waiter(999),
         "occupy must succeed on free waiter"
     );
+    // block_for_console 从本核 RUN 域 `current` 取登记 pid（ Busy 分支在 CAS
+    // 处即返回，pid 无需对应真实槽位）——必须先装上，否则 `expect(current)`
+    // 先炸（实测：缺此调用 → "block_for_console outside process" PANIC）。
     task::scheduler::debug_set_scheduler_current(0);
     let eagain = (-(klib::error::Error::WouldBlock.to_errno() as i64)) as u64;
     // 读缓冲用 page_a（已驻留；Busy 分支在缓冲校验之后、读之前返回）。
     // stdin 不可定位：offset 必须为顺序读哨兵 STREAM_OFFSET_CURRENT，否则
     // 在 WouldBlock 之前就被 ESPIPE 拒绝。
     //
-    // stdin read 可能触达 `block_for_kbd`（本次因 KBD_WAITER 被占走 Busy
-    // 分支，但 syscall 分发无条件经 `arch_frame` 取回底层中断帧）——故
-    // arch_frame 必须指向真实存在的 `InterruptFrame`，不得为 0（S09：不伪造、
-    // 不空指针）。
+    // syscall 分发无条件经 `arch_frame` 取回底层中断帧（console_blocking 的
+    // 登记契约）——arch_frame 必须指向真实存在的 `InterruptFrame`，不得为 0
+    // （S09：不伪造、不空指针；实测 0 → misaligned-pointer PANIC）。
     let mut rd_arch = arch_x86_64::interrupts::InterruptFrame {
         r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
         rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
@@ -6261,11 +6266,15 @@ pub fn test_syscall_memquery_and_stdin_busy() {
         aux_pid: 0,
     };
     assert!(crate::syscall::syscall_entry(&mut rd));
+    // P4 后 stdin 走 console 仲裁形态：WaiterBusy = 如实交付 0 字节
+    // （「此刻无数据」语义，与 /devices/console 设备节点 P2 语义同源）——
+    // 旧 KBD 形态的 EAGAIN 随等待源切换而退役。KM15 不变量不变：**不顶掉**
+    // 既有等待者（CAS 失败即退让），可观察值从 EAGAIN 变 0。
     assert_eq!(
-        rd.result, eagain,
-        "second concurrent stdin reader must get EAGAIN (KM15)"
+        rd.result, 0,
+        "second concurrent stdin reader must get honest 0 (KM15 no-steal, console form)"
     );
-    task::scheduler::debug_release_kbd_waiter();
+    task::scheduler::debug_release_console_waiter();
     task::scheduler::debug_clear_scheduler_current();
 
     // ---- B21-2：fd 表达 MAX_FDS 后如实 NoSpace，绝不无界增长 ----
@@ -10928,6 +10937,48 @@ pub fn test_console_byte_ring() {
         vfs::console::CONSOLE_RING_CAPACITY,
         "满环水位 = 容量",
     );
+
+    // ---- 9. P4 单径切换契约：stdin 源接线（§6.15）----
+    // ConsoleNode::new 已把环登记为单例——stdin 侧（StdinNode::as_console_ring
+    // → vfs::console::console_ring / input_read / input_peek）必须拿到**同一个**
+    // 环：consoled 的写端、/devices/console 节点、status 遥测、stdin 取字
+    // 四者一环（S13/S15 单一事实源，绝不另设第二字节通道）。
+    {
+        // 单例契约（S09 实证环境差异）：自检环境里 devfs 先行挂载——单例是
+        // **devfs 的那个环**（生产环境 consoled 真正写入的环）；本测试的
+        // node 是第二个构造者，其环不参与单例（Once 一次性）。故本块的
+        // 读写往返全部经**单例**进行，stdin 侧必须与单例同址。
+        let singleton = vfs::console::console_ring()
+            .expect("devfs 挂载必须已注册单例环（P4 stdin 源前提）");
+        // input_read 走单例取字：经单例写入（等价 consoled 写端），input_read
+        // 应取到同字节——这就是切换后 stdin 的完整取字路径。
+        assert_eq!(singleton.write_bytes(b"p4!"), 3, "单例写入（consoled 同构）");
+        let mut ib = [0u8; 4];
+        let in_ = vfs::console::input_read(&mut ib);
+        assert_eq!(in_, 3, "input_read 从单例环取字");
+        assert_eq!(&ib[..3], b"p4!", "input_read 字节逐位一致");
+        // input_peek 非消费：写入后 peek 同值、水位不变、再 read 取走同字节。
+        assert_eq!(singleton.write_bytes(b"x"), 1);
+        assert_eq!(vfs::console::input_peek(), Some(b'x'), "peek 看到队头");
+        assert_eq!(singleton.used(), 1, "peek 非消费：水位不变");
+        assert_eq!(vfs::console::input_peek(), Some(b'x'), "peek 可重复（不推进）");
+        let mut xb = [0u8; 1];
+        assert_eq!(vfs::console::input_read(&mut xb), 1);
+        assert_eq!(xb[0], b'x', "peek 之后 read 取走同字节");
+        // StdinNode 节点真值：console_stream + 环句柄同址（syscall 分流依据）。
+        assert!(
+            vfs::stdio::stdin_handle().inode.console_stream(),
+            "P4 后 stdin 必须自述 console_stream（阻塞分流真值，S15）"
+        );
+        let stdin_ring = vfs::stdio::stdin_handle()
+            .inode
+            .as_console_ring()
+            .expect("stdin 必须声明 console 环句柄（阻塞探针真值源）");
+        assert!(
+            Arc::ptr_eq(&stdin_ring, &singleton),
+            "stdin 环句柄必须与单例同址（同一环 = consoled 真正写入的环）"
+        );
+    }
 
     // ---- 清场：取走全部，恢复空环（本测试不依赖执行顺序）----
     let mut drain = [0u8; vfs::console::CONSOLE_RING_CAPACITY];

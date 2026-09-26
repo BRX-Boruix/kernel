@@ -190,6 +190,20 @@ impl INode for StdinNode {
     fn is_terminal(&self) -> bool {
         true
     }
+
+    /// I-EVENTS P4 单径切换（§6.15）：stdin 的字节源**就是** console 环——
+    /// 节点自述 console_stream 为真，syscall 层据此把空读阻塞接
+    /// `CONSOLE_WAITER`（唤醒 = consoled 落环后的 wake 钩子）。
+    fn console_stream(&self) -> bool {
+        true
+    }
+
+    /// A2 声明式环句柄（S15 单点）：返回**单例环**——与 consoled 的写端、
+    /// `/devices/console` 节点、status 遥测是同一个环，阻塞探针（`used()`）
+    /// 与交付路径同源，绝不另设第二真相源。
+    fn as_console_ring(&self) -> Option<alloc::sync::Arc<crate::console::ConsoleRing>> {
+        crate::console::console_ring()
+    }
     /// ADR-044 §1.3（J-TOKEN-B）：本 console 令牌的持有者（节点自述，S15）。
     ///
     /// 用户态经既有 stat/fstat 读到本值；`0` = 无主/未知。

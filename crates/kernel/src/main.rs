@@ -22,7 +22,6 @@ mod tests;
 use arch::interrupt::InterruptController;
 use arch::syscall::SyscallEntry;
 use arch::Platform;
-use core::sync::atomic::{AtomicBool, Ordering};
 use klib::{error, info, warn};
 use limine::{BaseRevision, FramebufferRequest};
 
@@ -1193,42 +1192,26 @@ pub(crate) fn halt_other_cpus_via_ipi() {
 /// 若用取走式探键，子进程的输入会被静默丢弃
 /// （实测：`/programs/spinburn.elf` 变成 `/prams/spinburn.elf`）。
 fn stdin_peek() -> Option<u8> {
-    arch_x86_64::keyboard::peek()
+    // I-EVENTS P4 单径切换（§6.15）：预览源 = console 环（非消费 peek）。
+    // 字节由 consoled 经事件流转换落环——与 stdin_source 同一真值源。
+    vfs::console::input_peek()
 }
 
 fn stdin_source(buf: &mut [u8]) -> usize {
-    use driver::drivers::keyboard::PS2_KEYBOARD_DEVICE_NAME;
-
-    let count = driver::DriverHub::device_count();
-    for i in 0..count {
-        if let Some(info) = driver::DriverHub::device_info_at(i) {
-            if info.name == PS2_KEYBOARD_DEVICE_NAME {
-                if let Some(ops) = driver::DriverHub::device_at(i) {
-                    if let Some(io) = ops.as_io() {
-                        return io.read(buf);
-                    }
-                }
-            }
-        }
-    }
-    static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
-    if !FALLBACK_WARNED.swap(true, Ordering::SeqCst) {
-        warn!(
-            "[stdin] '{}' not found in DriverHub; falling back to direct keyboard queue",
-            PS2_KEYBOARD_DEVICE_NAME
-        );
-    }
-    let mut n = 0usize;
-    while n < buf.len() {
-        match arch_x86_64::keyboard::pop() {
-            Some(ch) => {
-                buf[n] = ch;
-                n += 1;
-            }
-            None => break,
-        }
-    }
-    n
+    // I-EVENTS P4 单径切换（§6.15，裁决甲-a）：stdin 字节源 = console 环。
+    //
+    // **新链路**：PS/2 IRQ1 → 事件环（多读者，P1）→ consoled（用户态，
+    // libsys keymap）→ `/devices/console` 环 → 本函数取走。键盘字节到环的
+    // 搬运者是用户态 consoled——DM5「单一消费点」的落点从 PS2 键盘设备
+    // read 平移到 console 环（`vfs::console::input_read`），消费点依然唯一：
+    // 键盘事件环的读者是 consoled（唯一），console 环的读者是 fd 0（唯一）。
+    //
+    // **S20 失败模式**：consoled 未运行 → 环恒空 → stdin 恒 WouldBlock
+    // （阻塞在 CONSOLE_WAITER）——终端语义「稍后必有字节」的诚实形态，
+    // 与事件流无限期理由同源；init 启动序列保证 consoled 先于 login。
+    // 旧的 PS2 直读路径**不保留**（单径切换，甲-a 裁决：不采渐进组合）——
+    // 其退役清理（keyboard pop/peek 死代码）归 P5。
+    vfs::console::input_read(buf)
 }
 
 fn init_display() {

@@ -2852,6 +2852,27 @@ pub fn debug_release_kbd_waiter() {
     KBD_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
 }
 
+/// 预占 CONSOLE_WAITER（I-EVENTS P4：stdin 阻塞源切到 console 环后，B21 的
+/// 「第二并发 stdin 读者 EAGAIN」语义随之迁移到本槽——旧 KBD 钩子对 P4 后
+/// 的 stdin 路径不再可达）。仅编译进 kernel-tests；运行时路径零足迹。
+#[cfg(feature = "kernel-tests")]
+pub fn debug_occupy_console_waiter(pid: u32) -> bool {
+    CONSOLE_WAITER
+        .compare_exchange(
+            u32::MAX,
+            pid,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// 释放 [`debug_occupy_console_waiter`] 的占用（恢复空槽哨兵）。
+#[cfg(feature = "kernel-tests")]
+pub fn debug_release_console_waiter() {
+    CONSOLE_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+}
+
 /// 设置调度器视角的当前进程（审计 B21：`block_for_kbd` 从本核 RUN 域的
 /// `current` 取等待者 pid——仅装 per-cpu current 不够）。Busy 分支在触达
 /// 进程槽表之前即返回，pid 无需对应真实槽位。
