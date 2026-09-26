@@ -1,10 +1,12 @@
-//! PS/2 8042 键盘驱动（阶段 B）。
+//! PS/2 8042 键盘驱动（I-EVENTS 阶段 2 后形态；P5 轨道 A 退役 §6.15.5）。
 //!
 //! - 初始化 8042 控制器（端口 0x60/0x64），请求并等待键盘自检、开扫描；
-//! - 注册 IRQ1 中断 handler（vector 33 → irq 1）：读扫描码 → 译码为 ASCII →
-//!   压入输入环形缓冲；
-//! - 供内核 `read` syscall（stdin=0）从缓冲取字节；
-//! - 支持 Shift 组合（普通/上档两套键位映射）。
+//! - 注册 IRQ1 中断 handler（vector 33 → irq 1）：读扫描码 → **原始键码投递
+//!   事件环**（`push_event`，16B 记录，ADR-047）——ASCII 译码/转义序列展开
+//!   归用户态（libsys keymap，consoled），内核不再持 KEYMAP（P5 退役）。
+//! - 旧字节环形缓冲（BUF/pop/peek/has_input）与内核 KEYMAP/KEYMAP_SHIFT 已
+//!   **整体退役**：其唯一消费者（stdin 直读路径 / DriverHub ps2-keyboard
+//!   read）在 P4 单径切换后无数据可读。
 //!
 //! 外部中断路由：QEMU `pc` 机器下 IRQ1 走 **8259 → LAPIC LINT0 (ExtINT)**
 //! 路径（`pic::init` 重映射解屏蔽 + `imcr::switch_to_pic_mode` 切模式 +
@@ -27,7 +29,7 @@ const KB_CMD_ACK: u8 = 0xFA;
 const KB_ENABLE_SCAN: u8 = 0xF4; // 开扫描（键盘响应 ACK 后开始）
 /// 扫描码集选择命令前缀（后随集合号，如 0x01 = Set 1）。
 const KB_CMD_SCANCODE_SET: u8 = 0xF0;
-/// 扫描码集 1（本驱动 KEYMAP 的译码基准）。
+/// 扫描码集 1（事件记录 `code` 字段的键码基准，ADR-047 §2.1）。
 const KB_SCANCODE_SET1: u8 = 0x01;
 
 // 控制器配置字节位
@@ -40,27 +42,13 @@ const STATUS_INPUT_FULL: u8 = 0x02; // 输入缓冲满（忙）
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-/// 简单 SPSC 环形缓冲（写入=IRQ1 中断，读取=syscall）。
-const BUF_CAP: usize = 128;
-static WRITE_INDEX: AtomicUsize = AtomicUsize::new(0);
-static READ_INDEX: AtomicUsize = AtomicUsize::new(0);
-static BUF_DATA: [AtomicU32; BUF_CAP] = [const { AtomicU32::new(0) }; BUF_CAP];
-/// 缓冲是否已初始化（首次键盘输入前 false，read 检查）。
-static BUF_INIT: AtomicU32 = AtomicU32::new(0);
+// ----------（I-EVENTS P5 轨道 A 退役 §6.15.5）----------
+// 旧字节输入路径整体移除：SPSC 字节环（BUF_*/push/pop/peek/has_input）、
+// 内核 KEYMAP/KEYMAP_SHIFT 译码表与 decode_key、Shift/Ctrl 状态位、stdin
+// 唤醒回调（INPUT_CB → task::wake_kbd）。P4 单径切换后该路径无任何消费者；
+// ASCII/转义译码归用户态 libsys keymap（consoled），内核只投递原始键码事件。
 
-/// Shift 是否按住。
-static SHIFT: AtomicU32 = AtomicU32::new(0);
-
-/// Ctrl 是否按住（§6.8：此前完全缺失，故 `0x03` 永远产生不出来）。
-///
-/// 与 `SHIFT` 同一手法：IRQ1 里按 scancode 置位/清位，`decode_key` 里消费。
-/// **本状态只影响字节译码**——不产生任何信号、不新增 syscall、不引入模式开关。
-/// `Ctrl+字母` 折叠为 `字符 & 0x1F`（Ctrl-C → `0x03`、Ctrl-D → `0x04`），
-/// 与 `0x04`/\t/\x1b 走**同一条**既有入缓冲路径；信号语义仍全部在用户态
-/// （ADR-042 §3.1）。
-static CTRL: AtomicU32 = AtomicU32::new(0);
-
-// ---------- 内部 8042 操作 ----------
+// ---------- 内部 8042 操作（现役：事件环路径的硬件初始化/中断读取依赖） ----------
 
 /// 等待输入缓冲空（可写命令/数据），超时返回 false。
 fn wait_input_empty() -> bool {
@@ -115,139 +103,6 @@ fn send_kbd_cmd(cmd: u8) -> u8 {
     }
 }
 
-// ---------- 扫描码译码 ----------
-
-/// 扫描码 → ASCII（无 Shift 时）。索引 = 扫描码（Set 1，~0x01..=0x58）。
-///
-/// AD3 披露：当前译码为主键盘**子集**——**CapsLock/Alt/功能键仍部分未实现**，
-/// 双表结构（KEYMAP/KEYMAP_SHIFT）貌似完整键位支持，实际只覆盖可打印字符 +
-/// Esc/Tab/Backspace/Enter。扩展键位时须同步补 0xE0 前缀路径
-/// （该路径已存在但仅处理方向键）。
-///
-/// **2026-10-04（§6.8 修复后更新）**：**Ctrl 已实现**——修饰键状态在 IRQ1 里
-/// 按 scancode 维护（左/右均为 0x1D），`decode_key` 对字母折叠 `字符 & 0x1F`，
-/// 故 Ctrl-C → `0x03`、Ctrl-D → `0x04` 可正常入缓冲。
-/// **Alt 仍未实现**（按下被静默丢弃）；CapsLock 仍不改变字母大小写语义。
-const KEYMAP: [u8; 0x80] = {
-    let mut m = [0u8; 0x80];
-    m[0x01] = 27; // Esc
-    m[0x02] = b'1';
-    m[0x03] = b'2';
-    m[0x04] = b'3';
-    m[0x05] = b'4';
-    m[0x06] = b'5';
-    m[0x07] = b'6';
-    m[0x08] = b'7';
-    m[0x09] = b'8';
-    m[0x0A] = b'9';
-    m[0x0B] = b'0';
-    m[0x0C] = b'-';
-    m[0x0D] = b'=';
-    m[0x0E] = 0x7F; // backspace
-    m[0x0F] = b'\t';
-    m[0x10] = b'q';
-    m[0x11] = b'w';
-    m[0x12] = b'e';
-    m[0x13] = b'r';
-    m[0x14] = b't';
-    m[0x15] = b'y';
-    m[0x16] = b'u';
-    m[0x17] = b'i';
-    m[0x18] = b'o';
-    m[0x19] = b'p';
-    m[0x1A] = b'[';
-    m[0x1B] = b']';
-    m[0x1C] = b'\n';
-    m[0x1E] = b'a';
-    m[0x1F] = b's';
-    m[0x20] = b'd';
-    m[0x21] = b'f';
-    m[0x22] = b'g';
-    m[0x23] = b'h';
-    m[0x24] = b'j';
-    m[0x25] = b'k';
-    m[0x26] = b'l';
-    m[0x27] = b';';
-    m[0x28] = b'\'';
-    m[0x29] = b'`';
-    m[0x2B] = b'\\';
-    m[0x2C] = b'z';
-    m[0x2D] = b'x';
-    m[0x2E] = b'c';
-    m[0x2F] = b'v';
-    m[0x30] = b'b';
-    m[0x31] = b'n';
-    m[0x32] = b'm';
-    m[0x33] = b',';
-    m[0x34] = b'.';
-    m[0x35] = b'/';
-    m[0x39] = b' ';
-    m
-};
-
-/// 扫描码 → ASCII（Shift 按住时）。
-const KEYMAP_SHIFT: [u8; 0x80] = {
-    let mut m = [0u8; 0x80];
-    m[0x02] = b'!';
-    m[0x03] = b'@';
-    m[0x04] = b'#';
-    m[0x05] = b'$';
-    m[0x06] = b'%';
-    m[0x07] = b'^';
-    m[0x08] = b'&';
-    m[0x09] = b'*';
-    m[0x0A] = b'(';
-    m[0x0B] = b')';
-    m[0x0C] = b'_';
-    m[0x0D] = b'+';
-    m[0x10] = b'Q';
-    m[0x11] = b'W';
-    m[0x12] = b'E';
-    m[0x13] = b'R';
-    m[0x14] = b'T';
-    m[0x15] = b'Y';
-    m[0x16] = b'U';
-    m[0x17] = b'I';
-    m[0x18] = b'O';
-    m[0x19] = b'P';
-    m[0x1A] = b'{';
-    m[0x1B] = b'}';
-    m[0x1E] = b'A';
-    m[0x1F] = b'S';
-    m[0x20] = b'D';
-    m[0x21] = b'F';
-    m[0x22] = b'G';
-    m[0x23] = b'H';
-    m[0x24] = b'J';
-    m[0x25] = b'K';
-    m[0x26] = b'L';
-    m[0x27] = b':';
-    m[0x28] = b'"';
-    m[0x29] = b'~';
-    m[0x2B] = b'|';
-    m[0x2C] = b'Z';
-    m[0x2D] = b'X';
-    m[0x2E] = b'C';
-    m[0x2F] = b'V';
-    m[0x30] = b'B';
-    m[0x31] = b'N';
-    m[0x32] = b'M';
-    m[0x33] = b'<';
-    m[0x34] = b'>';
-    m[0x35] = b'?';
-    m
-};
-
-/// Shift 键扫描码（左/右）。
-const SC_LSHIFT: u8 = 0x2A;
-const SC_RSHIFT: u8 = 0x36;
-
-/// Ctrl 键扫描码。
-///
-/// 左 Ctrl 是**无 `E0` 前缀**的 `0x1D`；右 Ctrl 走 `0xE0 0x1D`（`e0 == true`，
-/// 与左键同码值 `0x1D`，靠 `e0` 标志区分——两者语义相同，故只用一个常量）。
-const SC_LCTRL: u8 = 0x1D;
-
 /// `0xE0` 扩展前缀标志：现代 101 键键盘的方向键/编辑键/小键盘（NumLock 关）/
 /// 右 Ctrl/Alt 等以 `0xE0 0xXX` 双字节序列发送。IRQ 每中断只读 1 字节，须跨中断
 /// 缓存前缀，待下一字节到达再合成完整键码。
@@ -261,137 +116,6 @@ const SC_LCTRL: u8 = 0x1D;
 /// 若未来引入多队列/多键盘路由（IOAPIC 回归），必须先改为 per-CPU 或
 /// IrqSpinLock 保护。
 static mut E0_PREFIX: bool = false;
-
-/// 译码结果：无输出 / 单个 ASCII 字节 / 一段（转义序列，静态生命周期）。
-enum KeyOut {
-    None,
-    Ascii(u8),
-    Seq(&'static [u8]),
-}
-
-/// 把（扩展标志, 键码, 释放?）译码为可入缓冲的字节序列。
-///
-/// - 主键盘可打印键 → ASCII（受 Shift 影响，查 `KEYMAP`/`KEYMAP_SHIFT`）。
-/// - 非 `E0` 的 `0x47..=0x53` 等区域：来自 **NumLock 开启**时的数字小键盘 → 数字。
-/// - `E0` 前缀的光标/编辑键 → ANSI 转义序列（与终端约定一致，shell 可据此行编辑）。
-/// - F1–F12（主集 `0x3B..=0x44`/`0x57`/`0x58`）→ ANSI 转义序列。
-fn decode_key(e0: bool, code: u8, key_up: bool) -> KeyOut {
-    if key_up {
-        return KeyOut::None;
-    }
-    if !e0 {
-        // 主键盘可打印字符（受 Shift 影响）。
-        let shift = SHIFT.load(Ordering::Relaxed) != 0;
-        let ch = if shift {
-            KEYMAP_SHIFT[code as usize]
-        } else {
-            KEYMAP[code as usize]
-        };
-        if ch != 0 {
-            // §6.8：Ctrl + 字母 → 控制字符（字符 & 0x1F）。
-            //
-            // 只对**字母**折叠：Ctrl-C → 0x03、Ctrl-D → 0x04，正是终端约定。
-            // 对非字母保持原样，避免把 Ctrl+数字/符号变成难以预期的控制码
-            // （那些组合的真实语义属应用层，本驱动不臆造，S17 安全侧默认）。
-            if CTRL.load(Ordering::Relaxed) != 0 && ch.is_ascii_alphabetic() {
-                return KeyOut::Ascii(ch & 0x1F);
-            }
-            return KeyOut::Ascii(ch);
-        }
-        // NumLock 语义的数字小键盘 / 主键盘符号，以及 F-keys。
-        return match code {
-            // 小键盘数字（NumLock 开）
-            0x47 => KeyOut::Ascii(b'7'),
-            0x48 => KeyOut::Ascii(b'8'),
-            0x49 => KeyOut::Ascii(b'9'),
-            0x4B => KeyOut::Ascii(b'4'),
-            0x4C => KeyOut::Ascii(b'5'),
-            0x4D => KeyOut::Ascii(b'6'),
-            0x4F => KeyOut::Ascii(b'1'),
-            0x50 => KeyOut::Ascii(b'2'),
-            0x51 => KeyOut::Ascii(b'3'),
-            0x52 => KeyOut::Ascii(b'0'),
-            0x53 => KeyOut::Ascii(b'.'),
-            // 小键盘/主键盘符号
-            0x37 => KeyOut::Ascii(b'*'), // 主键盘 '*'（8 上方）
-            0x4A => KeyOut::Ascii(b'-'), // 小键盘 '-'
-            0x4E => KeyOut::Ascii(b'+'), // 小键盘 '+'
-            // F1–F12
-            0x3B => KeyOut::Seq(b"\x1bOP"),
-            0x3C => KeyOut::Seq(b"\x1bOQ"),
-            0x3D => KeyOut::Seq(b"\x1bOR"),
-            0x3E => KeyOut::Seq(b"\x1bOS"),
-            0x3F => KeyOut::Seq(b"\x1b[15~"),
-            0x40 => KeyOut::Seq(b"\x1b[17~"),
-            0x41 => KeyOut::Seq(b"\x1b[18~"),
-            0x42 => KeyOut::Seq(b"\x1b[19~"),
-            0x43 => KeyOut::Seq(b"\x1b[20~"),
-            0x44 => KeyOut::Seq(b"\x1b[21~"),
-            0x57 => KeyOut::Seq(b"\x1b[23~"),
-            0x58 => KeyOut::Seq(b"\x1b[24~"),
-            _ => KeyOut::None,
-        };
-    }
-    // 扩展键（E0 前缀）：方向键 / 编辑键 / 小键盘 Enter、'/' → 转义序列。
-    match code {
-        0x48 => KeyOut::Seq(b"\x1b[A"),  // ↑
-        0x50 => KeyOut::Seq(b"\x1b[B"),  // ↓
-        0x4B => KeyOut::Seq(b"\x1b[D"),  // ←
-        0x4D => KeyOut::Seq(b"\x1b[C"),  // →
-        0x47 => KeyOut::Seq(b"\x1b[H"),  // Home
-        0x4F => KeyOut::Seq(b"\x1b[F"),  // End
-        0x52 => KeyOut::Seq(b"\x1b[2~"), // Insert
-        0x53 => KeyOut::Seq(b"\x1b[3~"), // Delete
-        0x49 => KeyOut::Seq(b"\x1b[5~"), // PgUp
-        0x51 => KeyOut::Seq(b"\x1b[6~"), // PgDn
-        0x35 => KeyOut::Seq(b"/"),       // 小键盘 '/'
-        0x1C => KeyOut::Seq(b"\n"),      // 小键盘 Enter
-        _ => KeyOut::None,
-    }
-}
-
-// ---------- 输入缓冲 ----------
-
-/// 键盘有输入时通知等待方（如阻塞的 read）的回调。由内核在启动时通过
-/// `set_input_callback` 注册（指向 `scheduler::wake_kbd`）。arch 层不反向依赖
-/// kernel，故用函数指针解耦。
-static mut INPUT_CB: Option<fn()> = None;
-
-/// 注册键盘输入回调（内核启动时调用一次）。
-pub fn set_input_callback(cb: fn()) {
-    // SAFETY: 早期单线程注册，之后仅只读访问。
-    unsafe {
-        INPUT_CB = Some(cb);
-    }
-}
-
-/// 通知等待方：有字符入缓冲（中断上下文调用）。
-fn notify_input() {
-    // SAFETY: 回调只读，且已注册。
-    unsafe {
-        if let Some(cb) = INPUT_CB {
-            cb();
-        }
-    }
-}
-
-/// 压入一个字符到缓冲（IRQ1 中断上下文调用）。
-///
-/// AM4：缓冲满时的静默丢弃不再无痕——累计进 [`DROPPED_KEYS`] 计数器，
-/// 诊断/自检可经 [`dropped_keys()`] 观察真实丢失量，而不是假装输入无损。
-fn push(ch: u8) {
-    let w = WRITE_INDEX.load(Ordering::Relaxed);
-    let r = READ_INDEX.load(Ordering::Relaxed);
-    if w.wrapping_sub(r) >= BUF_CAP {
-        // 满，丢弃（避免覆盖未读）——但留下计数痕迹。
-        DROPPED_KEYS.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    BUF_DATA[w % BUF_CAP].store(ch as u32, Ordering::Relaxed);
-    WRITE_INDEX.store(w + 1, Ordering::Release);
-    BUF_INIT.store(1, Ordering::Release);
-    notify_input(); // 唤醒阻塞在 read 的进程
-}
 
 /// 事件记录入队后通知等待方的回调（I-EVENTS 阶段 2）。由内核在启动时经
 /// [`set_event_callback`] 注册（指向 `task::wake_input_event`）。arch 层不反向
@@ -420,66 +144,6 @@ fn notify_event() {
             cb();
         }
     }
-}
-
-/// 因缓冲满而被丢弃的键字节总数（单调递增）。
-static DROPPED_KEYS: AtomicU64 = AtomicU64::new(0);
-
-/// 返回至今因缓冲满被丢弃的键字节数（AM4 诊断接口）。
-pub fn dropped_keys() -> u64 {
-    DROPPED_KEYS.load(Ordering::Relaxed)
-}
-
-/// 弹出一个字符（read syscall 调用）。无数据返回 None。
-pub fn pop() -> Option<u8> {
-    if BUF_INIT.load(Ordering::Acquire) == 0 {
-        return None;
-    }
-    let r = READ_INDEX.load(Ordering::Relaxed);
-    let w = WRITE_INDEX.load(Ordering::Acquire);
-    if r == w {
-        return None;
-    }
-    let ch = BUF_DATA[r % BUF_CAP].load(Ordering::Relaxed) as u8;
-    READ_INDEX.store(r + 1, Ordering::Release);
-    Some(ch)
-}
-
-/// 缓冲是否非空。
-/// 窥视下一个字符但**不消费**（`read` syscall 的非阻塞「探键」路径调用）。
-///
-/// # 为什么必须存在这个函数（裁决甲，§6.12.5）
-///
-/// shell 在前台子进程运行期间需要「看一眼有没有 `^C`」。若用 `pop()`，
-/// 取到的若是普通字符（属于**子进程**的输入，例如 `cat` 的用户输入），
-/// 该字节就**永久丢失**了——没有 pushback 设施可以放回。
-///
-/// 实测症状（真实 QEMU + 真实 PS/2 按键）：输入 `/programs/spinburn.elf`
-/// 会变成 `/prams/spinburn.elf`——`o` 与 `g` 在 shell 等待循环里被探键吃掉。
-/// 这是**真实的用户可见缺陷**，不是理论问题。
-///
-/// [`peek`] 与 [`pop`] 的唯一差别：**不推进** `READ_INDEX`。故调用方看完
-/// 若决定不处理，字节仍在缓冲里，下一个读者（子进程或行编辑）照样能取到。
-///
-/// # 内存序
-///
-/// 与 [`pop`] 相同的 Acquire 读 `WRITE_INDEX`——窥视同样必须看到生产者
-/// 已发布的完整状态（`BUF_DATA` 写入先于 `WRITE_INDEX` 的 Release 存储）。
-pub fn peek() -> Option<u8> {
-    if BUF_INIT.load(Ordering::Acquire) == 0 {
-        return None;
-    }
-    let r = READ_INDEX.load(Ordering::Relaxed);
-    let w = WRITE_INDEX.load(Ordering::Acquire);
-    if r == w {
-        return None;
-    }
-    // 只读不推进：本函数对缓冲状态**无副作用**，可安全重复调用。
-    Some(BUF_DATA[r % BUF_CAP].load(Ordering::Relaxed) as u8)
-}
-
-pub fn has_input() -> bool {
-    READ_INDEX.load(Ordering::Relaxed) != WRITE_INDEX.load(Ordering::Acquire)
 }
 
 // ---------- 原始键事件缓冲（I-EVENTS 阶段 1，ADR-047；双轨，旧字节路径不动） ----------
@@ -779,26 +443,12 @@ pub extern "C" fn irq1_handler(_irq: u8) -> bool {
     let key_up = scancode & 0x80 != 0; // bit7=1 表示释放
     let code = scancode & 0x7F;
 
-    // I-EVENTS 阶段 1（ADR-047；双轨）：**全部**键事件（含 Shift/Ctrl 自身、含释放）
-    // 以原始键码投递到事件缓冲——不译 ASCII、不折叠 Ctrl（转换层归用户态，ADR-047 §2.2）。
-    // 位于状态位维护之后、字节译码之外：旧字节路径（下方 match）零改动。
+    // I-EVENTS（ADR-047）：**全部**键事件（含 Shift/Ctrl 自身、含释放）以原始
+    // 键码投递到事件环——不译 ASCII、不折叠 Ctrl（转换层归用户态 keymap，
+    // ADR-047 §2.2）。
+    // （I-EVENTS P5 轨道 A 退役：原「双轨」的旧轨——Shift/Ctrl 状态位维护 +
+    //  decode_key 字节译码 + push 入字节环——已整体移除，见文件头说明。）
     push_event(e0, code, key_up);
-    if code == SC_LSHIFT || code == SC_RSHIFT {
-        SHIFT.store(if key_up { 0 } else { 1 }, Ordering::Relaxed);
-    } else if code == SC_LCTRL {
-        // §6.8：左右 Ctrl 同为 0x1D（右键靠 E0 前缀区分），语义相同。
-        CTRL.store(if key_up { 0 } else { 1 }, Ordering::Relaxed);
-    } else if !key_up {
-        match decode_key(e0, code, key_up) {
-            KeyOut::None => {}
-            KeyOut::Ascii(c) => push(c),
-            KeyOut::Seq(s) => {
-                for &b in s {
-                    push(b);
-                }
-            }
-        }
-    }
 
     // 键盘 IRQ 属于外部中断：发送 LAPIC EOI。
     crate::lapic::end_of_interrupt();
@@ -823,7 +473,7 @@ pub fn init() -> bool {
         return false;
     }
 
-    // 2. 使能键盘 IRQ（**关闭**扫描码翻译）。本驱动键位表 `KEYMAP` 是 Set 1；
+    // 2. 使能键盘 IRQ（**关闭**扫描码翻译）。事件记录投递的是 Set 1 原始键码；
     //    开启 8042 的 Set2→Set1 翻译会让 backspace(Set2 0x66) 等码在翻译环节被
     //    丢弃（翻译表无对应项），导致删除键收不到扫描码。故关闭翻译，并随后把
     //    键盘切到 Set 1，使所有键（含 backspace 0x0e）直通。

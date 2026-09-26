@@ -1,9 +1,12 @@
 //! Core 阶段：PS/2 键盘控制器驱动（Platform InputDevice）。
 //!
-//! 单一消费点纪律（ADR-022 §8 / DM5）：键盘队列是独占资源，字节唯一 pop
-//! 点是本设备的 [`IoDevice::read`]。kernel 侧 stdin 源与 DevFS 直读都经
-//! DriverHub 转发到同一扇门——多读者竞争自此是字符设备的标准语义，内核
-//! 内部不存在第二条绕过设备的隐藏通道。
+//! **I-EVENTS P5 轨道 A 退役（§6.15.5）**：本设备曾是「键盘字节队列的唯一
+//! 消费点」（ADR-022 §8 / DM5 的 stdin 扇门）。P4 单径切换后 stdin 不再
+//! 经 DriverHub 取键盘字节（等待源唯一是 console 环），P5 移除内核字节环
+//! 后本设备无字节可读——`IoDevice::read` 如实恒返 0（设备枚举与 DriverHub
+//! 登记保留：PS/2 控制器真实存在，设备清单的「有此硬件」仍是真话；「有
+//! 字节流」不再是）。键事件经 `/devices/input/events`（原始键码）+ 用户态
+//! consoled 转换供给终端。
 
 use crate::device::{BusType, CharDevice, Device, DeviceInfo, DeviceKind, InputDevice, IoDevice};
 use crate::driver::DriverStage;
@@ -33,22 +36,12 @@ impl Device for KeyboardDevice {
 }
 
 impl IoDevice for KeyboardDevice {
-    /// 从键盘队列取走至多 `out.len()` 个字节。
-    ///
-    /// 这是全内核唯一合法的键盘队列消费点；无数据时返回 0（非阻塞语义，
-    /// 与 stdin 源的 WouldBlock 契约衔接）。
-    fn read(&self, out: &mut [u8]) -> usize {
-        let mut got = 0usize;
-        while got < out.len() {
-            match arch_x86_64::keyboard::pop() {
-                Some(ch) => {
-                    out[got] = ch;
-                    got += 1;
-                }
-                None => break,
-            }
-        }
-        got
+    /// **恒返 0**（P5 轨道 A 退役）：字节环已随内核 KEYMAP 一起移除，本设备
+    /// 不再有数据源。保留 trait 槽位与 0 返回（「此刻无数据」的诚实形态）
+    /// 而非删除 impl——DriverHub 设备枚举/列举契约仍要求 IoDevice 存在；
+    /// 任何经此 read 的调用方得到的是「无数据」，不是伪造的字节。
+    fn read(&self, _out: &mut [u8]) -> usize {
+        0
     }
 
     // ADR-022 §6（DM2）：原恒 false 的 poll() 覆写已随 IoDevice::poll
