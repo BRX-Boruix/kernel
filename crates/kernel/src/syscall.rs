@@ -2213,6 +2213,24 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
             // 节点真值判定（S15）：仅 `input_event_stream()` 自述为真的节点走
             // 此路，普通文件/其它设备的 Ok(0) 仍逐位保持原 EOF 语义。
             Ok(0) => {
+                // §6.15 P2：console 字节流（甲-a 字节端）——空读是「consoled
+                // 尚未喂入」而非 EOF。真值判定（S15）与事件支路同构：只有
+                // `console_stream()` 自述为真的节点走此路，其余 Ok(0) 逐位
+                // 保持原 EOF 语义。探针 = 环水位 `used() > 0`（S15 单点：与
+                // `ConsoleRing::read` 的消费判据同源）。
+                if total == 0 && handle.inode.console_stream() {
+                    // 交互输入停车前的行缓冲冲刷（事件支路同一纪律）：读者
+                    // 可能刚写过**无换行**的部分行——不冲刷则输出滞留行缓冲，
+                    // 用户在进程停车的整个期间什么都看不到（r8 实测缺陷）。
+                    klib::console::flush_all_line_buffers();
+                    match console_blocking(frame, &handle.inode) {
+                        // 已挂起切走 / 已如实交付（并发等待者被占时的 0 字节）：
+                        // 本帧结果已定，入口不得再写返回值。
+                        Some(r) => return r,
+                        // 锁内复检发现字节已到：回到循环顶部重读交付。
+                        None => continue,
+                    }
+                }
                 if total == 0 && handle.inode.input_event_stream() {
                     // P1（§6.15）：锁内复检探针按**本读者的判定**注入——
                     // 有令牌（每读者）用 `tok.has_data()`（游标 vs 写指针）；
@@ -2352,6 +2370,13 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
 pub static BLOCKED_ON_EVENTS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// console 空读阻塞进入次数（§6.15 P2，S09 可观察——与 `BLOCKED_ON_EVENTS`
+/// 同款纪律：切换路径上不能取控制台锁留日志，只累加原子计数，由
+/// `/devices/console/status` 读取。用于区分「真阻塞」（几乎不增）与
+/// 「用户态空转」（每轮 read 都增长））。
+pub static BLOCKED_ON_CONSOLE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// `SYS_STREAM_READ`（阻塞形态，a5 无 NONBLOCK 位）的累计进入次数（S09 可观察）。
 ///
 /// **永久遥测**（§6.14.4n 立功后所有者裁决 Ⅰ 转正；原名 `READ_SYSCALLS`，
@@ -2414,6 +2439,58 @@ fn input_event_blocking(
         task::InputEventBlock::RecordsReady => None,
         // 已有并发等待者：如实返回「读走 0 条」，不抢别人的记录。
         task::InputEventBlock::WaiterBusy => Some(done(pack_ok(0))),
+    }
+}
+
+/// `SYS_STREAM_READ` 的 console 字节流空读阻塞路径（§6.15 P2）。
+///
+/// 与 [`input_event_blocking`] 同构（S15 单点：同一套登记→复检→挂起
+/// 纪律，不另造一套），差异仅在**等待源真值**与**唤醒原语**：等待的是
+/// consoled 经 `write_at` 落环的字节（唤醒钩子 `vfs::console::set_wake_hook`
+/// → `task::wake_console`，vfs_init 启动期安装）；登记槽是单槽
+/// `CONSOLE_WAITER`（终端读者 = 切换后的 fd 0，同一时刻至多一个前台
+/// 进程阻塞在读上，单槽与业务模型吻合——audio 的独占消费者仲裁同型）。
+///
+/// **无超时**（与 audio 的刻意差异）：audio 的生产者可能是已死的驱动，
+/// 有限超时保证调用者必返；console 的生产者是常驻 consoled，终端语义
+/// 「稍后必有字节」——与 `input_event_stream` 的无限期理由同源。
+///
+/// 返回与 [`input_event_blocking`] 相同的三态契约：`Some(_)` 本帧已定，
+/// `None` 复检发现字节已到、调用方重读交付。
+fn console_blocking(
+    frame: &mut SyscallFrame,
+    inode: &alloc::sync::Arc<dyn vfs::inode::INode>,
+) -> Option<DispatchResult> {
+    let Some(pid) = current_proc_mut().map(|p| p.pid()) else {
+        // 无当前进程（内核启动期）：如实返回「读走 0 字节」。
+        return Some(done(pack_ok(0)));
+    };
+    // 重新登记前清理本进程残留的等待者身份（同事件支路纪律：哨兵重试
+    // 路径不清登记，残留会占死单槽，让本次 CAS 失败退化成空读轮询）。
+    task::clear_console_waiter_if(pid);
+    // 就绪探针（S15 单点）：经节点声明的环句柄读 `used()`——**非消费**。
+    // console 的 read_at 是真消费（不同于 audio 的 peek），消费式探针会把
+    // 环里最后的字节交付给探针而非读者（S09 丢字节）。探针说有 = 交付
+    // 路径此刻真的读得到（同一水位真值），绝不另设第二真相源；audio 的
+    // `audio_ring_empty` 同款形态（环句柄 + 水位判定）。
+    // 节点未声明环（默认 None）→ 探针恒假：不阻塞、走空读返回（S17 安全侧）。
+    let ring = inode.as_console_ring();
+    let probe = move || -> bool {
+        ring.as_ref().is_some_and(|r| r.used() > 0)
+    };
+    match task::block_for_console(arch_frame(frame), probe) {
+        // 已挂起切走：本帧整体交棒，用户态经 `-EAGAIN` 哨兵重试 read。
+        task::ConsoleBlock::Switched => {
+            // 运行期痕迹：切换路径上不能用 klib::info!（取控制台/串口锁，
+            // 随被切走帧悬挂——实测缺陷），只累加原子计数（S09 可观察）。
+            BLOCKED_ON_CONSOLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Some(DispatchResult::Switched)
+        }
+        // 锁内复检发现字节已到：令调用方重读交付（本轮由复检观察到，
+        // 不会空转——探针为真即「重读」信号，见函数契约）。
+        task::ConsoleBlock::DataReady => None,
+        // 已有并发等待者：如实返回「读走 0 字节」，不抢别人的唤醒。
+        task::ConsoleBlock::WaiterBusy => Some(done(pack_ok(0))),
     }
 }
 

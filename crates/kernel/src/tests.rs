@@ -10836,6 +10836,84 @@ pub fn test_event_multireader() {
     info!("[test-event-multireader] PASS");
 }
 
+/// §6.15 P2：console 字节环契约（`ConsoleNode` + `ConsoleRing`，无副作用）。
+///
+/// 断言七件事（S09：每条都是可复算的真值，不靠日志判读）：
+/// 1. 空环读返回 0（不伪造、不报错）——阻塞语义归 syscall 层;
+/// 2. 写入后读回字节一致（SPSC 环基本交付）;
+/// 3. `as_console_ring()` 暴露环句柄且 `used()` 与水位一致——就绪探针
+///    的**非消费**真值（探针读了 used 不改变 used，S09 丢字节防线）;
+/// 4. 环满短写：写入量被截到容量、返回实际写入数、dropped 计数如实披露;
+/// 5. 消费后 `used()` 下降、再次耗尽后回 0（水位单调闭合）;
+/// 6. `console_stream()` 真值为真且 `as_console_ring()` 为 Some——
+///    syscall 层接等待者的**节点真值**契约（S15）;
+/// 7. `status` 子文件可达（容器型字符设备，S41 形态缺陷预防）。
+pub fn test_console_byte_ring() {
+    use alloc::sync::Arc;
+    use vfs::console::ConsoleNode;
+    use vfs::inode::INode;
+
+    info!("[test-console-byte-ring] === I-EVENTS P2: console 字节环契约 ===");
+
+    let node = Arc::new(ConsoleNode::new());
+
+    // ---- 6. 节点真值契约（S15）：syscall 层据此接 CONSOLE_WAITER ----
+    assert!(node.console_stream(), "console_stream 真值必须为真");
+    let ring = node
+        .as_console_ring()
+        .expect("console 节点必须声明自己的环（探针真值源）");
+
+    // ---- 1. 空环读返回 0 ----
+    let mut buf = [0u8; 8];
+    assert_eq!(node.read_at(0, &mut buf).unwrap(), 0, "空环读 = 0（不伪造）");
+    assert_eq!(ring.used(), 0, "空环水位 = 0");
+
+    // ---- 2. 写入后读回一致 ----
+    let n = node.write_at(0, b"abc").unwrap();
+    assert_eq!(n, 3, "写入 3 字节");
+    assert_eq!(ring.used(), 3, "水位随写入上升（探针真值）");
+    // 探针语义：used() 读取**不消费**——读两次水位必须一致（S09 丢字节防线）。
+    assert_eq!(ring.used(), 3, "探针（used）非消费：重复读水位不变");
+    assert_eq!(node.read_at(0, &mut buf).unwrap(), 3, "读回 3 字节");
+    assert_eq!(&buf[..3], b"abc", "字节逐位一致");
+
+    // ---- 5. 消费后水位闭合 ----
+    assert_eq!(ring.used(), 0, "读尽后水位归 0");
+
+    // ---- 4. 环满短写 + dropped 如实披露 ----
+    // 当前已空；写入 2×容量：第一份填满、第二份全拒。
+    let full = [0xA5u8; vfs::console::CONSOLE_RING_CAPACITY];
+    let n1 = node.write_at(0, &full).unwrap();
+    assert_eq!(n1, vfs::console::CONSOLE_RING_CAPACITY, "第一份整环写入");
+    let n2 = node.write_at(0, &full).unwrap();
+    assert_eq!(n2, 0, "环满短写 = 0（不阻塞、不覆盖）");
+    // dropped 真值经 status 披露——读回 JSON 断言 dropped == 第二份长度。
+    let status = node
+        .lookup("status")
+        .expect("status 子文件必须可达（S41 容器形态）");
+    let mut jbuf = [0u8; 512];
+    let jn = status.read_at(0, &mut jbuf).unwrap();
+    let js = core::str::from_utf8(&jbuf[..jn]).unwrap();
+    assert!(
+        js.contains(&alloc::format!("\"dropped\":{}", full.len())[..]),
+        "status 必须如实披露 dropped={}（实际：{}）",
+        full.len(),
+        js
+    );
+    assert_eq!(
+        ring.used(),
+        vfs::console::CONSOLE_RING_CAPACITY,
+        "满环水位 = 容量",
+    );
+
+    // ---- 清场：取走全部，恢复空环（本测试不依赖执行顺序）----
+    let mut drain = [0u8; vfs::console::CONSOLE_RING_CAPACITY];
+    let got = node.read_at(0, &mut drain).unwrap();
+    assert_eq!(got, vfs::console::CONSOLE_RING_CAPACITY, "一次排空");
+    assert_eq!(ring.used(), 0, "排空后水位归 0");
+
+    info!("[test-console-byte-ring] PASS");
+}
 pub fn test_read_nonblock_flag() {
     use crate::syscall::{read_is_nonblock, read_is_peek, STREAM_READ_NONBLOCK, STREAM_READ_PEEK};
 

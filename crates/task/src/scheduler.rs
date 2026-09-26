@@ -2291,6 +2291,195 @@ pub fn clear_input_event_waiter_if(pid: usize) {
     }
 }
 
+/// console 字节等待者槽（`u32::MAX` = 空闲）（§6.15 P2，第 4 个等待者）。
+///
+/// **S21 并发显式化**：与 `KBD_WAITER`/`AUDIO_WAITER` 同构的**单槽**设计。
+/// console 的字节生产者是常驻用户态转换者 consoled（甲-a 架构），读者是
+/// fd 0（stdin 换源后的前台 shell/login）——同一时刻至多一个前台进程在
+/// `read(0)` 阻塞，单槽语义与业务模型吻合（`/devices/input/events` 的
+/// `IN_EVENT_WAITERS` 8 槽对应其多读者形态；两者生产者/读者群都不同，
+/// S15 单点定义，不共用一张表）。
+///
+/// **为何不抽通用 `WaitQueue`**：scheduler.rs:2437 的注释自陈「若将来出现
+/// 第 4、5 个，那才是明确的抽取信号」——本表就是那个第 4 个。抽取信号
+/// **已触发**，但本批次仍按 S28 以第 4 份同构代码落地（同 a-y 的既有序列
+/// 纪律：先让事实到位，抽取作为独立小点随后进行，不在同一提交混入结构性
+/// 重排），避免本点引入回归面扩大。**抽取候选已在此留痕。**
+static CONSOLE_WAITER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// console 唤醒预置到保存帧 rax 的"曾阻塞、请重试"哨兵（`-EAGAIN`）。
+///
+/// **S13**：errno 取自集中定义 [`Error::WouldBlock`]，不内联裸字面量——
+/// 与 `EVENT_WAKE_RETRY_SENTINEL` / `AUDIO_WAKE_RETRY_SENTINEL` 同口径。
+const CONSOLE_WAKE_RETRY_SENTINEL: u64 = -(Error::WouldBlock.to_errno() as i64) as u64;
+
+/// [`block_for_console`] 的结果（与 [`InputEventBlock`] 三态同构，S28：
+/// 变体语义逐条对齐——Switched/切走、DataReady/复检已就绪、WaiterBusy/让位）。
+/// **不复用** [`InputEventBlock`] 的理由与不复用 [`SwitchOutcome`] 相同（S15）：
+/// 两个流的等待源、唤醒回调、登记表都不同，混用会让类型系统无法区分
+/// 「事件记录就绪」与「console 字节就绪」这两个不同的事实。
+pub enum ConsoleBlock {
+    /// 已置 Blocked 切走：调用方须以 `DispatchResult::Switched` 收尾。
+    Switched,
+    /// 锁内复检发现字节**确已到达**：调用方应重读一次并如实交付。
+    DataReady,
+    /// 已有并发等待者：调用方应如实返回「读走 0 字节」（单槽语义，
+    /// 不抢别人的唤醒——与 audio 的独占消费者仲裁同型）。
+    WaiterBusy,
+}
+
+
+/// 阻塞当前进程等待 console 字节（`read(0)` 空读且节点 `console_stream()`
+/// 为真时调用，§6.15 P2）。
+///
+/// 返回 [`ConsoleBlock`] 三态（成因与动作一一对应，变体名与
+/// [`InputEventBlock`] 同构）：
+/// - `Switched`：已置 Blocked 切走；consoled 写入字节经 `wake_console` 唤醒，
+///   用户态经 `-EAGAIN` 哨兵重试 read。
+/// - `DataReady`：**字节已在登记复检时就绪**（调用方立即重读交付）。
+/// - `WaiterBusy`：已有并发等待者（调用方按空读处理）。
+///
+/// **无超时（与 audio 的关键差异，刻意的）**：audio 生产者可能是已死的
+/// 驱动（有限超时保证调用者必定返回）；console 的生产者是**常驻 consoled**，
+/// 与 `input_event_stream` 的无限期理由同源——终端语义下「稍后必有字节」。
+/// 用户态需要非阻塞语义走 `O_NONBLOCK` 探读（`WouldBlock` 如实返回）。
+///
+/// `has_data` 是调用方提供的就绪探针（读环水位）。作为参数注入而非在本函数
+/// 内硬编码读环，同 `block_for_audio` 的理由：task crate **不依赖 vfs**
+/// （S12/S14：不制造反向依赖）。
+///
+/// **lost-wakeup 论证**（与 `block_for_input_event` 逐条同构）：登记（CAS 写
+/// `CONSOLE_WAITER`）先于 per-pid 临界区；置 Blocked 在 cur 的 per-pid 锁内
+/// 完成；[`wake_console`] 也取目标 pid 锁才改 Ready。故「字节到达 →
+/// wake_console」与「本进程登记」被锁完全串行：若字节先到，wake_console 见
+/// 无等待者直接返回，本进程随后复检 `has_data()` **为真** → 不阻塞；若本
+/// 进程先登记，wake_console 必在登记后（锁内）读到 pid 并唤醒。不存在
+/// 「登记后数据到达却无人唤醒」的窗口。
+pub fn block_for_console<F>(frame: &mut InterruptFrame, has_data: F) -> ConsoleBlock
+where
+    F: Fn() -> bool,
+{
+    let cur_pid = {
+        // 纯 RUN 读取（b）：短暂取本核 RUN 域读 current 即可，无需 pid 锁。
+        let run = run_mut(my_cpu_slot());
+        let cur = run.current.expect("block_for_console outside process");
+        assert!(
+            cur < u32::MAX as usize,
+            "pid {} collides with console-waiter sentinel",
+            cur
+        );
+        cur
+    };
+    // 登记等待者：单槽 CAS；已有并发等待者 = WaiterBusy（不顶掉既有等待者，
+    // 同 audio 的独占消费者语义）。
+    if CONSOLE_WAITER
+        .compare_exchange(
+            u32::MAX,
+            cur_pid as u32,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return ConsoleBlock::WaiterBusy;
+    }
+    // 登记后复检就绪条件：若字节已到，撤销登记、不阻塞（调用方立即重读）。
+    // 这是 lost-wakeup 的关键防线——数据先到则此处直接观察到，绝不错过。
+    if has_data() {
+        CONSOLE_WAITER.store(u32::MAX, core::sync::atomic::Ordering::Release);
+        return ConsoleBlock::DataReady;
+    }
+    // 置 Blocked 并保存现场（同 block_for_input_event：浮点现场由 commit_next
+    // 路径在唤醒后显式保存，此处不重复归档，K2 纪律）。
+    let cpu_slot = my_cpu_slot();
+    let mut run = run_mut(cpu_slot);
+    {
+        let mut g = proc_bucket_lock(cur_pid);
+        if let Some(slot) = g.get_mut(&cur_pid) {
+            slot.saved = *frame;
+            fpu::save(&mut slot.fpu);
+            slot.fs_base = gdt::read_fs_base();
+            slot.proc.set_state(TaskState::Blocked);
+        }
+    }
+    run.current = None;
+    clear_current_proc();
+
+    match pop_and_commit_switch(&mut run, frame, None, usize::MAX) {
+        NextCommit::Switched => {
+            // **不清登记**（同 block_for_input_event 的 Switched 分支纪律）：
+            // 本进程槽位的清除由唤醒方（wake_console 的 swap）负责。此处若
+            // 清掉，后续字节写入会读到 MAX、无法唤醒本进程。
+            ConsoleBlock::Switched
+        }
+        NextCommit::Empty | NextCommit::NothingSelf => {
+            drop(run);
+            match schedule_from_block(frame, cur_pid) {
+                // 切到其它就绪进程：自己仍 Blocked + 登记不变。
+                BlockResume::SwitchedOther => ConsoleBlock::Switched,
+                // 自己被字节唤醒入队：切回自身。对称的条件清理（仅当登记仍
+                // 指向本 pid）——数据唤醒已 swap 走登记，CAS 无效。
+                BlockResume::SwitchedSelf => {
+                    let _ = CONSOLE_WAITER.compare_exchange(
+                        cur_pid as u32,
+                        u32::MAX,
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                    );
+                    ConsoleBlock::Switched
+                }
+            }
+        }
+    }
+}
+
+/// console 字节写入后唤醒阻塞的读者（vfs `write_at` → wake 钩子调用）。
+///
+/// 取出 [`CONSOLE_WAITER`] 登记的 pid，若其仍处 `Blocked` 且未在 waitpid，
+/// 把保存帧 rax 预置为「曾阻塞、请重试」哨兵并置 Ready 入就绪队列——用户态
+/// `read` 封装识别哨兵后重试取字节（与 `wake_input_event` 同款重试协议）。
+///
+/// **调用上下文**：consoled 经 `write` syscall 写 `/devices/console`，本函数
+/// 在 syscall 上下文执行（非中断）；只取 per-pid 锁且不做分配/阻塞，
+/// `wake_enqueue` 负责跨核 IPI 的延迟唤醒。无等待者：快路径（一次原子读）。
+pub fn wake_console() {
+    let p = CONSOLE_WAITER.swap(u32::MAX, core::sync::atomic::Ordering::AcqRel);
+    if p == u32::MAX {
+        return;
+    }
+    let enqueue = {
+        let mut g = proc_bucket_lock(p as usize);
+        match g.get_mut(&(p as usize)) {
+            Some(slot) if slot.waiting_for.is_none() && slot.proc.state() == TaskState::Blocked => {
+                // 预置"曾阻塞、请重试"哨兵：用户态封装据此重试 read 取字节。
+                slot.saved.rax = CONSOLE_WAKE_RETRY_SENTINEL;
+                slot.proc.set_state(TaskState::Ready);
+                Some(slot.home_cpu)
+            }
+            _ => None,
+        }
+    };
+    if let Some(home) = enqueue {
+        wake_enqueue(p as usize, home);
+    }
+    // 未达唤醒判据（已醒/已死/waiting_for 占用）：无需动作——槽位已清，
+    // 判据不符意味着该进程经其它途径醒来或正在等待其它资源。
+}
+
+/// 清 console 等待者槽中残留的本进程登记（仅当仍指向 `pid`）。
+///
+/// 与 [`clear_audio_waiter_if`] 同构：`read` 路径在**重新登记前**调用，清掉
+/// 上一次「已就绪但登记未清」的残留（哨兵重试路径不清登记，只有真正的字节
+/// 唤醒经 swap 清），残留会让本次 CAS 失败（WaiterBusy）且退化成空读轮询。
+/// 绝不误伤指向其它 pid 的并发等待者。
+pub fn clear_console_waiter_if(pid: usize) {
+    let _ = CONSOLE_WAITER.compare_exchange(
+        pid as u32,
+        u32::MAX,
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Acquire,
+    );
+}
 /// 有设备事件入队时唤醒阻塞等待的进程（由 `driver::event::publish_event` 经
 /// 回调调用）。取出 [`EVENT_WAITER`] 登记的 pid 置 `Ready` 并入就绪队列。
 /// 在发布上下文调用，持锁时间极短（仅入队）。仅当等待者仍处 `Blocked` 才唤醒

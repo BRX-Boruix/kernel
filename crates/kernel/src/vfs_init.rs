@@ -1341,6 +1341,12 @@ fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
     // （task 知道）接起来。vfs 是 task 的下游，不能反向调用，故用回调解耦。
     // 不装则阻塞的读者永远等不到唤醒（只剩有限超时兜底）。
     vfs::audio::set_wake_hook(task::wake_audio);
+
+    // §6.15 P2：安装 console 字节到达回调（同 audio 的解耦理由——vfs 是
+    // task 的下游，不能反向调用；consoled 的 write 落环后经本钩子唤醒
+    // 阻塞在 fd 0 的读者）。P4 切换前本钩子是空转（无等待者、写入走
+    // 轮询路径），安装无害；P4 起成为阻塞读的唤醒源。
+    vfs::console::set_wake_hook(task::wake_console);
 }
 
 /// M1 启动自检：断言 `/devices/audio/stream/N` 在**真实挂载表**中可达且语义正确。

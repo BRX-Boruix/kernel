@@ -813,6 +813,22 @@ pub trait INode: Send + Sync {
     fn is_terminal(&self) -> bool {
         false
     }
+    /// 本节点是否为 **console 字节流**（§6.15 P2，甲-a 架构）：空读是「consoled
+    /// 尚未喂入」而**非** EOF，等待源是 `console::write_at` 落环后的 wake 钩子。
+    ///
+    /// 与 [`Self::blocks_when_empty`] 的分工（同 `input_event_stream` 的理由，
+    /// S15 单点定义）：console 的空读如实返回 `Ok(0)`（「读走 0 字节」而非
+    /// 「错误」），故复用 `blocks_when_empty` 的 `Err(WouldBlock)` 消费路径
+    /// **形态不匹配**；syscall 层据本真值接 console 专用等待者。与
+    /// [`Self::input_event_stream`] 的分工：等待源不同（字节环写入回调 vs
+    /// IRQ1 事件环）、唤醒原语不同（`CONSOLE_WAITER` vs `IN_EVENT_WAITERS`）——
+    /// 合并会让两个流共享一套等待者表，语义纠缠。
+    ///
+    /// **默认 `false`**（S17 安全侧）：漏写覆写只会让 console 节点退化为
+    /// 轮询读（空读如实 0），不会让任何普通文件凭空获得阻塞语义。
+    fn console_stream(&self) -> bool {
+        false
+    }
     /// 本节点所属控制台的 **owner pid**（ADR-044 §1.3 / J-TOKEN-B）。
     ///
     /// 语义：**谁现在持有这个 console 对象的令牌**。`0` = **无主/未知**
@@ -846,6 +862,20 @@ pub trait INode: Send + Sync {
     /// **默认 `None`**（S17 理由）：音频 ring 是本计划专有的新概念，其余节点
     /// 一律没有；默认安全侧，漏写只会导致如实 `NotSupported`，不会错认节点。
     fn as_audio_ring(&self) -> Option<alloc::sync::Arc<crate::audio::AudioRing>> {
+        None
+    }
+
+    /// 若本节点暴露 console 字节环，返回其共享句柄；否则 `None`（§6.15 P2）。
+    ///
+    /// 与 [`Self::as_audio_ring`] 完全同构（S28）：声明式能力而非 downcast
+    /// （理由逐字同上——`INode: Any` 会给 trait 加全局约束）。syscall 层的
+    /// console 就绪探针经它读 `ConsoleRing::used()`（**非消费**）判定就绪，
+    /// 与交付路径（`ConsoleNode::read_at`）同源——探针绝不取走字节
+    /// （消费式探针会把环里最后的字节交付给探针而非读者，S09 丢字节）。
+    ///
+    /// **默认 `None`**（S17）：console ring 是阶段 3 专有的新概念，其余节点
+    /// 一律没有；默认安全侧，漏写覆写只会导致如实 `None`。
+    fn as_console_ring(&self) -> Option<alloc::sync::Arc<crate::console::ConsoleRing>> {
         None
     }
 

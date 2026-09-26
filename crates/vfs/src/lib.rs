@@ -10,6 +10,7 @@ extern crate std;
 extern crate alloc;
 
 pub mod audio;
+pub mod console;
 pub mod devfs;
 pub mod dynamic;
 pub mod file_handle;
@@ -26,6 +27,7 @@ pub mod stream;
 pub mod sysfs;
 
 pub use audio::{AudioRing, DspNode, WriteGate, AUDIO_RING_CAPACITY, AUDIO_STREAM_COUNT};
+pub use console::{set_wake_hook, ConsoleNode, CONSOLE_RING_CAPACITY};
 pub use devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
 pub use dynamic::{DynamicDirNode, DynamicFileNode};
 pub use file_handle::{

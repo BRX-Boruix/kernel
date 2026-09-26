@@ -630,6 +630,13 @@ impl DevFS {
         input_dir.add_child("events", events_node);
         root.add_child("input", input_dir);
 
+        // 4.55.5 /devices/console（I-EVENTS 阶段 3 P2，§6.15 甲-a：字节端）。
+        // 读端 = 切换后的 fd 0（stdin 源），写端 = consoled（P3）喂入经
+        // 用户态 keymap 转换的字节。SPSC 环单例；status 如实披露水位与
+        // 丢弃计数。切换（P4）前无任何既有读者/写者，纯新增、零回归面。
+        let console_node = Arc::new(crate::console::ConsoleNode::new());
+        root.add_child("console", console_node);
+
         // 4.6 /devices/audio/dsp（plan_audio_vfs.md 批次一 A1）
         // 音频 PCM 哑管道：内核对音频零知识，只搬字节。写者与音频驱动
         // 通过本节点耦合，互不认识。无消费者附加时写入如实失败

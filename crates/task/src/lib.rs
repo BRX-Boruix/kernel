@@ -43,6 +43,9 @@ pub use scheduler::{
     clear_audio_timeout_timer, clear_audio_waiter_if,
     // I-EVENTS 阶段 2：键盘事件记录等待者（ADR-047）。
     InputEventBlock, block_for_input_event, wake_input_event, clear_input_event_waiter_if,
+    // I-EVENTS 阶段 3 P2（§6.15）：console 字节流等待者（第 4 个等待者，
+    // 甲-a 架构的阻塞原语——consoled 写入唤醒 fd 0 读者）。
+    ConsoleBlock, block_for_console, wake_console, clear_console_waiter_if,
 };
 #[cfg(feature = "kernel-tests")]
 pub use scheduler::test_hooks;

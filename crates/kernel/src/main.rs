@@ -865,6 +865,9 @@ unsafe fn kmain_body() -> ! {
     // I-EVENTS P1（§6.15）：事件流多读者契约（仿真环，无副作用）。
     #[cfg(feature = "kernel-tests")]
     tests::test_event_multireader();
+    // I-EVENTS P2（§6.15）：console 字节环契约（节点自有环，无副作用）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_console_byte_ring();
     // §6.12.6：RUN 域锁同核重入死锁复现（纯锁语义，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_run_lock_reentrancy_deadlock();
