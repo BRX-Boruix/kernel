@@ -34,19 +34,19 @@ const ATA_SECONDARY_BASE: u16 = 0x170;
 
 /// 通道内寄存器偏移（Primary 与 Secondary 同构，仅基址不同）。
 const REG_DATA: u16 = 0x00; // 16 位数据口
-const REG_FEATURES: u16 = 0x01;
-const REG_SECTOR_COUNT: u16 = 0x02;
-const REG_LBA_LOW: u16 = 0x03;
-const REG_LBA_MID: u16 = 0x04;
-const REG_LBA_HIGH: u16 = 0x05;
-const REG_DRIVE: u16 = 0x06;
-const REG_STATUS: u16 = 0x07;
-const REG_COMMAND: u16 = 0x07;
+pub(crate) const REG_FEATURES: u16 = 0x01;
+pub(crate) const REG_SECTOR_COUNT: u16 = 0x02;
+pub(crate) const REG_LBA_LOW: u16 = 0x03;
+pub(crate) const REG_LBA_MID: u16 = 0x04;
+pub(crate) const REG_LBA_HIGH: u16 = 0x05;
+pub(crate) const REG_DRIVE: u16 = 0x06;
+pub(crate) const REG_STATUS: u16 = 0x07;
+pub(crate) const REG_COMMAND: u16 = 0x07;
 
-const ATA_SR_BSY: u8 = 0x80;
-const ATA_SR_DRQ: u8 = 0x08;
-const ATA_SR_ERR: u8 = 0x01;
-const ATA_SR_DF: u8 = 0x20;
+pub(crate) const ATA_SR_BSY: u8 = 0x80;
+pub(crate) const ATA_SR_DRQ: u8 = 0x08;
+pub(crate) const ATA_SR_ERR: u8 = 0x01;
+pub(crate) const ATA_SR_DF: u8 = 0x20;
 
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_SECTORS: u8 = 0x20;
@@ -95,29 +95,29 @@ pub enum AtaIdentify {
 
 static FALLBACK_STORAGE: Mutex<[u8; 64 * 1024]> = Mutex::new([0u8; 64 * 1024]);
 
-fn io_delay() {
+pub(crate) fn io_delay() {
     outb(0x80, 0);
 }
 
 /// 读通道状态寄存器。
 #[inline]
-fn status_read(channel: u16) -> u8 {
+pub(crate) fn status_read(channel: u16) -> u8 {
     inb(channel + REG_STATUS)
 }
 
 /// 读通道数据口 16 位字。
 #[inline]
-fn data_read(channel: u16) -> u16 {
+pub(crate) fn data_read(channel: u16) -> u16 {
     inw(channel + REG_DATA)
 }
 
 /// 写通道数据口 16 位字。
 #[inline]
-fn data_write(channel: u16, word: u16) {
+pub(crate) fn data_write(channel: u16, word: u16) {
     outw(channel + REG_DATA, word);
 }
 
-fn wait_not_busy(channel: u16) -> bool {
+pub(crate) fn wait_not_busy(channel: u16) -> bool {
     // 预算依据：每次轮询是一次 VM exit 级 inb；QEMU 对冷文件首次回写
     // （新建镜像首启）可能超过 1 万次窗口，20 万次给出数百毫秒上限。
     for _ in 0..200_000 {
@@ -763,10 +763,13 @@ pub fn init_ata(_hub: &DriverHub) {
                 // 超域盘不可用，也不伪造回退；继续考察其余槽位。
             }
             AtaIdentify::AtapiPacket => {
+                // B2：包设备移交 ATAPI CD-ROM 驱动（同通道、同总线锁，协议独立）。
+                // 只读块层在此登记 cd0/cd1；ISO9660 文件系统层是后续独立件。
                 info!(
-                    "[ata_pio] ATAPI packet device detected on '{}'; LBA28 PIO block driver does not support packet devices - no block device registered",
+                    "[ata_pio] ATAPI packet device detected on '{}'; handing to atapi_cdrom",
                     dev.name
                 );
+                super::atapi_cdrom::register_atapi_device(channel, slave);
             }
             AtaIdentify::Absent => {
                 // 该槽位无设备；不登记、不伪造。四槽全缺席时最后统一落回退。

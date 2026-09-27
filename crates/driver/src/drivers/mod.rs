@@ -18,6 +18,7 @@
 pub mod ahci;
 pub mod ata_lock;
 pub mod ata_pio;
+pub mod atapi_cdrom;
 pub mod cmos;
 pub mod keyboard;
 pub mod pci_bus;

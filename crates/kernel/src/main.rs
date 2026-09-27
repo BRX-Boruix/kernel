@@ -760,6 +760,8 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_bench_ds32(); // D-S32: cycle-counter + page-cache hit-rate/throughput benchmark
     #[cfg(feature = "kernel-tests")]
+    tests::test_atapi_cdrom_block();
+    #[cfg(feature = "kernel-tests")]
     tests::test_driver_hub_m72();
     // A2：音频管道 syscall 域（消费者注册表/两阶段 IO/退出清理）。
     #[cfg(feature = "kernel-tests")]

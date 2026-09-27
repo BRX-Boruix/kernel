@@ -7336,6 +7336,70 @@ pub fn test_audio_pipe_a2() {
 
     info!("[test-audio-a2] PASS: slot semantics, two-phase IO, exit cleanup verified");
 }
+/// B2 第一步验收：ATAPI CD-ROM 块设备真实数据链路（S06——命令包→数据相位→
+/// 字节落缓冲的**整条物理链**必须被断言，而非只看设备存在）。
+///
+/// 断言链：
+/// 1. `-cdrom` 拓扑下 DriverHub 存在名为 `cd0` 的 Block 设备（QEMU 恒挂
+///    ISO 于 Primary Master，签名探测 + IDENTIFY PACKET 真实执行过）；
+/// 2. `block_size()==2048`（MMC 单一逻辑块大小）、`block_count()>0`
+///    （IDENTIFY word100-103 真容量，非伪造常量）；
+/// 3. **ISO9660 PVD 魔数**：LBA16（字节偏移 32768）读回的数据在偏移 1..6
+///    呈现 `CD001`——这是规范定死的卷描述符魔数，只有 packet 读链路
+///    端到端正确才能读到（S15：介质上的规范事实是唯一真值源）；
+/// 4. io_stats 读计数随成功 READ(12) 增长（C16.1 对账）。
+/// 无 `-cdrom` 的运行形态（纯 `-hda`）下 cd 设备缺席——本测试按拓扑**如实
+/// 跳过**（S31：跳过必须显式留痕，不静默）。
+pub fn test_atapi_cdrom_block() {
+    use driver::DriverHub;
+
+    let dev_count = DriverHub::device_count();
+    let mut cd_info = None;
+    for i in 0..dev_count {
+        if let Some(info) = DriverHub::device_info_at(i) {
+            if info.name == "cd0" || info.name == "cd1" {
+                cd_info = Some((i, info));
+                break;
+            }
+        }
+    }
+    let Some((idx, info)) = cd_info else {
+        info!("[test-atapi] no cd device in this topology (-cdrom absent); SKIPPED");
+        return;
+    };
+    info!(
+        "[test-atapi] found {} volatile={}",
+        info.name, info.volatile as u64
+    );
+    assert!(!info.volatile, "ATAPI CD-ROM is real hardware: volatile=false");
+
+    let dev = DriverHub::device_at(idx).expect("cd device present in hub");
+    assert_eq!(dev.kind(), driver::DeviceKind::Block);
+    let blk = dev.as_block().expect("cd0 exposes BlockDevice ops");
+    assert_eq!(blk.block_size(), 2048, "ATAPI logical block size is 2048B (MMC)");
+    assert!(blk.block_count() > 0, "IDENTIFY PACKET capacity must be real");
+
+    let io = dev.as_io().expect("cd device exposes io ops");
+    let stats = io.io_stats().expect("atapi must expose real io stats");
+    let r0 = stats.sectors_read();
+
+    // PVD 读：LBA16 = 字节偏移 32768（ISO9660 规范：主卷描述符固定驻留
+    // LBA16；type=1 且魔数 CD001 在偏移 1..6）。
+    let mut pvd = [0u8; 2048];
+    let n = io.read_at(16 * 2048, &mut pvd);
+    assert_eq!(n, 2048, "PVD read must deliver a full logical block");
+    assert_eq!(pvd[0], 1, "PVD type must be 1 (Primary)");
+    assert_eq!(&pvd[1..6], b"CD001", "ISO9660 PVD magic must be present");
+
+    let r1 = stats.sectors_read();
+    assert!(r1 > r0, "successful READ(12) must advance read counter");
+    info!(
+        "[test-atapi] {} PVD magic OK ({} blocks x 2048B) read-chain verified",
+        info.name,
+        blk.block_count()
+    );
+}
+
 pub fn test_driver_hub_m72() {
     use driver::DriverHub;
 
