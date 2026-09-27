@@ -214,35 +214,37 @@ pub fn test_user_address_space() {
     info!("[test-user-space] PASS");
 }
 
-/// KA7 第二层（RLIMIT_AS 语义）：单地址空间区域总量配额强制。
+/// KA7 第二层：单地址空间区域总量配额强制（B1 改造：两级比例化运行时值）。
 ///
-/// 48MiB 预留（< 64MiB 上限）必须成功；再追加 32MiB 使总量越限，必须
-/// `NoSpace` 拒绝；且拒绝后**已成功的区域保持完好**（配额失败零副作用）。
-/// 配额缺失时本测试必败（第二笔预留会静默成功）——TDD 红线。
+/// 第一笔 3/4 软上限（< 软上限）必须成功；再追加 1/2 软上限使累计
+/// 5/4 越限，必须 `NoSpace` 拒绝；且拒绝后**已成功的区域保持完好**（配额
+/// 失败零副作用）。配额缺失时本测试必败（第二笔预留会静默成功）——TDD 红线。
+/// 全部数值按运行时软上限推导（S31：任何物理内存配置下形状确定）。
 pub fn test_user_addr_quota() {
     use mm::user_space::{UserAddressSpace, USER_BASE};
 
-    const FIRST_BYTES: u64 = 48 * 1024 * 1024;
-    const SECOND_BYTES: u64 = 32 * 1024 * 1024;
+    let per_space = UserAddressSpace::<X86PageTable>::per_space_quota_public_bytes();
+    let first_bytes: u64 = per_space / 4 * 3;      // 3/4 软上限：低于即成功
+    let second_bytes: u64 = per_space / 2;         // 累计 5/4：必越线
 
     let us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
 
-    // 第一笔：贴用户半区底部，48MiB，应成功。
+    // 第一笔：贴用户半区底部，3/4 软上限，应成功。
     let a0 = USER_BASE;
     us.reserve_user(
         VirtAddr::new(a0),
-        VirtAddr::new(a0 + FIRST_BYTES),
+        VirtAddr::new(a0 + first_bytes),
         PageSize::Size4K,
         PageFlags::empty().writable(),
     )
     .expect("first reservation under quota must succeed");
 
-    // 第二笔：紧随其后，总量 80MiB > 64MiB 上限，必须 NoSpace。
-    let a1 = a0 + FIRST_BYTES + 0x4096_0000; // 远隔，规避任何重叠判定
+    // 第二笔：紧随其后，累计 5/4 软上限，必须 NoSpace。
+    let a1 = a0 + first_bytes + 0x4096_0000; // 远隔，规避任何重叠判定
     let err = us
         .reserve_user(
             VirtAddr::new(a1),
-            VirtAddr::new(a1 + SECOND_BYTES),
+            VirtAddr::new(a1 + second_bytes),
             PageSize::Size4K,
             PageFlags::empty().writable(),
         )
@@ -8606,7 +8608,7 @@ fn build_loader_elf(spec: &LoaderElfSpec) -> alloc::vec::Vec<u8> {
 
 /// 组装双 PT_LOAD 镜像（配额越线用例的专属形状）：两段均为 filesz=0 的纯
 /// bss 段，memsz 相同、vaddr 连续。单段镜像在定义上无法跨越**按地址空间
-/// 累计**的区域配额（mm::user_space `MAX_USER_AREA_TOTAL_BYTES`），此形状
+/// 累计**的区域配额（B1：单空间软上限，比例化运行时值），此形状
 /// 不可由单程序头的 [`LoaderElfSpec`] 派生，故独立成最小构造器。
 #[cfg(feature = "kernel-tests")]
 fn build_two_segment_elf(seg_bytes: u64) -> alloc::vec::Vec<u8> {
@@ -8778,15 +8780,14 @@ pub fn test_loader_adversarial() {
         "segment beyond user half",
     );
 
-    // -- 4b-1. 单段超用户区配额（S31 确定性轴）：合法但巨大的段（120MiB）
-    // > MAX_USER_AREA_TOTAL_BYTES(64MiB)。loader 现在**先**过配额预检再
-    // 分配物理帧——此拒绝码为 NoSpace，且与机器物理内存多寡无关。历史
-    // 缺陷：配额校验只在 map_user 内、位于 collect_frames 之后，超大段先
-    // 抽帧后撞配额，拒绝码随 -m 漂移（-m 小 → 池耗尽 OutOfMemory；-m 大
-    // → 配额 NoSpace），同一请求结果不确定。此处断言确定性契约：恒为
-    // NoSpace。--
+    // -- 4b-1. 单段超用户区配额（S31 确定性轴）：合法但巨大的段。B1 改造后
+    // 配额两级比例化：单空间软上限 = 全局预算（物理内存一半）的一半，均按
+    // 运行时计算——需求量 = 单空间软上限 + 1MiB，保证任何内存配置下都越线，
+    // 判据恒为 NoSpace（拒绝点在请求点，先于物理帧分配；拒绝码与 -m 无关的
+    // 确定性契约不变）。--
     {
-        const OVER_QUOTA_BYTES: u64 = 120 * 1024 * 1024;
+        let per_space = mm::user_space::UserAddressSpace::<X86PageTable>::per_space_quota_public_bytes();
+        let OVER_QUOTA_BYTES: u64 = per_space + 1024 * 1024;
         let spec = LoaderElfSpec {
             p_vaddr: 0x1000, // 页对齐低位起点（校验面：合法但巨大）
             p_filesz: 0x10,
@@ -8804,19 +8805,19 @@ pub fn test_loader_adversarial() {
     // -- 4b-2. 物理帧池真耗尽（L3/S31 资源耗尽轴的**防御回退**）：collect_frames
     // 在帧池见底时返回 OutOfMemory（绝不 panic / alloc abort），错误返回后
     // Vec Drop 全额归还已分配帧。本路径天然依赖物理内存多寡——只有当可用
-    // 帧数不足 64MiB 配额时，才可能在配额预检放行后把池抽干；池更大时该
-    // 路径不可达（配额 NoSpace 先拦截）。故按运行时可用帧数计算需求量：
-    // 需求量 = (free_frames + 1) 页（逼最后一帧分配失败），且须 < 64MiB
-    // 配额。满足则断言 OutOfMemory；否则记录跳过（-m 过大，池无法在配额
-    // 内耗尽，属预期而非失败）。--
+    // 帧数不足单空间软上限（B1 比例化，运行时计算）时，才可能在配额预检
+    // 放行后把池抽干；池更大时该路径不可达（配额 NoSpace 先拦截）。故按
+    // 运行时可用帧数计算需求量：需求量 = (free_frames + 1) 页（逼最后一帧
+    // 分配失败），且须 < 软上限。满足则断言 OutOfMemory；否则记录跳过
+    //（-m 过大，池无法在配额内耗尽，属预期而非失败）。--
     {
         use mm::frame_allocator::total_frames;
         const PAGE: u64 = 4096;
-        const QUOTA_BYTES: u64 = 64 * 1024 * 1024;
+        let quota_bytes = mm::user_space::UserAddressSpace::<X86PageTable>::per_space_quota_public_bytes();
         let free_frames = total_frames()
             .saturating_sub(mm::frame_stats().allocated_frames);
         let demand_bytes = (free_frames as u64 + 1).saturating_mul(PAGE);
-        if demand_bytes < QUOTA_BYTES {
+        if demand_bytes < quota_bytes {
             let spec = LoaderElfSpec {
                 p_vaddr: 0x1000,
                 p_filesz: 0x10,
@@ -8833,7 +8834,7 @@ pub fn test_loader_adversarial() {
             klib::info!(
                 "[test-loader] pool-exhaustion path skipped: free pool {:#x}B >= quota {:#x}B (unreachable within quota)",
                 (free_frames as u64) * PAGE,
-                QUOTA_BYTES
+                quota_bytes
             );
         }
     }
@@ -8852,17 +8853,19 @@ pub fn test_loader_adversarial() {
     );
 
     // -- 4d. 累计用户区配额越线 + 错误路径帧退款（audit-r2 F1 回归）：
-    //    两段各 QUOTA_SEG_BYTES——单段低于 MAX_USER_AREA_TOTAL_BYTES(64MiB)、
-    //    合计 66MiB 越线 ⇒ 第二段的 map_user 必须在配额闸门处以 NoSpace
-    //    拒绝（而非帧池 OutOfMemory 掩盖）。核心断言是资源完整性：失败段
-    //    collect_frames 已收集的全部物理帧必须当场退还帧池，「建地址空间 →
+    //    两段各 QUOTA_SEG_BYTES——单段低于单空间软上限、合计越线 ⇒ 第二段的
+    //    map_user 必须在配额闸门处以 NoSpace 拒绝（而非帧池 OutOfMemory 掩盖）。
+    //    B1 改造后配额比例化：段大小 = 软上限/2 + 1MiB（单段必然低于软上限，
+    //    两段合计必然越线），任何内存配置下形状确定。核心断言是资源完整性：
+    //    失败段 collect_frames 已收集的全部物理帧必须当场退还帧池，「建地址空间 →
     //    load 失败 → Drop」整个包络前后的 allocated_frames 严格相等。
     //    两次独立尝试：首次兼作内核堆预热——frames Vec 的容量增长可能触发
     //    一次性堆扩张（帧计数上升不可逆，属分配器设计内行为而非泄漏），
     //    故首试只记录包络差；第二次处于热态，包络内任何净差都是泄漏。
     //    预修复时每次尝试独立漏掉整段帧，故回归强度不受首试放宽影响。--
     {
-        const QUOTA_SEG_BYTES: u64 = 33 * 1024 * 1024;
+        let per_space = mm::user_space::UserAddressSpace::<X86PageTable>::per_space_quota_public_bytes();
+        let QUOTA_SEG_BYTES: u64 = per_space / 2 + 1024 * 1024;
         let attempt = |label: &str, strict_frames: bool| {
             let s0 = mm::frame_stats().allocated_frames;
             let mut us =

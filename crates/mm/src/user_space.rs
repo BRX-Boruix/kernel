@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use arch::{
     ActivePageTable, PageFlags, PageSize, PageTable, PhysAddr, PhysFrame, VirtAddr, phys_to_virt,
 };
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use klib::error::Error;
 use klib::sync::irq::IrqSpinLock;
@@ -232,6 +232,37 @@ fn shm_hooks_notify_released(ids: &[u64]) {
 /// `IrqSpinLock` 为**不可重入**锁（关中断自旋）；纪律：持有 `core` 锁的方法
 /// 内部只准调用本对象 `_locked`/同临界区私有体，禁止再走会重新取 `core` 锁的
 /// 公开包装（否则同一 CPU 自旋死锁）。
+/// 全局内存承诺账（B1 定案）：全系统所有存活地址空间的「预留即承诺」字节
+/// 总和。记账单位是**地址空间生命周期**：fork 克隆时按子空间初始 used 入账，
+/// destroy 时按销毁时刻 used 全额退账；存续期区域增减不动账（承诺语义：
+/// 按需分页下区域随时可能被触写，unmap 不等于收回承诺）。拒绝点在
+/// `check_area_quota`（请求点确定性拒绝，ADR-032/S31）。
+///
+/// 预算 = 物理内存一半（`global_commit_budget_bytes`）——Linux
+/// `overcommit_memory=2` + `overcommit_ratio=50` 同构；本账即 CommitLimit
+/// 的用户半区形态。轻度假定：check 与后续 push 之间的窗口允许多个请求各
+/// 自通过（无全局提交锁）——Linux mmap 同样无全局锁，账面偏保守可接受。
+static GLOBAL_COMMIT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// 全局承诺预算字节数 = 物理帧总数 × 帧大小 ÷ 2（S17：比例化默认值，
+/// 理由=按需分页下全系统承诺不得超半数物理内存，overcommit_ratio 50%
+/// 同构；替代原 64MiB 编译期硬常量——机器内存决定预算，绝不写死）。
+fn global_commit_budget_bytes() -> u64 {
+    (crate::frame_allocator::total_frames() as u64 * crate::FRAME_SIZE_BYTES) / 2
+}
+
+/// 全局承诺预算的**公开只读查询**（B1）：预算随物理内存比例化，测试与
+/// 遥测需要运行时真值（编译期常量已废除，S31 确定性判据按运行时计算）。
+/// `pub`：只读，无状态（预算是派生值不是可变状态）。
+pub fn commit_budget_bytes() -> u64 {
+    global_commit_budget_bytes()
+}
+
+/// 当前全局承诺账面值（B1 遥测/测试只读）。
+pub fn global_committed_bytes() -> u64 {
+    GLOBAL_COMMIT_BYTES.load(Ordering::Relaxed)
+}
+
 pub struct UserAddressSpace<PT: PageTable> {
     /// 由粗锁保护的核心可变状态：页表 + 分配游标/断点 + 析构守卫。
     core: IrqSpinLock<AddrCore<PT>>,
@@ -241,6 +272,11 @@ pub struct UserAddressSpace<PT: PageTable> {
     cow_pages: spin::Mutex<Vec<CowPage>>,
     /// 共享内存映射记账（M5 IPC）。
     shm_maps: spin::Mutex<Vec<ShmMap>>,
+    /// 本空间已登记进全局承诺账的字节累计（B1）。check_area_quota 通过时
+    /// 与全局账同步累加；destroy 时全额退账（S20 对偶面唯一）。原子量：
+    /// 本空间内无并发写者（check 调用方串行语义由调用侧保证），全局侧只经
+    /// 此字段与全局账对偶。
+    committed_bytes: AtomicU64,
 }
 
 /// 地址空间粗锁保护的核心状态（ADR-035 D4）。
@@ -277,6 +313,7 @@ where
             areas: spin::Mutex::new(Vec::new()),
             cow_pages: spin::Mutex::new(Vec::new()),
             shm_maps: spin::Mutex::new(Vec::new()),
+            committed_bytes: AtomicU64::new(0),
         })
     }
 
@@ -1011,6 +1048,23 @@ where
         let inherited_ids: alloc::vec::Vec<u64> =
             inherited.iter().map(|m| m.id).collect();
         shm_hooks_notify_acquired(&inherited_ids);
+        // B1 全局承诺账：子空间继承的克隆布局一次性入账（fetch_add 前置校验
+        // 与 check_area_quota 同构：超额回滚 + 上抛——fork 失败由 Drop 收拾，
+        // 此时 child.committed_bytes 尚为 0，destroy 退账自然为 0，对偶平衡）。
+        // 子空间存续期的后续 push 走自己的 check_area_quota（fetch_add）。
+        let inherited_commit = child.used_commit_bytes();
+        let old = GLOBAL_COMMIT_BYTES.fetch_add(inherited_commit, Ordering::Relaxed);
+        if old.saturating_add(inherited_commit) > global_commit_budget_bytes() {
+            GLOBAL_COMMIT_BYTES.fetch_sub(inherited_commit, Ordering::Relaxed);
+            klib::warn!(
+                "[user-space] fork rejected: inherited commit {:#x} exceeds global budget",
+                inherited_commit
+            );
+            return Err(Error::NoSpace.into());
+        }
+        child
+            .committed_bytes
+            .store(inherited_commit, Ordering::Relaxed);
         Ok(child)
     }
 
@@ -1178,6 +1232,16 @@ where
         // 故顶层页可无条件归还——原先那个 `top == current_paddr()` 的本核判定
         // 已被第 0 步的跨核门完全覆盖（前者只是后者的单核特例）。
         deallocate_frame(PhysFrame::from_paddr_raw(top));
+
+        // 4. B1 全局承诺账退账：按 `committed_bytes`（本空间累计登记额）全额
+        //    退还。与 check_area_quota / fork 入账严格对偶（S20 对偶面唯一）：
+        //    存续期区域缩减不退账（承诺不收回，账面保守），销毁时一次清零——
+        //    无泄漏、无虚低。fetch_sub 无条件执行：committed_bytes=0 时减 0
+        //    是 no-op，恒等安全。
+        let committed = self.committed_bytes.swap(0, Ordering::Relaxed);
+        if committed > 0 {
+            GLOBAL_COMMIT_BYTES.fetch_sub(committed, Ordering::Relaxed);
+        }
     }
 
     /// 解映射并释放虚拟区间 `[lo, hi)` 内**已补页**的物理页（未映射的页跳过）。
@@ -1257,51 +1321,91 @@ where
         Ok(gap_start)
     }
 
-    /// 单地址空间设备 MMIO 映射上限（KA7 限额纪律：用户可申请的设备映射
-    /// 总量有界，防循环 claim 耗尽地址空间/页表页）。
-    const MAX_USER_MMIO_MAP_BYTES: u64 = 16 * 1024 * 1024;
-
-    /// 单地址空间**区域总量**配额（KA7 第二层：内存记账强制第一级，
-    /// RLIMIT_AS 语义）。默认值 = 参考平台（selftest QEMU -m 128MiB）物理
-    /// 内存的一半：按需分页下"预留"即 OOM 承诺，单进程默认不得承诺超过
-    /// 半数物理内存。**当前为编译期常量、无运行时覆盖机制**（审计 B3 如实
-    /// 更正；S17 默认值理由如上）。若真机部署需要不同上限，须先立项注入点
-    /// （启动参数/配置服务），不得静默改此值。DeviceMmap 另有更严的 16MiB
-    /// 单类上限，但仍计入本配额。
-    const MAX_USER_AREA_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
-
-    /// 配额校验：`extra` 为本次拟新增的区域字节量。
+    /// 单地址空间**区域总量**软配额（B1 改造：原 64MiB 编译期硬常量的活形态）。
     ///
-    /// 占用量 = areas 区间长度和 + shm_maps 区间长度和（共享内存同样占用
-    /// 本地址空间的页表页与 OOM 承诺）。锁序：areas → shm_maps，与 brk 的
-    /// heap_clashes 检查一致（S21）。
+    /// 预算体系（Linux 同构，S17 默认值理由成文）：
+    /// - **全局承诺预算** = 物理内存的一半（按需分页下"预留"即 OOM 承诺，
+    ///   全系统承诺不得超半数物理内存——overcommit_ratio 50% 同构）；
+    /// - **单地址空间软上限** = 全局预算的一半（防单进程默认独占全局预算；
+    ///   原 64MiB 恰是 -m 128MiB 参考平台上的该值，语义连续）。
+    /// 两级都随物理内存比例化——机器内存翻倍，配额自动翻倍，绝不写死。
+    fn per_space_quota_bytes() -> u64 {
+        global_commit_budget_bytes() / 2
+    }
+
+    /// 单空间软上限的公开只读查询（测试/遥测用；语义见 `per_space_quota_bytes`）。
+    pub fn per_space_quota_public_bytes() -> u64 {
+        Self::per_space_quota_bytes()
+    }
+
+    /// 配额校验**并登记承诺**：`extra` 为本次拟新增的区域字节量。
+    ///
+    /// 双层判定（B1/B5 定案，owner 裁决）：
+    /// 1. **本空间软上限**：`本空间累计承诺 + extra > per_space_quota_bytes()`
+    ///    → NoSpace（防单进程默认独占，比例化）；
+    /// 2. **全局承诺账**：`extra + 全局已承诺 > 全局预算` → NoSpace（Linux
+    ///    overcommit_memory=2 的请求点确定性拒绝同构）。
+    ///
+    /// **check-and-commit 合一**（S13 单点）：校验通过即 `fetch_add` 进全局账
+    /// 并累加进本空间 `committed_bytes`。调用方语义天然对齐——每处
+    /// `check_area_quota(n)` 的 n 就是「本次新增承诺」；check 通过后调用方自身
+    /// 后续失败（映射失败等）不回滚承诺，账面虚高至空间销毁——**虚高即保守**，
+    /// 按需分页下区域随时可能被触写，提前收回承诺是自欺（S17 如实记录）。
+    /// 区域缩减（brk 收缩/munmap）同理不退账——承诺到生命周期结束释放。
+    ///
+    /// 精确性保证（S20 对偶面唯一）：全局账与 `committed_bytes` 严格同步增减，
+    /// 空间销毁时按 `committed_bytes` 全额退账——**账面无泄漏、无虚低**；
+    /// 存续期虚高是设计内保守，随空间销毁精确清零。
     ///
     /// `pub`：loader 在 `collect_frames`（物理帧分配）**之前**调用本方法做
     /// 配额预检——超配额段必须在此处以 NoSpace 确定性拒绝，绝不能先分配
     /// 物理帧再于 map_user 里拒（否则拒绝码随物理内存多寡漂移，见
     /// docs/adr/032 同期修复；S31 确定性轴）。
     pub fn check_area_quota(&self, extra: u64) -> Result<(), PT::Error> {
-        let used = {
-            let areas = self.areas.lock();
-            let shms = self.shm_maps.lock();
-            let area_bytes: u64 = areas
-                .iter()
-                .map(|a| a.end.as_u64() - a.start.as_u64())
-                .sum();
-            let shm_bytes: u64 = shms.iter().map(|m| m.end - m.vaddr).sum();
-            area_bytes + shm_bytes
-        };
-        if used.saturating_add(extra) > Self::MAX_USER_AREA_TOTAL_BYTES {
-            // NoSpace 与 fd 表上限同一语义家族："进程级资源额度耗尽"。
+        let committed = self.committed_bytes.load(Ordering::Relaxed);
+        // 1. 本空间软上限（比例化，防单进程默认独占）。
+        if committed.saturating_add(extra) > Self::per_space_quota_bytes() {
             return Err(Error::NoSpace.into());
         }
+        // 2. 全局承诺账（请求点确定性拒绝）。
+        //
+        // **fetch_add 前置校验 + 超额回滚**（非 load/store——load 后 store 会
+        // 覆盖并发加账，经典 lost update）：fetch_add 后复验，超额则 fetch_sub
+        // 回滚并拒绝。并发窗口内可能轻微超卖（多核同时通过旧读数）——Linux
+        // mmap 同样无全局锁，超卖有界（≤并发核数×单请求），账面偏保守可接受
+        //（S17 成文）。fetch_add 返回**旧值**：本请求通过时全局账 = old + extra。
+        let old = GLOBAL_COMMIT_BYTES.fetch_add(extra, Ordering::Relaxed);
+        if old.saturating_add(extra) > global_commit_budget_bytes() {
+            GLOBAL_COMMIT_BYTES.fetch_sub(extra, Ordering::Relaxed);
+            return Err(Error::NoSpace.into());
+        }
+        // 登记本空间累计值（与全局账严格对偶，destroy 按此全额退账）。
+        self.committed_bytes
+            .store(committed.saturating_add(extra), Ordering::Relaxed);
         Ok(())
+    }
+
+    /// 本空间当前承诺字节数 = areas 区间长度和 + shm_maps 区间长度和。
+    ///
+    /// 占用共享内存同样计入（共享内存占用页表页与 OOM 承诺，历史口径保留）。
+    /// 锁序：areas → shm_maps，与 brk 的 heap_clashes 检查一致（S21）。
+    fn used_commit_bytes(&self) -> u64 {
+        let areas = self.areas.lock();
+        let shms = self.shm_maps.lock();
+        let area_bytes: u64 = areas
+            .iter()
+            .map(|a| a.end.as_u64() - a.start.as_u64())
+            .sum();
+        let shm_bytes: u64 = shms.iter().map(|m| m.end - m.vaddr).sum();
+        area_bytes + shm_bytes
     }
 
     /// 把设备物理区间 `[phys, phys+size)` 真实映射到用户半区（K2 完全体，
     /// kernel1.md：UIO claim 的映射半程）。
-    /// - `phys` 必须 4KiB 对齐，`size` 非零（向上取整到页）；总量受
-    ///   [`MAX_USER_MMIO_MAP_BYTES`] 上限。
+    /// - `phys` 必须 4KiB 对齐，`size` 非零（向上取整到页）。
+    /// - **B5 统一账**：原独立 16MiB 单类上限已废除——设备映射的字节承诺与
+    ///   其他区域同账（reserve_user_with_kind → check_area_quota → 全局承诺
+    ///   账，S15 单一真值源）；拒绝点=请求点（NoSpace，确定性不变）。
     /// - 页以 `writable + user + device_memory`（不可缓存，PCD）映射——设备
     ///   寄存器读有副作用，绝不允许缓存/投机语义介入。
     /// - 区域登记为 [`UserAreaKind::DeviceMmap`]：进程退出销毁时**只清 PTE、
@@ -1320,9 +1424,9 @@ where
         }
         // B4：size 用户可控，对齐前先 checked——溢出如实拒绝而非回绕。
         let len = align_up_checked(size, PAGE).ok_or(Error::InvalidParam)?;
-        if len > Self::MAX_USER_MMIO_MAP_BYTES {
-            return Err(Error::NoSpace.into());
-        }
+        // B5：设备映射承诺与其他区域同账——本路径不再设独立单类上限，
+        // 统一由 reserve_user_with_kind 内的 check_area_quota（全局承诺账）
+        // 请求点拒绝。
         // 物理端溢出防护（u64 回绕即非法请求）。
         if phys.checked_add(len).is_none() {
             return Err(Error::InvalidParam.into());

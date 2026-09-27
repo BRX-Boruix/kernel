@@ -498,9 +498,10 @@ fn pack_err(e: Error) -> u64 {
 /// 单次 syscall 用户缓冲长度上限（审计 B2：逐页预校验的 CPU 有界性）。
 ///
 /// `validate_user_range` 对区间**逐页**走页表，len 无上限 = 用户一个 read
-/// 就能让内核空转 ~2^34 次页表查询。上限取 64MiB——与单地址空间配额
-/// （MAX_USER_AREA_TOTAL_BYTES）同量级，覆盖全部合法批量 IO；超出即参数
-/// 错误（InvalidParam），调用方分次提交。Linux 同型先例：MAX_RW_COUNT。
+/// 就能让内核空转 ~2^34 次页表查询。上限取 64MiB——历史参考平台上与旧
+/// 单空间配额同量级，覆盖全部合法批量 IO；这是 **IO 有界性**关切，与内存
+/// 承诺记账（B1 全局账）无涉。超出即参数错误（InvalidParam），调用方分次
+/// 提交。Linux 同型先例：MAX_RW_COUNT。
 const MAX_SYSCALL_BUF_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 预校验当前进程的用户缓冲区 `[buf, buf + len)` 对 `access` 意图可访问
