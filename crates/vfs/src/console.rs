@@ -199,6 +199,10 @@ fn notify_data_ready() {
     }
 }
 
+/// console 实例总数（ADR-048 §3.2：N=4——够用且可枚举；实例 0 为既有
+ /// 单终端的兼容形态，1..N-1 在 T2/T4 接上焦点路由与守护前只是存在的设备）。
+pub const CONSOLES_N: usize = 4;
+
 // ---------- 内核侧单例访问（I-EVENTS P4 单径切换，§6.15） ----------
 
 /// 全系统唯一的 console 环句柄（`ConsoleNode::new` 注册；系统只有一个
@@ -250,7 +254,17 @@ pub struct ConsoleNode {
 }
 
 impl ConsoleNode {
+    /// 实例 0（兼容别名 `/devices/console`）：**注册** stdin 单例环——
+    /// 行为与多终端改造前完全一致（ADR-048 T1：单会话回归零变化判据）。
     pub fn new() -> Self {
+        Self::new_instance(true)
+    }
+
+    /// 通用实例构造（ADR-048 决策 1/2）：`register_stdin=true` 仅实例 0 使用
+    ///（stdin 单例真值链不变）；实例 1..N-1 传 false——独立环、不触全局
+    /// 注册（在 T2 接焦点路由前，这些实例只是「存在的设备」，无读者/写者，
+    /// 纯新增零回归面）。
+    pub fn new_instance(register_stdin: bool) -> Self {
         let ring = Arc::new(ConsoleRing::new());
         let children = DynamicDirNode::new();
         let status_ring = ring.clone();
@@ -272,9 +286,12 @@ impl ConsoleNode {
             bytes
         });
         children.add_child("status", Arc::new(status_node));
-        // P4 单径切换：把环登记为内核 stdin 源的单例句柄（先于 start_init
-        // 完成——devfs 挂载在内核启动期，早于任何用户态 stdin 读）。
-        register_ring(ring.clone());
+        // P4 单径切换（仅实例 0）：把环登记为内核 stdin 源的单例句柄（先于
+        // start_init 完成——devfs 挂载在内核启动期，早于任何用户态 stdin 读）。
+        // 实例 1..N-1 不注册（ADR-048 T1：它们尚无读者；T2 接焦点路由）。
+        if register_stdin {
+            register_ring(ring.clone());
+        }
         Self { ring, children }
     }
 }

@@ -635,7 +635,25 @@ impl DevFS {
         // 用户态 keymap 转换的字节。SPSC 环单例；status 如实披露水位与
         // 丢弃计数。切换（P4）前无任何既有读者/写者，纯新增、零回归面。
         let console_node = Arc::new(crate::console::ConsoleNode::new());
-        root.add_child("console", console_node);
+        root.add_child("console", console_node.clone());
+
+        // 4.55.6 /devices/consoles/N（ADR-048 决策 1，T1：实例族挂载）。
+        // 实例 0 = 上面 console 节点**同一个 Arc**（别名，单会话行为零变化——
+        // consoled/login/shell 的既有路径零改动）；实例 1..CONSOLES_N-1 为
+        // 独立环的纯新增节点（T1 时无读者/写者；T2 接焦点路由、T4 接守护）。
+        // N=4（ADR-048 §3.2：够用且可枚举）。audio/stream/0..N-1 同款先例。
+        let consoles_dir = Arc::new(DynamicDirNode::new());
+        // 别名 = **同一个 Arc**（不是复制节点）：`/devices/console` 与
+        // `/devices/consoles/0` 打开的是同一环、同一 owner 真值（S13 单一事实源）。
+        consoles_dir.add_child("0", console_node.clone());
+        for i in 1..crate::console::CONSOLES_N {
+            let name: alloc::string::String = alloc::format!("{}", i);
+            consoles_dir.add_child(
+                name.as_str(),
+                Arc::new(crate::console::ConsoleNode::new_instance(false)),
+            );
+        }
+        root.add_child("consoles", consoles_dir);
 
         // 4.6 /devices/audio/dsp（plan_audio_vfs.md 批次一 A1）
         // 音频 PCM 哑管道：内核对音频零知识，只搬字节。写者与音频驱动
