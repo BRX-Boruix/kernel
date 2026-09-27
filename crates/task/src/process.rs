@@ -236,9 +236,14 @@ pub struct Groups {
 }
 
 impl Groups {
-    /// 上限 8：与 Linux NGROUPS_SMALL=64000 相比是玩具内核的诚实量级；
-    /// 超限拒绝而非静默截断（S09）。
-    pub const MAX: usize = 8;
+    /// A2（A 档，owner 指令 2026-09-27）：8 → 32。诚实取舍说明（S09/S24）：
+    /// 本字段**当前无真实消费者**（第一阶段恒空集、不参与求值，见
+    /// ProcessIdentity 注释）——「无限化」无对象；去 Copy 改动态 Vec 会引爆
+    /// ProcessIdentity 的 Copy（全内核 identity 值语义重构），爆炸半径远超
+    /// 价值。真无限化随 A2-4 组账户阶段（有消费者时）一起做：届时换
+    /// 「inline 小容量 + 溢出 Arc」形态（Linux small-group 同思路）。当前
+    /// 32 与超限拒绝（S17 不截断）维持，超限路径如实报错不变。
+    pub const MAX: usize = 32;
 
     pub const fn empty() -> Self { Self { n: 0, ids: [0; Groups::MAX] } }
 
