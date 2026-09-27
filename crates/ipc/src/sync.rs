@@ -29,8 +29,11 @@ use klib::sync::irq::IrqSpinLock;
 
 use crate::{wake_proc_with_value, BlockOutcome, NOTIFIER};
 
-/// SYNC_WAIT 超时上界（同事件机制 1h，S13 具名常量）。
-pub const SYNC_MAX_WAIT_TIMEOUT_NS: u64 = 3_600_000_000_000; // 1h
+/// SYNC_WAIT 超时上界（A10：1h 夹断删除，owner 指令 2026-09-27）——调用方
+/// 可传任意 u64 ns（u64::MAX ≈ 584 年 = 实际无限等待）。瞬态资源闭环不变：
+/// 到期自动唤醒回收；等待方被杀时定时器取消（原 1h 理由「无真实收益」不
+/// 成立——真实收益就是无限等待语义本身）。
+pub const SYNC_MAX_WAIT_TIMEOUT_NS: u64 = u64::MAX;
 
 /// 单个同步字对象的等待者条目。
 ///

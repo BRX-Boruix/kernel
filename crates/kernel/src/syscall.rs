@@ -2999,8 +2999,10 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
     /// prog_name 末段长度上限（超长拒绝，防注册表/日志被撑爆）。
     const PROG_NAME_MAX_LEN: usize = 63;
     /// 命令行缓冲容量。KM5：超出即 E2BIG 显式失败——静默截断会把被裁剪的
-    /// 命令行伪装成完整交付。
-    const CMD_BUF_BYTES: usize = 512;
+    /// 命令行伪装成完整交付。A11（owner 指令 2026-09-27）：512 → 4096
+    ///（与 PATH_MAX 同量级；内核栈 64KB 下 4KiB 栈缓冲安全）。真动态堆
+    /// 分配不做——spawn 热路径的栈缓冲简单性优先（S24）。
+    const CMD_BUF_BYTES: usize = 4096;
     if arg_len as usize > CMD_BUF_BYTES {
         return pack_err(Error::ArgListTooLong);
     }
@@ -4330,11 +4332,11 @@ fn sys_device_probe(frame: &mut SyscallFrame) -> u64 {
 /// 登记唯一等待者（同 KBD_WAITER 单读者仲裁，并发第二个等待者返回 WouldBlock）。
 fn sys_driver_event_next(frame: &mut SyscallFrame) -> DispatchResult {
     const MAX_EVENT_BYTES: usize = 512;
-    // 阻塞等待的超时上界（S31 对抗输入边界）：1 小时。设备事件等待是短时
-    // 驱动的（volumed 用 1s 周期对账）；超长 timeout 只会占住一个定时器槽
-    // 直到其远未来 deadline（且被 V2 提前返回/V3 被杀时取消），但对调用方
-    // 无真实收益，故显式拒绝，避免把 u64::MAX 之类对抗值当合法超时吞下。
-    const MAX_WAIT_TIMEOUT_NS: u64 = 3_600_000_000_000; // 1h
+    // 阻塞等待的超时上界（A10：1h 夹断删除，owner 指令 2026-09-27）。原
+    // 「超长 timeout 无真实收益」的理由不成立——无限等待是合法语义；占用的
+    // 定时器槽有完整回收闭环（到期自动 / 提前返回 / 被杀取消），无泄漏面。
+    // 定时器表本身有全局软闸（TIMER_SOFT_CAP，A3）。
+    const MAX_WAIT_TIMEOUT_NS: u64 = u64::MAX;
     let out_ptr = frame.a1;
     let cap = frame.a2 as usize;
     let timeout_ns = frame.a3;
@@ -4514,7 +4516,8 @@ fn sys_driver_unregister(frame: &mut SyscallFrame) -> u64 {
 ///
 /// 时钟未就绪/超时注册失败：如实退化（见下）。
 fn sys_driver_irq_wait(frame: &mut SyscallFrame) -> DispatchResult {
-    const MAX_WAIT_TIMEOUT_NS: u64 = 3_600_000_000_000; // 1h，同事件等待口径
+    // A10：同事件等待口径——1h 夹断删除（u64::MAX，回收闭环见上）。
+    const MAX_WAIT_TIMEOUT_NS: u64 = u64::MAX;
     if !current_has_cap(Caps::DEVICE) {
         return done(pack_err(Error::PermissionDenied));
     }
