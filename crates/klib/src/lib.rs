@@ -4,6 +4,11 @@
 
 #![no_std]
 
+// A3（定时器动态表）：klib 需要 alloc 容器（Vec）。no_std crate 无条件引
+// alloc：内核目标由 #[global_allocator]（本 crate allocator 模块）供给，
+// 宿主测试构建由 std 供给——alloc crate 不反向依赖 klib 模块，无循环（S13）。
+extern crate alloc;
+
 // 单测环境（std test harness）需要 std；no_std crate 需显式声明。
 #[cfg(test)]
 extern crate std;

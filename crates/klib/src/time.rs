@@ -162,8 +162,14 @@ pub fn read_cycle_counter() -> u64 {
 /// 定时器回调：`fn(arg: usize)`（`'static`，由注册方保证生命周期）。
 pub type TimerCallback = fn(arg: usize);
 
-/// 定时器表容量（无堆，静态定长）。
+/// 定时器表容量（A3 无限化改造，owner 指令 2026-09-27）：原静态定长 32 已
+/// 改为动态增长表；本常量语义升级为**全局软闸**（注册总数上限）——守住
+/// 「用户反复注册长超时定时器占堆」的 DoS 面（sync 等待超时是用户可控
+/// 注册路径），32 → 8192 为 256 倍扩展，实际等效无限；闸门拒绝仍是诚实
+/// None（调用方语义不变）。
 pub const MAX_TIMERS: usize = 32;
+/// 动态表的软闸容量（独立命名，见 MAX_TIMERS 注释）。
+pub const TIMER_SOFT_CAP: usize = 8192;
 
 /// 单个定时器槽：`deadline` 为到期时刻（纳秒时间线）。
 /// 三个字段均为原子，避免持有锁读；写入仅在锁内进行。
@@ -186,14 +192,15 @@ impl TimerSlot {
     }
 }
 
-/// 定时器表：静态槽位 + 单调递增 id。
+/// 定时器表：动态槽位（A3）+ 单调递增 id。空表起步，注册时增长（受
+/// TIMER_SOFT_CAP 软闸）；槽位永不物理删除（cancel 置空复用）。
 struct TimerTable {
-    slots: [TimerSlot; MAX_TIMERS],
+    slots: alloc::vec::Vec<TimerSlot>,
     next_id: u64,
 }
 
 static TIMER_TABLE: IrqSpinLock<TimerTable> = IrqSpinLock::new(TimerTable {
-    slots: [const { TimerSlot::empty() }; MAX_TIMERS],
+    slots: alloc::vec::Vec::new(),
     next_id: 1,
 });
 
@@ -209,10 +216,21 @@ pub fn set_timeout(delay_ns: u64, callback: TimerCallback, arg: usize) -> Option
     // clock_ready() 已保证注入时钟源。
     let deadline = now_nanos().expect("clock_ready checked").saturating_add(delay_ns);
     let mut table = TIMER_TABLE.lock();
-    let slot_index = table
+    let slot_index = match table
         .slots
         .iter()
-        .position(|slot| slot.callback.load(Ordering::Relaxed) == 0)?;
+        .position(|slot| slot.callback.load(Ordering::Relaxed) == 0)
+    {
+        Some(i) => i,
+        None => {
+            // A3：无空闲槽 → 增长表（软闸拒绝，语义与原表满一致：None）。
+            if table.slots.len() >= TIMER_SOFT_CAP {
+                return None;
+            }
+            table.slots.push(TimerSlot::empty());
+            table.slots.len() - 1
+        }
+    };
 
     // 0 始终表示“无 ID”；绕回时跳过它，确保 live ID 永不与空槽混淆。
     let id = table.next_id;
@@ -266,10 +284,10 @@ pub fn poll_timeouts() {
     }
     // clock_ready() 已保证注入时钟源。
     let now = now_nanos().expect("clock_ready checked");
-    // 收集到期槽（最多 MAX_TIMERS 个），按 deadline 升序排序后锁外执行回调。
-    let mut due = [0usize; MAX_TIMERS]; // callback 指针
-    let mut dl = [0u64; MAX_TIMERS];
-    let mut args = [0usize; MAX_TIMERS];
+    // 收集到期槽（A3：动态数量），按 deadline 升序排序后锁外执行回调。
+    let mut due: alloc::vec::Vec<usize> = alloc::vec::Vec::new(); // callback 指针
+    let mut dl: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    let mut args: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
     let mut n = 0usize;
     {
         let table = TIMER_TABLE.lock();
@@ -279,9 +297,9 @@ pub fn poll_timeouts() {
             }
             let deadline = slot.deadline.load(Ordering::Acquire);
             if deadline <= now {
-                due[n] = slot.callback.swap(0, Ordering::AcqRel);
-                dl[n] = deadline;
-                args[n] = slot.arg.load(Ordering::Relaxed);
+                due.push(slot.callback.swap(0, Ordering::AcqRel));
+                dl.push(deadline);
+                args.push(slot.arg.load(Ordering::Relaxed));
                 // poll 已认领回调；该 ID 从此不再可取消，也不会与后续重用槽位
                 // 的新定时器相混淆。
                 slot.id.store(0, Ordering::Relaxed);
@@ -504,16 +522,14 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
 
-        let mut ids = [0u64; MAX_TIMERS];
-        for id in &mut ids {
-            *id = set_timeout(1_000_000, cb_count, 0).expect("timer table slot");
+        // A3：动态表——注册 MAX_TIMERS*2 个（原定长 32 的 2 倍）全部成功；
+        // 取消任一个后立即可复用。
+        let count = MAX_TIMERS * 2;
+        let mut ids: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        for _ in 0..count {
+            ids.push(set_timeout(1_000_000, cb_count, 0).expect("timer table slot"));
         }
-        assert!(
-            set_timeout(1_000_000, cb_count, 0).is_none(),
-            "table must be full"
-        );
-
-        let released = ids[MAX_TIMERS / 2];
+        let released = ids[count / 2];
         assert!(
             cancel_timeout(released),
             "cancelling a live timer frees its slot"
@@ -538,12 +554,11 @@ mod tests {
     fn timer_table_full() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
-        for _ in 0..MAX_TIMERS {
+        // A3：动态表——MAX_TIMERS*2 注册全成功（不再有 32 上限拒绝）；到期
+        // 触发后槽位释放可再注册。
+        for _ in 0..(MAX_TIMERS * 2) {
             assert!(set_timeout(100_000, cb_count, 0).is_some()); // 100us
         }
-        // 表满：返回 None
-        assert!(set_timeout(100_000, cb_count, 0).is_none());
-        // 到期触发后槽位释放，可再注册
         FAKE_TICK.store(200, Ordering::Relaxed); // 200us
         poll_timeouts();
         assert!(set_timeout(100_000, cb_count, 0).is_some());
