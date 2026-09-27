@@ -1351,10 +1351,8 @@ fn sys_fstat(frame: &mut SyscallFrame) -> u64 {
 fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
     let old_fd = frame.a1 as usize;
     let new_fd = frame.a2 as usize;
-    // 目标 fd 槽位上限（与 Process::MAX_FDS 对齐，NA6 防无界扩展）。
-    if new_fd >= task::process::Process::<arch_x86_64::paging::X86PageTable>::MAX_FDS {
-        return pack_err(Error::NoSpace);
-    }
+    // A1 无限化：目标 fd 编号不再有单进程上限——表扩展受全局 fd 闸门约束，
+    // 拒绝语义（NoSpace）经 set_fd 返回（原入口 MAX_FDS 预检删除）。
     // 校验 old 存在并取得副本句柄（值拷贝，随后可释放 proc 借用做 ipc）。
     let old_handle = {
         let Some(proc) = current_proc_mut() else {
@@ -1370,12 +1368,16 @@ fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
     }
     // 副本是 pipe 端：递增引用计数（每个持有该 id 的 fd 记 1 ref）。
     // 用引用绑定取 id（Pipe 的 u64 是 Copy），不 move old_handle——它稍后
-    // 要整体 move 进 set_fd。
-    if let vfs::file_handle::OpenHandle::Pipe { id } = &old_handle {
+    // 要整体 move 进 set_fd。id 先存副本：set_fd 失败时 old_handle 已 move，
+    // 回滚需要这个 id（A1 闸门拒绝路径，S20）。
+    let old_pipe_id: Option<u64> = if let vfs::file_handle::OpenHandle::Pipe { id } = &old_handle {
         if ipc::pipe_ref_inc(*id).is_err() {
             return pack_err(Error::NoSpace);
         }
-    }
+        Some(*id)
+    } else {
+        None
+    };
     // 关 new 的旧句柄（若为 pipe 端递减引用）。
     if let Some(old) = { current_proc_mut().and_then(|p| p.close_fd(new_fd)) } {
         if let vfs::file_handle::OpenHandle::Pipe { id } = old {
@@ -1392,7 +1394,14 @@ fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
     };
     match proc.set_fd(new_fd, old_handle) {
         Ok(()) => pack_ok(new_fd as u64),
-        Err(_) => pack_err(Error::NoSpace),
+        Err(_) => {
+            // A1：set_fd 可因全局闸门拒绝（原入口预检已删）——pipe 引用
+            // 必须回滚，否则闸门拒绝路径泄漏 ref（S20）。
+            if let Some(id) = old_pipe_id {
+                let _ = ipc::pipe_ref_dec(id);
+            }
+            pack_err(Error::NoSpace)
+        }
     }
 }
 

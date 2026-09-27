@@ -6276,28 +6276,27 @@ pub fn test_syscall_memquery_and_stdin_busy() {
     task::scheduler::debug_release_console_waiter();
     task::scheduler::debug_clear_scheduler_current();
 
-    // ---- B21-2：fd 表达 MAX_FDS 后如实 NoSpace，绝不无界增长 ----
+    // ---- B21-2（A1 无限化后改述）：fd 表超过原 MAX_FDS=1024 继续分配成功
+    //（动态增长，受全局闸门约束；单测不触 65536 闸门以免吃满全局额度）。
+    // 关闭路径归还额度，账目收敛。
     {
         let p = task::current_proc_mut().expect("test proc");
-        let mut refused: Option<klib::error::Error> = None;
-        let mut granted = 0usize;
-        while granted <= Process::<X86PageTable>::MAX_FDS {
+        let mut granted: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        let target = Process::<X86PageTable>::MAX_FDS + 256;
+        for _ in 0..target {
             match p.alloc_fd(vfs::file_handle::OpenHandle::File(
                 vfs::stdio::stdout_handle(),
             )) {
-                Ok(_) => granted += 1,
+                Ok(fd) => granted.push(fd),
                 Err(e) => {
-                    refused = Some(e);
-                    break;
+                    panic!("fd table must grow past MAX_FDS now, got {:?} at {}", e, granted.len());
                 }
             }
         }
-        assert_eq!(
-            refused,
-            Some(klib::error::Error::NoSpace),
-            "fd table must refuse at MAX_FDS with NoSpace"
-        );
-        assert!(granted < Process::<X86PageTable>::MAX_FDS);
+        assert!(granted.len() > Process::<X86PageTable>::MAX_FDS);
+        for fd in granted {
+            let _ = p.close_fd(fd);
+        }
     }
 
     // 收尾：恢复 CR3 再销毁伪进程（同 usercopy 测试纪律）。

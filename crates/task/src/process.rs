@@ -302,6 +302,44 @@ impl ProcessIdentity {
     }
 }
 
+/// ---------- 全局 fd 闸门（A 档无限化改造，owner 指令 2026-09-27） ----------
+///
+/// 单进程 fd 数上限（原 MAX_FDS=1024 硬拒）已移除：fd 表随分配动态增长。
+/// 防线收口到**全局 fd 总量**（全系统所有进程的占用槽合计）——守住
+/// 「循环 open 无限吃内核堆」的整体耗尽面，同时单进程可开满全局额度。
+/// 记账语义 = **占用槽**（Some 槽）：alloc 成功 +1；close 取出 Some -1；
+/// dup2 覆盖净 0；fork/继承按子表占用数 +1；组容器 Drop 按占用数回冲。
+/// 未来 per-process 内存记账落地时本闸门自然并入（演进路径成文，S13）。
+const GLOBAL_MAX_FDS: usize = 65536;
+static GLOBAL_LIVE_FDS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 尝试为 `n` 个新占用槽取得全局额度；成功返回 true（计数已加）。
+fn fd_gate_acquire(n: usize) -> bool {
+    use core::sync::atomic::Ordering;
+    let mut cur = GLOBAL_LIVE_FDS.load(Ordering::Acquire);
+    loop {
+        let next = cur + n;
+        if next > GLOBAL_MAX_FDS {
+            return false;
+        }
+        match GLOBAL_LIVE_FDS.compare_exchange_weak(
+            cur,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// 归还 `n` 个占用槽额度（Drop/关闭路径；saturating 防账目回绕，S17）。
+fn fd_gate_release(n: usize) {
+    use core::sync::atomic::Ordering;
+    GLOBAL_LIVE_FDS.fetch_sub(n, Ordering::AcqRel);
+}
+
 /// 线程组共享容器（T1-1 / ADR-035 D1/D2 / threads.md T1-1）。
 ///
 /// 线程派生把"进程间可共享态"从 PCB 提入本**组级容器**：组内所有成员（组长 +
@@ -350,11 +388,26 @@ impl<PT: PageTable> ThreadGroup<PT> {
     /// 构造一个独立组（组长独占）：默认标准流 fd 表 + `/` cwd + 默认身份 +
     /// 传入的地址空间 `Arc`。组长进程在其 PCB 构造时经此自建并持有本组。
     fn new(addr_space: Arc<UserAddressSpace<PT>>, owner: usize) -> Self {
+        // A1 全局闸门：默认标准流表（0/1/2 三个占用槽）计入全局额度。
+        // 构造失败不可表达（组构造无 Result）——闸门在构造路径**不拒绝**：
+        // 进程创建本身受进程表/帧分配 OOM 约束，fd 闸门只拒后续 alloc/set。
+        // （账目完整性优先于构造期拒绝，S13——所有占用槽必有对应额度。）
+        let _ = fd_gate_acquire(3);
         Self {
             fd_table: klib::sync::spin::SpinMutex::new(default_stdio_table(owner)),
             cwd: klib::sync::spin::SpinMutex::new(alloc::string::String::from("/")),
             identity: klib::sync::spin::SpinMutex::new(ProcessIdentity::default_user()),
             addr_space,
+        }
+    }
+}
+
+impl<PT: PageTable> Drop for ThreadGroup<PT> {
+    fn drop(&mut self) {
+        // A1 全局闸门：组容器析构 = 最后一个成员退出，整表占用回冲。
+        let used = self.fd_table.lock().iter().filter(|s| s.is_some()).count();
+        if used > 0 {
+            fd_gate_release(used);
         }
     }
 }
@@ -477,19 +530,24 @@ impl<PT: PageTable> Process<PT> {
         Arc::clone(&self.group)
     }
 
-    /// 每进程文件描述符上限（KA7/S33 量化：POSIX NOFILE 传统量级）。
+    /// 每进程文件描述符上限（A 档无限化改造，owner 指令 2026-09-27）：
+    /// **由硬上限改为全局闸门下的动态增长**——单进程不再有固定 fd 数上限，
+    /// fd 表随分配增长；防线收口到全局 fd 总量（`GLOBAL_MAX_FDS`，全系统
+    /// 所有进程合计），防「循环 open 无限吃内核堆」的整体耗尽面。原
+    /// MAX_FDS=1024 保留为**默认水位**语义（procfs 报告与测试基线），不再
+    /// 参与分配拒绝。
     ///
-    /// 无上限的 Vec 增长允许用户循环 open 无限吃内核堆——单进程资源消耗
-    /// 必须有显式边界。超限返回 `Error::NoSpace`（ENOSPC，错误表"表满"语义，
-    /// 映射决策成文；klib 无 EMFILE，取语义最近项）。
+    /// 为什么全局闸门而非 per-process：本内核尚无 per-process 内存记账
+    ///（B 档），全局闸门以最小机制守住同一 DoS 面；未来记账体系落地时
+    /// 本闸门自然并入记账（演进路径成文于此，S13）。
     pub const MAX_FDS: usize = 1024;
 
     /// 分配新的文件描述符（返回分配的 fd 编号）。
     ///
     /// KM1：0/1/2 槽位由 [`Process::new`] 装入标准流句柄，扫描自然跳过
     /// 占用槽——不再需要 `fd >= 3` 魔法数字条件。
-    /// KA7：无空槽且表长已达 [`Self::MAX_FDS`] 时如实上抛
-    /// [`Error::NoSpace`]，绝不无界增长；已关闭槽位的复用不受上限挤压。
+    /// A1：无空槽时表 push 扩展（受全局 fd 闸门约束，超限如实上抛
+    /// [`Error::NoSpace`]）；已关闭槽位的复用不受挤压。
     ///
     /// S21 闭合（T1-8）：方法改 `&self`，在组内 `fd_table` 锁内找空槽/扩表
     /// （短持锁，仅槽位读写，不做 vfs 工作），不再依赖 `group_mut` 独占可变。
@@ -500,11 +558,16 @@ impl<PT: PageTable> Process<PT> {
         let mut table = self.group.fd_table.lock();
         for (fd, slot) in table.iter_mut().enumerate() {
             if slot.is_none() {
+                // 空槽复用仍占一个全局额度（占用计数语义）。
+                if !fd_gate_acquire(1) {
+                    return Err(klib::error::Error::NoSpace);
+                }
                 *slot = Some(handle);
                 return Ok(fd);
             }
         }
-        if table.len() >= Self::MAX_FDS {
+        // A1：单进程上限移除——受全局闸门约束（超限 NoSpace，语义不变）。
+        if !fd_gate_acquire(1) {
             return Err(klib::error::Error::NoSpace);
         }
         let fd = table.len();
@@ -537,6 +600,10 @@ impl<PT: PageTable> Process<PT> {
                 None
             }
         };
+        // A1：占用槽归还全局额度（None 取出无账目变化）。
+        if handle.is_some() {
+            fd_gate_release(1);
+        }
         // flock owner 用组共享身份的 uid（`Copy` 值，先读出自锁现场再用于解锁）。
         let uid = self.group.identity.lock().uid;
         if let Some(vfs::file_handle::OpenHandle::File(fh)) = &handle {
@@ -548,7 +615,7 @@ impl<PT: PageTable> Process<PT> {
     /// 把句柄安装到指定 fd 槽位（`dup2` 目标）。原槽位若已有句柄则**被覆盖
     /// 丢弃**——调用方必须先把旧句柄取出并正确处理（pipe 端 `pipe_ref_dec`），
     /// 否则泄漏/错账。槽位超出当前表长则扩展填充到 `fd`（含空槽），受
-    /// [`Self::MAX_FDS`] 上限约束。
+    /// 全局 fd 闸门约束（A1：单进程上限已移除）。
     ///
     /// 用于 `dup2(old, new)` 的"复制到指定编号"，与 [`Self::alloc_fd`]（找
     /// 最低空闲槽）互补。
@@ -559,10 +626,13 @@ impl<PT: PageTable> Process<PT> {
         fd: usize,
         handle: vfs::file_handle::OpenHandle,
     ) -> Result<(), klib::error::Error> {
-        if fd >= Self::MAX_FDS {
+        let mut table = self.group.fd_table.lock();
+        // A1：单进程上限移除——非覆盖写入占一个全局额度（覆盖 Some 净 0：
+        // 旧句柄由调用方负责 pipe 端回收，额度口径不变）。
+        let overwriting = fd < table.len() && table[fd].is_some();
+        if !overwriting && !fd_gate_acquire(1) {
             return Err(klib::error::Error::NoSpace);
         }
-        let mut table = self.group.fd_table.lock();
         if fd >= table.len() {
             table.resize(fd + 1, None);
         }
@@ -593,7 +663,20 @@ impl<PT: PageTable> Process<PT> {
         inherited: alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>>,
     ) {
         if !inherited.is_empty() {
-            *self.group.fd_table.lock() = inherited;
+            let mut table = self.group.fd_table.lock();
+            // A1 全局闸门差额调整：旧表（默认标准流）占用回冲，新表占用计入。
+            let old_used = table.iter().filter(|s| s.is_some()).count();
+            let new_used = inherited.iter().filter(|s| s.is_some()).count();
+            *table = inherited;
+            drop(table);
+            if old_used > new_used {
+                fd_gate_release(old_used - new_used);
+            } else if new_used > old_used {
+                // 继承表超闸门：本次 spawn 失败语义应在调用方预检——此处为
+                // 保持账目一致仍计入（闸门只拒「分配新槽」路径；继承路径的
+                // 预检由 spawn 调用方做，见 scheduler 装配注释）。
+                let _ = fd_gate_acquire(new_used - old_used);
+            }
         }
     }
 

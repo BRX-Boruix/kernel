@@ -655,8 +655,8 @@ unsafe fn kmain_body() -> ! {
     }
 
     // 审计 B14/B21：SYS_MEMORY_QUERY 全链路覆盖 + stdin Busy→EAGAIN 语义 +
-    // fd 表 MAX_FDS 上限拒绝。（必须在 stdio 接线之后：B21 臂依赖真实的
-    // stdin 源——接线前 StdinNode 读路径如实 NotSupported。）
+    // fd 表动态增长验证（A1：超 MAX_FDS 继续成功）。（必须在 stdio 接线之后：
+    // B21 臂依赖真实的 stdin 源——接线前 StdinNode 读路径如实 NotSupported。）
     #[cfg(feature = "kernel-tests")]
     tests::test_syscall_memquery_and_stdin_busy();
 
