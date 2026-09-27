@@ -200,9 +200,40 @@ fn notify_data_ready() {
     }
 }
 
-/// console 实例总数（ADR-048 §3.2：N=4——够用且可枚举；实例 0 为既有
- /// 单终端的兼容形态，1..N-1 在 T2/T4 接上焦点路由与守护前只是存在的设备）。
-pub const CONSOLES_N: usize = 4;
+/// console 实例总数（ADR-048 §3.2 + 扩展 E1，owner 指令 2026-09-27）：
+/// 构建期经 `BORUIX_CONSOLES_N` 注入（vfs/build.rs，默认 4、钳 1..=256）。
+/// 实例 0 为既有单终端的兼容形态（别名 + 恒焦点兼容）；1..N-1 自 T5 起
+/// 由 init 按激活数提供守护与 getty 轮转。为什么不做成运行期可变：devfs
+/// 挂载发生在内核启动极早期（vfs_init），彼时无用户态、无配置文件、无
+/// cmdline——「运行期改实例数」在启动序列上是伪需求（S09 如实）；构建期
+/// 注入与 init 的 BORUIX_INIT_ARGS 同款先例（S13 同一手法的第二次使用）。
+pub const CONSOLES_N: usize = match option_env!("BORUIX_CONSOLES_N") {
+    Some(s) => match const_parse_usize(s) {
+        Some(n) if n >= 1 && n <= 256 => n,
+        _ => 4,
+    },
+    None => 4,
+};
+
+/// const 上下文的十进制解析（build.rs 已钳位，此处为防御性二次钳——
+/// option_env 直改产物时仍不失安全，S17）。
+const fn const_parse_usize(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut n: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c < b'0' || c > b'9' {
+            return None;
+        }
+        n = n * 10 + (c - b'0') as usize;
+        i += 1;
+    }
+    Some(n)
+}
 
 // ---------- 内核侧单例访问（I-EVENTS P4 单径切换，§6.15） ----------
 
