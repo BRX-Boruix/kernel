@@ -14041,21 +14041,24 @@ pub fn test_drv1_remediation() {
             ..fill_dev_info(name)
         })
     };
-    for i in 0..70u32 {
+    // A7：容量 64 → 512 后注入「容量 + 6」个事件（恰 6 次丢弃，账目语义不变）。
+    let cap = driver::event::EVENT_QUEUE_CAPACITY;
+    let total = (cap + 6) as u32;
+    for i in 0..total {
         let name: &'static str = if i % 2 == 0 { "drv1-evt-a" } else { "drv1-evt-b" };
         driver::publish_event(mk(name));
     }
     let dropped_delta = driver::dropped_event_count() - dropped_before;
     assert_eq!(
         dropped_delta, 6,
-        "70 events into a 64-slot ring must account exactly 6 drops"
+        "cap+6 events into the ring must account exactly 6 drops"
     );
-    assert_eq!(driver::pending_event_count(), 64);
+    assert_eq!(driver::pending_event_count(), cap);
     let mut popped = 0;
     while driver::pop_event().is_some() {
         popped += 1;
     }
-    assert_eq!(popped, 64);
+    assert_eq!(popped, cap);
     info!("[test-drv1] DM4 event ring drop accounting OK");
 
     // ---- 7. DA2 后置条件：当前环境 ATA 盘容量不超 LBA28 域 ----
@@ -14388,14 +14391,18 @@ pub fn test_sync_syscalls() {
     assert!(crate::syscall::syscall_entry(&mut k4));
     assert_eq!(k4.result, nf, "wake on deleted id → NotFound");
 
-    // ---- 10. 超时参数越界 → InvalidParam ----
+    // ---- 10（A10 改述）：超时不再有 1h 夹断——合法超时透传（u64 ns 全域）。
+    // 运行期不再构造真实大超时等待（会真阻塞测试），改为断言语义常量：
+    // SYNC_MAX_WAIT_TIMEOUT_NS == u64::MAX（无限等待合法）。
     let mut c2 = frame(crate::syscall::SYS_SYNC_CREATE, 0, 0, 0);
     assert!(crate::syscall::syscall_entry(&mut c2));
     let id2 = c2.result;
     let ip = (Error::InvalidParam.to_errno() as i64).wrapping_neg() as u64;
-    let mut w5 = frame(crate::syscall::SYS_SYNC_WAIT, id2, 0, 3_700_000_000_000); // >1h
-    assert!(crate::syscall::syscall_entry(&mut w5));
-    assert_eq!(w5.result, ip, "timeout beyond bound → InvalidParam");
+    assert_eq!(
+        ipc::SYNC_MAX_WAIT_TIMEOUT_NS,
+        u64::MAX,
+        "A10: wait timeout clamp removed (u64::MAX = unlimited)"
+    );
 
     // ---- 11. bit63 值域约束（S09/S31）：CREATE init_value bit63 置位 → InvalidParam ----
     let mut c3 = frame(crate::syscall::SYS_SYNC_CREATE, 1 << 63, 0, 0);

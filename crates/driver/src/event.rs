@@ -39,7 +39,10 @@ pub enum DeviceEvent {
 /// 栈/静态占用量可忽略。事件是 fire-and-forget 日志语义，超容量时淘汰最旧并
 /// 经 [`dropped_event_count`] 留下可观测账目（AM4 纪律），故容量不追求"永不
 /// 满"——真实热插拔高频源接入时按实测扩容量并保持丢弃账目即可。
-pub const EVENT_QUEUE_CAPACITY: usize = 64;
+/// A7（A 档放大，owner 指令 2026-09-27）：64 → 512。有损遥测环语义不变
+/// （满淘汰最旧 + 丢弃账目）——本常量不是资源上限而是环容量，无限化不成立
+/// （无界内存），按实测放大降低高频源丢弃概率。
+pub const EVENT_QUEUE_CAPACITY: usize = 512;
 
 /// 因队列满而被淘汰的最旧事件累计数（单调递增）。
 ///
