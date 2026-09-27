@@ -9,16 +9,16 @@ use spin::RwLock;
 
 use crate::inode::{AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
 
-/// 单文件最大字节数（KA7/S33 量化：RamFS 内容驻留内核堆，单进程经
-/// SYS_ENTRY_WRITE 循环扩写即可无界吃堆——8MiB 覆盖全部现存用户程序与
-/// 测试产物，同时把"一个文件拖垮内核内存"变成显式 ENOSPC）。超限返回
-/// [`Error::NoSpace`]。
-pub const RAMFS_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// 单文件最大字节数（A8 放大 8MiB → 64MiB，owner 指令 2026-09-27）。
+/// 保留闸门的理由（S17）：RamFS 内容驻留内核堆，无 per-process 记账时
+/// 「单文件独占堆」的唯一防线是本闸 + 水位钩子（后者是最终防线，前者挡
+/// 单点独占）；64MiB 与单次拷贝上限（MAX_SYSCALL_BUF_BYTES）同量级对齐。
+/// 超 ENOSPC 语义不变。
+pub const RAMFS_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// 单目录最大条目数（KA7/S33：create/mkdir/symlink 无配额时用户可无限
-/// 创建目录项。4096 条 × 目录项开销 ≈ 数百 KiB 堆，边界明确且远超正常
-/// 用量）。超限返回 [`Error::NoSpace`]。
-pub const RAMFS_MAX_ENTRIES_PER_DIR: usize = 4096;
+/// 单目录最大条目数（A8 放大 4096 → 65536，owner 指令 2026-09-27）。
+/// 保留闸门理由同上（防无配额时的条目表无界增长）；65536 条 ≈ 数 MiB 堆。
+pub const RAMFS_MAX_ENTRIES_PER_DIR: usize = 65536;
 
 /// 水位咨询阈值（D4/ADR-023 §7）：单次增长达到该字节数才向内存水位
 /// 钩子咨询。低于它的增长即使堆紧张也由 try_reserve 兜底——逐字节写
