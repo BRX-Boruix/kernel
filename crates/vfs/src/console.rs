@@ -287,6 +287,15 @@ pub fn input_peek() -> Option<u8> {
 pub struct ConsoleNode {
     ring: Arc<ConsoleRing>,
     children: DynamicDirNode,
+    /// 本实例 id（ADR-048 决策 4/T5-b：写路径焦点过滤的判定本体——
+    /// 「本实例此刻是否焦点」与 FOCUS_INSTANCE 对拍；id 由挂载方显式传入，
+    /// 构造后不变）。
+    instance_id: usize,
+    /// 因「本实例非焦点」被拒的字节计数（status 遥测 `focus_dropped`）。
+    /// 与环满 `dropped` **分列**（S09：丢的原因不同，账必须分开——混列会让
+    /// 「消费者太慢」与「焦点在别处」在遥测上不可区分）。Arc 共享：status
+    /// 生成器闭包持有同一计数器（与 status_ring 同型共享形态）。
+    focus_dropped: Arc<AtomicU64>,
 }
 
 impl ConsoleNode {
@@ -304,6 +313,8 @@ impl ConsoleNode {
     pub fn new_instance(id: usize) -> Self {
         let ring = Arc::new(ConsoleRing::new());
         let children = DynamicDirNode::new();
+        let focus_dropped = Arc::new(AtomicU64::new(0));
+        let status_focus_dropped = focus_dropped.clone();
         let status_ring = ring.clone();
         let status_node = DynamicFileNode::read_only(move || {
             let (wp, rp, dropped, writes) = status_ring.snapshot();
@@ -316,6 +327,10 @@ impl ConsoleNode {
                 let _ = obj.field_u64("dropped", dropped);
                 let _ = obj.field_u64("writes", writes);
                 let _ = obj.field_u64("capacity", CONSOLE_RING_CAPACITY as u64);
+                let _ = obj.field_u64(
+                    "focus_dropped",
+                    status_focus_dropped.load(Ordering::Relaxed),
+                );
                 let _ = obj.end();
             }
             let mut bytes = target.into_bytes();
@@ -327,7 +342,7 @@ impl ConsoleNode {
         // （T2 恒 0）读到它，单会话行为与改造前一致。先于 start_init 完成
         // （devfs 挂载在内核启动期，早于任何用户态 stdin 读）。
         register_instance(id, ring.clone());
-        Self { ring, children }
+        Self { ring, children, instance_id: id, focus_dropped }
     }
 }
 
@@ -340,8 +355,23 @@ impl INode for ConsoleNode {
 
     /// consoled 写入字节。**忽略 offset**（字节流无定位语义——终端不是
     /// 随机访问设备）。环满短写 + dropped 计数（理由见模块文档）。
+    ///
+    /// **焦点过滤（ADR-048 T5-b，owner 裁决 B）**：本实例非焦点 → 字节
+    /// **不入环**，返回 `Ok(0)` + `focus_dropped` 计数。形态依据（S09/S20）：
+    /// consoled 既有策略是「`write` 返回 n < len（含 0）→ 丢剩余 + 自身
+    /// 计数、绝不重试」——非焦点拒绝与环满**同为短写**，consoled 零改动
+    /// 即正确运行；焦点切回后下一批事件自然送达，无需状态修复。焦点丢弃
+    /// 与环满丢弃**分列记账**（`focus_dropped` vs 环 `dropped`）——混列会让
+    /// 「消费者太慢」与「焦点在别处」在遥测上不可区分（S09）。
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, Error> {
         if buf.is_empty() {
+            return Ok(0);
+        }
+        // 焦点过滤：owner==0（无主期）恒焦点实例 0（决策 3 兼容现状——
+        // login 前的单终端形态与今天一致）；owner>0 时按 FOCUS_INSTANCE 对拍。
+        if self.instance_id != focus_instance() {
+            self.focus_dropped
+                .fetch_add(buf.len() as u64, Ordering::Relaxed);
             return Ok(0);
         }
         let n = self.ring.write(buf);
