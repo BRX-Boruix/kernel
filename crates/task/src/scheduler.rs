@@ -4097,8 +4097,10 @@ pub fn process_snapshots() -> Vec<vfs::ProcessSnapshot> {
 /// 去重策略：以小容量的定长数组收集（uid 空间在单机实际使用中远小于该上限），避免
 /// 引入 `BTreeMap` 分配；超过上限时**如实截断并报告**，不静默丢弃（S09）。
 pub fn active_user_snapshots() -> vfs::ActiveUserView {
-    /// 视图上限。现实单机同时活跃的 uid 数远小于此；超出则如实标记截断。
-    const MAX_ACTIVE_USERS: usize = 64;
+    /// 视图上限（A9 放大 64 → 4096，owner 指令 2026-09-27）：进程数本身无
+    /// 上限（B1），视图截断会漏报活跃用户；4096 与全局 fd 闸同量级，纯理论
+    /// 之外的截断如实标记（S09）。
+    const MAX_ACTIVE_USERS: usize = 4096;
     let mut out: alloc::vec::Vec<vfs::UserSnapshot> = alloc::vec::Vec::new();
     let mut truncated = false;
     for bucket in PROCESSES.iter() {
