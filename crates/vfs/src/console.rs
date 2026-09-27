@@ -172,6 +172,7 @@ impl ConsoleRing {
 
 // ---------- 数据到达回调（audio::AUDIO_WAKE_HOOK 同构，S28） ----------
 
+use spin::Mutex;
 use spin::Once;
 
 /// 数据到达回调槽（`Once`：系统只有一个 console 节点）。
@@ -205,38 +206,73 @@ pub const CONSOLES_N: usize = 4;
 
 // ---------- 内核侧单例访问（I-EVENTS P4 单径切换，§6.15） ----------
 
-/// 全系统唯一的 console 环句柄（`ConsoleNode::new` 注册；系统只有一个
-/// console 设备——`Once` 与 `CONSOLE_WAKE_HOOK` 同型）。
+/// console 实例环登记表（ADR-048 决策 2，T2：环实例化）。
+///
+/// 由 devfs 挂载期 `register_instance` 填充（启动期单线程写，此后只读——
+/// 用 `Mutex<Vec>` 而非 `Once`：实例族有 N 个成员，注册时机彼此独立；
+/// 运行期不再增删，读路径走 `instance_ring` 的表扫描）。
 ///
 /// **谁是合法读者**：内核 `stdin_source`（fd 0 的字节源）——P4 切换后
-/// stdin 的取字路径与 consoled 的写入路径在此环上配对，**同一真值源**
-/// （S13/S15：与 `/devices/console` 节点读写、status 遥测共用一个环，
-/// 绝不另设第二字节通道）。
-static CONSOLE_RING: Once<Arc<ConsoleRing>> = Once::new();
+/// stdin 的取字路径与 consoled 的写入路径在环上配对，**同一真值源**
+/// （S13/S15：与节点读写、status 遥测共用一个环，绝不另设第二字节通道）。
+static INSTANCE_RINGS: Mutex<Vec<(usize, Arc<ConsoleRing>)>> =
+    Mutex::new(Vec::new());
 
-/// 注册单例环（`ConsoleNode::new` 调用一次；重复注册不覆盖）。
-fn register_ring(ring: Arc<ConsoleRing>) {
-    CONSOLE_RING.call_once(|| ring);
+/// 焦点实例 id（ADR-048 决策 3：owner==0 → 焦点恒实例 0——T2 阶段无
+/// owner 移交（T3 落地），故本值恒 0 = **单会话行为与改造前完全一致**
+/// （零回归判据的本体）。T3 的移交路径写本值；AtomicUsize 保证跨核
+/// 读改的原子性（焦点切换是运行期动作，与启动期注册不同）。
+static FOCUS_INSTANCE: AtomicUsize = AtomicUsize::new(0);
+
+/// 登记实例环（devfs 挂载期调用；同 id 重复登记 = bug，忽略并保持首个
+/// ——与旧 `call_once` 的「首注册赢」语义一致，S17）。
+fn register_instance(id: usize, ring: Arc<ConsoleRing>) {
+    let mut t = INSTANCE_RINGS.lock();
+    if t.iter().any(|(i, _)| *i == id) {
+        return;
+    }
+    t.push((id, ring));
 }
 
-/// 返回单例环句柄（未注册时 `None`——devfs 尚未挂载 console 的启动极早期）。
+/// 按实例 id 取环句柄（未登记时 `None`——devfs 尚未挂载的启动极早期）。
+pub fn instance_ring(id: usize) -> Option<Arc<ConsoleRing>> {
+    INSTANCE_RINGS.lock().iter().find(|(i, _)| *i == id).map(|(_, r)| r.clone())
+}
+
+/// **焦点实例**的环句柄——stdin 真值链的真值源（ADR-048 决策 3：
+/// owner 即焦点；owner==0 恒焦点 0）。T2 阶段 FOCUS 恒 0。
 pub fn console_ring() -> Option<Arc<ConsoleRing>> {
-    CONSOLE_RING.get().cloned()
+    instance_ring(FOCUS_INSTANCE.load(Ordering::Acquire))
+}
+
+/// 焦点实例切换（T3 owner 移交路径调用；越界 id 如实拒绝——S17 安全侧：
+/// 焦点永远只能落在**存在**的实例上，绝不静默夹取）。
+pub fn set_focus_instance(id: usize) -> Result<(), Error> {
+    if instance_ring(id).is_none() {
+        return Err(Error::InvalidParam);
+    }
+    FOCUS_INSTANCE.store(id, Ordering::Release);
+    Ok(())
+}
+
+/// 焦点实例 id（诊断/遥测观察口；T3 后与 owner 移交对账）。
+pub fn focus_instance() -> usize {
+    FOCUS_INSTANCE.load(Ordering::Acquire)
 }
 
 /// stdin 字节取走路径（内核 `stdin_source` 委派）：取走至多 `buf.len()`
 /// 字节，空环 0（StdinNode 层照旧转 WouldBlock）。未注册时 0（S17：
-/// 早期无环 = 暂无输入，不是错误）。
+/// 早期无环 = 暂无输入，不是错误）。读**焦点实例**（T2 恒 0）。
 pub fn input_read(buf: &mut [u8]) -> usize {
-    match CONSOLE_RING.get() {
+    match console_ring() {
         Some(r) => r.read(buf),
         None => 0,
     }
 }
 
-/// stdin 非消费预览路径（内核 `stdin_peek` 委派，§6.12.5）。
+/// stdin 非消费预览路径（内核 `stdin_peek` 委派，§6.12.5）。读焦点实例。
 pub fn input_peek() -> Option<u8> {
-    CONSOLE_RING.get().and_then(|r| r.peek())
+    console_ring().and_then(|r| r.peek())
 }
 
 // ---------- 节点 ----------
@@ -254,17 +290,18 @@ pub struct ConsoleNode {
 }
 
 impl ConsoleNode {
-    /// 实例 0（兼容别名 `/devices/console`）：**注册** stdin 单例环——
+    /// 实例 0（兼容别名 `/devices/console`）：注册 + 焦点真值不变——
     /// 行为与多终端改造前完全一致（ADR-048 T1：单会话回归零变化判据）。
     pub fn new() -> Self {
-        Self::new_instance(true)
+        Self::new_instance(0)
     }
 
-    /// 通用实例构造（ADR-048 决策 1/2）：`register_stdin=true` 仅实例 0 使用
-    ///（stdin 单例真值链不变）；实例 1..N-1 传 false——独立环、不触全局
-    /// 注册（在 T2 接焦点路由前，这些实例只是「存在的设备」，无读者/写者，
-    /// 纯新增零回归面）。
-    pub fn new_instance(register_stdin: bool) -> Self {
+    /// 通用实例构造（ADR-048 决策 1/2）：`id` 由**挂载方显式传入**（devfs
+    /// 知道自己在挂哪一号——实例 id 是路径形状的一部分，绝不靠构造顺序
+    /// 隐式推导，S09）。每实例独立环；登记进实例表（T2：registry 是完备
+    /// 真值，T3 焦点切换按 id 找环）。stdin 真值链读 FOCUS_INSTANCE
+    /// （T2 恒 0，行为与改造前一致；零回归判据本体）。
+    pub fn new_instance(id: usize) -> Self {
         let ring = Arc::new(ConsoleRing::new());
         let children = DynamicDirNode::new();
         let status_ring = ring.clone();
@@ -286,12 +323,10 @@ impl ConsoleNode {
             bytes
         });
         children.add_child("status", Arc::new(status_node));
-        // P4 单径切换（仅实例 0）：把环登记为内核 stdin 源的单例句柄（先于
-        // start_init 完成——devfs 挂载在内核启动期，早于任何用户态 stdin 读）。
-        // 实例 1..N-1 不注册（ADR-048 T1：它们尚无读者；T2 接焦点路由）。
-        if register_stdin {
-            register_ring(ring.clone());
-        }
+        // P4 单径切换：把环登记进实例表——stdin 真值链经 FOCUS_INSTANCE
+        // （T2 恒 0）读到它，单会话行为与改造前一致。先于 start_init 完成
+        // （devfs 挂载在内核启动期，早于任何用户态 stdin 读）。
+        register_instance(id, ring.clone());
         Self { ring, children }
     }
 }

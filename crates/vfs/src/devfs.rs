@@ -650,7 +650,7 @@ impl DevFS {
             let name: alloc::string::String = alloc::format!("{}", i);
             consoles_dir.add_child(
                 name.as_str(),
-                Arc::new(crate::console::ConsoleNode::new_instance(false)),
+                Arc::new(crate::console::ConsoleNode::new_instance(i)),
             );
         }
         root.add_child("consoles", consoles_dir);
