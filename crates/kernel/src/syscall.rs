@@ -168,6 +168,15 @@ pub const SYS_STREAM_LOCK: u32 = nr(domain::STREAM, 0x06); // 0x16
 /// STREAM 域扩展动词：fstat（按 fd 读元数据，ADR-014 第二原语）。
 /// a1=fd, a2=out_buf_ptr（收 `vfs::inode::StatInfo` 完整定长结构）。
 pub const SYS_STREAM_FSTAT: u32 = nr(domain::STREAM, 0x07); // 0x17
+/// STREAM 域扩展动词：焦点实例切换（ADR-048 T3，owner 裁决 α 2026-09-27：
+/// 受控例外形状 = audio attach 同款「独立域动词 + 能力门禁」；ADR-044
+/// 「不新增 syscall」红线按本意澄清——防的是无序动词蔓延破坏单径事件链，
+/// 域内受控子动作 ≠ 新 syscall；ADR-014 §4.1 动词表随本动词同步修订）。
+/// a1=实例 id（0..CONSOLES_N-1）。**门禁在 syscall 层**（`current_has_cap`）：
+/// VFS 节点层 `write_at` 无调用者身份，焦点切换若落在节点层 = 任意进程
+/// 终端劫持面（S17/S20）；语义 = tcsetpgrp/TIOCSPGRP 的本域同构（权限
+/// 判定在有 caller 身份的内核边界，机制内核、策略用户态）。
+pub const SYS_STREAM_FOCUS_SET: u32 = nr(domain::STREAM, 0x08); // 0x18
 
 /// STREAM read/write 的顺序 I/O 哨兵值。
 ///
@@ -1250,6 +1259,38 @@ fn sys_flock(frame: &mut SyscallFrame) -> u64 {
             pack_ok(0)
         }
         _ => pack_err(Error::InvalidParam),
+    }
+}
+
+/// 焦点实例切换（SYS_STREAM_FOCUS_SET，ADR-048 T3，owner 裁决 α）：
+/// a1 = 目标实例 id。**门禁先行**（audio attach 同款纪律：先权限后解析，
+/// 防止非特权调用者从返回码差异探测实例存在性——信息泄露）：非
+/// CAP_SYSTEM → EACCES + 日志留痕；实例不存在 → InvalidParam（越界
+/// 如实拒绝，绝不静默夹取，S17）；成功 → 返回 0 并留痕（审计可查谁
+/// 何时切了焦点——终端语义下这是可观测的用户可见动作）。
+///
+/// 内核对 console 保持零知识 + 一致性判定：本函数不碰字节、不碰环，
+/// 只把「焦点真值」改写到 VFS 层单点（`vfs::console::set_focus_instance`，
+/// T2 落的 registry 真值），stdin 真值链（input_read/input_peek）随之
+/// 自然改道——单一事实源，无第二通道（S13/S15）。
+fn sys_stream_focus_set(frame: &mut SyscallFrame) -> u64 {
+    if !current_has_cap(Caps::SYSTEM) {
+        let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+        klib::info!("[console] pid={} FOCUS_SET denied (no CAP_SYSTEM)", pid);
+        return pack_err(Error::PermissionDenied);
+    }
+    let instance = frame.a1 as usize;
+    match vfs::console::set_focus_instance(instance) {
+        Ok(()) => {
+            let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+            klib::info!("[console] pid={} focus -> instance {}", pid, instance);
+            pack_ok(0)
+        }
+        Err(e) => {
+            let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
+            klib::info!("[console] pid={} FOCUS_SET instance={} rejected: {:?}", pid, instance, e);
+            pack_err(e)
+        }
     }
 }
 
@@ -4883,6 +4924,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_STREAM_DUP => done(sys_dup2(frame)),
         SYS_STREAM_LOCK => done(sys_flock(frame)),
         SYS_STREAM_FSTAT => done(sys_fstat(frame)),
+        SYS_STREAM_FOCUS_SET => done(sys_stream_focus_set(frame)),
 
         // MEMORY Domain (0x20)
         SYS_MEMORY_MAP => done(sys_mmap(frame)),

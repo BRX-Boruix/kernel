@@ -27,7 +27,7 @@ pub mod stream;
 pub mod sysfs;
 
 pub use audio::{AudioRing, DspNode, WriteGate, AUDIO_RING_CAPACITY, AUDIO_STREAM_COUNT};
-pub use console::{set_wake_hook, ConsoleNode, CONSOLE_RING_CAPACITY};
+pub use console::{set_focus_instance, set_wake_hook, ConsoleNode, CONSOLES_N, CONSOLE_RING_CAPACITY};
 pub use devfs::{DevFS, DeviceInfo, DeviceInfoProvider};
 pub use dynamic::{DynamicDirNode, DynamicFileNode};
 pub use file_handle::{
