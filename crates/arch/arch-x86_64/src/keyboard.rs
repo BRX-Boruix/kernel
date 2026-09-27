@@ -323,7 +323,7 @@ pub fn pop_event(out: &mut [u8]) -> bool {
 // `EVQ_WRITE` 的 Release 存储可见，Acquire 配对后槽内容必然完整）。
 
 /// wrapping 序比较：`x` 是否落在 `[lo, hi)` 内（三值同一单调域；域跨度
-/// 远小于 2^63——环深 128，游标差不可能进入高位歧义区）。
+/// 远小于 2^63——环深 1024，游标差不可能进入高位歧义区）。
 fn evq_in_range(x: u64, lo: u64, hi: u64) -> bool {
     let dx = x.wrapping_sub(lo);
     let dh = hi.wrapping_sub(lo);
@@ -424,6 +424,13 @@ pub fn has_event() -> bool {
 
 /// IRQ1 键盘中断：读扫描码、处理 `0xE0` 扩展前缀、译码并压入缓冲。
 pub extern "C" fn irq1_handler(_irq: u8) -> bool {
+    // 幻中断防御（S20）：IRQ1 触发但输出缓冲空——spurious/毛刺/已被初始化
+    // 轮询路径读走。此时 inb(DATA_PORT) 读回的是**垃圾**（总线浮空值 0xFF 或
+    // 上一次残留），被当键码投递即成「幻键」。只有 OBF=1 才读；空 = 直接 EOI。
+    if inb(CMD_PORT) & STATUS_OUTPUT_FULL == 0 {
+        crate::lapic::end_of_interrupt();
+        return true;
+    }
     // 读数据端口（清中断挂起）。
     let scancode = inb(DATA_PORT);
 
@@ -464,6 +471,18 @@ pub extern "C" fn irq1_handler(_irq: u8) -> bool {
 /// 返回是否成功（键盘自检通过）。须在中断已配置（IDT 加载）、外部中断
 /// 路由就绪后调用。
 pub fn init() -> bool {
+    // 0. 先挂 IRQ1 handler（早于任何使能 8042 IRQ 线的动作）。
+    //    顺序依据（S20 失败模式先行）：若先 write_cfg 置 CFG_IRQ_ENABLE 再
+    //    register_irq，两步之间（切码集 + 开扫描的三轮命令往返，毫秒级）
+    //    到达的按键会触发**无 handler 的 IRQ1**——中断丢失或落进默认矢量；
+    //    且初始化轮询读与中断读竞争 0x60，按键/ACK 互吞（S20 最忌形态）。
+    //    handler 先在位，之后无论何时开 IRQ 线都安全。注册失败 = 无键盘，
+    //    如实失败退出（后续 write_cfg 不再使能 IRQ，绝不带病上岗）。
+    if !interrupts::register_irq(1, irq1_handler) {
+        klib::info!("[kbd] failed to register IRQ1 handler");
+        return false;
+    }
+
     // 1. 8042 自检。
     wait_input_empty();
     outb(CMD_PORT, CMD_SELF_TEST);
@@ -475,7 +494,9 @@ pub fn init() -> bool {
         return false;
     }
 
-    // 2. 使能键盘 IRQ（**关闭**扫描码翻译）。事件记录投递的是 Set 1 原始键码；
+    // 2. 配置控制器：**关闭**扫描码翻译；**此刻不使能 IRQ**——切码集/开扫描
+    //    的命令往返全程靠轮询（wait_output_full），IRQ 线未开则无竞争读
+    //    （S20：轮询与中断抢 0x60 会互吞字节）。事件记录投递 Set 1 原始键码；
     //    开启 8042 的 Set2→Set1 翻译会让 backspace(Set2 0x66) 等码在翻译环节被
     //    丢弃（翻译表无对应项），导致删除键收不到扫描码。故关闭翻译，并随后把
     //    键盘切到 Set 1，使所有键（含 backspace 0x0e）直通。
@@ -483,7 +504,6 @@ pub fn init() -> bool {
         klib::info!("[kbd] config byte read timed out");
         return false;
     };
-    cfg |= CFG_IRQ_ENABLE;
     cfg &= !CFG_TRANSLATE;
     write_cfg(cfg);
 
@@ -524,12 +544,14 @@ pub fn init() -> bool {
         return false;
     }
 
-    // 4. 注册 IRQ1 handler。
-    let ok = interrupts::register_irq(1, irq1_handler);
-    if ok {
-        klib::info!("[kbd] PS/2 keyboard initialized (IRQ1)");
-    } else {
-        klib::info!("[kbd] failed to register IRQ1 handler");
-    }
-    ok
+    // 4. 全部命令往返完成（handler 已在位）：此刻才使能 8042 IRQ1 线。
+    //    自此按键走中断路径；开线后可能立刻有一个已缓冲按键触发 IRQ1——
+    //    handler 的 OBF 检查（幻中断防御）保证空缓冲毛刺安全，实数据正常投递。
+    let Some(cfg) = read_cfg() else {
+        klib::info!("[kbd] config byte read timed out before irq enable");
+        return false;
+    };
+    write_cfg(cfg | CFG_IRQ_ENABLE);
+    klib::info!("[kbd] PS/2 keyboard initialized (IRQ1)");
+    true
 }
