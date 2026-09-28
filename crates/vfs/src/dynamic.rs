@@ -21,6 +21,15 @@ pub struct DynamicFileNode {
     generator: Option<ContentGenerator>,
     writer: Option<WriteHandler>,
     perms: AccessPolicy,
+    // 快照一致性缓存（B3 阻塞缺陷修复，2026-09-28 晚）：read_at(offset==0)
+    // 重生成并替换；offset>0 的续读复用同一快照。此前每次 read_at 都
+    // 重新调用 generator——/processes/list 这类实时内容在 512B 分块
+    // 续读中途进程表变化，第二块与第一块来自不同快照，拼接后 JSON
+    // 撕裂（init 看门狗把活着的 consoled 误判死亡，respawn 风暴；
+    // S13：同一 open-read-close 事务必须看到同一份内容）。并发边界
+    // （S09 如实）：两读者同时流式读同一节点时，后到者的 offset==0
+    // 刷新会让先到者的续读换快照——当前读者均为短事务，交错窗口可忽略。
+    snapshot: RwLock<Option<Arc<Vec<u8>>>>,
 }
 
 /// 手写 Debug（D5 / ADR-023 §7）：安全摘要，不调用生成器/写入器。
@@ -44,6 +53,7 @@ impl DynamicFileNode {
             generator: Some(Box::new(generator)),
             writer: None,
             perms: AccessPolicy::readonly(),
+            snapshot: RwLock::new(None),
         }
     }
 
@@ -57,6 +67,7 @@ impl DynamicFileNode {
             generator: Some(Box::new(generator)),
             writer: Some(Box::new(writer)),
             perms: AccessPolicy::read_write(),
+            snapshot: RwLock::new(None),
         }
     }
 }
@@ -66,7 +77,24 @@ impl INode for DynamicFileNode {
         let Some(ref func) = self.generator else {
             return Err(Error::PermissionDenied);
         };
-        let content = func();
+        // 快照一致性（B3 阻塞缺陷修复）：offset==0 = 新一轮读（或重读）
+        // → 重生成并替换快照；offset>0 = 续读 → 复用快照，保证同一
+        // open-read-close 事务内内容单一真值（S13）。
+        let content: Arc<Vec<u8>> = if offset == 0 {
+            let fresh = Arc::new(func());
+            *self.snapshot.write() = Some(fresh.clone());
+            fresh
+        } else {
+            match self.snapshot.read().clone() {
+                Some(snap) => snap,
+                None => {
+                    // 首读即 offset>0（罕见：调用方自行 seek）：生成一次补缓存。
+                    let fresh = Arc::new(func());
+                    *self.snapshot.write() = Some(fresh.clone());
+                    fresh
+                }
+            }
+        };
         let off = offset as usize;
         if off >= content.len() {
             return Ok(0);
