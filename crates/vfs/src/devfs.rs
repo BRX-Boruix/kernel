@@ -637,11 +637,14 @@ impl DevFS {
         let console_node = Arc::new(crate::console::ConsoleNode::new());
         root.add_child("console", console_node.clone());
 
-        // 4.55.6 /devices/consoles/N（ADR-048 决策 1，T1：实例族挂载）。
+        // 4.55.6 /devices/consoles/N（ADR-048 决策 1，T1：实例族挂载；
+        // B3-C4 语义迁移：CONSOLES_N = **开机预创建数**（BORUIX_CONSOLES_N，
+        // 默认 4、钳 1..=256），不是实例总数——运行期经 /system/console-requests
+        // 的请求还可创建新实例，硬上限 CONSOLES_MAX=64（见 console.rs）。
         // 实例 0 = 上面 console 节点**同一个 Arc**（别名，单会话行为零变化——
         // consoled/login/shell 的既有路径零改动）；实例 1..CONSOLES_N-1 为
-        // 独立环的纯新增节点（T1 时无读者/写者；T2 接焦点路由、T4 接守护）。
-        // N=4（ADR-048 §3.2：够用且可枚举）。audio/stream/0..N-1 同款先例。
+        // 预创建的独立环节点（挂载时无读者/写者；焦点路由/守护均已接）。
+        // audio/stream/0..N-1 同款先例。
         let consoles_dir = Arc::new(DynamicDirNode::new());
         // 别名 = **同一个 Arc**（不是复制节点）：`/devices/console` 与
         // `/devices/consoles/0` 打开的是同一环、同一 owner 真值（S13 单一事实源）。

@@ -172,7 +172,7 @@ pub const SYS_STREAM_FSTAT: u32 = nr(domain::STREAM, 0x07); // 0x17
 /// 受控例外形状 = audio attach 同款「独立域动词 + 能力门禁」；ADR-044
 /// 「不新增 syscall」红线按本意澄清——防的是无序动词蔓延破坏单径事件链，
 /// 域内受控子动作 ≠ 新 syscall；ADR-014 §4.1 动词表随本动词同步修订）。
-/// a1=实例 id（0..CONSOLES_N-1）。**门禁在 syscall 层**（`current_has_cap`）：
+/// a1=实例 id（预创建 0..CONSOLES_N-1；运行期创建的实例亦合法，上限 CONSOLES_MAX=64）。**门禁在 syscall 层**（`current_has_cap`）：
 /// VFS 节点层 `write_at` 无调用者身份，焦点切换若落在节点层 = 任意进程
 /// 终端劫持面（S17/S20）；语义 = tcsetpgrp/TIOCSPGRP 的本域同构（权限
 /// 判定在有 caller 身份的内核边界，机制内核、策略用户态）。
