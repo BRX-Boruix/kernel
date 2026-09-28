@@ -154,6 +154,10 @@ pub static GS_READY_FLAG: core::sync::atomic::AtomicU64 =
 pub struct SyscallStack(pub [u8; SYSCALL_STACK_SIZE]);
 
 /// 专用 syscall 栈大小（16 KiB）。
+/// B3 阻塞缺陷实证（2026-09-28 晚）：ATAPICDROM read_at 曾在此栈上放
+/// 16KiB 暂存数组，调用链总深越限、写穿 SYSCALL_STACKS 池（内核态取指
+/// Page Fault error=0x11）。暂存已移内核堆（atapi_cdrom.rs read_at）；
+/// 本预算保持 16KiB——栈上大对象一律入堆的纪律以此案为戒（S33）。
 pub const SYSCALL_STACK_SIZE: usize = 16 * 1024;
 
 impl SyscallStack {

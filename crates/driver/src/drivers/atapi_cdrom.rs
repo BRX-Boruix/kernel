@@ -302,6 +302,12 @@ impl IoDevice for AtapiCdromDevice {
         let mut done = 0usize;
         let mut remaining = out.len();
         let mut cur = lba;
+        // 暂存缓冲放**内核堆**（B3 阻塞缺陷修复，S20）：本函数运行在 16KiB
+        // 专用 syscall 栈上——VFS→ISO9660→本驱动的调用链已吃数 KB，再加
+        // 16KiB 栈上数组即越限、写穿 SYSCALL_STACKS 池（返回地址被覆盖 →
+        // 内核态取指 Page Fault error=0x11，cr2 落在池内）。容量 = 单命令
+        // 上限 8 块（与下方 max_by_buf 一致），一次分配、循环内复用。
+        let mut buf = alloc::vec![0u8; ATAPI_BLOCK_SIZE * 8];
         // 单次 PACKET 命令交付多少块：对齐块数（跨块请求一次 READ(12) 多块）。
         while remaining > 0 && cur < total_blocks {
             // 本次覆盖的块数：受三重约束——请求剩余、单命令上限（ATAPI 字节
@@ -314,7 +320,6 @@ impl IoDevice for AtapiCdromDevice {
                 .min(max_by_buf)
                 .min((total_blocks - cur) as usize);
             let nblocks = want_blocks; // 本命令实际读的块数（名字沿用语义层）
-            let mut buf = [0u8; ATAPI_BLOCK_SIZE * 8];
             let mut rd_ok = false;
             for _ in 0..3 {
                 if atapi_read_blocks(self.channel, self.slave, cur, nblocks as u32, &mut buf) {
