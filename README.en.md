@@ -13,14 +13,14 @@ of device access.
 
 - Physical and virtual memory management, including a kernel heap allocator
 - Interrupt and exception handling, local APIC and SMP multi-core boot
-- A preemptive scheduler with a process and thread model
+- A scheduler with a process and thread model: time-sliced preemption in user space only, never in kernel space
 - System call entry with argument validation
 - A virtual file system with devfs, ramfs, procfs, sysfs and mount-point management
 - Page cache and block cache
 - ISO9660 and EXT2 file systems
 - An ELF loader and user-space program startup
 - Shared memory and pipes
-- Device tree and device claiming for user-space drivers to attach to
+- Device classification and a unified device operation abstraction, with drivers started in four ordered stages; device claiming lets user-space drivers attach
 - A framebuffer terminal based on Flanterm
 - AHCI, ATAPI CD-ROM, ATA PIO disk, PCI bus and PS/2 keyboard drivers
 
@@ -28,8 +28,8 @@ of device access.
 
 - Verified only on QEMU and x86_64; never run on real hardware
 - Requires a nightly toolchain: some crates use unstable features
-- No swap and no memory overcommit; running out of physical memory fails
-- Single user, with no account isolation beyond the permission model
+- No swap; the commit limit is half of physical memory and requests beyond it are refused
+- A multi-user model (uid/gid and capability bits) exists, but there is no graphical login
 
 ## Building
 
