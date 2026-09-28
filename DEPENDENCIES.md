@@ -20,7 +20,7 @@
 |---|---|---|
 | Rust toolchain | workspace edition 2024（见 rust-toolchain） | 编译器 |
 | `cargo build --target x86_64-unknown-none` | — | 裸机目标 |
-| Python ≥3.x + sdk/ 构建脚本 | — | ISO 组装、符号表生成（symbols_generated.rs）、selftest 编排 |
+| Python ≥3.x + tools/ 构建脚本 | — | ISO 组装、符号表生成（symbols_generated.rs）、selftest 编排 |
 
 ## 版本钉策略
 

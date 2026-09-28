@@ -1,6 +1,6 @@
 //! 符号表：把返回地址解析为函数名（供 panic 栈回溯使用）。
 //!
-//! 符号表数据由构建脚本 `sdk/sdk_build/symbols.py` 从内核 ELF 提取生成，
+//! 符号表数据由构建脚本 `tools/tools_build/symbols.py` 从内核 ELF 提取生成，
 //! 内容为 `symbols_generated.rs`（按地址升序排列的 `(addr, name)` 数组）。
 //! 若未生成（首次构建）则为空表，`symbolize` 退化为仅返回十六进制地址。
 //!
