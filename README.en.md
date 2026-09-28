@@ -5,9 +5,9 @@ BORUIX's kernel: an x86_64 operating system kernel written from scratch in Rust.
 [简体中文](README.md)
 
 After boot the kernel initialises memory management, interrupts, the scheduler and the virtual file
-system, loads user-space drivers and hands control to the init process. Most file systems and
-peripheral drivers run in user space; the kernel keeps address spaces, processes, system calls and the
-granting of device access.
+system, loads user-space drivers and hands control to the init process. Most device drivers run in
+user space; the kernel keeps address spaces, processes, system calls, the file system and the granting
+of device access.
 
 ## Features
 
