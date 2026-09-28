@@ -160,10 +160,17 @@ impl INode for DynamicFileNode {
     }
 }
 
+/// 子项创建回调（B3-C3 接线）：目录 open(create) 时被调。回调自行查重
+/// 并把子项挂进目录（通常经既有 add_child/upsert），返回 ()=创建成功，
+/// create() 随后 lookup 该名取节点返回给调用方。
+type ChildCreator = Box<dyn Fn(&str) -> Result<(), Error> + Send + Sync>;
+
 /// 动态/静态混合虚拟目录节点。
 pub struct DynamicDirNode {
     entries: RwLock<Vec<(alloc::string::String, Arc<dyn INode>)>>,
     perms: AccessPolicy,
+    /// None = 禁止 create（现行默认，返回 NotDirectory）。
+    on_create: Option<ChildCreator>,
 }
 
 /// 手写 Debug（D5 / ADR-023 §7）：安全摘要，不枚举目录项内容。
@@ -181,7 +188,18 @@ impl DynamicDirNode {
         Self {
             entries: RwLock::new(Vec::new()),
             perms: AccessPolicy::all(),
+            on_create: None,
         }
+    }
+
+    /// 挂子项创建回调（B3-C3）：仅 consoles 这类「open(create) 语义物化
+    /// 内核状态」的目录使用；其余目录维持禁止 create 的默认。
+    pub fn with_create<F>(mut self, creator: F) -> Self
+    where
+        F: Fn(&str) -> Result<(), Error> + Send + Sync + 'static,
+    {
+        self.on_create = Some(Box::new(creator));
+        self
     }
 
     pub fn add_child(&self, name: &str, node: Arc<dyn INode>) {
@@ -233,8 +251,13 @@ impl INode for DynamicDirNode {
         Err(Error::NotFound)
     }
 
-    fn create(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
-        Err(Error::PermissionDenied)
+    fn create(&self, name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {
+        let creator = match &self.on_create {
+            Some(f) => f,
+            None => return Err(Error::PermissionDenied),
+        };
+        creator(name)?;
+        self.lookup(name)
     }
 
     fn mkdir(&self, _name: &str, _mode: u32, _owner: (u32, u32)) -> Result<Arc<dyn INode>, Error> {

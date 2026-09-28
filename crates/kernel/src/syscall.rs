@@ -1528,7 +1528,7 @@ fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
     }
     let root = crate::vfs_init::root();
     // A1-3 / ADR-040 §2.6：unlink = **父目录 Write**（经父目录路径求值）。
-    match split_parent(&path) {
+    let parent_node = match split_parent(&path) {
         Some((parent_path, _)) => {
             let parent = match root.resolve(&parent_path, true) {
                 Ok(n) => n,
@@ -1540,12 +1540,16 @@ fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
             if let Err(e) = check_parent_write_access(&identity, &parent) {
                 return pack_err(e);
             }
+            parent
         }
         None => return pack_err(Error::InvalidParam),
-    }
-    // A1-5 / §2.6：unlink 还需**目标属主**面（或 `CAP_OWNER`）——被删节点
-    // 的属主即持有者（A1-3 时属主真值未落地，注释记账至此补全）。父目录
-    // 写面在前：无父目录写权限者在目标面之前即被拒（判定序成文）。
+    };
+    // A1-5 / §2.6：unlink 还需**目标属主**面（或 `CAP_OWNER`）。B3 修正
+    // （2026-09-28 晚）：增**父目录属主豁免**——目录属主管理自己目录内的
+    // 条目（/system/console-requests 属主 = init 0:0，消费 openvt（uid
+    // 1000）创建的请求文件是设计语义；此前 init 无 CAP_OWNER 而被拒 →
+    // 请求文件永不消失 → 巡检重复 drop 刷屏）。判定序：父目录写面 →
+    // 目标属主面（父属主豁免在后者内）。
     {
         let identity = current_proc_mut()
             .map(|p| p.identity())
@@ -1558,7 +1562,14 @@ fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
             Ok(m) => m,
             Err(e) => return pack_err(e),
         };
-        if identity.uid != meta.permissions.owner_uid() && !identity.caps.contains(Caps::OWNER) {
+        let parent_meta = match parent_node.metadata() {
+            Ok(m) => m,
+            Err(e) => return pack_err(e),
+        };
+        let owner_ok = identity.uid == meta.permissions.owner_uid()
+            || identity.uid == parent_meta.permissions.owner_uid()
+            || identity.caps.contains(Caps::OWNER);
+        if !owner_ok {
             return pack_err(Error::PermissionDenied);
         }
     }

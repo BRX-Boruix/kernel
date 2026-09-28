@@ -645,7 +645,26 @@ impl DevFS {
         // consoled/login/shell 的既有路径零改动）；实例 1..CONSOLES_N-1 为
         // 预创建的独立环节点（挂载时无读者/写者；焦点路由/守护均已接）。
         // audio/stream/0..N-1 同款先例。
-        let consoles_dir = Arc::new(DynamicDirNode::new());
+        let consoles_dir = Arc::new(
+            DynamicDirNode::new().with_create(|name: &str| {
+                // B3-C3 接线：open(create) 请求 = 运行期实例物化触发。名字
+                // 必须是合法实例 id（1..CONSOLES_MAX，0 = 别名永不可创建）；
+                // create_instance 自带查重/上限/挂载事务（S20 单点）。
+                // 非数字名如实 InvalidParam（S31 对抗输入不猜测）。
+                let mut id: usize = 0;
+                let bytes = name.as_bytes();
+                if bytes.is_empty() || bytes.len() > 2 {
+                    return Err(Error::InvalidParam);
+                }
+                for c in bytes.iter() {
+                    if *c < b'0' || *c > b'9' {
+                        return Err(Error::InvalidParam);
+                    }
+                    id = id * 10 + (*c - b'0') as usize;
+                }
+                crate::console::create_instance(id)
+            }),
+        );
         // 别名 = **同一个 Arc**（不是复制节点）：`/devices/console` 与
         // `/devices/consoles/0` 打开的是同一环、同一 owner 真值（S13 单一事实源）。
         consoles_dir.add_child("0", console_node.clone());
