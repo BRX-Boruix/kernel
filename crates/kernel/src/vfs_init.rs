@@ -1072,24 +1072,87 @@ pub fn init() {
     }
 }
 
-/// liveCD 模式：RAMFS 根 + `/programs` 内置 payload + 所有块设备挂 `/volumes`。
+/// liveCD 模式：RAMFS 根 + `/programs` = **ISO 内真目录**（B2 载体迁移）+
+/// 所有块设备挂 `/volumes`。
+///
+/// `/programs` 的来源（ADR-017 payload 内嵌**已退役**，owner 裁决「介质即
+/// 系统」）：启动时扫描 cd* 块设备 → ISO9660 探测 → 把 ISO 的 `/programs`
+/// 子目录挂为 VFS `/programs`（零复制——程序在介质上，拖入即装）。无
+/// -cdrom 拓扑（纯硬盘）下 `/programs` 保持池内空目录，程序来自挂载卷。
 fn init_livecd() {
     let ramfs = Arc::new(RamFS::new());
     let mount_table = Arc::new(MountTable::new(ramfs));
     build_skeleton(&mount_table);
-    populate_builtin_programs(&mount_table);
     let volumes_mounted = try_mount_ext2_volumes(&mount_table, None);
+    mount_programs_from_iso(&mount_table);
 
     VFS_ROOT.call_once(|| mount_table);
     if volumes_mounted {
         klib::info!(
-            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /programs = built-in liveCD payload, external disk mounted at /volumes/<label>"
+            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /programs = ISO medium directory, external disk mounted at /volumes/<label>"
         );
     } else {
         klib::info!(
-            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /programs = built-in liveCD payload (no external disk)"
+            "[vfs] root RamFS, ProcFS, SysFS, DevFS mounted, /programs = ISO medium directory (no external disk)"
         );
     }
+}
+
+/// B2：从 ISO 介质挂载 `/programs`（零复制真目录）。
+///
+/// 扫描 DriverHub 的 cd* 块设备：ISO9660 探测成功 → `open_subroot(["programs"])`
+/// 把 ISO 的 /programs 子目录挂为 VFS `/programs`（mount_named 遮蔽池内骨架
+/// 空目录——ADR-028 单源语义保留：/programs 唯一来源=介质）。介质缺失
+///（无 -cdrom）或非 ISO 介质（挂了数据盘到 cd 口）时如实留痕跳过，`/programs`
+/// 保持骨架空目录——绝不伪造内容（S09）。数据盘（/volumes/*）全程不触碰。
+fn mount_programs_from_iso(mount_table: &Arc<vfs::mount::MountTable>) {
+    let count = driver::DriverHub::device_count();
+    for i in 0..count {
+        let Some(info) = driver::DriverHub::device_info_at(i) else {
+            continue;
+        };
+        if info.kind != driver::DeviceKind::Block {
+            continue;
+        }
+        // 只考察 CD 槽位名（cd0/cd1——ATAPI 驱动的命名空间；不碰 ata*/硬盘）。
+        if !(info.name == "cd0" || info.name == "cd1") {
+            continue;
+        }
+        let Some(ops) = driver::DriverHub::device_at(i) else {
+            continue;
+        };
+        let bridge = cached_bridge_for(info.name, ops);
+        // ISO 的 /programs 子目录存在才挂（空目录也合法——介质可以没有程序）。
+        let iso = match fs::iso9660::IsoFs::open_subroot(bridge, &["programs"]) {
+            Ok(iso) => iso,
+            // NotFound = 介质不是 ISO9660 或无 /programs 子目录：如实留痕。
+            Err(_) => {
+                klib::info!(
+                    "[vfs] {} has no ISO9660 /programs subtree; /programs stays empty skeleton",
+                    info.name
+                );
+                continue;
+            }
+        };
+        match mount_table.mount_named(String::from("/programs"), Arc::new(iso)) {
+            Ok(final_path) => {
+                klib::info!(
+                    "[vfs] /programs mounted from {} (ISO9660 real directory on medium)",
+                    info.name
+                );
+                // MOUNTED_DEVICES 登记（卸载/热插拔闭环口径一致）。
+                MOUNTED_DEVICES
+                    .lock()
+                    .push((String::from(info.name), final_path));
+                return;
+            }
+            Err(e) => {
+                klib::error!("[vfs] /programs mount from {} failed: {:?}", info.name, e);
+                return;
+            }
+        }
+    }
+    klib::info!("[vfs] no cd device with ISO /programs found; /programs stays empty skeleton");
 }
 
 /// 安装模式：把启动盘分区（mbr_disk_id + partition_index）的 EXT2 挂为根，
@@ -1180,6 +1243,61 @@ fn init_install(mbr_disk_id: u32, partition_index: u32) -> bool {
         return true;
     }
     false
+}
+
+/// 清空 `/scratch` 临时文件区的**直接子项**（不递归进子目录内部再删父目录？——
+/// 是递归的，见下）。
+///
+/// # 为什么需要
+///
+/// `/scratch` 的契约是"临时文件区"（ADR-005 v2、ADR-011 §1.1）。在没有持久
+/// 存储的启动方式下（ISO：根为 RamFS）它天然每次全新；但在**安装模式**
+///（`--systemdisk`，ADR-029）下根就是系统盘的 EXT2 分区，`/scratch` 会跨重启
+/// 保留上一轮的全部内容。两种启动方式语义不一致，且持久化的一侧违反"临时"
+/// 定义并导致 `create_file` 报 `AlreadyExists`。
+///
+/// # 行为
+///
+/// 逐个删除 `/scratch` 下的子项：目录**递归先清空**再删，文件直接删。
+/// 任一子项清理失败即 `warn` 并**继续**处理其余子项——一个删不掉的残留不应
+/// 阻断其余清理，更不应阻断启动。失败保持可见（不静默）。
+fn clear_scratch(mount_table: &Arc<vfs::mount::MountTable>, path: &str) {
+    let node = match mount_table.resolve(path, true) {
+        Ok(n) => n,
+        Err(e) => {
+            klib::warn!("[vfs] clear {}: resolve failed: {:?}", path, e);
+            return;
+        }
+    };
+    let entries = match node.list_dir() {
+        Ok(e) => e,
+        Err(e) => {
+            klib::warn!("[vfs] clear {}: list_dir failed: {:?}", path, e);
+            return;
+        }
+    };
+    let mut removed = 0usize;
+    for entry in entries.iter() {
+        let name = entry.name.as_str();
+        // 防御：`list_dir` 契约上不返回自引用项，但真出现了也绝不递归删除
+        // （`. ` 指向自身，递归即无限展开）。
+        if name == "." || name == ".." {
+            continue;
+        }
+        let child = alloc::format!("{}/{}", path, name);
+        if entry.node_type == vfs::inode::INodeType::Directory {
+            // 先递归清空子目录内部的条目，再删子目录本身——
+            // `unlink` 对非空目录返回 NotEmpty（与 rmdir 同语义）。
+            clear_scratch(mount_table, &child);
+        }
+        match mount_table.unlink(&child) {
+            Ok(_) => removed += 1,
+            Err(e) => klib::warn!("[vfs] clear {}: unlink {} failed: {:?}", path, child, e),
+        }
+    }
+    if removed > 0 {
+        klib::info!("[vfs] cleared {} stale entr(ies) from {}", removed, path);
+    }
 }
 
 /// 构建默认 RESTful 顶层目录骨架与特殊文件系统挂载（liveCD 与安装模式共用）。
@@ -1491,106 +1609,6 @@ fn audio_boot_selfcheck(mount_table: &Arc<vfs::mount::MountTable>) {
     }
 }
 
-/// liveCD 基线：把构建期嵌入的用户程序 payload（SDK 生成 `binaries_payload.rs`）
-/// 写入 ramfs `/programs`——无外部盘时系统仍可启动（ADR-017）。外部盘不再
-/// 遮蔽 `/programs`（ADR-028 单源：外部盘改挂 `/volumes/{label}`）。
-/// 任一写入失败如实报错并继续（残留部分 payload 会使 init 加载失败可见，
-/// 不静默伪装成功）。
-/// 清空 `/scratch` 临时文件区的**直接子项**（不递归进子目录内部再删父目录？——
-/// 是递归的，见下）。
-///
-/// # 为什么需要
-///
-/// `/scratch` 的契约是"临时文件区"（ADR-005 v2、ADR-011 §1.1）。在没有持久
-/// 存储的启动方式下（ISO：根为 RamFS）它天然每次全新；但在**安装模式**
-///（`--systemdisk`，ADR-029）下根就是系统盘的 EXT2 分区，`/scratch` 会跨重启
-/// 保留上一轮的全部内容。两种启动方式语义不一致，且持久化的一侧违反"临时"
-/// 定义并导致 `create_file` 报 `AlreadyExists`。
-///
-/// # 行为
-///
-/// 逐个删除 `/scratch` 下的子项：目录**递归先清空**再删，文件直接删。
-/// 任一子项清理失败即 `warn` 并**继续**处理其余子项——一个删不掉的残留不应
-/// 阻断其余清理，更不应阻断启动。失败保持可见（不静默）。
-fn clear_scratch(mount_table: &Arc<vfs::mount::MountTable>, path: &str) {
-    let node = match mount_table.resolve(path, true) {
-        Ok(n) => n,
-        Err(e) => {
-            klib::warn!("[vfs] clear {}: resolve failed: {:?}", path, e);
-            return;
-        }
-    };
-    let entries = match node.list_dir() {
-        Ok(e) => e,
-        Err(e) => {
-            klib::warn!("[vfs] clear {}: list_dir failed: {:?}", path, e);
-            return;
-        }
-    };
-    let mut removed = 0usize;
-    for entry in entries.iter() {
-        let name = entry.name.as_str();
-        // 防御：`list_dir` 契约上不返回自引用项，但真出现了也绝不递归删除
-        // （`. ` 指向自身，递归即无限展开）。
-        if name == "." || name == ".." {
-            continue;
-        }
-        let child = alloc::format!("{}/{}", path, name);
-        if entry.node_type == vfs::inode::INodeType::Directory {
-            // 先递归清空子目录内部的条目，再删子目录本身——
-            // `unlink` 对非空目录返回 NotEmpty（与 rmdir 同语义）。
-            clear_scratch(mount_table, &child);
-        }
-        match mount_table.unlink(&child) {
-            Ok(_) => removed += 1,
-            Err(e) => klib::warn!("[vfs] clear {}: unlink {} failed: {:?}", path, child, e),
-        }
-    }
-    if removed > 0 {
-        klib::info!("[vfs] cleared {} stale entr(ies) from {}", removed, path);
-    }
-}
-
-fn populate_builtin_programs(mount_table: &Arc<vfs::mount::MountTable>) {
-    for p in crate::binaries_payload::PAYLOADS {
-        let path = alloc::format!("/programs/{}", p.name);
-        // A1-1：内置可执行 payload 需要执行位——0o555（owner 含 x）。原
-        // readonly()（无 x）在 A1-3 EXEC 强制下会全盘拒绝执行，此处如实
-        // 表达"系统提供的可执行程序"语义。
-        let node = match mount_table.create_file(&path, 0o555, (0, 0)) {
-            Ok(n) => n,
-            Err(e) => {
-                klib::error!("[vfs] built-in payload failed (create {}): {:?}", path, e);
-                continue;
-            }
-        };
-        if let Err(e) = node.write_at(0, p.data) {
-            klib::error!(
-                "[vfs] built-in payload failed (write {} {} bytes): {:?}",
-                path,
-                p.data.len(),
-                e
-            );
-            continue;
-        }
-        // KM4 同款纪律：RamFS 写入要么全量要么 Err，但署名长度不符仍须显式
-        // 报错——绝不静默把截断的 ELF 当作完整 payload 交给加载器。
-        if node.metadata().map(|m| m.size).unwrap_or(0) != p.data.len() as u64 {
-            klib::error!(
-                "[vfs] built-in payload size mismatch on {}: expected {} got {}",
-                path,
-                p.data.len(),
-                node.metadata().map(|m| m.size).unwrap_or(0)
-            );
-            continue;
-        }
-        klib::info!(
-            "[vfs] built-in liveCD payload: {} ({} bytes, read-only)",
-            p.name,
-            p.data.len()
-        );
-    }
-}
 
 /// drv 块设备 → fs::ByteDevice 桥接（M0.2 起提供读写双向；EXT2 只读挂载
 /// 阶段只用到读，写路径为 PRE-1 可写 EXT2 的地基）。

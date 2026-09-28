@@ -167,7 +167,9 @@ impl MountTable {
     /// 卷挂载核心：以 `/volumes/` 下 base 为候选，同名自增消解后挂载返回
     /// 最终绝对路径（ADR-012 §3.2.1）。base 已含 `/volumes/` 前缀且未段经
     /// [`validate_name`] 校验，故不再重复校验。
-    fn mount_named(&self, base: String, fs: Arc<dyn FileSystem>) -> Result<String, Error> {
+    /// 按任意绝对路径挂载（B2：内核把 ISO 的 /programs 子目录挂为程序卷）。
+    /// 公开给内核 vfs_init（程序卷挂载点不是 /volumes 命名空间的一部分）。
+    pub fn mount_named(&self, base: String, fs: Arc<dyn FileSystem>) -> Result<String, Error> {
         // 创建首个候选挂载点目录（占用时多建几个空目录无害，最终以 mounts 键为准）。
         if let Err(e) = self.mkdir(&base, 0o777, (0, 0)) {
             match e {

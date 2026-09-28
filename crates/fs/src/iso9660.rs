@@ -88,8 +88,22 @@ pub struct IsoFs {
 }
 
 impl IsoFs {
-    /// 打开设备上的 ISO9660 并校验 PVD。
+    /// 打开设备上的 ISO9660 并校验 PVD（整盘根）。
     pub fn open(dev: Arc<dyn ByteDevice>) -> Result<Self, IsoError> {
+        Self::open_rooted(dev, &[])
+    }
+
+    /// 打开 ISO9660 并以 `subpath` 子目录为文件系统根（B2：/programs 载体）。
+    ///
+    /// 语义：介质即系统——SDK 把用户程序放进 ISO 的 `/programs/` 真目录，
+    /// 内核把该子目录直接挂为 VFS `/programs`（零复制、拖入即装）。
+    /// `subpath` 逐段解析（每段须是目录）；空切片 = 整盘根。
+    pub fn open_subroot(dev: Arc<dyn ByteDevice>, subpath: &[&str]) -> Result<Self, IsoError> {
+        Self::open_rooted(dev, subpath)
+    }
+
+    /// 内部通用打开：PVD 校验后，从根（或子路径末端目录）建立 FS 根。
+    fn open_rooted(dev: Arc<dyn ByteDevice>, subpath: &[&str]) -> Result<Self, IsoError> {
         let pvd_off = PVD_LBA * ISO_BLOCK_SIZE;
         // +156 起的根目录记录（34 字节）是 PVD 读取的最深字段 → 缓冲 200 字节。
         let mut pvd = [0u8; 200];
@@ -110,14 +124,29 @@ impl IsoFs {
         }
         // 根目录记录：+156，34 字节定长形态（9.1）。extent/size 双端校验。
         let rr = &pvd[156..156 + 34];
-        let root_lba = read_both_u32(rr, 2)?;
-        let root_size = read_both_u32(rr, 10)?;
+        let mut root_lba = read_both_u32(rr, 2)?;
+        let mut root_size = read_both_u32(rr, 10)?;
         if rr[0] != 34 {
             return Err(IsoError::Corrupt);
         }
         let volume_id = String::from(
             core::str::from_utf8(&pvd[40..72]).unwrap_or("").trim_end(),
         );
+        // 子路径逐段下行（B2：["programs"] → /programs 子目录为根）。
+        let probe = Self {
+            dev: dev.clone(),
+            root_lba,
+            root_size,
+            volume_id: volume_id.clone(),
+        };
+        for seg in subpath {
+            let rec = probe.lookup_in_dir(root_lba, root_size, seg)?;
+            if rec.flags & 0x02 == 0 {
+                return Err(IsoError::Corrupt); // 子路径中间段必须是目录
+            }
+            root_lba = rec.lba;
+            root_size = rec.size;
+        }
         Ok(Self {
             dev,
             root_lba,

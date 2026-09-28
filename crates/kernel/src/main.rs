@@ -3,11 +3,8 @@
 
 extern crate alloc;
 
-// liveCD 内置用户程序 payload（SDK 构建生成，ADR-017）：无外部盘时
-// 内核用其填充 /programs 完成启动；外部盘挂载后整体覆盖（盘优先）。
-// 模块名 `binaries_payload` 为 SDK 生成产物契约名（见 sdk_build/build.py），
-// 沿用历史命名，用户态可见路径一律是 /programs。
-mod binaries_payload;
+// B2 载体迁移：liveCD 内置 payload（binaries_payload，ADR-017）已退役——
+// /programs 现在是 ISO 介质上的真目录（iso9660 挂载，零复制拖入即装）。
 mod acpi;
 mod drivers;
 mod ipc_init;
@@ -1241,11 +1238,11 @@ fn init_display() {
 
 /// ADR-028 单源读取：`/programs/<name>` 是**唯一**程序来源。
 ///
-/// `/programs` 只由构建期内置 liveCD payload 填充（`vfs_init` 的
-/// `populate_builtin_programs`），外部盘不再遮蔽 `/programs`（ADR-025 的
-/// "盘优先"双源机制已废除，见 ADR-028 §决策1/3）。故本函数读到的恒是
-/// 内置 payload；任何失败（文件缺失/短读/超限）返回 None，由调用方显式
-/// 失败，绝不伪造成功、绝不回退到第二条来源。
+/// `/programs` 是 ISO 介质上的真目录（B2：`mount_programs_from_iso` 把
+/// cd* 设备的 ISO9660 /programs 子目录挂载于此，零复制；外部盘不再遮蔽
+/// `/programs`——ADR-025 的"盘优先"双源机制已废除，见 ADR-028 §决策1/3，
+/// ADR-017 的内嵌 payload 已退役）。任何失败（文件缺失/短读/超限）返回
+/// None，由调用方显式失败，绝不伪造成功、绝不回退到第二条来源。
 pub fn read_binary_from_programs(name: &str) -> Option<alloc::vec::Vec<u8>> {
     let root = crate::vfs_init::root();
     let path = alloc::format!("/programs/{}", name);

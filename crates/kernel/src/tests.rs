@@ -7353,17 +7353,22 @@ pub fn test_audio_pipe_a2() {
 /// B2 第二步验收：ISO9660 挂载 + 文件内容端到端（volume_mount 的 ISO9660
 /// 回退路径 → VFS 树 → 文件字节流）。
 ///
-/// 断言链（S06 真实数据链路）：
-/// 1. 挂载点存在：`/volumes/ISOIMAGE`（卷标命名；无 -cdrom 拓扑如实跳过）；
-/// 2. 根目录 list_dir 含 `boot`（目录）——PVD 根 extent 解析真实工作；
-/// 3. `boot/kernel.`（8.3 截断名）read_at 头 4 字节 = ELF 魔数 `\x7fELF`
-///    ——目录记录→extent→ATAPI READ(12)→字节缓冲的**内容链**端到端；
+/// 断言链（S06 真实数据链路；B2 第三步后介质语义 = /programs 程序卷）：
+/// 1. cd1 已被 `mount_programs_from_iso` 挂为 `/programs`（ISO 的 /programs
+///    子目录，零复制）；`mount_device_volume` 幂等返回该路径（无 -cdrom
+///    拓扑如实跳过）；
+/// 2. 目录列表含 `init.elf`（Rock Ridge NM 真名）——PVD 根 extent 解析
+///    真实工作且介质带程序集；
+/// 3. `init.elf` read_at 头 4 字节 = ELF 魔数 `\x7fELF`——目录记录→extent
+///    →ATAPI READ(12)→字节缓冲的**内容链**端到端（这正是 init 的加载源：
+///    系统程序现在从介质真目录来，S15）；
 /// 4. 写路径如实 ReadOnly（介质物理事实，S17）。
 pub fn test_iso9660_mount_read() {
     use crate::vfs_init;
 
-    // 内核测试期早于 volumed：主动触发挂载（mount_device_volume 幂等，
-    // 已挂返回既有路径；设备缺席时 NotFound——无 -cdrom 拓扑如实跳过）。
+    // 内核测试期早于 volumed：cd1 应已由 mount_programs_from_iso 挂为
+    // /programs（ISO /programs 子目录视图）。mount_device_volume 幂等返回
+    // 既有挂载路径；设备缺席时 NotFound——无 -cdrom 拓扑如实跳过。
     let mount_path = match vfs_init::mount_device_volume("cd1") {
         Ok(p) => p,
         Err(klib::error::Error::NotFound) => {
@@ -7375,31 +7380,30 @@ pub fn test_iso9660_mount_read() {
     let root = vfs_init::root();
     let vol = root
         .resolve(&mount_path, true)
-        .expect("iso volume path resolvable after mount");
-    // 根目录列表：boot 目录在场。
-    let entries = vol.list_dir().expect("iso root list_dir");
-    let boot = entries
+        .expect("iso programs path resolvable after mount");
+    // 目录列表：init.elf 在场（介质 = 程序卷）。
+    let entries = vol.list_dir().expect("iso programs list_dir");
+    let init = entries
         .iter()
-        .find(|e| e.name == "boot")
-        .expect("iso root must contain boot dir");
-    assert_eq!(boot.node_type, vfs::inode::INodeType::Directory);
-    // 文件内容链：boot/kernel（Rock Ridge NM 真名；8.3 基础名 kernel.;1 的
-    // RR 真名 = kernel，xorriso 产物实证）头 4 字节 ELF 魔数。
-    let boot_dir = vol.lookup("boot").expect("lookup boot");
-    let kernel = boot_dir.lookup("kernel").expect("lookup kernel (RR real name)");
+        .find(|e| e.name == "init.elf")
+        .expect("iso /programs must contain init.elf");
+    assert_eq!(init.node_type, vfs::inode::INodeType::RegularFile);
+    // 文件内容链：init.elf 头 4 字节 ELF 魔数——这正是 start_init 的加载源。
+    let node = vol.lookup("init.elf").expect("lookup init.elf");
     let mut hdr = [0u8; 4];
-    let n = kernel.read_at(0, &mut hdr).expect("read kernel header");
-    assert_eq!(n, 4, "kernel header read must deliver 4 bytes");
+    let n = node.read_at(0, &mut hdr).expect("read init.elf header");
+    assert_eq!(n, 4, "init.elf header read must deliver 4 bytes");
     assert_eq!(
         &hdr,
         b"\x7fELF",
-        "boot/kernel. must start with ELF magic (content chain end-to-end)"
+        "/programs/init.elf must start with ELF magic (content chain end-to-end)"
     );
     // 写路径诚实拒绝。
-    let w = kernel.write_at(0, b"xxxx");
+    let w = node.write_at(0, b"xxxx");
     assert_eq!(w, Err(klib::error::Error::ReadOnly), "CD medium is read-only");
     info!(
-        "[test-iso] /volumes/ISOIMAGE boot/kernel ELF magic verified; entries={}",
+        "[test-iso] {} init.elf ELF magic verified; entries={}",
+        mount_path,
         entries.len()
     );
 }
@@ -14942,11 +14946,13 @@ pub fn test_access_enforcement_matrix() {
 
     // ---- 夹具：直接经 root() 建（VFS 原语不强制；被测是 syscall 层）----
     // /scratch 本体 0755 属主 (0,0)：User 对其 create/unlink 应被父目录写面拒绝。
+    // no-exec 程序夹具也放 /scratch：B2 载体迁移后 /programs 是 ISO 介质真目录
+    //（只读、内容由介质决定），测试夹具的家是可写的临时区。
     let root = crate::vfs_init::root();
     root.create_file("/scratch/a3_f0644.txt", 0o644, (0, 0)).expect("fixture 0644");
     root.create_file("/scratch/a3_f0400.txt", 0o400, (0, 0)).expect("fixture 0400");
     root.mkdir("/scratch/a3_d0700", 0o700, (0, 0)).expect("fixture dir 0700");
-    root.create_file("/programs/a3_nox.elf", 0o400, (0, 0)).expect("fixture no-exec program");
+    root.create_file("/scratch/a3_nox.elf", 0o400, (0, 0)).expect("fixture no-exec program");
 
     // 用户缓冲：路径串槽位（0x100 间隔；A1-5 扩至 0x3000 共 12 槽）+ readdir 输出页。
     let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x3000, 0, 0);
@@ -14974,7 +14980,7 @@ pub fn test_access_enforcement_matrix() {
         b"/scratch/a3_f0644.txt\x00",
         b"/scratch/a3_f0400.txt\x00",
         b"/scratch/a3_d0700\x00",
-        b"/programs/a3_nox.elf\x00",
+        b"/scratch/a3_nox.elf\x00",
     ];
     let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
     for (i, ps) in paths.iter().enumerate() {
@@ -15217,7 +15223,7 @@ pub fn test_access_enforcement_matrix() {
         let _ = root.unlink("/scratch/a3_f0644.txt");
         let _ = root.unlink("/scratch/a3_f0400.txt");
         let _ = root.unlink("/scratch/a3_d0700");
-        let _ = root.unlink("/programs/a3_nox.elf");
+        let _ = root.unlink("/scratch/a3_nox.elf");
     }
 
     arch_x86_64::mmio::write_cr3(saved_cr3);
