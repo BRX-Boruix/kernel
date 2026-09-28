@@ -66,8 +66,13 @@ pub struct DirRecord {
     pub size: u64,
     /// bit0=目录、其余本层不消费。
     pub flags: u8,
-    /// 规范化名字（去掉 ;1 版本号；`.`/`..` 保持点形态）。
+    /// **规范真名**：Rock Ridge NM 条目优先（介质真值，S15）；无 RR 介质
+    /// 降级为 ISO9660 基础名（8.3 去 `;1`）——后者在 RR 介质上是**降级视
+    /// 图**而非真名（`kernel.;1` 的真名是 `kernel`）。
     pub name: String,
+    /// Rock Ridge PX 条目的 POSIX mode（低 12 位，含类型/权限位）；无 PX
+    /// 时为 `None`（metadata 权限回退到只读缺省 0o555）。
+    pub rr_mode: Option<u32>,
     /// 是否 `.` / `..` 特殊项（list_dir 过滤——与 EXT2 同纪律）。
     pub is_dot: bool,
 }
@@ -164,12 +169,18 @@ impl IsoFs {
                 return Err(IsoError::Corrupt);
             }
             let name_bytes = &rec[33..33 + name_len];
-            let (name, is_dot) = decode_name(name_bytes);
+            let (base_name, is_dot) = decode_name(name_bytes);
+            // System Use 区（名字后 pad 到偶对齐）——SUSP/Rock Ridge 条目：
+            // NM=真名、PX=POSIX mode。无 RR 介质该区无 NM，降级基础名。
+            let su_off = 33 + name_len + ((33 + name_len) & 1);
+            let (rr_name, rr_mode) = parse_susp(&rec[su_off..]);
+            let name = rr_name.unwrap_or(base_name);
             out.push(DirRecord {
                 lba: lba2,
                 size: size2,
                 flags,
                 name,
+                rr_mode,
                 is_dot,
             });
             o += len;
@@ -212,6 +223,54 @@ fn decode_name(raw: &[u8]) -> (String, bool) {
     let end = raw.iter().position(|&b| b == b';').unwrap_or(raw.len());
     let s = core::str::from_utf8(&raw[..end]).unwrap_or("");
     (String::from(s), false)
+}
+
+/// SUSP / Rock Ridge 条目解析（System Use 区）。
+///
+/// 只消费两件有真值语义的东西：
+/// - **NM**（RFC 名称记录）：介质上的真名——`kernel.;1` 的真名是 `kernel`
+///   （xorriso 产物实证）。多段 NM 顺序拼接（RFC 名可分段）。
+/// - **PX**（POSIX 文件属性）：mode（both-endian u32，低 12 位类型+权限）。
+///   权限含可执行位——exec 语义的真值源，比硬编码 0o555 诚实。
+///
+/// 其余签名（SP/TF/CE/SL/PN…）按各自长度整段跳过，不会把数据误读成下一
+/// 条目；CE（延续区）跳过意味着**超长延续真名不支持**——如实降级为 8.3
+/// 基础名（不支持的能力不伪装，S09）。
+fn parse_susp(su: &[u8]) -> (Option<String>, Option<u32>) {
+    let mut name: Option<String> = None;
+    let mut mode: Option<u32> = None;
+    let mut k = 0usize;
+    while k + 4 <= su.len() {
+        let sig = [su[k], su[k + 1]];
+        let len = su[k + 2] as usize;
+        // SUSP 最短条目 4 字节；长度越界 = 结构破坏，停止解析（已提取的保留）。
+        if len < 4 || k + len > su.len() {
+            break;
+        }
+        match sig {
+            // NM：flags 在 +4（bit0=CONTINUE 有后续段），内容 +5..len；
+            // bit0 置位表示后面还有 NM 段——循环自然续拼。
+            [b'N', b'M'] if len >= 5 && su[k + 4] & 0b1 == 0 => {
+                let seg = core::str::from_utf8(&su[k + 5..k + len]).unwrap_or("");
+                let merged = match name.take() {
+                    Some(prev) => prev + seg,
+                    None => String::from(seg),
+                };
+                name = Some(merged);
+            }
+            // PX：mode/links/uid/gid 均 both-endian u32（载荷 16 字节）。
+            [b'P', b'X'] if len >= 20 => {
+                let le = u32::from_le_bytes([su[k + 4], su[k + 5], su[k + 6], su[k + 7]]);
+                let be = u32::from_be_bytes([su[k + 8], su[k + 9], su[k + 10], su[k + 11]]);
+                if le == be {
+                    mode = Some(le & 0xFFF);
+                }
+            }
+            _ => {}
+        }
+        k += len;
+    }
+    (name, mode)
 }
 
 /// both-endian u32 读取：小端份为值、大端份交叉校验（不一致=镜像损坏）。
@@ -279,9 +338,14 @@ impl INode for IsoNode {
                 INodeType::RegularFile
             },
             size: self.rec.size,
-            // 只读介质 + 无盘上权限字段：r-x 任意人可读（r=4 x=1，无写位）——
-            // 无属主真值，(0,0) 烙印（与 EXT2 symlink 路径同一过渡态口径）。
-            permissions: AccessPolicy::from_classic_owned(0o555, 0, 0),
+            // 权限真值序：Rock Ridge PX mode（介质披露，含可执行位）优先；
+            // 无 PX 介质回退只读缺省 0o555（诚实缺省，非伪造）。无属主真值，
+            // (0,0) 烙印（与 EXT2 symlink 路径同一过渡态口径）。
+            permissions: AccessPolicy::from_classic_owned(
+                self.rec.rr_mode.unwrap_or(0o555),
+                0,
+                0,
+            ),
             // ISO9660 记录的 time 字段语义弱且无时区真值——恒 0（“字段不采信”
             // 比“采信伪时间”诚实，FM1 同源）。
             created_time: 0,
@@ -345,6 +409,7 @@ impl FileSystem for IsoFs {
                 size: self.root_size,
                 flags: 0x02,
                 name: String::from("/"),
+                rr_mode: None,
                 is_dot: false,
             },
         })

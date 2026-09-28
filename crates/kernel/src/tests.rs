@@ -7383,9 +7383,10 @@ pub fn test_iso9660_mount_read() {
         .find(|e| e.name == "boot")
         .expect("iso root must contain boot dir");
     assert_eq!(boot.node_type, vfs::inode::INodeType::Directory);
-    // 文件内容链：boot/kernel. 头 4 字节 ELF 魔数。
+    // 文件内容链：boot/kernel（Rock Ridge NM 真名；8.3 基础名 kernel.;1 的
+    // RR 真名 = kernel，xorriso 产物实证）头 4 字节 ELF 魔数。
     let boot_dir = vol.lookup("boot").expect("lookup boot");
-    let kernel = boot_dir.lookup("kernel.").expect("lookup kernel. (8.3 name)");
+    let kernel = boot_dir.lookup("kernel").expect("lookup kernel (RR real name)");
     let mut hdr = [0u8; 4];
     let n = kernel.read_at(0, &mut hdr).expect("read kernel header");
     assert_eq!(n, 4, "kernel header read must deliver 4 bytes");
@@ -7398,7 +7399,7 @@ pub fn test_iso9660_mount_read() {
     let w = kernel.write_at(0, b"xxxx");
     assert_eq!(w, Err(klib::error::Error::ReadOnly), "CD medium is read-only");
     info!(
-        "[test-iso] /volumes/ISOIMAGE boot/kernel. ELF magic verified; entries={}",
+        "[test-iso] /volumes/ISOIMAGE boot/kernel ELF magic verified; entries={}",
         entries.len()
     );
 }
