@@ -200,13 +200,13 @@ fn notify_data_ready() {
     }
 }
 
-/// console 实例总数（ADR-048 §3.2 + 扩展 E1，owner 指令 2026-09-27）：
+/// **开机预创建**实例数（B3 owner 裁决 2026-09-28：语义从「实例总数」
+/// 迁移为「开机预创建数」；运行期上限另见 CONSOLES_MAX）。
 /// 构建期经 `BORUIX_CONSOLES_N` 注入（vfs/build.rs，默认 4、钳 1..=256）。
 /// 实例 0 为既有单终端的兼容形态（别名 + 恒焦点兼容）；1..N-1 自 T5 起
-/// 由 init 按激活数提供守护与 getty 轮转。为什么不做成运行期可变：devfs
-/// 挂载发生在内核启动极早期（vfs_init），彼时无用户态、无配置文件、无
-/// cmdline——「运行期改实例数」在启动序列上是伪需求（S09 如实）；构建期
-/// 注入与 init 的 BORUIX_INIT_ARGS 同款先例（S13 同一手法的第二次使用）。
+/// 由 init 提供守护与 getty。运行期创建新实例走 create_instance（openvt
+/// 语义：用户申请「开一个新终端」）——旧注释「运行期改实例数是伪需求」
+/// 已随 B3 裁决作废：用户态就绪后实例创建有了真实请求源与执行者。
 pub const CONSOLES_N: usize = match option_env!("BORUIX_CONSOLES_N") {
     Some(s) => match const_parse_usize(s) {
         Some(n) if n >= 1 && n <= 256 => n,
@@ -239,9 +239,9 @@ const fn const_parse_usize(s: &str) -> Option<usize> {
 
 /// console 实例环登记表（ADR-048 决策 2，T2：环实例化）。
 ///
-/// 由 devfs 挂载期 `register_instance` 填充（启动期单线程写，此后只读——
-/// 用 `Mutex<Vec>` 而非 `Once`：实例族有 N 个成员，注册时机彼此独立；
-/// 运行期不再增删，读路径走 `instance_ring` 的表扫描）。
+/// 由 devfs 挂载期与运行期 `create_instance` 经 `register_instance` 填充
+/// （`Mutex<Vec>` 而非 `Once`：实例族成员的注册时机彼此独立；B3 起运行期
+/// 也增删——读路径走 `instance_ring` 的表扫描）。
 ///
 /// **谁是合法读者**：内核 `stdin_source`（fd 0 的字节源）——P4 切换后
 /// stdin 的取字路径与 consoled 的写入路径在环上配对，**同一真值源**
@@ -274,6 +274,76 @@ pub fn instance_ring(id: usize) -> Option<Arc<ConsoleRing>> {
 /// owner 即焦点；owner==0 恒焦点 0）。T2 阶段 FOCUS 恒 0。
 pub fn console_ring() -> Option<Arc<ConsoleRing>> {
     instance_ring(FOCUS_INSTANCE.load(Ordering::Acquire))
+}
+
+// ---------- B3-C1：运行期动态实例创建（openvt 语义的内核侧地基） ----------
+
+/// 运行期实例硬上限（**含**预创建实例）。B3 owner 裁决（2026-09-28）：
+/// 64——环内存上界 = 64 x CONSOLE_RING_CAPACITY(4KiB) = 256 KiB（可控、
+/// 可预算，S33）；账本/枚举成本低；覆盖任何交互场景。无上界的环分配 = DoS
+/// 面（S20 资源耗尽先行），绝不开放「取消上限」形态。
+pub const CONSOLES_MAX: usize = 64;
+
+/// devfs 挂载期登记的 consoles 目录句柄（运行期创建实例的挂载点）。
+///
+/// 为什么存这里而不是 devfs 内部：实例创建的事务单元 = 「节点挂进目录 +
+/// 环登记进 INSTANCE_RINGS」两步必须**同函数同锁域完成**（S20 半态禁止：
+/// 节点在而环不在 → 焦点路由踩空；环在而节点不在 → open 踩空）。两步
+/// 拆在两个模块 = 半态窗口。attach 一次（devfs 启动期），此后运行期创建
+/// 走本模块单函数。
+///
+/// 锁序（S21）：CONSOLES_DIR.lock() 短临界区取 Arc 后即放；不与
+/// INSTANCE_RINGS 锁嵌套（add_child 用 DynamicDirNode 自己的 RwLock，
+/// register_instance 在 new_instance 内部拿 INSTANCE_RINGS——三者无
+/// 互相持有的路径，无死锁环）。
+static CONSOLES_DIR: Mutex<Option<alloc::sync::Arc<DynamicDirNode>>> =
+    Mutex::new(None);
+
+/// devfs 挂载期把 consoles 目录句柄交给本模块（启动生命周期内只此一次；
+/// 重复 attach 静默忽略并保持首个——与 register_instance 的「首注册赢」
+/// 同一口径，S17：启动期无更上层错误通道，覆盖反而造出双真值源）。
+pub fn attach_consoles_dir(dir: alloc::sync::Arc<DynamicDirNode>) {
+    let mut slot = CONSOLES_DIR.lock();
+    if slot.is_some() {
+        return;
+    }
+    *slot = Some(dir);
+}
+
+/// 运行期创建 console 实例（openvt 语义：申请一个新终端）。
+///
+/// 事务（S20 单事务，两步同函数）：
+///   1. `ConsoleNode::new_instance(id)`——构造即注册环（register_instance
+///      在 new_instance 内部，既有路径）；
+///   2. `CONSOLES_DIR.add_child(id)`——节点挂进 /devices/consoles/。
+/// 步骤 1 失败 = 无节点无环（自然无半态）；步骤 2 只在 1 成功后执行
+///（add_child 为 upsert，不失败）。
+///
+/// 错误（S09 全部如实，绝不吞）：
+///   - `InvalidParam`：id == 0（0 是 /devices/console 别名，永不算实例）或
+///     id >= CONSOLES_MAX（上限诚实拒绝）；
+///   - `AlreadyExists`：同 id 重复创建（幂等性由调用方账本保证，内核不吞
+///     重复——吞了会把「调用方以为创建了新实例」掩盖成静默旧实例复用）；
+///   - `NoSpace`：devfs 尚未 attach（早期调用 = 请求无法落地，不是参数错；
+///     复用 NoSpace 表「资源/设施未就绪」口径，klib Error 无更贴切变体）。
+pub fn create_instance(id: usize) -> Result<(), Error> {
+    if id == 0 || id >= CONSOLES_MAX {
+        return Err(Error::InvalidParam);
+    }
+    let dir = {
+        let slot = CONSOLES_DIR.lock();
+        match slot.as_ref() {
+            Some(d) => d.clone(),
+            None => return Err(Error::NoSpace),
+        }
+    };
+    if instance_ring(id).is_some() {
+        return Err(Error::AlreadyExists);
+    }
+    let node = alloc::sync::Arc::new(ConsoleNode::new_instance(id));
+    let name: alloc::string::String = alloc::format!("{}", id);
+    dir.add_child(name.as_str(), node);
+    Ok(())
 }
 
 /// 焦点实例切换（T3 owner 移交路径调用；越界 id 如实拒绝——S17 安全侧：

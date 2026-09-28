@@ -653,6 +653,10 @@ impl DevFS {
                 Arc::new(crate::console::ConsoleNode::new_instance(i)),
             );
         }
+        // B3-C1：把目录句柄交给 console 模块——运行期 create_instance 的
+        // 挂载点（节点挂载 + 环登记同事务，S20）。启动期只此一次。
+        // 先 attach 再 add_child（后者 move consoles_dir）。
+        crate::console::attach_consoles_dir(consoles_dir.clone());
         root.add_child("consoles", consoles_dir);
 
         // 4.6 /devices/audio/dsp（plan_audio_vfs.md 批次一 A1）

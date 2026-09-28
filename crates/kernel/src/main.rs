@@ -868,6 +868,9 @@ unsafe fn kmain_body() -> ! {
     // I-EVENTS P2（§6.15）：console 字节环契约（节点自有环，无副作用）。
     #[cfg(feature = "kernel-tests")]
     tests::test_console_byte_ring();
+    // B3-C1：运行期动态 console 实例创建契约（attach/create/registry/对抗面）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_console_runtime_create();
     // §6.12.6：RUN 域锁同核重入死锁复现（纯锁语义，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
     tests::test_run_lock_reentrancy_deadlock();

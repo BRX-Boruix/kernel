@@ -11110,6 +11110,68 @@ pub fn test_console_byte_ring() {
 
     info!("[test-console-byte-ring] PASS");
 }
+/// B3-C1（运行期动态 console 实例）：`create_instance` 契约（TDD 先行）。
+///
+/// 断言链（S06 真实链路）：
+/// 1. 未 attach consoles 目录时创建**如实失败**（NoSpace? 不——NotReady 类：
+///    用 `Error::InvalidParam`? 不诚实。真实错误 = 目录未接：用 `Error::NotDirectory`
+///    不对……未 attach = 设备层未就绪，本测试通过 attach 后的行为断言为主；
+/// 2. attach 后 create(id) → `/devices/consoles/<id>` 节点**真实可达**
+///    （DynamicDirNode.lookup 命中同一 Arc）；
+/// 3. 环登记生效：`instance_ring(id)` 返回 Some（焦点路由真值源）；
+/// 4. 对抗面（S31）：id=0 拒（0 是 /devices/console 别名，永不算实例）、
+///    id>=CONSOLES_MAX 拒（上限诚实）、重复创建 AlreadyExists（幂等由
+///    调用方账本保证，内核不吞重复——S09 不吞错误）。
+pub fn test_console_runtime_create() {
+    use vfs::console;
+    use vfs::inode::INode;
+
+    info!("[test-console-create] === B3-C1: 运行期实例创建契约 ===");
+
+    // devfs 启动期已 attach 真 consoles 目录（首注册赢，S17）——本测试
+    // 直接走真链路：create 后从 VFS 树 resolve（S06：验证的是用户 open
+    // 的同一条解析路径，不是测试私有目录）。
+    let root = crate::vfs_init::root();
+
+    // ---- 2/3. 创建 → VFS 可达 + 环登记（正常路径）----
+    console::create_instance(5).expect("create instance 5 must succeed");
+    let node = root
+        .resolve("/devices/consoles/5", true)
+        .expect("created instance must resolve in /devices/consoles");
+    assert_eq!(
+        node.node_type().expect("node_type"),
+        vfs::inode::INodeType::CharacterDevice,
+        "console instance node is a container-type char device (status 子文件)，与 /devices/console 别名同形态（test_console_byte_ring 断言 7 口径，S15）"
+    );
+    assert!(
+        console::instance_ring(5).is_some(),
+        "instance_ring(5) must be registered (focus routing truth)"
+    );
+
+    // ---- 4. 对抗面（S31）----
+    assert_eq!(
+        console::create_instance(0),
+        Err(klib::error::Error::InvalidParam),
+        "id 0 is the /devices/console alias, never an instance"
+    );
+    assert_eq!(
+        console::create_instance(console::CONSOLES_MAX),
+        Err(klib::error::Error::InvalidParam),
+        "id >= CONSOLES_MAX must be rejected honestly"
+    );
+    assert_eq!(
+        console::create_instance(5),
+        Err(klib::error::Error::AlreadyExists),
+        "duplicate create must be reported, not swallowed (S09)"
+    );
+    assert!(
+        console::instance_ring(console::CONSOLES_MAX + 1).is_none(),
+        "out-of-range id must have no ring"
+    );
+
+    info!("[test-console-create] PASS: create/reach/registry/adversarial all verified");
+}
+
 pub fn test_read_nonblock_flag() {
     use crate::syscall::{read_is_nonblock, read_is_peek, STREAM_READ_NONBLOCK, STREAM_READ_PEEK};
 
