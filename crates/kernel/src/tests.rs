@@ -7350,6 +7350,59 @@ pub fn test_audio_pipe_a2() {
 /// 4. io_stats 读计数随成功 READ(12) 增长（C16.1 对账）。
 /// 无 `-cdrom` 的运行形态（纯 `-hda`）下 cd 设备缺席——本测试按拓扑**如实
 /// 跳过**（S31：跳过必须显式留痕，不静默）。
+/// B2 第二步验收：ISO9660 挂载 + 文件内容端到端（volume_mount 的 ISO9660
+/// 回退路径 → VFS 树 → 文件字节流）。
+///
+/// 断言链（S06 真实数据链路）：
+/// 1. 挂载点存在：`/volumes/ISOIMAGE`（卷标命名；无 -cdrom 拓扑如实跳过）；
+/// 2. 根目录 list_dir 含 `boot`（目录）——PVD 根 extent 解析真实工作；
+/// 3. `boot/kernel.`（8.3 截断名）read_at 头 4 字节 = ELF 魔数 `\x7fELF`
+///    ——目录记录→extent→ATAPI READ(12)→字节缓冲的**内容链**端到端；
+/// 4. 写路径如实 ReadOnly（介质物理事实，S17）。
+pub fn test_iso9660_mount_read() {
+    use crate::vfs_init;
+
+    // 内核测试期早于 volumed：主动触发挂载（mount_device_volume 幂等，
+    // 已挂返回既有路径；设备缺席时 NotFound——无 -cdrom 拓扑如实跳过）。
+    let mount_path = match vfs_init::mount_device_volume("cd1") {
+        Ok(p) => p,
+        Err(klib::error::Error::NotFound) => {
+            info!("[test-iso] no cd1 device in this topology; SKIPPED");
+            return;
+        }
+        Err(e) => panic!("cd1 mount must succeed on cdrom topology: {:?}", e),
+    };
+    let root = vfs_init::root();
+    let vol = root
+        .resolve(&mount_path, true)
+        .expect("iso volume path resolvable after mount");
+    // 根目录列表：boot 目录在场。
+    let entries = vol.list_dir().expect("iso root list_dir");
+    let boot = entries
+        .iter()
+        .find(|e| e.name == "boot")
+        .expect("iso root must contain boot dir");
+    assert_eq!(boot.node_type, vfs::inode::INodeType::Directory);
+    // 文件内容链：boot/kernel. 头 4 字节 ELF 魔数。
+    let boot_dir = vol.lookup("boot").expect("lookup boot");
+    let kernel = boot_dir.lookup("kernel.").expect("lookup kernel. (8.3 name)");
+    let mut hdr = [0u8; 4];
+    let n = kernel.read_at(0, &mut hdr).expect("read kernel header");
+    assert_eq!(n, 4, "kernel header read must deliver 4 bytes");
+    assert_eq!(
+        &hdr,
+        b"\x7fELF",
+        "boot/kernel. must start with ELF magic (content chain end-to-end)"
+    );
+    // 写路径诚实拒绝。
+    let w = kernel.write_at(0, b"xxxx");
+    assert_eq!(w, Err(klib::error::Error::ReadOnly), "CD medium is read-only");
+    info!(
+        "[test-iso] /volumes/ISOIMAGE boot/kernel. ELF magic verified; entries={}",
+        entries.len()
+    );
+}
+
 pub fn test_atapi_cdrom_block() {
     use driver::DriverHub;
 

@@ -762,6 +762,8 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_atapi_cdrom_block();
     #[cfg(feature = "kernel-tests")]
+    tests::test_iso9660_mount_read();
+    #[cfg(feature = "kernel-tests")]
     tests::test_driver_hub_m72();
     // A2：音频管道 syscall 域（消费者注册表/两阶段 IO/退出清理）。
     #[cfg(feature = "kernel-tests")]

@@ -13,6 +13,7 @@ extern crate std;
 
 pub mod block_cache;
 pub mod ext2;
+pub mod iso9660;
 pub mod mbr;
 
 /// 块设备字节读后端最小抽象。

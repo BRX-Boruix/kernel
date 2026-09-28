@@ -1789,6 +1789,30 @@ pub fn mount_device_volume(name: &str) -> Result<String, klib::error::Error> {
         if bridge.read_bytes(0, &mut sector) < 512 {
             return Err(klib::error::Error::Corrupt);
         }
+        // B2：MBR 缺失（光介质常态，无分区表）→ **整盘裸 ISO9660** 探测。
+        // 探测序：MBR+EXT2（硬盘形态）失败后试 ISO9660（CD 形态）——两者是
+        // 介质形态的正交分支，不是回退链上的容错（S15：各自唯一判据）。
+        if fs::mbr::parse_mbr(&sector).is_err() {
+            match fs::iso9660::IsoFs::open(bridge) {
+                Ok(iso) => {
+                    let mount_table = root();
+                    let label = String::from(iso.volume_id());
+                    let result = if label.is_empty() {
+                        mount_table.mount_unnamed_volume(None, Arc::new(iso))
+                    } else {
+                        mount_table.mount_volume(&label, Arc::new(iso))
+                    };
+                    if let Ok(final_path) = &result {
+                        MOUNTED_DEVICES
+                            .lock()
+                            .push((String::from(name), final_path.clone()));
+                    }
+                    return result;
+                }
+                // 非 ISO9660：维持旧口径——非 EXT2/非 ISO 介质如实 NotSupported。
+                Err(_) => return Err(klib::error::Error::NotSupported),
+            }
+        }
         let first = fs::mbr::parse_mbr(&sector)
             .map_err(|_| klib::error::Error::Corrupt)?
             .first_partition()
