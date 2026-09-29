@@ -13,7 +13,7 @@ use crate::port::{inb, outb};
 use crate::serial;
 use crate::smp;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// 默认 LAPIC 物理基址（回退值，绝大多数 x86 平台使用 0xFEE00000）。
 ///
@@ -23,6 +23,62 @@ const DEFAULT_LAPIC_PHYS: u64 = 0xFEE0_0000;
 
 /// IA32_APIC_BASE MSR：bit 12 启用 APIC，低 12 位之上为 LAPIC 物理基址。
 const MSR_APIC_BASE: u32 = 0x1B;
+
+/// IA32_APIC_BASE bit 11：APIC 全局使能（SDM Vol3 §10.4.3）。
+const APIC_BASE_ENABLE: u64 = 1 << 11;
+/// IA32_APIC_BASE bit 10：x2APIC 使能（SDM Vol3 §10.4.3）。
+const APIC_BASE_X2APIC: u64 = 1 << 10;
+
+/// x2APIC MSR 编号 = 0x800 + 寄存器偏移/16（SDM Vol3 §10.12.1.2）。
+const X2APIC_MSR_BASE: u32 = 0x800;
+/// x2APIC ICR：单次 64 位写，目标 id 在高 32 位（SDM Vol3 §10.12.9）。
+const X2APIC_MSR_ICR: u32 = 0x830;
+
+/// LAPIC 访问模式：true = x2APIC（MSR），false = xAPIC（MMIO）。
+///
+/// 由 [`init`] 依据 Limine SMP 响应 `flags` bit0 置位——该位由引导器声明
+/// （brxlimine-rs lib.rs 552："Bit 0: X2APIC has been enabled"）。全体核共享
+/// 同一模式：x2APIC 下 0xFEE00000 的 MMIO 窗口不再代表 LAPIC。
+static X2APIC: AtomicBool = AtomicBool::new(false);
+
+/// 设置 LAPIC 访问模式（供 [`init`] 依引导器声明调用）。
+pub fn set_x2apic(on: bool) {
+    X2APIC.store(on, Ordering::Release);
+}
+
+/// 当前是否处于 x2APIC 模式。
+pub fn is_x2apic() -> bool {
+    X2APIC.load(Ordering::Acquire)
+}
+
+/// 读 MSR（本地辅助，与 syscall/gdt 同款内联写法）。
+fn msr_read(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// 写 MSR。
+fn msr_write(msr: u32, v: u64) {
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") v as u32,
+            in("edx") (v >> 32) as u32,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
 
 /// 读取 IA32_APIC_BASE MSR，返回 LAPIC 物理基址。
 ///
@@ -89,6 +145,9 @@ static TICKS: [AtomicU64; TICKS_SLOTS] = [const { AtomicU64::new(0) }; TICKS_SLO
 
 /// 读取当前 CPU 的 LAPIC ID（0~255）。
 pub fn current_lapic_id() -> u32 {
+    if is_x2apic() {
+        return lapic_read(LAPIC_ID); // x2APIC：32 位完整 id（SDM §10.12.5）
+    }
     lapic_read(LAPIC_ID) >> 24
 }
 
@@ -133,12 +192,15 @@ pub fn system_ticks() -> u64 {
 /// 供 panic 等场景安全读取 CPU id：未映射时调用 `current_lapic_id` 会访问
 /// 虚拟地址 0 附近触发二次页错误，需先经此检查。
 pub fn is_mapped() -> bool {
-    LAPIC_VIRT.load(Ordering::Relaxed) != 0
+    is_x2apic() || LAPIC_VIRT.load(Ordering::Relaxed) != 0
 }
 
 /// 读取 LAPIC 寄存器（基于映射后的虚拟地址）。
 #[inline]
 fn lapic_read(reg: usize) -> u32 {
+    if is_x2apic() {
+        return msr_read(X2APIC_MSR_BASE + (reg as u32 >> 4)) as u32;
+    }
     // LAPIC 必须 16 字节对齐访问
     let virt = LAPIC_VIRT.load(Ordering::Relaxed);
     unsafe { mmio::read_u32(virt + reg as u64) }
@@ -147,6 +209,10 @@ fn lapic_read(reg: usize) -> u32 {
 /// 写入 LAPIC 寄存器。
 #[inline]
 fn lapic_write(reg: usize, val: u32) {
+    if is_x2apic() {
+        msr_write(X2APIC_MSR_BASE + (reg as u32 >> 4), val as u64);
+        return;
+    }
     let virt = LAPIC_VIRT.load(Ordering::Relaxed);
     unsafe { mmio::write_u32(virt + reg as u64, val) };
 }
@@ -182,6 +248,14 @@ const ICI_SEND_POLL_LIMIT: u32 = 1_000_000;
 /// 返回 `true` = 已成功发出；`false` = LAPIC 未映射或发送队列未在有界轮询
 /// 内排空（调用方按失败处理，如降级为本地排空并告警）。
 pub fn send_fixed_ipi(dest_lapic_id: u32, vector: u8) -> bool {
+    if is_x2apic() {
+        // 单次 64 位写即触发投递（SDM §10.12.9），无需 MMIO 高/低半两次写。
+        msr_write(
+            X2APIC_MSR_ICR,
+            ((dest_lapic_id as u64) << 32) | (vector as u64) | ICR_LEVEL_ASSERT as u64,
+        );
+        return true;
+    }
     if !is_mapped() {
         return false;
     }
@@ -335,25 +409,33 @@ static CALIBRATED_BUS_FREQ: AtomicU64 = AtomicU64::new(0);
 /// AP 不应调用本函数——它们只需 init_timer_self（在 ap_entry 里调），
 /// 不重复映射/校准/注入全局状态。
 pub fn init() {
-    // 0. 从 MSR IA32_APIC_BASE 读取真实 LAPIC 物理基址，避免硬编码 0xFEE00000。
-    //    若 MSR 报告 LAPIC 已启用（bit 12），使用其基址；否则回退默认值。
-    let apic_base = read_apic_base();
-    let phys = if apic_base & (1 << 12) != 0 {
-        apic_base & !0xFFF
+    // 0. 访问模式：引导器在 Limine SMP 响应 flags bit0 声明是否已使能 x2APIC
+    //    （brxlimine-rs lib.rs 552）。必须先于任何 LAPIC 访问确定。
+    set_x2apic(smp::x2apic_enabled());
+    if is_x2apic() {
+        // x2APIC：0xFEE00000 的 MMIO 窗口不再代表 LAPIC，不做映射。
+        klib::info!("[lapic] x2APIC mode: MSR access (id={})", current_lapic_id());
     } else {
-        DEFAULT_LAPIC_PHYS
-    };
-    // 映射到高半区虚拟地址：统一设备映射基址（mmio::DEVICE_MMIO_VIRT_BASE，
-    // arch1.md AA2：不再各文件硬编码 HHDM 形状的魔数）。
-    let virt = phys | mmio::DEVICE_MMIO_VIRT_BASE;
-    LAPIC_VIRT.store(virt, Ordering::Relaxed);
+        // 1. 从 MSR IA32_APIC_BASE 读取真实 LAPIC 物理基址，避免硬编码 0xFEE00000。
+        //    若 MSR 报告 LAPIC 已启用（bit 12），使用其基址；否则回退默认值。
+        let apic_base = read_apic_base();
+        let phys = if apic_base & (1 << 12) != 0 {
+            apic_base & !0xFFF
+        } else {
+            DEFAULT_LAPIC_PHYS
+        };
+        // 映射到高半区虚拟地址：统一设备映射基址（mmio::DEVICE_MMIO_VIRT_BASE，
+        // arch1.md AA2：不再各文件硬编码 HHDM 形状的魔数）。
+        let virt = phys | mmio::DEVICE_MMIO_VIRT_BASE;
+        LAPIC_VIRT.store(virt, Ordering::Relaxed);
 
-    // 把 LAPIC 物理地址映射到高半区虚拟地址（全局内核页表，全体核共享该映射）
-    if !mmio::map_lapic(phys, virt) {
-        klib::info!("[lapic] map failed");
-        return;
+        // 把 LAPIC 物理地址映射到高半区虚拟地址（全局内核页表，全体核共享该映射）
+        if !mmio::map_lapic(phys, virt) {
+            klib::info!("[lapic] map failed");
+            return;
+        }
+        klib::info!("[lapic] mapped to {:#x}", virt);
     }
-    klib::info!("[lapic] mapped to {:#x}", virt);
 
     // 1. 使能 LAPIC（SVR，伪中断向量 = interrupts::SPURIOUS_VECTOR，
     //    IDT 已在 interrupts::init 填充对应表项——arch1.md AA3）
@@ -401,6 +483,26 @@ pub fn init() {
     klib::info!("[lapic] LAPIC timer initialized (BSP)");
 }
 
+/// 确保**本核**处于 x2APIC 模式（IA32_APIC_BASE bit10）。
+///
+/// IA32_APIC_BASE 是每 CPU 寄存器：AP 经 INIT 启动后回到 xAPIC，而内核的
+/// LAPIC 访问模式是全局的（由引导器 flags 决定）。因此 AP 入口必须在任何
+/// LAPIC 访问（含 `current_lapic_id`）之前调用本函数，否则 x2APIC MSR 读会
+/// 在 xAPIC 的核上触发 #GP。幂等：已是 x2APIC 时直接返回。
+///
+/// **本函数不得打印日志**：它在 AP 的 per-CPU 状态就绪之前运行，而 klib 的
+/// 串口锁以 CPU 槽位做同核重入检测——槽位未就绪时 `cpu_slot_id()` 回退为常量
+/// 1，会把「BSP 持有该锁」误判为「本核重入」并当场 panic（M12 实测：日志行
+/// 加入后 AP 一上线即报 SpinMutex 同核重入）。
+pub fn ensure_x2apic_on_this_cpu() {
+    if !is_x2apic() {
+        return;
+    }
+    let base = read_apic_base();
+    if base & APIC_BASE_X2APIC == 0 {
+        msr_write(MSR_APIC_BASE, base | APIC_BASE_ENABLE | APIC_BASE_X2APIC);
+    }
+}
 /// 启动当前 CPU 的 LAPIC 周期定时器（100Hz）。
 ///
 /// 每核一份硬件资源：BSP 在 init 末尾调用；每个 AP 在 smp::ap_entry 上线后调用。

@@ -106,10 +106,12 @@ impl<T> SpinMutex<T> {
         let me = self::cpu_slot_id();
         let owner = self.owner.load(Ordering::Acquire);
         if owner == me {
+            // cpu_slot_id() 返回「槽位 + 1」（0 是 owner 的未持有哨兵），
+            // 报告时还原为槽位号，避免误导排查方向。
             panic!(
                 "SpinMutex 同核重入死锁：本 CPU (slot {}) 已持有本锁；\
                  纯自旋锁在此必然永久自旋。请检查中断上下文中是否重入了同一把锁",
-                me
+                me.wrapping_sub(1)
             );
         }
         while self
