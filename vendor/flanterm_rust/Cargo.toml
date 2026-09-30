@@ -3,6 +3,7 @@ name = "flanterm_rust"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "MIT AND BSD-2-Clause"
 
 [lib]
 path = "src/lib.rs"
