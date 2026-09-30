@@ -30,17 +30,6 @@ static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// `ap_self_halted() > 0` 则缺口中有已知自杀者（配置问题），而非纯启动慢。
 static AP_SELF_HALTED: AtomicUsize = AtomicUsize::new(0);
 
-/// 引导器是否已使能 x2APIC（Limine SMP 响应 `flags` bit0）。
-///
-/// brxlimine-rs lib.rs 552："Bit 0: X2APIC has been enabled"。引导器在交出
-/// 控制权前完成切换时置位，内核据此选择 LAPIC 访问模式（MSR vs MMIO）。
-pub fn x2apic_enabled() -> bool {
-    SMP_REQUEST
-        .get_response()
-        .get()
-        .map(|r| r.flags & 1 != 0)
-        .unwrap_or(false)
-}
 /// 读取因防御分支自停的 AP 计数。
 pub fn ap_self_halted() -> usize {
     AP_SELF_HALTED.load(Ordering::Acquire)
@@ -341,11 +330,6 @@ pub fn total_cpus() -> usize {
 /// 槽位索引由 BSP 在 `extra_argument` 中指定（紧凑唯一，从 1 开始）。
 #[unsafe(no_mangle)]
 extern "C" fn ap_entry(info: *const limine::SmpInfo) -> ! {
-    // AP 经 INIT 启动后是 xAPIC；内核的 LAPIC 访问模式是全局的（由引导器
-    // flags 决定），故必须在任何 LAPIC 访问（含 current_lapic_id）之前把本核
-    // 切到 x2APIC，否则 x2APIC MSR 读会在 xAPIC 的核上触发 #GP。
-    lapic::ensure_x2apic_on_this_cpu();
-
     // 从 extra_argument 取得 BSP 分配的唯一槽位索引（>=1）
     let slot = unsafe { (*info).extra_argument as usize };
 
