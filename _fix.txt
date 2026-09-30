@@ -1,0 +1,9 @@
+﻿fix(cpu): 每个 CPU 补齐 CR4 的 SSE/FPU 位，不再依赖引导器留下的 CR4
+
+实测（liftoff 引导）：BSP CR4=0x668（含 OSFXSR|OSXMMEXCPT），AP 只有 0x20（PAE）
+—— liftoff 的 AP trampoline 在 16 位阶段只置 PAE。于是 AP 的 FPU/SSE 探测因
+OSFXSR/OSXMMEXCPT 未置位触发 #UD，异常返回后重试 → 无限「CPU EXCEPTION」风暴
+（init spawned 之后 30+ 次横幅），登录提示永不出现。
+
+brxLimine 的 trampoline 恰好置好了这些位，所以缺陷一直没暴露。enable_features()
+现在按内核自身需要补齐 OSFXSR/OSXMMEXCPT/PGE，与引导器解耦。

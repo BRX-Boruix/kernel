@@ -524,6 +524,15 @@ pub fn enable_smep_smap() {
     if fsgsbase_ok {
         cr4 |= FSGSBASE;
     }
+    // SSE/FPU 与全局页：**每个 CPU 都必须置位**，不能依赖引导器或早期 trampoline
+    // 留下的 CR4。liftoff 的 AP trampoline 在 16 位阶段只置了 PAE（AP 实测
+    // CR4=0x20），于是 AP 的 FPU/SSE 探测因 OSFXSR/OSXMMEXCPT 未置位触发 #UD，
+    // 异常返回后又重试 → 无限「CPU EXCEPTION」风暴，PID 1 永远轮不上（实测：
+    // init spawned 之后 30+ 次异常横幅，登录提示永不出现）。
+    const OSFXSR: u64 = 1 << 9;      // SDM Vol3 §13.5.4：SSE 指令可用
+    const OSXMMEXCPT: u64 = 1 << 10; // 同节：SSE 异常可用
+    const PGE: u64 = 1 << 7;         // 全局页（BSP 本就有，AP 需一致）
+    cr4 |= OSFXSR | OSXMMEXCPT | PGE;
     mmio::write_cr4(cr4);
 
     klib::info!(
