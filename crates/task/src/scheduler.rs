@@ -4401,6 +4401,31 @@ pub fn start() -> ! {
         // At AP entry no user process FPU state is loaded yet, so a transient SSE op is
         // safe (the first scheduled process does fpu::restore anyway). If TS were set,
         // fnstcw below would #NM - this proves FP instructions run on the AP.
+        // 引导器差异定位（临时诊断）：打印本核执行第一条 x87 指令之前的 CPU 状态，
+        // 与 brxLimine 链路逐字段对比，找出 liftoff trampoline 未建立的 Limine 保证
+        // （"AP 的 CPU 状态与 BSP 一致"）里到底是哪一项让 x87 前置条件不满足。
+        {
+            let cr0d: u64;
+            let cr4d: u64;
+            let trd: u16;
+            let idt_base: u64;
+            let gdt_base: u64;
+            unsafe {
+                core::arch::asm!("mov {}, cr0", out(reg) cr0d, options(nomem, nostack));
+                core::arch::asm!("mov {}, cr4", out(reg) cr4d, options(nomem, nostack));
+                core::arch::asm!("str ax", out("ax") trd, options(nomem, nostack));
+                let mut idtr = [0u8; 10];
+                let mut gdtr = [0u8; 10];
+                core::arch::asm!("sidt [{}]", in(reg) idtr.as_mut_ptr(), options(nostack));
+                core::arch::asm!("sgdt [{}]", in(reg) gdtr.as_mut_ptr(), options(nostack));
+                idt_base = u64::from_le_bytes([idtr[2], idtr[3], idtr[4], idtr[5], idtr[6], idtr[7], 0, 0]);
+                gdt_base = u64::from_le_bytes([gdtr[2], gdtr[3], gdtr[4], gdtr[5], gdtr[6], gdtr[7], 0, 0]);
+            }
+            klib::info!(
+                "[sched] AP slot {} pre-x87: cr0={:#x} cr4={:#x} tr={:#x} idt={:#x} gdt={:#x}",
+                entry_slot, cr0d, cr4d, trd, idt_base, gdt_base
+            );
+        }
         let mut fpcheck: u16 = 0;
         unsafe { core::arch::asm!("fnstcw [{}]", in(reg) &mut fpcheck, options(nostack)); }
         // x87 control word low bits: 0x037F default (rounding/precision). Bit set => FPU live.
