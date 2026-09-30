@@ -4,3 +4,13 @@
 *.toml text eol=lf
 *.md   text eol=lf
 *      text=auto
+# ---- cargo vendor 产物必须逐字节保真 ----
+# vendor/registry 下每个 crate 都带 .cargo-checksum.json，它记录的是**文件内容哈希**；
+# 许可证文本还会经 include_str! 进内核（/system/licenses）。行尾若被上面的
+# `* text=auto` 转换，会造成两处失真：哈希失配，以及披露文本随平台漂移（S04）。
+# 故整棵 vendored 树禁用一切行尾转换。
+vendor/registry/** -text
+# 这两个文件同样经 include_str! 进内核，且是「逐字节取自上游」的披露来源。
+vendor/flanterm_rust/LICENSE-MIT -text
+vendor/flanterm_rust/LICENSE-BSD-2 -text
+
