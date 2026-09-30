@@ -14,6 +14,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use arch::Platform;
 use core::sync::atomic::{AtomicBool, Ordering};
+use crate::licenses;
 use spin::Mutex;
 use spin::Once;
 
@@ -1432,10 +1433,22 @@ fn build_skeleton(mount_table: &Arc<vfs::mount::MountTable>) {
     // 运行时文件）；SysFS 只读 JSON 视图挂载到子目录 `/system/info/`，避免
     // 虚视图遮蔽真实存储归属。
     ensure_dir("/system/info");
+    // `/system/licenses`：法律披露域目录。真实目录而非虚视图——ADR-012 §3 #3
+    // 规定只读虚视图一律挂 `/system/info/`。
+    ensure_dir("/system/licenses");
     let sysfs = Arc::new(SysFS::new(Arc::new(KernelSystemProvider)));
     mount_table
         .mount("/system/info", sysfs)
         .expect("mount sysfs at /system/info");
+
+    // ---- /system/licenses/：随二进制披露的许可证全文 ----
+    //
+    // 收录判据是"组件代码真的进了内核二进制"（不是"在 vendor/ 下"）：当前登记
+    // flanterm_rust（经 crates/term）与 brxlimine-rs（经 kernel/mm/arch-x86_64）。
+    // 组件表与判据见 crate::licenses；尚未收录的缺口见 kernel/NOTICE.md。
+    // 播种为**权威重写**（先截断再写满），语义与失败模式见该模块文档；
+    // 对抗验证见 tests::test_licenses_vfs。
+    licenses::seed_all(mount_table);
 
     let devfs = Arc::new(DevFS::new(Arc::new(KernelDeviceProvider)));
     mount_table.mount("/devices", devfs).expect("mount devfs");

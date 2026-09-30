@@ -4292,6 +4292,187 @@ pub fn test_vfs_lexicon() {
     );
 }
 
+/// `/system/licenses/` 法律披露文件的真实链路验收。
+///
+/// 对 [`licenses::COMPONENTS`] **逐个**组件断言，而不是只测某一个——组件表是
+/// 唯一登记点，测试若写死某个组件名，新增组件时会静默漏测（S28）。
+///
+/// 覆盖：
+/// 1. 每个组件经**活体挂载表**可达，且为普通文件、权限 `0644`、属主 `(0,0)`；
+/// 2. 盘上字节与内核内嵌文本**长度与内容逐字节相等**——证明写入完整，
+///    不是"建了个空文件"或短写（S06/S09）；
+/// 3. 每个组件的文本含其许可证的关键标识串；
+/// 4. **对抗（S31）**：先塞入比正文更长的旧内容再重新播种，读回仍逐字节
+///    等于正文。若实现漏掉"先截断"，只有本项能抓住残留的旧尾巴。
+///
+/// 每次断言前都重新经挂载表 `resolve`，不跨写操作复用旧节点句柄——
+/// RamFS 缓存同一 `Arc`、EXT2 每次新建，复用句柄会让断言依赖具体后端的
+/// 元数据缓存行为（S04 平台差异显式化）。
+pub fn test_licenses_vfs() {
+    use crate::licenses;
+    use crate::vfs_init;
+    use vfs::inode::INodeType;
+
+    info!("[test-licenses] === /system/licenses real-chain selftest ===");
+
+    let root = vfs_init::root();
+    assert!(
+        !licenses::COMPONENTS.is_empty(),
+        "license component table must not be empty"
+    );
+
+    // 1+2. 每个登记组件：可达 / 类型 / 权限 / 属主 / 逐字节等于内嵌文本
+    for component in licenses::COMPONENTS {
+        let path = alloc::format!("{}/{}", licenses::DIR, component.file_name);
+        let node = root
+            .resolve(path.as_str(), true)
+            .unwrap_or_else(|e| panic!("resolve {}: {:?}", path, e));
+        let meta = node
+            .metadata()
+            .unwrap_or_else(|e| panic!("metadata {}: {:?}", path, e));
+        assert_eq!(
+            meta.node_type,
+            INodeType::RegularFile,
+            "{} must be a regular file",
+            path
+        );
+        assert_eq!(
+            meta.permissions.classic_mode(),
+            0o644,
+            "{} must be 0644 (readable by any identity)",
+            path
+        );
+        assert_eq!(meta.permissions.owner_uid(), 0, "{} owner uid", path);
+        assert_eq!(meta.permissions.owner_gid(), 0, "{} owner gid", path);
+
+        let expected = component.text.as_bytes();
+        assert!(
+            !expected.is_empty(),
+            "{} embedded text must not be empty",
+            path
+        );
+        assert_eq!(
+            meta.size as usize,
+            expected.len(),
+            "{} on-disk size must equal embedded length",
+            path
+        );
+        let mut buf = alloc::vec::Vec::new();
+        buf.resize(expected.len(), 0u8);
+        let n = node
+            .read_at(0, &mut buf)
+            .unwrap_or_else(|e| panic!("read {}: {:?}", path, e));
+        assert_eq!(n, expected.len(), "{} short read", path);
+        assert!(
+            buf.as_slice() == expected,
+            "{} on-disk bytes differ from embedded text",
+            path
+        );
+    }
+    info!(
+        "[test-licenses] {} component(s) reachable, 0644, byte-identical",
+        licenses::COMPONENTS.len()
+    );
+
+    // 3. 逐组件的标识串：证明内嵌的确是那个组件的许可证，不是空壳或串台。
+    //
+    // 这张表必须覆盖**每一个**登记组件（下方有覆盖性守卫）——否则新增组件时
+    // 内容断言会静默缺失、测试照样全绿（S28：防"实现了却没接上"）。
+    const MARKERS: &[(&str, &str)] = &[
+        ("kernel.txt", "Yang Borui"),
+        ("flanterm_rust.txt", "Mintsuki"),
+        ("flanterm_rust.txt", "BSD-2-Clause"),
+        ("flanterm_rust.txt", "Redistribution and use in source and binary forms"),
+        ("brxlimine-rs.txt", "Anhad Singh"),
+        ("spin.txt", "Mathijs van de Nes"),
+        ("lock_api.txt", "The Rust Project Developers"),
+        ("scopeguard.txt", "Ulrik Sverdrup"),
+        ("buddy_system_allocator.txt", "Jiajie Chen"),
+    ];
+    let text_of = |name: &str| -> &'static str {
+        licenses::COMPONENTS
+            .iter()
+            .find(|c| c.file_name == name)
+            .map(|c| c.text)
+            .unwrap_or_else(|| panic!("component '{}' not registered", name))
+    };
+    for (name, marker) in MARKERS {
+        assert!(
+            text_of(name).contains(marker),
+            "{} missing marker: {}",
+            name,
+            marker
+        );
+    }
+    for component in licenses::COMPONENTS {
+        assert!(
+            MARKERS.iter().any(|(n, _)| *n == component.file_name),
+            "component '{}' has no content marker in MARKERS - add one",
+            component.file_name
+        );
+    }
+    info!(
+        "[test-licenses] all {} component(s) carry their identifying markers",
+        licenses::COMPONENTS.len()
+    );
+
+    // 4. 对抗：更长的旧内容在重新播种后不得残留（对全部组件）
+    for component in licenses::COMPONENTS {
+        let path = alloc::format!("{}/{}", licenses::DIR, component.file_name);
+        let mut stale = alloc::vec::Vec::new();
+        stale.resize(component.text.len() + 512, b'X');
+        let written = root
+            .resolve(path.as_str(), true)
+            .unwrap_or_else(|e| panic!("re-resolve {}: {:?}", path, e))
+            .write_at(0, &stale)
+            .unwrap_or_else(|e| panic!("stale write {}: {:?}", path, e));
+        assert_eq!(written, stale.len(), "{} stale write must be full", path);
+        assert_eq!(
+            root.resolve(path.as_str(), true)
+                .unwrap_or_else(|e| panic!("re-resolve {}: {:?}", path, e))
+                .metadata()
+                .unwrap_or_else(|e| panic!("meta {}: {:?}", path, e))
+                .size as usize,
+            stale.len(),
+            "{} precondition: stale content must be longer",
+            path
+        );
+    }
+
+    licenses::seed_all(&root);
+
+    for component in licenses::COMPONENTS {
+        let path = alloc::format!("{}/{}", licenses::DIR, component.file_name);
+        let node = root
+            .resolve(path.as_str(), true)
+            .unwrap_or_else(|e| panic!("re-resolve {}: {:?}", path, e));
+        let expected = component.text.as_bytes();
+        assert_eq!(
+            node.metadata()
+                .unwrap_or_else(|e| panic!("meta {}: {:?}", path, e))
+                .size as usize,
+            expected.len(),
+            "{} reseed must truncate away the stale tail",
+            path
+        );
+        let mut buf = alloc::vec::Vec::new();
+        buf.resize(expected.len(), 0u8);
+        assert_eq!(
+            node.read_at(0, &mut buf)
+                .unwrap_or_else(|e| panic!("read {}: {:?}", path, e)),
+            expected.len(),
+            "{} short read after reseed",
+            path
+        );
+        assert!(buf.as_slice() == expected, "{} reseed left stale bytes", path);
+    }
+
+    info!(
+        "[test-licenses] PASS ({} component(s); stale-tail rewrite clean)",
+        licenses::COMPONENTS.len()
+    );
+}
+
 /// M6.2：验证进程文件描述符表（FD Table）与 IO 域系统调用。
 ///
 /// 覆盖：

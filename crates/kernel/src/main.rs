@@ -8,6 +8,7 @@ extern crate alloc;
 mod acpi;
 mod drivers;
 mod ipc_init;
+mod licenses;
 mod panic;
 mod symbols;
 mod syscall;
@@ -666,6 +667,10 @@ unsafe fn kmain_body() -> ! {
     // 词法规范 v2（ADR-005）命名 linter：根命名空间词表契约。
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_lexicon();
+    // /system/licenses/flanterm_rust.txt 法律披露：内嵌许可证全文真实落盘
+    // （逐字节比对 + 更旧长内容重写不留尾巴）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_licenses_vfs();
     #[cfg(feature = "kernel-tests")]
     tests::test_vfs_m62();
     #[cfg(feature = "kernel-tests")]

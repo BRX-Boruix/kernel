@@ -4,3 +4,18 @@
 # 代价：每个函数多保留 rbp（少量栈/寄存器开销），对内核可接受。
 [target.x86_64-unknown-none]
 rustflags = ["-C", "force-frame-pointers=yes"]
+# ---- cargo vendor（ADR 纪律：registry 依赖的源码与许可证随仓入库）----
+#
+# 目的有二：① 构建不依赖本机 cargo 缓存与网络（S01：代码离开这台电脑、
+# 换一个系统不改一行能跑）；② 让第三方许可证文本进入**仓库内相对路径**，
+# 从而可用 `include_str!` 内嵌进内核（此前它们只存在于本机 registry 缓存，
+# 是 /system/licenses 披露的缺口）。
+#
+# 由 `cargo vendor vendor/registry` 生成。**更新依赖后必须重跑该命令**，
+# 并复核 `python tools/checks/regression/license_audit.py`（未披露即 exit 1）。
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor/registry"
+
