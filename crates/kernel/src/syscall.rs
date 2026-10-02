@@ -3011,9 +3011,15 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
     /// prog_name 末段长度上限（超长拒绝，防注册表/日志被撑爆）。
     const PROG_NAME_MAX_LEN: usize = 63;
     /// 命令行缓冲容量。KM5：超出即 E2BIG 显式失败——静默截断会把被裁剪的
-    /// 命令行伪装成完整交付。A11（owner 指令 2026-09-27）：512 → 4096
-    ///（与 PATH_MAX 同量级；内核栈 64KB 下 4KiB 栈缓冲安全）。真动态堆
-    /// 分配不做——spawn 热路径的栈缓冲简单性优先（S24）。
+    /// 命令行伪装成完整交付。A11（owner 指令 2026-09-27）：512 → 4096。
+    ///
+    /// **缓冲必须在堆上**（S33；本决定晚于 A11，以 2026-09-28 的 B3 实证为准）：
+    /// 本函数运行在**16 KiB 专用 syscall 栈**上（arch percpu.rs 的
+    /// `SYSCALL_STACKS`），A11 当时按"内核栈 64KB"论证的 4 KiB 栈缓冲对该预算
+    /// **不成立**。实测（3P4-1）：TLS 装配给这条调用链再加几百字节后，栈写穿
+    /// SYSCALL_STACKS 池、返回地址被覆盖，症状为**内核态取指 Page Fault
+    /// error=0x11**——与 percpu.rs 记录的 B3 案同型（那里的结论就是"栈上大对象
+    /// 一律入堆"）。故改用堆分配；失败如实上抛，不静默截断、不降级。
     const CMD_BUF_BYTES: usize = 4096;
     // 注意：本门限只保证「内核缓冲放得下」。**入口字符串区的真实上限是
     // loader 的 `STR_OFF - 1 = 511` 字节**（docs/abi/syscall-abi.md §4），
@@ -3024,7 +3030,12 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
         return pack_err(Error::ArgListTooLong);
     }
     // 拷命令行到内核缓冲（带 SMAP 安全的 copy_from_user）。空命令行 → 正常启动。
-    let mut cmd = [0u8; CMD_BUF_BYTES];
+    // 堆分配（S33）：4 KiB 栈缓冲在 16 KiB syscall 栈上会写穿 SYSCALL_STACKS 池。
+    let mut cmd: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if cmd.try_reserve_exact(CMD_BUF_BYTES).is_err() {
+        return pack_err(Error::OutOfMemory);
+    }
+    cmd.resize(CMD_BUF_BYTES, 0);
     let cmd_len = if arg_len == 0 {
         0
     } else {
