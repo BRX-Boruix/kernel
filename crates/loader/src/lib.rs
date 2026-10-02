@@ -67,7 +67,7 @@ pub(crate) mod raw {
     /// 下静默回绕、debug 下 overflow panic；这里全程 checked，溢出返回
     /// `None`，由调用方统一翻译为 `Error::InvalidParam`。
     #[inline]
-    pub(crate) fn align_up_checked(v: u64, align: u64) -> Option<u64> {
+    fn align_up_checked(v: u64, align: u64) -> Option<u64> {
         debug_assert!(align.is_power_of_two());
         Some(v.checked_add(align - 1)? & !(align - 1))
     }
@@ -317,13 +317,12 @@ pub(crate) mod raw {
         Load,
         /// 无需装载、跳过安全（PT_NULL / PT_NOTE / PT_PHDR / PT_GNU_* 等）。
         Skip,
-        /// PT_TLS：镜像声明了线程局部存储段——**解析为模板**（不装载、不映射）。
+        /// 明确拒绝：PT_TLS——镜像声明了线程局部存储段，而用户态 TLS 未实现。
         ///
-        /// 此前该段被静默跳过（程序装载成功却在首次 fs: 访问处取指 fault），
-        /// 3P0-4 起改为显式拒绝。3P4-1 落地用户态 TLS 后，本类改为「记录模板」：
-        /// 每线程的 TLS 块由内核按该模板分配、初始化，并把 FS base 指向块尾 TCB。
-        /// 模板的 .tdata 内容仍在某个 PT_LOAD 段内（本类不负责映射）。
-        TlsTemplate,
+        /// 此前该段被静默跳过：镜像「装载成功」，程序却在首次 fs: 访问
+        /// （errno / thread_local!）处取指 fault。伪支持比显式拒绝更糟（S09）：
+        /// 故障点离原因太远。TLS 落地后（docs/TODO/3p.md 3P4-1）本分支改为装载。
+        RejectTls,
         /// 明确拒绝：PT_INTERP——镜像要求动态链接器，而本加载器只接受静态
         /// ET_EXEC（ET_DYN 已在 parse_header 处拒绝）。
         RejectInterp,
@@ -345,69 +344,11 @@ pub(crate) mod raw {
         const PT_TLS: u32 = 7;
         match p_type {
             PT_LOAD => PhdrClass::Load,
-            PT_TLS => PhdrClass::TlsTemplate,
+            PT_TLS => PhdrClass::RejectTls,
             PT_INTERP => PhdrClass::RejectInterp,
             PT_DYNAMIC => PhdrClass::RejectDynamic,
             _ => PhdrClass::Skip,
         }
-    }
-
-    // ---------- PT_TLS 模板（用户态 TLS，docs/TODO/3p.md 3P4-1） ----------
-
-    /// ELF PT_TLS 描述的用户态 TLS 模板。
-    ///
-    /// **模板不是映射**：[offset, offset+filesz) 是 .tdata 在镜像文件中的初值，
-    /// 其虚拟地址 vaddr 落在某个 PT_LOAD 段内（因此装载后也可从用户地址空间读到）。
-    /// 每个线程需要自己的一份副本：内核按 memsz/align 分配块，把 filesz 字节初值
-    /// 拷进去、其余补零，然后令 FS base = 块尾 TCB。
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct TlsTemplate {
-        /// .tdata 初值在文件中的偏移。
-        pub offset: u64,
-        /// .tdata 初值的目标虚拟地址（仅用于范围校验；块是另分配的）。
-        pub vaddr: u64,
-        /// 已初始化部分大小（.tdata）。
-        pub filesz: u64,
-        /// TLS 块大小（.tdata + .tbss）。
-        pub memsz: u64,
-        /// 块对齐（ELF 要求 0 或 2 的幂）。
-        pub align: u64,
-    }
-
-    /// 解析并校验一个 PT_TLS 程序头（纯函数，host 单测覆盖）。
-    ///
-    /// 校验（loader1 的对抗输入纪律）：
-    /// - filesz <= memsz（否则声明了超出块大小的初值）；
-    /// - align 为 0/1 或 2 的幂（ELF 规范要求）；
-    /// - offset + filesz 落在镜像内（L2：越界会把镜像外内存当初值拷进用户页）；
-    /// - vaddr + filesz 不回绕（checked）。
-    ///
-    /// 「模板虚拟地址必须落在某个已加载段内」由 backend 结合段区间集合校验——
-    /// 本函数不持有段信息。
-    pub(crate) fn parse_tls_template(elf: &[u8], ph: usize) -> Result<TlsTemplate, Error> {
-        let offset = rd_u64(elf, ph + 8);
-        let vaddr = rd_u64(elf, ph + 16);
-        let filesz = rd_u64(elf, ph + 32);
-        let memsz = rd_u64(elf, ph + 40);
-        let align = rd_u64(elf, ph + 48);
-        if filesz > memsz {
-            return Err(Error::InvalidParam);
-        }
-        if align != 0 && align != 1 && !align.is_power_of_two() {
-            return Err(Error::InvalidParam);
-        }
-        let file_end = offset.checked_add(filesz).ok_or(Error::OutOfRange)?;
-        if file_end > elf.len() as u64 {
-            return Err(Error::InvalidParam);
-        }
-        vaddr.checked_add(filesz).ok_or(Error::OutOfRange)?;
-        Ok(TlsTemplate {
-            offset,
-            vaddr,
-            filesz,
-            memsz,
-            align,
-        })
     }
 
     // ---------- host 单测（`cargo test -p loader`） ----------
@@ -755,8 +696,8 @@ pub(crate) mod raw {
 
         #[test]
         fn classify_phdr_rejects_unimplemented_capabilities() {
-            // PT_TLS(7)：3P4-1 起改为**解析模板**（不再是拒绝）。
-            assert_eq!(classify_phdr(7), PhdrClass::TlsTemplate);
+            // PT_TLS(7)：用户态 TLS 未实现——静默跳过后程序首次 fs: 访问即崩。
+            assert_eq!(classify_phdr(7), PhdrClass::RejectTls);
             // PT_INTERP(3)：需要动态链接器；本加载器只接受静态 ET_EXEC。
             assert_eq!(classify_phdr(3), PhdrClass::RejectInterp);
             // PT_DYNAMIC(2)：动态链接元数据；本加载器不做任何重定位。
@@ -774,64 +715,6 @@ pub(crate) mod raw {
             assert_eq!(classify_phdr(4), PhdrClass::Skip); // PT_NOTE
             assert_eq!(classify_phdr(6), PhdrClass::Skip); // PT_PHDR
         }
-
-        // ---- parse_tls_template：PT_TLS 模板解析与校验 ----
-
-        /// 覆写 build_elf 留下的占位程序头（位于偏移 64，长度 56）。
-        fn write_phdr_fields(e: &mut alloc::vec::Vec<u8>, p_offset: u64, p_vaddr: u64, filesz: u64, memsz: u64, align: u64) {
-            let ph = EHDR_SIZE;
-            e[ph..ph + 4].copy_from_slice(&7u32.to_le_bytes()); // PT_TLS
-            e[ph + 4..ph + 8].copy_from_slice(&4u32.to_le_bytes()); // PF_R
-            e[ph + 8..ph + 16].copy_from_slice(&p_offset.to_le_bytes());
-            e[ph + 16..ph + 24].copy_from_slice(&p_vaddr.to_le_bytes());
-            e[ph + 24..ph + 32].copy_from_slice(&0u64.to_le_bytes()); // p_paddr
-            e[ph + 32..ph + 40].copy_from_slice(&filesz.to_le_bytes());
-            e[ph + 40..ph + 48].copy_from_slice(&memsz.to_le_bytes());
-            e[ph + 48..ph + 56].copy_from_slice(&align.to_le_bytes());
-        }
-
-        /// 组装「头 + 1 个 PT_TLS 程序头 + 16 字节模板内容」的最小镜像。
-        fn build_tls_elf(p_offset: u64, p_vaddr: u64, filesz: u64, memsz: u64, align: u64) -> alloc::vec::Vec<u8> {
-            let mut e = build_elf(0x40_0000, EHDR_SIZE as u64, 56, 1);
-            write_phdr_fields(&mut e, p_offset, p_vaddr, filesz, memsz, align);
-            e.extend_from_slice(&[0xA5; 16]);
-            e
-        }
-
-        #[test]
-        fn tls_template_reads_fields() {
-            let elf = build_tls_elf(120, 0x40_2000, 4, 8, 4);
-            let t = parse_tls_template(&elf, 64).expect("合法 PT_TLS");
-            assert_eq!(t.offset, 120);
-            assert_eq!(t.vaddr, 0x40_2000);
-            assert_eq!(t.filesz, 4);
-            assert_eq!(t.memsz, 8);
-            assert_eq!(t.align, 4);
-        }
-
-        #[test]
-        fn tls_template_rejects_filesz_above_memsz() {
-            let elf = build_tls_elf(120, 0x40_2000, 16, 8, 4);
-            assert_eq!(parse_tls_template(&elf, 64), Err(Error::InvalidParam));
-        }
-
-        #[test]
-        fn tls_template_rejects_non_power_of_two_align() {
-            let elf = build_tls_elf(120, 0x40_2000, 4, 4, 3);
-            assert_eq!(parse_tls_template(&elf, 64), Err(Error::InvalidParam));
-        }
-
-        #[test]
-        fn tls_template_rejects_vaddr_overflow() {
-            let elf = build_tls_elf(120, u64::MAX - 3, 8, 8, 4);
-            assert_eq!(parse_tls_template(&elf, 64), Err(Error::OutOfRange));
-        }
-
-        #[test]
-        fn tls_template_accepts_align_zero_and_one() {
-            assert!(parse_tls_template(&build_tls_elf(120, 0x40_2000, 4, 4, 0), 64).is_ok());
-            assert!(parse_tls_template(&build_tls_elf(120, 0x40_2000, 4, 4, 1), 64).is_ok());
-        }
     }
 }
 
@@ -839,8 +722,8 @@ pub(crate) mod raw {
 #[cfg(feature = "user-space")]
 mod backend {
     use super::raw::{
-        PhdrClass, RSP_OFF, STR_OFF, SegmentSpec, TlsTemplate, align_up_checked, classify_phdr,
-        entry_block, parse_header, parse_tls_template, plan_segment, rd_u32, rd_u64,
+        PhdrClass, RSP_OFF, STR_OFF, SegmentSpec, classify_phdr, entry_block, parse_header,
+        plan_segment, rd_u32, rd_u64,
     };
     use alloc::vec::Vec;
     use arch::{PageFlags, PageSize, VirtAddr};
@@ -891,9 +774,6 @@ mod backend {
         pub entry: u64,
         /// 用户栈顶（初始 `rsp`，指向栈顶 argc 处）。
         pub user_stack_top: u64,
-        /// 主线程的 TLS 段基址（`IA32_FS_BASE` 初值）。镜像无 PT_TLS 时为 None，
-        /// 此时该单元 `fs_base = 0`（与 3P4-1 之前的行为一致）。
-        pub tls_fs_base: Option<u64>,
     }
 
     /// 把 ELF 镜像加载到 `addr_space`，返回入口与用户栈顶。
@@ -922,8 +802,6 @@ mod backend {
         if seg_ranges.try_reserve(hdr.phnum).is_err() {
             return Err(Error::OutOfMemory);
         }
-        // PT_TLS 模板（0 或 1 份）：不装载，仅记录，供每线程 TLS 块装配（3P4-1）。
-        let mut tls: Option<TlsTemplate> = None;
         for i in 0..hdr.phnum {
             // 表完整性由 parse_header 单点保证：phoff + phnum*PHDR_SIZE
             // <= elf.len()，故按表项偏移的读取不会越界。
@@ -938,22 +816,11 @@ mod backend {
                 // 拒绝面：显式报错并**点名**原因，绝不做伪支持（S09）。
                 // 这三类都要求本加载器不具备的能力，静默跳过的后果是
                 // 镜像「装载成功」而程序在运行期以难以定位的方式崩。
-                PhdrClass::TlsTemplate => {
-                    let t = parse_tls_template(elf, ph)?;
-                    // 模板初值必须落在某个已加载段内：否则「拷贝初值」的源地址
-                    // 不在该地址空间里（或指向内核半区）——按 L2 纪律显式拒绝。
-                    let tpl_end = t.vaddr.checked_add(t.filesz).ok_or(Error::OutOfRange)?;
-                    if !seg_ranges
-                        .iter()
-                        .any(|&(s, e)| t.vaddr >= s && tpl_end <= e)
-                    {
-                        return Err(Error::InvalidParam);
-                    }
-                    // 单模块静态 TLS：多份 PT_TLS 不支持（本加载器不做多模块 TLS 布局）。
-                    if tls.is_some() {
-                        return Err(Error::NotSupported);
-                    }
-                    tls = Some(t);
+                PhdrClass::RejectTls => {
+                    klib::warn!(
+                        "[loader] 拒绝镜像：含 PT_TLS，用户态 TLS 未实现（docs/TODO/3p.md 3P4-1）"
+                    );
+                    return Err(Error::NotSupported);
                 }
                 PhdrClass::RejectInterp => {
                     klib::warn!("[loader] 拒绝镜像：含 PT_INTERP，本加载器不做动态链接");
@@ -985,24 +852,17 @@ mod backend {
         }
 
         let stack_top = setup_user_stack(addr_space, cmd)?;
-        // 主线程 TLS 块（无 PT_TLS 时为 None）：块 + TCB 建好并返回 FS base。
-        let tls_fs_base = match tls {
-            Some(t) => Some(setup_tls(addr_space, &t, elf)?),
-            None => None,
-        };
 
         klib::debug!(
-            "[elf] loaded {} segments, entry={:#x}, stack_top={:#x}, tls_fs_base={:?}",
+            "[elf] loaded {} segments, entry={:#x}, stack_top={:#x}",
             loaded,
             hdr.entry,
-            stack_top,
-            tls_fs_base
+            stack_top
         );
 
         Ok(LoadedElf {
             entry: hdr.entry,
             user_stack_top: stack_top,
-            tls_fs_base,
         })
     }
 
@@ -1155,86 +1015,6 @@ mod backend {
         }
 
         Ok((plan.vaddr_start, plan.vaddr_end))
-    }
-
-    /// TCB 尺寸（TLS 块尾）：与 libc 的 TCB 契约对齐（T2-1：errno 槽在 FS:0）。
-    const TCB_SIZE: u64 = 64;
-
-    /// 为一个执行单元建立 TLS 块并返回 FS base（= 块尾 TCB 首址）。
-    ///
-    /// 布局（x86-64 variant II）：[TLS 块 tls_size][TCB TCB_SIZE]，FS base 指向 TCB。
-    /// 编译器 local-exec 访问形如 mov rax, fs:[0]; mov eax,[rax+off]，off 是**负**的
-    /// R_X86_64_TPOFF32，故变量地址 = TP + off 落在 TLS 块内。
-    ///
-    /// **tls_size 必须与链接器一致**：align_up(memsz, p_align)。不得擅自放大成
-    /// max(align,16)——块尺寸变了，变量的实际偏移就与链接期算出的 TPOFF 错位，
-    /// 程序会读到未初始化数据。TP 另按 max(align,16) 对齐，块起点随之确定。
-    ///
-    /// TCB 契约（与 libc errno 机制 T2-1 对齐）：TCB+0 = errno 槽（i32），
-    /// TCB+8 = self 指针，TCB+16 = tid（本步为 0；线程路径建立时写入）。
-    fn setup_tls(
-        addr_space: &mut UserAddressSpace<X86PageTable>,
-        t: &TlsTemplate,
-        elf: &[u8],
-    ) -> Result<u64, Error> {
-        if t.memsz == 0 {
-            return Err(Error::InvalidParam);
-        }
-        let block_align = if t.align == 0 { 1 } else { t.align };
-        let tls_size = align_up_checked(t.memsz, block_align).ok_or(Error::OutOfRange)?;
-        let tp_align = if block_align < 16 { 16 } else { block_align };
-        // 块区放在用户栈区**之下**（每进程独立地址空间，无冲突）。
-        let region_end = USER_STACK_TOP - DEFAULT_STACK_SIZE;
-        let need = tls_size + TCB_SIZE + tp_align;
-        let pages = (need.div_ceil(PAGE_SIZE)) as usize;
-        let region_start = region_end - pages as u64 * PAGE_SIZE;
-
-        let tcb_base = (region_end - TCB_SIZE) & !(tp_align - 1);
-        let block_start = tcb_base - tls_size;
-        if block_start < region_start {
-            return Err(Error::OutOfRange);
-        }
-
-        // 预留 + 实映射（与 setup_user_stack 同一资源纪律：映射拒绝当场退帧）。
-        addr_space
-            .reserve_user(
-                VirtAddr::new(region_start),
-                VirtAddr::new(region_end),
-                PageSize::Size4K,
-                PageFlags::empty().writable(),
-            )
-            .map_err(Error::from)?;
-        let frames = collect_frames(pages)?;
-        if let Err(e) = addr_space.map_user(
-            VirtAddr::new(region_start),
-            VirtAddr::new(region_end),
-            PageSize::Size4K,
-            PageFlags::empty().writable(),
-            &frames,
-        ) {
-            refund_frames(&frames);
-            return Err(e);
-        }
-
-        let off = hhdm_offset()?;
-        // 整块清零（.tbss 与 TCB 初值），再拷 .tdata 初值。
-        for &f in frames.iter() {
-            unsafe { core::ptr::write_bytes((f + off) as *mut u8, 0, PAGE_SIZE as usize) };
-        }
-        // 初值源取镜像文件内 [offset, offset+filesz)：不依赖「模板段已映射且可读」，
-        // 只依赖 L2 已校验的「初值落在镜像内」。
-        for i in 0..t.filesz {
-            let va = block_start + i;
-            let idx = ((va - region_start) / PAGE_SIZE) as usize;
-            let po = (va - region_start) % PAGE_SIZE;
-            unsafe { *((frames[idx] + off + po) as *mut u8) = elf[(t.offset + i) as usize] };
-        }
-        // TCB 自指针（FS:0 留给 errno，故 self 在 +8）。
-        let sp_va = tcb_base + 8;
-        let idx = ((sp_va - region_start) / PAGE_SIZE) as usize;
-        let po = (sp_va - region_start) % PAGE_SIZE;
-        unsafe { *((frames[idx] + off + po) as *mut u64) = tcb_base };
-        Ok(tcb_base)
     }
 
     fn setup_user_stack(
