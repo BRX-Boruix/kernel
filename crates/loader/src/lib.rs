@@ -940,14 +940,21 @@ mod backend {
                 // 镜像「装载成功」而程序在运行期以难以定位的方式崩。
                 PhdrClass::TlsTemplate => {
                     let t = parse_tls_template(elf, ph)?;
-                    // 模板初值必须落在某个已加载段内：否则「拷贝初值」的源地址
-                    // 不在该地址空间里（或指向内核半区）——按 L2 纪律显式拒绝。
-                    let tpl_end = t.vaddr.checked_add(t.filesz).ok_or(Error::OutOfRange)?;
-                    if !seg_ranges
-                        .iter()
-                        .any(|&(s, e)| t.vaddr >= s && tpl_end <= e)
-                    {
-                        return Err(Error::InvalidParam);
+                    // 模板初值必须落在某个已加载段内：否则「拷贝初值」的源地址不在该
+                    // 地址空间里（或指向内核半区）——按 L2 纪律显式拒绝。
+                    //
+                    // **但仅在 filesz > 0 时才有内容要拷**：只有 .tbss（零初始化）的
+                    // TLS 段 filesz=0，其 vaddr 天然落在 NOBITS 区、不被任何 PT_LOAD
+                    // 覆盖——那是 ELF 的正常形态，不是畸形。此时块内容全为 0，无源可拷，
+                    // 故不做区间校验（实测：写后读的探针只产生 .tbss，vaddr 在段外）。
+                    if t.filesz > 0 {
+                        let tpl_end = t.vaddr.checked_add(t.filesz).ok_or(Error::OutOfRange)?;
+                        if !seg_ranges
+                            .iter()
+                            .any(|&(s, e)| t.vaddr >= s && tpl_end <= e)
+                        {
+                            return Err(Error::InvalidParam);
+                        }
                     }
                     // 单模块静态 TLS：多份 PT_TLS 不支持（本加载器不做多模块 TLS 布局）。
                     if tls.is_some() {
