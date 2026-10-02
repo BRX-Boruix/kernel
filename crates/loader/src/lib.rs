@@ -1234,6 +1234,8 @@ mod backend {
         let idx = ((sp_va - region_start) / PAGE_SIZE) as usize;
         let po = (sp_va - region_start) % PAGE_SIZE;
         unsafe { *((frames[idx] + off + po) as *mut u64) = tcb_base };
+        // 随地址空间携带 FS base：spawn 在**入队前**读它写进 PCB（见 mm 侧字段注释）。
+        addr_space.set_tls_fs_base(tcb_base);
         Ok(tcb_base)
     }
 

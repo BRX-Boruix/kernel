@@ -277,6 +277,13 @@ pub struct UserAddressSpace<PT: PageTable> {
     /// 本空间内无并发写者（check 调用方串行语义由调用侧保证），全局侧只经
     /// 此字段与全局账对偶。
     committed_bytes: AtomicU64,
+    /// 本地址空间的**初始 FS base**（用户态 TLS 线程指针，3P4-1）。
+    ///
+    /// 由 loader 建立主线程 TLS 块时写入；spawn 在把新进程**入队之前**读取它并
+    /// 写进 PCB 的 fs_base。为什么必须随地址空间携带、而不是 spawn 返回后另设：
+    /// 入队后别的核可能立刻切入该进程，任何"先入队再设"的写法都有竞态窗口——
+    /// 该窗口内进程以 fs_base=0 运行，首次 fs: 访问即 #PF。未建 TLS 块时为 0。
+    tls_fs_base: AtomicU64,
 }
 
 /// 地址空间粗锁保护的核心状态（ADR-035 D4）。
@@ -314,7 +321,18 @@ where
             cow_pages: spin::Mutex::new(Vec::new()),
             shm_maps: spin::Mutex::new(Vec::new()),
             committed_bytes: AtomicU64::new(0),
+            tls_fs_base: AtomicU64::new(0),
         })
+    }
+
+    /// 写本地址空间的初始 FS base（用户态 TLS 线程指针；由 loader 调用）。
+    pub fn set_tls_fs_base(&self, base: u64) {
+        self.tls_fs_base.store(base, Ordering::Relaxed);
+    }
+
+    /// 读本地址空间的初始 FS base（未建 TLS 块时为 0）。
+    pub fn tls_fs_base(&self) -> u64 {
+        self.tls_fs_base.load(Ordering::Relaxed)
     }
 
     /// 在用户空间映射一段物理页。

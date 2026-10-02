@@ -555,6 +555,10 @@ pub fn spawn_with_ppid_fds(
     // 传 0（无 restorer），保持哑地址空间记账不变。
     // ADR-035 D4：PCB 内部经 Arc 持地址空间；此处把 spawn 传入的空间包成唯一 Arc
     // （地基阶段一进程一份；组共享派生留给 T1，届时传同一 Arc 的 clone）。
+    // 3P4-1：主线程 TLS 的 FS base 随地址空间携带，必须在**入队前**写进 PCB。
+    // 若改为 spawn 返回后再设，入队与设置之间存在竞态窗口（别的核可能已切入该
+    // 进程并以 fs_base=0 运行），首次 fs: 访问即 #PF。
+    let tls_fs_base = addr_space.tls_fs_base();
     let mut proc = Box::new(Process::<X86PageTable>::new(
         pid,
         entry_rip,
@@ -585,7 +589,7 @@ pub fn spawn_with_ppid_fds(
         exit_code: 0,
         waiting_for: None,
         home_cpu,
-        fs_base: 0,
+        fs_base: tls_fs_base,
         // 新进程 vruntime 先置 0；真正入队时由 `enqueue_ready(is_new=true)`
         // 改写到「当前最小基准」，避免新进程凭空获得优先权。
         vruntime: 0,
@@ -683,20 +687,6 @@ pub fn spawn_thread_with(
     // EEVDF：首次入队走统一入队口（vruntime 取当前最小基准，非 0）。
     enqueue_ready(&mut run_mut(home_cpu), pid, true);
     Ok(pid)
-}
-
-/// 设置某个调度单元的 FS 段基址（IA32_FS_BASE 初值），供用户态 TLS 装配使用。
-///
-/// 语义：只改 PCB 里的 fs_base；该单元**下次被切入**时由切换点写进 MSR
-/// （switch_apply_next 的 gdt::write_fs_base）。故调用方必须在单元**开始运行前**
-/// 调用——spawn 之后立即调用即满足（新单元尚未入 CPU）。
-pub fn set_unit_fs_base(pid: usize, base: u64) -> Result<(), Error> {
-    let mut g = proc_bucket_lock(pid);
-    let Some(e) = g.get_mut(&pid) else {
-        return Err(Error::NotFound);
-    };
-    e.fs_base = base;
-    Ok(())
 }
 
 // ---------- COW 派生子进程（ADR-038 / kernel-tests M5+） ----------
