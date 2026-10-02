@@ -8869,6 +8869,28 @@ fn push_ehdr(elf: &mut alloc::vec::Vec<u8>, entry: u64, phoff: u64, phnum: u16) 
     elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
 }
 
+/// 程序头写入器（单点：`p_type` 可覆写，供对抗变体使用——S15：禁止为每个
+/// 用例复制一份构造器）。
+#[cfg(feature = "kernel-tests")]
+fn push_phdr_typed(
+    elf: &mut alloc::vec::Vec<u8>,
+    p_type: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_flags: u32,
+) {
+    elf.extend_from_slice(&p_type.to_le_bytes());
+    elf.extend_from_slice(&p_flags.to_le_bytes());
+    elf.extend_from_slice(&p_offset.to_le_bytes());
+    elf.extend_from_slice(&p_vaddr.to_le_bytes());
+    elf.extend_from_slice(&0u64.to_le_bytes()); // p_paddr
+    elf.extend_from_slice(&p_filesz.to_le_bytes());
+    elf.extend_from_slice(&p_memsz.to_le_bytes());
+    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+}
+
 /// 单个 PT_LOAD 程序头写入器（消费方同 [`push_ehdr`]）。
 #[cfg(feature = "kernel-tests")]
 fn push_phdr(
@@ -8879,14 +8901,7 @@ fn push_phdr(
     p_memsz: u64,
     p_flags: u32,
 ) {
-    elf.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
-    elf.extend_from_slice(&p_flags.to_le_bytes());
-    elf.extend_from_slice(&p_offset.to_le_bytes());
-    elf.extend_from_slice(&p_vaddr.to_le_bytes());
-    elf.extend_from_slice(&0u64.to_le_bytes()); // p_paddr
-    elf.extend_from_slice(&p_filesz.to_le_bytes());
-    elf.extend_from_slice(&p_memsz.to_le_bytes());
-    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+    push_phdr_typed(elf, 1, p_offset, p_vaddr, p_filesz, p_memsz, p_flags);
 }
 
 /// 按规格组装 ELF64 镜像：头(64B) + 单程序头(56B) + 16 字节 0xA5 段内容。
@@ -9315,6 +9330,34 @@ pub fn test_loader_adversarial() {
             );
         }
         info!("[test-loader] baseline load OK, bss + tail-pad pages verified zero");
+    }
+
+    // -- 8. 要求未实现能力的程序头：显式拒绝而非静默跳过（伪支持止血）--
+    //
+    // PT_TLS(7) / PT_INTERP(3) / PT_DYNAMIC(2) 都要求本加载器不具备的能力
+    // （用户态 TLS / 动态链接器 / 重定位）。此前一律 continue：镜像会被
+    // 「成功装载」，程序却在运行期以难以定位的方式崩——TLS 的典型症状是
+    // 首次 fs: 访问（errno / thread_local）即取指 fault。显式拒绝把故障点
+    // 移回装载期（S09：错误优于伪支持）。
+    //
+    // 拒绝面的经验依据：实测现有 33 个用户态程序（32 个内置 + 第三方样例）
+    // 只含 PT_LOAD / PT_GNU_RELRO / PT_GNU_STACK，故对它们零影响。
+    // 用户态 TLS 落地后（docs/TODO/3p.md 3P4-1），PT_TLS 用例应改为「接受」。
+    for (p_type, name) in [(7u32, "pt_tls"), (3, "pt_interp"), (2, "pt_dynamic")] {
+        let mut elf = alloc::vec::Vec::new();
+        // 一个正常 PT_LOAD（entry 落在其页区间内）+ 一个被测类型的程序头。
+        push_ehdr(&mut elf, LoaderElfSpec::BASE.entry, 64, 2);
+        push_phdr(
+            &mut elf,
+            64 + 2 * 56, // 段内容紧随两个程序头
+            LoaderElfSpec::BASE.p_vaddr,
+            0x10,
+            0x10,
+            5, // PF_R | PF_X
+        );
+        push_phdr_typed(&mut elf, p_type, 0, 0, 0, 0, 0);
+        elf.extend_from_slice(&[0xA5; 16]);
+        expect_loader_reject(&elf, &[], Error::NotSupported, name);
     }
 
     info!("[test-loader] PASS");

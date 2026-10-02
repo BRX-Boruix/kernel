@@ -308,6 +308,49 @@ pub(crate) mod raw {
         })
     }
 
+    // ---------- 程序头类型的装载处置 ----------
+
+    /// 程序头类型的装载处置（纯函数，host 单测覆盖）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum PhdrClass {
+        /// 装载该段（PT_LOAD）。
+        Load,
+        /// 无需装载、跳过安全（PT_NULL / PT_NOTE / PT_PHDR / PT_GNU_* 等）。
+        Skip,
+        /// 明确拒绝：PT_TLS——镜像声明了线程局部存储段，而用户态 TLS 未实现。
+        ///
+        /// 此前该段被静默跳过：镜像「装载成功」，程序却在首次 fs: 访问
+        /// （errno / thread_local!）处取指 fault。伪支持比显式拒绝更糟（S09）：
+        /// 故障点离原因太远。TLS 落地后（docs/TODO/3p.md 3P4-1）本分支改为装载。
+        RejectTls,
+        /// 明确拒绝：PT_INTERP——镜像要求动态链接器，而本加载器只接受静态
+        /// ET_EXEC（ET_DYN 已在 parse_header 处拒绝）。
+        RejectInterp,
+        /// 明确拒绝：PT_DYNAMIC——镜像带动态链接元数据（需要重定位），而本
+        /// 加载器不做任何重定位。
+        RejectDynamic,
+    }
+
+    /// 判定单个程序头类型的处置。
+    ///
+    /// **拒绝面**只覆盖「要求本加载器不具备的能力」的三类（TLS / 动态链接器 /
+    /// 重定位），其余类型一律 Skip。该分界的经验依据：实测现有 33 个用户态程序
+    /// （32 个内置 + 第三方样例）只出现 PT_LOAD / PT_GNU_RELRO / PT_GNU_STACK，
+    /// 故 Skip 面对它们是空操作、拒绝面为零影响。
+    pub(crate) fn classify_phdr(p_type: u32) -> PhdrClass {
+        const PT_LOAD: u32 = 1;
+        const PT_DYNAMIC: u32 = 2;
+        const PT_INTERP: u32 = 3;
+        const PT_TLS: u32 = 7;
+        match p_type {
+            PT_LOAD => PhdrClass::Load,
+            PT_TLS => PhdrClass::RejectTls,
+            PT_INTERP => PhdrClass::RejectInterp,
+            PT_DYNAMIC => PhdrClass::RejectDynamic,
+            _ => PhdrClass::Skip,
+        }
+    }
+
     // ---------- host 单测（`cargo test -p loader`） ----------
     #[cfg(test)]
     pub(crate) mod tests {
@@ -640,6 +683,38 @@ pub(crate) mod raw {
             assert!(entry_block(0, 1).is_err());
             assert!(entry_block(RSP_OFF as u64 - 1, 1).is_err());
         }
+
+        // ---- classify_phdr：程序头类型的装载处置 ----
+        //
+        // 这一组锚定「哪些 p_type 必须被拒绝」：静默跳过要求未实现能力的段，
+        // 会让镜像「装载成功」而在运行期崩（伪支持，S09）。
+
+        #[test]
+        fn classify_phdr_loads_only_pt_load() {
+            assert_eq!(classify_phdr(1), PhdrClass::Load); // PT_LOAD
+        }
+
+        #[test]
+        fn classify_phdr_rejects_unimplemented_capabilities() {
+            // PT_TLS(7)：用户态 TLS 未实现——静默跳过后程序首次 fs: 访问即崩。
+            assert_eq!(classify_phdr(7), PhdrClass::RejectTls);
+            // PT_INTERP(3)：需要动态链接器；本加载器只接受静态 ET_EXEC。
+            assert_eq!(classify_phdr(3), PhdrClass::RejectInterp);
+            // PT_DYNAMIC(2)：动态链接元数据；本加载器不做任何重定位。
+            assert_eq!(classify_phdr(2), PhdrClass::RejectDynamic);
+        }
+
+        #[test]
+        fn classify_phdr_skips_types_present_in_real_programs() {
+            // 实测：现有 33 个用户态程序（32 内置 + 第三方样例）只含
+            // PT_LOAD / PT_GNU_RELRO / PT_GNU_STACK。这三类之外的良性类型
+            // 必须继续可跳过，否则会把今天能跑的程序拒之门外。
+            assert_eq!(classify_phdr(0x6474_e551), PhdrClass::Skip); // PT_GNU_STACK
+            assert_eq!(classify_phdr(0x6474_e552), PhdrClass::Skip); // PT_GNU_RELRO
+            assert_eq!(classify_phdr(0), PhdrClass::Skip); // PT_NULL
+            assert_eq!(classify_phdr(4), PhdrClass::Skip); // PT_NOTE
+            assert_eq!(classify_phdr(6), PhdrClass::Skip); // PT_PHDR
+        }
     }
 }
 
@@ -647,7 +722,8 @@ pub(crate) mod raw {
 #[cfg(feature = "user-space")]
 mod backend {
     use super::raw::{
-        RSP_OFF, STR_OFF, SegmentSpec, entry_block, parse_header, plan_segment, rd_u32, rd_u64,
+        PhdrClass, RSP_OFF, STR_OFF, SegmentSpec, classify_phdr, entry_block, parse_header,
+        plan_segment, rd_u32, rd_u64,
     };
     use alloc::vec::Vec;
     use arch::{PageFlags, PageSize, VirtAddr};
@@ -655,7 +731,7 @@ mod backend {
     use klib::error::Error;
     use mm::user_space::{DEFAULT_STACK_SIZE, USER_STACK_TOP, USER_TOP, UserAddressSpace};
 
-    const PT_LOAD: u32 = 1;
+    // PT_LOAD 的判定已上收至 raw::classify_phdr（单点），此处不再保留本地常量。
     const PF_X: u32 = 1;
     const PF_W: u32 = 2;
     /// 段标志：可读。x86-64 PTE 没有「禁止读」位——present 页恒可读，因此
@@ -730,12 +806,31 @@ mod backend {
             // 表完整性由 parse_header 单点保证：phoff + phnum*PHDR_SIZE
             // <= elf.len()，故按表项偏移的读取不会越界。
             let ph = hdr.phoff + i * hdr.phentsize;
-            if rd_u32(elf, ph) != PT_LOAD {
-                continue;
+            match classify_phdr(rd_u32(elf, ph)) {
+                PhdrClass::Load => {
+                    let range = load_segment(elf, ph, addr_space)?;
+                    seg_ranges.push(range);
+                    loaded += 1;
+                }
+                PhdrClass::Skip => continue,
+                // 拒绝面：显式报错并**点名**原因，绝不做伪支持（S09）。
+                // 这三类都要求本加载器不具备的能力，静默跳过的后果是
+                // 镜像「装载成功」而程序在运行期以难以定位的方式崩。
+                PhdrClass::RejectTls => {
+                    klib::warn!(
+                        "[loader] 拒绝镜像：含 PT_TLS，用户态 TLS 未实现（docs/TODO/3p.md 3P4-1）"
+                    );
+                    return Err(Error::NotSupported);
+                }
+                PhdrClass::RejectInterp => {
+                    klib::warn!("[loader] 拒绝镜像：含 PT_INTERP，本加载器不做动态链接");
+                    return Err(Error::NotSupported);
+                }
+                PhdrClass::RejectDynamic => {
+                    klib::warn!("[loader] 拒绝镜像：含 PT_DYNAMIC，本加载器不做重定位");
+                    return Err(Error::NotSupported);
+                }
             }
-            let range = load_segment(elf, ph, addr_space)?;
-            seg_ranges.push(range);
-            loaded += 1;
         }
         if loaded == 0 {
             // LD2（已闭环）：格式可解析但没有任何可装载内容——ENOEXEC 语义，
