@@ -4401,9 +4401,6 @@ pub fn start() -> ! {
         // At AP entry no user process FPU state is loaded yet, so a transient SSE op is
         // safe (the first scheduled process does fpu::restore anyway). If TS were set,
         // fnstcw below would #NM - this proves FP instructions run on the AP.
-        // 引导器差异定位（临时诊断）：打印本核执行第一条 x87 指令之前的 CPU 状态，
-        // 与 brxLimine 链路逐字段对比，找出 liftoff trampoline 未建立的 Limine 保证
-        // （"AP 的 CPU 状态与 BSP 一致"）里到底是哪一项让 x87 前置条件不满足。
         {
             let cr0d: u64;
             let cr4d: u64;
