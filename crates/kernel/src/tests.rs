@@ -9361,13 +9361,14 @@ pub fn test_loader_adversarial() {
         expect_loader_reject(&elf, &[], Error::NotSupported, name);
     }
 
-    // -- 9. PT_TLS：模板必须落在已加载段内（3P4-1）--
+    // -- 9. PT_TLS：模板**初值**必须落在已加载段内；只有 .tbss 的模板则接受（3P4-1）--
     //
-    // PT_TLS 不再被拒绝，而是解析为模板并为线程建块。但模板初值的虚拟地址
-    // 必须落在某个已加载 PT_LOAD 段内——否则「拷贝初值」的源地址不在该地址
-    // 空间里（或指向内核半区）。本用例构造一个 vaddr=0 的模板（不在任何段内），
-    // 断言以 InvalidParam 拒绝，而不是放任它去拷内核内存（L2 同类纪律）。
+    // 仅在 filesz > 0（.tdata 有初值）时校验区间：否则「拷贝初值」的源地址不在该
+    // 地址空间里（或指向内核半区）——L2 同类纪律。**filesz = 0 不校验**：只有 .tbss
+    // 的模板没有内容要拷，且其 vaddr 天然落在 NOBITS 区、不被任何 PT_LOAD 覆盖，
+    // 那是 ELF 的正常形态（实测：先写后读的 TLS 探针只产生 .tbss，vaddr 在段外）。
     {
+        // (a) filesz=4 且 vaddr=0（在任何已加载段之外）→ 拒绝。
         let mut elf = alloc::vec::Vec::new();
         push_ehdr(&mut elf, LoaderElfSpec::BASE.entry, 64, 2);
         push_phdr(
@@ -9378,10 +9379,34 @@ pub fn test_loader_adversarial() {
             0x10,
             5,
         );
-        // PT_TLS：vaddr=0（任何已加载段之外）、filesz=4、memsz=4、align=4。
-        push_phdr_typed(&mut elf, 7, 0, 0, 0, 4, 4);
+        // push_phdr_typed(elf, p_type, p_offset, p_vaddr, p_filesz, p_memsz, p_flags)
+        push_phdr_typed(&mut elf, 7, 0, 0, 4, 4, 4);
         elf.extend_from_slice(&[0xA5; 16]);
-        expect_loader_reject(&elf, &[], Error::InvalidParam, "pt_tls outside loaded segments");
+        expect_loader_reject(
+            &elf,
+            &[],
+            Error::InvalidParam,
+            "pt_tls content outside loaded segments",
+        );
+
+        // (b) filesz=0（只有 .tbss，memsz=4）→ **接受**（无内容可拷，不校验区间）。
+        let mut elf2 = alloc::vec::Vec::new();
+        push_ehdr(&mut elf2, LoaderElfSpec::BASE.entry, 64, 2);
+        push_phdr(
+            &mut elf2,
+            64 + 2 * 56,
+            LoaderElfSpec::BASE.p_vaddr,
+            0x10,
+            0x10,
+            5,
+        );
+        push_phdr_typed(&mut elf2, 7, 0, 0, 0, 4, 4);
+        elf2.extend_from_slice(&[0xA5; 16]);
+        let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
+        match loader::load(&elf2, &mut us, &[]) {
+            Ok(_) => info!("[test-loader] tbss-only PT_TLS accepted (no content to copy)"),
+            Err(e) => panic!("[test-loader] tbss-only PT_TLS must load, got {:?}", e),
+        }
     }
 
     info!("[test-loader] PASS");
