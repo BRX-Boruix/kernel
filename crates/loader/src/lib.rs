@@ -985,9 +985,20 @@ mod backend {
         }
 
         let stack_top = setup_user_stack(addr_space, cmd)?;
-        // 主线程 TLS 块（无 PT_TLS 时为 None）：块 + TCB 建好并返回 FS base。
+        // **安全闸（3P4-1 未完，勿删）**：装配路径已实现，且 TLS 块本身经实测验证
+        // 正确（用户态 memory_query 报 PRESENT|USER|WRITABLE、裸指针读到正确初值、
+        // rdfsbase 读回 FS base），但 **FS 相对访问**仍失败，且该失败会让用户程序
+        // 触发内核态取指异常（安全洞）。故在根因定位前**显式拒绝**：解析与校验仍
+        // 执行（契约受检、代码可达），只是不交付给用户程序。
+        // 证据与下一步见本次提交信息与 docs/TODO/3p.md 的 3P4-1 条目。
         let tls_fs_base = match tls {
-            Some(t) => Some(setup_tls(addr_space, &t, elf)?),
+            Some(t) => {
+                let _fs_base = setup_tls(addr_space, &t, elf)?;
+                klib::warn!(
+                    "[loader] 拒绝镜像：含 PT_TLS，用户态 TLS 端到端未通过（3P4-1 未完）"
+                );
+                return Err(Error::NotSupported);
+            }
             None => None,
         };
 
