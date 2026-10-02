@@ -1208,6 +1208,10 @@ fn switch_apply_next(
     fpu::restore(&slot.fpu);
     // T2-0: 恢复切入单元的用户态 FS 基址(镜像 FPU restore;保证切回后 FS base 恒指向
     // 当前单元 TCB——普通单线程进程 fs_base=0，防旧线程 base 泄漏)。
+    // FS 选择子必须与基址成对设置：基址走 MSR，而"选择子是否可用"决定 fs: 访问
+    // 会不会 #GP。实测用户态 FS 选择子为 0（空选择子）→ 任何 fs: 访问立即 #GP，
+    // 与基址是否正确无关（见 gdt::set_fs_user_selector）。
+    gdt::set_fs_user_selector(slot.fs_base != 0);
     gdt::write_fs_base(slot.fs_base);
     let cr3 = slot.proc.addr_space().page_table_paddr();
     let ktop = slot.kstack_top;

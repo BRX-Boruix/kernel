@@ -176,6 +176,26 @@ fn tss_high(base: u64) -> u64 {
     base >> 32
 }
 
+/// 把当前 CPU 的 FS 段选择子设为**用户数据段**（RPL=3）或内核数据段。
+///
+/// 为什么必须显式设置（3P4-1 实测）：长模式下 `fs:` 访问**既查 IA32_FS_BASE
+/// （基址）也查选择子**。实测用户态读到 FS 选择子为 **0（空选择子）**——空选择子
+/// 在长模式下"不可用"，任何 `fs:` 访问立即 #GP，**即使 IA32_FS_BASE 已指向合法
+/// 用户地址**。而 `rdfsbase` 只读 MSR、不碰选择子，故它"看起来完全正常"，
+/// 极具迷惑性（实测：rdfsbase 正确、memory_query 显示页 PRESENT|USER|WRITABLE、
+/// 裸指针读也正确，唯独 `fs:[...]` 挂掉）。
+///
+/// 从 CPL=0 装载 DPL=3 的数据选择子是合法的（数据段检查为 max(CPL,RPL) <= DPL）。
+///
+/// **asm 选项注意**：这里**不能**声明 `nomem`——改段寄存器会影响后续内存访问的
+/// 语义，声明 nomem 等于向编译器撒谎、可能被重排（本项目在 3P4-1 中先犯过此错）。
+pub fn set_fs_user_selector(user: bool) {
+    let sel: u16 = if user { UDATA | 3 } else { KDATA };
+    unsafe {
+        core::arch::asm!("mov fs, {0:x}", in(reg) sel, options(nostack, preserves_flags));
+    }
+}
+
 /// GDTR 结构（lgdt 需要：16 位 limit + 64 位 base）。
 #[repr(C, packed)]
 pub struct Gdtr {
