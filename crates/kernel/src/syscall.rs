@@ -3015,6 +3015,11 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
     ///（与 PATH_MAX 同量级；内核栈 64KB 下 4KiB 栈缓冲安全）。真动态堆
     /// 分配不做——spawn 热路径的栈缓冲简单性优先（S24）。
     const CMD_BUF_BYTES: usize = 4096;
+    // 注意：本门限只保证「内核缓冲放得下」。**入口字符串区的真实上限是
+    // loader 的 `STR_OFF - 1 = 511` 字节**（docs/abi/syscall-abi.md §4），
+    // 因此长度在 512..=4096 的命令行会在此放行、随后在 loader 里以 E2BIG
+    // 拒绝——同一语义两个门限。两者收敛属 docs/TODO/3p.md 的 3P4-2
+    // （ABI v2 提升命令行上限），届时以新布局为准统一。
     if arg_len as usize > CMD_BUF_BYTES {
         return pack_err(Error::ArgListTooLong);
     }
@@ -3061,6 +3066,10 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
     else {
         return pack_err(Error::OutOfMemory);
     };
+    // `cmd` 是**整条命令行字符串**（不含程序名；shell 派生时已剥首词）。
+    // 入口参数块 mini-ABI（argc/argv 语义、字符串区容量、无命令行形态）见
+    // docs/abi/syscall-abi.md §4；布局算术的单点定义与行为锚点在
+    // `loader::raw::entry_block()`（由 loader 侧 host 单测锚定）。
     let loaded = match loader::load(elf_bytes, &mut us, cmd) {
         Ok(l) => l,
         Err(e) => return pack_err(e),
