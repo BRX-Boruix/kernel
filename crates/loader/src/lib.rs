@@ -999,13 +999,7 @@ mod backend {
         // 执行（契约受检、代码可达），只是不交付给用户程序。
         // 证据与下一步见本次提交信息与 docs/TODO/3p.md 的 3P4-1 条目。
         let tls_fs_base = match tls {
-            Some(t) => {
-                let _fs_base = setup_tls(addr_space, &t, elf)?;
-                klib::warn!(
-                    "[loader] 拒绝镜像：含 PT_TLS，用户态 TLS 端到端未通过（3P4-1 未完）"
-                );
-                return Err(Error::NotSupported);
-            }
+            Some(t) => Some(setup_tls(addr_space, &t, elf)?),
             None => None,
         };
 
@@ -1247,8 +1241,14 @@ mod backend {
             let po = (va - region_start) % PAGE_SIZE;
             unsafe { *((frames[idx] + off + po) as *mut u8) = elf[(t.offset + i) as usize] };
         }
-        // TCB 自指针（FS:0 留给 errno，故 self 在 +8）。
-        let sp_va = tcb_base + 8;
+        // TCB **首字段必须是线程指针自指针**（x86-64 TLS ABI，实测得出）：
+        // 编译器 local-exec 序列为 "mov rax, fs:[0]; mov [rax+disp], ..."——它从
+        // FS:0 取出线程指针、再加**负**位移访问变量。若把自指针放在 +8、把 FS:0
+        // 留给 errno（T2-1 的库管理设计），则 fs:[0] 读出 0，访问落到
+        // 0xfffffffffffffffc 而 #PF（本轮实测：选择子与基址都正确却仍 SIGSEGV，
+        // 根因即此）。故 errno 槽后移到 +8——libc 的 __errno_location 需同步改为
+        // 返回 fs_base + 8（见本次提交信息）。
+        let sp_va = tcb_base;
         let idx = ((sp_va - region_start) / PAGE_SIZE) as usize;
         let po = (sp_va - region_start) % PAGE_SIZE;
         unsafe { *((frames[idx] + off + po) as *mut u64) = tcb_base };
