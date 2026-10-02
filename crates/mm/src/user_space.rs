@@ -263,6 +263,28 @@ pub fn global_committed_bytes() -> u64 {
     GLOBAL_COMMIT_BYTES.load(Ordering::Relaxed)
 }
 
+/// 用户态 TLS 模板参数（3P4-1）：由 loader 解析 PT_TLS 后随地址空间携带，
+/// 供**每个执行单元**（主线程与后续派生线程）建立各自的 TLS 块。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlsParams {
+    /// .tdata 初值在进程镜像中的虚拟地址（filesz = 0 时无意义）。
+    pub vaddr: u64,
+    /// 已初始化部分大小（.tdata）。
+    pub filesz: u64,
+    /// TLS 块大小（.tdata + .tbss）。
+    pub memsz: u64,
+    /// 块对齐（ELF 要求 0 或 2 的幂）。
+    pub align: u64,
+}
+
+/// TCB 尺寸（TLS 块尾）：首字段为线程指针自指针（x86-64 TLS ABI）。
+const TCB_SIZE: u64 = 64;
+
+/// 向上对齐（checked；`a` 必须是 2 的幂）。
+fn align_up_u64(v: u64, a: u64) -> Option<u64> {
+    Some(v.checked_add(a - 1)? & !(a - 1))
+}
+
 pub struct UserAddressSpace<PT: PageTable> {
     /// 由粗锁保护的核心可变状态：页表 + 分配游标/断点 + 析构守卫。
     core: IrqSpinLock<AddrCore<PT>>,
@@ -284,6 +306,11 @@ pub struct UserAddressSpace<PT: PageTable> {
     /// 入队后别的核可能立刻切入该进程，任何"先入队再设"的写法都有竞态窗口——
     /// 该窗口内进程以 fs_base=0 运行，首次 fs: 访问即 #PF。未建 TLS 块时为 0。
     tls_fs_base: AtomicU64,
+    /// 本空间的 TLS 模板（由 loader 写入一次，此后只读）。
+    tls_params: spin::Mutex<Option<TlsParams>>,
+    /// 每执行单元 TLS 块的 VA 分配游标：自用户栈区之下**向下**增长
+    /// （每块不重叠；与 mmap 区向上增长互不干扰）。
+    tls_cursor: AtomicU64,
 }
 
 /// 地址空间粗锁保护的核心状态（ADR-035 D4）。
@@ -322,6 +349,8 @@ where
             shm_maps: spin::Mutex::new(Vec::new()),
             committed_bytes: AtomicU64::new(0),
             tls_fs_base: AtomicU64::new(0),
+            tls_params: spin::Mutex::new(None),
+            tls_cursor: AtomicU64::new(USER_STACK_TOP - DEFAULT_STACK_SIZE),
         })
     }
 
@@ -333,6 +362,114 @@ where
     /// 读本地址空间的初始 FS base（未建 TLS 块时为 0）。
     pub fn tls_fs_base(&self) -> u64 {
         self.tls_fs_base.load(Ordering::Relaxed)
+    }
+
+    /// 记录本空间的 TLS 模板（由 loader 解析 PT_TLS 后写入一次；此后只读）。
+    pub fn set_tls_params(&self, p: TlsParams) {
+        *self.tls_params.lock() = Some(p);
+    }
+
+    /// 读本空间的 TLS 模板（无 PT_TLS 的镜像为 None）。
+    pub fn tls_params(&self) -> Option<TlsParams> {
+        *self.tls_params.lock()
+    }
+
+    /// 为**一个执行单元**建立 TLS 块（块 + TCB），返回其 FS base（= TCB 首址）。
+    ///
+    /// 布局（x86-64 variant II）：`[TLS 块 tls_size][TCB TCB_SIZE]`，FS base 指向 TCB；
+    /// TCB 首字段是**线程指针自指针**——编译器 local-exec 序列从 `fs:[0]` 取线程指针，
+    /// 再加**负**位移访问变量（实测：自指针若不在 offset 0，`fs:[0]` 读出 0 → 访问
+    /// 0xfffffffffffffffc → SIGSEGV）。
+    ///
+    /// 初值从**本空间自己的镜像**（`p.vaddr`，已被某个 PT_LOAD 映射）读取——主线程
+    /// 与派生线程因此共用同一份初值来源，本函数是全系统唯一的块装配实现（S15）。
+    ///
+    /// VA 分配：自用户栈区之下**向下**逐块分配（每执行单元一块，互不重叠）。
+    pub fn alloc_tls_block(&self, p: &TlsParams) -> Result<u64, Error>
+    where
+        Error: From<PT::Error>,
+    {
+        if p.memsz == 0 {
+            return Err(Error::InvalidParam);
+        }
+        let block_align = if p.align == 0 { 1 } else { p.align };
+        let tls_size = align_up_u64(p.memsz, block_align).ok_or(Error::OutOfRange)?;
+        let tp_align = if block_align < 16 { 16 } else { block_align };
+        let page = crate::FRAME_SIZE_BYTES;
+        let pages = ((tls_size + TCB_SIZE).div_ceil(page)) as usize;
+        let region_size = pages as u64 * page;
+        let region_end = self
+            .tls_cursor
+            .fetch_sub(region_size, Ordering::Relaxed);
+        let region_start = region_end - region_size;
+        let tcb_base = (region_end - TCB_SIZE) & !(tp_align - 1);
+        let block_start = tcb_base - tls_size;
+
+        self.reserve_user(
+            VirtAddr::new(region_start),
+            VirtAddr::new(region_end),
+            PageSize::Size4K,
+            PageFlags::empty().writable(),
+        )
+        .map_err(Error::from)?;
+        let mut frames: Vec<u64> = Vec::new();
+        frames.try_reserve(pages).map_err(|_| Error::OutOfMemory)?;
+        for _ in 0..pages {
+            match crate::allocate_frame() {
+                Some(f) => frames.push(f.start_paddr()),
+                None => {
+                    for q in frames.iter().rev() {
+                        crate::deallocate_frame(PhysFrame::from_paddr_raw(*q));
+                    }
+                    return Err(Error::OutOfMemory);
+                }
+            }
+        }
+        if let Err(e) = self.map_user(
+            VirtAddr::new(region_start),
+            VirtAddr::new(region_end),
+            PageSize::Size4K,
+            PageFlags::empty().writable(),
+            &frames,
+        ) {
+            for q in frames.iter().rev() {
+                crate::deallocate_frame(PhysFrame::from_paddr_raw(*q));
+            }
+            return Err(Error::from(e));
+        }
+
+        // 块内写字节（VA → 帧 + 页内偏移 → HHDM）。
+        let write_byte = |va: u64, b: u8| {
+            let idx = ((va - region_start) / page) as usize;
+            let po = (va - region_start) % page;
+            unsafe { *((frames[idx] + arch::PHYS_OFFSET.get().copied().unwrap_or(0) + po) as *mut u8) = b };
+        };
+        // 整块清零（.tbss 与 TCB 初值）。
+        for &f in frames.iter() {
+            unsafe {
+                core::ptr::write_bytes(
+                    (f + arch::PHYS_OFFSET.get().copied().unwrap_or(0)) as *mut u8,
+                    0,
+                    page as usize,
+                )
+            };
+        }
+        // 初值：从本空间镜像逐字节读（`translate` 走本空间页表）。
+        for i in 0..p.filesz {
+            let phys = self
+                .translate(VirtAddr::new(p.vaddr + i))
+                .ok_or(Error::BadAddress)?;
+            let b = unsafe { *(phys_to_virt(phys.as_u64()) as *const u8) };
+            write_byte(block_start + i, b);
+        }
+        // TCB 首字段 = 线程指针自指针（x86-64 TLS ABI）。
+        let sp = tcb_base.to_le_bytes();
+        for i in 0..8u64 {
+            write_byte(tcb_base + i, sp[i as usize]);
+        }
+        // 随地址空间携带主线程 FS base（首次调用即主线程；派生线程各自设置自己的）。
+        self.set_tls_fs_base(tcb_base);
+        Ok(tcb_base)
     }
 
     /// 在用户空间映射一段物理页。

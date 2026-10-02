@@ -846,7 +846,7 @@ mod backend {
     use arch::{PageFlags, PageSize, VirtAddr};
     use arch_x86_64::paging::X86PageTable;
     use klib::error::Error;
-    use mm::user_space::{DEFAULT_STACK_SIZE, USER_STACK_TOP, USER_TOP, UserAddressSpace};
+    use mm::user_space::{DEFAULT_STACK_SIZE, TlsParams, USER_STACK_TOP, USER_TOP, UserAddressSpace};
 
     // PT_LOAD 的判定已上收至 raw::classify_phdr（单点），此处不再保留本地常量。
     const PF_X: u32 = 1;
@@ -960,6 +960,13 @@ mod backend {
                     if tls.is_some() {
                         return Err(Error::NotSupported);
                     }
+                    // 模板随地址空间携带：派生线程据此建**各自独立**的块（3P4-1）。
+                    addr_space.set_tls_params(TlsParams {
+                        vaddr: t.vaddr,
+                        filesz: t.filesz,
+                        memsz: t.memsz,
+                        align: t.align,
+                    });
                     tls = Some(t);
                 }
                 PhdrClass::RejectInterp => {
@@ -999,7 +1006,12 @@ mod backend {
         // 执行（契约受检、代码可达），只是不交付给用户程序。
         // 证据与下一步见本次提交信息与 docs/TODO/3p.md 的 3P4-1 条目。
         let tls_fs_base = match tls {
-            Some(t) => Some(setup_tls(addr_space, &t, elf)?),
+            Some(t) => Some(addr_space.alloc_tls_block(&TlsParams {
+                vaddr: t.vaddr,
+                filesz: t.filesz,
+                memsz: t.memsz,
+                align: t.align,
+            })?),
             None => None,
         };
 
@@ -1171,91 +1183,6 @@ mod backend {
 
     /// TCB 尺寸（TLS 块尾）：与 libc 的 TCB 契约对齐（T2-1：errno 槽在 FS:0）。
     const TCB_SIZE: u64 = 64;
-
-    /// 为一个执行单元建立 TLS 块并返回 FS base（= 块尾 TCB 首址）。
-    ///
-    /// 布局（x86-64 variant II）：[TLS 块 tls_size][TCB TCB_SIZE]，FS base 指向 TCB。
-    /// 编译器 local-exec 访问形如 mov rax, fs:[0]; mov eax,[rax+off]，off 是**负**的
-    /// R_X86_64_TPOFF32，故变量地址 = TP + off 落在 TLS 块内。
-    ///
-    /// **tls_size 必须与链接器一致**：align_up(memsz, p_align)。不得擅自放大成
-    /// max(align,16)——块尺寸变了，变量的实际偏移就与链接期算出的 TPOFF 错位，
-    /// 程序会读到未初始化数据。TP 另按 max(align,16) 对齐，块起点随之确定。
-    ///
-    /// TCB 契约（与 libc errno 机制 T2-1 对齐）：TCB+0 = errno 槽（i32），
-    /// TCB+8 = self 指针，TCB+16 = tid（本步为 0；线程路径建立时写入）。
-    fn setup_tls(
-        addr_space: &mut UserAddressSpace<X86PageTable>,
-        t: &TlsTemplate,
-        elf: &[u8],
-    ) -> Result<u64, Error> {
-        if t.memsz == 0 {
-            return Err(Error::InvalidParam);
-        }
-        let block_align = if t.align == 0 { 1 } else { t.align };
-        let tls_size = align_up_checked(t.memsz, block_align).ok_or(Error::OutOfRange)?;
-        let tp_align = if block_align < 16 { 16 } else { block_align };
-        // 块区放在用户栈区**之下**（每进程独立地址空间，无冲突）。
-        let region_end = USER_STACK_TOP - DEFAULT_STACK_SIZE;
-        let need = tls_size + TCB_SIZE + tp_align;
-        let pages = (need.div_ceil(PAGE_SIZE)) as usize;
-        let region_start = region_end - pages as u64 * PAGE_SIZE;
-
-        let tcb_base = (region_end - TCB_SIZE) & !(tp_align - 1);
-        let block_start = tcb_base - tls_size;
-        if block_start < region_start {
-            return Err(Error::OutOfRange);
-        }
-
-        // 预留 + 实映射（与 setup_user_stack 同一资源纪律：映射拒绝当场退帧）。
-        addr_space
-            .reserve_user(
-                VirtAddr::new(region_start),
-                VirtAddr::new(region_end),
-                PageSize::Size4K,
-                PageFlags::empty().writable(),
-            )
-            .map_err(Error::from)?;
-        let frames = collect_frames(pages)?;
-        if let Err(e) = addr_space.map_user(
-            VirtAddr::new(region_start),
-            VirtAddr::new(region_end),
-            PageSize::Size4K,
-            PageFlags::empty().writable(),
-            &frames,
-        ) {
-            refund_frames(&frames);
-            return Err(e);
-        }
-
-        let off = hhdm_offset()?;
-        // 整块清零（.tbss 与 TCB 初值），再拷 .tdata 初值。
-        for &f in frames.iter() {
-            unsafe { core::ptr::write_bytes((f + off) as *mut u8, 0, PAGE_SIZE as usize) };
-        }
-        // 初值源取镜像文件内 [offset, offset+filesz)：不依赖「模板段已映射且可读」，
-        // 只依赖 L2 已校验的「初值落在镜像内」。
-        for i in 0..t.filesz {
-            let va = block_start + i;
-            let idx = ((va - region_start) / PAGE_SIZE) as usize;
-            let po = (va - region_start) % PAGE_SIZE;
-            unsafe { *((frames[idx] + off + po) as *mut u8) = elf[(t.offset + i) as usize] };
-        }
-        // TCB **首字段必须是线程指针自指针**（x86-64 TLS ABI，实测得出）：
-        // 编译器 local-exec 序列为 "mov rax, fs:[0]; mov [rax+disp], ..."——它从
-        // FS:0 取出线程指针、再加**负**位移访问变量。若把自指针放在 +8、把 FS:0
-        // 留给 errno（T2-1 的库管理设计），则 fs:[0] 读出 0，访问落到
-        // 0xfffffffffffffffc 而 #PF（本轮实测：选择子与基址都正确却仍 SIGSEGV，
-        // 根因即此）。故 errno 槽后移到 +8——libc 的 __errno_location 需同步改为
-        // 返回 fs_base + 8（见本次提交信息）。
-        let sp_va = tcb_base;
-        let idx = ((sp_va - region_start) / PAGE_SIZE) as usize;
-        let po = (sp_va - region_start) % PAGE_SIZE;
-        unsafe { *((frames[idx] + off + po) as *mut u64) = tcb_base };
-        // 随地址空间携带 FS base：spawn 在**入队前**读它写进 PCB（见 mm 侧字段注释）。
-        addr_space.set_tls_fs_base(tcb_base);
-        Ok(tcb_base)
-    }
 
     fn setup_user_stack(
         addr_space: &mut UserAddressSpace<X86PageTable>,
