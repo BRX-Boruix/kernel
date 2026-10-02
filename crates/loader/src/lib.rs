@@ -239,6 +239,75 @@ pub(crate) mod raw {
         })
     }
 
+    // ---------- 入口栈参数块 mini-ABI（docs/abi/syscall-abi.md §4） ----------
+
+    /// 命令行字符串区容量偏移：字符串区起于 `stack_top - STR_OFF`，可用 `STR_OFF - 1`
+    /// 字节 + NUL 终止符。取值理由与变更纪律见 §4——**禁止散落魔数**。
+    pub(crate) const STR_OFF: usize = 0x200;
+
+    /// 参数块偏移：入口 `rsp = stack_top - RSP_OFF`。
+    pub(crate) const RSP_OFF: usize = 0x220;
+
+    /// 入口栈参数块的纯布局结果（mini-ABI）。
+    ///
+    /// **不是 POSIX argv**：内核不拆词——命令行是**一条字符串**，`argv[0]` 指向它，
+    /// `argc` 恒为 1（有命令行时），`argv[1]` 为 NULL。经 shell 派生时该字符串
+    /// **不含程序名**（shell 已剥首词）。切分由用户程序完成。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct EntryBlock {
+        /// `[rsp + 0x00]`：参数计数（有命令行 = 1，无 = 0）。
+        pub argc: u64,
+        /// `[rsp + 0x08]`：指向整条命令行字符串（NUL 结尾）；无命令行时为 0。
+        pub argv0: u64,
+        /// `[rsp + 0x10]`：NULL 终结槽。
+        ///
+        /// **空命令行时为 `None`**：此时 `rsp = stack_top - 16`，参数块仅两字——
+        /// 第三字会落在栈顶页之外（映射区间为 `[stack_top - PAGE, stack_top)`），
+        /// 故契约不承诺该槽存在，写入方也不得写它。
+        pub argv1: Option<u64>,
+        /// 入口 `rsp`。
+        pub rsp: u64,
+    }
+
+    /// 计算入口栈参数块布局——mini-ABI 在代码中的**单点定义**。
+    ///
+    /// 生产端（`backend::setup_user_stack`）与消费端（`libsys::start`）都以
+    /// `docs/abi/syscall-abi.md` §4 为准；本函数是该契约的唯一实现，
+    /// host 单测 `tests::entry_block_*` 直接锚定它，文档漂移或实现回退在此先红。
+    ///
+    /// 错误：
+    /// - `cmd_len > STR_OFF - 1` → `ArgListTooLong`（E2BIG）。**绝不截断**：静默裁剪
+    ///   会把不完整的命令行伪装成完整交付（LA3/KM5）。
+    /// - 栈顶不足以容纳字符串区/参数块（算术下溢）→ `OutOfRange`。本函数是纯函数，
+    ///   单测会喂任意 `stack_top`，下溢必须显式报错而非回绕出巨地址。
+    pub(crate) fn entry_block(stack_top: u64, cmd_len: usize) -> Result<EntryBlock, Error> {
+        if cmd_len == 0 {
+            // 无命令行：argc 槽与 argv[0] 槽均为 0，rsp = stack_top - 16（§4）。
+            let rsp = stack_top.checked_sub(16).ok_or(Error::OutOfRange)?;
+            return Ok(EntryBlock {
+                argc: 0,
+                argv0: 0,
+                argv1: None,
+                rsp,
+            });
+        }
+        if cmd_len > STR_OFF - 1 {
+            return Err(Error::ArgListTooLong);
+        }
+        let str_user = stack_top
+            .checked_sub(STR_OFF as u64)
+            .ok_or(Error::OutOfRange)?;
+        let rsp = stack_top
+            .checked_sub(RSP_OFF as u64)
+            .ok_or(Error::OutOfRange)?;
+        Ok(EntryBlock {
+            argc: 1,
+            argv0: str_user,
+            argv1: Some(0),
+            rsp,
+        })
+    }
+
     // ---------- host 单测（`cargo test -p loader`） ----------
     #[cfg(test)]
     pub(crate) mod tests {
@@ -512,13 +581,74 @@ pub(crate) mod raw {
             };
             assert_eq!(plan(136, plain).expect("plain").npages, 1);
         }
+
+        // ---- entry_block：入口栈参数块 mini-ABI（docs/abi/syscall-abi.md §4） ----
+        //
+        // 这些断言是 §4 的**行为锚点**：文档若漂移、实现若回退，此处先红。
+        // 语义要点（与 POSIX argv 的差异，勿按 POSIX 直觉修改）：
+        //   - argc 恒为 1（有命令行时），**内核不拆词**；
+        //   - argv[0] 指向**整条命令行字符串**（shell 派生时不含程序名）；
+        //   - argv[1] = NULL；拆词是用户程序的职责。
+
+        /// 与 mm::user_space::USER_STACK_TOP 同形的 16 字节对齐栈顶（host 侧样本值）。
+        const TEST_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
+
+        #[test]
+        fn entry_block_points_argv0_at_whole_cmdline() {
+            let b = entry_block(TEST_STACK_TOP, 5).expect("5 字节命令行应被接受");
+            assert_eq!(b.argc, 1, "有命令行时 argc 恒为 1（不拆词）");
+            assert_eq!(
+                b.argv0,
+                TEST_STACK_TOP - STR_OFF as u64,
+                "argv[0] 指向整条命令行字符串区首址，不是程序名"
+            );
+            assert_eq!(b.argv1, Some(0), "argv[1] 必须是 NULL 终结");
+            assert_eq!(b.rsp, TEST_STACK_TOP - RSP_OFF as u64, "rsp 落在参数块首址");
+            // 参数块（argc + argv[0] + NULL = 24 字节）整体位于字符串区**之下**，
+            // 且与 System V 的 16 字节入口对齐要求相容。
+            // argv[0] 即字符串区首址：参数块整体必须落在它之下。
+            assert!(b.rsp + 24 <= b.argv0, "参数块不得与命令行字符串区重叠");
+            assert_eq!(b.rsp % 16, 0, "entry 处 rsp 须 16 字节对齐");
+        }
+
+        #[test]
+        fn entry_block_without_cmdline_has_zero_argc() {
+            let b = entry_block(TEST_STACK_TOP, 0).expect("空命令行合法");
+            assert_eq!(b.argc, 0, "无命令行时 argc 槽为 0");
+            assert_eq!(b.argv0, 0, "无命令行时 argv[0] 槽为 0");
+            assert_eq!(
+                b.argv1, None,
+                "空命令行参数块仅两字：第三字会越出栈顶页，契约不承诺该槽"
+            );
+            assert_eq!(b.rsp, TEST_STACK_TOP - 16);
+        }
+
+        #[test]
+        fn entry_block_accepts_capacity_limit_and_rejects_beyond() {
+            // STR_OFF-1 是字符串区容量上限（命令行 + NUL 终止符）：恰满可交付。
+            assert!(entry_block(TEST_STACK_TOP, STR_OFF - 1).is_ok());
+            // 超一字节即显式拒绝——绝不截断后把裁剪过的命令行伪装成完整交付（LA3/KM5）。
+            assert_eq!(
+                entry_block(TEST_STACK_TOP, STR_OFF),
+                Err(Error::ArgListTooLong)
+            );
+        }
+
+        #[test]
+        fn entry_block_rejects_stack_top_underflow() {
+            // 栈顶小到放不下参数块/字符串区时必须显式报错，不得回绕出巨地址。
+            assert!(entry_block(0, 1).is_err());
+            assert!(entry_block(RSP_OFF as u64 - 1, 1).is_err());
+        }
     }
 }
 
 // ---------- 后端层：用户地址空间装载（kernel 经 user-space feature 启用） ----------
 #[cfg(feature = "user-space")]
 mod backend {
-    use super::raw::{parse_header, plan_segment, rd_u32, rd_u64, SegmentSpec};
+    use super::raw::{
+        RSP_OFF, STR_OFF, SegmentSpec, entry_block, parse_header, plan_segment, rd_u32, rd_u64,
+    };
     use alloc::vec::Vec;
     use arch::{PageFlags, PageSize, VirtAddr};
     use arch_x86_64::paging::X86PageTable;
@@ -796,21 +926,17 @@ mod backend {
         addr_space: &mut UserAddressSpace<X86PageTable>,
         cmd: &[u8],
     ) -> Result<u64, Error> {
-        // 栈顶参数块 mini-ABI：布局、STR_OFF/RSP_OFF 取值理由与变更纪律见
-        // docs/abi/syscall-abi.md §4（LA2）。
-        const STR_OFF: usize = 0x200;
-        const RSP_OFF: usize = 0x220;
-
-        // LA3/KM5：命令行 + NUL 终止符必须能完整放进栈顶字符串区。超容即
-        // 显式 ArgListTooLong（与 syscall 层 CMD_BUF_BYTES 上限同一政策）——
-        // 静默截断会把被裁剪过的命令行伪装成完整交付（伪数据）。校验放在
-        // 分配之前：失败路径不产生任何待回收资源。
-        if cmd.len() > STR_OFF - 1 {
-            return Err(Error::ArgListTooLong);
-        }
-
+        // 栈顶参数块 mini-ABI：布局的**单点定义**在 `raw::entry_block`（host 单测
+        // 锚定其契约），语义、取值理由与变更纪律见 docs/abi/syscall-abi.md §4
+        // （LA2）；消费端 `libsys::start` 按同一契约取 argc/argv。
+        //
+        // LA3/KM5：命令行 + NUL 终止符必须能完整放进栈顶字符串区，超容即显式
+        // ArgListTooLong（与 syscall 层 CMD_BUF_BYTES 上限同一政策）——静默截断
+        // 会把被裁剪过的命令行伪装成完整交付（伪数据）。校验在 `entry_block` 内，
+        // 且先于任何资源获取：失败路径不产生待回收资源。
         let stack_size = USER_STACK_PAGES as u64 * PAGE_SIZE;
         let stack_top = USER_STACK_TOP;
+        let block = entry_block(stack_top, cmd.len())?;
         let stack_bottom = stack_top - stack_size;
 
         // S20：同 load_segment，HHDM 前置先于任何资源获取。
@@ -848,12 +974,9 @@ mod backend {
             // 栈顶页的物理末端（帧起始 + HHDM 偏移 + 整页）。
             let top = (frames[0] + off + PAGE_SIZE) as *mut u8;
 
-            if !cmd.is_empty() {
-                let str_user = stack_top - STR_OFF as u64;
-                let rsp_user = stack_top - RSP_OFF as u64;
-
+            if block.argc == 1 {
                 let sp = top.sub(STR_OFF);
-                // 容量已在函数入口验证（cmd.len() <= STR_OFF - 1），
+                // 容量已在 `entry_block` 验证（cmd.len() <= STR_OFF - 1），
                 // 写入 cmd 后必然还剩至少 1 字节给 NUL，无需截断。
                 let n = cmd.len();
                 for i in 0..n {
@@ -862,19 +985,22 @@ mod backend {
                 *sp.add(n) = 0;
 
                 let rp = top.sub(RSP_OFF) as *mut u64;
-                *rp = 1;
-                *rp.add(1) = str_user;
-                *rp.add(2) = 0;
+                *rp = block.argc;
+                *rp.add(1) = block.argv0;
+                // 有命令行时 NULL 终结槽必然存在（`entry_block` 单测锚定）。
+                debug_assert_eq!(block.argv1, Some(0), "mini-ABI：argv[1] 必须为 NULL");
+                *rp.add(2) = block.argv1.unwrap_or(0);
 
-                return Ok(rsp_user);
+                return Ok(block.rsp);
             }
 
+            // 无命令行：参数块仅两字（第三字会越出栈顶页，见 `EntryBlock::argv1`）。
             let top64 = top as *mut u64;
             *top64.sub(2) = 0;
             *top64.sub(1) = 0;
         }
 
-        Ok(stack_top - 16)
+        Ok(block.rsp)
     }
 }
 
