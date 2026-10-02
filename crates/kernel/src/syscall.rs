@@ -3114,13 +3114,23 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
         child_identity,
     ) {
         Ok(pid) => {
+            // 3P4-1：镜像含 PT_TLS 时，loader 已建好主线程的 TLS 块并给出 FS base。
+            // 必须在子进程**开始运行前**写入（切换点切入时写 MSR）；写失败即如实
+            // 上抛——不静默留 fs_base=0，否则带 TLS 的程序会在首次 fs: 访问处取指
+            // fault（伪支持，S09）。
+            if let Some(fs_base) = loaded.tls_fs_base {
+                if let Err(e) = task::set_unit_fs_base(pid, fs_base) {
+                    return pack_err(e);
+                }
+            }
             // 每进程一条的流程细节：降为 debug（默认不输出）。
             klib::debug!(
-                "[syscall] exec prog={} -> pid={} (ppid={}) entry={:#x}",
+                "[syscall] exec prog={} -> pid={} (ppid={}) entry={:#x} tls_fs_base={:?}",
                 prog_name,
                 pid,
                 parent_pid,
-                loaded.entry
+                loaded.entry,
+                loaded.tls_fs_base
             );
             pack_ok(pid as u64)
         }

@@ -685,6 +685,20 @@ pub fn spawn_thread_with(
     Ok(pid)
 }
 
+/// 设置某个调度单元的 FS 段基址（IA32_FS_BASE 初值），供用户态 TLS 装配使用。
+///
+/// 语义：只改 PCB 里的 fs_base；该单元**下次被切入**时由切换点写进 MSR
+/// （switch_apply_next 的 gdt::write_fs_base）。故调用方必须在单元**开始运行前**
+/// 调用——spawn 之后立即调用即满足（新单元尚未入 CPU）。
+pub fn set_unit_fs_base(pid: usize, base: u64) -> Result<(), Error> {
+    let mut g = proc_bucket_lock(pid);
+    let Some(e) = g.get_mut(&pid) else {
+        return Err(Error::NotFound);
+    };
+    e.fs_base = base;
+    Ok(())
+}
+
 // ---------- COW 派生子进程（ADR-038 / kernel-tests M5+） ----------
 
 /// `derive` 内核原语：以 `ppid` 为父，**COW 派生**一个独立线程组的新子进程（ADR-038）。

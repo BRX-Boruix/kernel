@@ -9332,18 +9332,19 @@ pub fn test_loader_adversarial() {
         info!("[test-loader] baseline load OK, bss + tail-pad pages verified zero");
     }
 
-    // -- 8. 要求未实现能力的程序头：显式拒绝而非静默跳过（伪支持止血）--
+    // -- 8. 未实现能力的程序头：显式拒绝而非静默跳过（伪支持止血）--
     //
-    // PT_TLS(7) / PT_INTERP(3) / PT_DYNAMIC(2) 都要求本加载器不具备的能力
-    // （用户态 TLS / 动态链接器 / 重定位）。此前一律 continue：镜像会被
-    // 「成功装载」，程序却在运行期以难以定位的方式崩——TLS 的典型症状是
-    // 首次 fs: 访问（errno / thread_local）即取指 fault。显式拒绝把故障点
-    // 移回装载期（S09：错误优于伪支持）。
+    // PT_INTERP(3) / PT_DYNAMIC(2) 要求本加载器不具备的能力（动态链接器 /
+    // 重定位）。此前一律 continue：镜像会被「成功装载」，程序却在运行期以
+    // 难以定位的方式崩。显式拒绝把故障点移回装载期（S09：错误优于伪支持）。
+    //
+    // **PT_TLS(7) 已不在拒绝面内**：3P4-1 落地用户态 TLS 后，该类型改为
+    // 「解析模板 + 为每线程建块」；模板必须落在已加载段内，否则 InvalidParam
+    // （见本段末尾的用例）。
     //
     // 拒绝面的经验依据：实测现有 33 个用户态程序（32 个内置 + 第三方样例）
     // 只含 PT_LOAD / PT_GNU_RELRO / PT_GNU_STACK，故对它们零影响。
-    // 用户态 TLS 落地后（docs/TODO/3p.md 3P4-1），PT_TLS 用例应改为「接受」。
-    for (p_type, name) in [(7u32, "pt_tls"), (3, "pt_interp"), (2, "pt_dynamic")] {
+    for (p_type, name) in [(3u32, "pt_interp"), (2, "pt_dynamic")] {
         let mut elf = alloc::vec::Vec::new();
         // 一个正常 PT_LOAD（entry 落在其页区间内）+ 一个被测类型的程序头。
         push_ehdr(&mut elf, LoaderElfSpec::BASE.entry, 64, 2);
@@ -9358,6 +9359,29 @@ pub fn test_loader_adversarial() {
         push_phdr_typed(&mut elf, p_type, 0, 0, 0, 0, 0);
         elf.extend_from_slice(&[0xA5; 16]);
         expect_loader_reject(&elf, &[], Error::NotSupported, name);
+    }
+
+    // -- 9. PT_TLS：模板必须落在已加载段内（3P4-1）--
+    //
+    // PT_TLS 不再被拒绝，而是解析为模板并为线程建块。但模板初值的虚拟地址
+    // 必须落在某个已加载 PT_LOAD 段内——否则「拷贝初值」的源地址不在该地址
+    // 空间里（或指向内核半区）。本用例构造一个 vaddr=0 的模板（不在任何段内），
+    // 断言以 InvalidParam 拒绝，而不是放任它去拷内核内存（L2 同类纪律）。
+    {
+        let mut elf = alloc::vec::Vec::new();
+        push_ehdr(&mut elf, LoaderElfSpec::BASE.entry, 64, 2);
+        push_phdr(
+            &mut elf,
+            64 + 2 * 56,
+            LoaderElfSpec::BASE.p_vaddr,
+            0x10,
+            0x10,
+            5,
+        );
+        // PT_TLS：vaddr=0（任何已加载段之外）、filesz=4、memsz=4、align=4。
+        push_phdr_typed(&mut elf, 7, 0, 0, 0, 4, 4);
+        elf.extend_from_slice(&[0xA5; 16]);
+        expect_loader_reject(&elf, &[], Error::InvalidParam, "pt_tls outside loaded segments");
     }
 
     info!("[test-loader] PASS");
