@@ -650,6 +650,13 @@ pub fn spawn_thread_with(
         (leader.proc.thread_group_arc(), leader.proc.signal().trampoline())
     };
     let pid = alloc_pid();
+    // 3P4-1：为组员建立**独立**的 TLS 块（须在 `group` 被 Process::with_group 移走之前）。
+    // 模板随组长地址空间携带；每执行单元一块、内容各自独立——这正是"跨线程独立"
+    // 的实现点。镜像无 PT_TLS 时 fs_base = 0（该线程不做 fs: 访问，与既有行为一致）。
+    let member_fs_base = match group.addr_space().tls_params() {
+        Some(p) => group.addr_space().alloc_tls_block(&p)?,
+        None => 0,
+    };
     // 分配组员独立内核栈（16 帧，同组长；HHDM 高半区共享页表可见）。
     let stack_frame = mm::allocate_frames(KSTACK_ORDER).ok_or(Error::OutOfMemory)?;
     let kstack_top = arch::phys_to_virt(stack_frame.start_paddr()) + KSTACK_SIZE as u64;
@@ -679,7 +686,7 @@ pub fn spawn_thread_with(
         exit_code: 0,
         waiting_for: None,
         home_cpu,
-        fs_base: 0,
+        fs_base: member_fs_base,
         vruntime: 0,
         nice: 0,
     });

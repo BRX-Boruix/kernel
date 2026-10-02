@@ -390,6 +390,12 @@ pub(crate) struct ThreadGroup<PT: PageTable> {
 }
 
 impl<PT: PageTable> ThreadGroup<PT> {
+    /// 组共享地址空间（`Arc`，T1-4 内部粗锁）。派生线程据此为**自己**建 TLS 块
+    /// （3P4-1：模板随地址空间携带，每执行单元一块、互不共享）。
+    pub(crate) fn addr_space(&self) -> &Arc<UserAddressSpace<PT>> {
+        &self.addr_space
+    }
+
     /// 构造一个独立组（组长独占）：默认标准流 fd 表 + `/` cwd + 默认身份 +
     /// 传入的地址空间 `Arc`。组长进程在其 PCB 构造时经此自建并持有本组。
     fn new(addr_space: Arc<UserAddressSpace<PT>>, owner: usize) -> Self {
