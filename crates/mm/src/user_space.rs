@@ -43,7 +43,7 @@ pub const USER_STACK_TOP: u64 = 0x0000_7fff_0000_0000;
 /// 用户堆基址（`brk` 的初始断点）。
 pub const USER_HEAP_BASE: u64 = 0x0000_0001_0000_0000;
 /// 默认用户栈大小（预留区域，按需分页）。
-pub const DEFAULT_STACK_SIZE: u64 = 4 * 1024 * 1024; // 4MiB
+pub const DEFAULT_STACK_SIZE: u64 = 1 * 1024 * 1024; // 1MiB（ADR-049 起为**增长上限**，不再前置提交）
 
 /// 信号 restorer（trampoline）保留区虚拟地址（ADR-034 §2.5 / PRE-3）。
 ///
