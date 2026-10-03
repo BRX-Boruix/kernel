@@ -3085,7 +3085,9 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
     // 入口参数块 mini-ABI（argc/argv 语义、字符串区容量、无命令行形态）见
     // docs/abi/syscall-abi.md §4；布局算术的单点定义与行为锚点在
     // `loader::raw::entry_block()`（由 loader 侧 host 单测锚定）。
-    let loaded = match loader::load(elf_bytes, &mut us, cmd) {
+    // ABI v2（3P4-2）：第 4 参是 envp。本步先交付**空环境**（布局与传递链路已就位，
+    // 内核侧环境合成与继承属 3P4-2 下一步）；空环境同样以 NULL 终结，语义自洽。
+    let loaded = match loader::load(elf_bytes, &mut us, cmd, &[]) {
         Ok(l) => l,
         Err(e) => return pack_err(e),
     };

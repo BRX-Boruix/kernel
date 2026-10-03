@@ -251,36 +251,45 @@ pub(crate) mod raw {
     /// 内核单次拷贝缓冲同量级，且远小于用户栈预算（字符串区 + 参数块 < 0x2000）。
     pub const MAX_CMDLINE_BYTES: usize = 4096;
 
-    /// 字符串区偏移：字符串区起于 `stack_top - STR_OFF`。
+    /// 环境块容量上限（字节：所有 env 串长度 + 各自 NUL 之和）——**单点定义**。
     ///
-    /// 预算 = 命令行（`MAX_CMDLINE_BYTES` + NUL）向上对齐到 16 字节边界。
-    /// **禁止散落魔数**：由 `MAX_CMDLINE_BYTES` 派生，不写字面量。
-    pub const STR_OFF: usize = (MAX_CMDLINE_BYTES + 1 + 15) & !15;
+    /// 3P4-2（ABI v2）：envp 按 §4 预留规则追加（argv 之后、NULL 终结前插入，envp 再其后）。
+    pub const MAX_ENV_BYTES: usize = 4096;
 
-    /// 参数块偏移：入口 `rsp = stack_top - RSP_OFF`。
+    /// 环境变量条数上限（envp 槽位数）——单点定义。
+    pub const MAX_ENV_COUNT: usize = 64;
+
+    /// 字符串区偏移：字符串区起于 `stack_top - STR_OFF`，承载**命令行与环境串**。
     ///
-    /// 参数块（argc + argv[0] + NULL 终结 = 24 字节）放在字符串区**之下**再留 8 字节，
-    /// 使 `rsp` 落在 16 字节对齐边界（System V x86-64：entry 处 rsp 须 16 对齐）。
-    pub const RSP_OFF: usize = STR_OFF + 0x20;
+    /// 预算 = 命令行（`MAX_CMDLINE_BYTES` + NUL）+ 环境（`MAX_ENV_BYTES`），
+    /// 向上对齐到 16 字节边界。**禁止散落魔数**：全部由上述常量派生。
+    pub const STR_OFF: usize = (MAX_CMDLINE_BYTES + 1 + MAX_ENV_BYTES + 15) & !15;
+
+    /// 入口 `rsp` 相对栈顶的**最小**偏移（空命令行 + 空环境时的字数组下界）。
+    ///
+    /// ABI v2 起字数组长度随 envp 条数变化，故 `rsp` 由 `entry_block` **动态**算出；
+    /// 本常量只用于容量与下溢校验（初始实映射页数亦由算出的 `rsp` 反推）。
+    pub const RSP_OFF_MIN: usize = STR_OFF + 0x20;
 
     /// 入口栈参数块的纯布局结果（mini-ABI）。
     ///
     /// **不是 POSIX argv**：内核不拆词——命令行是**一条字符串**，`argv[0]` 指向它，
     /// `argc` 恒为 1（有命令行时），`argv[1]` 为 NULL。经 shell 派生时该字符串
     /// **不含程序名**（shell 已剥首词）。切分由用户程序完成。
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct EntryBlock {
         /// `[rsp + 0x00]`：参数计数（有命令行 = 1，无 = 0）。
         pub argc: u64,
         /// `[rsp + 0x08]`：指向整条命令行字符串（NUL 结尾）；无命令行时为 0。
         pub argv0: u64,
-        /// `[rsp + 0x10]`：NULL 终结槽。
+        /// envp 槽位值（逐项指向环境串），位于 `argv[argc]` 的 NULL 终结槽之后。
         ///
-        /// **空命令行时为 `None`**：此时 `rsp = stack_top - 16`，参数块仅两字——
-        /// 第三字会落在栈顶页之外（映射区间为 `[stack_top - PAGE, stack_top)`），
-        /// 故契约不承诺该槽存在，写入方也不得写它。
-        pub argv1: Option<u64>,
-        /// 入口 `rsp`。
+        /// 布局（ABI v2）：`argc, argv[0..argc), NULL, envp[0..envc), NULL`——
+        /// 消费端可据 `argv + (argc + 1) * 8` 直接定位 envp，无需新 ABI 槽。
+        pub envp: alloc::vec::Vec<u64>,
+        /// 每个环境串在**字符串区内的字节偏移**（相对 `stack_top - STR_OFF`），与 `envp` 同序。
+        pub env_offsets: alloc::vec::Vec<u64>,
+        /// 入口 `rsp`（字数组首址，16 字节对齐）。
         pub rsp: u64,
     }
 
@@ -293,32 +302,62 @@ pub(crate) mod raw {
     /// 错误：
     /// - `cmd_len > MAX_CMDLINE_BYTES` → `ArgListTooLong`（E2BIG）。**绝不截断**：静默裁剪
     ///   会把不完整的命令行伪装成完整交付（LA3/KM5）。
-    /// - 栈顶不足以容纳字符串区/参数块（算术下溢）→ `OutOfRange`。本函数是纯函数，
+    /// - 环境超 `MAX_ENV_COUNT` 条或超 `MAX_ENV_BYTES` 字节 → 同样显式 `ArgListTooLong`
+    ///   （**绝不丢弃**任何一条：静默丢环境与截断命令行同性质）。
+    /// - 栈顶不足以容纳字符串区/字数组（算术下溢）→ `OutOfRange`。本函数是纯函数，
     ///   单测会喂任意 `stack_top`，下溢必须显式报错而非回绕出巨地址。
-    pub(crate) fn entry_block(stack_top: u64, cmd_len: usize) -> Result<EntryBlock, Error> {
-        if cmd_len == 0 {
-            // 无命令行：argc 槽与 argv[0] 槽均为 0，rsp = stack_top - 16（§4）。
-            let rsp = stack_top.checked_sub(16).ok_or(Error::OutOfRange)?;
-            return Ok(EntryBlock {
-                argc: 0,
-                argv0: 0,
-                argv1: None,
-                rsp,
-            });
-        }
+    pub(crate) fn entry_block(
+        stack_top: u64,
+        cmd_len: usize,
+        env: &[&[u8]],
+    ) -> Result<EntryBlock, Error> {
         if cmd_len > MAX_CMDLINE_BYTES {
             return Err(Error::ArgListTooLong);
         }
-        let str_user = stack_top
+        if env.len() > MAX_ENV_COUNT {
+            return Err(Error::ArgListTooLong);
+        }
+        let env_bytes = env
+            .iter()
+            .try_fold(0usize, |acc, e| acc.checked_add(e.len() + 1))
+            .ok_or(Error::OutOfRange)?;
+        if env_bytes > MAX_ENV_BYTES {
+            return Err(Error::ArgListTooLong);
+        }
+
+        let argc: usize = if cmd_len == 0 { 0 } else { 1 };
+        // 字数组：argc + argv[0..argc) + NULL + envp[0..envc) + NULL。
+        let words = 1 + argc + 1 + env.len() + 1;
+        let str_base = stack_top
             .checked_sub(STR_OFF as u64)
             .ok_or(Error::OutOfRange)?;
-        let rsp = stack_top
-            .checked_sub(RSP_OFF as u64)
+        // 字数组紧贴字符串区**之下**，rsp 向下取整到 16 字节对齐（System V 入口要求）。
+        let raw_rsp = str_base
+            .checked_sub((words * 8) as u64)
             .ok_or(Error::OutOfRange)?;
+        let rsp = raw_rsp & !15u64;
+
+        // 环境串在字符串区内的偏移：命令行（含 NUL）之后依次排布。
+        let mut env_offsets = alloc::vec::Vec::new();
+        env_offsets.try_reserve(env.len()).map_err(|_| Error::OutOfMemory)?;
+        let mut off = (cmd_len + if cmd_len == 0 { 0 } else { 1 }) as u64;
+        for e in env.iter() {
+            env_offsets.push(off);
+            off += (e.len() + 1) as u64;
+        }
+        // envp 槽位地址：字数组内 argv 终结槽之后。
+        let envp_first = rsp + ((1 + argc + 1) * 8) as u64;
+        let mut envp = alloc::vec::Vec::new();
+        envp.try_reserve(env.len()).map_err(|_| Error::OutOfMemory)?;
+        for (i, _) in env.iter().enumerate() {
+            envp.push(str_base + env_offsets[i]);
+        }
+        let _ = envp_first;
         Ok(EntryBlock {
-            argc: 1,
-            argv0: str_user,
-            argv1: Some(0),
+            argc: argc as u64,
+            argv0: if cmd_len == 0 { 0 } else { str_base },
+            envp,
+            env_offsets,
             rsp,
         })
     }
@@ -712,57 +751,105 @@ pub(crate) mod raw {
 
         #[test]
         fn entry_block_points_argv0_at_whole_cmdline() {
-            let b = entry_block(TEST_STACK_TOP, 5).expect("5 字节命令行应被接受");
+            let b = entry_block(TEST_STACK_TOP, 5, &[]).expect("5 字节命令行应被接受");
             assert_eq!(b.argc, 1, "有命令行时 argc 恒为 1（不拆词）");
             assert_eq!(
                 b.argv0,
                 TEST_STACK_TOP - STR_OFF as u64,
                 "argv[0] 指向整条命令行字符串区首址，不是程序名"
             );
-            assert_eq!(b.argv1, Some(0), "argv[1] 必须是 NULL 终结");
-            assert_eq!(b.rsp, TEST_STACK_TOP - RSP_OFF as u64, "rsp 落在参数块首址");
-            // 参数块（argc + argv[0] + NULL = 24 字节）整体位于字符串区**之下**，
-            // 且与 System V 的 16 字节入口对齐要求相容。
-            // argv[0] 即字符串区首址：参数块整体必须落在它之下。
-            assert!(b.rsp + 24 <= b.argv0, "参数块不得与命令行字符串区重叠");
+            assert!(b.envp.is_empty(), "空环境：envp 无槽位");
+            // 字数组（argc + argv[0] + NULL + envp NULL = 32 字节，空环境）整体位于
+            // 字符串区**之下**，且与 System V 的 16 字节入口对齐要求相容。
+            assert!(b.rsp + 32 <= b.argv0, "字数组不得与字符串区重叠");
             assert_eq!(b.rsp % 16, 0, "entry 处 rsp 须 16 字节对齐");
         }
 
         #[test]
         fn entry_block_without_cmdline_has_zero_argc() {
-            let b = entry_block(TEST_STACK_TOP, 0).expect("空命令行合法");
+            let b = entry_block(TEST_STACK_TOP, 0, &[]).expect("空命令行合法");
             assert_eq!(b.argc, 0, "无命令行时 argc 槽为 0");
             assert_eq!(b.argv0, 0, "无命令行时 argv[0] 槽为 0");
-            assert_eq!(
-                b.argv1, None,
-                "空命令行参数块仅两字：第三字会越出栈顶页，契约不承诺该槽"
-            );
-            assert_eq!(b.rsp, TEST_STACK_TOP - 16);
+            // ABI v2 起布局**统一**（不再有"第三字越出栈顶页"的特例）：空命令行下字数组
+            // 仍是 argc + argv NULL + envp NULL，故 envp 定位规则对两种 argc 一致。
+            let str_base = TEST_STACK_TOP - STR_OFF as u64;
+            assert!((str_base - b.rsp) / 8 >= 3, "空命令行下字数组至少 3 字");
+            assert_eq!(b.rsp % 16, 0);
         }
 
         #[test]
         fn entry_block_accepts_capacity_limit_and_rejects_beyond() {
             // MAX_CMDLINE_BYTES 是命令行长度上限（不含 NUL 终止符）：恰满可交付。
-            assert!(entry_block(TEST_STACK_TOP, MAX_CMDLINE_BYTES).is_ok());
+            assert!(entry_block(TEST_STACK_TOP, MAX_CMDLINE_BYTES, &[]).is_ok());
             // 超一字节即显式拒绝——绝不截断后把裁剪过的命令行伪装成完整交付（LA3/KM5）。
             assert_eq!(
-                entry_block(TEST_STACK_TOP, MAX_CMDLINE_BYTES + 1),
+                entry_block(TEST_STACK_TOP, MAX_CMDLINE_BYTES + 1, &[]),
                 Err(Error::ArgListTooLong)
             );
             // 3P4-2 行为锚点：**旧上限（511）必须已解除**——512..=MAX 之间一律可交付。
             // 若只改了常量而没改契约，本断言先红（文档漂移/实现回退在此暴露）。
             assert!(
-                entry_block(TEST_STACK_TOP, 0x1FF + 1).is_ok(),
+                entry_block(TEST_STACK_TOP, 0x1FF + 1, &[]).is_ok(),
                 "511 字节旧上限必须已解除（3P4-2）"
             );
-            assert!(entry_block(TEST_STACK_TOP, 4096).is_ok());
+            assert!(entry_block(TEST_STACK_TOP, 4096, &[]).is_ok());
         }
 
         #[test]
         fn entry_block_rejects_stack_top_underflow() {
             // 栈顶小到放不下参数块/字符串区时必须显式报错，不得回绕出巨地址。
-            assert!(entry_block(0, 1).is_err());
-            assert!(entry_block(RSP_OFF as u64 - 1, 1).is_err());
+            assert!(entry_block(0, 1, &[]).is_err());
+            assert!(entry_block(RSP_OFF_MIN as u64 - 1, 1, &[]).is_err());
+        }
+
+        #[test]
+        fn entry_block_lays_out_envp_after_argv() {
+            let env: [&[u8]; 2] = [b"PATH=/programs", b"HOME=/"];
+            let b = entry_block(TEST_STACK_TOP, 5, &env).expect("带环境应被接受");
+            assert_eq!(b.argc, 1);
+            assert_eq!(b.envp.len(), 2, "envp 槽位数 = 环境条数");
+            let str_base = TEST_STACK_TOP - STR_OFF as u64;
+            // envp 指向字符串区内的环境串，且区内偏移紧凑排布（各自含 NUL）。
+            assert_eq!(b.envp[0], str_base + b.env_offsets[0]);
+            assert_eq!(b.envp[1], str_base + b.env_offsets[1]);
+            assert!(b.env_offsets[0] >= 6, "环境串排在命令行（5 + NUL）之后");
+            assert_eq!(
+                b.env_offsets[1] - b.env_offsets[0],
+                env[0].len() as u64 + 1,
+                "环境串在区内紧凑排布（各自含 NUL）"
+            );
+            // 字数组：[argc][argv0][NULL][envp0][envp1][NULL]（6 字 = 48 字节）。
+            assert!(b.rsp + 48 <= str_base, "字数组必须整体在字符串区之下");
+            assert_eq!(b.rsp % 16, 0, "entry 处 rsp 须 16 字节对齐");
+            // 消费端定位规则（ABI §4）：envp = argv + (argc + 1) * 8，
+            // 其中 argv 即 argv[0] 槽地址（rsp + 8）。
+            let argv_slot = b.rsp + 8;
+            assert_eq!(
+                argv_slot + (b.argc + 1) * 8,
+                b.rsp + 24,
+                "envp 首槽紧跟 argv 的 NULL 终结槽"
+            );
+        }
+
+        #[test]
+        fn entry_block_rejects_env_over_limits() {
+            // 条数超限 → 显式拒绝（**绝不静默丢弃**环境变量，与命令行不截断同政策）。
+            let many: alloc::vec::Vec<&[u8]> = alloc::vec![&b"K=V"[..]; MAX_ENV_COUNT + 1];
+            assert_eq!(
+                entry_block(TEST_STACK_TOP, 0, &many),
+                Err(Error::ArgListTooLong)
+            );
+            // 字节数超限 → 同样显式拒绝。
+            let big = alloc::vec![b'x'; MAX_ENV_BYTES];
+            let over: [&[u8]; 1] = [&big];
+            assert_eq!(
+                entry_block(TEST_STACK_TOP, 0, &over),
+                Err(Error::ArgListTooLong)
+            );
+            // 边界内侧（恰满字节预算）可交付。
+            let exact = alloc::vec![b'y'; MAX_ENV_BYTES - 1];
+            let ok: [&[u8]; 1] = [&exact];
+            assert!(entry_block(TEST_STACK_TOP, 0, &ok).is_ok());
         }
 
         // ---- classify_phdr：程序头类型的装载处置 ----
@@ -861,7 +948,8 @@ pub(crate) mod raw {
 #[cfg(feature = "user-space")]
 mod backend {
     use super::raw::{
-        MAX_CMDLINE_BYTES, PhdrClass, RSP_OFF, STR_OFF, SegmentSpec, TlsTemplate, align_up_checked, classify_phdr,
+        MAX_CMDLINE_BYTES, MAX_ENV_BYTES, MAX_ENV_COUNT, PhdrClass, RSP_OFF_MIN, STR_OFF, SegmentSpec,
+        TlsTemplate, align_up_checked, classify_phdr,
         entry_block, parse_header, parse_tls_template, plan_segment, rd_u32, rd_u64,
     };
     use alloc::vec::Vec;
@@ -932,6 +1020,7 @@ mod backend {
         elf: &[u8],
         addr_space: &mut UserAddressSpace<X86PageTable>,
         cmd: &[u8],
+        env: &[&[u8]],
     ) -> Result<LoadedElf, Error> {
         let hdr = parse_header(elf)?;
 
@@ -1020,7 +1109,7 @@ mod backend {
             return Err(Error::InvalidParam);
         }
 
-        let stack_top = setup_user_stack(addr_space, cmd)?;
+        let stack_top = setup_user_stack(addr_space, cmd, env)?;
         // **安全闸（3P4-1 未完，勿删）**：装配路径已实现，且 TLS 块本身经实测验证
         // 正确（用户态 memory_query 报 PRESENT|USER|WRITABLE、裸指针读到正确初值、
         // rdfsbase 读回 FS base），但 **FS 相对访问**仍失败，且该失败会让用户程序
@@ -1209,27 +1298,26 @@ mod backend {
     fn setup_user_stack(
         addr_space: &mut UserAddressSpace<X86PageTable>,
         cmd: &[u8],
+        env: &[&[u8]],
     ) -> Result<u64, Error> {
-        // 栈顶参数块 mini-ABI：布局的**单点定义**在 `raw::entry_block`（host 单测
-        // 锚定其契约），语义、取值理由与变更纪律见 docs/abi/syscall-abi.md §4
-        // （LA2）；消费端 `libsys::start` 按同一契约取 argc/argv。
+        // 栈顶参数块 mini-ABI：布局的**单点定义**在 `raw::entry_block`（host 单测锚定
+        // 其契约），语义、取值理由与变更纪律见 docs/abi/syscall-abi.md §4（LA2）。
+        // 消费端 `libsys::start` 按同一契约取 argc/argv，并按 `argv + (argc + 1) * 8`
+        // 定位 envp（ABI v2，3P4-2）——**无需新 ABI 槽**。
         //
-        // LA3/KM5：命令行 + NUL 终止符必须能完整放进栈顶字符串区，超容即显式
-        // ArgListTooLong（与 syscall 层 CMD_BUF_BYTES 上限同一政策）——静默截断
-        // 会把被裁剪过的命令行伪装成完整交付（伪数据）。校验在 `entry_block` 内，
+        // LA3/KM5：命令行与环境都必须能完整放进字符串区，超容即显式 ArgListTooLong
+        // ——静默截断或丢弃会把不完整交付伪装成完整（伪数据）。校验在 `entry_block` 内，
         // 且先于任何资源获取：失败路径不产生待回收资源。
         let stack_size = USER_STACK_PAGES as u64 * PAGE_SIZE;
         let stack_top = USER_STACK_TOP;
-        let block = entry_block(stack_top, cmd.len())?;
+        let block = entry_block(stack_top, cmd.len(), env)?;
         let stack_bottom = stack_top - stack_size;
 
         // S20：同 load_segment，HHDM 前置先于任何资源获取。
         let off = hhdm_offset()?;
 
-        // 按需分页（M17 重构）：只预留整个 4MiB 栈区（demand_paging=true，
-        // 不分配物理帧），初始只实映射**栈顶 1 页**承载命令行 + 参数块。
-        // 栈向下增长越过首页时由用户态 #PF 经 handle_page_fault 逐页补帧，
-        // 不再一次预分配 1024 页物理帧（旧实现深递归场景预占帧过多）。
+        // 按需分页（M17）：预留整个 4MiB 栈区，初始只实映射承载
+        // **字符串区 + 字数组**的那些页；其余页由用户态 #PF 逐页补帧。
         addr_space
             .reserve_user(
                 VirtAddr::new(stack_bottom),
@@ -1239,13 +1327,13 @@ mod backend {
             )
             .map_err(|e| Error::from(e))?;
 
-        // 初始实映射**必须覆盖字符串区 + 参数块**：二者都落在
-        // `[stack_top - RSP_OFF, stack_top)` 内。页数由 RSP_OFF 派生（单点，禁止字面量）。
+        // 初始实映射**必须覆盖 [block.rsp, stack_top)**（字符串区 + 字数组）。
+        // 页数由**算出的 rsp** 反推——ABI v2 起字数组随 envp 条数变化，固定偏移不再适用。
         //
-        // 3P4-2 教训：命令行上限从 0x1FF 提升后 RSP_OFF 跨出了栈顶一页；若仍只映射 1 页，
-        // 参数块会被经 HHDM 写进**相邻物理帧**——静默内存损坏（实测症状：运行停滞、
-        // 命令行永不到达）。故页数必须随布局派生，不能硬编码 1。
-        let init_pages = (RSP_OFF + PAGE_SIZE as usize - 1) / PAGE_SIZE as usize;
+        // 3P4-2 教训：命令行上限提升后参数块跨出栈顶一页；若仍只映射 1 页，字数组会被
+        // 经 HHDM 写进**相邻物理帧**——静默内存损坏（实测症状：运行停滞、命令行永不到达）。
+        let need_bytes = stack_top - block.rsp;
+        let init_pages = ((need_bytes + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
         let init_bytes = init_pages as u64 * PAGE_SIZE;
         // 与段帧同一退款纪律（audit-r2 F1）：map_user 拒绝时当场全额归还。
         let frames = collect_frames(init_pages)?;
@@ -1262,14 +1350,9 @@ mod backend {
         }
 
         unsafe {
-            // 栈顶（最高 VA）那页的物理末端（帧起始 + HHDM 偏移 + 整页）。
-            // `map_user` 按 VA 升序消耗 frames，故最高 VA 页是**最后一帧**。
-            let top = (frames[init_pages - 1] + off + PAGE_SIZE) as *mut u8;
-
-            // VA → 帧内地址：**禁止用 `top.sub(N)`**。那只在 `N <= PAGE_SIZE`（留在最高帧内）
-            // 时成立；多页映射的帧是**任意物理帧**，虚拟连续 ≠ 物理连续——`top.sub(STR_OFF)`
-            // 在 STR_OFF > 页大小时会写到最高帧**之前**的相邻物理帧，静默踩坏内核内存
-            // （实测 3P4-2 首版即如此：崩在页表遍历 `phys_to_virt` 加法溢出处）。
+            // VA → 帧内地址：**禁止用 `top.sub(N)`**。多页映射的帧是**任意物理帧**，
+            // 虚拟连续 ≠ 物理连续——`top.sub(STR_OFF)` 在 STR_OFF > 页大小时会写到最高帧
+            // **之前**的相邻物理帧，静默踩坏内核内存（3P4-2 首版实测即如此）。
             // 故一律按页索引换算：页 i 覆盖 VA [init_bottom_va + i*PAGE, +PAGE)。
             let page_ptr = |va: u64| -> *mut u8 {
                 let idx = ((va - init_bottom_va) / PAGE_SIZE) as usize;
@@ -1277,30 +1360,41 @@ mod backend {
                 (frames[idx] + off + po) as *mut u8
             };
 
-            if block.argc == 1 {
-                // 容量已在 `entry_block` 验证（cmd.len() <= MAX_CMDLINE_BYTES），
-                // 写入 cmd 后必然还剩至少 1 字节给 NUL，无需截断。
-                let str_va = stack_top - STR_OFF as u64;
-                let n = cmd.len();
-                for i in 0..n {
-                    *page_ptr(str_va + i as u64) = cmd[i];
-                }
-                *page_ptr(str_va + n as u64) = 0;
-
-                let rp = page_ptr(block.rsp) as *mut u64;
-                *rp = block.argc;
-                *rp.add(1) = block.argv0;
-                // 有命令行时 NULL 终结槽必然存在（`entry_block` 单测锚定）。
-                debug_assert_eq!(block.argv1, Some(0), "mini-ABI：argv[1] 必须为 NULL");
-                *rp.add(2) = block.argv1.unwrap_or(0);
-
-                return Ok(block.rsp);
+            let str_base = stack_top - STR_OFF as u64;
+            // 命令行（容量已在 `entry_block` 验证；NUL 必须落地）。
+            let n = cmd.len();
+            for i in 0..n {
+                *page_ptr(str_base + i as u64) = cmd[i];
             }
-
-            // 无命令行：参数块仅两字（第三字会越出栈顶页，见 `EntryBlock::argv1`）。
-            let top64 = top as *mut u64;
-            *top64.sub(2) = 0;
-            *top64.sub(1) = 0;
+            if n > 0 {
+                *page_ptr(str_base + n as u64) = 0;
+            }
+            // 环境串（逐条 NUL 结尾；区内偏移由 `entry_block` 单点给出）。
+            for (i, e) in env.iter().enumerate() {
+                let base = str_base + block.env_offsets[i];
+                for (k, b) in e.iter().enumerate() {
+                    *page_ptr(base + k as u64) = *b;
+                }
+                *page_ptr(base + e.len() as u64) = 0;
+            }
+            // 字数组：argc, argv[0..argc), NULL, envp[0..envc), NULL。
+            let mut words: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+            words
+                .try_reserve(3 + block.envp.len())
+                .map_err(|_| Error::OutOfMemory)?;
+            // [argc] ++ argv[0..argc) ++ [NULL] ++ envp[0..envc) ++ [NULL]。
+            // **argc = 0 时不得写 argv[0] 槽**：该槽即 argv 的 NULL 终结槽，
+            // 多写一字会让 envp 位置与消费端规则 argv + (argc + 1) * 8 不一致。
+            words.push(block.argc);
+            if block.argc == 1 {
+                words.push(block.argv0);
+            }
+            words.push(0);
+            words.extend_from_slice(&block.envp);
+            words.push(0);
+            for (i, w) in words.iter().enumerate() {
+                *(page_ptr(block.rsp + (i * 8) as u64) as *mut u64) = *w;
+            }
         }
 
         Ok(block.rsp)
@@ -1315,4 +1409,4 @@ pub use backend::{load, LoadedElf};
 /// 门控与 `raw` 模块一致：本常量只在纯逻辑层编译面存在（有测试或有后端消费方），
 /// 否则那个构建面里连模块都没有（cargo 会以"无 test、无 user-space"再编一次库）。
 #[cfg(any(test, feature = "user-space"))]
-pub use crate::raw::{MAX_CMDLINE_BYTES, RSP_OFF, STR_OFF};
+pub use crate::raw::{MAX_CMDLINE_BYTES, MAX_ENV_BYTES, MAX_ENV_COUNT, RSP_OFF_MIN, STR_OFF};
