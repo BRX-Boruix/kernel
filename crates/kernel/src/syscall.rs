@@ -3020,7 +3020,11 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
     /// SYSCALL_STACKS 池、返回地址被覆盖，症状为**内核态取指 Page Fault
     /// error=0x11**——与 percpu.rs 记录的 B3 案同型（那里的结论就是"栈上大对象
     /// 一律入堆"）。故改用堆分配；失败如实上抛，不静默截断、不降级。
-    const CMD_BUF_BYTES: usize = 4096;
+    ///
+    /// **3P4-2（ABI v2）：本门限即 loader 的 `MAX_CMDLINE_BYTES`（单点定义）**——此前
+    /// 内核缓冲 4096 与 loader 字符串区 511 是两个门限，512..=4096 的命令行会被内核放行、
+    /// 随后在 loader 被 E2BIG 拒绝（同一语义两处判断必然漂移）。现直接引用同一常量。
+    const CMD_BUF_BYTES: usize = loader::MAX_CMDLINE_BYTES;
     // 注意：本门限只保证「内核缓冲放得下」。**入口字符串区的真实上限是
     // loader 的 `STR_OFF - 1 = 511` 字节**（docs/abi/syscall-abi.md §4），
     // 因此长度在 512..=4096 的命令行会在此放行、随后在 loader 里以 E2BIG

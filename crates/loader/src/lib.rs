@@ -241,12 +241,27 @@ pub(crate) mod raw {
 
     // ---------- 入口栈参数块 mini-ABI（docs/abi/syscall-abi.md §4） ----------
 
-    /// 命令行字符串区容量偏移：字符串区起于 `stack_top - STR_OFF`，可用 `STR_OFF - 1`
-    /// 字节 + NUL 终止符。取值理由与变更纪律见 §4——**禁止散落魔数**。
-    pub(crate) const STR_OFF: usize = 0x200;
+    /// 命令行字符串长度上限（字节，**不含** NUL 终止符）——**全系统单点定义**。
+    ///
+    /// 3P4-2（ABI v2）：此前内核侧拷贝缓冲（4096）与 loader 侧字符串区（511）是**两个**
+    /// 门限——512..=4096 的命令行被内核放行、随后在 loader 被 E2BIG 拒绝。同一语义两处
+    /// 判断必然漂移，故内核直接引用本常量（`loader::MAX_CMDLINE_BYTES`），门限收敛为一处。
+    ///
+    /// 取值依据：GCC/tcc 调用 `cc1` 的参数长度必撞旧的 511 上限（3P4-2 依据）；4096 与
+    /// 内核单次拷贝缓冲同量级，且远小于用户栈预算（字符串区 + 参数块 < 0x2000）。
+    pub const MAX_CMDLINE_BYTES: usize = 4096;
+
+    /// 字符串区偏移：字符串区起于 `stack_top - STR_OFF`。
+    ///
+    /// 预算 = 命令行（`MAX_CMDLINE_BYTES` + NUL）向上对齐到 16 字节边界。
+    /// **禁止散落魔数**：由 `MAX_CMDLINE_BYTES` 派生，不写字面量。
+    pub const STR_OFF: usize = (MAX_CMDLINE_BYTES + 1 + 15) & !15;
 
     /// 参数块偏移：入口 `rsp = stack_top - RSP_OFF`。
-    pub(crate) const RSP_OFF: usize = 0x220;
+    ///
+    /// 参数块（argc + argv[0] + NULL 终结 = 24 字节）放在字符串区**之下**再留 8 字节，
+    /// 使 `rsp` 落在 16 字节对齐边界（System V x86-64：entry 处 rsp 须 16 对齐）。
+    pub const RSP_OFF: usize = STR_OFF + 0x20;
 
     /// 入口栈参数块的纯布局结果（mini-ABI）。
     ///
@@ -276,7 +291,7 @@ pub(crate) mod raw {
     /// host 单测 `tests::entry_block_*` 直接锚定它，文档漂移或实现回退在此先红。
     ///
     /// 错误：
-    /// - `cmd_len > STR_OFF - 1` → `ArgListTooLong`（E2BIG）。**绝不截断**：静默裁剪
+    /// - `cmd_len > MAX_CMDLINE_BYTES` → `ArgListTooLong`（E2BIG）。**绝不截断**：静默裁剪
     ///   会把不完整的命令行伪装成完整交付（LA3/KM5）。
     /// - 栈顶不足以容纳字符串区/参数块（算术下溢）→ `OutOfRange`。本函数是纯函数，
     ///   单测会喂任意 `stack_top`，下溢必须显式报错而非回绕出巨地址。
@@ -291,7 +306,7 @@ pub(crate) mod raw {
                 rsp,
             });
         }
-        if cmd_len > STR_OFF - 1 {
+        if cmd_len > MAX_CMDLINE_BYTES {
             return Err(Error::ArgListTooLong);
         }
         let str_user = stack_top
@@ -727,13 +742,20 @@ pub(crate) mod raw {
 
         #[test]
         fn entry_block_accepts_capacity_limit_and_rejects_beyond() {
-            // STR_OFF-1 是字符串区容量上限（命令行 + NUL 终止符）：恰满可交付。
-            assert!(entry_block(TEST_STACK_TOP, STR_OFF - 1).is_ok());
+            // MAX_CMDLINE_BYTES 是命令行长度上限（不含 NUL 终止符）：恰满可交付。
+            assert!(entry_block(TEST_STACK_TOP, MAX_CMDLINE_BYTES).is_ok());
             // 超一字节即显式拒绝——绝不截断后把裁剪过的命令行伪装成完整交付（LA3/KM5）。
             assert_eq!(
-                entry_block(TEST_STACK_TOP, STR_OFF),
+                entry_block(TEST_STACK_TOP, MAX_CMDLINE_BYTES + 1),
                 Err(Error::ArgListTooLong)
             );
+            // 3P4-2 行为锚点：**旧上限（511）必须已解除**——512..=MAX 之间一律可交付。
+            // 若只改了常量而没改契约，本断言先红（文档漂移/实现回退在此暴露）。
+            assert!(
+                entry_block(TEST_STACK_TOP, 0x1FF + 1).is_ok(),
+                "511 字节旧上限必须已解除（3P4-2）"
+            );
+            assert!(entry_block(TEST_STACK_TOP, 4096).is_ok());
         }
 
         #[test]
@@ -839,7 +861,7 @@ pub(crate) mod raw {
 #[cfg(feature = "user-space")]
 mod backend {
     use super::raw::{
-        PhdrClass, RSP_OFF, STR_OFF, SegmentSpec, TlsTemplate, align_up_checked, classify_phdr,
+        MAX_CMDLINE_BYTES, PhdrClass, RSP_OFF, STR_OFF, SegmentSpec, TlsTemplate, align_up_checked, classify_phdr,
         entry_block, parse_header, parse_tls_template, plan_segment, rd_u32, rd_u64,
     };
     use alloc::vec::Vec;
@@ -1217,12 +1239,19 @@ mod backend {
             )
             .map_err(|e| Error::from(e))?;
 
-        // 只分配并映射栈顶 1 页。与段帧同一退款纪律（audit-r2 F1）：
-        // map_user 拒绝时当场全额归还（此处单帧，refund 即可）。
-        let frames = collect_frames(1)?;
-        let top_page_va = stack_top - PAGE_SIZE as u64;
+        // 初始实映射**必须覆盖字符串区 + 参数块**：二者都落在
+        // `[stack_top - RSP_OFF, stack_top)` 内。页数由 RSP_OFF 派生（单点，禁止字面量）。
+        //
+        // 3P4-2 教训：命令行上限从 0x1FF 提升后 RSP_OFF 跨出了栈顶一页；若仍只映射 1 页，
+        // 参数块会被经 HHDM 写进**相邻物理帧**——静默内存损坏（实测症状：运行停滞、
+        // 命令行永不到达）。故页数必须随布局派生，不能硬编码 1。
+        let init_pages = (RSP_OFF + PAGE_SIZE as usize - 1) / PAGE_SIZE as usize;
+        let init_bytes = init_pages as u64 * PAGE_SIZE;
+        // 与段帧同一退款纪律（audit-r2 F1）：map_user 拒绝时当场全额归还。
+        let frames = collect_frames(init_pages)?;
+        let init_bottom_va = stack_top - init_bytes;
         if let Err(e) = addr_space.map_user(
-            VirtAddr::new(top_page_va),
+            VirtAddr::new(init_bottom_va),
             VirtAddr::new(stack_top),
             PageSize::Size4K,
             PageFlags::empty().writable(),
@@ -1233,20 +1262,32 @@ mod backend {
         }
 
         unsafe {
-            // 栈顶页的物理末端（帧起始 + HHDM 偏移 + 整页）。
-            let top = (frames[0] + off + PAGE_SIZE) as *mut u8;
+            // 栈顶（最高 VA）那页的物理末端（帧起始 + HHDM 偏移 + 整页）。
+            // `map_user` 按 VA 升序消耗 frames，故最高 VA 页是**最后一帧**。
+            let top = (frames[init_pages - 1] + off + PAGE_SIZE) as *mut u8;
+
+            // VA → 帧内地址：**禁止用 `top.sub(N)`**。那只在 `N <= PAGE_SIZE`（留在最高帧内）
+            // 时成立；多页映射的帧是**任意物理帧**，虚拟连续 ≠ 物理连续——`top.sub(STR_OFF)`
+            // 在 STR_OFF > 页大小时会写到最高帧**之前**的相邻物理帧，静默踩坏内核内存
+            // （实测 3P4-2 首版即如此：崩在页表遍历 `phys_to_virt` 加法溢出处）。
+            // 故一律按页索引换算：页 i 覆盖 VA [init_bottom_va + i*PAGE, +PAGE)。
+            let page_ptr = |va: u64| -> *mut u8 {
+                let idx = ((va - init_bottom_va) / PAGE_SIZE) as usize;
+                let po = (va - init_bottom_va) % PAGE_SIZE;
+                (frames[idx] + off + po) as *mut u8
+            };
 
             if block.argc == 1 {
-                let sp = top.sub(STR_OFF);
-                // 容量已在 `entry_block` 验证（cmd.len() <= STR_OFF - 1），
+                // 容量已在 `entry_block` 验证（cmd.len() <= MAX_CMDLINE_BYTES），
                 // 写入 cmd 后必然还剩至少 1 字节给 NUL，无需截断。
+                let str_va = stack_top - STR_OFF as u64;
                 let n = cmd.len();
                 for i in 0..n {
-                    *sp.add(i) = cmd[i];
+                    *page_ptr(str_va + i as u64) = cmd[i];
                 }
-                *sp.add(n) = 0;
+                *page_ptr(str_va + n as u64) = 0;
 
-                let rp = top.sub(RSP_OFF) as *mut u64;
+                let rp = page_ptr(block.rsp) as *mut u64;
                 *rp = block.argc;
                 *rp.add(1) = block.argv0;
                 // 有命令行时 NULL 终结槽必然存在（`entry_block` 单测锚定）。
@@ -1268,3 +1309,10 @@ mod backend {
 
 #[cfg(feature = "user-space")]
 pub use backend::{load, LoadedElf};
+
+/// 命令行长度上限的公开再导出（单点定义在 `raw`，供内核 syscall 层引用）。
+///
+/// 门控与 `raw` 模块一致：本常量只在纯逻辑层编译面存在（有测试或有后端消费方），
+/// 否则那个构建面里连模块都没有（cargo 会以"无 test、无 user-space"再编一次库）。
+#[cfg(any(test, feature = "user-space"))]
+pub use crate::raw::{MAX_CMDLINE_BYTES, RSP_OFF, STR_OFF};

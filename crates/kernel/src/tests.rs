@@ -9251,30 +9251,36 @@ pub fn test_loader_adversarial() {
         }
     }
 
-    // -- 6. 命令行容量边界（LA3/KM5）：截断改为显式拒绝 --
-    let full_cmd = [b'a'; CMD_CAPACITY];
-    expect_loader_reject(
-        &build_loader_elf(&LoaderElfSpec::BASE),
-        &full_cmd,
-        Error::ArgListTooLong,
-        "cmd fills entire string area (NUL won't fit)",
-    );
+    // -- 6. 命令行容量边界（LA3/KM5）：截断改为显式拒绝；3P4-2 起上限提升到 4096 --
+    //
+    // 上限是 loader 的**单点常量** `MAX_CMDLINE_BYTES`（内核 `CMD_BUF_BYTES` 引用同一值）。
+    // 旧实现有两个门限（内核 4096 / loader 511），512..=4096 会被内核放行、随后在此拒绝。
     {
-        // 容量-1：最大合法命令行，正常加载且字符串完整落地（含 NUL）。
-        let max_cmd = [b'a'; CMD_CAPACITY - 1];
+        // 超上限一字节 → 显式拒绝（绝不截断后把裁剪过的命令行伪装成完整交付）。
+        let too_long = alloc::vec![b'a'; loader::MAX_CMDLINE_BYTES + 1];
+        expect_loader_reject(
+            &build_loader_elf(&LoaderElfSpec::BASE),
+            &too_long,
+            Error::ArgListTooLong,
+            "cmd one byte over MAX_CMDLINE_BYTES",
+        );
+
+        // **3P4-2 行为锚点**：旧上限 511 必须已解除——1000 字节命令行正常加载，
+        // 且字符串与 NUL 逐字节完整落地（这是"上限提升"的可观测判据）。
+        let long_cmd = alloc::vec![b'L'; 1000];
         let elf = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        let loaded = match loader::load(&elf, &mut us, &max_cmd) {
+        let loaded = match loader::load(&elf, &mut us, &long_cmd) {
             Ok(l) => l,
-            Err(e) => panic!("[test-loader] capacity-1 cmd must load, got {:?}", e),
+            Err(e) => panic!("[test-loader] 1000-byte cmd must load (3P4-2), got {:?}", e),
         };
         assert_eq!(
             loaded.user_stack_top,
-            USER_STACK_TOP - 0x220,
-            "rsp must sit at STR area minus 0x20"
+            USER_STACK_TOP - loader::RSP_OFF as u64,
+            "rsp 必须落在参数块首址（RSP_OFF 单点）"
         );
-        let str_base = USER_STACK_TOP - 0x200;
-        for (i, b) in max_cmd.iter().enumerate() {
+        let str_base = USER_STACK_TOP - loader::STR_OFF as u64;
+        for (i, b) in long_cmd.iter().enumerate() {
             assert_eq!(
                 read_user_byte(&us, str_base + i as u64),
                 *b,
@@ -9283,11 +9289,20 @@ pub fn test_loader_adversarial() {
             );
         }
         assert_eq!(
-            read_user_byte(&us, str_base + CMD_CAPACITY as u64 - 1),
+            read_user_byte(&us, str_base + long_cmd.len() as u64),
             0,
             "cmd NUL terminator missing"
         );
-        info!("[test-loader] capacity-1 cmd loads, string+NUL intact");
+        info!("[test-loader] 1000-byte cmd loads, string+NUL intact (3P4-2 旧 511 上限已解除)");
+
+        // 恰满上限（边界内侧）同样可交付。
+        let max_cmd = alloc::vec![b'a'; loader::MAX_CMDLINE_BYTES];
+        let elf2 = build_loader_elf(&LoaderElfSpec::BASE);
+        let mut us2 = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
+        match loader::load(&elf2, &mut us2, &max_cmd) {
+            Ok(_) => info!("[test-loader] cmd at MAX_CMDLINE_BYTES loads, string+NUL intact"),
+            Err(e) => panic!("[test-loader] cmd at limit must load, got {:?}", e),
+        }
     }
 
     // -- 7. 正常路径回归 + bss/尾页垫零验证（LM2）--
