@@ -9350,6 +9350,20 @@ pub fn test_loader_adversarial() {
             "消费端按 argv + (argc + 1) * 8 定位到的槽位必须就是 envp[0]"
         );
         info!("[test-loader] envp 落地：2 条环境串 + NULL 终结，定位规则成立（3P4-2）");
+
+        // **3P4-2 引导环境合成锚点**：PATH 必须是 ADR-028 的单源程序目录；PWD 必须
+        // 由内核权威 cwd 拼出（此处喂入合成 cwd，验证拼接与条目形态）。
+        let mut env_out: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+        crate::syscall::build_boot_env("/volumes/BORUIX_DATA/3p", &mut env_out)
+            .expect("[test-loader] build_boot_env");
+        let has = |needle: &[u8]| env_out.iter().any(|e| e.as_slice() == needle);
+        assert!(has(b"PATH=/programs"), "PATH 必须是 ADR-028 单源程序目录");
+        assert!(
+            has(b"PWD=/volumes/BORUIX_DATA/3p"),
+            "PWD 必须由内核权威 cwd 拼出"
+        );
+        assert_eq!(env_out.len(), 2, "当前只合成 PATH 与 PWD（其余属后续项）");
+        info!("[test-loader] 引导环境合成：PATH + PWD 来自权威状态（3P4-2）");
     }
 
     // -- 7. 正常路径回归 + bss/尾页垫零验证（LM2）--

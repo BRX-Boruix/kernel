@@ -3007,6 +3007,37 @@ pub fn compute_child_identity(idx_or_tag: u64, caller: ProcessIdentity) -> Resul
     }
 }
 
+/// 合成进程的**引导环境**（3P4-2 ABI v2）。条目形如 `KEY=VALUE`（**不含** NUL；
+/// loader 负责补 NUL 并写入字符串区）。
+///
+/// 数据来源（**权威状态**，非为验收编造的常量）：
+/// - `PATH`：`/programs` —— ADR-028 明文规定的**唯一**程序来源（`/programs/<name>`）；
+/// - `PWD`：调用进程的当前工作目录（组共享、由用户态经 chdir 设置，内核权威）。
+///
+/// **诚实边界**：本步只做"内核合成"。用户态 `setenv` 与显式 `execve(envp)` 传递
+/// 尚未实现，故环境**不是**父进程可变副本的继承，而是每次 exec 时按当时权威状态重建。
+/// 该边界已写入 docs/TODO/3p.md 的 3P4-2 条目。
+pub(crate) fn build_boot_env(
+    cwd: &str,
+    out: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
+) -> Result<(), Error> {
+    let mut push = |s: &[u8]| -> Result<(), Error> {
+        let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        v.try_reserve(s.len()).map_err(|_| Error::OutOfMemory)?;
+        v.extend_from_slice(s);
+        out.push(v);
+        Ok(())
+    };
+    push(b"PATH=/programs")?;
+    // PWD 由前缀 + cwd 拼接（cwd 长度由用户态决定，故先预留再拼，避免中途再分配）。
+    let mut pwd: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    pwd.try_reserve(4 + cwd.len()).map_err(|_| Error::OutOfMemory)?;
+    pwd.extend_from_slice(b"PWD=");
+    pwd.extend_from_slice(cwd.as_bytes());
+    out.push(pwd);
+    Ok(())
+}
+
 fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64) -> u64 {
     /// prog_name 末段长度上限（超长拒绝，防注册表/日志被撑爆）。
     const PROG_NAME_MAX_LEN: usize = 63;
@@ -3087,7 +3118,19 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
     // `loader::raw::entry_block()`（由 loader 侧 host 单测锚定）。
     // ABI v2（3P4-2）：第 4 参是 envp。本步先交付**空环境**（布局与传递链路已就位，
     // 内核侧环境合成与继承属 3P4-2 下一步）；空环境同样以 NULL 终结，语义自洽。
-    let loaded = match loader::load(elf_bytes, &mut us, cmd, &[]) {
+    // 3P4-2（ABI v2）：合成**引导环境**并随入口参数块交付（envp 位于 argv 之后）。
+    // 数据取自内核权威状态（见 build_boot_env 文档）；cwd 在此读成自有 String，
+    // 借用不跨越后续的调度调用（KA3）。
+    let cwd = current_proc_mut()
+        .map(|p| p.cwd())
+        .unwrap_or_else(|| alloc::string::String::from("/"));
+    let mut env_buf: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    if let Err(e) = build_boot_env(&cwd, &mut env_buf) {
+        return pack_err(e);
+    }
+    let env_refs: alloc::vec::Vec<&[u8]> = env_buf.iter().map(|v| v.as_slice()).collect();
+
+    let loaded = match loader::load(elf_bytes, &mut us, cmd, &env_refs) {
         Ok(l) => l,
         Err(e) => return pack_err(e),
     };
