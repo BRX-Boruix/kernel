@@ -66,6 +66,13 @@ SECTIONS
         *(.dynamic)
     } :data :dynamic
 
+    /* 镜像**物理跨度**的链接期真值（ADR-050 兜底用）：mm 以
+       "max(常量下界, __kernel_image_end − 链接基址)" 计算帧分配器要保留的区间，
+       使"保留量估小 → 内核代码被当空闲帧发出去"这一灾难性失败结构上不可能发生
+       （常量只是下界；真实镜像更大时以真实值为准）。 */
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __kernel_image_end = .;
+
     /DISCARD/ : {
         *(.eh_frame*)
         *(.note .note.*)

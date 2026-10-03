@@ -74,9 +74,24 @@ pub fn cpu_count() -> usize {
 /// 宁可多保留、不可少保留：多保留只损失少量物理内存，少保留会让内核代码被当
 /// 空闲帧分发出去。
 fn kernel_image_range(phys_offset: u64) -> (usize, usize) {
-    /// 内核镜像物理占用的保守上界（含 .text/.rodata/.data/.bss 与嵌入模块）。
-    /// 实测内核产物 + 内嵌 initrd/modules 远小于此；取 64 MiB 上界。
-    const KERNEL_IMAGE_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+    /// 内核镜像物理占用的**保守下界**（含 .text/.rodata/.data/.bss、内核主栈与守护页）。
+    ///
+    /// ADR-050：本值只是**下界**——真实保留量取 max(本值, 链接期真值)，其中链接期真值由
+    /// __kernel_image_end（kernel/crates/kernel/linker.ld）减链接基址算出。故本值估小
+    /// **不会**导致"内核代码被当空闲帧发出去"（灾难性），只会让保留量贴合实际。
+    ///
+    /// 取值依据（实测产物）：release 7.65 MiB / debug 27.11 MiB（payload 已不内嵌，
+    /// 走 ISO 上的 /programs，见 ADR-017 退役说明）→ 48 MiB 对两种 profile 都留有余量。
+    const KERNEL_IMAGE_RESERVE_MIN_BYTES: u64 = 48 * 1024 * 1024;
+
+    /// 链接期内核镜像的**虚拟**基址（与 kernel/crates/kernel/linker.ld 的
+    /// 0xffffffff80000000 同一事实，两侧互指）。
+    const KERNEL_VIRT_BASE: u64 = 0xffff_ffff_8000_0000;
+
+    /// 链接期镜像末端符号（由 kernel 的链接脚本提供）。
+    unsafe extern "C" {
+        static __kernel_image_end: u8;
+    }
 
     let base = KERNEL_ADDRESS_REQUEST
         .get_response()
@@ -88,15 +103,26 @@ fn kernel_image_range(phys_offset: u64) -> (usize, usize) {
         klib::error!("[mm] Limine kernel address response missing; kernel image NOT reserved");
         return (0, 0);
     }
+    // 真实镜像跨度（链接期真值）——向上取整到页；取 max(下界, 真值) 作为保留量。
+    // 依据：本函数的存在理由是"绝不把内核代码页当空闲帧发出去"，故**宁可多保留**；
+    // 用链接期真值兜底后，下界常量只影响小内存机的占用，不影响正确性（ADR-050）。
+    let actual = (unsafe { &__kernel_image_end as *const u8 as u64 })
+        .saturating_sub(KERNEL_VIRT_BASE)
+        .saturating_add(0xfff)
+        & !0xfff;
+    let reserve = core::cmp::max(KERNEL_IMAGE_RESERVE_MIN_BYTES, actual);
+
     let start = base & !0xfff;
-    let end = (base + KERNEL_IMAGE_RESERVE_BYTES + 0xfff) & !0xfff;
+    let end = (base + reserve + 0xfff) & !0xfff;
     klib::info!(
-        "[mm] kernel image phys base {:#x} (virt {:#x}) -> reserving {:#x}-{:#x} ({} MiB), HHDM {:#x}",
+        "[mm] kernel image phys base {:#x} (virt {:#x}) -> reserving {:#x}-{:#x} ({} MiB; actual {} MiB, min {} MiB), HHDM {:#x}",
         base,
         KERNEL_ADDRESS_REQUEST.get_response().get().map(|r| r.virtual_base).unwrap_or(0),
         start,
         end,
-        KERNEL_IMAGE_RESERVE_BYTES / 1024 / 1024,
+        reserve / 1024 / 1024,
+        actual / 1024 / 1024,
+        KERNEL_IMAGE_RESERVE_MIN_BYTES / 1024 / 1024,
         phys_offset
     );
     (start as usize, end as usize)
