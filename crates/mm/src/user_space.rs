@@ -102,6 +102,17 @@ pub enum UserAreaKind {
     /// 帧不归本地址空间所有——销毁/回收只清 PTE，绝不 `deallocate_frame`
     /// （与 shm 同一所有权纪律）。
     DeviceMmap,
+    /// **可增长的用户栈**（ADR-049）：`limit_bottom` 是允许向下增长的下界。
+    ///
+    /// 为什么需要它：栈按需分页，但"预留即提交"会把整段上限（4 MiB）一次性计入承诺，
+    /// 使每进程成本几乎全由栈预留决定（实测占 93%），进程数上限因此被栈尺寸绑架。
+    /// 本变体把"已预留"与"可增长上限"分开：只有**已经触碰过**的页提交承诺，缺页时
+    /// 按页扩展预留，并在**扩展点**确定性提交/拒绝（保留"请求点拒绝"语义，见
+    /// `check_area_quota` 文档）。
+    Stack {
+        /// 允许增长到的下界（含）；故障低于此即视为越界（由上层终止进程）。
+        limit_bottom: VirtAddr,
+    },
     /// 用户态驱动 DMA 一致性缓冲（阶段二 `alloc_dma_user`）：页**真实映射**
     /// 由本内核分配的 RAM 物理帧（`allocate_frames`），以不可缓存(PCD)呈现，
     /// 保证 CPU 写对总线 DMA 可见（x86 一致性 DMA 语义）。**帧归本地址空间
@@ -601,6 +612,26 @@ where
         self.reserve_user_with_kind(start, end, size, flags, UserAreaKind::Reserved)
     }
 
+    /// 声明**可增长的用户栈**（ADR-049）：`[start, end)` 是初始预留（提交），
+    /// `limit_bottom` 是允许向下增长的下界（栈上限）。
+    ///
+    /// 故障落在 `[limit_bottom, start)` 时由 `handle_page_fault` 按页扩展预留，
+    /// 并在扩展点调用 `check_area_quota`——超预算即**确定性拒绝**（不静默超额，
+    /// 也不把失败推迟到进程运行中的任意时刻）。
+    pub fn reserve_user_stack(
+        &self,
+        limit_bottom: VirtAddr,
+        start: VirtAddr,
+        end: VirtAddr,
+        size: PageSize,
+        flags: PageFlags,
+    ) -> Result<(), PT::Error> {
+        if limit_bottom.as_u64() >= start.as_u64() {
+            return Err(Error::InvalidParam.into());
+        }
+        self.reserve_user_with_kind(start, end, size, flags, UserAreaKind::Stack { limit_bottom })
+    }
+
     /// 声明按需分页区，并在区域记录中写入唯一的所有权策略。
     fn reserve_user_with_kind(
         &self,
@@ -763,6 +794,47 @@ where
         self.areas.lock().len()
     }
 
+    /// 在**已预留**区域内定位故障页（demand_paging 且落在 [start, end)）。
+    ///
+    /// 自持 areas 锁——**调用方不得在持有该锁时调用**（spin 锁不可重入）。
+    fn locate_fault_area(&self, vaddr: u64) -> Option<usize> {
+        let areas = self.areas.lock();
+        areas.iter().position(|a| {
+            a.demand_paging && vaddr >= a.start.as_u64() && vaddr < a.end.as_u64()
+        })
+    }
+
+    /// 栈区**增长**（ADR-049）：故障页落在某个 Stack 区的增长下界之内时，把该区
+    /// 的预留起点下移到故障页，并对**新增字节**调用 `check_area_quota`。
+    ///
+    /// 返回是否成功增长；失败（不在任何栈区的增长范围 / 超预算）即由调用方按非法访问处理。
+    /// 调用方须已持有 `core` 粗锁（本函数只动 `areas` 集合与配额原子量）。
+    fn try_grow_stack_locked(&self, vaddr: u64) -> bool {
+        let mut areas = self.areas.lock();
+        let Some(i) = areas.iter().position(|a| match a.kind {
+            UserAreaKind::Stack { limit_bottom } => {
+                vaddr < a.start.as_u64() && vaddr >= limit_bottom.as_u64()
+            }
+            _ => false,
+        }) else {
+            return false;
+        };
+        let limit_bottom = match areas[i].kind {
+            UserAreaKind::Stack { limit_bottom } => limit_bottom.as_u64(),
+            _ => return false,
+        };
+        let Some((new_start, grow)) = plan_stack_growth(areas[i].start.as_u64(), vaddr, limit_bottom)
+        else {
+            return false;
+        };
+        // **扩展点确定性拒绝**：超预算即失败，绝不静默超额。
+        if self.check_area_quota(grow).is_err() {
+            return false;
+        }
+        areas[i].start = VirtAddr::new(new_start);
+        true
+    }
+
     /// 按需补页：处理用户态 #PF。
     ///
     /// 若 `vaddr` 落在某个 `demand_paging=true` 的预留区域内，则分配一个物理页、
@@ -789,13 +861,24 @@ where
                 return self.cow_fault_locked(&mut core, idx);
             }
         }
-        let areas = self.areas.lock();
-        let Some(idx) = areas
-            .iter()
-            .position(|a| a.demand_paging && vaddr >= a.start.as_u64() && vaddr < a.end.as_u64())
-        else {
-            return false; // 未预留区域 → 非法访问
+        // 未命中任何已预留区时，**可增长栈**是唯一允许在已预留范围之外被触碰的区域
+        // （ADR-049）：故障页落在某个 Stack 区的增长下界之内 → 下移预留起点并按新增字节
+        // 在**请求点**提交配额（超预算即确定性拒绝）。
+        // 定位走自持锁的 locate_fault_area（spin 锁不可重入：增长路径要重新取锁，
+        // 故不能与外层守卫重叠）。
+        let idx = match self.locate_fault_area(vaddr) {
+            Some(i) => i,
+            None => {
+                if !self.try_grow_stack_locked(vaddr) {
+                    return false; // 非栈区 / 越界 / 超预算 → 非法访问
+                }
+                match self.locate_fault_area(vaddr) {
+                    Some(i) => i,
+                    None => return false,
+                }
+            }
         };
+        let areas = self.areas.lock();
         let area = areas[idx];
 
         // 校验访问权限：写访问落在不可写区域一律拒绝（语义查询走抽象层
@@ -2127,6 +2210,79 @@ where
     /// 自锁死锁——锁内 `destroyed` 守卫保证与显式 `destroy` 竞争时的幂等。
     fn drop(&mut self) {
         self.destroy();
+    }
+}
+
+/// 栈增长规划（**纯函数**，host 单测锚定）：给定当前预留起点、故障地址与增长下界，
+/// 返回（新的预留起点，需提交的新增字节数）；不在可增长范围内返回 None。
+///
+/// 按页扩展（一次故障只承诺它实际触碰的那一页），故提交量 = 起点下移的字节数。
+pub(crate) fn plan_stack_growth(
+    cur_start: u64,
+    fault_vaddr: u64,
+    limit_bottom: u64,
+) -> Option<(u64, u64)> {
+    let page = PageSize::Size4K.bytes();
+    let fault_page = fault_vaddr & !(page - 1);
+    if fault_page >= cur_start || fault_page < limit_bottom {
+        return None;
+    }
+    Some((fault_page, cur_start - fault_page))
+}
+
+#[cfg(test)]
+mod stack_growth_tests {
+    use super::plan_stack_growth;
+
+    const TOP: u64 = 0x0000_7FFF_0000_0000;
+    const PAGE: u64 = 0x1000;
+
+    #[test]
+    fn grows_down_to_the_faulting_page_and_commits_only_that() {
+        // 初始预留只覆盖栈顶 2 页；故障落在其下 3 页处 → 起点下移到故障页，
+        // 提交量 = 下移的字节数（只承诺**确实被触碰**的页）。
+        let cur_start = TOP - 2 * PAGE;
+        let fault = TOP - 5 * PAGE;
+        let limit = TOP - 1024 * PAGE;
+        let (new_start, grow) = plan_stack_growth(cur_start, fault, limit).expect("可增长");
+        assert_eq!(new_start, fault, "起点下移到故障页");
+        assert_eq!(grow, 3 * PAGE, "只提交下移的 3 页");
+        assert_eq!(new_start + grow, cur_start, "新增范围与旧起点无缝衔接");
+    }
+
+    #[test]
+    fn fault_inside_reserved_area_is_not_a_growth() {
+        // 已在预留范围内 → 不是增长（走普通补页路径，由调用方另行处理）。
+        let cur_start = TOP - 2 * PAGE;
+        assert_eq!(
+            plan_stack_growth(cur_start, TOP - PAGE, TOP - 1024 * PAGE),
+            None
+        );
+    }
+
+    #[test]
+    fn fault_below_limit_is_rejected() {
+        // 越过增长下界 → 拒绝（进程终止），绝不静默超额。
+        let cur_start = TOP - 2 * PAGE;
+        let limit = TOP - 10 * PAGE;
+        assert_eq!(plan_stack_growth(cur_start, TOP - 11 * PAGE, limit), None);
+        // 恰好在界上：可增长（下界含）。
+        assert!(plan_stack_growth(cur_start, limit, limit).is_some());
+    }
+
+    #[test]
+    fn growth_is_page_aligned() {
+        // 非页对齐故障地址按页下取整（契约成文，不依赖 cr2 恰好页对齐）。
+        let cur_start = TOP - 2 * PAGE;
+        let (new_start, grow) = plan_stack_growth(
+            cur_start,
+            TOP - 4 * PAGE + 0x123,
+            TOP - 1024 * PAGE,
+        )
+        .unwrap();
+        assert_eq!(new_start % PAGE, 0);
+        assert_eq!(grow % PAGE, 0);
+        assert_eq!(new_start, TOP - 4 * PAGE);
     }
 }
 

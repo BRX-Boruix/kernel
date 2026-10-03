@@ -333,6 +333,9 @@ unsafe fn kmain_body() -> ! {
     // M1.3：验证按需分页（demand paging：#PF → 补页）
     #[cfg(feature = "kernel-tests")]
     tests::test_demand_paging();
+    // ADR-049：可增长栈——只提交被触碰的页（承诺账判据）
+    #[cfg(feature = "kernel-tests")]
+    tests::test_stack_growth();
     // M1.4：验证进程地址空间内部分配器（栈/mmap/brk）
     #[cfg(feature = "kernel-tests")]
     tests::test_address_space_alloc();

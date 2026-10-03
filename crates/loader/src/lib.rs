@@ -1382,17 +1382,6 @@ mod backend {
         // S20：同 load_segment，HHDM 前置先于任何资源获取。
         let off = hhdm_offset()?;
 
-        // 按需分页（M17）：预留整个 4MiB 栈区，初始只实映射承载
-        // **字符串区 + 字数组**的那些页；其余页由用户态 #PF 逐页补帧。
-        addr_space
-            .reserve_user(
-                VirtAddr::new(stack_bottom),
-                VirtAddr::new(stack_top),
-                PageSize::Size4K,
-                PageFlags::empty().writable(),
-            )
-            .map_err(|e| Error::from(e))?;
-
         // 初始实映射**必须覆盖 [block.rsp, stack_top)**（字符串区 + 字数组）。
         // 页数由**算出的 rsp** 反推——ABI v2 起字数组随 envp 条数变化，固定偏移不再适用。
         //
@@ -1401,9 +1390,24 @@ mod backend {
         let need_bytes = stack_top - block.rsp;
         let init_pages = ((need_bytes + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
         let init_bytes = init_pages as u64 * PAGE_SIZE;
+        let init_bottom_va = stack_top - init_bytes;
+
+        // **可增长栈**（ADR-049）：只预留（并提交）**初始实映射**那几页，其余由缺页
+        // 逐页扩展——"预留即提交"会把整段 4 MiB 上限一次性计入承诺（实测每进程承诺的
+        // 93% 来自栈预留，进程数上限被栈尺寸绑架）。增长下界仍是 stack_bottom（上限不变），
+        // 扩展点在超预算时**确定性拒绝**。
+        addr_space
+            .reserve_user_stack(
+                VirtAddr::new(stack_bottom),
+                VirtAddr::new(init_bottom_va),
+                VirtAddr::new(stack_top),
+                PageSize::Size4K,
+                PageFlags::empty().writable(),
+            )
+            .map_err(|e| Error::from(e))?;
+
         // 与段帧同一退款纪律（audit-r2 F1）：map_user 拒绝时当场全额归还。
         let frames = collect_frames(init_pages)?;
-        let init_bottom_va = stack_top - init_bytes;
         if let Err(e) = addr_space.map_user(
             VirtAddr::new(init_bottom_va),
             VirtAddr::new(stack_top),

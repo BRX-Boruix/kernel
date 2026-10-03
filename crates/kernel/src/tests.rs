@@ -285,6 +285,51 @@ extern "C" fn noop_fault_handler(_vaddr: u64, _error_code: u64) -> bool {
     false
 }
 
+/// ADR-049：**可增长栈**——只有被触碰的页提交承诺，缺页时按页扩展。
+///
+/// 判据（这是"预留即提交"被解除的可观测证据）：
+/// 1. 只预留栈顶 2 页、增长下界在其下 6 页处 → 承诺增量**恰为 2 页**（不是 8 页上限）；
+/// 2. 故障落在其下 2 页 → 扩展成功，承诺只增加下移的 2 页；
+/// 3. 故障越过增长下界 → 拒绝，且承诺账**不再变化**（拒绝路径零副作用）。
+pub fn test_stack_growth() {
+    let us = mm::user_space::UserAddressSpace::<X86PageTable>::new().expect("new us");
+    let top = 0x0000_0000_7000_0000u64;
+    let page = 0x1000u64;
+    let limit_bottom = top - 8 * page;
+    let init_start = top - 2 * page;
+
+    let before = mm::user_space::global_committed_bytes();
+    us.reserve_user_stack(
+        VirtAddr::new(limit_bottom),
+        VirtAddr::new(init_start),
+        VirtAddr::new(top),
+        PageSize::Size4K,
+        PageFlags::empty().writable(),
+    )
+    .expect("growable stack reservation");
+    let after_reserve = mm::user_space::global_committed_bytes();
+    assert_eq!(
+        after_reserve - before,
+        2 * page,
+        "初始只提交 2 页（不是增长上限的 8 页）"
+    );
+
+    let code = arch_x86_64::paging::PageFaultCode::new(0);
+    let fault = init_start - 2 * page;
+    assert!(us.handle_page_fault(fault, code), "栈应可向下增长");
+    let after_grow = mm::user_space::global_committed_bytes();
+    assert_eq!(after_grow - after_reserve, 2 * page, "扩展只提交下移的 2 页");
+
+    let bad = limit_bottom - page;
+    assert!(!us.handle_page_fault(bad, code), "越过增长下界必须拒绝");
+    assert_eq!(
+        mm::user_space::global_committed_bytes(),
+        after_grow,
+        "拒绝路径不得改变承诺账"
+    );
+    info!("[test-stack-growth] PASS");
+}
+
 /// M1.3：验证按需分页（demand paging）。
 ///
 /// 流程：
