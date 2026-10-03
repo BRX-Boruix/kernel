@@ -8946,7 +8946,7 @@ fn build_two_segment_elf(seg_bytes: u64) -> alloc::vec::Vec<u8> {
 fn expect_loader_reject(elf: &[u8], cmd: &[u8], want: klib::error::Error, ctx: &str) {
     use mm::user_space::UserAddressSpace;
     let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-    match loader::load(elf, &mut us, cmd, &[]) {
+    match loader::load(elf, &mut us, cmd, None, &[]) {
         Err(e) if e == want => info!("[test-loader] {} rejected: {:?}", ctx, e),
         Ok(_) => panic!("[test-loader] {}: malicious image unexpectedly loaded", ctx),
         Err(e) => panic!("[test-loader] {}: expected Err({:?}), got Err({:?})", ctx, want, e),
@@ -9189,7 +9189,7 @@ pub fn test_loader_adversarial() {
             let mut us =
                 UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
             let elf = build_two_segment_elf(QUOTA_SEG_BYTES);
-            match loader::load(&elf, &mut us, &[], &[]) {
+            match loader::load(&elf, &mut us, &[], None, &[]) {
                 Err(e) if e == Error::NoSpace => {
                     info!("[test-loader] {} rejected: {:?}", label, e);
                 }
@@ -9245,7 +9245,7 @@ pub fn test_loader_adversarial() {
         };
         let elf = build_loader_elf(&spec);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        match loader::load(&elf, &mut us, &[], &[]) {
+        match loader::load(&elf, &mut us, &[], None, &[]) {
             Ok(_) => info!("[test-loader] W+X segment loads with warn (D9 policy)"),
             Err(e) => panic!("[test-loader] W+X segment must load per D9 policy, got {:?}", e),
         }
@@ -9270,14 +9270,16 @@ pub fn test_loader_adversarial() {
         let long_cmd = alloc::vec![b'L'; 1000];
         let elf = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        let loaded = match loader::load(&elf, &mut us, &long_cmd, &[]) {
+        let loaded = match loader::load(&elf, &mut us, &long_cmd, None, &[]) {
             Ok(l) => l,
             Err(e) => panic!("[test-loader] 1000-byte cmd must load (3P4-2), got {:?}", e),
         };
-        assert_eq!(
-            loaded.user_stack_top,
-            USER_STACK_TOP - loader::RSP_OFF_MIN as u64,
-            "rsp 必须落在字数组下界（空环境时的 RSP_OFF_MIN）"
+        // ABI v2 起字数组长度随 envp 条数与 auxv 存在与否变化，故**不再断言固定偏移**；
+        // 断言契约性质：rsp 16 字节对齐，且字数组整体位于字符串区之下（不重叠）。
+        assert_eq!(loaded.user_stack_top % 16, 0, "entry rsp 须 16 字节对齐");
+        assert!(
+            loaded.user_stack_top + 8 <= USER_STACK_TOP - loader::STR_OFF as u64,
+            "字数组必须整体位于字符串区之下"
         );
         let str_base = USER_STACK_TOP - loader::STR_OFF as u64;
         for (i, b) in long_cmd.iter().enumerate() {
@@ -9299,7 +9301,7 @@ pub fn test_loader_adversarial() {
         let max_cmd = alloc::vec![b'a'; loader::MAX_CMDLINE_BYTES];
         let elf2 = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us2 = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        match loader::load(&elf2, &mut us2, &max_cmd, &[]) {
+        match loader::load(&elf2, &mut us2, &max_cmd, None, &[]) {
             Ok(_) => info!("[test-loader] cmd at MAX_CMDLINE_BYTES loads, string+NUL intact"),
             Err(e) => panic!("[test-loader] cmd at limit must load, got {:?}", e),
         }
@@ -9309,7 +9311,7 @@ pub fn test_loader_adversarial() {
         let env: [&[u8]; 2] = [b"PATH=/programs", b"TERM=boruix"];
         let elf3 = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us3 = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        let loaded3 = match loader::load(&elf3, &mut us3, b"hello", &env) {
+        let loaded3 = match loader::load(&elf3, &mut us3, b"hello", Some(b"tlsdemo"), &env) {
             Ok(l) => l,
             Err(e) => panic!("[test-loader] env load must succeed, got {:?}", e),
         };
@@ -9349,6 +9351,28 @@ pub fn test_loader_adversarial() {
             envp0,
             "消费端按 argv + (argc + 1) * 8 定位到的槽位必须就是 envp[0]"
         );
+        // **3P4-2 AT_EXECFN 锚点**：envp 的 NULL 之后是 auxv 对——程序名独立于 argv[0]
+        // （argv[0] 是整条命令行；程序名只经本槽提供）。
+        let auxv = rsp + 8 + (argc + 1) * 8 + env.len() as u64 * 8 + 8;
+        assert_eq!(rd64(&us3, auxv), loader::AT_EXECFN, "auxv 首槽类型必须是 AT_EXECFN");
+        let execfn = rd64(&us3, auxv + 8);
+        assert_eq!(rd64(&us3, auxv + 16), loader::AT_NULL, "auxv 必须以 AT_NULL 终结");
+        assert_eq!(rd64(&us3, auxv + 24), 0, "AT_NULL 的值必须为 0");
+        for (i, b) in b"tlsdemo".iter().enumerate() {
+            assert_eq!(
+                read_user_byte(&us3, execfn + i as u64),
+                *b,
+                "prog name byte {} mismatch",
+                i
+            );
+        }
+        assert_eq!(read_user_byte(&us3, execfn + 7), 0, "prog name NUL missing");
+        let argv0_ptr = rd64(&us3, rsp + 8);
+        assert_ne!(
+            execfn, argv0_ptr,
+            "程序名指针不得等于 argv[0]（后者指向整条命令行）"
+        );
+        info!("[test-loader] AT_EXECFN 槽落地：程序名独立于 argv[0]（3P4-2）");
         info!("[test-loader] envp 落地：2 条环境串 + NULL 终结，定位规则成立（3P4-2）");
 
         // **3P4-2 引导环境合成锚点**：PATH 必须是 ADR-028 的单源程序目录；PWD 必须
@@ -9370,7 +9394,7 @@ pub fn test_loader_adversarial() {
     {
         let elf = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        let loaded = match loader::load(&elf, &mut us, &[], &[]) {
+        let loaded = match loader::load(&elf, &mut us, &[], None, &[]) {
             Ok(l) => l,
             Err(e) => panic!("[test-loader] baseline ELF must load, got {:?}", e),
         };
@@ -9491,7 +9515,7 @@ pub fn test_loader_adversarial() {
         push_phdr_typed(&mut elf2, 7, 0, 0, 0, 4, 4);
         elf2.extend_from_slice(&[0xA5; 16]);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        match loader::load(&elf2, &mut us, &[], &[]) {
+        match loader::load(&elf2, &mut us, &[], None, &[]) {
             Ok(_) => info!("[test-loader] tbss-only PT_TLS accepted (no content to copy)"),
             Err(e) => panic!("[test-loader] tbss-only PT_TLS must load, got {:?}", e),
         }

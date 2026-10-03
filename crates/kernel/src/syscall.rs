@@ -3130,7 +3130,9 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
     }
     let env_refs: alloc::vec::Vec<&[u8]> = env_buf.iter().map(|v| v.as_slice()).collect();
 
-    let loaded = match loader::load(elf_bytes, &mut us, cmd, &env_refs) {
+    // 3P4-2：程序名经 auxv 型 AT_EXECFN 槽交付（**不改 argv[0] 含义**——后者仍是整条
+    // 命令行）。程序名的单点来源是本函数的 prog_name（VFS 路径末段或内建索引名）。
+    let loaded = match loader::load(elf_bytes, &mut us, cmd, Some(prog_name.as_bytes()), &env_refs) {
         Ok(l) => l,
         Err(e) => return pack_err(e),
     };
