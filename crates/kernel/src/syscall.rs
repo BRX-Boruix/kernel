@@ -3059,8 +3059,16 @@ fn sys_exec(frame: &mut SyscallFrame) -> u64 {
 
     let root = crate::vfs_init::root();
 
-    // 1. 获取 ELF 字节数据
-    let elf_data: alloc::vec::Vec<u8> = match arg1 {
+    // 1. 取得镜像数据来源（3P4-7：两条通道）
+    //
+    // - 内建小程序（init/shell）：保持**整读**——体积已知且很小，且验收要求本通道
+    //   **零回归**，故不动其形状；
+    // - 文件程序：**分段装载**——分块流进 shm，加载器按偏移分块读回。
+    enum Image {
+        Slice(alloc::vec::Vec<u8>),
+        Shm { id: u64, len: u64 },
+    }
+    let image: Image = match arg1 {
         BUILTIN_INDEX_INIT | BUILTIN_INDEX_SHELL => {
             // 内建索引走统一单源读取（ADR-028）：`/programs` 只由内置
             // liveCD payload 填充，外部盘不再遮蔽（盘优先双源已废除）。
@@ -3072,7 +3080,7 @@ fn sys_exec(frame: &mut SyscallFrame) -> u64 {
                 "shell.elf"
             };
             match crate::read_binary_from_programs(name) {
-                Some(v) => v,
+                Some(v) => Image::Slice(v),
                 None => return pack_err(Error::NotFound),
             }
         }
@@ -3114,24 +3122,42 @@ fn sys_exec(frame: &mut SyscallFrame) -> u64 {
                         Ok(m) => m,
                         Err(e) => return pack_err(e),
                     };
-                    // S31：不得按 meta.size 无界分配内核堆整读——恶意/超大
-                    // 可执行文件会触发内核 OOM abort（自伤面）。用既有批量
-                    // IO 上限 MAX_SYSCALL_BUF_BYTES 约束；超限即拒绝装载。
-                    if meta.size > MAX_SYSCALL_BUF_BYTES {
+                    // 3P4-7：**分段装载**。旧形状是「按 meta.size 整读进内核堆」并由
+                    // MAX_SYSCALL_BUF_BYTES（64MiB，单次 IO 有界性设计，Linux
+                    // MAX_RW_COUNT 同型）设门——那让程序体积上限 = 单次拷贝上限。
+                    // 现在改为分块流进 shm：常量不动，形状变了，程序体积不再受它约束。
+                    //
+                    // 上界仍在，但语义不同：MAX_EXEC_IMAGE_BYTES 是**资源防护**
+                    // （避免一次 exec 就把帧池抽干），不是能力上限。
+                    if meta.size > MAX_EXEC_IMAGE_BYTES {
                         return pack_err(Error::ExecFormat);
                     }
-                    let mut buf = alloc::vec![0u8; meta.size as usize];
-                    if let Err(e) = inode.read_at(0, &mut buf) {
-                        return pack_err(e);
+                    let id = match stream_inode_to_shm(inode.as_ref(), meta.size) {
+                        Ok(i) => i,
+                        Err(e) => return pack_err(e),
+                    };
+                    Image::Shm {
+                        id,
+                        len: meta.size,
                     }
-                    buf
                 }
                 Err(e) => return pack_err(e),
             }
         }
     };
 
-    spawn_elf_image(&elf_data, arg_ptr, arg_len, arg1)
+    let r = match &image {
+        Image::Slice(bytes) => spawn_elf_image(&bytes[..], arg_ptr, arg_len, arg1),
+        Image::Shm { id, len } => {
+            let src = ShmImage { id: *id, len: *len };
+            spawn_elf_image(&src, arg_ptr, arg_len, arg1)
+        }
+    };
+    // 镜像已拷进新进程的段帧，staging 对象使命完成——当场销毁（引用归零即回收帧）。
+    if let Image::Shm { id, .. } = image {
+        let _ = ipc::shm_destroy(id);
+    }
+    r
 }
 
 /// 内建程序索引：init（与 libsys nr::PROG_* 约定同源；内核不依赖
@@ -3189,7 +3215,82 @@ pub(crate) fn build_boot_env(
     Ok(())
 }
 
-fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64) -> u64 {
+/// 3P4-7：一次 exec 允许的镜像体积上界。
+///
+/// **语义与 MAX_SYSCALL_BUF_BYTES 不同**：后者是"单次用户拷贝请求"的有界性设计
+/// （Linux MAX_RW_COUNT 同型），曾被误用为程序体积上限；本值是**资源防护**——
+/// 避免一次 exec 就把帧池抽干（staging 用 shm，段帧另有地址空间配额把关）。
+/// 取 1 GiB：远高于验收所需的 512MiB，又远低于用户半区，属防呆而非能力线。
+const MAX_EXEC_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// 3P4-7：分段装载的**单块搬运粒度**（1 MiB）。
+///
+/// 与 MAX_SYSCALL_BUF_BYTES 的关系：那是单次 IO 的上界（仍成立），本值是内核侧
+/// 流式搬运的缓冲大小。取 1MiB 是"内存占用 vs 拷贝次数"的平衡，不是能力上限。
+const EXEC_STREAM_CHUNK_BYTES: u64 = 1024 * 1024;
+
+/// 3P4-7：以**共享内存对象**为后端的镜像数据源（分段装载的读取端）。
+///
+/// `len` 是**文件真实长度**（不是 shm 的对齐容量）——L2 校验（段声称的文件内容必须
+/// 完全落在镜像内）因此天然按"流 + 总长"判定，与整读时代的语义等价；截断的镜像
+/// 仍会在同一处响亮拒绝。
+struct ShmImage {
+    id: u64,
+    len: u64,
+}
+
+impl loader::ImageSource for ShmImage {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_at(&self, off: u64, dst: &mut [u8]) -> Result<(), Error> {
+        ipc::shm_read_at(self.id, off, dst)
+    }
+}
+
+/// 3P4-7：把 inode 内容**分块**流进新建的 shm 对象，返回对象 id。
+///
+/// 任何失败（建对象 / 读文件 / 写 shm）都**当场销毁对象**再上抛——错误路径零资源
+/// 缺口（与 loader 的帧退款同款纪律）。短读（文件比元数据声称的短）如实 ExecFormat，
+/// 绝不把缺字节的镜像当完整镜像装载。
+fn stream_inode_to_shm(inode: &dyn vfs::inode::INode, len: u64) -> Result<u64, Error> {
+    let id = ipc::shm_create(len)?;
+    let chunk = core::cmp::min(len, EXEC_STREAM_CHUNK_BYTES) as usize;
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if buf.try_reserve(chunk).is_err() {
+        let _ = ipc::shm_destroy(id);
+        return Err(Error::OutOfMemory);
+    }
+    buf.resize(chunk, 0);
+    let mut off = 0u64;
+    while off < len {
+        let n = core::cmp::min(chunk as u64, len - off) as usize;
+        match inode.read_at(off, &mut buf[..n]) {
+            Ok(got) if got == n => {}
+            Ok(_) => {
+                let _ = ipc::shm_destroy(id);
+                return Err(Error::ExecFormat);
+            }
+            Err(e) => {
+                let _ = ipc::shm_destroy(id);
+                return Err(e);
+            }
+        }
+        if let Err(e) = ipc::shm_write_at(id, off, &buf[..n]) {
+            let _ = ipc::shm_destroy(id);
+            return Err(e);
+        }
+        off += n as u64;
+    }
+    Ok(id)
+}
+
+fn spawn_elf_image<S: loader::ImageSource + ?Sized>(
+    image: &S,
+    arg_ptr: u64,
+    arg_len: u64,
+    idx_or_tag: u64,
+) -> u64 {
     /// prog_name 末段长度上限（超长拒绝，防注册表/日志被撑爆）。
     const PROG_NAME_MAX_LEN: usize = 63;
     /// 命令行缓冲容量。KM5：超出即 E2BIG 显式失败——静默截断会把被裁剪的
@@ -3284,7 +3385,7 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
     // 3P4-2：程序名经 auxv 型 AT_EXECFN 槽交付（**不改 argv[0] 含义**——后者仍是整条
     // 命令行）。程序名的单点来源是本函数的 prog_name（VFS 路径末段或内建索引名）。
     let loaded = match loader::load(
-        elf_bytes,
+        image,
         &mut us,
         cmd,
         Some(prog_name.as_bytes()),

@@ -231,6 +231,66 @@ pub fn shm_create(size: u64) -> Result<u64, Error> {
 /// 销毁路径——对象仍有存活映射（refs>0）时拒绝（`Busy`），须先全部 unmap。
 ///
 /// 与 `shm_create`/`shm_map`/`shm_unmap` 同持 `SHM_TABLE` 锁，无新增锁序。
+/// 共享对象内容的**逐帧**搬运内核（读/写共用；3P4-7 分段装载的存取原语）。
+///
+/// 帧是**非连续**的，故必须按页切分：第 i 片落在 frames[(off)/PAGE] 内偏移
+/// (off)%PAGE，经 HHDM 取得内核虚拟地址。越界如实 InvalidParam，绝不部分交付。
+fn shm_copy_locked(
+    obj: &ShmObject,
+    off: u64,
+    len: usize,
+    caller: *mut u8,
+    write: bool,
+) -> Result<(), Error> {
+    let page = arch::PageSize::Size4K.bytes();
+    let end = off.checked_add(len as u64).ok_or(Error::InvalidParam)?;
+    if end > obj.size {
+        return Err(Error::InvalidParam);
+    }
+    let mut done = 0usize;
+    while done < len {
+        let cur = off + done as u64;
+        let idx = (cur / page) as usize;
+        let in_page = (cur % page) as usize;
+        let n = core::cmp::min(page as usize - in_page, len - done);
+        let Some(&phys) = obj.frames.get(idx) else {
+            return Err(Error::InvalidParam);
+        };
+        let kaddr = arch::phys_to_virt(phys) as *mut u8;
+        unsafe {
+            let frame_ptr = kaddr.add(in_page);
+            if write {
+                core::ptr::copy_nonoverlapping(caller.add(done), frame_ptr, n);
+            } else {
+                core::ptr::copy_nonoverlapping(frame_ptr as *const u8, caller.add(done), n);
+            }
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+/// 把 `src` 写入共享对象 `id` 的 `[off, off+src.len())`（3P4-7）。
+///
+/// 直接经 HHDM 写对象自己的物理帧：不经映射、不要求调用方持有地址空间。
+/// **不改动 refs**——这是对象内容的读写，与映射生命周期无关。
+pub fn shm_write_at(id: u64, off: u64, src: &[u8]) -> Result<(), Error> {
+    let table = SHM_TABLE.lock();
+    let Some(obj) = table.get(&id) else {
+        return Err(Error::NotFound);
+    };
+    shm_copy_locked(obj, off, src.len(), src.as_ptr() as *mut u8, true)
+}
+
+/// 从共享对象 `id` 的 `[off, off+dst.len())` 读入 `dst`（3P4-7）。
+pub fn shm_read_at(id: u64, off: u64, dst: &mut [u8]) -> Result<(), Error> {
+    let table = SHM_TABLE.lock();
+    let Some(obj) = table.get(&id) else {
+        return Err(Error::NotFound);
+    };
+    shm_copy_locked(obj, off, dst.len(), dst.as_mut_ptr(), false)
+}
+
 pub fn shm_destroy(id: u64) -> Result<(), Error> {
     let mut table = SHM_TABLE.lock();
     match table.get(&id) {

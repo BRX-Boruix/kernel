@@ -1159,6 +1159,10 @@ pub(crate) mod raw {
 
 // ---------- 后端层：用户地址空间装载（kernel 经 user-space feature 启用） ----------
 #[cfg(feature = "user-space")]
+// 3P4-7：数据源 trait 对**外部**（内核）公开——分段装载需要内核提供 shm 后端。
+// 这是刻意的门面：raw 模块本身保持 crate 私有，只放行这一个接口。
+pub use raw::ImageSource;
+
 mod backend {
     use super::raw::ImageSource;
     use super::raw::{
