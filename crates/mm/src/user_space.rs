@@ -1876,6 +1876,95 @@ where
     ///
     /// 解除映射改 pt 结构 + 同步删 cow/areas 记账 + 回退游标 → 全程持 `core` 锁，
     /// 保证 PTE 解除与记账移除对并发读者原子一致。游标（core.next_mmap）在锁内改。
+    /// 修改一段**已映射**用户内存的权限（mprotect，3P4-5）。
+    ///
+    /// 机制与 [`Self::cow_fault_locked`] 同源（那是同帧 remap 的既有先例）：逐页
+    /// `unmap`（清 PTE + 本核 `invlpg`）→ [`PT::shootdown_one`]（跨核会合失效，
+    /// **返回即各核已 invlpg**）→ **同一物理帧** `map` 新权限。
+    ///
+    /// 顺序不可换：必须先让所有核丢掉旧翻译，再装入新 PTE。全程持 `core` 粗锁，
+    /// 缺页处理器同锁——故窗口内不会有核用旧权限回填（S21）。
+    ///
+    /// 只接受**已映射**的页：未映射页如实 `NotFound`。mprotect 不负责补页（那是缺页
+    /// 路径的职责），静默跳过会让调用方以为权限已改（S09）。
+    pub fn protect_user(&self, start: u64, len: u64, flags: PageFlags) -> Result<(), PT::Error> {
+        const PAGE_SIZE: u64 = 4096;
+        if len == 0 || start % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
+            return Err(Error::InvalidParam.into());
+        }
+        let end = start.checked_add(len).ok_or(Error::InvalidParam)?;
+        if start < USER_BASE || end > USER_TOP || end <= start {
+            return Err(Error::InvalidParam.into());
+        }
+        let mut core = self.core.lock();
+
+        // 目标区间必须完整落在**单个**已有区域内：跨区域改权限语义含混（各区所有权与
+        // 释放策略不同），如实拒绝，调用方按区域粒度调用。
+        let area = {
+            let areas = self.areas.lock();
+            let Some(a) = areas
+                .iter()
+                .copied()
+                .find(|a| start >= a.start.as_u64() && end <= a.end.as_u64())
+            else {
+                return Err(Error::NotFound.into());
+            };
+            a
+        };
+
+        // 第一遍：**先完整校验**所有页都已映射，任何未映射页在动页表前失败。
+        let mut vaddr = start;
+        while vaddr < end {
+            if core.pt.translate(VirtAddr::new(vaddr)).is_none() {
+                return Err(Error::NotFound.into());
+            }
+            vaddr += PAGE_SIZE;
+        }
+
+        // 第二遍：逐页同帧 remap（unmap → 跨核失效 → map 新权限）。
+        vaddr = start;
+        while vaddr < end {
+            let phys = core
+                .pt
+                .unmap(VirtAddr::new(vaddr))
+                .map_err(|_| Error::NotFound)?;
+            PT::shootdown_one(vaddr);
+            core.pt
+                .map(VirtAddr::new(vaddr), phys, PageSize::Size4K, flags)
+                .map_err(|_| Error::NoSpace)?;
+            vaddr += PAGE_SIZE;
+        }
+
+        // 区间记账：把 [start,end) 从原区域切出，中段按新权限记录（左右两片保留原属性）。
+        // 与 munmap_anonymous 同款「先 remove 再重推」纪律，保证不出现重叠记录。
+        let mut areas = self.areas.lock();
+        let idx = areas
+            .iter()
+            .position(|a| a.start.as_u64() == area.start.as_u64() && a.end.as_u64() == area.end.as_u64());
+        if let Some(i) = idx {
+            let removed = areas.remove(i);
+            if removed.start.as_u64() < start {
+                areas.push(UserArea {
+                    end: VirtAddr::new(start),
+                    ..removed
+                });
+            }
+            areas.push(UserArea {
+                start: VirtAddr::new(start),
+                end: VirtAddr::new(end),
+                flags,
+                ..removed
+            });
+            if end < removed.end.as_u64() {
+                areas.push(UserArea {
+                    start: VirtAddr::new(end),
+                    ..removed
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn munmap_anonymous(&self, start: u64, len: u64) -> Result<(), PT::Error> {
         const PAGE_SIZE: u64 = 4096;
         if len == 0 || start % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {

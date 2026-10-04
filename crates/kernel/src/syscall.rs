@@ -202,6 +202,11 @@ pub const MEM_MAP_SHARED: u64 = 1 << 0;
 pub const SYS_MEMORY_QUERY: u32 = nr(domain::MEMORY, op::READ); // 0x22
 pub const SYS_MEMORY_GROW: u32 = nr(domain::MEMORY, op::WRITE); // 0x23
 pub const SYS_MEMORY_UNMAP: u32 = nr(domain::MEMORY, op::DELETE); // 0x24
+/// mprotect(addr, len, prot)：修改一段**已映射**内存的权限（MEMORY 域扩展 0x05 / 号 0x25，
+/// 3P4-5）。用途是 W^X 型 JIT 的「先写后切执行」（RW → RX）与「执行后切回写」（RX → RW）。
+/// **W^X 门禁复用 3P4-4 的同一单点**（mm 层 map_flags_from_prot）——否则 mprotect 就是
+/// 绕过 W^X 的后门。
+pub const SYS_MEMORY_PROTECT: u32 = nr(domain::MEMORY, 0x05); // 0x25
 
 // ---------- 3. TASK Domain (0x30) ----------
 pub const SYS_TASK_SPAWN: u32 = nr(domain::TASK, op::CREATE); // 0x31
@@ -3428,6 +3433,33 @@ fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
+/// `mprotect(addr, len, prot)`：修改已映射内存权限（MEMORY 域 0x25，3P4-5）。
+///
+/// 权限解码与 W^X 门禁**复用 3P4-4 的 mm 层单点**（map_flags_from_prot）——若此处另写
+/// 一份判定，mprotect 就会成为绕过 W^X 的后门（S13：策略只一处）。
+///
+/// prot == 0（POSIX PROT_NONE）如实 NotSupported：抽象层没有"存在但不可访问"的权限
+/// 表示（PageFlags 只有可写/可执行/用户位，无"不可读"位），拒绝而不是假装成只读。
+fn sys_mprotect(frame: &mut SyscallFrame) -> u64 {
+    let addr = frame.a1;
+    let len = frame.a2;
+    let prot = frame.a3;
+    if prot == 0 {
+        return pack_err(Error::NotSupported);
+    }
+    let flags = match mm::user_space::map_flags_from_prot(prot) {
+        Ok(f) => f,
+        Err(e) => return pack_err(e),
+    };
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    match proc.addr_space().protect_user(addr, len, flags) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
 /// `munmap(addr, size)`：释放当前进程的一段 mmap 地址区间（匿名或共享）。
 ///
 /// ABI 使用 `rdi=addr`、`rsi=size`。地址必须 4KiB 粒度。若 `addr` 命中本进程
@@ -5193,6 +5225,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_MEMORY_QUERY => done(sys_memory_query(frame)),
         SYS_MEMORY_GROW => done(sys_brk(frame)),
         SYS_MEMORY_UNMAP => done(sys_munmap(frame)),
+        SYS_MEMORY_PROTECT => done(sys_mprotect(frame)),
 
         // TASK Domain (0x30)
         SYS_TASK_SPAWN => done(sys_exec(frame)),
