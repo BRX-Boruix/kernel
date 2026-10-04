@@ -177,6 +177,15 @@ pub const SYS_STREAM_FSTAT: u32 = nr(domain::STREAM, 0x07); // 0x17
 /// 终端劫持面（S17/S20）；语义 = tcsetpgrp/TIOCSPGRP 的本域同构（权限
 /// 判定在有 caller 身份的内核边界，机制内核、策略用户态）。
 pub const SYS_STREAM_FOCUS_SET: u32 = nr(domain::STREAM, 0x08); // 0x18
+/// STREAM 域扩展动词：`ftruncate`（按 **fd** 截断/扩展，3P4-8）。
+/// a1=fd, a2=新长度。fd 基（C `ftruncate` 语义）；路径基的 `truncate` 另议。
+///
+/// **为什么本常量必须定义在内核侧**（教训成文）：dispatch 的 `match nr` 里若
+/// 用了未定义的名字，Rust 会把它当成**通配绑定**而非常量模式——该 arm 会吞掉其后
+/// **全部** syscall，且只是 warning 不是 error。本项首版即如此：内核里漏定义该常量，
+/// 导致 MEMORY/后续域的 syscall 全被路由进 `sys_ftruncate`（实测 init 的 brk/yield/open
+/// 全失败 → 用户态堆 OOM → panic）。构建时必须确认 `unreachable_patterns` 警告为零。
+pub const SYS_STREAM_FTRUNCATE: u32 = nr(domain::STREAM, 0x09); // 0x19
 
 /// STREAM read/write 的顺序 I/O 哨兵值。
 ///
@@ -1466,7 +1475,7 @@ fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
     // A1 无限化：目标 fd 编号不再有单进程上限——表扩展受全局 fd 闸门约束，
     // 拒绝语义（NoSpace）经 set_fd 返回（原入口 MAX_FDS 预检删除）。
     // 校验 old 存在并取得副本句柄（值拷贝，随后可释放 proc 借用做 ipc）。
-    let old_handle = {
+    let mut old_handle = {
         let Some(proc) = current_proc_mut() else {
             return pack_err(Error::NotFound);
         };
@@ -1476,7 +1485,16 @@ fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
         }
     };
     if old_fd == new_fd {
+        // POSIX：新旧 fd 相同则**无任何其它副作用**——故 CLOEXEC 也不清除。
         return pack_ok(new_fd as u64);
+    }
+    // POSIX dup2：副本的 **FD_CLOEXEC 被清除**（每-fd 标志的归属：**fork 继承、
+    // dup 清除**）。本系统每个 fd 槽各持一份 OpenHandle，故直接改副本标志即可。
+    // 不清除的后果：dup2 出来的 fd 会带着 CLOEXEC 被 exec 掉，调用方按 POSIX
+    // 预期"复制一个可继承的 fd"就会失败（本项首版用例正是踩此坑）。
+    match &mut old_handle {
+        vfs::file_handle::OpenHandle::File(fh) => fh.flags.cloexec = false,
+        vfs::file_handle::OpenHandle::Pipe { flags, .. } => flags.cloexec = false,
     }
     // 副本是 pipe 端：递增引用计数（每个持有该 id 的 fd 记 1 ref）。
     // 用引用绑定取 id（Pipe 的 u64 是 Copy），不 move old_handle——它稍后
