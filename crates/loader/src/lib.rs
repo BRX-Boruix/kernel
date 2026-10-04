@@ -88,19 +88,84 @@ pub(crate) mod raw {
         pub phnum: usize,
     }
 
+    /// 镜像**数据源**（3P4-7）：把"整块内存里的镜像"抽象成"可按偏移读取的字节流"。
+    ///
+    /// 为什么需要它：此前 exec 必须把整个可执行文件**整读**进内核堆（受
+    /// MAX_SYSCALL_BUF_BYTES = 64MiB 约束），大镜像直接拒绝装载。分段装载（shmem 方案）
+    /// 下镜像分散在若干物理帧里（**非连续**），加载器只能按偏移**分块**读取——本 trait
+    /// 就是那条缝：`&[u8]` 覆盖内建程序与全部 host 单测，shm 视图覆盖新路径。
+    ///
+    /// 约定：`read_at` 越界**如实报错**（InvalidParam），绝不短读、绝不返回部分数据。
+    pub trait ImageSource {
+        /// 镜像总字节数。
+        fn len(&self) -> u64;
+        /// 把 `[off, off + dst.len())` 读入 `dst`。
+        fn read_at(&self, off: u64, dst: &mut [u8]) -> Result<(), Error>;
+
+        fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+        fn rd_u8(&self, off: u64) -> Result<u8, Error> {
+            let mut b = [0u8; 1];
+            self.read_at(off, &mut b)?;
+            Ok(b[0])
+        }
+        fn rd_u16(&self, off: u64) -> Result<u16, Error> {
+            let mut b = [0u8; 2];
+            self.read_at(off, &mut b)?;
+            Ok(u16::from_le_bytes(b))
+        }
+        fn rd_u32(&self, off: u64) -> Result<u32, Error> {
+            let mut b = [0u8; 4];
+            self.read_at(off, &mut b)?;
+            Ok(u32::from_le_bytes(b))
+        }
+        fn rd_u64(&self, off: u64) -> Result<u64, Error> {
+            let mut b = [0u8; 8];
+            self.read_at(off, &mut b)?;
+            Ok(u64::from_le_bytes(b))
+        }
+    }
+
+    impl ImageSource for [u8] {
+        fn len(&self) -> u64 {
+            self.len() as u64
+        }
+        fn read_at(&self, off: u64, dst: &mut [u8]) -> Result<(), Error> {
+            let off = usize::try_from(off).map_err(|_| Error::InvalidParam)?;
+            let end = off.checked_add(dst.len()).ok_or(Error::InvalidParam)?;
+            if end > self.len() {
+                return Err(Error::InvalidParam);
+            }
+            dst.copy_from_slice(&self[off..end]);
+            Ok(())
+        }
+    }
+
+    impl ImageSource for alloc::vec::Vec<u8> {
+        fn len(&self) -> u64 {
+            self.as_slice().len() as u64
+        }
+        fn read_at(&self, off: u64, dst: &mut [u8]) -> Result<(), Error> {
+            self.as_slice().read_at(off, dst)
+        }
+    }
+
     /// 解析并校验 ELF 头。
     ///
     /// L1：程序头表必须不与 ELF 头重叠、且完整落在镜像内。全部算术
     /// checked——phnum 与 phoff 都是攻击者可控值，回绕后的「合法小值」
     /// 正是越界读 panic 的入口（红阶段实测：len=136、index=4232）。
-    pub(crate) fn parse_header(elf: &[u8]) -> Result<ElfHeader, Error> {
-        if elf.len() < EHDR_SIZE {
+    pub(crate) fn parse_header<S: ImageSource + ?Sized>(image: &S) -> Result<ElfHeader, Error> {
+        if image.len() < EHDR_SIZE as u64 {
             // LD3：连 ELF 头都装不下 —— 同样属于「这不是 ELF」（ENOEXEC），
             // 而非「是 ELF 但某字段非法」。空文件、被截断的文件、随便一个
             // 短文本文件都会走到这里，它们与"内核不支持这个 ELF"无关。
             return Err(Error::ExecFormat);
         }
-        if elf[0..4] != ELF_MAGIC {
+        let mut magic = [0u8; 4];
+        image.read_at(0, &mut magic)?;
+        if magic != ELF_MAGIC {
             // LD3：**不是 ELF** 与「ELF 头里某字段非法」是两类不同的失败。
             // 前者是「这不是一份可执行镜像」（ENOEXEC），后者是
             // 「是 ELF 但这处参数不合法」（EINVAL）。
@@ -112,28 +177,28 @@ pub(crate) mod raw {
             // 实测（QEMU）：执行纯文本文件得到 errno=22 而非 8，正是该缺陷。
             return Err(Error::ExecFormat);
         }
-        if elf[4] != ELFCLASS64 {
+        if image.rd_u8(4)? != ELFCLASS64 {
             return Err(Error::NotSupported);
         }
-        if elf[5] != ELFDATA2LSB {
+        if image.rd_u8(5)? != ELFDATA2LSB {
             return Err(Error::NotSupported);
         }
-        let e_type = rd_u16(elf, 16);
+        let e_type = image.rd_u16(16)?;
         // 3P4-6：接受 ET_DYN（PIE）。位置无关的静态程序**无需重定位**即可在任意
         // 基址装载（实测：rust-lld 的 -nostdlib PIE 产物不含 PT_DYNAMIC）；真正的
         // 动态链接（重定位/多模块）仍归阶段 5 的用户态 rtld。
         if e_type != ET_EXEC && e_type != ET_DYN {
             return Err(Error::NotSupported);
         }
-        let e_machine = rd_u16(elf, 18);
+        let e_machine = image.rd_u16(18)?;
         if e_machine != EM_X86_64 {
             return Err(Error::NotSupported);
         }
 
-        let entry = rd_u64(elf, 24);
-        let phoff = usize::try_from(rd_u64(elf, 32)).map_err(|_| Error::InvalidParam)?;
-        let phentsize = rd_u16(elf, 54) as usize;
-        let phnum = rd_u16(elf, 56) as usize;
+        let entry = image.rd_u64(24)?;
+        let phoff = usize::try_from(image.rd_u64(32)?).map_err(|_| Error::InvalidParam)?;
+        let phentsize = image.rd_u16(54)? as usize;
+        let phnum = image.rd_u16(56)? as usize;
         if phentsize != PHDR_SIZE {
             return Err(Error::NotSupported);
         }
@@ -145,7 +210,7 @@ pub(crate) mod raw {
         let table_end = phoff
             .checked_add(table_bytes)
             .ok_or(Error::InvalidParam)?;
-        if table_end > elf.len() {
+        if table_end as u64 > image.len() {
             return Err(Error::InvalidParam);
         }
 
@@ -500,12 +565,15 @@ pub(crate) mod raw {
     ///
     /// 「模板虚拟地址必须落在某个已加载段内」由 backend 结合段区间集合校验——
     /// 本函数不持有段信息。
-    pub(crate) fn parse_tls_template(elf: &[u8], ph: usize) -> Result<TlsTemplate, Error> {
-        let offset = rd_u64(elf, ph + 8);
-        let vaddr = rd_u64(elf, ph + 16);
-        let filesz = rd_u64(elf, ph + 32);
-        let memsz = rd_u64(elf, ph + 40);
-        let align = rd_u64(elf, ph + 48);
+    pub(crate) fn parse_tls_template<S: ImageSource + ?Sized>(
+        image: &S,
+        ph: usize,
+    ) -> Result<TlsTemplate, Error> {
+        let offset = image.rd_u64((ph + 8) as u64)?;
+        let vaddr = image.rd_u64((ph + 16) as u64)?;
+        let filesz = image.rd_u64((ph + 32) as u64)?;
+        let memsz = image.rd_u64((ph + 40) as u64)?;
+        let align = image.rd_u64((ph + 48) as u64)?;
         if filesz > memsz {
             return Err(Error::InvalidParam);
         }
@@ -513,7 +581,7 @@ pub(crate) mod raw {
             return Err(Error::InvalidParam);
         }
         let file_end = offset.checked_add(filesz).ok_or(Error::OutOfRange)?;
-        if file_end > elf.len() as u64 {
+        if file_end > image.len() {
             return Err(Error::InvalidParam);
         }
         vaddr.checked_add(filesz).ok_or(Error::OutOfRange)?;
@@ -606,12 +674,12 @@ pub(crate) mod raw {
             magic[0] = 0;
             assert_eq!(parse_header(&magic), Err(Error::ExecFormat));
             // 同一条纪律：空文件 / 短于 ELF 头同样是「不是 ELF」。
-            assert_eq!(parse_header(&[]), Err(Error::ExecFormat));
-            assert_eq!(parse_header(&[0x7f]), Err(Error::ExecFormat));
+            assert_eq!(parse_header(&[][..]), Err(Error::ExecFormat));
+            assert_eq!(parse_header(&[0x7f][..]), Err(Error::ExecFormat));
             // 纯文本文件（长度足够但 magic 不对）—— 这正是用户在 shell 里
             // 敲一个非 ELF 文件时走的路径，实测曾错误地得到 EINVAL(22)。
             assert_eq!(
-                parse_header(b"this is plain text, not an ELF image\n"),
+                parse_header(&b"this is plain text, not an ELF image\n"[..]),
                 Err(Error::ExecFormat)
             );
 
@@ -1092,6 +1160,7 @@ pub(crate) mod raw {
 // ---------- 后端层：用户地址空间装载（kernel 经 user-space feature 启用） ----------
 #[cfg(feature = "user-space")]
 mod backend {
+    use super::raw::ImageSource;
     use super::raw::{
         AT_EXECFN, AT_NULL, MAX_CMDLINE_BYTES, MAX_ENV_BYTES, MAX_ENV_COUNT, MAX_PROG_NAME_BYTES,
         PhdrClass, RSP_OFF_MIN, STR_OFF, SegmentSpec, TlsTemplate, align_up_checked, classify_phdr,
@@ -1161,15 +1230,15 @@ mod backend {
     ///   回收。台账外的中间状态——mm 侧 `pt.map` 中途失败的已映射页不入
     ///   areas 台账——不在本承诺范围内，见 docs/degradation.md D10；当前
     ///   exec 错误路径 CR3 从未切向该空间、表随 Drop 消亡，无实际可达缺口。
-    pub fn load(
-        elf: &[u8],
+    pub fn load<S: ImageSource + ?Sized>(
+        image: &S,
         addr_space: &mut UserAddressSpace<X86PageTable>,
         cmd: &[u8],
         prog_name: Option<&[u8]>,
         env: &[&[u8]],
         pie_base: u64,
     ) -> Result<LoadedElf, Error> {
-        let hdr = parse_header(elf)?;
+        let hdr = parse_header(image)?;
         // 3P4-6：ET_DYN 需要**装载基址偏移**（其 p_vaddr 相对基址）；ET_EXEC 的
         // p_vaddr 已是绝对地址，偏移恒 0。基址必须页对齐且非零——否则段内页偏移
         // 会被基址扰动（文件侧换算失效），或把镜像落到 NULL 页。
@@ -1197,9 +1266,9 @@ mod backend {
             // 表完整性由 parse_header 单点保证：phoff + phnum*PHDR_SIZE
             // <= elf.len()，故按表项偏移的读取不会越界。
             let ph = hdr.phoff + i * hdr.phentsize;
-            match classify_phdr(rd_u32(elf, ph)) {
+            match classify_phdr(image.rd_u32(ph as u64)?) {
                 PhdrClass::Load => {
-                    let range = load_segment(elf, ph, addr_space, bias)?;
+                    let range = load_segment(image, ph, addr_space, bias)?;
                     seg_ranges.push(range);
                     loaded += 1;
                 }
@@ -1210,7 +1279,7 @@ mod backend {
                 PhdrClass::TlsTemplate => {
                     // 3P4-6：PT_TLS 的 vaddr 与段同属镜像地址空间，必须一并加偏移——
                     // 否则 TLS 块会按未偏移的地址装配（ET_DYN 下必然错位）。
-                    let mut t = parse_tls_template(elf, ph)?;
+                    let mut t = parse_tls_template(image, ph)?;
                     t.vaddr = t.vaddr.checked_add(bias).ok_or(Error::OutOfRange)?;
                     // 模板初值必须落在某个已加载段内：否则「拷贝初值」的源地址不在该
                     // 地址空间里（或指向内核半区）——按 L2 纪律显式拒绝。
@@ -1348,22 +1417,23 @@ mod backend {
 
     /// 加载单个 `PT_LOAD` 段，返回它占用的用户虚拟区间
     /// `[vaddr_start, vaddr_end)`（LM3 入口校验的消费方）。
-    fn load_segment(
-        elf: &[u8],
+    fn load_segment<S: ImageSource + ?Sized>(
+        image: &S,
         ph: usize,
         addr_space: &mut UserAddressSpace<X86PageTable>,
         bias: u64,
     ) -> Result<(u64, u64), Error> {
-        let p_flags = rd_u32(elf, ph + 4);
+        let p_flags = image.rd_u32((ph + 4) as u64)?;
         let spec = SegmentSpec {
-            p_offset: rd_u64(elf, ph + 8),
-            p_vaddr: rd_u64(elf, ph + 16),
-            p_filesz: rd_u64(elf, ph + 32),
-            p_memsz: rd_u64(elf, ph + 40),
+            p_offset: image.rd_u64((ph + 8) as u64)?,
+            p_vaddr: image.rd_u64((ph + 16) as u64)?,
+            p_filesz: image.rd_u64((ph + 32) as u64)?,
+            p_memsz: image.rd_u64((ph + 40) as u64)?,
         };
 
         // 全部段级校验与页数学单点在纯逻辑层完成（host 可测，LA4）。
-        let plan = plan_segment(elf.len(), PAGE_SIZE, USER_TOP, bias, spec)?;
+        let image_len = usize::try_from(image.len()).map_err(|_| Error::InvalidParam)?;
+        let plan = plan_segment(image_len, PAGE_SIZE, USER_TOP, bias, spec)?;
         if plan.npages == 0 {
             return Ok((plan.vaddr_start, plan.vaddr_end));
         }
@@ -1400,16 +1470,18 @@ mod backend {
             }
             if c_hi > c_lo {
                 let n = (c_hi - c_lo) as usize;
-                // 不变量（plan_segment 的 L2 校验已证）：p_offset + p_filesz <= elf.len()，
+                // 不变量（plan_segment 的 L2 校验已证）：p_offset + p_filesz <= image.len()，
                 // 且文件侧段内偏移 = c_lo - page_off（同余保证与 p_vaddr 对齐），
-                // 故源区间完全落在镜像内，此处转换不截断、拷贝不越界。
-                let src = (spec.p_offset + (c_lo - plan.page_off)) as usize;
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        elf.as_ptr().add(src),
-                        dst.add((c_lo - page_lo) as usize),
-                        n,
-                    );
+                // 故源区间完全落在镜像内。
+                let src = spec.p_offset + (c_lo - plan.page_off);
+                // 3P4-7：从**数据源**分块读取（不再要求镜像躺在连续内存里）。读取失败必须
+                // 全额退还已取得帧——否则错误路径泄漏整段物理帧（audit-r2 F1 同款纪律）。
+                let dst_slice = unsafe {
+                    core::slice::from_raw_parts_mut(dst.add((c_lo - page_lo) as usize), n)
+                };
+                if let Err(e) = image.read_at(src, dst_slice) {
+                    refund_frames(&frames);
+                    return Err(e);
                 }
             }
         }
