@@ -5464,6 +5464,15 @@ pub extern "C" fn syscall_entry(frame: &mut SyscallFrame) -> bool {
             // 用 `read_unaligned` 读 cs 判定是否真实用户态返回帧（合成测试帧的
             // arch_frame 为 0 或指向未对齐局部帧时安全跳过），避免 misaligned deref。
             frame.result = ret;
+            // **交付顺序**（3P4-9 实测暴露）：`frame.result` 只是 SyscallFrame 的字段，
+            // 架构帧的 rax 由 entry stub 在本函数返回后才回写。而信号投递会**保存整帧**
+            // （handler 的 sigreturn 再整体恢复）——若此刻 rax 还是 syscall 调用号，被恢复的
+            // 就是调用号本身。实测症状：被信号打断的 read 返回 0x12（= SYS_STREAM_READ）。
+            // 故投递前先把结果落到架构帧 rax；stub 随后再写一次同值，无害。
+            // 合成测试帧（arch_frame==0）不触碰。
+            if frame.arch_frame != 0 {
+                arch_frame(frame).rax = ret;
+            }
             if !deliver_pending_signal(frame) {
                 // 进程被默认动作终止并已切走：架构层不得再把 result 回写（调度已
                 // 替换帧）。置 switched 由调度语义接管。
