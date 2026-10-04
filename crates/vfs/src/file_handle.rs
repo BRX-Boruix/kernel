@@ -212,6 +212,37 @@ impl OpenHandle {
     }
 }
 
+// ---------- fd 句柄释放钩子（3P4-3b） ----------
+
+/// fd 句柄**永久释放**钩子：进程退出 drain fd 表时逐个交付。
+
+/// 为什么需要钩子：`OpenHandle::Pipe` 的**端引用计数在 ipc 层**维护，而释放点是
+/// task 的进程终止路径——vfs 不该反向依赖 ipc。形状与 `mm::user_space::ShmMappingHooks`
+/// 同族：vfs 定义钩子点，kernel 侧装配 ipc 实现（依赖方向 vfs ← kernel → ipc）。
+///
+/// **边界**（有意为之，非重复造轮子）：syscall 侧的 close/dup2/exec 继承仍显式调用
+/// `ipc::pipe_ref_dec` —— 那些路径需要**销毁结果**（refs 归零即销毁对象）来决定后续动作，
+/// 而本钩子只表达"这个句柄永久没了"，返回值为空。两处语义不同，故不强行合并。
+pub trait FdReleaseHooks: Send + Sync {
+    /// 一个 fd 句柄被永久释放（当前唯一来源：进程退出 drain fd 表）。
+    fn on_handle_released(&self, handle: &OpenHandle);
+}
+
+static FD_RELEASE_HOOKS: klib::sync::irq::IrqSpinLock<Option<&'static dyn FdReleaseHooks>> =
+    klib::sync::irq::IrqSpinLock::new(None);
+
+/// 装配钩子实现（kernel 侧引导期调用一次）。
+pub fn set_fd_release_hooks(hooks: &'static dyn FdReleaseHooks) {
+    *FD_RELEASE_HOOKS.lock() = Some(hooks);
+}
+
+/// 交付一个被释放的句柄给钩子。未装配时无副作用（引导早期 / host 单测）。
+pub fn release_handle(handle: &OpenHandle) {
+    if let Some(h) = *FD_RELEASE_HOOKS.lock() {
+        h.on_handle_released(handle);
+    }
+}
+
 impl FileHandle {
     /// 构造句柄（ADR-023 §5）。
     ///

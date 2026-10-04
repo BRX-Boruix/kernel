@@ -82,7 +82,24 @@ impl mm::user_space::ShmMappingHooks for ShmOwnershipHooks {
 
 static SHM_HOOKS: ShmOwnershipHooks = ShmOwnershipHooks;
 
+/// fd 句柄释放适配（3P4-3b）：进程退出 drain fd 表时，把管道端引用归还 ipc 层。
+/// vfs 定义钩子点、本层装配——依赖方向 vfs ← kernel → ipc 保持单向（同 SHM_HOOKS 手法）。
+struct FdReleaseAdapter;
+
+impl vfs::file_handle::FdReleaseHooks for FdReleaseAdapter {
+    fn on_handle_released(&self, handle: &vfs::file_handle::OpenHandle) {
+        // 只有管道端需要归还引用；文件句柄的 inode 由 Arc 自然回收。
+        if let vfs::file_handle::OpenHandle::Pipe { id, writer, .. } = handle {
+            // 归零即销毁管道对象——退出路径无需据此决策，故忽略返回值。
+            let _ = ipc::pipe_ref_dec(*id, *writer);
+        }
+    }
+}
+
+static FD_HOOKS: FdReleaseAdapter = FdReleaseAdapter;
+
 pub fn init_ipc() {
     ipc::set_ipc_notifier(&NOTIFIER);
     mm::user_space::set_shm_mapping_hooks(&SHM_HOOKS);
+    vfs::file_handle::set_fd_release_hooks(&FD_HOOKS);
 }

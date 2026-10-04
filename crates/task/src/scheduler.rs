@@ -807,8 +807,9 @@ pub fn spawn_derived(
     ));
     // fd 表深拷贝的语义：`clone_fd_table` 只做结构性克隆（`OpenHandle` 的
     // `Clone`），**pipe 端引用计数递增不在 task 层**——由 kernel syscall 层在
-    // 本函数返回后对每个 `Pipe { id }` 调 `ipc::pipe_ref_inc`（task 不依赖 ipc，
-    // 见 `spawn_with_ppid_fds` 同款注释）。
+    // 本函数返回后对每个 `Pipe { id }` 调 `ipc::pipe_ref_inc`（3P4-3b 复核：本条
+    // 注释原写「task 不依赖 ipc」，与 Cargo.toml 及本文件既有 `ipc::sync_release_process`
+    // 调用不符，已更正——依赖存在，只是**递增点**仍在 syscall 层以保持单点）。
     proc.set_inherited_fd_table(fd_table);
     proc.set_cwd(cwd);
     proc.set_identity(identity);
@@ -3018,6 +3019,18 @@ fn terminate_process_locked(pid: usize, code: u64) -> Termination {
         None
     };
     let deliver = deliver_ppid_home.is_some();
+
+    // 3P4-3b：进程**退出即**释放 fd 表持有的资源引用（POSIX：fd 在退出时关闭，不等收尸——
+    // 否则未收尸的 zombie 会一直占着管道写端，读者等不到 EOF）。
+    //
+    // 单点：只在本函数（组长完整终止）执行；组员走 terminate_member_locked，不触碰进程的
+    // fd 表（fd 表组内共享，成员退出不关进程的 fd）。drain 后表为空，重复调用无副作用。
+    // 句柄到具体资源的映射由 vfs 的释放钩子交付（kernel 侧装配 ipc 实现，见 ipc_init.rs）。
+    if let Some(e) = proc_bucket_lock(pid).get(&pid) {
+        for h in e.proc.drain_fd_table() {
+            vfs::file_handle::release_handle(&h);
+        }
+    }
 
     let outcome = if !reapable {
         driver::uio_on_process_exit(pid);

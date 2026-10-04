@@ -662,6 +662,24 @@ impl<PT: PageTable> Process<PT> {
         self.group.fd_table.lock().clone()
     }
 
+    /// 3P4-3b：drain fd 表并返回全部句柄（进程退出时释放其持有的资源引用）。
+    ///
+    /// 表随即为空——重复调用返回空（幂等）。fd 表是**组内共享**的，故只有**组长**的
+    /// 完整终止路径调用它；组员（线程）退出不关进程的 fd。
+    ///
+    /// **全局 fd 闸门**（S18）：按被 drain 的占用槽数归还；组容器 Drop 随后看到空表、
+    /// 归还 0，不会重复回冲。
+    pub fn drain_fd_table(&self) -> alloc::vec::Vec<vfs::file_handle::OpenHandle> {
+        let mut table = self.group.fd_table.lock();
+        let used = table.iter().filter(|s| s.is_some()).count();
+        let handles: alloc::vec::Vec<_> = table.drain(..).flatten().collect();
+        drop(table);
+        if used > 0 {
+            fd_gate_release(used);
+        }
+        handles
+    }
+
     /// 以父进程继承的 fd 表替换本进程的默认标准流表（spawn 时注入）。
     ///
     /// 仅当继承表**非空**时替换：默认标准流表（0/1/2）由 [`Self::new`] 已装好，
