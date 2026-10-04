@@ -4346,6 +4346,13 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
         let mut g = proc_bucket_lock(target);
         if let Some(slot) = g.get_mut(&target) {
             slot.proc.signal_mut().raise(sig);
+            // ADR-052：若目标正**阻塞在 syscall 里**，唤醒它的同时直接把 EINTR 写进它的保存帧。
+            // 只置 pending 不够——被唤醒的 syscall 用的是进入阻塞时保存的帧（本系统无内核
+            // 上下文切换），而信号会在它回用户态时被消费；于是重试时预检看不到任何待决信号，
+            // 又会睡回去（实测：永久挂起）。此处直接交付结果，语义与 POSIX 一致。
+            if slot.proc.state() == TaskState::Blocked {
+                slot.saved.rax = klib::error::Error::Interrupted.packed();
+            }
         }
     }
     // ADR-051：投递必须**唤醒阻塞中的目标**——否则阻塞在 syscall 里的进程永远看不到

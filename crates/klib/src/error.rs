@@ -102,6 +102,14 @@ impl Error {
     /// 转为 POSIX errno 风格数值（ADR-003 syscall 边界铺路，可后续直接映射）。
     /// `const fn`：允许调用方在常量上下文（如哨兵值）引用集中错误码，杜绝
     /// 在别处内联裸字面量重复定义（S13 单一事实源）。
+    /// ABI 打包：错误以 **-errno 的补码**返回（bit63 置位 = 错误，ADR-003）。
+    ///
+    /// **单点定义**（S13）：内核 syscall 收尾与"唤醒阻塞 syscall 时预置返回值"
+    /// （ADR-052）两处都必须用同一规则——分散实现必然漂移。
+    pub const fn packed(self) -> u64 {
+        (self.to_errno() as i64).wrapping_neg() as u64
+    }
+
     pub const fn to_errno(self) -> i32 {
         match self {
             Error::OutOfMemory => 12,      // ENOMEM

@@ -34,6 +34,19 @@ impl ipc::IpcTaskNotifier for KernelIpcNotifier {
         // 由调用方以 EINTR 收场（信号本身照常在 syscall 返回点投递给用户 handler）。
         // 预检与阻塞之间若恰好到达信号，投递路径会 wake 本进程，阻塞循环重入本函数
         // 时再次命中——该窗口由循环重入闭合，无需在调度锁内联查。
+        // ADR-052：**被唤醒的阻塞 syscall 的返回值**。
+        //
+        // 本系统的"阻塞"由帧交换实现（commit_same_lock 做 *frame = next.saved 后 iretq），
+        // **没有内核上下文切换**——因此被唤醒的 syscall **不会继续执行**，它回到用户态时
+        // 用的是进入阻塞时保存的帧。若不做处理，rax 仍是进入时的 **syscall 调用号**，
+        // 用户会拿到一个纯属伪造的成功值（实测：阻塞 read 返回 18 = 0x12 = SYS_STREAM_READ）。
+        //
+        // 诚实语义：本次调用**没有**完成阻塞等待，如实返回 WouldBlock（EAGAIN，"请重试"）。
+        // 调用方重试时会重新进入本函数：若此时信号已待决，预检直接给出 Interrupted（EINTR），
+        // 从而让"被信号打断"与"被事件唤醒"两条路都收敛到正确结果。
+        //
+        // 这里在**保存帧之前**写 rax：task 侧 slot.saved = *frame 会原样捕获该值。
+        frame.rax = crate::syscall::pack_err(klib::error::Error::WouldBlock);
         if let Some(cur) = task::current_proc_mut() {
             // 两个来源都要看：pending（信号刚到、还没投递）与 interrupted（投递已经
             // 发生并消费了 pending 位——典型是调度 tick 那条触发点）。

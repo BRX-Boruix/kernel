@@ -519,8 +519,9 @@ fn pack_ok(v: u64) -> u64 {
 
 /// 打包错误：返回 `-errno` 的补码（`bit63` 置位 = 错误，ADR-003 错误码直接返回）。
 #[inline]
-fn pack_err(e: Error) -> u64 {
-    (e.to_errno() as i64).wrapping_neg() as u64
+pub(crate) fn pack_err(e: Error) -> u64 {
+    // 规则单点在 klib（S13）：与 ADR-052 的「唤醒时预置返回值」共用同一实现。
+    e.packed()
 }
 
 // ---------- 具体 syscall 实现 ----------
