@@ -3786,9 +3786,11 @@ fn build_test_elf() -> alloc::vec::Vec<u8> {
     code.extend_from_slice(&[0xCD, 0x80]);
 
     let code_len = code.len() as u64;
-    // program header 0 起点 = header(64) + 2 * phdr(56) = 176
-    let code_off: u64 = 64 + 2 * 56;
-    let msg_off: u64 = code_off + code_len;
+    // 3P4-6：p_offset 必须与 p_vaddr **同余**（模页大小）。真实链接器把各段放在页对齐
+    // 的文件偏移上；此前用「头之后紧跟段内容」（176）虽紧凑，却违反该约束——旧加载器
+    // 不检查同余，故一直没暴露。两个段各自对齐到独立页，避免同页映射冲突。
+    let code_off: u64 = 0x1000;
+    let msg_off: u64 = 0x2000;
 
     // ---- 组装 ELF ----
     let mut elf: Vec<u8> = Vec::new();
@@ -3836,8 +3838,14 @@ fn build_test_elf() -> alloc::vec::Vec<u8> {
     w64(&mut elf, msg.len() as u64); // p_memsz
     w64(&mut elf, 0x1000); // p_align
 
-    // 段内容：text + data
+    // 段内容：text + data（各自补齐到其页对齐的文件偏移）
+    while (elf.len() as u64) < code_off {
+        elf.push(0);
+    }
     elf.extend_from_slice(&code);
+    while (elf.len() as u64) < msg_off {
+        elf.push(0);
+    }
     elf.extend_from_slice(msg);
 
     elf
@@ -8905,7 +8913,10 @@ impl LoaderElfSpec {
         entry: 0x40_0000,
         phoff: 64,
         phnum: 1,
-        p_offset: 120, // EHDR(64) + 1 × PHDR(56)
+        // 3P4-6：p_offset 必须与 p_vaddr **同余**（模页大小）。真实链接器把段内容放在
+        // 页对齐的文件偏移上（这正是同余约束的现实来源）；此前用 120（紧接头之后）虽然
+        // 方便，却违反了该约束——旧加载器不检查同余，故一直没暴露。
+        p_offset: 0x1000,
         p_vaddr: 0x40_0000,
         p_filesz: 0x10,
         p_memsz: 0x1008, // 页尾 [memsz, page_end) 是分配器残留清零验证区（LM2）
@@ -8987,7 +8998,11 @@ fn build_loader_elf(spec: &LoaderElfSpec) -> alloc::vec::Vec<u8> {
         spec.p_memsz,
         spec.p_flags,
     );
-    // 段内容：可辨识的非零字节（拷贝路径验证 + 清零断言的对照面）
+    // 段内容：可辨识的非零字节（拷贝路径验证 + 清零断言的对照面）。
+    // 3P4-6：文件按 p_offset 补齐，使段内容落在声明的（页对齐）文件偏移上。
+    while (elf.len() as u64) < spec.p_offset {
+        elf.push(0);
+    }
     elf.extend_from_slice(&[0xA5; 16]);
     elf
 }
@@ -9014,7 +9029,7 @@ fn build_two_segment_elf(seg_bytes: u64) -> alloc::vec::Vec<u8> {
 fn expect_loader_reject(elf: &[u8], cmd: &[u8], want: klib::error::Error, ctx: &str) {
     use mm::user_space::UserAddressSpace;
     let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-    match loader::load(elf, &mut us, cmd, None, &[]) {
+    match loader::load(elf, &mut us, cmd, None, &[], 0) {
         Err(e) if e == want => info!("[test-loader] {} rejected: {:?}", ctx, e),
         Ok(_) => panic!("[test-loader] {}: malicious image unexpectedly loaded", ctx),
         Err(e) => panic!("[test-loader] {}: expected Err({:?}), got Err({:?})", ctx, want, e),
@@ -9118,7 +9133,9 @@ pub fn test_loader_adversarial() {
         "phoff table arithmetic overflow",
     );
     let spec = LoaderElfSpec {
-        phnum: 2, // 表声明 2 项，文件只装得下 1 项
+        // 表声明 256 项而文件只写了 1 项——3P4-6 后文件按 p_offset(0x1000) 补齐，
+        // 2 项（176B）已装得下，故计数必须足够大才能维持本用例的语义。
+        phnum: 0x100,
         ..LoaderElfSpec::BASE
     };
     expect_loader_reject(
@@ -9257,7 +9274,7 @@ pub fn test_loader_adversarial() {
             let mut us =
                 UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
             let elf = build_two_segment_elf(QUOTA_SEG_BYTES);
-            match loader::load(&elf, &mut us, &[], None, &[]) {
+            match loader::load(&elf, &mut us, &[], None, &[], 0) {
                 Err(e) if e == Error::NoSpace => {
                     info!("[test-loader] {} rejected: {:?}", label, e);
                 }
@@ -9313,7 +9330,7 @@ pub fn test_loader_adversarial() {
         };
         let elf = build_loader_elf(&spec);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        match loader::load(&elf, &mut us, &[], None, &[]) {
+        match loader::load(&elf, &mut us, &[], None, &[], 0) {
             Ok(_) => info!("[test-loader] W+X segment loads with warn (D9 policy)"),
             Err(e) => panic!("[test-loader] W+X segment must load per D9 policy, got {:?}", e),
         }
@@ -9338,7 +9355,7 @@ pub fn test_loader_adversarial() {
         let long_cmd = alloc::vec![b'L'; 1000];
         let elf = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        let loaded = match loader::load(&elf, &mut us, &long_cmd, None, &[]) {
+        let loaded = match loader::load(&elf, &mut us, &long_cmd, None, &[], 0) {
             Ok(l) => l,
             Err(e) => panic!("[test-loader] 1000-byte cmd must load (3P4-2), got {:?}", e),
         };
@@ -9369,7 +9386,7 @@ pub fn test_loader_adversarial() {
         let max_cmd = alloc::vec![b'a'; loader::MAX_CMDLINE_BYTES];
         let elf2 = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us2 = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        match loader::load(&elf2, &mut us2, &max_cmd, None, &[]) {
+        match loader::load(&elf2, &mut us2, &max_cmd, None, &[], 0) {
             Ok(_) => info!("[test-loader] cmd at MAX_CMDLINE_BYTES loads, string+NUL intact"),
             Err(e) => panic!("[test-loader] cmd at limit must load, got {:?}", e),
         }
@@ -9379,7 +9396,7 @@ pub fn test_loader_adversarial() {
         let env: [&[u8]; 2] = [b"PATH=/programs", b"TERM=boruix"];
         let elf3 = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us3 = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        let loaded3 = match loader::load(&elf3, &mut us3, b"hello", Some(b"tlsdemo"), &env) {
+        let loaded3 = match loader::load(&elf3, &mut us3, b"hello", Some(b"tlsdemo"), &env, 0) {
             Ok(l) => l,
             Err(e) => panic!("[test-loader] env load must succeed, got {:?}", e),
         };
@@ -9462,7 +9479,7 @@ pub fn test_loader_adversarial() {
     {
         let elf = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        let loaded = match loader::load(&elf, &mut us, &[], None, &[]) {
+        let loaded = match loader::load(&elf, &mut us, &[], None, &[], 0) {
             Ok(l) => l,
             Err(e) => panic!("[test-loader] baseline ELF must load, got {:?}", e),
         };
@@ -9530,13 +9547,16 @@ pub fn test_loader_adversarial() {
         push_ehdr(&mut elf, LoaderElfSpec::BASE.entry, 64, 2);
         push_phdr(
             &mut elf,
-            64 + 2 * 56, // 段内容紧随两个程序头
+            0x1000, // 3P4-6：p_offset 必须与 p_vaddr 同余（页对齐） // 段内容紧随两个程序头
             LoaderElfSpec::BASE.p_vaddr,
             0x10,
             0x10,
             5, // PF_R | PF_X
         );
         push_phdr_typed(&mut elf, p_type, 0, 0, 0, 0, 0);
+        while elf.len() < 0x1000 {
+            elf.push(0);
+        }
         elf.extend_from_slice(&[0xA5; 16]);
         expect_loader_reject(&elf, &[], Error::NotSupported, name);
     }
@@ -9553,7 +9573,7 @@ pub fn test_loader_adversarial() {
         push_ehdr(&mut elf, LoaderElfSpec::BASE.entry, 64, 2);
         push_phdr(
             &mut elf,
-            64 + 2 * 56,
+            0x1000, // 3P4-6：p_offset 必须与 p_vaddr 同余（页对齐）
             LoaderElfSpec::BASE.p_vaddr,
             0x10,
             0x10,
@@ -9561,6 +9581,9 @@ pub fn test_loader_adversarial() {
         );
         // push_phdr_typed(elf, p_type, p_offset, p_vaddr, p_filesz, p_memsz, p_flags)
         push_phdr_typed(&mut elf, 7, 0, 0, 4, 4, 4);
+        while elf.len() < 0x1000 {
+            elf.push(0);
+        }
         elf.extend_from_slice(&[0xA5; 16]);
         expect_loader_reject(
             &elf,
@@ -9574,16 +9597,19 @@ pub fn test_loader_adversarial() {
         push_ehdr(&mut elf2, LoaderElfSpec::BASE.entry, 64, 2);
         push_phdr(
             &mut elf2,
-            64 + 2 * 56,
+            0x1000, // 3P4-6：p_offset 必须与 p_vaddr 同余（页对齐）
             LoaderElfSpec::BASE.p_vaddr,
             0x10,
             0x10,
             5,
         );
         push_phdr_typed(&mut elf2, 7, 0, 0, 0, 4, 4);
+        while elf2.len() < 0x1000 {
+            elf2.push(0);
+        }
         elf2.extend_from_slice(&[0xA5; 16]);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        match loader::load(&elf2, &mut us, &[], None, &[]) {
+        match loader::load(&elf2, &mut us, &[], None, &[], 0) {
             Ok(_) => info!("[test-loader] tbss-only PT_TLS accepted (no content to copy)"),
             Err(e) => panic!("[test-loader] tbss-only PT_TLS must load, got {:?}", e),
         }

@@ -32,6 +32,9 @@ pub(crate) mod raw {
     const ELFCLASS64: u8 = 2;
     const ELFDATA2LSB: u8 = 1;
     const ET_EXEC: u16 = 2;
+    /// 位置无关可执行（PIE，3P4-6）。`pub(crate)`：backend 的 `load` 需要据此
+    /// 决定装载基址偏移（ET_EXEC 的 p_vaddr 是绝对地址，偏移恒 0）。
+    pub(crate) const ET_DYN: u16 = 3;
     const EM_X86_64: u16 = 0x3E;
 
     const EHDR_SIZE: usize = 64;
@@ -75,6 +78,8 @@ pub(crate) mod raw {
     /// ELF 头解析结果（LD1：命名字段取代匿名四元组）。
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct ElfHeader {
+        /// ELF 类型（ET_EXEC / ET_DYN，3P4-6）：决定装载基址偏移。
+        pub e_type: u16,
         /// 入口 RIP（合法性在段规划后由后端统一校验，LM3）。
         pub entry: u64,
         /// 程序头表文件内偏移。已验证 ≥ EHDR_SIZE 且整张表完整落在镜像内（L1）。
@@ -114,7 +119,10 @@ pub(crate) mod raw {
             return Err(Error::NotSupported);
         }
         let e_type = rd_u16(elf, 16);
-        if e_type != ET_EXEC {
+        // 3P4-6：接受 ET_DYN（PIE）。位置无关的静态程序**无需重定位**即可在任意
+        // 基址装载（实测：rust-lld 的 -nostdlib PIE 产物不含 PT_DYNAMIC）；真正的
+        // 动态链接（重定位/多模块）仍归阶段 5 的用户态 rtld。
+        if e_type != ET_EXEC && e_type != ET_DYN {
             return Err(Error::NotSupported);
         }
         let e_machine = rd_u16(elf, 18);
@@ -142,6 +150,7 @@ pub(crate) mod raw {
         }
 
         Ok(ElfHeader {
+            e_type,
             entry,
             phoff,
             phentsize,
@@ -161,20 +170,30 @@ pub(crate) mod raw {
     /// 单个 PT_LOAD 段的装载规划：校验通过后的页几何。
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct SegmentPlan {
-        /// 段虚拟区间起点（= p_vaddr，已验证页对齐）。
+        /// 段映射区间起点（= align_down(p_vaddr + bias)，页对齐）。
         pub vaddr_start: u64,
-        /// 页对齐区间终点（= align_up(p_vaddr + p_memsz)，含尾页垫零区）。
+        /// 页对齐区间终点（= align_up(p_vaddr + bias + p_memsz)，含尾页垫零区）。
         pub vaddr_end: u64,
         /// 覆盖页数。
         pub npages: usize,
+        /// 段内容在其**首页内的起点**（= p_vaddr % page_size，LM1/3P4-6）。
+        ///
+        /// 首页 [vaddr_start, vaddr_start + page_off) 这截不属于本段，必须清零——
+        /// 不清零就是把分配器残留内容映射给用户（脏数据交付面）。
+        pub page_off: u64,
     }
 
     /// 校验单个 PT_LOAD 段并推导其页几何（纯函数：无内存副作用）。
     ///
+    /// `bias` 是装载基址偏移（3P4-6）：ET_EXEC 恒 0；ET_DYN（PIE）由内核选定，
+    /// 必须页对齐（否则段内页偏移会变）。
+    ///
     /// 汇集 loader1 全部段级对抗校验：
-    /// - LM1：p_vaddr 必须按 `page_size` 对齐（本加载器整页映射的限制声明；
-    ///   ELF 规范允许非对齐 vaddr 配文件内偏移修正，解除需段内页偏移映射，
-    ///   随 PIE/动态链接里程碑立项）；
+    /// - **LM1（3P4-6 解除）**：此前要求 p_vaddr 页对齐——比 ELF 规范更严。规范只
+    ///   要求 `p_vaddr ≡ p_offset (mod page_size)`；非零的 `p_vaddr % page_size` 是
+    ///   **段内页偏移**：段内容从首页的该偏移处开始，文件侧相应回退（`p_offset` 与
+    ///   `p_vaddr` 同余，故文件内容在文件页内的偏移与段在首页内的偏移一致）。
+    ///   违反同余约束才是真畸形（InvalidParam）。
     /// - L2：段声称的文件内容必须完全落在镜像内——缺失此检查时超出部分会把
     ///   镜像之后相邻的内核堆内存拷进用户页（机密性泄露）；
     /// - L3：地址算术全程 checked（release 裸算术回绕会推导荒谬映射）；
@@ -187,16 +206,25 @@ pub(crate) mod raw {
         elf_len: usize,
         page_size: u64,
         user_top: u64,
+        bias: u64,
         spec: SegmentSpec,
     ) -> Result<SegmentPlan, Error> {
         debug_assert!(page_size.is_power_of_two());
+        // 装载基址必须页对齐：否则段内页偏移会被基址扰动，文件侧换算失效。
+        debug_assert!(bias % page_size == 0);
 
-        if spec.p_vaddr % page_size != 0 {
-            return Err(Error::NotSupported);
+        // LM1（3P4-6 解除）：规范只要求 p_vaddr 与 p_offset **同余**（模页大小），
+        // 不要求 p_vaddr 页对齐。不同余 = 真畸形（文件内容无法与段内容对齐）。
+        let page_off = spec.p_vaddr % page_size;
+        if spec.p_offset % page_size != page_off {
+            return Err(Error::InvalidParam);
         }
-        // S31/S20：不得映射 NULL 页。p_vaddr == 0 会把段落到地址 0——空指针
+
+        let vaddr = spec.p_vaddr.checked_add(bias).ok_or(Error::InvalidParam)?;
+        // S31/S20：不得映射 NULL 页。映射起点落在 0 会把段落到地址 0——空指针
         // 解引用将不触发故障（掩盖指针 bug）。必须显式拒绝。
-        if spec.p_vaddr == 0 {
+        let page_start = vaddr & !(page_size - 1);
+        if page_start == 0 {
             return Err(Error::InvalidParam);
         }
         if spec.p_memsz < spec.p_filesz {
@@ -204,9 +232,10 @@ pub(crate) mod raw {
         }
         if spec.p_memsz == 0 {
             return Ok(SegmentPlan {
-                vaddr_start: spec.p_vaddr,
-                vaddr_end: spec.p_vaddr,
+                vaddr_start: page_start,
+                vaddr_end: page_start,
                 npages: 0,
+                page_off,
             });
         }
 
@@ -218,17 +247,13 @@ pub(crate) mod raw {
             return Err(Error::InvalidParam);
         }
 
-        let vaddr_end = spec
-            .p_vaddr
-            .checked_add(spec.p_memsz)
-            .ok_or(Error::InvalidParam)?;
-        let page_start = spec.p_vaddr;
+        let vaddr_end = vaddr.checked_add(spec.p_memsz).ok_or(Error::InvalidParam)?;
         let page_end = align_up_checked(vaddr_end, page_size).ok_or(Error::InvalidParam)?;
 
         if page_end > user_top {
             return Err(Error::OutOfRange);
         }
-        // page_start 已验证页对齐，故 page_end >= page_start，下方减法不回绕。
+        // page_start <= vaddr <= vaddr_end <= page_end，故下方减法不回绕。
         let npages =
             usize::try_from((page_end - page_start) / page_size).map_err(|_| Error::InvalidParam)?;
 
@@ -236,6 +261,7 @@ pub(crate) mod raw {
             vaddr_start: page_start,
             vaddr_end: page_end,
             npages,
+            page_off,
         })
     }
 
@@ -597,9 +623,18 @@ pub(crate) mod raw {
             data[5] = 2; // ELFDATA2MSB
             assert_eq!(parse_header(&data), Err(Error::NotSupported));
 
+            // 3P4-6：ET_DYN 由「拒绝」改为「接受」——这里断言类型被如实解析，
+            // 且**其它**未知类型仍拒绝（能力边界不能靠多接受一个糊过去）。
             let mut etype = build_elf(0, 64, 56, 1);
             etype[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
-            assert_eq!(parse_header(&etype), Err(Error::NotSupported));
+            assert_eq!(
+                parse_header(&etype).map(|h| h.e_type),
+                Ok(ET_DYN),
+                "ET_DYN (PIE) must be accepted since 3P4-6"
+            );
+            let mut etype2 = build_elf(0, 64, 56, 1);
+            etype2[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL
+            assert_eq!(parse_header(&etype2), Err(Error::NotSupported));
 
             let mut machine = build_elf(0, 64, 56, 1);
             machine[18..20].copy_from_slice(&0x03u16.to_le_bytes()); // EM_386
@@ -633,24 +668,69 @@ pub(crate) mod raw {
 
         // ---- plan_segment ----
 
+        // 3P4-6：p_offset 必须与 p_vaddr **同余**（模页大小）——这是 ELF 规范要求，
+        // 旧代码不检查（因为它同时要求 vaddr 页对齐，同余自动成立）。此处 p_offset
+        // 取 0 与页对齐的 vaddr 同余。
         const BASE_SPEC: SegmentSpec = SegmentSpec {
-            p_offset: 120,
+            p_offset: 0,
             p_vaddr: 0x40_0000,
             p_filesz: 0x10,
             p_memsz: 0x1008, // 跨页：bss 尾 + 末页垫零区
         };
 
         fn plan(elf_len: usize, spec: SegmentSpec) -> Result<SegmentPlan, Error> {
-            plan_segment(elf_len, PAGE, TEST_USER_TOP, spec)
+            plan_segment(elf_len, PAGE, TEST_USER_TOP, 0, spec)
         }
 
+        /// 带装载基址偏移的规划（3P4-6，ET_DYN）。
+        fn plan_at(elf_len: usize, bias: u64, spec: SegmentSpec) -> Result<SegmentPlan, Error> {
+            plan_segment(elf_len, PAGE, TEST_USER_TOP, bias, spec)
+        }
+
+        /// 3P4-6（LM1 解除）：规范只要求 `p_vaddr ≡ p_offset (mod page)`，**不要求**
+        /// p_vaddr 页对齐。同余的非对齐段必须放行，并如实给出段内页偏移。
         #[test]
-        fn plan_rejects_unaligned_vaddr() {
+        fn plan_accepts_congruent_unaligned_vaddr() {
             let spec = SegmentSpec {
-                p_vaddr: 0x40_0800,
-                ..BASE_SPEC
+                p_vaddr: 0x40_0800, // 页内偏移 0x800
+                p_offset: 0x800,    // 同余
+                p_filesz: 0x10,
+                p_memsz: 0x1008,
             };
-            assert_eq!(plan(136, spec), Err(Error::NotSupported));
+            let got = plan(0x2000, spec).expect("congruent unaligned segment must pass");
+            assert_eq!(got.page_off, 0x800, "段内页偏移必须如实给出");
+            assert_eq!(got.vaddr_start, 0x40_0000, "映射起点回退到页边界");
+            assert_eq!(got.vaddr_end, 0x40_2000);
+            assert_eq!(got.npages, 2);
+        }
+
+        /// 不同余 = 文件内容与段内容无法对齐，属**畸形**（InvalidParam），不是"不支持"。
+        #[test]
+        fn plan_rejects_incongruent_vaddr_offset() {
+            let spec = SegmentSpec {
+                p_vaddr: 0x40_0800, // 页内偏移 0x800
+                p_offset: 0,        // 页内偏移 0 —— 不同余
+                p_filesz: 0x10,
+                p_memsz: 0x1008,
+            };
+            assert_eq!(plan(0x2000, spec), Err(Error::InvalidParam));
+        }
+
+        /// 3P4-6：装载基址偏移按页平移整个映射，段内页偏移不变。
+        #[test]
+        fn plan_applies_bias() {
+            let got = plan_at(136, 0x1000_0000, BASE_SPEC).expect("biased plan must pass");
+            assert_eq!(got.vaddr_start, 0x40_0000 + 0x1000_0000);
+            assert_eq!(got.vaddr_end, 0x40_2000 + 0x1000_0000);
+            assert_eq!(got.page_off, 0);
+            // 偏移把映射起点压到 NULL 页 → 拒绝（NULL 页永不可映射）
+            let low = SegmentSpec {
+                p_vaddr: 0x800,
+                p_offset: 0x800,
+                p_filesz: 0x10,
+                p_memsz: 0x10,
+            };
+            assert_eq!(plan_at(0x2000, 0, low), Err(Error::InvalidParam));
         }
 
         #[test]
@@ -685,7 +765,7 @@ pub(crate) mod raw {
             assert_eq!(plan(136, spec), Err(Error::InvalidParam));
             // 边界恰合：file_end == elf_len 放行
             let exact = SegmentSpec {
-                p_offset: 120,
+                p_offset: 0,
                 p_vaddr: 0x40_0000,
                 p_filesz: 16,
                 p_memsz: PAGE,
@@ -724,7 +804,7 @@ pub(crate) mod raw {
             // 边界恰合：page_end == user_top 放行
             let ok_spec = SegmentSpec {
                 p_vaddr: TEST_USER_TOP - PAGE,
-                p_offset: 120,
+                p_offset: 0,
                 p_filesz: 16,
                 p_memsz: PAGE,
             };
@@ -758,6 +838,7 @@ pub(crate) mod raw {
                     vaddr_start: 0x40_0000,
                     vaddr_end: 0x40_2000,
                     npages: 2,
+                    page_off: 0,
                 }
             );
             // memsz 恰为整页倍数：不产生多余页
@@ -1086,8 +1167,20 @@ mod backend {
         cmd: &[u8],
         prog_name: Option<&[u8]>,
         env: &[&[u8]],
+        pie_base: u64,
     ) -> Result<LoadedElf, Error> {
         let hdr = parse_header(elf)?;
+        // 3P4-6：ET_DYN 需要**装载基址偏移**（其 p_vaddr 相对基址）；ET_EXEC 的
+        // p_vaddr 已是绝对地址，偏移恒 0。基址必须页对齐且非零——否则段内页偏移
+        // 会被基址扰动（文件侧换算失效），或把镜像落到 NULL 页。
+        let bias = if hdr.e_type == crate::raw::ET_DYN {
+            if pie_base == 0 || pie_base % PAGE_SIZE != 0 {
+                return Err(Error::InvalidParam);
+            }
+            pie_base
+        } else {
+            0
+        };
 
         let mut loaded = 0usize;
         // 已成功加载段的用户虚拟区间集合，供入口校验（LM3）。
@@ -1106,7 +1199,7 @@ mod backend {
             let ph = hdr.phoff + i * hdr.phentsize;
             match classify_phdr(rd_u32(elf, ph)) {
                 PhdrClass::Load => {
-                    let range = load_segment(elf, ph, addr_space)?;
+                    let range = load_segment(elf, ph, addr_space, bias)?;
                     seg_ranges.push(range);
                     loaded += 1;
                 }
@@ -1115,7 +1208,10 @@ mod backend {
                 // 这三类都要求本加载器不具备的能力，静默跳过的后果是
                 // 镜像「装载成功」而程序在运行期以难以定位的方式崩。
                 PhdrClass::TlsTemplate => {
-                    let t = parse_tls_template(elf, ph)?;
+                    // 3P4-6：PT_TLS 的 vaddr 与段同属镜像地址空间，必须一并加偏移——
+                    // 否则 TLS 块会按未偏移的地址装配（ET_DYN 下必然错位）。
+                    let mut t = parse_tls_template(elf, ph)?;
+                    t.vaddr = t.vaddr.checked_add(bias).ok_or(Error::OutOfRange)?;
                     // 模板初值必须落在某个已加载段内：否则「拷贝初值」的源地址不在该
                     // 地址空间里（或指向内核半区）——按 L2 纪律显式拒绝。
                     //
@@ -1167,10 +1263,8 @@ mod backend {
         // 的入口能过此校验但执行即取指 fault，收紧到精确 memsz 终点随 PIE
         // 里程碑评估）。内核半区 / 非规范地址天然被排除——段范围本身已受
         // 用户半区校验；这比依赖 iretq RPL3 触发 #GP 异常兜底更早、更显式。
-        if !seg_ranges
-            .iter()
-            .any(|&(s, e)| hdr.entry >= s && hdr.entry < e)
-        {
+        let entry = hdr.entry.checked_add(bias).ok_or(Error::OutOfRange)?;
+        if !seg_ranges.iter().any(|&(s, e)| entry >= s && entry < e) {
             return Err(Error::InvalidParam);
         }
 
@@ -1192,15 +1286,16 @@ mod backend {
         };
 
         klib::debug!(
-            "[elf] loaded {} segments, entry={:#x}, stack_top={:#x}, tls_fs_base={:?}",
+            "[elf] loaded {} segments, entry={:#x} (bias={:#x}), stack_top={:#x}, tls_fs_base={:?}",
             loaded,
-            hdr.entry,
+            entry,
+            bias,
             stack_top,
             tls_fs_base
         );
 
         Ok(LoadedElf {
-            entry: hdr.entry,
+            entry,
             user_stack_top: stack_top,
             tls_fs_base,
         })
@@ -1257,6 +1352,7 @@ mod backend {
         elf: &[u8],
         ph: usize,
         addr_space: &mut UserAddressSpace<X86PageTable>,
+        bias: u64,
     ) -> Result<(u64, u64), Error> {
         let p_flags = rd_u32(elf, ph + 4);
         let spec = SegmentSpec {
@@ -1267,7 +1363,7 @@ mod backend {
         };
 
         // 全部段级校验与页数学单点在纯逻辑层完成（host 可测，LA4）。
-        let plan = plan_segment(elf.len(), PAGE_SIZE, USER_TOP, spec)?;
+        let plan = plan_segment(elf.len(), PAGE_SIZE, USER_TOP, bias, spec)?;
         if plan.npages == 0 {
             return Ok((plan.vaddr_start, plan.vaddr_end));
         }
@@ -1289,29 +1385,31 @@ mod backend {
 
         for i in 0..plan.npages {
             let dst = (frames[i] + off) as *mut u8;
+            // 映射相对偏移：本页覆盖 [page_lo, page_lo + PAGE_SIZE)。
             let page_lo = (i as u64) * PAGE_SIZE;
             let page_hi = page_lo + PAGE_SIZE;
-            let copy_hi = page_hi.min(spec.p_filesz);
-            if copy_hi > page_lo {
-                let n = (copy_hi - page_lo) as usize;
-                // 不变量（plan_segment 的 L2 校验已证）：page_lo < p_filesz
-                // 且 p_offset + p_filesz <= elf.len()
-                //   ⇒ 源区间 [p_offset+page_lo, p_offset+copy_hi) 完全落在
-                // 镜像内，此处转换不截断、拷贝不越界。
-                let src = (spec.p_offset + page_lo) as usize;
-                unsafe {
-                    core::ptr::copy_nonoverlapping(elf.as_ptr().add(src), dst, n);
-                }
+            // 段内容在映射内的区间是 [page_off, page_off + p_filesz)（LM1/3P4-6）——
+            // 首页 page_off 之前那一截**不属于本段**。
+            let c_lo = page_lo.max(plan.page_off);
+            let c_hi = page_hi.min(plan.page_off + spec.p_filesz);
+            // LM2 + LM1：整页先清零——覆盖段前的页内空隙、bss（[p_filesz, p_memsz)）
+            // 与末页垫零（[p_memsz, vaddr_end)）。分配器残留内容若被映射给用户进程，
+            // 就是脏数据交付（机密性面）。
+            unsafe {
+                core::ptr::write_bytes(dst, 0, PAGE_SIZE as usize);
             }
-            // LM2：从 file 内容终点一直清零到页终点。[p_filesz, p_memsz) 是
-            // bss（语义要求为零），[p_memsz, vaddr_end) 是末页页内垫零——
-            // 后者若不清零，分配器残留内容会被映射给用户进程（脏数据交付面）。
-            let zero_lo = page_lo.max(spec.p_filesz);
-            if page_hi > zero_lo {
-                let start = (zero_lo - page_lo) as usize;
-                let n = (page_hi - zero_lo) as usize;
+            if c_hi > c_lo {
+                let n = (c_hi - c_lo) as usize;
+                // 不变量（plan_segment 的 L2 校验已证）：p_offset + p_filesz <= elf.len()，
+                // 且文件侧段内偏移 = c_lo - page_off（同余保证与 p_vaddr 对齐），
+                // 故源区间完全落在镜像内，此处转换不截断、拷贝不越界。
+                let src = (spec.p_offset + (c_lo - plan.page_off)) as usize;
                 unsafe {
-                    core::ptr::write_bytes(dst.add(start), 0, n);
+                    core::ptr::copy_nonoverlapping(
+                        elf.as_ptr().add(src),
+                        dst.add((c_lo - page_lo) as usize),
+                        n,
+                    );
                 }
             }
         }

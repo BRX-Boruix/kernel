@@ -199,6 +199,13 @@ pub const SYS_MEMORY_MAP: u32 = nr(domain::MEMORY, op::CREATE); // 0x21
 /// SYS_MEMORY_MAP `flags` 位：新建共享内存对象并映射（ADR-014 §4.2，旧
 /// SYS_SHM_CREATE 合并路径；`shared_id` 参数置 0 走本路径）。
 pub const MEM_MAP_SHARED: u64 = 1 << 0;
+
+/// PIE（ET_DYN）程序的装载基址（3P4-6）。
+///
+/// 取 64 GiB：远离 ET_EXEC 程序的链接地址（0x40_0000 起）与堆/mmap 游标，又在用户半区
+/// （128 TiB）内、页对齐。ET_EXEC 不使用它（其 p_vaddr 是绝对地址，偏移恒 0）。
+/// **本项只证明「可装载到任意基址」的能力**；ASLR（随机基址）不在此范围。
+pub const USER_PIE_BASE: u64 = 0x0010_0000_0000;
 pub const SYS_MEMORY_QUERY: u32 = nr(domain::MEMORY, op::READ); // 0x22
 pub const SYS_MEMORY_GROW: u32 = nr(domain::MEMORY, op::WRITE); // 0x23
 pub const SYS_MEMORY_UNMAP: u32 = nr(domain::MEMORY, op::DELETE); // 0x24
@@ -3276,7 +3283,14 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
 
     // 3P4-2：程序名经 auxv 型 AT_EXECFN 槽交付（**不改 argv[0] 含义**——后者仍是整条
     // 命令行）。程序名的单点来源是本函数的 prog_name（VFS 路径末段或内建索引名）。
-    let loaded = match loader::load(elf_bytes, &mut us, cmd, Some(prog_name.as_bytes()), &env_refs) {
+    let loaded = match loader::load(
+        elf_bytes,
+        &mut us,
+        cmd,
+        Some(prog_name.as_bytes()),
+        &env_refs,
+        USER_PIE_BASE,
+    ) {
         Ok(l) => l,
         Err(e) => return pack_err(e),
     };

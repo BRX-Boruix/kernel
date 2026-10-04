@@ -1338,7 +1338,14 @@ fn start_init() -> ! {
     };
     // ABI v2（3P4-2）：第 4 参 envp。init 是**引导环境**的注入点（内核合成的最小环境
     // 属 3P4-2 下一步）；本步先传空环境，链路与布局已就位。
-    let loaded = match loader::load(&elf_bytes, &mut us, &[], Some(b"init.elf"), &[]) {
+    let loaded = match loader::load(
+        &elf_bytes,
+        &mut us,
+        &[],
+        Some(b"init.elf"),
+        &[],
+        crate::syscall::USER_PIE_BASE,
+    ) {
         Ok(l) => l,
         Err(e) => {
             error!("[kmain] init: load init.elf failed: {:?}", e);
