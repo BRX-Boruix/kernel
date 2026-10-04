@@ -780,17 +780,28 @@ pub fn test_time_abstraction() {
     );
 
     // 4. sleep_us：忙等 20ms，验证期间时间确实流逝。
+    //
+    // 判据用**单调毫秒**而非 LAPIC ticks：ticks 是 100Hz（10ms/格），20ms 只覆盖 1~2 格，
+    // 边界恰好贴着 1——实测同一测试两次运行分别得 0 与 1 ticks（0 即 panic）。那不是在测
+    // sleep_us，而是在测「100Hz 计数器在这 20ms 里恰好跨了几格」。本测试要证明的是
+    // 「确实延迟了约 20ms」，故直接量它自己的单位（毫秒）；上下界按本文件既有口径放宽
+    // （QEMU TCG 下时钟换算不稳，见上面 5-tick 检查的注释）。
     let t2 = arch_x86_64::lapic::ticks();
+    let s0 = X8664Timer::now_millis().expect("clock ready in selftest");
     X8664Timer::sleep_us(20_000); // 20ms
+    let s1 = X8664Timer::now_millis().expect("clock ready in selftest");
     let elapsed_ticks = arch_x86_64::lapic::ticks().wrapping_sub(t2);
+    let elapsed_ms = s1.saturating_sub(s0);
     info!(
-        "[time] sleep_us(20ms) cost {} ticks (~{}ms)",
+        "[time] sleep_us(20ms) cost {} ticks (~{}ms), monotonic +{}ms",
         elapsed_ticks,
-        elapsed_ticks * 10
+        elapsed_ticks * 10,
+        elapsed_ms
     );
     assert!(
-        elapsed_ticks >= 1 && elapsed_ticks <= 20,
-        "sleep_us drifted"
+        elapsed_ms >= 10 && elapsed_ms <= 1_000,
+        "sleep_us(20ms) advanced the monotonic clock by {}ms",
+        elapsed_ms
     );
 
     info!("[time] time abstraction tests passed");
