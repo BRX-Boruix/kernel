@@ -5446,6 +5446,12 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
 /// 返回 `true` 让 `iretq` 把（可能的）新现场带回目标用户态。
 pub extern "C" fn syscall_entry(frame: &mut SyscallFrame) -> bool {
     let nr = frame.nr;
+    // ADR-051：**系统调用入口清除"被打断"标记**——它只对**被打断的那一次**调用有意义。
+    // 配合"投递即置位"，既不会漏掉阻塞期间的投递（tick 触发点），也不会把上一次调用
+    // 收尾时的投递误算到下一次调用头上。
+    if let Some(cur) = current_proc_mut() {
+        let _ = cur.signal_mut().take_interrupted();
+    }
     // 进入/返回 trace 仅在自检构建开启（避免每条 syscall 生产刷屏）。
     #[cfg(feature = "kernel-tests")]
     klib::info!(

@@ -489,13 +489,12 @@ pub fn deliver_on_return<PT: arch::PageTable>(
                     crate::scheduler::exit_current(frame, sig as u64);
                     return DeliveryOutcome::Terminated;
                 }
-                // ADR-051：若投递发生在进程**阻塞**期间（调度 tick 那条触发点），本次投递
-                // 打断的正是它的阻塞 syscall——置位供阻塞前预检取用（pending 位已被本次
-                // 投递消费，光看 pending 会看不到打断发生过）。若进程正在运行（syscall 返回
-                // 点那条），系统调用已结束，不置位——否则会误伤下一次阻塞调用。
-                if proc.state() == crate::TaskState::Blocked {
-                    proc.signal_mut().mark_interrupted();
-                }
+                // ADR-051：**投递即置位**，不以"进程当时是否 Blocked"为条件——实测教训：
+                // 被唤醒的进程是在**恢复执行**时才被 tick 投递的，那一刻它已经是 Running，
+                // 按 Blocked 判会漏掉置位，于是阻塞循环重入预检时看不到打断发生过。
+                // 误伤由"系统调用入口清标记"消除：返回点投递只影响本次调用的收尾，入口一清
+                // 就不会波及下一次调用。
+                proc.signal_mut().mark_interrupted();
                 return DeliveryOutcome::Continue;
             }
             None => continue, // 越界信号号（take_unblocked 已保证 < NSIG，防御）。
