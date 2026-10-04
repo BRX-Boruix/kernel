@@ -357,6 +357,15 @@ pub const SYS_ENTRY_DELETE: u32 = nr(domain::VFS, op::DELETE); // 0x44
 pub const SYS_ENTRY_CHDIR: u32 = nr(domain::VFS, 0x05); // 0x45
 /// `getcwd()`：读当前进程工作目录（VFS 域扩展，0x46）。
 pub const SYS_ENTRY_GETCWD: u32 = nr(domain::VFS, 0x06); // 0x46
+/// `symlink(target, link_path)`：创建软链接（VFS 域扩展，0x47）。
+///
+/// 3P4-8：ext2 的落盘实现（fast symlink、`INode::symlink`）与 vfs 的
+/// `Mount::symlink` 都已存在，本项**纯接线**。
+pub const SYS_ENTRY_SYMLINK: u32 = nr(domain::VFS, 0x07); // 0x47
+/// `readlink(path, buf, cap)`：读软链接目标（VFS 域扩展，0x48）。
+///
+/// 写入**不含**终止 NUL（POSIX `readlink` 语义）；缓冲不足如实 `NoSpace`，绝不截断。
+pub const SYS_ENTRY_READLINK: u32 = nr(domain::VFS, 0x08); // 0x48
 
 // ---------- SYS_ENTRY_READ kind 编码（stat 技术报告）----------
 /// readdir 模式（默认）：a4=0，输出 JSON 目录项列表。
@@ -761,6 +770,108 @@ fn sys_getcwd(frame: &mut SyscallFrame) -> u64 {
         arch_x86_64::mmio::copy_to_user(buf_ptr, out_buf.as_ptr(), out_buf.len());
     }
     pack_ok(cwd.len() as u64)
+}
+
+/// `symlink(target, link_path)`：创建软链接（VFS 域 0x47，3P4-8）。
+///
+/// 接线要点：`target` 是**软链内容**（不解析、允许任意字符串，POSIX 语义）；
+/// `link_path` 走与其余路径 syscall 同一套纪律——用户路径拷贝、相对路径归一为
+/// 绝对、逐级目录遍历检查，然后交给 vfs。
+fn sys_symlink(frame: &mut SyscallFrame) -> u64 {
+    let target = match copy_path_from_user(frame.a1, MAX_USER_PATH_BYTES) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    let link_path = match copy_path_from_user(frame.a2, MAX_USER_PATH_BYTES) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    let abs = match absolute_path(&link_path) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &abs) {
+            return pack_err(e);
+        }
+    }
+    let root = crate::vfs_init::root();
+    match root.symlink(&target, &abs) {
+        Ok(_) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `readlink(path, buf, cap)`：读软链接目标（VFS 域 0x48，3P4-8）。
+///
+/// `resolve(abs, false)` 取**软链节点本身**（不跟随）——跟随会解析到目标文件，
+/// 那就读不出链接内容了。非软链节点由 `read_link` 如实报错（不编造）。
+fn sys_readlink(frame: &mut SyscallFrame) -> u64 {
+    let path = match copy_path_from_user(frame.a1, MAX_USER_PATH_BYTES) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    let buf_ptr = frame.a2;
+    let cap = frame.a3 as usize;
+    let abs = match absolute_path(&path) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &abs) {
+            return pack_err(e);
+        }
+    }
+    let root = crate::vfs_init::root();
+    let node = match root.resolve(&abs, false) {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    let target = match node.read_link() {
+        Ok(t) => t,
+        Err(e) => return pack_err(e),
+    };
+    // POSIX readlink：**不写**终止 NUL；缓冲装不下即如实拒绝（绝不截断）。
+    if target.len() > cap {
+        return pack_err(Error::NoSpace);
+    }
+    if let Err(e) = validate_user_range(buf_ptr, target.len() as u64, UserAccess::Write) {
+        return pack_err(e);
+    }
+    unsafe {
+        arch_x86_64::mmio::copy_to_user(buf_ptr, target.as_ptr(), target.len());
+    }
+    pack_ok(target.len() as u64)
+}
+
+/// `ftruncate(fd, len)`：按 fd 截断/扩展文件（STREAM 域 0x19，3P4-8）。
+///
+/// 接线要点：fd → 句柄 → 节点（与 `fstat` 同款解析）；权限走**写**语义
+/// （截断会改内容）；管道端与缺失 fd 一律 `NotFound`（不假装成功）。
+/// ext2 的 truncate 落盘实现已存在，本项是接线。
+fn sys_ftruncate(frame: &mut SyscallFrame) -> u64 {
+    let fd = frame.a1 as usize;
+    let len = frame.a2;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let Some(vfs::file_handle::OpenHandle::File(fh)) = proc.get_fd(fd) else {
+        return pack_err(Error::NotFound); // fd 缺失或管道端
+    };
+    let identity = proc.identity();
+    if let Err(e) = check_access(&identity, fh.inode.as_ref(), vfs::inode::PermBits::WRITE) {
+        return pack_err(e);
+    }
+    match fh.inode.truncate(len) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
 }
 
 /// A1-2 / ADR-040 §2.3：系统门禁强制（承 ADR-033 的 system_only 语义）。
@@ -5030,6 +5141,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_STREAM_DUP => done(sys_dup2(frame)),
         SYS_STREAM_LOCK => done(sys_flock(frame)),
         SYS_STREAM_FSTAT => done(sys_fstat(frame)),
+        SYS_STREAM_FTRUNCATE => done(sys_ftruncate(frame)),
         SYS_STREAM_FOCUS_SET => done(sys_stream_focus_set(frame)),
 
         // MEMORY Domain (0x20)
@@ -5071,6 +5183,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_ENTRY_DELETE => done(sys_unlink(frame)),
         SYS_ENTRY_CHDIR => done(sys_chdir(frame)),
         SYS_ENTRY_GETCWD => done(sys_getcwd(frame)),
+        SYS_ENTRY_SYMLINK => done(sys_symlink(frame)),
+        SYS_ENTRY_READLINK => done(sys_readlink(frame)),
 
         // DEVICE Domain (0x50)
         SYS_DRIVER_REGISTER => done(sys_driver_register(frame)),
