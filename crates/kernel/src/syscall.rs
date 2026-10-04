@@ -1292,37 +1292,46 @@ fn sys_open_pipe(path: alloc::string::String, flags: vfs::file_handle::OpenFlags
         Ok(i) => i,
         Err(e) => return pack_err(e),
     };
-    let inc = |id: u64| ipc::pipe_ref_inc(id);
-    let dec = |id: u64| {
-        let _ = ipc::pipe_ref_dec(id);
+    // 3P4-3a：引用必须带**端方向**——EOF 判定只认写端存活数。
+    let inc = |id: u64, writer: bool| ipc::pipe_ref_inc(id, writer);
+    let dec = |id: u64, writer: bool| {
+        let _ = ipc::pipe_ref_dec(id, writer);
     };
-    if inc(id).is_err() {
+    if inc(id, false).is_err() {
         // 理论不可达（刚创建必在表内），防御性清理。
         let _ = ipc::pipe_close(id);
         return pack_err(Error::NotFound);
     }
     let Some(proc) = current_proc_mut() else {
-        dec(id);
+        dec(id, false);
         return pack_err(Error::NotFound);
     };
     // 分配两个 fd 端。第二个失败需回滚：释放第一个 fd 槽 + 递减引用。
-    let read_fd = match proc.alloc_fd(vfs::file_handle::OpenHandle::Pipe { id, flags }) {
+    let read_fd = match proc.alloc_fd(vfs::file_handle::OpenHandle::Pipe {
+        id,
+        flags,
+        writer: false,
+    }) {
         Ok(fd) => fd,
         Err(e) => {
-            dec(id);
+            dec(id, false);
             return pack_err(e);
         }
     };
-    if inc(id).is_err() {
+    if inc(id, true).is_err() {
         proc.close_fd(read_fd);
-        dec(id);
+        dec(id, false);
         return pack_err(Error::NotFound);
     }
-    let write_fd = match proc.alloc_fd(vfs::file_handle::OpenHandle::Pipe { id, flags }) {
+    let write_fd = match proc.alloc_fd(vfs::file_handle::OpenHandle::Pipe {
+        id,
+        flags,
+        writer: true,
+    }) {
         Ok(fd) => fd,
         Err(e) => {
             proc.close_fd(read_fd);
-            dec(id);
+            dec(id, true);
             return pack_err(e);
         }
     };
@@ -1344,9 +1353,10 @@ fn sys_close(frame: &mut SyscallFrame) -> u64 {
         return pack_err(Error::NotFound);
     };
     match proc.close_fd(fd) {
-        Some(vfs::file_handle::OpenHandle::Pipe { id, .. }) => {
-            // 释放管道端引用；归零即销毁（ipc::pipe_ref_dec 语义）。
-            match ipc::pipe_ref_dec(id) {
+        Some(vfs::file_handle::OpenHandle::Pipe { id, writer, .. }) => {
+            // 释放管道端引用（带方向：最后一个写端关闭即触发读者 EOF 唤醒）；
+            // 归零即销毁（ipc::pipe_ref_dec 语义）。
+            match ipc::pipe_ref_dec(id, writer) {
                 Ok(()) => pack_ok(0),
                 Err(_) => pack_err(Error::NotFound),
             }
@@ -1500,25 +1510,25 @@ fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
     // 用引用绑定取 id（Pipe 的 u64 是 Copy），不 move old_handle——它稍后
     // 要整体 move 进 set_fd。id 先存副本：set_fd 失败时 old_handle 已 move，
     // 回滚需要这个 id（A1 闸门拒绝路径，S20）。
-    let old_pipe_id: Option<u64> = if let vfs::file_handle::OpenHandle::Pipe { id, .. } = &old_handle {
-        if ipc::pipe_ref_inc(*id).is_err() {
+    let old_pipe_id: Option<(u64, bool)> = if let vfs::file_handle::OpenHandle::Pipe { id, writer, .. } = &old_handle {
+        if ipc::pipe_ref_inc(*id, *writer).is_err() {
             return pack_err(Error::NoSpace);
         }
-        Some(*id)
+        Some((*id, *writer))
     } else {
         None
     };
     // 关 new 的旧句柄（若为 pipe 端递减引用）。
     if let Some(old) = { current_proc_mut().and_then(|p| p.close_fd(new_fd)) } {
-        if let vfs::file_handle::OpenHandle::Pipe { id, .. } = old {
-            let _ = ipc::pipe_ref_dec(id);
+        if let vfs::file_handle::OpenHandle::Pipe { id, writer, .. } = old {
+            let _ = ipc::pipe_ref_dec(id, writer);
         }
     }
     // 装入副本（new_fd 已在入口校验 < MAX_FDS，set_fd 必成功）。
     let Some(proc) = current_proc_mut() else {
         // proc 消失的极小窗口：回滚刚递增的 pipe 引用。
-        if let vfs::file_handle::OpenHandle::Pipe { id, .. } = &old_handle {
-            let _ = ipc::pipe_ref_dec(*id);
+        if let vfs::file_handle::OpenHandle::Pipe { id, writer, .. } = &old_handle {
+            let _ = ipc::pipe_ref_dec(*id, *writer);
         }
         return pack_err(Error::NotFound);
     };
@@ -1527,8 +1537,8 @@ fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
         Err(_) => {
             // A1：set_fd 可因全局闸门拒绝（原入口预检已删）——pipe 引用
             // 必须回滚，否则闸门拒绝路径泄漏 ref（S20）。
-            if let Some(id) = old_pipe_id {
-                let _ = ipc::pipe_ref_dec(id);
+            if let Some((id, w)) = old_pipe_id {
+                let _ = ipc::pipe_ref_dec(id, w);
             }
             pack_err(Error::NoSpace)
         }
@@ -3340,16 +3350,17 @@ fn clone_inherited_fd_table(
         }
     }
     // 克隆后为每个 pipe 端递增引用（记下已增项，失败即回滚）。
-    let mut incd: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    // 回滚要连**方向**一起记（否则回滚会记错端别，污染 EOF 记账）。
+    let mut incd: alloc::vec::Vec<(u64, bool)> = alloc::vec::Vec::new();
     for slot in table.iter() {
-        if let Some(vfs::file_handle::OpenHandle::Pipe { id, .. }) = slot {
-            if ipc::pipe_ref_inc(*id).is_err() {
-                for done in incd {
-                    let _ = ipc::pipe_ref_dec(done);
+        if let Some(vfs::file_handle::OpenHandle::Pipe { id, writer, .. }) = slot {
+            if ipc::pipe_ref_inc(*id, *writer).is_err() {
+                for (done, w) in incd {
+                    let _ = ipc::pipe_ref_dec(done, w);
                 }
                 return Err(Error::NoSpace);
             }
-            incd.push(*id);
+            incd.push((*id, *writer));
         }
     }
     Ok(table)

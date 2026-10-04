@@ -1789,14 +1789,26 @@ pub fn test_ipc() {
         n,
         core::str::from_utf8(&dst_page[..5]).unwrap()
     );
-    // 空管道读：无数据、无进程可阻塞 → WouldBlock（不死锁）。
+    // 空管道读（**写端存活**）：无数据、无进程可阻塞 → WouldBlock（不死锁）。
+    // 3P4-3a：引用必须带端方向，故先显式持有读端 + 写端各一笔（生产路径由
+    // sys_open_pipe 成对增记；此处模拟「读者持读端、写者持写端」）。
+    ipc::pipe_ref_inc(pipe_id, false).expect("reader ref");
+    ipc::pipe_ref_inc(pipe_id, true).expect("writer ref");
     let e = ipc::pipe_read(&mut frame, pipe_id, &user_buf, buf_va, 4).unwrap_err();
     assert_eq!(
         e,
         klib::error::Error::WouldBlock,
-        "empty pipe read -> WouldBlock"
+        "empty pipe read with writer alive -> WouldBlock"
     );
-    ipc::pipe_close(pipe_id).expect("pipe_close");
+    // **3P4-3a EOF 判据**：最后一个写端关闭后，同一个读请求必须**立即返回 0**，
+    // 而不是继续 WouldBlock。这是「父关写端 → 子读 EOF」的内核侧对应物。
+    // 注意：EOF 只在**读端仍持有引用**时可见——引用归零即销毁（那是 NotFound）。
+    ipc::pipe_ref_dec(pipe_id, true).expect("writer ref dec");
+    let n = ipc::pipe_read(&mut frame, pipe_id, &user_buf, buf_va, 4).expect("EOF read");
+    assert_eq!(n, 0, "last writer closed -> read returns 0 (EOF)");
+    info!("[ipc-test] pipe EOF: last writer closed -> read 0 OK");
+    // 读端引用归零即销毁对象（无需再 pipe_close——重复关闭会如实 NotFound）。
+    ipc::pipe_ref_dec(pipe_id, false).expect("reader ref dec");
     // 复原内核页表（与上方 `user_buf.activate()` 成对；同一纪律，见
     // `test_user_space` tests.rs:201）。必须在本测试返回前复原——后续测试与
     // 启动流程都假定运行在内核页表上。

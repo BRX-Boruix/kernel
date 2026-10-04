@@ -143,6 +143,10 @@ struct PipeObject {
     /// 全部残留等待者。`pipe_create` 建表时 `refs=0`，每分配一个 fd 端经
     /// [`pipe_ref_inc`] 增记，关闭一个 fd 端经 [`pipe_ref_dec`] 减记。
     refs: usize,
+    /// **写端**存活的 fd 端数量（3P4-3a）。EOF 语义的唯一依据：缓冲空且此数为 0 时，
+    /// 读端读到 **0**（POSIX：最后一个写端关闭 → 读者见 EOF）。refs 是总端数，
+    /// 二者差值即读端数（写端向无读端的管道写应报 EPIPE——归 3P4-9 的信号语义项）。
+    writer_refs: usize,
 }
 
 static SHM_TABLE: IrqSpinLock<BTreeMap<u64, ShmObject>> = IrqSpinLock::new(BTreeMap::new());
@@ -382,6 +386,7 @@ pub fn pipe_create() -> Result<u64, Error> {
         read_waiters: Vec::new(),
         write_waiters: Vec::new(),
         refs: 0,
+        writer_refs: 0,
     };
     pipe.buf
         .try_reserve(PIPE_CAPACITY)
@@ -395,7 +400,7 @@ pub fn pipe_create() -> Result<u64, Error> {
 ///
 /// 增加 `refs`。若 `id` 不存在返回 `NotFound`（宁缺毋假：未建引用绝不
 /// 伪造成功）。调用方在 fd 分配失败需回滚时应配对的 [`pipe_ref_dec`]。
-pub fn pipe_ref_inc(id: u64) -> Result<(), Error> {
+pub fn pipe_ref_inc(id: u64, is_writer: bool) -> Result<(), Error> {
     let mut table = PIPE_TABLE.lock();
     let Some(pipe) = table.get_mut(&id) else {
         return Err(Error::NotFound);
@@ -404,6 +409,10 @@ pub fn pipe_ref_inc(id: u64) -> Result<(), Error> {
     // 极端路径回绕（2^64 个 fd 端不可达，防御性）——回绕即资源上限，ENOSPC。
     let new = pipe.refs.checked_add(1).ok_or(Error::NoSpace)?;
     pipe.refs = new;
+    if is_writer {
+        let w = pipe.writer_refs.checked_add(1).ok_or(Error::NoSpace)?;
+        pipe.writer_refs = w;
+    }
     Ok(())
 }
 
@@ -412,8 +421,10 @@ pub fn pipe_ref_inc(id: u64) -> Result<(), Error> {
 /// 递减 `refs`；归零即销毁管道并唤醒全部残留读写等待者（同 [`pipe_close`]）。
 /// 若 `id` 不存在返回 `NotFound`。`refs` 已为 0 时如实返回 `NotFound`——
 /// 绝不静默减出下溢。
-pub fn pipe_ref_dec(id: u64) -> Result<(), Error> {
-    let wake: Vec<usize> = {
+pub fn pipe_ref_dec(id: u64, is_writer: bool) -> Result<(), Error> {
+    let mut wake: Vec<usize> = Vec::new();
+    let mut destroyed = false;
+    {
         let mut table = PIPE_TABLE.lock();
         let Some(pipe) = table.get_mut(&id) else {
             return Err(Error::NotFound);
@@ -422,17 +433,34 @@ pub fn pipe_ref_dec(id: u64) -> Result<(), Error> {
             return Err(Error::NotFound);
         }
         pipe.refs -= 1;
-        if pipe.refs > 0 {
-            return Ok(());
+        if is_writer {
+            if pipe.writer_refs == 0 {
+                // 记账不一致：如实报错，绝不静默减出下溢。
+                return Err(Error::NotFound);
+            }
+            pipe.writer_refs -= 1;
+            if pipe.writer_refs == 0 {
+                // **EOF 唤醒**（3P4-3a）：最后一个写端关闭 → 唤醒全部读等待者，
+                // 让它们重新判定并读到 0。不唤醒则读者永久睡在再也不会到来的写上。
+                wake.extend(core::mem::take(&mut pipe.read_waiters));
+            }
         }
-        let (rw, ww) = (core::mem::take(&mut pipe.read_waiters), core::mem::take(&mut pipe.write_waiters));
-        table.remove(&id);
-        rw.into_iter().chain(ww).collect()
-    };
+        if pipe.refs == 0 {
+            let (rw, ww) = (
+                core::mem::take(&mut pipe.read_waiters),
+                core::mem::take(&mut pipe.write_waiters),
+            );
+            table.remove(&id);
+            wake.extend(rw.into_iter().chain(ww));
+            destroyed = true;
+        }
+    }
     for pid in wake {
         wake_proc(pid);
     }
-    klib::info!("[ipc] pipe id={} refcount-destroyed", id);
+    if destroyed {
+        klib::info!("[ipc] pipe id={} refcount-destroyed", id);
+    }
     Ok(())
 }
 
@@ -724,6 +752,12 @@ pub fn pipe_read<PT: arch::PageTable>(
                     }
                     return Ok(total as u64);
                 }
+            }
+            // **POSIX EOF**（3P4-3a）：缓冲已空且**最后一个写端已关闭** → 如实交付 0。
+            // 读端自身仍开着（这正是它与管道销毁返回 NotFound 的区别）；没有这一支，
+            // 读者会永久阻塞（实测：父关写端后子进程 read 挂住，父进程收尸也挂住）。
+            if avail == 0 && pipe.writer_refs == 0 {
+                return Ok(total as u64);
             }
         }
         for w in writers {

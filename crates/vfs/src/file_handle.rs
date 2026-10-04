@@ -193,7 +193,13 @@ pub enum OpenHandle {
     /// `flags`（3P4-3）：管道端同样需要承载**每 fd** 的标志（当前只有
     /// `cloexec` 有意义——方向由"拿到的是读端还是写端"决定，不由位标志表达）。
     /// 查询一律走 `OpenHandle::flags()`（单一访问点）。
-    Pipe { id: u64, flags: OpenFlags },
+    Pipe {
+        id: u64,
+        flags: OpenFlags,
+        /// **是否为写端**（3P4-3a）：管道 EOF 语义依赖「每端方向」的存活记账——
+        /// 最后一个写端关闭后，读端必须读到 0。dup2/继承都原样传递本字段。
+        writer: bool,
+    },
 }
 
 impl OpenHandle {
