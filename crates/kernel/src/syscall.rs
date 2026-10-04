@@ -3371,6 +3371,14 @@ fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
     let size = frame.a1;
     let flags = frame.a2;
     let shared_id = frame.a3;
+    // 3P4-4：a4 = prot 位。**W^X 单点门禁在 mm 层**（map_flags_from_prot）——
+    // 此处只做一次解码，绝不重复实现策略（S13/S15）。历史调用方一律传 0 →
+    // 由 mm 层解释为 RW（既有行为不变）。
+    let prot = frame.a4;
+    let pf = match mm::user_space::map_flags_from_prot(prot) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
@@ -3378,6 +3386,14 @@ fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
     // SYS_SHM_MAP 合并）；`flags & MEM_MAP_SHARED` 新建共享对象并映射（旧
     // SYS_SHM_CREATE 合并）。二者返回起始虚拟地址。均经 `ipc::shm_*` 路径，
     // 不再把 shared_id 静默忽略成匿名映射。
+    // 共享内存映射的权限目前**固定**为创建时的 RW（shm 对象未记录 prot）——
+    // 显式请求非默认权限时如实拒绝，绝不静默忽略（宁缺毋假，S09）。
+    if (shared_id != 0 || flags & MEM_MAP_SHARED != 0)
+        && prot != 0
+        && prot != mm::user_space::PROT_DEFAULT
+    {
+        return pack_err(Error::NotSupported);
+    }
     if shared_id != 0 {
         let addr_space = proc.addr_space();
         return match ipc::shm_map::<arch_x86_64::paging::X86PageTable>(shared_id, addr_space) {
@@ -3406,7 +3422,6 @@ fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
             }
         };
     }
-    let pf = PageFlags::empty().writable().user();
     match proc.addr_space().mmap_user(size, pf) {
         Ok(addr) => pack_ok(addr),
         Err(e) => pack_err(e),

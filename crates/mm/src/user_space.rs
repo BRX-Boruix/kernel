@@ -2213,6 +2213,40 @@ where
     }
 }
 
+/// `mmap` 的 `prot` 位（3P4-4）。**单点定义**：内核 syscall 层与 libsys 共用同一编号。
+pub const PROT_READ: u64 = 1 << 0;
+pub const PROT_WRITE: u64 = 1 << 1;
+pub const PROT_EXEC: u64 = 1 << 2;
+/// `prot == 0` 的历史语义：早期 wire 未使用该参数，调用方一律传 0 → 解释为 RW
+/// （保持既有调用方行为不变；新代码应显式传 PROT_READ|PROT_WRITE）。
+pub const PROT_DEFAULT: u64 = PROT_READ | PROT_WRITE;
+
+/// 由 `prot` 位构造映射权限，并在**唯一入口**拒绝 W+X（3P4-4）。
+///
+/// 为什么**拒绝**而不是静默降级：W^X 是运行期可执行内存的安全前提。静默丢掉 EXEC 会让
+/// 调用方以为拿到了可执行页（JIT 运行时随后把控制流跳进去 → 取指失败），静默丢掉 WRITE
+/// 则会让调用方以为写成功。两者都是"把失败伪装成成功"（S09），故此处响亮
+/// `InvalidParam`，由调用方如实上抛；未知位同样不静默忽略。
+pub fn map_flags_from_prot(prot: u64) -> Result<PageFlags, Error> {
+    let prot = if prot == 0 { PROT_DEFAULT } else { prot };
+    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return Err(Error::InvalidParam);
+    }
+    let writable = prot & PROT_WRITE != 0;
+    let executable = prot & PROT_EXEC != 0;
+    if writable && executable {
+        return Err(Error::InvalidParam);
+    }
+    let mut pf = PageFlags::empty().user();
+    if writable {
+        pf = pf.writable();
+    }
+    if executable {
+        pf = pf.executable();
+    }
+    Ok(pf)
+}
+
 /// 栈增长规划（**纯函数**，host 单测锚定）：给定当前预留起点、故障地址与增长下界，
 /// 返回（新的预留起点，需提交的新增字节数）；不在可增长范围内返回 None。
 ///
@@ -2228,6 +2262,48 @@ pub(crate) fn plan_stack_growth(
         return None;
     }
     Some((fault_page, cur_start - fault_page))
+}
+
+#[cfg(test)]
+mod mmap_prot_tests {
+    use super::*;
+
+    #[test]
+    fn default_prot_is_read_write() {
+        // prot == 0 保持历史语义 = RW（既有调用方一律传 0）。
+        let pf = map_flags_from_prot(0).expect("default");
+        assert!(pf.is_writable());
+        assert!(pf.is_user());
+    }
+
+    #[test]
+    fn read_only_is_not_writable() {
+        let pf = map_flags_from_prot(PROT_READ).expect("ro");
+        assert!(!pf.is_writable());
+        assert!(pf.is_user());
+    }
+
+    #[test]
+    fn wx_is_rejected_loudly() {
+        // W^X 单点门禁：写 + 执行同页 → 拒绝（不静默降级）。
+        assert_eq!(
+            map_flags_from_prot(PROT_READ | PROT_WRITE | PROT_EXEC),
+            Err(Error::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn rx_is_accepted() {
+        let pf = map_flags_from_prot(PROT_READ | PROT_EXEC).expect("rx");
+        assert!(!pf.is_writable());
+        assert!(pf.is_user());
+    }
+
+    #[test]
+    fn unknown_bits_are_rejected() {
+        // 未知位不静默忽略（与 OpenFlags 的宽松掩码不同：权限位误读是安全问题）。
+        assert_eq!(map_flags_from_prot(1 << 9), Err(Error::InvalidParam));
+    }
 }
 
 #[cfg(test)]
