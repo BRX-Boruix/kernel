@@ -1062,7 +1062,7 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
 
     // ADR-014 FLAG_PIPE：匿名管道，不落文件系统。路径须为空（"" 或 "/"）。
     if flags.pipe {
-        return sys_open_pipe(path, frame);
+        return sys_open_pipe(path, flags);
     }
 
     // 相对路径与进程 cwd 拼接成绝对路径（VFS 只接受绝对路径，ADR-011 M1）。
@@ -1163,7 +1163,7 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
 ///
 /// 路径必须是空串 `""` 或根路径 `"/"`（宁缺毋假：带真实路径的 FLAG_PIPE
 /// 返回 `InvalidParam`，绝不静默忽略路径）。返回 `(read_fd << 32) | write_fd`。
-fn sys_open_pipe(path: alloc::string::String, _frame: &mut SyscallFrame) -> u64 {
+fn sys_open_pipe(path: alloc::string::String, flags: vfs::file_handle::OpenFlags) -> u64 {
     if path != "/" && !path.is_empty() {
         return pack_err(Error::InvalidParam);
     }
@@ -1186,7 +1186,7 @@ fn sys_open_pipe(path: alloc::string::String, _frame: &mut SyscallFrame) -> u64 
         return pack_err(Error::NotFound);
     };
     // 分配两个 fd 端。第二个失败需回滚：释放第一个 fd 槽 + 递减引用。
-    let read_fd = match proc.alloc_fd(vfs::file_handle::OpenHandle::Pipe { id }) {
+    let read_fd = match proc.alloc_fd(vfs::file_handle::OpenHandle::Pipe { id, flags }) {
         Ok(fd) => fd,
         Err(e) => {
             dec(id);
@@ -1198,7 +1198,7 @@ fn sys_open_pipe(path: alloc::string::String, _frame: &mut SyscallFrame) -> u64 
         dec(id);
         return pack_err(Error::NotFound);
     }
-    let write_fd = match proc.alloc_fd(vfs::file_handle::OpenHandle::Pipe { id }) {
+    let write_fd = match proc.alloc_fd(vfs::file_handle::OpenHandle::Pipe { id, flags }) {
         Ok(fd) => fd,
         Err(e) => {
             proc.close_fd(read_fd);
@@ -1224,7 +1224,7 @@ fn sys_close(frame: &mut SyscallFrame) -> u64 {
         return pack_err(Error::NotFound);
     };
     match proc.close_fd(fd) {
-        Some(vfs::file_handle::OpenHandle::Pipe { id }) => {
+        Some(vfs::file_handle::OpenHandle::Pipe { id, .. }) => {
             // 释放管道端引用；归零即销毁（ipc::pipe_ref_dec 语义）。
             match ipc::pipe_ref_dec(id) {
                 Ok(()) => pack_ok(0),
@@ -1371,7 +1371,7 @@ fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
     // 用引用绑定取 id（Pipe 的 u64 是 Copy），不 move old_handle——它稍后
     // 要整体 move 进 set_fd。id 先存副本：set_fd 失败时 old_handle 已 move，
     // 回滚需要这个 id（A1 闸门拒绝路径，S20）。
-    let old_pipe_id: Option<u64> = if let vfs::file_handle::OpenHandle::Pipe { id } = &old_handle {
+    let old_pipe_id: Option<u64> = if let vfs::file_handle::OpenHandle::Pipe { id, .. } = &old_handle {
         if ipc::pipe_ref_inc(*id).is_err() {
             return pack_err(Error::NoSpace);
         }
@@ -1381,14 +1381,14 @@ fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
     };
     // 关 new 的旧句柄（若为 pipe 端递减引用）。
     if let Some(old) = { current_proc_mut().and_then(|p| p.close_fd(new_fd)) } {
-        if let vfs::file_handle::OpenHandle::Pipe { id } = old {
+        if let vfs::file_handle::OpenHandle::Pipe { id, .. } = old {
             let _ = ipc::pipe_ref_dec(id);
         }
     }
     // 装入副本（new_fd 已在入口校验 < MAX_FDS，set_fd 必成功）。
     let Some(proc) = current_proc_mut() else {
         // proc 消失的极小窗口：回滚刚递增的 pipe 引用。
-        if let vfs::file_handle::OpenHandle::Pipe { id } = &old_handle {
+        if let vfs::file_handle::OpenHandle::Pipe { id, .. } = &old_handle {
             let _ = ipc::pipe_ref_dec(*id);
         }
         return pack_err(Error::NotFound);
@@ -2021,7 +2021,7 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
     // ADR-014 FLAG_PIPE：管道端直接经 ipc::pipe_write 路由（环形缓冲 +
     // 内部阻塞/唤醒）。管道不可定位，非顺序写哨兵如实 ESPIPE。
     let pipe_id = match proc.get_fd(fd as usize) {
-        Some(vfs::file_handle::OpenHandle::Pipe { id }) => Some(id),
+        Some(vfs::file_handle::OpenHandle::Pipe { id, .. }) => Some(id),
         Some(vfs::file_handle::OpenHandle::File(_)) => None,
         None => return pack_err(Error::InvalidParam),
     };
@@ -2171,7 +2171,7 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
     // 非顺序读哨兵如实 ESPIPE。pipe_read 内部阻塞/唤醒（进程回归后本帧即
     // 当前进程现场），完成后可安全回写 result。
     let pipe_id = match proc.get_fd(fd as usize) {
-        Some(vfs::file_handle::OpenHandle::Pipe { id }) => Some(id),
+        Some(vfs::file_handle::OpenHandle::Pipe { id, .. }) => Some(id),
         Some(vfs::file_handle::OpenHandle::File(_)) => None,
         None => return done(pack_err(Error::InvalidParam)),
     };
@@ -3201,11 +3201,19 @@ fn spawn_elf_image(elf_bytes: &[u8], arg_ptr: u64, arg_len: u64, idx_or_tag: u64
 fn clone_inherited_fd_table(
     parent: &mut task::process::Process<arch_x86_64::paging::X86PageTable>,
 ) -> Result<alloc::vec::Vec<Option<vfs::file_handle::OpenHandle>>, Error> {
-    let table = parent.clone_fd_table();
+    let mut table = parent.clone_fd_table();
+    // **3P4-3 CLOEXEC**：exec 派生新映像时**不继承**打了 CLOEXEC 的 fd（POSIX FD_CLOEXEC）。
+    // 必须在递增 pipe 引用**之前**剔除：被剔除的槽不再持引用——否则子进程继承的写端会让
+    // "父进程关闭写端后读端读到 EOF"永远不成立（正是本项要修的语义缺陷）。
+    for slot in table.iter_mut() {
+        if slot.as_ref().is_some_and(|h| h.flags().cloexec) {
+            *slot = None;
+        }
+    }
     // 克隆后为每个 pipe 端递增引用（记下已增项，失败即回滚）。
     let mut incd: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     for slot in table.iter() {
-        if let Some(vfs::file_handle::OpenHandle::Pipe { id }) = slot {
+        if let Some(vfs::file_handle::OpenHandle::Pipe { id, .. }) = slot {
             if ipc::pipe_ref_inc(*id).is_err() {
                 for done in incd {
                     let _ = ipc::pipe_ref_dec(done);

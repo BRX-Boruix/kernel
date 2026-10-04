@@ -18,6 +18,16 @@ pub struct OpenFlags {
     /// FLAG_PIPE（ADR-014 §4.1）：配合空路径，经 `SYS_STREAM_CREATE` 分配
     /// 一对匿名管道流句柄，而非打开文件节点。
     pub pipe: bool,
+    /// FLAG_CLOEXEC（3P4-3）：本 fd 在 **exec 派生新映像时不继承**（POSIX
+    /// `FD_CLOEXEC` 语义）。位分配 = bit 7（见 `from_bits`/`to_bits`）。
+    ///
+    /// 为什么需要它：没有它，父进程为内部用途打开的管道/文件端会被每个子进程
+    /// 继承并持住引用——父进程关闭写端后，**子进程仍持有写端**，读端永远读不到
+    /// EOF（管道场景的经典死锁）。这是 fd 泄漏在语义层面的表现，不只是资源浪费。
+    ///
+    /// 归属：这是**每 fd** 的标志（不是每"打开文件描述"），本系统每个 fd 槽各自
+    /// 持一份 `OpenHandle`（`dup2` 值拷贝标志、共享偏移），故放在这里即可。
+    pub cloexec: bool,
 }
 
 impl OpenFlags {
@@ -29,6 +39,7 @@ impl OpenFlags {
         append: false,
         directory: false,
         pipe: false,
+        cloexec: false,
     };
 
     pub const WRITE_ONLY: Self = Self {
@@ -39,6 +50,7 @@ impl OpenFlags {
         append: false,
         directory: false,
         pipe: false,
+        cloexec: false,
     };
 
     pub const READ_WRITE: Self = Self {
@@ -49,6 +61,7 @@ impl OpenFlags {
         append: false,
         directory: false,
         pipe: false,
+        cloexec: false,
     };
 
     pub const CREATE_OR_TRUNCATE: Self = Self {
@@ -59,6 +72,7 @@ impl OpenFlags {
         append: false,
         directory: false,
         pipe: false,
+        cloexec: false,
     };
 
     /// 追加写（O_APPEND 语义）：每次 write 的落点锚定当前真实大小。
@@ -70,6 +84,7 @@ impl OpenFlags {
         append: true,
         directory: false,
         pipe: false,
+        cloexec: false,
     };
 
     pub const fn to_bits(self) -> u32 {
@@ -95,6 +110,9 @@ impl OpenFlags {
         if self.pipe {
             bits |= 1 << 6;
         }
+        if self.cloexec {
+            bits |= 1 << 7;
+        }
         bits
     }
 
@@ -113,6 +131,7 @@ impl OpenFlags {
             append: (bits & (1 << 4)) != 0,
             directory: (bits & (1 << 5)) != 0,
             pipe: (bits & (1 << 6)) != 0,
+            cloexec: (bits & (1 << 7)) != 0,
         }
     }
 }
@@ -170,7 +189,21 @@ pub enum OpenHandle {
     File(FileHandle),
     /// 匿名管道端：`id` 为 ipc 管道表主键。同一管道可被多个 fd 引用
     /// （FLAG_PIPE 一次创建一对读写端），引用计数在 ipc 层维护。
-    Pipe { id: u64 },
+    ///
+    /// `flags`（3P4-3）：管道端同样需要承载**每 fd** 的标志（当前只有
+    /// `cloexec` 有意义——方向由"拿到的是读端还是写端"决定，不由位标志表达）。
+    /// 查询一律走 `OpenHandle::flags()`（单一访问点）。
+    Pipe { id: u64, flags: OpenFlags },
+}
+
+impl OpenHandle {
+    /// 本 fd 的打开标志——**CLOEXEC 的唯一查询点**（3P4-3）。
+    pub fn flags(&self) -> OpenFlags {
+        match self {
+            OpenHandle::File(f) => f.flags,
+            OpenHandle::Pipe { flags, .. } => *flags,
+        }
+    }
 }
 
 impl FileHandle {
