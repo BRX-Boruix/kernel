@@ -101,6 +101,9 @@ pub struct SignalState {
     blocked: SignalSet,
     pending: SignalSet,
     signal_depth: u32,
+    /// 「有一次异步投递打断了系统调用」（ADR-051）：投递点置位、阻塞前取用。
+    /// 不能只看 pending——投递（尤其调度 tick 那条）会消费 pending 位。
+    interrupted: bool,
     trampoline: u64,
 }
 
@@ -112,6 +115,7 @@ impl SignalState {
             blocked: SignalSet::empty(),
             pending: SignalSet::empty(),
             signal_depth: 0,
+        interrupted: false,
             trampoline: 0,
         }
     }
@@ -216,6 +220,8 @@ impl SignalState {
     ///   强制处理终止，ADR-034 §2.6）；
     /// - 其余信号：加入未决集。
     pub fn raise(&mut self, sig: u32) {
+        // 注意：此处**不**置 interrupted 标记——
+        // 标记表达的是「投递真的打断了某次阻塞」，由投递点（deliver_on_return）置位。
         if sig >= NSIG {
             return;
         }
@@ -243,6 +249,40 @@ impl SignalState {
             }
             None => None,
         }
+    }
+
+    /// 记录"本进程有一次异步信号投递打断了系统调用"（ADR-051）。
+    ///
+    /// 为什么需要它：投递可能发生在**调度 tick**（三处触发点之一），此时 pending 位已
+    /// 被消费、handler 已进——等到阻塞循环重入 `try_block` 时，光看 pending 会**看不到**
+    /// 打断发生过，于是又睡回去（实测症状：父进程 read 永不返回）。故投递时置位、阻塞前取用。
+    pub fn mark_interrupted(&mut self) {
+        self.interrupted = true;
+    }
+
+    /// 取用并清除"被打断"标记（阻塞前预检）。
+    pub fn take_interrupted(&mut self) -> bool {
+        let v = self.interrupted;
+        self.interrupted = false;
+        v
+    }
+
+    /// 是否有**会被投递给用户 handler** 的待决信号（ADR-051 EINTR 判据，**不消费**）。
+    ///
+    /// 与 [`Self::take_unblocked`] 的区别：本查询只读，不摘除任何位——供阻塞前预检。
+    /// 只认 `Handler(f)`（f != 0）：`Ignore` 不打断阻塞（POSIX），`Default` 的终止/停止
+    /// 动作由返回路径的 [`deliver_on_return`] 处置（届时进程已被处置，EINTR 无意义）。
+    pub fn has_handler_pending(&self) -> bool {
+        let unblocked = self.pending.intersection(self.blocked.complement());
+        let mut bits = unblocked.bits();
+        while bits != 0 {
+            let sig = bits.trailing_zeros();
+            bits &= bits - 1;
+            if matches!(self.disposition(sig), Some(SigDisposition::Handler(f)) if f != 0) {
+                return true;
+            }
+        }
+        false
     }
 
     /// 设置/清除"正在 handler 中"守卫（兼容 setter：true→深度 1，false→0）。
@@ -448,6 +488,13 @@ pub fn deliver_on_return<PT: arch::PageTable>(
                     // 用户栈写帧失败（越界/不可写）：无法安全投递，终止兜底。
                     crate::scheduler::exit_current(frame, sig as u64);
                     return DeliveryOutcome::Terminated;
+                }
+                // ADR-051：若投递发生在进程**阻塞**期间（调度 tick 那条触发点），本次投递
+                // 打断的正是它的阻塞 syscall——置位供阻塞前预检取用（pending 位已被本次
+                // 投递消费，光看 pending 会看不到打断发生过）。若进程正在运行（syscall 返回
+                // 点那条），系统调用已结束，不置位——否则会误伤下一次阻塞调用。
+                if proc.state() == crate::TaskState::Blocked {
+                    proc.signal_mut().mark_interrupted();
                 }
                 return DeliveryOutcome::Continue;
             }

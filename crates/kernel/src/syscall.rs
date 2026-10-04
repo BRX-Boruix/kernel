@@ -5271,6 +5271,8 @@ fn sys_sync_wait(frame: &mut SyscallFrame) -> DispatchResult {
         ipc::SyncWaitResult::WouldBlock => done(pack_err(Error::WouldBlock)),
         ipc::SyncWaitResult::NotFound => done(pack_err(Error::NotFound)),
         ipc::SyncWaitResult::InvalidParam => done(pack_err(Error::InvalidParam)),
+        // ADR-051：等待被可投递的 handler 信号打断 → EINTR。
+        ipc::SyncWaitResult::Interrupted => done(pack_err(Error::Interrupted)),
     }
 }
 

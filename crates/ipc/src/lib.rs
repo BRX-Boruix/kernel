@@ -84,6 +84,9 @@ pub enum BlockOutcome {
     /// 拒绝阻塞（无可调度进程可切，或登记被拒）：现场未动、等待者未入册，
     /// 调用方应如实报 `WouldBlock`。
     Refused,
+    /// 阻塞前预检命中可投递的 handler 信号（ADR-051）：**未入册、未阻塞**，
+    /// 调用方应如实报 `Interrupted`（EINTR）。信号本身由 syscall 返回点投递。
+    Interrupted,
 }
 
 /// 调度器与进程回调 Provider（解耦 IPC 与 Task/Scheduler 的循环依赖）。
@@ -734,6 +737,9 @@ pub fn pipe_write<PT: arch::PageTable>(
                 }
                 return Err(Error::WouldBlock);
             }
+            // ADR-051：有可投递的 handler 信号 → 本次调用以 EINTR 收场。
+            // 预检在入册**之前**，故此处没有等待者登记需要撤销。
+            BlockOutcome::Interrupted => return Err(Error::Interrupted),
             BlockOutcome::Switched => {}
         }
     }
@@ -845,6 +851,9 @@ pub fn pipe_read<PT: arch::PageTable>(
                 }
                 return Err(Error::WouldBlock);
             }
+            // ADR-051：有可投递的 handler 信号 → 本次调用以 EINTR 收场。
+            // 预检在入册**之前**，故此处没有等待者登记需要撤销。
+            BlockOutcome::Interrupted => return Err(Error::Interrupted),
             BlockOutcome::Switched => {}
         }
     }

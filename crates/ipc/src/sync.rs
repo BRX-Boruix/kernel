@@ -104,6 +104,9 @@ pub enum SyncWaitResult {
     NotFound,
     /// 超时越界。
     InvalidParam,
+    /// 阻塞前预检命中可投递的 handler 信号（ADR-051）：未入册、未阻塞，
+    /// 调用方应如实报 `Interrupted`（EINTR）。
+    Interrupted,
 }
 
 /// `sync_wait(id, expected, timeout_ns, frame)`（SYS_SYNC_WAIT / 0x72，可阻塞）。
@@ -160,6 +163,14 @@ pub fn sync_wait(frame_ptr: usize, id: u64, expected: u64, timeout_ns: u64) -> S
         };
         match block_with_registration(frame_ptr, &mut *register) {
             BlockOutcome::Switched => return SyncWaitResult::Switched,
+            // ADR-051：可投递的 handler 信号 → 本次等待以 EINTR 收场（登记未发生，
+            // 仅需撤销已注册的超时回调）。
+            BlockOutcome::Interrupted => {
+                if let Some(t) = timer {
+                    let _ = klib::time::cancel_timeout(t);
+                }
+                return SyncWaitResult::Interrupted;
+            }
             BlockOutcome::Refused => {
                 if let Some(t) = timer {
                     let _ = klib::time::cancel_timeout(t);

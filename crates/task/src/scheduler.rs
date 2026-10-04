@@ -4348,6 +4348,13 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
             slot.proc.signal_mut().raise(sig);
         }
     }
+    // ADR-051：投递必须**唤醒阻塞中的目标**——否则阻塞在 syscall 里的进程永远看不到
+    // 信号（实测：父进程阻塞在管道 read 上，子进程 kill 之后父永不返回）。唤醒在桶锁
+    // **之外**（wake 自持桶锁）。waitpid 独占管理的进程由 wake 自行跳过（见其文档），
+    // 那条路径的 EINTR 接入是 ADR-051「后果」里登记的未覆盖项。
+    if sig != SIGKILL {
+        wake(target);
+    }
     Ok(0)
 }
 
