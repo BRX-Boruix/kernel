@@ -1345,6 +1345,7 @@ fn start_init() -> ! {
         Some(b"init.elf"),
         &[],
         crate::syscall::USER_PIE_BASE,
+        crate::syscall::USER_INTERP_BASE,
     ) {
         Ok(l) => l,
         Err(e) => {
@@ -1353,6 +1354,13 @@ fn start_init() -> ! {
             CurrentArch::halt();
         }
     };
+    // 阶段 5 中途态（如实声明）：`init` **必须**是静态镜像——它由内核在任何文件系统可用之前
+    // 拉起，解释器（rtld）此时无从取得。故带 PT_INTERP 的 init 显式拒绝，绝不放行一个
+    // 无人重定位的程序（S09）。
+    if loaded.interp.is_some() {
+        error!("[kmain] init 必须是静态镜像：含 PT_INTERP 无法在引导期兑现动态链接");
+        CurrentArch::halt();
+    }
     info!(
         "[kmain] init: entry={:#x} stack_top={:#x}",
         loaded.entry, loaded.user_stack_top

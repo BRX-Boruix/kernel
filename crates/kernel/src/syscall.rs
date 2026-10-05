@@ -206,6 +206,12 @@ pub const MEM_MAP_SHARED: u64 = 1 << 0;
 /// （128 TiB）内、页对齐。ET_EXEC 不使用它（其 p_vaddr 是绝对地址，偏移恒 0）。
 /// **本项只证明「可装载到任意基址」的能力**；ASLR（随机基址）不在此范围。
 pub const USER_PIE_BASE: u64 = 0x0010_0000_0000;
+
+/// 解释器（rtld）的装载基址（阶段 5 / 3P5-1）。
+///
+/// 与 `USER_PIE_BASE` **分开**：解释器与可执行文件同时在地址空间里，两者基址必须
+/// 不重叠。这是**策略常量**（而非从镜像推导），故调用方先定、由 loader 写进 `AT_BASE`。
+pub const USER_INTERP_BASE: u64 = 0x0020_0000_0000;
 pub const SYS_MEMORY_QUERY: u32 = nr(domain::MEMORY, op::READ); // 0x22
 pub const SYS_MEMORY_GROW: u32 = nr(domain::MEMORY, op::WRITE); // 0x23
 pub const SYS_MEMORY_UNMAP: u32 = nr(domain::MEMORY, op::DELETE); // 0x24
@@ -3392,6 +3398,7 @@ fn spawn_elf_image<S: loader::ImageSource + ?Sized>(
         Some(prog_name.as_bytes()),
         &env_refs,
         USER_PIE_BASE,
+        USER_INTERP_BASE,
     ) {
         Ok(l) => l,
         Err(e) => return pack_err(e),

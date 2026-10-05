@@ -362,6 +362,39 @@ pub(crate) mod raw {
     /// auxv 终结槽类型（值恒 0）。
     pub const AT_NULL: u64 = 0;
 
+    // ---------- 动态链接所需的 auxv 槽（阶段 5 / 3P5-1）----------
+    //
+    // 取值与 Linux 一致（解释器按同一编号读取；libsys::auxv 同步）。
+
+    /// `AT_PHDR`：可执行文件程序头表在**用户地址空间**的 VA。
+    pub const AT_PHDR: u64 = 3;
+    /// `AT_PHENT`：单个程序头项字节数。
+    pub const AT_PHENT: u64 = 4;
+    /// `AT_PHNUM`：程序头条数。
+    pub const AT_PHNUM: u64 = 5;
+    /// `AT_BASE`：解释器装载基址。
+    pub const AT_BASE: u64 = 7;
+    /// `AT_ENTRY`：可执行文件入口（解释器做完重定位后跳这里）。
+    pub const AT_ENTRY: u64 = 9;
+
+    /// 动态链接所需的 auxv 附加项（阶段 5 / 3P5-1）。
+    ///
+    /// **只在可执行文件那一份栈上填写**——解释器不重建栈，故它读到的正是这份。
+    /// 为 `None` 时（静态程序）auxv 内容与 3P4-2 完全一致，**零影响**。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct AuxvInfo {
+        /// `AT_PHDR`：可执行文件程序头表的用户 VA。
+        pub phdr: u64,
+        /// `AT_PHENT`。
+        pub phent: u64,
+        /// `AT_PHNUM`。
+        pub phnum: u64,
+        /// `AT_ENTRY`。
+        pub entry: u64,
+        /// `AT_BASE`：解释器装载基址。
+        pub interp_base: u64,
+    }
+
     /// 字符串区偏移：字符串区起于 `stack_top - STR_OFF`，承载**命令行、程序名与环境串**。
     ///
     /// 预算 = 命令行（`MAX_CMDLINE_BYTES` + NUL）+ 程序名（`MAX_PROG_NAME_BYTES` + NUL）
@@ -422,6 +455,7 @@ pub(crate) mod raw {
         cmd_len: usize,
         prog_name: Option<&[u8]>,
         env: &[&[u8]],
+        aux: Option<AuxvInfo>,
     ) -> Result<EntryBlock, Error> {
         if cmd_len > MAX_CMDLINE_BYTES {
             return Err(Error::ArgListTooLong);
@@ -441,8 +475,10 @@ pub(crate) mod raw {
         }
 
         let argc: usize = if cmd_len == 0 { 0 } else { 1 };
-        // auxv 对：有程序名时 (AT_EXECFN, ptr) + (AT_NULL, 0)，否则仅 (AT_NULL, 0)。
-        let auxv_pairs = if prog_name.is_some() { 2 } else { 1 };
+        // auxv 对：程序名（可选，1 对）+ 动态链接五项（有解释器时，5 对）+ 终结项（1 对）。
+        let auxv_pairs = (if prog_name.is_some() { 1 } else { 0 })
+            + (if aux.is_some() { 5 } else { 0 })
+            + 1;
         // 字数组：argc + argv[0..argc) + NULL + envp[0..envc) + NULL + auxv 对。
         let words = 1 + argc + 1 + env.len() + 1 + auxv_pairs * 2;
         let str_base = stack_top
@@ -970,7 +1006,7 @@ pub(crate) mod raw {
 
         #[test]
         fn entry_block_points_argv0_at_whole_cmdline() {
-            let b = entry_block(TEST_STACK_TOP, 5, None, &[]).expect("5 字节命令行应被接受");
+            let b = entry_block(TEST_STACK_TOP, 5, None, &[], None).expect("5 字节命令行应被接受");
             assert_eq!(b.argc, 1, "有命令行时 argc 恒为 1（不拆词）");
             assert_eq!(
                 b.argv0,
@@ -986,7 +1022,7 @@ pub(crate) mod raw {
 
         #[test]
         fn entry_block_without_cmdline_has_zero_argc() {
-            let b = entry_block(TEST_STACK_TOP, 0, None, &[]).expect("空命令行合法");
+            let b = entry_block(TEST_STACK_TOP, 0, None, &[], None).expect("空命令行合法");
             assert_eq!(b.argc, 0, "无命令行时 argc 槽为 0");
             assert_eq!(b.argv0, 0, "无命令行时 argv[0] 槽为 0");
             // ABI v2 起布局**统一**（不再有"第三字越出栈顶页"的特例）：空命令行下字数组
@@ -999,32 +1035,32 @@ pub(crate) mod raw {
         #[test]
         fn entry_block_accepts_capacity_limit_and_rejects_beyond() {
             // MAX_CMDLINE_BYTES 是命令行长度上限（不含 NUL 终止符）：恰满可交付。
-            assert!(entry_block(TEST_STACK_TOP, MAX_CMDLINE_BYTES, None, &[]).is_ok());
+            assert!(entry_block(TEST_STACK_TOP, MAX_CMDLINE_BYTES, None, &[], None).is_ok());
             // 超一字节即显式拒绝——绝不截断后把裁剪过的命令行伪装成完整交付（LA3/KM5）。
             assert_eq!(
-                entry_block(TEST_STACK_TOP, MAX_CMDLINE_BYTES + 1, None, &[]),
+                entry_block(TEST_STACK_TOP, MAX_CMDLINE_BYTES + 1, None, &[], None),
                 Err(Error::ArgListTooLong)
             );
             // 3P4-2 行为锚点：**旧上限（511）必须已解除**——512..=MAX 之间一律可交付。
             // 若只改了常量而没改契约，本断言先红（文档漂移/实现回退在此暴露）。
             assert!(
-                entry_block(TEST_STACK_TOP, 0x1FF + 1, None, &[]).is_ok(),
+                entry_block(TEST_STACK_TOP, 0x1FF + 1, None, &[], None).is_ok(),
                 "511 字节旧上限必须已解除（3P4-2）"
             );
-            assert!(entry_block(TEST_STACK_TOP, 4096, None, &[]).is_ok());
+            assert!(entry_block(TEST_STACK_TOP, 4096, None, &[], None).is_ok());
         }
 
         #[test]
         fn entry_block_rejects_stack_top_underflow() {
             // 栈顶小到放不下参数块/字符串区时必须显式报错，不得回绕出巨地址。
-            assert!(entry_block(0, 1, None, &[]).is_err());
-            assert!(entry_block(RSP_OFF_MIN as u64 - 1, 1, None, &[]).is_err());
+            assert!(entry_block(0, 1, None, &[], None).is_err());
+            assert!(entry_block(RSP_OFF_MIN as u64 - 1, 1, None, &[], None).is_err());
         }
 
         #[test]
         fn entry_block_lays_out_envp_after_argv() {
             let env: [&[u8]; 2] = [b"PATH=/programs", b"HOME=/"];
-            let b = entry_block(TEST_STACK_TOP, 5, None, &env).expect("带环境应被接受");
+            let b = entry_block(TEST_STACK_TOP, 5, None, &env, None).expect("带环境应被接受");
             assert_eq!(b.argc, 1);
             assert_eq!(b.envp.len(), 2, "envp 槽位数 = 环境条数");
             let str_base = TEST_STACK_TOP - STR_OFF as u64;
@@ -1071,11 +1107,11 @@ pub(crate) mod raw {
         fn entry_block_rejects_prog_name_over_limit() {
             let big = alloc::vec![b'n'; MAX_PROG_NAME_BYTES + 1];
             assert_eq!(
-                entry_block(TEST_STACK_TOP, 0, Some(&big), &[]),
+                entry_block(TEST_STACK_TOP, 0, Some(&big), &[], None),
                 Err(Error::ArgListTooLong)
             );
             let exact = alloc::vec![b'n'; MAX_PROG_NAME_BYTES];
-            assert!(entry_block(TEST_STACK_TOP, 0, Some(&exact), &[]).is_ok());
+            assert!(entry_block(TEST_STACK_TOP, 0, Some(&exact), &[], None).is_ok());
         }
 
         #[test]
@@ -1083,20 +1119,20 @@ pub(crate) mod raw {
             // 条数超限 → 显式拒绝（**绝不静默丢弃**环境变量，与命令行不截断同政策）。
             let many: alloc::vec::Vec<&[u8]> = alloc::vec![&b"K=V"[..]; MAX_ENV_COUNT + 1];
             assert_eq!(
-                entry_block(TEST_STACK_TOP, 0, None, &many),
+                entry_block(TEST_STACK_TOP, 0, None, &many, None),
                 Err(Error::ArgListTooLong)
             );
             // 字节数超限 → 同样显式拒绝。
             let big = alloc::vec![b'x'; MAX_ENV_BYTES];
             let over: [&[u8]; 1] = [&big];
             assert_eq!(
-                entry_block(TEST_STACK_TOP, 0, None, &over),
+                entry_block(TEST_STACK_TOP, 0, None, &over, None),
                 Err(Error::ArgListTooLong)
             );
             // 边界内侧（恰满字节预算）可交付。
             let exact = alloc::vec![b'y'; MAX_ENV_BYTES - 1];
             let ok: [&[u8]; 1] = [&exact];
-            assert!(entry_block(TEST_STACK_TOP, 0, None, &ok).is_ok());
+            assert!(entry_block(TEST_STACK_TOP, 0, None, &ok, None).is_ok());
         }
 
         // ---- classify_phdr：程序头类型的装载处置 ----
@@ -1202,7 +1238,8 @@ pub use raw::ImageSource;
 mod backend {
     use super::raw::ImageSource;
     use super::raw::{
-        AT_EXECFN, AT_NULL, MAX_CMDLINE_BYTES, MAX_ENV_BYTES, MAX_ENV_COUNT, MAX_PROG_NAME_BYTES,
+        AT_BASE, AT_ENTRY, AT_EXECFN, AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM, MAX_CMDLINE_BYTES,
+        MAX_ENV_BYTES, MAX_ENV_COUNT, MAX_PROG_NAME_BYTES,
         PhdrClass, RSP_OFF_MIN, STR_OFF, SegmentSpec, TlsTemplate, align_up_checked, classify_phdr,
         entry_block, parse_header, parse_tls_template, plan_segment, rd_u32, rd_u64,
     };
@@ -1283,6 +1320,7 @@ mod backend {
         prog_name: Option<&[u8]>,
         env: &[&[u8]],
         pie_base: u64,
+        interp_base: u64,
     ) -> Result<LoadedElf, Error> {
         let hdr = parse_header(image)?;
         // 3P4-6：ET_DYN 需要**装载基址偏移**（其 p_vaddr 相对基址）；ET_EXEC 的
@@ -1394,7 +1432,19 @@ mod backend {
             return Err(Error::InvalidParam);
         }
 
-        let stack_top = setup_user_stack(addr_space, cmd, prog_name, env)?;
+        // 动态链接 auxv（阶段 5）：只在**本镜像**要求解释器时填写；静态程序为 None，
+        // 故 auxv 内容与 3P4-2 完全一致（零影响）。
+        let aux = match interp {
+            Some(_) => Some(crate::raw::AuxvInfo {
+                phdr: bias.checked_add(hdr.phoff as u64).ok_or(Error::OutOfRange)?,
+                phent: hdr.phentsize as u64,
+                phnum: hdr.phnum as u64,
+                entry,
+                interp_base,
+            }),
+            None => None,
+        };
+        let stack_top = setup_user_stack(addr_space, cmd, prog_name, env, aux)?;
         // **安全闸（3P4-1 未完，勿删）**：装配路径已实现，且 TLS 块本身经实测验证
         // 正确（用户态 memory_query 报 PRESENT|USER|WRITABLE、裸指针读到正确初值、
         // rdfsbase 读回 FS base），但 **FS 相对访问**仍失败，且该失败会让用户程序
@@ -1593,6 +1643,7 @@ mod backend {
         cmd: &[u8],
         prog_name: Option<&[u8]>,
         env: &[&[u8]],
+        aux: Option<crate::raw::AuxvInfo>,
     ) -> Result<u64, Error> {
         // 栈顶参数块 mini-ABI：布局的**单点定义**在 `raw::entry_block`（host 单测锚定
         // 其契约），语义、取值理由与变更纪律见 docs/abi/syscall-abi.md §4（LA2）。
@@ -1604,7 +1655,7 @@ mod backend {
         // 且先于任何资源获取：失败路径不产生待回收资源。
         let stack_size = USER_STACK_PAGES as u64 * PAGE_SIZE;
         let stack_top = USER_STACK_TOP;
-        let block = entry_block(stack_top, cmd.len(), prog_name, env)?;
+        let block = entry_block(stack_top, cmd.len(), prog_name, env, aux)?;
         let stack_bottom = stack_top - stack_size;
 
         // S20：同 load_segment，HHDM 前置先于任何资源获取。
@@ -1704,6 +1755,19 @@ mod backend {
                 words.push(AT_EXECFN);
                 words.push(p);
             }
+            // 动态链接五项（阶段 5）：解释器靠它们找到可执行文件的程序头、入口与自身基址。
+            if let Some(a) = aux {
+                words.push(AT_PHDR);
+                words.push(a.phdr);
+                words.push(AT_PHENT);
+                words.push(a.phent);
+                words.push(AT_PHNUM);
+                words.push(a.phnum);
+                words.push(AT_ENTRY);
+                words.push(a.entry);
+                words.push(AT_BASE);
+                words.push(a.interp_base);
+            }
             words.push(AT_NULL);
             words.push(0);
             for (i, w) in words.iter().enumerate() {
@@ -1724,6 +1788,6 @@ pub use backend::{load, LoadedElf};
 /// 否则那个构建面里连模块都没有（cargo 会以"无 test、无 user-space"再编一次库）。
 #[cfg(any(test, feature = "user-space"))]
 pub use crate::raw::{
-    AT_EXECFN, AT_NULL, MAX_CMDLINE_BYTES, MAX_ENV_BYTES, MAX_ENV_COUNT, MAX_PROG_NAME_BYTES,
-    RSP_OFF_MIN, STR_OFF,
+    AT_BASE, AT_ENTRY, AT_EXECFN, AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM, MAX_CMDLINE_BYTES,
+    MAX_ENV_BYTES, MAX_ENV_COUNT, MAX_PROG_NAME_BYTES, RSP_OFF_MIN, STR_OFF,
 };

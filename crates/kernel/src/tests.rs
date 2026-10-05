@@ -9029,7 +9029,7 @@ fn build_two_segment_elf(seg_bytes: u64) -> alloc::vec::Vec<u8> {
 fn expect_loader_reject(elf: &[u8], cmd: &[u8], want: klib::error::Error, ctx: &str) {
     use mm::user_space::UserAddressSpace;
     let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-    match loader::load(elf, &mut us, cmd, None, &[], 0) {
+    match loader::load(elf, &mut us, cmd, None, &[], 0, 0) {
         Err(e) if e == want => info!("[test-loader] {} rejected: {:?}", ctx, e),
         Ok(_) => panic!("[test-loader] {}: malicious image unexpectedly loaded", ctx),
         Err(e) => panic!("[test-loader] {}: expected Err({:?}), got Err({:?})", ctx, want, e),
@@ -9274,7 +9274,7 @@ pub fn test_loader_adversarial() {
             let mut us =
                 UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
             let elf = build_two_segment_elf(QUOTA_SEG_BYTES);
-            match loader::load(&elf, &mut us, &[], None, &[], 0) {
+            match loader::load(&elf, &mut us, &[], None, &[], 0, 0) {
                 Err(e) if e == Error::NoSpace => {
                     info!("[test-loader] {} rejected: {:?}", label, e);
                 }
@@ -9330,7 +9330,7 @@ pub fn test_loader_adversarial() {
         };
         let elf = build_loader_elf(&spec);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        match loader::load(&elf, &mut us, &[], None, &[], 0) {
+        match loader::load(&elf, &mut us, &[], None, &[], 0, 0) {
             Ok(_) => info!("[test-loader] W+X segment loads with warn (D9 policy)"),
             Err(e) => panic!("[test-loader] W+X segment must load per D9 policy, got {:?}", e),
         }
@@ -9355,7 +9355,7 @@ pub fn test_loader_adversarial() {
         let long_cmd = alloc::vec![b'L'; 1000];
         let elf = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        let loaded = match loader::load(&elf, &mut us, &long_cmd, None, &[], 0) {
+        let loaded = match loader::load(&elf, &mut us, &long_cmd, None, &[], 0, 0) {
             Ok(l) => l,
             Err(e) => panic!("[test-loader] 1000-byte cmd must load (3P4-2), got {:?}", e),
         };
@@ -9386,7 +9386,7 @@ pub fn test_loader_adversarial() {
         let max_cmd = alloc::vec![b'a'; loader::MAX_CMDLINE_BYTES];
         let elf2 = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us2 = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        match loader::load(&elf2, &mut us2, &max_cmd, None, &[], 0) {
+        match loader::load(&elf2, &mut us2, &max_cmd, None, &[], 0, 0) {
             Ok(_) => info!("[test-loader] cmd at MAX_CMDLINE_BYTES loads, string+NUL intact"),
             Err(e) => panic!("[test-loader] cmd at limit must load, got {:?}", e),
         }
@@ -9396,7 +9396,7 @@ pub fn test_loader_adversarial() {
         let env: [&[u8]; 2] = [b"PATH=/programs", b"TERM=boruix"];
         let elf3 = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us3 = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        let loaded3 = match loader::load(&elf3, &mut us3, b"hello", Some(b"tlsdemo"), &env, 0) {
+        let loaded3 = match loader::load(&elf3, &mut us3, b"hello", Some(b"tlsdemo"), &env, 0, 0) {
             Ok(l) => l,
             Err(e) => panic!("[test-loader] env load must succeed, got {:?}", e),
         };
@@ -9479,7 +9479,7 @@ pub fn test_loader_adversarial() {
     {
         let elf = build_loader_elf(&LoaderElfSpec::BASE);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        let loaded = match loader::load(&elf, &mut us, &[], None, &[], 0) {
+        let loaded = match loader::load(&elf, &mut us, &[], None, &[], 0, 0) {
             Ok(l) => l,
             Err(e) => panic!("[test-loader] baseline ELF must load, got {:?}", e),
         };
@@ -9619,7 +9619,7 @@ pub fn test_loader_adversarial() {
         }
         elf2.extend_from_slice(&[0xA5; 16]);
         let mut us = UserAddressSpace::<X86PageTable>::new().expect("[test-loader] new user space");
-        match loader::load(&elf2, &mut us, &[], None, &[], 0) {
+        match loader::load(&elf2, &mut us, &[], None, &[], 0, 0) {
             Ok(_) => info!("[test-loader] tbss-only PT_TLS accepted (no content to copy)"),
             Err(e) => panic!("[test-loader] tbss-only PT_TLS must load, got {:?}", e),
         }
