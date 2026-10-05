@@ -505,12 +505,16 @@ pub(crate) mod raw {
         /// 每线程的 TLS 块由内核按该模板分配、初始化，并把 FS base 指向块尾 TCB。
         /// 模板的 .tdata 内容仍在某个 PT_LOAD 段内（本类不负责映射）。
         TlsTemplate,
-        /// 明确拒绝：PT_INTERP——镜像要求动态链接器，而本加载器只接受静态
-        /// ET_EXEC（ET_DYN 已在 parse_header 处拒绝）。
-        RejectInterp,
-        /// 明确拒绝：PT_DYNAMIC——镜像带动态链接元数据（需要重定位），而本
-        /// 加载器不做任何重定位。
-        RejectDynamic,
+        /// PT_INTERP：镜像要求动态链接器。**接受**——本类只负责"记录解释器路径"，
+        /// 真正的装载与入口转交由调用方（exec 路径）完成：把解释器作为**第二个镜像**
+        /// 装进同一地址空间，并把入口设为解释器的入口（阶段 5 / 3P5-1）。
+        Interp,
+        /// PT_DYNAMIC：动态链接元数据（需要重定位）。
+        ///
+        /// **单独出现时仍拒绝**：本加载器不做重定位，没有解释器就没人替它做，
+        /// 静默放行等于让程序带着未重定位的指针跑起来（S09）。
+        /// 与 PT_INTERP 同时出现才接受——那时重定位是解释器的职责。
+        Dynamic,
     }
 
     /// 判定单个程序头类型的处置。
@@ -527,10 +531,40 @@ pub(crate) mod raw {
         match p_type {
             PT_LOAD => PhdrClass::Load,
             PT_TLS => PhdrClass::TlsTemplate,
-            PT_INTERP => PhdrClass::RejectInterp,
-            PT_DYNAMIC => PhdrClass::RejectDynamic,
+            PT_INTERP => PhdrClass::Interp,
+            PT_DYNAMIC => PhdrClass::Dynamic,
             _ => PhdrClass::Skip,
         }
+    }
+
+    /// `PT_INTERP` 路径的长度上限（防御性；真实路径远小于此）。
+    const MAX_INTERP_BYTES: u64 = 4096;
+
+    /// 读取 `PT_INTERP` 段的解释器路径（NUL 结尾字符串）。
+    ///
+    /// `ph` 是该程序头在文件中的偏移。返回的 `Vec` **不含**结尾 NUL。
+    /// 长度取 `p_filesz`，故路径为空、非 NUL 结尾、或超限时**如实报错**（S09）。
+    pub(crate) fn read_interp_path<S: ImageSource + ?Sized>(
+        image: &S,
+        ph: usize,
+    ) -> Result<alloc::vec::Vec<u8>, Error> {
+        // ELF64 程序头布局：p_type@0 p_flags@4 p_offset@8 p_vaddr@16 p_paddr@24
+        // p_filesz@32 p_memsz@40 p_align@48（与 raw 模块同口径）。
+        let off = image.rd_u64((ph + 8) as u64)?;
+        let filesz = image.rd_u64((ph + 32) as u64)?;
+        if filesz == 0 || filesz > MAX_INTERP_BYTES {
+            return Err(Error::InvalidParam);
+        }
+        let mut buf = alloc::vec![0u8; filesz as usize];
+        image.read_at(off, &mut buf)?;
+        if buf.last() != Some(&0) {
+            return Err(Error::InvalidParam); // 不是 NUL 结尾 → 不是合法字符串
+        }
+        buf.pop();
+        if buf.is_empty() {
+            return Err(Error::InvalidParam);
+        }
+        Ok(buf)
     }
 
     // ---------- PT_TLS 模板（用户态 TLS，docs/TODO/3p.md 3P4-1） ----------
@@ -1076,13 +1110,15 @@ pub(crate) mod raw {
         }
 
         #[test]
-        fn classify_phdr_rejects_unimplemented_capabilities() {
+        fn classify_phdr_accepts_dynamic_linking_metadata() {
             // PT_TLS(7)：3P4-1 起改为**解析模板**（不再是拒绝）。
             assert_eq!(classify_phdr(7), PhdrClass::TlsTemplate);
-            // PT_INTERP(3)：需要动态链接器；本加载器只接受静态 ET_EXEC。
-            assert_eq!(classify_phdr(3), PhdrClass::RejectInterp);
-            // PT_DYNAMIC(2)：动态链接元数据；本加载器不做任何重定位。
-            assert_eq!(classify_phdr(2), PhdrClass::RejectDynamic);
+            // PT_INTERP(3) / PT_DYNAMIC(2)：阶段 5 起**接受**。loader 只负责"记录解释器
+            // 路径"与"有动态元数据"这两件事实；装载解释器、转交入口、做重定位分别由
+            // 调用方与解释器负责（S13 边界）。**PT_DYNAMIC 单独出现仍拒绝**——见 load 里
+            // 的显式检查（没有解释器就没人做重定位）。
+            assert_eq!(classify_phdr(3), PhdrClass::Interp);
+            assert_eq!(classify_phdr(2), PhdrClass::Dynamic);
         }
 
         #[test]
@@ -1222,6 +1258,12 @@ mod backend {
         /// 主线程的 TLS 段基址（`IA32_FS_BASE` 初值）。镜像无 PT_TLS 时为 None，
         /// 此时该单元 `fs_base = 0`（与 3P4-1 之前的行为一致）。
         pub tls_fs_base: Option<u64>,
+        /// `PT_INTERP` 记录的解释器路径（阶段 5 / 3P5-1）。
+        ///
+        /// `Some` 表示"这是个动态可执行文件"：调用方须把该解释器作为**第二个镜像**
+        /// 装进同一地址空间，并把入口改为解释器的入口（`entry` 字段仍是**本镜像**的入口，
+        /// 由解释器经 `AT_ENTRY` 取用）。
+        pub interp: Option<alloc::vec::Vec<u8>>,
     }
 
     /// 把 ELF 镜像加载到 `addr_space`，返回入口与用户栈顶。
@@ -1266,6 +1308,10 @@ mod backend {
         }
         // PT_TLS 模板（0 或 1 份）：不装载，仅记录，供每线程 TLS 块装配（3P4-1）。
         let mut tls: Option<TlsTemplate> = None;
+        // PT_INTERP 路径（阶段 5）：记录，由调用方装载并转交入口。
+        let mut interp: Option<alloc::vec::Vec<u8>> = None;
+        // PT_DYNAMIC 出现标志：单独出现时拒绝（无人做重定位），与 PT_INTERP 同时出现才接受。
+        let mut has_dynamic = false;
         for i in 0..hdr.phnum {
             // 表完整性由 parse_header 单点保证：phoff + phnum*PHDR_SIZE
             // <= elf.len()，故按表项偏移的读取不会越界。
@@ -1314,15 +1360,22 @@ mod backend {
                     });
                     tls = Some(t);
                 }
-                PhdrClass::RejectInterp => {
-                    klib::warn!("[loader] 拒绝镜像：含 PT_INTERP，本加载器不做动态链接");
-                    return Err(Error::NotSupported);
+                PhdrClass::Interp => {
+                    // 只记录路径（NUL 结尾的字符串，位于 p_offset/p_filesz 描述的文件区间）。
+                    // 装载解释器与入口转交由调用方负责——loader 不递归装载（S13：
+                    // 「把 ELF 装进地址空间」与「决定跑谁」是两件事）。
+                    interp = Some(crate::raw::read_interp_path(image, ph)?);
                 }
-                PhdrClass::RejectDynamic => {
-                    klib::warn!("[loader] 拒绝镜像：含 PT_DYNAMIC，本加载器不做重定位");
-                    return Err(Error::NotSupported);
+                PhdrClass::Dynamic => {
+                    has_dynamic = true;
                 }
             }
+        }
+        // **诚实边界（S09）**：PT_DYNAMIC 单独出现时，没有任何组件会做重定位——
+        // 放行等于让程序带着未重定位的指针跑。故仍显式拒绝（与 PT_INTERP 同在才放行）。
+        if has_dynamic && interp.is_none() {
+            klib::warn!("[loader] 拒绝镜像：含 PT_DYNAMIC 但无 PT_INTERP，无人做重定位");
+            return Err(Error::NotSupported);
         }
         if loaded == 0 {
             // LD2（已闭环）：格式可解析但没有任何可装载内容——ENOEXEC 语义，
@@ -1371,6 +1424,7 @@ mod backend {
             entry,
             user_stack_top: stack_top,
             tls_fs_base,
+            interp,
         })
     }
 

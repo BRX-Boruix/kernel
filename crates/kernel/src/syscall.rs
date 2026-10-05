@@ -3396,6 +3396,14 @@ fn spawn_elf_image<S: loader::ImageSource + ?Sized>(
         Ok(l) => l,
         Err(e) => return pack_err(e),
     };
+    // 阶段 5 **中途态（如实声明）**：loader 已能解析 PT_INTERP/PT_DYNAMIC（并对其分类），
+    // 但 exec 路径**尚未**实现"把解释器装进同一地址空间并转交入口"。故此处显式拒绝动态
+    // 镜像——绝不放行一个"没人做重定位"的程序（S09：静默的错误行为比拒绝更糟）。
+    // 落地计划见 docs/TODO/3p.md 3P5-1。
+    if loaded.interp.is_some() {
+        klib::warn!("[exec] 动态可执行文件（PT_INTERP）暂不支持：解释器装载尚未接线");
+        return pack_err(Error::NotSupported);
+    }
     // exec 派生的是**当前调用进程的子进程**（C7.1）：登记真实 ppid，
     // 使 waitpid/退出码交付对 shell 前台等待等场景成立。
     let parent_pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);

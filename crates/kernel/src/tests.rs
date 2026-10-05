@@ -9529,11 +9529,14 @@ pub fn test_loader_adversarial() {
         info!("[test-loader] baseline load OK, bss + tail-pad pages verified zero");
     }
 
-    // -- 8. 未实现能力的程序头：显式拒绝而非静默跳过（伪支持止血）--
+    // -- 8. 动态链接元数据的程序头：能解析的解析、不能兑现的显式拒绝 --
     //
-    // PT_INTERP(3) / PT_DYNAMIC(2) 要求本加载器不具备的能力（动态链接器 /
-    // 重定位）。此前一律 continue：镜像会被「成功装载」，程序却在运行期以
-    // 难以定位的方式崩。显式拒绝把故障点移回装载期（S09：错误优于伪支持）。
+    // **阶段 5 起 PT_INTERP(3) 不再属"未实现能力"**：loader 会去读路径字符串，
+    // 并把它作为 `LoadedElf::interp` 交给调用方（装载解释器与入口转交是调用方的事，
+    // S13 边界）。故本用例喂的 p_filesz=0（没有路径）属**畸形** → InvalidParam。
+    //
+    // **PT_DYNAMIC(2) 单独出现仍拒绝**：没有解释器就没人做重定位，放行等于让程序
+    // 带着未重定位的指针跑起来（S09：错误优于伪支持）。
     //
     // **PT_TLS(7) 已不在拒绝面内**：3P4-1 落地用户态 TLS 后，该类型改为
     // 「解析模板 + 为每线程建块」；模板必须落在已加载段内，否则 InvalidParam
@@ -9558,7 +9561,14 @@ pub fn test_loader_adversarial() {
             elf.push(0);
         }
         elf.extend_from_slice(&[0xA5; 16]);
-        expect_loader_reject(&elf, &[], Error::NotSupported, name);
+        // PT_INTERP(3)：loader 现在会读路径；本用例 p_filesz=0（无路径）→ 畸形 → InvalidParam。
+        // PT_DYNAMIC(2)：单独出现（无 PT_INTERP）→ NotSupported。
+        let want = if p_type == 3 {
+            Error::InvalidParam
+        } else {
+            Error::NotSupported
+        };
+        expect_loader_reject(&elf, &[], want, name);
     }
 
     // -- 9. PT_TLS：模板**初值**必须落在已加载段内；只有 .tbss 的模板则接受（3P4-1）--
