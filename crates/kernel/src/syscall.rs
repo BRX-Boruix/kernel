@@ -4448,6 +4448,27 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) -> bool {
 ///
 /// 返回 `true` 表示已处置（handler 入口 或 已切换到下一进程），架构层 iretq；
 /// 返回 `false` 表示无法处置（无当前进程等致命情形），架构层停机。
+/// 用户态异常导致**终止**时的留证（S09）。
+///
+/// 为什么需要：此前进程因异常终止时内核**什么都不打印**——只留一个退出码，
+/// 出错地址（CR2）与出错指令（RIP）全部丢失。定位越界类缺陷时这正是最关键的两条信息，
+/// 实测（tcc 在系统内加载对象时崩溃）因为没有它而多花了好几轮纯行为分割。
+///
+/// 只在**终止**路径调用（不是每次异常），所以不会刷屏。
+fn log_user_fatal(sig: u64, cr2: u64, frame: &arch_x86_64::interrupts::InterruptFrame, why: &str) {
+    // fault_addr 仅 #PF（vector 14）有意义，其余异常 CR2 无意义填 0（与 SigInfo 同一约定）。
+    let fault_addr = if frame.vector == 14 { cr2 } else { 0 };
+    klib::info!(
+        "[fatal] user exception -> terminate: sig={} vector={} fault_addr={:#x} rip={:#x} err={:#x} ({})",
+        sig,
+        frame.vector,
+        fault_addr,
+        frame.rip,
+        frame.error_code,
+        why
+    );
+}
+
 pub extern "C" fn user_exception_signal_handler(
     cr2: u64,
     frame: &mut arch_x86_64::interrupts::InterruptFrame,
@@ -4464,6 +4485,7 @@ pub extern "C" fn user_exception_signal_handler(
             let restorer = cur.signal().trampoline();
             if restorer == 0 {
                 // 无 restorer（PRE-3 未装）：无法安全进 handler，终止兜底。
+                log_user_fatal(sig as u64, cr2, frame, "no restorer");
                 task::exit_current(frame, sig as u64);
                 return true; // exit_current 已改写帧为下一进程，iretq 切走
             }
@@ -4481,12 +4503,14 @@ pub extern "C" fn user_exception_signal_handler(
                 return true; // 已改写帧为 handler 入口，iretq 进用户 handler
             }
             // 用户栈写帧失败（越界/不可写）：无法安全投递，终止兜底。
+            log_user_fatal(sig as u64, cr2, frame, "signal frame not deliverable");
             task::exit_current(frame, sig as u64);
             return true;
         }
         // Ignore → 对同步异常等价 Default 终止（防异常风暴，S30）；
         // Default → 终止（现状）；越界防御同样终止。
         _ => {
+            log_user_fatal(sig as u64, cr2, frame, "default/ignore");
             task::exit_current(frame, sig as u64);
             return true; // exit_current 已改写帧为下一进程，iretq 切走
         }
