@@ -808,33 +808,45 @@ global_asm!(
         // ---- 阶段 6：跳过中断号 + 错误码 ----
         add rsp, 16
 
-        // ---- 阶段 7：弹出硬件上下文（不 iretq，用 sysretq 快速返回）----
+        // ---- 阶段 7：换回 GS 并按 iretq 返回 ----
         //
-        // 栈上 5 个槽（由低到高）：RIP, CS, RFLAGS, RSP, SS。
+        // # 为什么这里**不能**用 sysretq（3P6-1 根因五，实测修复）
         //
-        // **槽位消费精确表（FAST-4c 实测修正，见下）**：此处栈上由低到高为
-        //   [RIP, CS, RFLAGS, RSP, SS]。
-        // 正确消费：pop rcx 取 RIP → add rsp,8 丢 CS → pop r11 取 RFLAGS →
-        // **pop rsp 直接取用户 RSP**。SS 槽位于最高处，`pop rsp` 切到用户栈后
-        // 该槽自然废弃，**绝不需要第二条 add rsp,8**。
+        // 本 stub 的返回路径会被调度器用来进入**任意**进程：当某进程在本 stub 里
+        // 阻塞时，syscall 内部的 `commit_next` 会 `*frame = slot.saved` 把**目标
+        // 进程的帧**整体写进本 stub 的帧位置，随后由本 stub 的尾部负责进入它。
+        // 而目标进程的帧可能是**中断路径**（`interrupt_common_stub` 的时钟 / #PF）
+        // 保存的——那种帧的 `rcx` 槽与 `r11` 槽装的是**用户当时真正的 rcx/r11**，
+        // 不是 syscall 约定值。
         //
-        // **实测踩坑（_fast4ab5 TEMP-dispatch 证实）**：首版（以及此前的「修复版」）
-        // 在 pop r11 之后又 `add rsp,8` 注释称「丢弃 SS」——实际跳过的是**用户 RSP
-        // 槽**，随后 `pop rsp` 装进的是 **SS 槽的值 0x30**。用户程序拿到 rsp=0x30
-        // 后不带栈地继续跑（write/yield 全是展开代码，不碰栈），一切「正常」；
-        // 直到首个用寄存器做循环计数的 bench（dec r8 + jnz）才暴露：RIP 每轮
-        // 倒回 mov r8 处（rcx 恒 0x195）、r8 恒 8，死循环。教训：**无栈访问的
-        // 测试程序测不出返回栈损坏**；验收程序必须包含使用循环计数寄存器与
-        // 内存写屏障的循环。
-        pop rcx                    // RIP  -> rcx（sysretq 要求）
-        add rsp, 8                 // 丢弃 CS
-        pop r11                    // RFLAGS -> r11（sysretq 要求）
-        pop rsp                    // 用户 RSP（直接取；SS 槽自然废弃）
-
-        // ---- 阶段 8：换回 GS 并快速返回 ----
-        // 与阶段 1 的 `swapgs` 配对：恢复「用户 GS 值 / per-CPU 在 KERNEL_GS_BASE」。
+        // `sysretq` 把 `rcx` 当目标 RIP、`r11` 当目标 RFLAGS，且**不修改**它们。
+        // 于是用户拿回的 `rcx` 变成「被打断处的 RIP」、`r11` 变成 RFLAGS。对「把
+        // 循环计数器放在 rcx」的代码（libsys 的 `memset`、tcc 的 `load_data`）这是
+        // 致命的：计数器被换成代码地址，循环冲出缓冲区 → SIGSEGV。
+        //
+        // 实测（`tcc-on-boruix/boruix/probe_pf_rcx.c`，4 MiB 写循环被时钟抢占后
+        // 再由"另一个进程的阻塞 syscall"切回）：`rcx` 变成 **0x40008b**（正是该循环
+        // 存储指令的地址）、`r11` 变成 **0x10203**（RFLAGS|RF）——两者恰好就是
+        // sysretq 的两个输入。同一次运行里未触发 #PF 的对照组（预触碰全部页）完好。
+        //
+        // `iretq` 从帧里弹 RIP/CS/RFLAGS/RSP/SS，并把 15 个 GPR（含 rcx/r11）按帧
+        // 恢复，因此对「syscall 帧」与「中断帧」**都**正确——与
+        // `interrupt_common_stub` 的尾部完全一致（两者必须能互换地消费对方保存的
+        // 帧，这是本节修复后必须维持的不变式）。
+        //
+        // syscall ABI 不受影响：syscall 帧的 rcx/r11 槽本就是本 stub 压入的
+        // 「返回 RIP / RFLAGS」，用户拿到的值不变。
+        //
+        // 代价：`sysretq` 回程（SYSCALL-FAST-4）由此废除；入口仍是 `syscall`
+        // （LSTAR），快路径的主要收益（免 `int 0x80` 的门开销）保留。
+        // GS 退出判定：读**即将 iretq 的那一帧**的 CS（偏移 8 = CS）。
+        // 与阶段 1 的 `swapgs` 配对——不变式：**CPL3 ⟺ GS.base 是用户值**。
+        // 调度器可能已把帧整体换成另一进程的帧，故判据跟着「要回哪」走。
+        test byte ptr [rsp + 8], 3
+        jz 6f
         swapgs
-        sysretq
+        6:
+        iretq
     "#
 );
 
