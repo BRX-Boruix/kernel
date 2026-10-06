@@ -4763,15 +4763,21 @@ pub fn test_syscall_munmap() {
 
 /// AR1/K7/K8 对抗验收：用户缓冲区预校验（EFAULT 路线）与拷贝资源边界。
 ///
-/// 用例与历史病灶一一对应：
-/// 1. **未触碰的按需分页页**作 write 源 → 必须 EFAULT。修复前此处是内核态
-///    #PF → CPU EXCEPTION 整机停机（arch1.md AR1 的攻击面本体）；
-/// 2. 补页触碰后同一缓冲 → 正常写出（预校验不误伤合法驻留页）；
-/// 3. 跨越 USER_TOP 窗口 → OutOfRange；
-/// 4. 只读映射页作 readdir 输出目标（copy_to_user 写意图）→ EFAULT——
-///    present 但不可写的页对内核侧写入同样会内核态 #PF；
-/// 5. 越过已映射范围的长度 → EFAULT（分块逐段校验，不再整块盲拷）；
-/// 6. **K8**：O_TRUNC 无写位 → EINVAL 且文件内容原样保留；带写位截断成功。
+/// 用例与历史病灶一一对应（2026-10 随 AR1a 语义补全更新）：
+/// 1. **未触碰的按需分页页**作 write 源（copy_from_user 方向）→ 必须**成功**：
+///    该页属于本进程已声明区域，只是尚未被触碰（按需分页 = 未触碰即无 PTE）。
+///    纯存在性预校验会把它误判成野指针并返回 EFAULT——tcc 自举实测即卡在此处。
+///    修复前更早的形态是内核态 #PF → CPU EXCEPTION 整机停机（arch1.md AR1 本体）；
+/// 2. 同一方向补页后重复写出 → 仍正常（预补页不误伤已驻留页）；
+/// 3. **未触碰页**作 readdir 输出目标（copy_to_user 写意图）→ 必须**成功**：
+///    这是 POSIX `read` 进刚 malloc 缓冲的形状，即 tcc 的真实病灶；
+/// 4. **野指针**（窗口内但不在任何已声明区域内）→ 仍必须 EFAULT：
+///    补页不得放松安全断言；
+/// 5. 跨越 USER_TOP 窗口 → OutOfRange；
+/// 6. 只读映射页作 readdir 输出目标（copy_to_user 写意图）→ EFAULT——
+///    present 但不可写且不在任何按需区内，补页同样补不上；
+/// 7. 长度越过**已声明区域**边界 → EFAULT（分块逐段校验，不再整块盲拷）；
+/// 8. **K8**：O_TRUNC 无写位 → EINVAL 且文件内容原样保留；带写位截断成功。
 pub fn test_syscall_usercopy_faults() {
     use alloc::boxed::Box;
     use arch::syscall::SyscallFrame;
@@ -4819,49 +4825,99 @@ pub fn test_syscall_usercopy_faults() {
         arch_x86_64::mmio::write_cr3(p.addr_space().page_table_paddr());
     }
 
-    // 两页按需分页 mmap 区（未触碰，无 PTE）：page A 探针源，page B 放路径串。
-    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0);
+    // 四页按需分页 mmap 区（**全部未触碰**，无 PTE）：
+    //   page A = copy_to_user 目标（readdir 输出，保持未触碰直到用例 3）
+    //   page B = 路径串缓冲
+    //   page C = copy_from_user 源
+    //   page D = 验证 Fault-Ahead 预取（由 page C 的补页向前预充）
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x4000, 0, 0);
     assert!(crate::syscall::syscall_entry(&mut map));
     let page_a = map.result;
     let page_b = page_a + 0x1000;
+    let page_c = page_a + 0x2000;
+    let page_d = page_a + 0x3000;
 
     let efault = (-(Error::BadAddress.to_errno() as i64)) as u64;
     let out_of_range = (-(Error::OutOfRange.to_errno() as i64)) as u64;
     let einval = (-(Error::InvalidParam.to_errno() as i64)) as u64;
 
-    // ---- 1. 未触碰页作 write 源 → EFAULT（修复前：内核态 #PF 停机）----
-    info!("[test-syscall-usercopy] probing write from untouched demand page...");
-    let mut w = frame(crate::syscall::SYS_STREAM_WRITE, 1, page_a, 16);
+    // 前置断言：四页确为"未触碰"（无 PTE）。这是本组用例的**前提**——若这里就
+    // 已映射，后面所有"未触碰页"语义断言都会退化成对已驻留页的重复测试。
+    {
+        let p = task::current_proc_mut().expect("test proc installed");
+        for v in [page_a, page_b, page_c, page_d] {
+            assert!(
+                p.addr_space().translate(arch::VirtAddr::new(v)).is_none(),
+                "demand page {:#x} must start unmapped",
+                v
+            );
+        }
+    }
+
+    // ---- 1. copy_from_user 方向：未触碰页作 write 源 → 必须成功 ----
+    // 该页在本进程已声明区域内，只是尚未被触碰。validate_user_range 现在先按
+    // 读意图补页（fault_in_range），因此 write 正常写出 1 字节。
+    info!("[test-syscall-usercopy] write from untouched demand page (expect success)...");
+    let mut w = frame(crate::syscall::SYS_STREAM_WRITE, 1, page_c, 1);
     w.a4 = u64::MAX; // STREAM_OFFSET_CURRENT
     assert!(crate::syscall::syscall_entry(&mut w));
     assert_eq!(
-        w.result, efault,
-        "untouched demand page as write source must return EFAULT"
+        w.result, 1,
+        "untouched demand page must be faulted in and written out (not EFAULT)"
     );
-
-    // ---- 2. 补页触碰后同一缓冲 → 正常写出 ----
-    // （对 page_a 的显式补页会经 Fault-Ahead 预取把 page_b 一并建立；此处以
-    //   translate 验证两页均已驻留——对已全映射窗口的二次补页返回 false 是
-    //   "无新映射"语义，不是失败。）
     {
         let p = task::current_proc_mut().expect("test proc installed");
-        assert!(p.addr_space().handle_page_fault(page_a, arch_x86_64::paging::PageFaultCode::new(0)));
-        let p = task::current_proc_mut().expect("test proc installed");
         assert!(
-            p.addr_space()
-                .translate(arch::VirtAddr::new(page_a))
-                .is_some(),
-            "page A must be resident after explicit fault"
+            p.addr_space().translate(arch::VirtAddr::new(page_c)).is_some(),
+            "page C must be resident after pre-fault"
         );
-        let p = task::current_proc_mut().expect("test proc installed");
+        // Fault-Ahead 预取：补页从故障页起向前预充 4 页 → page D 一并驻留。
         assert!(
-            p.addr_space()
-                .translate(arch::VirtAddr::new(page_b))
-                .is_some(),
-            "page B must be resident via fault-ahead prefetch"
+            p.addr_space().translate(arch::VirtAddr::new(page_d)).is_some(),
+            "page D must be resident via fault-ahead prefetch"
+        );
+        // page A 必须仍未触碰：用例 3 靠它验证 copy_to_user 方向的补页。
+        assert!(
+            p.addr_space().translate(arch::VirtAddr::new(page_a)).is_none(),
+            "page A must stay untouched (fault-ahead only goes forward from the fault page)"
         );
     }
-    let mut w_ok = frame(crate::syscall::SYS_STREAM_WRITE, 1, page_a, 8);
+
+    // ---- 2. 路径串缓冲 page B 经 fault_in_range 单点补页驻留 ----
+    // （直接驱动新增的 mm 单点，而非另开一条补页路径。）
+    {
+        let p = task::current_proc_mut().expect("test proc installed");
+        assert!(
+            p.addr_space().fault_in_range::<arch_x86_64::paging::PageFaultCode>(
+                page_b,
+                1,
+                mm::user_space::UserAccess::Read,
+            ),
+            "fault_in_range must back the path-buffer page"
+        );
+    }
+
+    // ---- 2b. 野指针仍必须 EFAULT（补页不得放松安全断言）----
+    // 窗口内、但不在本进程任何已声明区域内的地址：补页必须补不上。
+    const WILD_ADDR: u64 = 0x0000_0000_7000_0000; // 堆基址之下的空闲用户区
+    {
+        let p = task::current_proc_mut().expect("test proc installed");
+        assert!(
+            p.addr_space().translate(arch::VirtAddr::new(WILD_ADDR)).is_none(),
+            "wild probe address must be unmapped before the test"
+        );
+    }
+    info!("[test-syscall-usercopy] wild pointer must still EFAULT...");
+    let mut w_wild = frame(crate::syscall::SYS_STREAM_WRITE, 1, WILD_ADDR, 16);
+    w_wild.a4 = u64::MAX;
+    assert!(crate::syscall::syscall_entry(&mut w_wild));
+    assert_eq!(
+        w_wild.result, efault,
+        "wild pointer outside every declared area must still return EFAULT"
+    );
+
+    // ---- 2c. 已驻留缓冲重复写出仍正常 ----
+    let mut w_ok = frame(crate::syscall::SYS_STREAM_WRITE, 1, page_c, 8);
     w_ok.a4 = u64::MAX;
     assert!(crate::syscall::syscall_entry(&mut w_ok));
     assert_eq!(w_ok.result, 8, "resident buffer must be writable out");
@@ -4886,6 +4942,24 @@ pub fn test_syscall_usercopy_faults() {
             path_dir.as_ptr(),
             (pa + off + 64) as *mut u8,
             path_dir.len(),
+        );
+    }
+
+    // ---- 2d. copy_to_user 方向：未触碰页作 readdir 输出目标 → 必须成功 ----
+    // 这是 POSIX `read` 进刚 malloc 缓冲的形状——tcc 的真实病灶
+    // （read 进 malloc 缓冲 → EFAULT → 目标缓冲内容未定义 → 后续空指针读）。
+    info!("[test-syscall-usercopy] readdir into untouched demand page (expect success)...");
+    let mut rd_new = frame(crate::syscall::SYS_ENTRY_READ, page_b + 64, page_a, 256);
+    assert!(crate::syscall::syscall_entry(&mut rd_new));
+    assert!(
+        rd_new.result != out_of_range && rd_new.result != efault && rd_new.result != 0,
+        "untouched demand page must be faulted in as copy_to_user target (not EFAULT)"
+    );
+    {
+        let p = task::current_proc_mut().expect("test proc installed");
+        assert!(
+            p.addr_space().translate(arch::VirtAddr::new(page_a)).is_some(),
+            "page A must be resident after pre-fault as readdir target"
         );
     }
 
@@ -4935,13 +5009,16 @@ pub fn test_syscall_usercopy_faults() {
         "readdir into writable resident page must succeed"
     );
 
-    // ---- 5. 长度越过已映射边界 → EFAULT（分块逐段校验）----
-    let mut w_over = frame(crate::syscall::SYS_STREAM_WRITE, 1, page_a, 0x3000);
+    // ---- 5. 长度越过**已声明区域**边界 → EFAULT（分块逐段校验）----
+    // 起点在区域内（page D 已驻留），长度跨出区域末尾（区域 = 4 页）。区外那一页
+    // 不属于任何已声明区域，补页补不上 → 整体如实拒绝。单块 0x2000 远小于 1MiB
+    // 分块上限，故在**拷贝前**就被拦下，不会产生部分输出。
+    let mut w_over = frame(crate::syscall::SYS_STREAM_WRITE, 1, page_d, 0x2000);
     w_over.a4 = u64::MAX;
     assert!(crate::syscall::syscall_entry(&mut w_over));
     assert_eq!(
         w_over.result, efault,
-        "length past the last mapped page must EFAULT"
+        "length past the declared area end must EFAULT"
     );
 
     // ---- 6. K8：O_TRUNC 无写位 → EINVAL 且内容保留；带写位才真截断 ----

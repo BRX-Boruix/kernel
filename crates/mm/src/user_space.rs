@@ -747,6 +747,58 @@ where
         true
     }
 
+    /// 主动补页：把 `[start, start + len)` 内**尚未按 `access` 意图就绪**的页
+    /// 就地补上（pre-fault，arch1.md AR1a 的语义补全，2026-10）。
+    ///
+    /// **存在理由**：按需分页意味着"合法但未被触碰 = 无 PTE"。内核侧 STAC 拷贝
+    /// 前若只做 [`Self::is_range_mapped`] 的纯存在性检查，会把**合法的** malloc
+    /// 缓冲区判成野指针并返回 EFAULT——这是 POSIX 语义错误（Linux 会补页并成功），
+    /// tcc 自举实测正是卡在这里（`read` 进刚 malloc 的缓冲 → EFAULT → 目标缓冲
+    /// 内容未定义 → 后续 `strncmp` 空指针读）。
+    ///
+    /// **不新增权限**：本函数复用与真实缺页**完全同一条**策略路径
+    /// （[handle_page_fault](Self::handle_page_fault)：COW → 栈增长 → 区域权限 →
+    /// 2M/4K 补页）。能被本函数补上的页，用户程序自己触碰也能补上；不在任何已声明
+    /// 区域内的地址依旧补不上（野指针照旧 EFAULT）。
+    ///
+    /// **边界纪律**：
+    /// - 返回 `true` 仅表示范围内每一页都已按意图就绪。帧耗尽时
+    ///   `handle_page_fault` 的 4K 路径会**部分成功**，此时本函数返回 `false`——
+    ///   调用方必须整体拒绝，**绝不允许"部分补页 + 部分拷贝"被当成成功**。
+    /// - 不改变承诺记账：配额在区域声明时已提交（ADR-049），补页只消耗物理帧。
+    /// - 本函数是**语义补全兼优化**，不是安全边界：调用方仍须随后以
+    ///   [`Self::is_range_mapped`] 复核。extable（异常恢复表）落地前的 TOCTOU
+    ///   窗口由该复核收窄，演进项见 docs/TODO/kernel-user-access-extable.md。
+    ///
+    /// **代价**：对已全部驻留的区间，本函数与随后的 `is_range_mapped` 各做一次
+    /// 逐页遍历（每页两次页表走查）。这是刻意的：两者语义不同（前者"补齐"、
+    /// 后者"复核"），合并会把"补页失败"与"校验失败"两种归因糊成一种。
+    pub fn fault_in_range<PC: arch::PageFaultCode>(
+        &self,
+        start: u64,
+        len: u64,
+        access: UserAccess,
+    ) -> bool {
+        let Some((mut page, end)) = fault_plan(start, len) else {
+            return false;
+        };
+        let write = access == UserAccess::Write;
+        while page < end {
+            // 已就绪（映射存在 + user 位 + 写意图下可写）的页无需补页；其余一律
+            // 交给策略层判定——包括"present 但只读 + 写意图"，那正是 COW 页需要
+            // `handle_page_fault` 破共享的情形（fork 后子进程读进继承缓冲）。
+            let ready = match self.translate_with_flags(VirtAddr::new(page)) {
+                Some((_, flags)) => flags.is_user() && (!write || flags.is_writable()),
+                None => false,
+            };
+            if !ready && !self.handle_page_fault(page, PC::synthetic(write)) {
+                return false;
+            }
+            page += 0x1000;
+        }
+        true
+    }
+
     /// 把本用户地址空间切换为活动页表（装入 CR3）。需 `PT: ActivePageTable`。
     ///
     /// 装载/遍历页表与并发改页表互斥 → 取 `core` 锁。注意这是**瞬时**装载：
@@ -2351,6 +2403,73 @@ pub(crate) fn plan_stack_growth(
         return None;
     }
     Some((fault_page, cur_start - fault_page))
+}
+
+/// 预补页范围规划（**纯函数**，host 单测锚定）：给定用户缓冲区起点与长度，
+/// 返回需要逐页处理的页对齐范围 `(first_page, end)`。
+///
+/// - 起点**向下取整**到页（缓冲区可以起于页中）；
+/// - 终点保持 `start + len` 原值（末页只需处理到实际触及的字节所在页）；
+/// - `len == 0` 返回 `(aligned, aligned)`——"无页可处理"，与
+///   [`UserAddressSpace::is_range_mapped`] 对零长度先返回 true 的口径一致；
+/// - 区间越出用户半区或 `start + len` 回绕返回 `None`（调用方按非法处理）。
+pub(crate) fn fault_plan(start: u64, len: u64) -> Option<(u64, u64)> {
+    const PAGE: u64 = 0x1000;
+    let aligned = start & !(PAGE - 1);
+    if len == 0 {
+        return Some((aligned, aligned));
+    }
+    let end = start.checked_add(len)?;
+    if start < USER_BASE || end > USER_TOP {
+        return None;
+    }
+    Some((aligned, end))
+}
+
+#[cfg(test)]
+mod fault_plan_tests {
+    use super::*;
+
+    #[test]
+    fn aligns_start_down_and_keeps_end_exact() {
+        // 起于页中：起点下取整到页，终点保持 start+len（末页不必补到页尾）。
+        assert_eq!(
+            fault_plan(USER_HEAP_BASE + 0x1005, 8),
+            Some((USER_HEAP_BASE + 0x1000, USER_HEAP_BASE + 0x100d))
+        );
+    }
+
+    #[test]
+    fn zero_length_plans_no_pages() {
+        // 零长度 = 无页可处理（与 is_range_mapped 的 len==0 先返回 true 同口径）。
+        let (first, end) = fault_plan(USER_HEAP_BASE + 0x2005, 0).expect("zero-len is valid");
+        assert_eq!(first, end, "零长度不得规划出任何页");
+    }
+
+    #[test]
+    fn start_plus_len_overflow_is_invalid() {
+        // 回绕即非法：绝不静默得到一个"看起来合法"的短区间。
+        assert_eq!(fault_plan(u64::MAX - 3, 16), None);
+    }
+
+    #[test]
+    fn crossing_user_top_is_invalid() {
+        assert_eq!(fault_plan(USER_TOP - 4, 8), None);
+        // 恰好贴到 USER_TOP 上界：合法（右开区间）。
+        assert_eq!(
+            fault_plan(USER_TOP - 0x1000, 0x1000),
+            Some((USER_TOP - 0x1000, USER_TOP))
+        );
+    }
+
+    #[test]
+    fn above_user_top_is_invalid() {
+        // 用户半区之上的内核地址：即使整段不跨界，也不得被规划为补页目标。
+        assert_eq!(fault_plan(USER_TOP + 0x1000, 0x1000), None);
+        // USER_BASE 是 0（低半区起点），故"低于下界"只能取内核半区地址，
+        // 与上一行同族；此处不构造 USER_BASE - 1（编译期即溢出）。
+        assert!(USER_BASE == 0);
+    }
 }
 
 #[cfg(test)]

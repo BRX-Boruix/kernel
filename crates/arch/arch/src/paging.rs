@@ -262,4 +262,17 @@ pub trait PageFaultCode: Copy {
     fn is_present(self) -> bool;
     /// 故障是否由指令取指引发。
     fn is_instruction_fetch(self) -> bool;
+    /// 合成一个"页不存在 + 指定访问意图 + 用户态访问"的缺页码。
+    ///
+    /// 供内核**主动补页**（pre-fault）使用：内核在自己的 STAC 拷贝前代用户程序
+    /// 触碰其合法但尚未触碰的页时，必须走与真实缺页**同一条**策略路径
+    /// （`mm::UserAddressSpace::handle_page_fault`），但此时并不存在硬件交付的
+    /// 原始错误码。本方法把"访问意图"翻译为架构码，翻译点仍留在架构层
+    /// （MM6：位编码知识不外泄给策略层）。
+    ///
+    /// 契约：合成码必须满足 `!is_present()`、`is_user()`、
+    /// `is_write() == write`、`!is_instruction_fetch()`——与用户在未映射页上
+    /// 做读/写访问时硬件交付的码**同形**，保证策略层无法区分二者，因而合成码
+    /// 不会绕过任何权限判定（补不上的页依旧补不上）。
+    fn synthetic(write: bool) -> Self;
 }

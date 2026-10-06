@@ -776,6 +776,17 @@ impl arch::PageFaultCode for PageFaultCode {
     fn is_instruction_fetch(self) -> bool {
         self.0 & PF_EC_INSN != 0
     }
+    /// 合成"页不存在 + 用户态 + 指定意图"的缺页码（内核主动补页用）。
+    ///
+    /// 与真实 #PF 同形：present 位不置（页不存在）、user 位置位（用户页访问）、
+    /// write 位随意图、取指位不置。位组装只在本层发生（MM6）。
+    fn synthetic(write: bool) -> Self {
+        let mut raw = PF_EC_USER;
+        if write {
+            raw |= PF_EC_WRITE;
+        }
+        Self(raw)
+    }
 }
 
 /// 保留位违规查询（x86 特有语义：bit3）。策略层经 [`arch::PageFaultCode`]

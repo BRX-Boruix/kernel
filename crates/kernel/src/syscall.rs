@@ -544,14 +544,19 @@ const MAX_SYSCALL_BUF_BYTES: u64 = 64 * 1024 * 1024;
 /// 预校验当前进程的用户缓冲区 `[buf, buf + len)` 对 `access` 意图可访问
 /// （arch1.md AR1a EFAULT 路线的统一入口）。
 ///
-/// 三层检查：
+/// 四层检查：
 /// 1. **长度上限**——超过 [`MAX_SYSCALL_BUF_BYTES`] 直接 InvalidParam：
 ///    页表预校验逐页执行，必须保证其迭代次数有界（B2）；
 /// 2. **窗口检查**——区间必须整体落在用户半区 `[USER_BASE, USER_TOP)`，
 ///    越界属参数值错误，返回 [`Error::OutOfRange`]；
-/// 3. **页表预校验**——经 [`mm::user_space::UserAddressSpace::is_range_mapped`]
+/// 3. **主动补页**——经 [`mm::user_space::UserAddressSpace::fault_in_range`]
+///    把区间内**合法但尚未被触碰**的按需分页页按访问意图补上（AR1a 语义补全，
+///    2026-10）。缺了这一步，`malloc` 之后未经自触碰就交给 syscall 的缓冲区
+///    会被误判成野指针——按需分页意味着"未触碰 = 无 PTE"；
+/// 4. **页表复核**——经 [`mm::user_space::UserAddressSpace::is_range_mapped`]
 ///    逐页确认已映射、带 user 位、写意图另需可写位；不满足返回
-///    [`Error::BadAddress`]（EFAULT）。
+///    [`Error::BadAddress`]（EFAULT）。第 3 步因帧耗尽而**部分**补页时在此被
+///    如实整体拒绝，绝不部分拷贝。
 ///
 /// 任何 STAC 拷贝（`copy_from_user`/`copy_to_user`）之前必须先通过本校验：
 /// arch 层对内核态 #PF 一律停机，这里放过一个野指针就是放过了整机死机。
@@ -568,7 +573,14 @@ fn validate_user_range(buf: u64, len: u64, access: UserAccess) -> Result<(), Err
     let Some(proc) = current_proc_mut() else {
         return Err(Error::NotFound);
     };
-    if proc.addr_space().is_range_mapped(buf, len, access) {
+    let space = proc.addr_space();
+    // 第 3 层：按意图主动补页（复用 handle_page_fault 单点，不新增任何权限）。
+    // 补页失败 = 区间内有页不属于本进程任何已声明区域（野指针）或物理帧耗尽。
+    if !space.fault_in_range::<arch_x86_64::paging::PageFaultCode>(buf, len, access) {
+        return Err(Error::BadAddress);
+    }
+    // 第 4 层：补页后复核。这也是 extable 落地前收窄 TOCTOU 窗口的那一次检查。
+    if space.is_range_mapped(buf, len, access) {
         Ok(())
     } else {
         Err(Error::BadAddress)
