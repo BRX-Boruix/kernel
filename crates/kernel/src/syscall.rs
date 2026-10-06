@@ -4458,12 +4458,28 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) -> bool {
 fn log_user_fatal(sig: u64, cr2: u64, frame: &arch_x86_64::interrupts::InterruptFrame, why: &str) {
     // fault_addr 仅 #PF（vector 14）有意义，其余异常 CR2 无意义填 0（与 SigInfo 同一约定）。
     let fault_addr = if frame.vector == 14 { cr2 } else { 0 };
+    // 再取一个**调用方返回地址**：只知出错指令（`memset`/`memcpy` 本身）不足以定位缺陷，
+    // 缺陷在**调用方**。`memset`/`memcpy` 是叶子函数，出错时 `[rsp]` 就是返回地址。
+    //
+    // **必须先校验用户栈页**：`copy_from_user` 是裸拷贝，arch 层对内核态 #PF 一律停机，
+    // 在这条致命路径上读一个野指针就是整机死机（`validate_user_range` 的文档正是这么写的）。
+    let mut ret_addr: u64 = 0;
+    if validate_user_range(frame.rsp, 8, UserAccess::Read).is_ok() {
+        unsafe {
+            arch_x86_64::mmio::copy_from_user(
+                &mut ret_addr as *mut u64 as *mut u8,
+                frame.rsp,
+                8,
+            );
+        }
+    }
     klib::info!(
-        "[fatal] user exception -> terminate: sig={} vector={} fault_addr={:#x} rip={:#x} err={:#x} ({})",
+        "[fatal] user exception -> terminate: sig={} vector={} fault_addr={:#x} rip={:#x} ret={:#x} err={:#x} ({})",
         sig,
         frame.vector,
         fault_addr,
         frame.rip,
+        ret_addr,
         frame.error_code,
         why
     );
