@@ -9930,6 +9930,71 @@ pub fn test_signal_foundation() {
             .expect("spawned process must have trampoline");
         assert_eq!(tp2, SIGNAL_RESTORER_ADDR, "spawned proc trampoline set");
         info!("[test-signal] 9b PRE-3 spawn sets trampoline (pid={} tp={:#x})", pid, tp2);
+
+        // 9c. **exec 路径必须继承父进程的 cwd**（2026-10 修复：spawn_with_ppid_fds
+        //     此前漏了这一步，导致 shell 里 `cd /dir && prog rel-file` 以 cwd=`/`
+        //     运行 → 找不到 rel-file；实测 tcc 即卡在这里）。
+        //     夹具纪律：父必须**在进程表内**（`register_test_entry` 的文档已写明
+        //     只写 CURRENT_PROC 会得到 NotFound），且必须有一个**非默认** cwd，
+        //     否则断言恒真。
+        const CWD_DAD: usize = 0x00E1_D0D0;
+        assert!(
+            task::scheduler::test_hooks::register_test_entry(CWD_DAD, 0, "cwddad.elf"),
+            "register cwd-dad entry"
+        );
+        assert_eq!(
+            task::scheduler::test_hooks::probe_cwd(CWD_DAD).as_deref(),
+            Some("/"),
+            "fresh PCB must default to /"
+        );
+        assert!(
+            task::scheduler::test_hooks::set_test_cwd(CWD_DAD, "/volumes/BORUIX_DATA/3p"),
+            "set cwd-dad cwd"
+        );
+        let child_us = UserAddressSpace::<X86PageTable>::new().expect("new cwd-child user space");
+        let cwd_child = task::spawn_with_ppid_fds(
+            CWD_DAD,
+            "cwdchild.elf",
+            0x1000,
+            0x4000_0000,
+            child_us,
+            0,
+            None,
+            task::process::ProcessIdentity::default_user(),
+        )
+        .expect("spawn child of cwd-dad");
+        assert_eq!(
+            task::scheduler::test_hooks::probe_cwd(cwd_child).as_deref(),
+            Some("/volumes/BORUIX_DATA/3p"),
+            "exec path must inherit the parent's cwd (POSIX)"
+        );
+        info!(
+            "[test-signal] 9c exec inherits parent cwd -> {:?} (pid={})",
+            task::scheduler::test_hooks::probe_cwd(cwd_child),
+            cwd_child
+        );
+        // 负向对照：引导路径（ppid=0）没有可继承的父，必须保持默认 `/`。
+        let boot_us = UserAddressSpace::<X86PageTable>::new().expect("new bootstrap user space");
+        let boot_child = task::spawn_with_ppid_fds(
+            0,
+            "cwdinit.elf",
+            0x1000,
+            0x4000_0000,
+            boot_us,
+            0,
+            None,
+            task::process::ProcessIdentity::default_user(),
+        )
+        .expect("spawn bootstrap child");
+        assert_eq!(
+            task::scheduler::test_hooks::probe_cwd(boot_child).as_deref(),
+            Some("/"),
+            "bootstrap spawn (ppid=0) must keep the default cwd"
+        );
+        info!(
+            "[test-signal] 9c bootstrap spawn keeps cwd=/ (pid={})",
+            boot_child
+        );
     }
 
     info!("[test-signal] === ADR-034 前期工作全部通过（返回主流程继续启动）===");

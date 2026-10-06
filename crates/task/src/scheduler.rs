@@ -537,15 +537,23 @@ pub fn spawn_with_ppid_fds(
     let (name_buf, name_len) = store_name(name)?;
     // 父必须真实存在且非 zombie，否则拒绝建立虚假父子关系（零伪数据）。
     // 分桶化：父须实际在册（map 中存在）且非 zombie；否则视同无父/不存在。
-    if ppid != 0 {
-        let ok = proc_bucket_lock(ppid)
-            .get(&ppid)
-            .map(|p| p.proc.state() != TaskState::Exit)
-            .unwrap_or(false);
-        if !ok {
-            return Err(Error::NotFound);
+    //
+    // **同时快照父的 cwd**（与 fork 路径 `spawn_derived` 的 `leader.proc.cwd()` 同源）：
+    // `exec_path` 出来的子进程必须继承调用方的当前目录。否则 shell 里
+    // `cd /dir && prog rel-file` 会以 cwd=`/` 运行 → 找不到 `rel-file`
+    // （2026-10 实测：`cd /volumes/BORUIX_DATA/3p && tcc hello.c` 报
+    // `file 'hello.c' not found`，而同一行改用绝对路径就能装载文件）。
+    // 快照与校验放在**同一次持锁**内：分两次加锁会在两次之间给父进程改 cwd 的机会。
+    let inherited_cwd = if ppid != 0 {
+        let guard = proc_bucket_lock(ppid);
+        match guard.get(&ppid) {
+            Some(p) if p.proc.state() != TaskState::Exit => Some(p.proc.cwd()),
+            _ => return Err(Error::NotFound),
         }
-    }
+    } else {
+        // 引导路径（init 等）：没有可继承的父，保持 `Process::new` 的默认 `/`。
+        None
+    };
     let pid = alloc_pid();
     // 分配独立内核栈（16 帧；HHDM 高半区在所有进程页表继承可见）。
     let stack_frame = mm::allocate_frames(KSTACK_ORDER).ok_or(Error::OutOfMemory)?;
@@ -567,6 +575,13 @@ pub fn spawn_with_ppid_fds(
         Arc::new(addr_space),
     ));
     proc.signal_mut().set_trampoline(trampoline);
+    // 继承父进程的 cwd（POSIX：exec 不改变当前目录）。修复前这里恒为
+    // `Process::new` 的默认 `/` —— `spawn_derived`（fork 路径）有这一步，而本函数
+    // （`SYS_TASK_SPAWN`/`exec_path` 的公共实现）漏了，于是 shell 里 `cd` 之后
+    // 启动的程序都从根目录解析相对路径。
+    if let Some(cwd) = inherited_cwd {
+        proc.set_cwd(cwd);
+    }
     // 管道方案 A：注入父进程继承的 fd 表（若提供）。非空才替换（空表保留
     // 默认标准流）。pipe 端引用计数已由 syscall 层在克隆时递增，此处仅挂表。
     if let Some(fds) = inherited_fds {
@@ -4562,6 +4577,29 @@ pub mod test_hooks {
         // 分桶化：pid 在册则持其所在桶读探针。
         let guard = proc_bucket_lock(pid);
         guard.get(&pid).map(|e| e.proc.signal().trampoline())
+    }
+
+    /// 夹具：设置表内某进程的 cwd（`[test-signal]` 9c 验收用）。
+    ///
+    /// 为什么需要它：`register_test_entry*` 建出来的 PCB 的 cwd 恒为
+    /// `Process::new` 的默认值 `/`；要验证「子进程继承父 cwd」必须先让父有一个
+    /// **非默认**的 cwd，否则断言会恒真（拿默认值比默认值 —— 假绿）。
+    pub fn set_test_cwd(pid: usize, cwd: &str) -> bool {
+        let guard = proc_bucket_lock(pid);
+        match guard.get(&pid) {
+            Some(e) => {
+                e.proc.set_cwd(alloc::string::String::from(cwd));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 探针：返回表内某进程的 cwd（`[test-signal]` 9c 验收用）。
+    pub fn probe_cwd(pid: usize) -> Option<alloc::string::String> {
+        // 分桶化：pid 在册则持其所在桶读探针。
+        let guard = proc_bucket_lock(pid);
+        guard.get(&pid).map(|e| e.proc.cwd())
     }
 
     /// 真实内存记账探针（C1.2 验收用）：返回该进程地址空间 declared_bytes()（MM7：虚拟预留量，非 RSS）。
