@@ -3798,6 +3798,29 @@ fn waitpid_inner(
             slot.saved = *f;
         }
     }
+    // ---- 修复（目标第 11 轮）：登记后的**二次探测**，关闭 check-then-register 丢唤醒窗口 ----
+    //
+    // 【缺陷（第 10 轮定位）】本函数上方「探 zombie」（WAIT_ANY 分支第 1 步 / 单目标分支的
+    // `reap_child_locked`）与「登记 waiting_for」**不在同一临界区**：子进程若在这两步之间退出，
+    // 其终止路径对父的交付（本文件 :3015-3032）要求父已 `Blocked` 且 `waiting_for` 已置，
+    // 条件不满足即**跳过投递**；父随后登记并切走，此后再无任何事件唤醒它 ⇒ **永久挂起**。
+    // 实测：wave2 的 fork 段连续 6 次挂起，且同代码时通时挂（取决于子进程是否恰在窗口内退出）。
+    //
+    // 【修法】登记之后**再探一次**：此刻若已有可收割的 zombie，就撤销登记并就地交付，不切走。
+    // 因为退出侧投递同样持 cur 的 per-pid 锁、且只要求 `waiting_for` 已置，故**登记之后到达的
+    // 任何退出都必然被交付**——窗口关闭。
+    //
+    // 【锁序】先释放 cur 槽锁再调 `waitpid_probe`（它自己按序取子进程桶锁），与上方探测同序。
+    if let Ok(Waited::Reaped { pid, code }) = waitpid_probe(cur, target_pid) {
+        {
+            let mut gc = proc_bucket_lock(cur);
+            if let Some(s) = gc.get_mut(&cur) {
+                s.waiting_for = None;
+                s.proc.set_state(TaskState::Running);
+            }
+        }
+        return Ok(Waited::Reaped { pid, code });
+    }
     // cur 已 Blocked+waiting_for 登记。切换到任一非 cur 就绪进程。
     if let Some(f) = frame.as_deref_mut() {
         // 物理切换形态（真实 syscall）：统一"选 next + 原子提交切换"原语（DESIGN §3.2）。
