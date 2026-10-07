@@ -1244,6 +1244,18 @@ fn sys_open(frame: &mut SyscallFrame) -> u64 {
 
     let inode = match root.resolve(&path, true) {
         Ok(n) => {
+            // FLAG_EXCL（O_EXCL，3P6-2 第二波）：独占创建。POSIX 语义——
+            // `O_CREAT|O_EXCL` 时若路径**已存在**则 open 失败（EEXIST），绝不
+            // 打开已有文件。
+            //
+            // 为什么判定必须落在这里（而不是让用户态先 stat 再 create）：
+            // `resolve` 与本判定在同一 syscall、同一内核临界区内完成，中间没有
+            // 可被抢占的窗口；用户态两步走则存在 TOCTOU——两个进程可同时判定
+            // 「不存在」，随后互相覆盖刚建的临时文件。`mkstemp`/`mkdtemp` 的
+            // 原子性只能由内核提供，用户态无法补出。
+            if flags.exclusive {
+                return pack_err(Error::AlreadyExists);
+            }
             if flags.truncate {
                 // kernel1.md K8：截断失败必须上抛，绝不能 `let _ =` 吞错——
                 // 吞错会让调用者相信文件已清空而实际内容原样保留（伪成功）。

@@ -28,6 +28,15 @@ pub struct OpenFlags {
     /// 归属：这是**每 fd** 的标志（不是每"打开文件描述"），本系统每个 fd 槽各自
     /// 持一份 `OpenHandle`（`dup2` 值拷贝标志、共享偏移），故放在这里即可。
     pub cloexec: bool,
+    /// FLAG_EXCL（O_EXCL）：**独占创建**——`create` 与 `exclusive` 同时置位时，
+    /// 若路径已存在则 open 以 `AlreadyExists`（EEXIST）失败，绝不打开已有文件。
+    /// 位分配 = bit 8（用户侧同一事实见 `libsys::io::OpenFlags`，线格式单点解码在
+    /// `kernel::syscall::sys_open`）。
+    ///
+    /// 语义归属：**判定必须与创建在同一 syscall 内完成**，否则用户态只能「先 stat
+    /// 再 create」，两步之间的 TOCTOU 窗口会让 `mkstemp` 类调用互相覆盖临时文件。
+    /// 故本标志的解释点在 sys_open（内核侧），而不是用户态。
+    pub exclusive: bool,
 }
 
 impl OpenFlags {
@@ -40,6 +49,7 @@ impl OpenFlags {
         directory: false,
         pipe: false,
         cloexec: false,
+        exclusive: false,
     };
 
     pub const WRITE_ONLY: Self = Self {
@@ -51,6 +61,7 @@ impl OpenFlags {
         directory: false,
         pipe: false,
         cloexec: false,
+        exclusive: false,
     };
 
     pub const READ_WRITE: Self = Self {
@@ -62,6 +73,7 @@ impl OpenFlags {
         directory: false,
         pipe: false,
         cloexec: false,
+        exclusive: false,
     };
 
     pub const CREATE_OR_TRUNCATE: Self = Self {
@@ -73,6 +85,7 @@ impl OpenFlags {
         directory: false,
         pipe: false,
         cloexec: false,
+        exclusive: false,
     };
 
     /// 追加写（O_APPEND 语义）：每次 write 的落点锚定当前真实大小。
@@ -85,6 +98,7 @@ impl OpenFlags {
         directory: false,
         pipe: false,
         cloexec: false,
+        exclusive: false,
     };
 
     pub const fn to_bits(self) -> u32 {
@@ -113,6 +127,9 @@ impl OpenFlags {
         if self.cloexec {
             bits |= 1 << 7;
         }
+        if self.exclusive {
+            bits |= 1 << 8;
+        }
         bits
     }
 
@@ -132,6 +149,7 @@ impl OpenFlags {
             directory: (bits & (1 << 5)) != 0,
             pipe: (bits & (1 << 6)) != 0,
             cloexec: (bits & (1 << 7)) != 0,
+            exclusive: (bits & (1 << 8)) != 0,
         }
     }
 }
