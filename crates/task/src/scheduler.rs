@@ -3846,6 +3846,50 @@ fn waitpid_inner(
         }
         return Ok(Waited::Reaped { pid, code });
     }
+    // ---- 交付竞态收口（本轮修复）：登记之后、切换之前，判"是否已被交付" ----
+    //
+    // 【缺陷（本轮定位）】上面的登记（waiting_for/Blocked/saved）与下面的
+    // `pop_and_commit_switch` **不在同一临界区**：子进程若恰好在这两步之间退出，其终止
+    // 路径会**已经交付**——清 `waiting_for`、写 `saved.rax/r10`、`set_state(Ready)`、
+    // `wake_enqueue` 入队。此时父进程**仍会切走**，而切走会把**当前帧**重新存进 `saved`
+    // ⇒ **覆盖掉刚交付的退出码**。父进程还留在就绪队列里，稍后被调度回来时从被覆盖的
+    // `saved` 恢复 ⇒ `rax = 0`（登记时的占位值）⇒ `waitpid` 返回 0 ⇒ 调用方
+    // （shell 的 `yield_now(); continue;` 重试循环）反复重试 ⇒ **自旋烧核**。
+    // 实测形态：子进程正常退出后 shell 停住，CPU ≈ 4.2 核 > 空闲基线 3.2（是自旋不是阻塞）。
+    //
+    // 【判据】交付会把 `waiting_for` 清空并把状态置 `Ready`；未交付时 `waiting_for`
+    // 恒为 `Some(..)`、状态为 `Blocked`。故 `waiting_for.is_none()` 就是"已交付"的确证。
+    //
+    // 【修法】就地取走交付结果、**撤销 `wake_enqueue` 的入队**（本进程马上就在本核继续
+    // 跑，不该再被排一次，否则会被两个核同时调度）、把结果写进**当前帧**，直接返回。
+    // **绝不切走**，故没有覆盖 `saved` 的机会。锁序保持 pid → RUN（与文件头纪律一致）。
+    let delivered = {
+        let mut gc = proc_bucket_lock(cur);
+        let is_delivered = gc
+            .get(&cur)
+            .is_some_and(|s| s.waiting_for.is_none() && s.proc.state() == TaskState::Ready);
+        if is_delivered {
+            let (pid, code) = gc
+                .get(&cur)
+                .map(|s| (s.saved.r10 as usize, s.saved.rax))
+                .unwrap_or((0, 0));
+            // 撤销入队（持 cur 槽锁期间取 RUN，顺序 pid → RUN）。
+            dequeue_ready(run, cur);
+            if let Some(s) = gc.get_mut(&cur) {
+                s.proc.set_state(TaskState::Running);
+            }
+            Some((pid, code))
+        } else {
+            None
+        }
+    };
+    if let Some((pid, code)) = delivered {
+        if let Some(f) = frame.as_deref_mut() {
+            f.rax = code;
+            f.r10 = pid as u64;
+        }
+        return Ok(Waited::Reaped { pid, code });
+    }
     // cur 已 Blocked+waiting_for 登记。切换到任一非 cur 就绪进程。
     if let Some(f) = frame.as_deref_mut() {
         // 物理切换形态（真实 syscall）：统一"选 next + 原子提交切换"原语（DESIGN §3.2）。
