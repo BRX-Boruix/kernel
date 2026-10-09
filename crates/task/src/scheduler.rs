@@ -2807,17 +2807,10 @@ pub fn debug_set_saved_rax(pid: usize, rax: u64) -> bool {
 
 // ---------- C7.1 终止核心：zombie / 退出码交付 / 孤儿级联 ----------
 
-/// 父进程是否具备收尸资格：存在、非 zombie。`0` 表示无父。
-///
-/// zombie 父进程自己都在等收尸，无资格再收尸；其子女退出时按"无父"处理
-/// （立即回收），避免 zombie 链无限累积。
-fn parent_reapable(ppid: usize) -> bool {
-    ppid != 0
-        && proc_bucket_lock(ppid)
-            .get(&ppid)
-            .map(|p| p.proc.state() != TaskState::Exit)
-            .unwrap_or(false)
-}
+// （原 `parent_reapable(ppid)` 已删除：它只服务于"父进程判定"，而该判定现在
+//  与交付动作一起收进 `terminate` 里的**同一把父槽锁**——两段式判定有 TOCTOU
+//  窗口，会走到 `.expect("parent reapable")` 而 panic 内核。语义（`ppid == 0` 与
+//  zombie 父均视为"无父"）在新代码里逐字保留，见那里的注释。）
 
 /// 终止结果（供日志与测试钩子断言）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3012,26 +3005,40 @@ fn terminate_process_locked(pid: usize, code: u64) -> Termination {
     // 父进程判定与交付动作：reapable 自持 ppid 锁判态；若交付则在 ppid 锁内
     // 完成（写入父 waiting_for/保存帧/置 Ready 并读回父 home 供唤醒入队）。
     // 这是第二个 pid 区域，与 pid 槽互斥且单点（交付父与收尸子不并发）。
-    let reapable = parent_reapable(ppid);
-    let deliver_ppid_home = if reapable {
+    // **父进程判定与交付必须在同一次持锁内完成**（实测 panic 修复）。
+    //
+    // 原实现先 `parent_reapable(ppid)`（自持一把锁判"存在且非 zombie"），**释放**后再
+    // `proc_bucket_lock(ppid)` 并 `.expect("parent reapable")`——两步之间父进程可能
+    // 已被收尸/退出（TOCTOU），于是 **panic 内核**。实测该路径由正常用户态
+    // （子进程退出时的父收尸）可达。
+    //
+    // 本版把判定与交付收进同一把父槽锁：
+    //   - 父已消失（含 `ppid == 0` 的引导情形）⇒ `reapable = false`，与旧
+    //     `parent_reapable` 对"无父"的结论**逐字一致**（走立即回收）；
+    //   - 父为 zombie ⇒ 同样 `false`（zombie 父无资格收尸，避免 zombie 链累积）；
+    //   - 父存活 ⇒ `reapable = true`，再按"是否阻塞等本 pid"决定交付。
+    let (reapable, deliver_ppid_home) = {
         let mut gp = proc_bucket_lock(ppid);
-        let ps = gp.get_mut(&ppid).expect("parent reapable");
-        if ps.proc.state() == TaskState::Blocked
-            && (ps.waiting_for == Some(pid) || ps.waiting_for == Some(WAIT_ANY))
-        {
-            // 交付：退出码即 syscall 成功返回值（pack_ok(code) == code），
-            // 直接写进父的保存帧 rax；被收尸子进程 pid 写进保存帧 r10——
-            // 父被调度回来 iretq 后用户态即刻拿到 rax=code、r10=pid。
-            ps.waiting_for = None;
-            ps.saved.rax = code;
-            ps.saved.r10 = pid as u64;
-            ps.proc.set_state(TaskState::Ready);
-            Some(ps.home_cpu)
-        } else {
-            None
+        match gp.get_mut(&ppid) {
+            None => (false, None),
+            Some(ps) if ps.proc.state() == TaskState::Exit => (false, None),
+            Some(ps) => {
+                if ps.proc.state() == TaskState::Blocked
+                    && (ps.waiting_for == Some(pid) || ps.waiting_for == Some(WAIT_ANY))
+                {
+                    // 交付：退出码即 syscall 成功返回值（pack_ok(code) == code），
+                    // 直接写进父的保存帧 rax；被收尸子进程 pid 写进保存帧 r10——
+                    // 父被调度回来 iretq 后用户态即刻拿到 rax=code、r10=pid。
+                    ps.waiting_for = None;
+                    ps.saved.rax = code;
+                    ps.saved.r10 = pid as u64;
+                    ps.proc.set_state(TaskState::Ready);
+                    (true, Some(ps.home_cpu))
+                } else {
+                    (true, None)
+                }
+            }
         }
-    } else {
-        None
     };
     let deliver = deliver_ppid_home.is_some();
 
@@ -3287,26 +3294,56 @@ fn blocked_wakeable_for(target_pid: usize, cur: usize) -> bool {
 ///    `Ok(Reaped)`（收割本身是收尸语义的一部分，与阻塞路径一致，非破坏性）；
 /// 2. 单目标不存在/非亲生 → `Err(NotFound)`（与 inner 同判据）；
 /// 3. 其余（有子进程但都在跑）→ `Err(WouldBlock)`（调用方继续注册定时器+真阻塞）。
+/// 在**已持有的桶锁**内，找并收割 `cur` 的第一个 zombie 直接子进程。
+///
+/// ## 为什么需要"持锁内"版本（这是实测 panic 的根因修复）
+///
+/// 调用点原先是「持锁扫描 → **释放桶锁** → `reap_child_locked` 重取锁收割」。
+/// 两步之间，子进程的**退出路径在另一个核上**可能已经把该表项摘除（退出路径在
+/// `DeliveredToParent` 分支里 `remove` 该 pid），于是 `reap_child_locked` 返回
+/// `None`，而调用点用 `.expect("zombie confirmed")` **panic 内核**。实测形态
+/// （`sys_task_wait` → `waitpid_probe`）见 docs/TODO/3p.md。
+///
+/// 本版本把「判定 + 摘除」收进**同一临界区**：父侧持子进程桶锁期间，退出路径
+/// 无法摘除该表项（它必须取**同一把** `proc_bucket_lock(pid)`）⇒ 窗口不存在。
+/// 表项确实已不在时只是"找不到"，如实返回 `None`——**绝不 panic**。
+///
+/// R1 口径与 `waitpid_inner` 一致：`tgid() == pid` 才是进程子，组员不算。
+/// 摘除后的清理顺序与 `reap_child_locked` **逐字相同**（uio → sync → retire），
+/// 且同样在桶锁内进行——**不引入新的锁序**。
+fn reap_zombie_child_in(
+    cur: usize,
+    gc: &mut BTreeMap<usize, Box<ProcEntry>>,
+) -> Option<(usize, u64)> {
+    let mut victim: Option<usize> = None;
+    for (p, e) in gc.iter() {
+        if e.proc.tgid() == *p && e.ppid == cur && e.proc.state() == TaskState::Exit {
+            victim = Some(*p);
+            break;
+        }
+    }
+    let victim = victim?;
+    let code = gc.get(&victim).map(|e| e.exit_code).unwrap_or(0);
+    driver::uio_on_process_exit(victim);
+    ipc::sync_release_process(victim);
+    if let Some(e) = gc.remove(&victim) {
+        let home = e.home_cpu;
+        retire_entry(e, home);
+    }
+    Some((victim, code))
+}
+
 fn waitpid_probe(cur: usize, target_pid: usize) -> Result<Waited, Error> {
     if target_pid == WAIT_ANY {
         // 扫描所有直接子进程：首个 zombie 即收割（与 inner 的 R1 口径一致：
         // 排除组员——组员 ppid==组长但不是进程子）。
-        let mut first_zombie_child: Option<usize> = None;
+        // 扫描所有直接子进程：首个 zombie **在同一临界区内**收割。
+        // （原实现"扫描后释放锁再收割"有跨核竞态窗口，见 reap_zombie_child_in 的注释。）
         for bucket in PROCESSES.iter() {
-            let gi = bucket.lock();
-            for (p, e) in gi.iter() {
-                if e.proc.tgid() == *p && e.ppid == cur && e.proc.state() == TaskState::Exit {
-                    first_zombie_child = Some(*p);
-                    break;
-                }
+            let mut gi = bucket.lock();
+            if let Some((pid, code)) = reap_zombie_child_in(cur, &mut gi) {
+                return Ok(Waited::Reaped { pid, code });
             }
-            if first_zombie_child.is_some() {
-                break;
-            }
-        }
-        if let Some(c) = first_zombie_child {
-            let (pid, code) = reap_child_locked(cur, c).expect("zombie confirmed");
-            return Ok(Waited::Reaped { pid, code });
         }
         // 无 zombie：有子进程 → WouldBlock（等）；无子进程 → NotFound（ECHILD）。
         let has_children = {
@@ -3606,28 +3643,16 @@ fn waitpid_inner(
 ) -> Result<Waited, Error> {
     // ---- WAIT_ANY（等待任意子进程）分支 ----
     if target_pid == WAIT_ANY {
-        // 1. 扫描所有子进程，如有 zombie 则收割（取第一个）。逐桶升序取锁。
-        //    桶内 BTreeMap 按 pid 升序迭代；判到首个 zombie 子进程即记下其 pid，
-        //    释放桶锁后再交 reap_child_locked 重取该子桶完成收割（避免同桶重锁）。
-        let mut first_zombie_child: Option<usize> = None;
+        // 1. 扫描所有子进程，如有 zombie 则**在同一临界区内**收割（取第一个）。
+        //    逐桶升序取锁；桶内 BTreeMap 按 pid 升序迭代，故"第一个"与 pid 升序一致。
+        //    R1 口径（排除组员）由 reap_zombie_child_in 实现——**单点**，不再两处各写一遍。
+        //    （原实现"扫描后释放锁再收割"有跨核竞态窗口：表项可能已被退出路径摘除，
+        //      于是 reap 返回 None 而调用点 .expect() **panic 内核**。）
         for bucket in PROCESSES.iter() {
-            let gi = bucket.lock();
-            for (p, e) in gi.iter() {
-                // R1：排除组员——组员 ppid==组长（可被组长显式 join / C4），但**不是**
-                // 组长可经 WAIT_ANY 收取的进程子。真正的进程子 tgid == 自身 pid（自己的
-                // 组长/独立进程）；组员 tgid != 自身 pid，跳过，不得误报给组长。
-                if e.proc.tgid() == *p && e.ppid == cur && e.proc.state() == TaskState::Exit {
-                    first_zombie_child = Some(*p);
-                    break;
-                }
+            let mut gi = bucket.lock();
+            if let Some((pid, code)) = reap_zombie_child_in(cur, &mut gi) {
+                return Ok(Waited::Reaped { pid, code });
             }
-            if first_zombie_child.is_some() {
-                break;
-            }
-        }
-        if let Some(c) = first_zombie_child {
-            let (pid, code) = reap_child_locked(cur, c).expect("zombie confirmed");
-            return Ok(Waited::Reaped { pid, code });
         }
         // 2. 无 zombie：检查是否至少有一个子进程存在。
         let has_children = {
