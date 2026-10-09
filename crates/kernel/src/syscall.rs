@@ -2467,6 +2467,13 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
                     // 可能刚写过**无换行**的部分行——不冲刷则输出滞留行缓冲，
                     // 用户在进程停车的整个期间什么都看不到（r8 实测缺陷）。
                     klib::console::flush_all_line_buffers();
+                    // **常驻低噪声留痕**：即将停在"读控制台 fd"上时打一行（含 pid）。
+                    // 理由与安全性与 input_event_blocking 那处**逐字相同**（见其注释：
+                    // 打点在阻塞**之前**，进程仍 Running、帧未被替换）。
+                    {
+                        let p = current_proc_mut().map(|q| q.pid()).unwrap_or(0);
+                        klib::info!("[blk] pid={} console_blocking (read fd)", p);
+                    }
                     match console_blocking(frame, &handle.inode) {
                         // 已挂起切走 / 已如实交付（并发等待者被占时的 0 字节）：
                         // 本帧结果已定，入口不得再写返回值。
@@ -2496,6 +2503,22 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
                     // （如 demo 的 `[CHAR a]`）——不冲刷则输出滞留行缓冲，用户
                     // 在进程停车的整个期间什么都看不到（r8 实测缺陷）。
                     klib::console::flush_all_line_buffers();
+                    // **常驻低噪声留痕**：进程即将停在"读输入事件流"上时打一行（含 pid）。
+                    //
+                    // 为什么必须有：BLOCKED_ON_EVENTS 计数只回答"阻塞了几次"，回答不了
+                    // "**是哪个进程**卡在输入上"——而"某个程序零输出且永不退出"这类现象，
+                    // 恰恰只能靠 pid 关联来判定（对照 [term] 的 pid）。
+                    //
+                    // **为什么打在这里是安全的**：本行在调用 block_for_input_event
+                    // **之前**——进程仍 Running、帧尚未被替换。代码里警告的"切换路径上打印
+                    // 会冻结"指的是 Switched 分支**之后**（帧已被整体替换、控制台锁可能
+                    // 随被切走的帧悬挂）。两者是不同位置，不可混为一谈。
+                    //
+                    // 噪声量级（实测）：每次真正的阻塞 1 行；正常运行时近乎为零。
+                    {
+                        let p = current_proc_mut().map(|q| q.pid()).unwrap_or(0);
+                        klib::info!("[blk] pid={} input_event_blocking", p);
+                    }
                     match input_event_blocking(frame, probe) {
                         // 已挂起切走（`Switched`）或已如实交付（等待者被占
                         // 时的 0 字节）：本帧结果已定，入口不得再写返回值。
@@ -2827,7 +2850,7 @@ fn audio_fetch_blocking(frame: &mut SyscallFrame, inode: &alloc::sync::Arc<dyn v
     // 它们仍会在"确有生产者却真的拿不到数据"时出现，可观测性不受损。
     // 不采用降级或节流：那只是让症状不显眼，根因仍在。
     klib::info!("[audio] pid={} fetch blocking on empty ring", pid);
-    match task::block_for_audio(arch_frame(frame), move || !audio_ring_empty(&probe)) {
+            match task::block_for_audio(arch_frame(frame), move || !audio_ring_empty(&probe)) {
         task::SwitchOutcome::Switched => {
             klib::info!("[audio] pid={} switched out (asleep)", pid);
             DispatchResult::Switched
@@ -5061,6 +5084,8 @@ fn irq_wait_blocking(frame: &mut SyscallFrame, pid: usize, irq: u8, timeout_ns: 
         }
         driver::irq_owner::irq_timer_clear(irq);
     };
+    // [临时诊断] block_for_irq **不打**：audiod 会在忙循环里反复调它（实测 38257 次），
+    // 打了会淹没串口、并改变时序。该缺陷另案处理。
     match task::block_for_irq(arch_frame(frame), irq) {
         task::SwitchOutcome::Switched => DispatchResult::Switched,
         task::SwitchOutcome::NotSwitched => {
