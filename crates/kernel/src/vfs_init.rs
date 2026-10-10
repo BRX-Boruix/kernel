@@ -737,6 +737,44 @@ impl DeviceInfoProvider for KernelDeviceProvider {
         }
     }
 
+    /// `/devices/storage/cache`：各设备块缓存的真实计数快照（键 = 设备名）。
+    ///
+    /// 全部直读 [`fs::block_cache::CacheStats`] 与槽位脏标志，无影子副本、无修饰：
+    /// 计数难看就如实难看。**`misses`/`writebacks` 直接等于设备读/写命令次数**
+    /// （每个缓存块 = 一条 512 字节命令），故这组数字就是"磁盘操作次数"的真值。
+    fn blk_cache_stats_json(&self) -> String {
+        // 先取快照再序列化：序列化期间不持有 DEVICE_CACHES 锁（避免与
+        // 缓存自身锁形成不必要的锁序），也避免在锁内调用 dirty_count。
+        let caches: alloc::vec::Vec<(String, Arc<fs::block_cache::CachingByteDevice>)> = {
+            let reg = DEVICE_CACHES.lock();
+            reg.iter().map(|(n, c)| (n.clone(), c.clone())).collect()
+        };
+        let mut target = klib::json::VecTarget::new();
+        let mut writer = klib::json::JsonWriter::new(&mut target);
+        writer
+            .start_object()
+            .and_then(|mut root| {
+                for (name, cache) in &caches {
+                    let st = cache.stats();
+                    root.sub_object(name.as_str(), |o| {
+                        o.field_u64("hits", st.hits())?;
+                        o.field_u64("misses", st.misses())?;
+                        o.field_u64("write_touches", st.write_touches())?;
+                        o.field_u64("writebacks", st.writebacks())?;
+                        o.field_u64("writeback_errors", st.writeback_errors())?;
+                        o.field_u64("direct_writes", st.direct_writes())?;
+                        o.field_u64("dirty", cache.dirty_count() as u64)?;
+                        Ok(())
+                    })?;
+                }
+                root.end()
+            })
+            .expect("Vec-backed cache stats JSON serialization cannot fail");
+        target
+            .into_string()
+            .expect("cache stats JSON keys and device names are UTF-8")
+    }
+
     /// 真实显示几何直通：唯一数据源是 Limine 注册的 framebuffer 描述符
     /// （drivers::framebuffer_geometry）。缺席时显式报错；刷新率 Limine 不
     /// 披露，宁缺毋假不输出 refresh_hz（vfs1 R1 / KM12：编造的 1024x768@60 已废除）。

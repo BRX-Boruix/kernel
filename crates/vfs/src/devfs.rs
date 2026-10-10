@@ -123,6 +123,17 @@ pub trait DeviceInfoProvider: Send + Sync {
     fn storage_status_json(&self) -> String {
         alloc::string::String::from(r#"{"error":"no_counter"}"#)
     }
+    /// `/devices/storage/cache`：各设备**块缓存**的真实计数快照。
+    ///
+    /// 为什么必须有这个节点（本轮实测驱动）：写回（write-back）下「写入成功」
+    /// 不等于「已落盘」，判断真实代价只能看**设备命令次数**——`misses` 是设备
+    /// 读命令数、`writebacks` 是设备写命令数。没有这组计数就只能靠猜，
+    /// 而"猜"在上一轮已经导致过一个假数据（把丢数据的假快当成 30 倍加速）。
+    ///
+    /// 默认实现显式 error（宁缺毋假，S09），由内核 provider 覆写。
+    fn blk_cache_stats_json(&self) -> String {
+        alloc::string::String::from(r#"{"error":"no_block_cache_source"}"#)
+    }
     /// 网络统计在真实 NIC 数据路径落地前只允许显式 unsupported。
     fn net_stats_json(&self) -> String {
         alloc::string::String::from(r#"{"error":"no_net_stats"}"#)
@@ -747,6 +758,14 @@ impl DevFS {
         }));
         primary_storage_dir.add_child("status", storage_status_node);
         storage_dir.add_child("primary", primary_storage_dir);
+        // 6b. /devices/storage/cache：块缓存的真实计数快照（写回诊断的唯一依据）。
+        let p_cache = provider.clone();
+        let blk_cache_node = Arc::new(DynamicFileNode::read_only(move || {
+            let mut json = p_cache.blk_cache_stats_json().into_bytes();
+            json.push(b'\n');
+            json
+        }));
+        storage_dir.add_child("cache", blk_cache_node);
         root.add_child("storage", storage_dir);
 
         // 7. /devices/net/primary/stats (M10.2 网络设备遥测)
