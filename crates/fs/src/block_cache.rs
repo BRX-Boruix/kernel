@@ -342,14 +342,37 @@ impl CachingByteDevice {
                     Some(Self::snapshot(slot))
                 }
             };
-            // 锁外读入本块旧内容（保留未覆盖字节）。
+            // 锁外取本块内容。
+            //
+            // **整块覆盖（in_block == 0 且长度恰为一块）时绝不读设备**：整块都被
+            // 覆盖，没有任何「未覆盖字节」需要保留，读一次是**纯粹的浪费**。
+            // 这不是微优化——2026-10 机内实测（tools/diskfiles/3p/fswrite.c）：
+            // 数据盘上的**追加写**恒为 ~130,000 cycles/**字节**，与调用粒度无关
+            // （64B x 512 次与 16KiB x 2 次同为 ~130k cyc/byte）；而同偏移覆盖只要
+            // 680 cyc/byte @4096B。成本全在**新块首次触碰**的设备访问上，而 ext2
+            // 每次 write_block 都是整块写 ⇒ 每分配一个新块都白付一条 ATA PIO 命令
+            // （数据相位 + wait_drq 轮询，代价与有效命令同量级）。
+            //
+            // **前提守卫**：只有「块完整落在设备长度内」才走这条快路。设备长度未知
+            // 或块越出设备末端时仍走读路径——那条路径用短读**如实发现**越界，
+            // 直接缓存会把一次注定短写的写伪装成成功（S09）。
             let mut buf = [0u8; CACHE_BLOCK_BYTES];
-            let got = self.inner.read_bytes(Self::offset_of(block), &mut buf);
-            if got != CACHE_BLOCK_BYTES {
-                // 设备末端短块：整块化会伪造尾部数据，交给直接写路径。
-                return false;
+            let full_block = in_block == 0 && src.len() == CACHE_BLOCK_BYTES;
+            let within_device = match self.inner.byte_len() {
+                Some(len) => Self::offset_of(block) + CACHE_BLOCK_BYTES as u64 <= len,
+                None => false,
+            };
+            if full_block && within_device {
+                buf.copy_from_slice(src);
+            } else {
+                // 部分块：必须先读旧内容，否则回写会把未覆盖字节写成 0（伪造数据，S09）。
+                let got = self.inner.read_bytes(Self::offset_of(block), &mut buf);
+                if got != CACHE_BLOCK_BYTES {
+                    // 设备末端短块：整块化会伪造尾部数据，交给直接写路径。
+                    return false;
+                }
+                buf[in_block..in_block + src.len()].copy_from_slice(src);
             }
-            buf[in_block..in_block + src.len()].copy_from_slice(src);
             if let Some(o) = &occ {
                 if o.dirty {
                     self.writeback_block(o.tag, &o.data);

@@ -269,6 +269,44 @@ mod tests {
         assert_eq!(&on_dev[..], &expect[..], "flushed block must match device");
     }
 
+    /// 写**整块**（长度恰为 CACHE_BLOCK_BYTES、且块内偏移为 0）且**未命中**时，
+    /// **不得**读设备——整块都被覆盖，没有任何「未覆盖字节」需要保留。
+    ///
+    /// 这条为什么不是微优化（2026-10 机内实测，tools/diskfiles/3p/fswrite.c）：
+    /// 数据盘上**追加写**的代价恒为 ~130,000 cycles/**字节**，与调用粒度无关
+    /// （64B x 512 次与 16KiB x 2 次都是 ~130k cyc/byte）；而**同偏移覆盖**只要
+    /// 680 cyc/byte @4096B、742 cyc/byte 到 /tmp —— 相差约 200 倍。
+    /// ⇒ 成本在**新块首次触碰**的设备访问上。ext2 每次 write_block 都是整块写，
+    /// 而缓存在未命中时**无条件**先读设备，于是每分配一个新块都白付一条读命令
+    /// （ATA PIO 下一条命令 = 数据相位 + wait_drq 轮询，代价与有效命令同量级）。
+    #[test]
+    fn test_cache_full_block_write_miss_does_not_read_device() {
+        let dev = Arc::new(CountingDevice::new(64 * 1024));
+        let cache = block_cache::CachingByteDevice::new(dev.clone());
+        let block = [0x5Au8; block_cache::CACHE_BLOCK_BYTES];
+        let n = cache.write_bytes(4096, &block);
+        assert_eq!(n, block_cache::CACHE_BLOCK_BYTES);
+        assert_eq!(
+            dev.reads(),
+            0,
+            "整块覆盖写不需要读设备（没有未覆盖字节要保留）"
+        );
+        // 内容仍然正确：写进缓存的必须恰好是这次写的内容（不得被旧设备内容污染）。
+        let mut back = [0u8; block_cache::CACHE_BLOCK_BYTES];
+        assert_eq!(
+            cache.read_bytes(4096, &mut back),
+            block_cache::CACHE_BLOCK_BYTES
+        );
+        assert_eq!(back, block, "整块写的缓存内容必须与写入一致");
+        assert_eq!(cache.flush_dirty().1, 0);
+        let mut on_dev = [0u8; block_cache::CACHE_BLOCK_BYTES];
+        assert_eq!(
+            dev.read_bytes(4096, &mut on_dev),
+            block_cache::CACHE_BLOCK_BYTES
+        );
+        assert_eq!(on_dev, block, "回写后设备真值必须与写入一致");
+    }
+
     /// 短读（设备末端）绝不能被缓存成"看似完整的满块"（S19/S09）。
     #[test]
     fn test_cache_tail_short_read_not_cached() {
