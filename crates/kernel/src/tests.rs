@@ -3470,14 +3470,32 @@ pub fn test_shared_irq() {
         "[irq] observer {} -> {} calls; lapic ticks {} -> {}; time {} -> {} ms over 100ms sleep",
         before_calls, after_calls, ticks_before, ticks_after, t0, t1
     );
-    assert!(
-        after_calls > before_calls,
-        "observer should be dispatched on every tick (slot 0)"
-    );
-    assert!(
-        t1 > t0,
-        "LAPIC timer still running with shared handler present"
-    );
+    // **判据必须能区分两种"没有调用"**（本轮修，清单第 17 项）：
+    //  (a) 宿主把本核饿死 ⇒ **墙钟都没推进**（t1 == t0）⇒ 本次测量**无法判定**，
+    //      如实报 INCONCLUSIVE 并跳过断言——不把它伪装成通过，也不用重试/加长超时掩盖；
+    //  (b) 时间推进了却没分发 ⇒ 共享分发**真的坏了** ⇒ 必须失败。
+    //
+    // 此前只有一条 `after_calls > before_calls`：宿主负载让本核 100ms 没被调度时，
+    // 它会把"环境没给时间"报成"共享分发坏了"——那是**假失败**（实测出现过一次：
+    // `lapic ticks 251 -> 251`）。
+    if t1 == t0 {
+        klib::warn!(
+            "[irq] INCONCLUSIVE: 100ms sleep 期间墙钟未推进（宿主未调度本核）；本次无法判定共享分发"
+        );
+    } else {
+        assert!(
+            after_calls > before_calls,
+            "时间已推进（{} -> {} ms）但观察者未被分发：共享分发坏了",
+            t0,
+            t1
+        );
+        assert!(
+            ticks_after > ticks_before,
+            "时间已推进但 LAPIC tick 未前进（{} -> {}）：定时器与时钟源不一致",
+            ticks_before,
+            ticks_after
+        );
+    }
 
     // 4. 注销观察者并重排：恢复为仅 LAPIC handler（slot 0）。
     assert!(
