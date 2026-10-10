@@ -439,6 +439,12 @@ struct Port {
     sectors: u64,
     /// 端口锁（S21：粒度=端口，锁内不得再取任何锁）。
     lock: Mutex<()>,
+    /// 已提交的 DMA 命令数（PxCI 置位即计）。
+    ///
+    /// 计的是「提交」而非「成功」：计数点紧贴 PxCI 写，失败命令同样计入。
+    /// 本计数回答的是「发出了多少条命令」——读命令粒度的收益来自摊薄
+    /// 每命令固定开销，故命令数必须可观测。
+    dma_commands: core::sync::atomic::AtomicU64,
 }
 
 impl Port {
@@ -932,6 +938,9 @@ impl Port {
         // 清除动作会把本代完成位一并清掉——故清除点紧贴启动点。
         self.write32(PX_IS, 0xFFFF_FFFF);
         self.write32(PX_CI, 1u32 << CMD_SLOT);
+        // PxCI 置位 = 命令已交给控制器，这是「已提交」的唯一定义点。
+        self.dma_commands
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         match self.wait_command(log_failure) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -1002,6 +1011,19 @@ impl BlockDevice for AhciDevice {
 
     fn block_count(&self) -> u64 {
         *self.sectors.lock()
+    }
+
+    fn read_command_count(&self) -> Option<u64> {
+        Some(
+            self.port
+                .as_ref()?
+                .dma_commands
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn max_sectors_per_command(&self) -> u64 {
+        MAX_SECTORS_PER_CMD as u64
     }
 }
 
@@ -1653,6 +1675,7 @@ fn init_port(abar: &u64, index: u8) -> Result<bool, Error> {
         data: None,
         sectors: 0,
         lock: Mutex::new(()),
+        dma_commands: core::sync::atomic::AtomicU64::new(0),
     };
 
     // 读 PxSSTS 判定链路状态（DET=3 表示设备已连接且通信建立）。

@@ -13815,6 +13815,205 @@ pub fn test_storage_ahci4_pio_vs_ahci_benchmark() {
     );
     info!("[test-ahci4] PASS (measurement valid; cross-path comparison is done across two runs)");
 }
+
+/// STORAGE-AHCI-7：**读命令粒度**同启动交错 A/B ——「8 次 512B 命令」对「1 次 4KiB 命令」。
+///
+/// ## 与 test-ahci4 的分工（不是重复）
+///
+/// `test-ahci4` 比较的是**随机单扇区**对**顺序 32 扇区**：两条臂在「访问模式」
+/// 与「每命令扇区数」上**同时**不同，故它回答不了「只把命令变大，收益有多少」。
+/// 本测试固定访问模式（同为顺序、每轮同为 4 KiB），**只改每命令扇区数**：
+///   - 臂 A：8 次 `read_at(off + i*512, &mut [u8;512])` ⇒ 8 条底层命令
+///   - 臂 B：1 次 `read_at(off, &mut [u8;4096])`        ⇒ 1 条底层命令（AHCI）
+/// 两臂总字节数相同、采样区间不相交、逐轮交错（A(r), B(r), A(r+1), …）以抵消
+/// 宿主页缓存随启动时间的漂移。
+///
+/// ## 为什么这条测量决定 DMA 能否翻盘
+///
+/// ATA PIO 通路**每条命令固定搬 1 个扇区**（`ata_pio::read_at` 的循环里逐扇区
+/// 调用 `ata_read_sector`），它**结构上无法**靠放大请求省下命令；AHCI 的
+/// `read_sectors` 可把连续多扇区合并进一条命令。因此「把请求从 512B 放大到
+/// 4KiB」这条杠杆只对 AHCI 存在——若每命令固定开销确实是瓶颈，AHCI 在这里
+/// 应当显著变便宜；若不变便宜，则「PIO 更快」的既有结论与命令粒度无关。
+///
+/// ## 命令数必须**实测**，不能推算（S10）
+///
+/// 臂间唯一差异就是命令数，故命令数取自设备自身的计数
+/// （`BlockDevice::read_command_count`，AHCI 在 PxCI 置位处自增、PIO 在每条
+/// 成功扇区命令处自增），而不是由 `ceil(len/512)` 推算后当作观测值写进日志。
+/// 测试**断言**命令数等于按 `max_sectors_per_command` 算出的预期值：合并逻辑
+/// 一旦回归（例如退化成每扇区一条命令），这里先失败，而不是把「其实没省下
+/// 命令」的结果当成 DMA 的收益报出去。
+///
+/// ## 测量效度（S32）
+///
+/// - QEMU TCG 下 `rdtsc` 计的是 TCG 翻译的指令数，**不是硬件周期**；只作同口径
+///   相对比较，不当绝对时间。
+/// - 两臂交错、区间不相交、预热一轮后丢弃。
+/// - 只断言「测量有效」（无短读、两种粒度读到同一份真值、TSC 可用），
+///   **不断言谁更快**——谁快由数据说话。
+pub fn test_storage_ahci7_read_granularity_ab() {
+    info!("[test-ahci7] === read command granularity: 8x512B vs 1x4KiB (same boot, interleaved) ===");
+
+    // 选一个真实（非易失）块设备——判据与 test-ahci4 相同。
+    let mut picked: Option<(&'static str, &'static str)> = None;
+    for i in 0..driver::DriverHub::device_count() {
+        let Some(info) = driver::DriverHub::device_info_at(i) else {
+            continue;
+        };
+        if info.kind != driver::DeviceKind::Block || info.volatile {
+            continue;
+        }
+        let Some(drv) = driver::DriverHub::driver_name_of(info.name) else {
+            continue;
+        };
+        picked = Some((info.name, drv));
+        break;
+    }
+    let Some((dev_name, driver_name)) = picked else {
+        info!("[test-ahci7] SKIP: no non-volatile block device in this run");
+        return;
+    };
+
+    let dev = driver::DriverHub::device_by_name(dev_name).expect("picked device must resolve");
+    let block = dev.as_block().expect("picked block device must expose BlockDevice");
+    let sectors = block.block_count();
+    assert!(sectors > 2048, "benchmark needs a disk with room to sample");
+
+    // 不暴露命令计数的设备如实 SKIP，而不是用请求长度推算一个数字顶上。
+    let Some(_) = block.read_command_count() else {
+        info!(
+            "[test-ahci7] SKIP: driver={} does not expose a read command count",
+            driver_name
+        );
+        return;
+    };
+
+    let gran = block.max_sectors_per_command().max(1);
+    info!(
+        "[test-ahci7] target={} driver={} sectors={} max_sectors_per_command={}",
+        dev_name, driver_name, sectors, gran
+    );
+
+    // 每轮 4 KiB = 8 扇区：臂 A 用 8 条命令，臂 B 用 ceil(8/gran) 条命令。
+    const SECTORS_PER_ROUND: u64 = 8;
+    const REPS: u64 = 24;
+    let span = SECTORS_PER_ROUND * REPS;
+    // 两条区间相邻但不重叠，落在盘中段，避开 MBR/超级块所在的头部。
+    let base_a = sectors / 2;
+    let base_b = base_a + span;
+    assert!(
+        base_b + span < sectors,
+        "sampling windows must stay inside the disk"
+    );
+
+    let mut buf512 = [0u8; 512];
+    let mut buf4k = [0u8; 4096];
+
+    // ---- 正确性门（不计时）----
+    // 同一段字节分别用两种粒度读，必须逐字节相同——否则两条臂读的不是同一份
+    // 真值，后面的时间比较没有意义。
+    let probe = base_a * 512;
+    let mut ref8 = [0u8; 4096];
+    for i in 0..8u64 {
+        let n = block.read_at(probe + i * 512, &mut buf512);
+        assert_eq!(n, 512, "reference 512B read must be complete");
+        ref8[(i * 512) as usize..((i + 1) * 512) as usize].copy_from_slice(&buf512);
+    }
+    let n = block.read_at(probe, &mut buf4k);
+    assert_eq!(n, 4096, "reference 4KiB read must be complete");
+    assert_eq!(
+        ref8, buf4k,
+        "8x512B and 1x4KiB must return identical bytes for the same range"
+    );
+    info!("[test-ahci7] correctness gate OK: 8x512B == 1x4KiB byte-for-byte");
+
+    // ---- 预热（不计时）----
+    let _ = block.read_at(base_a * 512, &mut buf512);
+    let _ = block.read_at(base_b * 512, &mut buf4k);
+
+    // ---- 交错计时：A(r), B(r), A(r+1), … ----
+    let mut cycles_a = 0u64;
+    let mut cycles_b = 0u64;
+    let mut cmds_a = 0u64;
+    let mut cmds_b = 0u64;
+
+    for r in 0..REPS {
+        let off_a = (base_a + r * SECTORS_PER_ROUND) * 512;
+        let off_b = (base_b + r * SECTORS_PER_ROUND) * 512;
+
+        let c0 = block.read_command_count().expect("count must stay available");
+        let t0 = klib::time::read_cycle_counter();
+        for i in 0..SECTORS_PER_ROUND {
+            let n = block.read_at(off_a + i * 512, &mut buf512);
+            assert_eq!(n, 512, "arm A read must be complete (round {})", r);
+        }
+        let t1 = klib::time::read_cycle_counter();
+        let c1 = block.read_command_count().expect("count must stay available");
+        cycles_a = cycles_a.wrapping_add(t1.wrapping_sub(t0));
+        cmds_a += c1 - c0;
+
+        let c0 = block.read_command_count().expect("count must stay available");
+        let t0 = klib::time::read_cycle_counter();
+        let n = block.read_at(off_b, &mut buf4k);
+        assert_eq!(n, 4096, "arm B read must be complete (round {})", r);
+        let t1 = klib::time::read_cycle_counter();
+        let c1 = block.read_command_count().expect("count must stay available");
+        cycles_b = cycles_b.wrapping_add(t1.wrapping_sub(t0));
+        cmds_b += c1 - c0;
+    }
+
+    if cycles_a == 0 || cycles_b == 0 {
+        info!("[test-ahci7] SKIP: cycle counter unavailable (rdtsc returned 0)");
+        return;
+    }
+
+    // ---- 机制断言：命令数必须等于按设备能力算出的预期值 ----
+    // 这是本测试**可证伪**的核心。臂 A 每次请求 1 个扇区，两条驱动都是 1 条命令；
+    // 臂 B 每次请求 8 个扇区，命令数取决于驱动能否合并。
+    let expected_a = REPS * SECTORS_PER_ROUND;
+    let per_round_b = (SECTORS_PER_ROUND + gran - 1) / gran;
+    let expected_b = REPS * per_round_b;
+    info!(
+        "[test-ahci7] commands: armA={} (expect {}) armB={} (expect {})",
+        cmds_a, expected_a, cmds_b, expected_b
+    );
+    assert_eq!(
+        cmds_a, expected_a,
+        "arm A must issue exactly one command per 512B request"
+    );
+    assert_eq!(
+        cmds_b, expected_b,
+        "arm B command count disagrees with the driver's declared granularity"
+    );
+
+    let bytes = SECTORS_PER_ROUND * 512 * REPS;
+    let per_byte_a = cycles_a / bytes;
+    let per_byte_b = cycles_b / bytes;
+    let ratio_x100 = (per_byte_b as u128 * 100) / (per_byte_a.max(1) as u128);
+
+    info!(
+        "[test-ahci7] driver={} armA 8x512B : {} cycles/byte, {} cycles/command ({} bytes)",
+        driver_name,
+        per_byte_a,
+        cycles_a / cmds_a.max(1),
+        bytes
+    );
+    info!(
+        "[test-ahci7] driver={} armB 1x4KiB : {} cycles/byte, {} cycles/command ({} bytes)",
+        driver_name,
+        per_byte_b,
+        cycles_b / cmds_b.max(1),
+        bytes
+    );
+    info!(
+        "[test-ahci7] driver={} armB/armA per-byte ratio = {}.{:02}x",
+        driver_name,
+        ratio_x100 / 100,
+        ratio_x100 % 100
+    );
+    info!("[test-ahci7] PASS (measurement valid; cross-driver comparison is done across two runs)");
+}
 /// STORAGE-AHCI-6d 自检：**中断完成路径 vs 纯轮询**的同启动真 A/B 基准。
 ///
 /// ## 为什么这次能做真 A/B（比 STORAGE-AHCI-4 更强）

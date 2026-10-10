@@ -25,7 +25,7 @@ use crate::hub::DriverHub;
 use arch_x86_64::port::{inb, insw, inw, outb, outsw, outw};
 use klib::{error::Error, info};
 use spin::Mutex;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Primary 通道寄存器基址（0x1F0 系列）。
 const ATA_PRIMARY_BASE: u16 = 0x1F0;
@@ -428,6 +428,13 @@ pub struct AtaPioDevice {
     /// status=0xFF）时触发一次 unregister + DeviceDeparted；`swap` 置 true
     /// 保证每个槽位只拔除一次，避免后续每次失败 IO 重复拔除。
     pub gone: AtomicBool,
+    /// 已提交的 PIO 读命令数（每条成功的单扇区读命令计 1）。
+    ///
+    /// PIO 通路**每条命令固定搬 1 个扇区**——`read_at` 的循环里
+    /// `ata_read_sector` 逐扇区调用，不涉及多扇区计数寄存器。故本计数
+    /// 在硬件路径上恒等于「请求覆盖的扇区数」，与请求长度无关；内存回退
+    /// 盘不产生命令，经 `read_command_count` 如实返回 `None`。
+    pub read_commands: AtomicU64,
 }
 
 impl Device for AtaPioDevice {
@@ -508,6 +515,7 @@ impl IoDevice for AtaPioDevice {
             }
             // C16.1：每条成功 sector 读命令计 1。
             self.stats.record_read(1);
+            self.read_commands.fetch_add(1, Ordering::Relaxed);
             let take = core::cmp::min(remaining, 512 - sector_off);
             out[done..done + take].copy_from_slice(&buf[sector_off..sector_off + take]);
             done += take;
@@ -643,6 +651,14 @@ impl BlockDevice for AtaPioDevice {
     fn block_count(&self) -> u64 {
         *self.sectors.lock()
     }
+
+    fn read_command_count(&self) -> Option<u64> {
+        // 内存回退盘不发命令，计数无意义——如实返回 None 而不是 0。
+        if !*self.is_hardware.lock() {
+            return None;
+        }
+        Some(self.read_commands.load(Ordering::Relaxed))
+    }
 }
 
 /// identify 成功时的真实硬件盘身份（M0.4 四设备）：
@@ -656,6 +672,7 @@ pub static ATA_PRIMARY_MASTER: AtaPioDevice = AtaPioDevice {
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
     gone: AtomicBool::new(false),
+    read_commands: AtomicU64::new(0),
 };
 pub static ATA_PRIMARY_SLAVE: AtaPioDevice = AtaPioDevice {
     name: "ata1",
@@ -666,6 +683,7 @@ pub static ATA_PRIMARY_SLAVE: AtaPioDevice = AtaPioDevice {
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
     gone: AtomicBool::new(false),
+    read_commands: AtomicU64::new(0),
 };
 pub static ATA_SECONDARY_MASTER: AtaPioDevice = AtaPioDevice {
     name: "ata2",
@@ -676,6 +694,7 @@ pub static ATA_SECONDARY_MASTER: AtaPioDevice = AtaPioDevice {
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
     gone: AtomicBool::new(false),
+    read_commands: AtomicU64::new(0),
 };
 pub static ATA_SECONDARY_SLAVE: AtaPioDevice = AtaPioDevice {
     name: "ata3",
@@ -686,6 +705,7 @@ pub static ATA_SECONDARY_SLAVE: AtaPioDevice = AtaPioDevice {
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
     gone: AtomicBool::new(false),
+    read_commands: AtomicU64::new(0),
 };
 
 /// identify 失败时的内存回退盘身份（DMYGH #15）：
@@ -699,6 +719,7 @@ static ATA_RAM_FALLBACK: AtaPioDevice = AtaPioDevice {
     is_hardware: Mutex::new(false),
     stats: IoStats::new(),
     gone: AtomicBool::new(false),
+    read_commands: AtomicU64::new(0),
 };
 
 /// 回退盘容量：128 扇区 × 512B = 64KiB。

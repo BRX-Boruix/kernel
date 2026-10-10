@@ -922,6 +922,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_storage_ahci4_pio_vs_ahci_benchmark();
 
+    // STORAGE-AHCI-7：读命令粒度同启动交错 A/B（8x512B 对 1x4KiB，命令数实测）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_storage_ahci7_read_granularity_ab();
+
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
     tests::test_init_contract();
