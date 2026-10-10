@@ -189,6 +189,43 @@ fn le_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+/// 在块位图里扫描 `[lo, hi)` 位，返回第一个 **0 位**（空闲块）的位号与
+/// **循环体执行次数**（诊断口径：整字跳算 1 次、单 bit 判算 1 次）。
+///
+/// **为什么要按 32 位字跳**：EXT2 的块分配是「从前往后找第一个 0 位」的形态，
+/// 而盘上**前面若干块组通常是满的**——逐位扫在那种输入上要白走 `组数 × 8192`
+/// 次位测试。实测（2026-10，数据盘 1 KB 块 / 8192 块每组）：单次分配约 131,000
+/// 次位测试 ≈ 132M cycles ≈ **40 毫秒/新块**，且 `/devices/storage/cache` 的
+/// 设备命令计数显示新增命令为 **零**（位图都在缓存里）⇒ 这 40 毫秒全是扫位图的 CPU。
+/// 整字跳过把这段降到 1/32；配合 `alloc_block` 里「按组空闲计数跳过全满组」后，
+/// 常态分配退化为几次字比较。
+///
+/// **越界即停**（不补零充数）：`map` 可能短于该组的位跨度（末组 / 小容量卷），
+/// 原实现同样在 `byte >= map.len()` 处停下——语义保持不变。
+fn first_free_bit_from(map: &[u8], lo: usize, hi: usize) -> (Option<usize>, u64) {
+    let mut steps = 0u64;
+    let mut idx = lo;
+    while idx < hi {
+        let byte = idx / 8;
+        if byte >= map.len() {
+            break;
+        }
+        steps += 1;
+        // 字对齐处先整字判：整字全 1 才可能跳过（一次跳过 32 位）。
+        if idx % 32 == 0 && idx + 32 <= hi && byte + 4 <= map.len() {
+            if le_u32(map, byte) == 0xFFFF_FFFF {
+                idx += 32;
+                continue;
+            }
+        }
+        if map[byte] & (1 << (idx % 8)) == 0 {
+            return (Some(idx), steps);
+        }
+        idx += 1;
+    }
+    (None, steps)
+}
+
 /// 解析 1024 字节超级块镜像。
 ///
 /// fs1 FA2：blocks_count/inodes_count/first_data_block 施加结构性 sanity
@@ -343,6 +380,12 @@ struct Ext2Inner {
     /// 的 size/mtime），那是伪数据，比崩溃更隐蔽。故 `write_inode` 在写
     /// inode 2 时同步刷新本缓存。
     root_inode: spin::Mutex<Inode>,
+    /// 块位图**位测试累计次数**（诊断计数，确定性、无噪声）。
+    ///
+    /// 存在的理由与 `/devices/storage/cache` 同族：把「块分配是不是
+    /// O(卷上已用块数)」变成**可断言的事实**。本宿主的运行间波动达 ±100%，
+    /// 用墙钟判断一个常数因子级的算法退化是不可能的。
+    alloc_scan_steps: core::sync::atomic::AtomicU64,
 }
 
 impl Ext2Fs {
@@ -383,12 +426,24 @@ impl Ext2Fs {
                 mtime: 0,
                 ctime: 0,
             }),
+            alloc_scan_steps: core::sync::atomic::AtomicU64::new(0),
         };
         let root = read_inode_in(&inner, EXT2_ROOT_INO)?;
         *inner.root_inode.lock() = root;
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// 块分配时**位图扫描的循环体执行次数**累计（诊断）。
+    ///
+    /// 计数口径：整字跳算 1 次、单 bit 判算 1 次——即**每次循环体**记 1。
+    /// 宿主测试据此断言「分配不是 O(卷上已用块数)」；见 `alloc_block` 的说明。
+    /// 用计数而不是墙钟，是因为本宿主的运行间波动达 ±100%。
+    pub fn alloc_scan_steps(&self) -> u64 {
+        self.inner
+            .alloc_scan_steps
+            .load(core::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn superblock(&self) -> &Ext2Superblock {
@@ -821,43 +876,75 @@ impl Ext2Fs {
     }
 
     /// 分配一个空闲块：跨组扫描，组内位图中找 0 位，置位并更新组/全局空闲计数。
+    ///
+    /// **两遍扫描**：第一遍按 GDT 的组空闲计数**跳过整组已满**的组；第二遍不跳，
+    /// 只在第一遍一无所获时才走（陈旧/损坏的组计数不该被当成"卷满"）。
+    ///
+    /// 第一遍那条"跳过"是「块分配退化成 O(卷上已用块数)」的**根因修复**：
+    /// 原实现无条件对每个组 read_bitmap 再逐位扫 8192 次，于是盘上前面每多一个
+    /// **全满**的组，单次分配就多 8192 次循环体。机内实测（2026-10）：数据盘
+    /// （150 MB 量级，前十几个组已满）上追加写恒为约 130,000 cycles/字节，换算
+    /// 约 40 毫秒/新块；而 /devices/storage/cache 的设备命令计数显示新增命令为
+    /// **零**（位图都在缓存里）⇒ 这 40 毫秒全是扫位图的 CPU。
+    /// 宿主锚点：test_alloc_block_does_not_scan_full_groups_step_by_step
+    /// （修前 32 块要 812,724 步；修后约 1,200 步）。
     fn alloc_block(&self) -> Result<u32, Ext2Error> {
         let sb = self.superblock();
-        // 读盘上实时空闲计数（快照 `sb.free_blocks_count` 不随写更新，S31）。
+        // 读盘上实时空闲计数（快照 sb.free_blocks_count 不随写更新，S31）。
         if self.live_free_blocks()? == 0 {
             return Err(Ext2Error::BlockOutOfRange); // 卷满：显式无空闲块
         }
         let group_count = sb.blocks_count.div_ceil(sb.blocks_per_group);
-        for group in 0..group_count {
-            let gd = self.read_group_desc(group)?;
-            let map = self.read_bitmap(gd.block_bitmap)?;
-            // 组内位范围：该组覆盖的块号区间。
-            let group_start = group * sb.blocks_per_group;
-            let group_end = core::cmp::min(group_start + sb.blocks_per_group, sb.blocks_count);
-            let bits = (group_end - group_start) as usize;
-            for idx in 0..bits {
-                let byte = idx / 8;
-                if byte >= map.len() {
-                    break;
-                }
-                if map[byte] & (1 << (idx % 8)) == 0 {
-                    // 找到空闲位：置位并记账。
-                    let block = group_start + idx as u32;
-                    self.bitmap_set(gd.block_bitmap, idx as u32)?;
-                    self.adjust_group_free_blocks(group, -1)?;
-                    self.adjust_superblock_free_blocks(-1)?;
-                    // S06/S18：新分配块清零——`free_block` 只清位图位不清数据，
-                    // 块内容保留被删文件的残留。若此处不置零，间接表块首次使用
-                    // 会读入陈旧指针（N1），文件增长后未写区会读出残留数据（N2）。
-                    // 统一在此清零，任何经 alloc_block 的块都是干净的。
-                    let bs = sb.block_size as usize;
-                    let zero = alloc::vec![0u8; bs];
-                    self.write_block(block, &zero)?;
-                    return Ok(block);
+        for skip_full in [true, false] {
+            for group in 0..group_count {
+                if let Some(b) = self.alloc_in_group(group, skip_full)? {
+                    return Ok(b);
                 }
             }
         }
         Err(Ext2Error::BlockOutOfRange)
+    }
+
+    /// 在**一个块组**内找并占用一个空闲块；整组无空洞返回 None。
+    ///
+    /// skip_full 为真时，先看 GDT 的 bg_free_blocks_count：为 0 直接跳过，
+    /// **不读位图、不进逐位扫描**。该计数是盘上真值——本文件系统的写路径
+    /// （adjust_group_free_blocks）与建盘脚本（tools/tools_build/disk.py 的
+    /// grp_free_blocks）都维护它。
+    ///
+    /// 置位与记账的三步（位图 / 组空闲计数 / 全局空闲计数）与原来的单遍实现
+    /// **逐字节相同**，只是位图扫描换成 first_free_bit_from（按 32 位字跳）。
+    fn alloc_in_group(&self, group: u32, skip_full: bool) -> Result<Option<u32>, Ext2Error> {
+        let sb = self.superblock();
+        let gd = self.read_group_desc(group)?;
+        if skip_full && gd.free_blocks == 0 {
+            return Ok(None);
+        }
+        let map = self.read_bitmap(gd.block_bitmap)?;
+        // 组内位范围：该组覆盖的块号区间。
+        let group_start = group * sb.blocks_per_group;
+        let group_end = core::cmp::min(group_start + sb.blocks_per_group, sb.blocks_count);
+        let bits = (group_end - group_start) as usize;
+        let (found, steps) = first_free_bit_from(&map, 0, bits);
+        self.inner
+            .alloc_scan_steps
+            .fetch_add(steps, core::sync::atomic::Ordering::Relaxed);
+        let Some(idx) = found else {
+            return Ok(None);
+        };
+        // 找到空闲位：置位并记账。
+        let block = group_start + idx as u32;
+        self.bitmap_set(gd.block_bitmap, idx as u32)?;
+        self.adjust_group_free_blocks(group, -1)?;
+        self.adjust_superblock_free_blocks(-1)?;
+        // S06/S18：新分配块清零——free_block 只清位图位不清数据，
+        // 块内容保留被删文件的残留。若此处不置零，间接表块首次使用
+        // 会读入陈旧指针（N1），文件增长后未写区会读出残留数据（N2）。
+        // 统一在此清零，任何经 alloc_block 的块都是干净的。
+        let bs = sb.block_size as usize;
+        let zero = alloc::vec![0u8; bs];
+        self.write_block(block, &zero)?;
+        Ok(Some(block))
     }
 
     /// 释放一个块：清零位图位并更新组/全局空闲计数。
@@ -2607,11 +2694,137 @@ mod tests {
         img.data
     }
 
+    /// 前 `full_groups` 个块组**整组占满**、最后一个组有空洞的可写镜像。
+    ///
+    /// **为什么需要它**（2026-10 第 5 项根因）：`alloc_block` 修前是「从组 0 的
+    /// bit 0 起逐位扫第一个 0 位」，于是盘上前面每多一个**全满**的组，单次分配就
+    /// 多 8192 次循环体。真实数据盘（150 MB 量级）里前十几个组都是满的，单次分配
+    /// 约 131,000 次 ≈ 132M cycles ≈ **40 毫秒**——这正是系统内 tcc 链接那 50 秒的
+    /// 大头（`/devices/storage/cache` 的设备命令计数显示新增命令为**零**，即这
+    /// 40 毫秒全是扫位图的 CPU）。本夹具把那个形态缩到最小：前面若干个满组 +
+    /// 一个有空洞的组。
+    ///
+    /// 布局（1 KB 块、8192 块/组、256 inode/组）：
+    /// - 组 0：块 0..8191 全部占用（位图全 1、`bg_free_blocks_count = 0`）；
+    /// - 其余满组同理；
+    /// - 末组（组 `full_groups`）：块基址 +0=块位图、+1=inode 位图、
+    ///   +2..+33=inode 表（32 块）、+34=根目录数据块，其后空闲。
+    ///
+    /// 根 inode（2 号）在组 0 的 inode 表（块 5）里，但它的**数据块在末组**
+    /// ——inode 与数据块本来就可以不同组，这样组 0 才能真的整组占满。
+    fn build_image_with_full_leading_groups(full_groups: u32) -> Vec<u8> {
+        const BPG: u32 = 8192;
+        let groups = full_groups + 1;
+        let total_blocks = groups * BPG;
+        let part_sectors = total_blocks * 2; // 1 KB 块 = 2 扇区
+        let mut img = Img::new(PART_START_LBA as u32 + part_sectors);
+        // MBR
+        img.w8(510, 0x55);
+        img.w8(511, 0xAA);
+        img.w8(0x1BE, 0x80);
+        img.w8(0x1BE + 4, 0x83);
+        img.w32(0x1BE + 8, PART_START_LBA as u32);
+        img.w32(0x1BE + 12, part_sectors);
+        // 超级块
+        let sb = img.part + 1024;
+        img.w32(sb, 256 * groups); // s_inodes_count
+        img.w32(sb + 4, total_blocks);
+        img.w32(sb + 8, 0);
+        img.w32(sb + 12, BPG - 35); // 只有末组有空闲块
+        img.w32(sb + 16, 254 + 256 * full_groups); // 空闲 inode
+        img.w32(sb + 20, 1);
+        img.w32(sb + 24, 0);
+        img.w32(sb + 28, 0);
+        img.w32(sb + 32, BPG); // s_blocks_per_group
+        img.w32(sb + 36, BPG);
+        img.w32(sb + 40, 256); // s_inodes_per_group
+        img.w16(sb + 56, EXT2_SUPER_MAGIC);
+        img.w32(sb + 76, 1);
+        img.w16(sb + 88, 128);
+        img.write_bytes(sb + 104, &[0xCD; 16]);
+        img.write_bytes(sb + 120, b"FULLLEAD");
+        // GDT @块 2：每项 32 B。
+        let gdt = img.part + 2 * BS;
+        for g in 0..groups {
+            let e = gdt + (g as usize) * 32;
+            let full = g < full_groups;
+            let base = g * BPG;
+            // 满组的位图/inode 表放在组 0 的元数据区（块 3/4/5）——它们本来就已占用。
+            img.w32(e, if full { 3 } else { base });
+            img.w32(e + 4, if full { 4 } else { base + 1 });
+            img.w32(e + 8, if full { 5 } else { base + 2 });
+            img.w16(e + 12, if full { 0 } else { (BPG - 35) as u16 });
+            img.w16(e + 14, if g == 0 { 254 } else { 256 });
+            img.w16(e + 16, if g == 0 { 1 } else { 0 });
+        }
+        // 组 0 块位图 @3：整块全 1。组 0 inode 位图 @4：inode 1、2 已占。
+        img.write_block(3, &[0xFFu8; BS]);
+        let mut ib0 = [0u8; BS];
+        ib0[0] = 0x03;
+        img.write_block(4, &ib0);
+        // 组 0 inode 表 @5：inode 2 = 根目录，数据块在末组。
+        let base_last = full_groups * BPG;
+        let itab = img.part + 5 * BS;
+        img.w16(itab + 128, 0x4000 | 0o755);
+        img.w32(itab + 128 + 4, BS as u32);
+        img.w32(itab + 128 + 26, 2); // i_links_count
+        img.w32(itab + 128 + 28, 2); // i_blocks
+        img.w32(itab + 128 + 40, base_last + 34); // i_block[0] = 末组根数据块
+        // 末组的块位图：组内位 0..34 已占。inode 位图：全空。
+        let mut bb = [0u8; BS];
+        bb[0] = 0xFF;
+        bb[1] = 0xFF;
+        bb[2] = 0xFF;
+        bb[3] = 0xFF;
+        bb[4] = 0x07;
+        img.write_block(base_last, &bb);
+        img.write_block(base_last + 1, &[0u8; BS]);
+        // 根目录数据块 @末组+34
+        let mut d = [0u8; BS];
+        put_de(&mut d, 0, 2, ".", 2, 12);
+        put_de(&mut d, 12, 2, "..", 2, BS - 12);
+        img.write_block(base_last + 34, &d);
+        img.data
+    }
+
     fn open_writable() -> Ext2Fs {
         let img = build_writable_image();
         let dev = Arc::new(MockByteDevice::new(img));
         Ext2Fs::open(dev, PART_START_LBA * SECTOR).expect("writable fixture opens")
     }
+    /// **第 5 项根因的宿主锚**：块分配不得是 O(卷上已用块数)。
+    ///
+    /// 夹具：3 个块组整组占满，第 4 组有空洞。修前 `alloc_block` 每次分配都从
+    /// 组 0 的 bit 0 逐位扫，单次分配要走过 3 x 8192 次循环体；建一个 32 块
+    /// （32 KB）的新文件就是约 78 万次。断言用**扫描步数**（确定性），不用墙钟。
+    ///
+    /// 阈值 4096 的三态区分（都是量级差，不是踩线；都是**实测**值）：
+    /// - 修前（逐位扫 + 不跳满组）：**812,724** 步 ⇒ 红
+    /// - 只改成整字跳（不跳满组）：约 25,700 步 ⇒ 仍红
+    /// - 跳满组 + 整字跳：**569** 步 ⇒ 绿（约 1,428 倍）
+    #[test]
+    fn test_alloc_block_does_not_scan_full_groups_step_by_step() {
+        use vfs::inode::FileSystem;
+        let img = build_image_with_full_leading_groups(3);
+        let dev = Arc::new(MockByteDevice::new(img));
+        let fs = Ext2Fs::open(dev, PART_START_LBA * SECTOR).expect("full-leading fixture opens");
+        let before = fs.alloc_scan_steps();
+        let root = FileSystem::root(&fs);
+        let f = root.create("big32k.bin", 0o644, (0, 0)).expect("create");
+        let payload = alloc::vec![0x5Au8; 32 * 1024];
+        let n = f.write_at(0, &payload).expect("write 32 KB");
+        assert_eq!(n, payload.len());
+        let steps = fs.alloc_scan_steps() - before;
+        assert!(
+            steps < 4096,
+            "32 个新块只该做常数级位图扫描；实测 {steps} 步 —— 分配退化成了 O(卷上已用块数)"
+        );
+        // 正确性不许被性能改动带走：内容与读回都要对。
+        let mut back = alloc::vec![0u8; payload.len()];
+        assert_eq!(f.read_at(0, &mut back).expect("read back"), payload.len());
+        assert_eq!(back, payload, "payload round-trips");
+    }
+
 
     /// A1-5 / §3.2 #7：三段忠实往返 + `i_uid`/`i_gid` 真属主往返。
     ///
