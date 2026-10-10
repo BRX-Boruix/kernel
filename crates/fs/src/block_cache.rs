@@ -10,38 +10,44 @@
 //! | `ls /`（11 项） | 30,327 | **+7,518 = 3.85 MB** |
 //!
 //! 一个 11 项的目录列表读 3.85 MB，因为 ATA PIO 下**每个扇区**都要
-//! 256 次 `inw`（每次是一次 VM exit，见 `ata_pio.rs` 原注释），
-//! 且当时 ext2 之上**无块缓存**——路径解析每一级都重新打盘读同样的元数据块
-//! （旁证：一次**失败**的路径查找同样读取 8,884 扇区）。
+//! 256 次端口访问（每次是一次 VM exit），且当时 ext2 之上**无块缓存**——
+//! 路径解析每一级都重新打盘读同样的元数据块。
 //!
-//! **时态注**（本节是立项动机的存档，描述的是**本模块落地前**的实测状态）：
-//! "无块缓存"指本模块尚不存在的当时；本模块落地后该陈述自然不再成立，
-//! 勿把它当作现状引用。
-//!
-//! 本模块消除其中的**重复读取**部分。它不改变单次传输的成本
-//! （那是 ATA PIO -> AHCI 的事），只保证同一字节不被反复取。
+//! **时态注**：本节是立项动机的存档，描述的是本模块落地**前**的实测状态；
+//! 本模块落地后该陈述自然不再成立，勿把它当作现状引用。
 //!
 //! ## 为什么放在 fs 层而非 driver 层
 //!
 //! `fs` 明确不依赖 `drv`/`arch`（见本 crate 模块头），块设备访问只经
-//! [`ByteDevice`] 注入。缓存包在这一层：
-//! - 三个接线点（`vfs_init.rs` 的 :878/:1321/:1452）都构造
-//!   `Arc<dyn ByteDevice>`，包在构造处即**全覆盖**，无站点特例（S15）；
-//! - driver 层加缓存则 ramdisk / 未来 NVMe 各要一份，职责重叠且易漏。
+//! [`ByteDevice`] 注入。缓存包在这一层：三处接线点
+//! （`vfs_init.rs` 的 `cached_bridge_for`）都构造 `Arc<dyn ByteDevice>`，
+//! 包在构造处即**全覆盖**，无站点特例；driver 层加缓存则 ramdisk / 未来
+//! NVMe 各要一份，职责重叠且易漏。
 //!
-//! ## 一致性：为什么是 write-through 而不是 write-back
+//! ## 一致性：为什么从 write-through 改成 write-back（写回）
 //!
-//! 已核验：ext2 的**所有**写入都汇集到单一 choke point
-//! `ByteDevice::write_bytes`（`ext2.rs:757`，:918/:933/:949/:965/:1023 亦经它），
-//! 不存在绕过本层的直接盘访问（`vfs_init.rs:790` 的裸 `read_at` 是挂载前的
-//! 一次性 MBR 探测，只读、且发生在任何缓存建立之前）。
+//! 2026-10 实测（原始串口证据见 `docs/TODO/3p.md`）：写直通下 tcc 链接
+//! `libc.a`（`shnum = 4049` 个节）耗时 **84.1 秒**。根因不是字循环——
+//! `rep insw/outsw` 只快 1.25 倍；时间花在**磁盘操作次数 × 单次等待**
+//! （实测每次小写 ~8.9 ms，等 QEMU 的 IDE 仿真，`wait_not_busy` 每次轮询
+//! 1,100~2,100 次）。⇒ 唯一的根治是**减少磁盘操作次数**，即写回。
 //!
-//! 因此 write-through 在此结构下**可按构造成立**：写直通落盘，命中的副本
-//! 同步更新，未命中的不插入（避免写大文件把整盘灌进缓存）。
+//! 写回的正确性由四条不变式保证（每条都有对应的宿主测试，见
+//! `lib.rs` 的 `mod tests`）：
 //!
-//! 不用 write-back 的理由：崩电丢失窗口与"不静默丢数据"的诚实性红线冲突，
-//! 且 write-back 需要脏页回写机制——本轮收益来自**消除重复读**，
-//! 不需要引入这个复杂度（S39 不做无理由的灵活性）。
+//! 1. **淘汰必回写**：任何槽位被**另一个块**占用前，若它是脏的，必须先把
+//!    旧内容写回设备。两条淘汰路径（读触发、写触发）各有一个测试。
+//! 2. **写未命中必先读整块**：写只覆盖块内一段时，未覆盖的字节必须来自设备
+//!    真值，否则回写会把它们变成 0——那是伪造数据（S09）。
+//! 3. **锁外做设备 I/O，装回时校验版本**：槽位带 `seq` 版本号。锁外 I/O
+//!    期间槽位若被他人改动，本次安装作废并重试，绝不覆盖更新的内容。
+//! 4. **失败绝不静默**：回写短写计入 `writeback_errors` 并**保持脏标志**，
+//!    由 [`CachingByteDevice::flush_dirty`] 的返回值与统计如实暴露。
+//!
+//! **诚实边界（必须一并满足，否则写回就是数据丢失）**：写回把数据留在内存，
+//! 因此卸载/关机路径**必须**显式冲刷。`flush_dirty` 有生产调用者
+//! （`vfs_init::release_device_cache` 在释放缓存前冲刷）——这是写回的
+//! 前提条件，不是可选清理。
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -62,26 +68,55 @@ pub const CACHE_BLOCK_BYTES: usize = 512;
 
 /// 缓存块数量（4096 x 512 B = 2 MiB）。
 ///
-/// 取值理由（S17）：ext2 元数据工作集远小于此（`ls /` 的 3.85 MB 读量
-/// **含大量重复**，去重后是数百 KB 量级）；宿主 RAM 512 MB，2 MiB 占 0.4%，
-/// 内存代价可忽略。取 2 的幂以便用位掩码取模（避免除法与魔法数）。
+/// 取值理由（S17）：ext2 元数据工作集远小于此；宿主 RAM 512 MB，2 MiB 占
+/// 0.4%，内存代价可忽略。取 2 的幂以便用位掩码取模（避免除法与魔法数）。
 pub const CACHE_BLOCK_COUNT: usize = 4096;
 
 /// 空槽哨兵。设备块号不可能取该值：u64::MAX 个 512 B 块 = 8 ZiB，
 /// 远超 ATA LBA28 的 2^28 与任何真实设备。
 const EMPTY_TAG: u64 = u64::MAX;
 
+/// 单次槽位操作的**最大重试次数**。
+///
+/// 只在"锁外做设备 I/O 期间槽位被他人改动"时消耗。正常路径（命中、
+/// 空槽、无竞争）一次成功。重试耗尽不是静默失败：读路径退化为直接读设备，
+/// 写路径退化为直接写设备，且计入 `direct_writes` 统计。
+const SLOT_RETRIES: usize = 8;
+
 /// 单个缓存槽。
 struct Slot {
     /// 该槽当前缓存的设备块号；`EMPTY_TAG` = 空。
     tag: u64,
+    /// 内容是否比设备新（尚未落盘）。
+    dirty: bool,
+    /// 内容版本号：每次内容变更 +1。
+    ///
+    /// 用途：锁外做设备 I/O 后重新加锁时，用它判定"槽位是否已被他人改动"。
+    /// 只比较 `tag` 不够——同一块被他人重写后 `tag` 不变，但内容已不同，
+    /// 直接覆盖会丢掉那次写。
+    seq: u64,
     data: Box<[u8; CACHE_BLOCK_BYTES]>,
 }
 
 impl Slot {
     fn new() -> Self {
-        Self { tag: EMPTY_TAG, data: Box::new([0u8; CACHE_BLOCK_BYTES]) }
+        Self {
+            tag: EMPTY_TAG,
+            dirty: false,
+            seq: 0,
+            data: Box::new([0u8; CACHE_BLOCK_BYTES]),
+        }
     }
+}
+
+/// 槽位内容的快照（在锁内拷出，锁外使用）。
+///
+/// 用定长数组而非 `Box`：快照在**持锁期间**构造，不能分配内存。
+struct Occupant {
+    tag: u64,
+    dirty: bool,
+    seq: u64,
+    data: [u8; CACHE_BLOCK_BYTES],
 }
 
 /// 缓存统计。**全部是真实计数**，不做任何修饰（诚实性红线）：
@@ -90,8 +125,15 @@ impl Slot {
 pub struct CacheStats {
     hits: AtomicU64,
     misses: AtomicU64,
-    /// 因写直通而更新了缓存副本的次数。
+    /// 写入命中缓存块的次数（写回下不落盘）。
     write_touches: AtomicU64,
+    /// 成功写回设备的块数。
+    writebacks: AtomicU64,
+    /// 写回**失败**（底层短写）的次数。非零即意味着有数据尚未落盘，
+    /// 必须由上层如实报告，绝不静默丢弃。
+    writeback_errors: AtomicU64,
+    /// 因无法缓存而直接落盘的写次数（设备末端短块，或槽位竞争重试耗尽）。
+    direct_writes: AtomicU64,
 }
 
 impl CacheStats {
@@ -103,6 +145,15 @@ impl CacheStats {
     }
     pub fn write_touches(&self) -> u64 {
         self.write_touches.load(Ordering::Relaxed)
+    }
+    pub fn writebacks(&self) -> u64 {
+        self.writebacks.load(Ordering::Relaxed)
+    }
+    pub fn writeback_errors(&self) -> u64 {
+        self.writeback_errors.load(Ordering::Relaxed)
+    }
+    pub fn direct_writes(&self) -> u64 {
+        self.direct_writes.load(Ordering::Relaxed)
     }
     /// 命中率（0.0-1.0）。无访问时返回 0.0（不返回 NaN，也不伪造值）。
     pub fn hit_ratio(&self) -> f64 {
@@ -156,6 +207,66 @@ impl CachingByteDevice {
         (block & (CACHE_BLOCK_COUNT as u64 - 1)) as usize
     }
 
+    /// 设备块号 -> 设备字节偏移。块号是**设备绝对**块号（ext2 传入的
+    /// 偏移已含分区起点），读写两侧同一套换算，不存在相对/绝对混用。
+    #[inline]
+    fn offset_of(block: u64) -> u64 {
+        block * CACHE_BLOCK_BYTES as u64
+    }
+
+    /// 锁内快照一个非空槽位。
+    #[inline]
+    fn snapshot(slot: &Slot) -> Occupant {
+        let mut data = [0u8; CACHE_BLOCK_BYTES];
+        data.copy_from_slice(&slot.data[..]);
+        Occupant {
+            tag: slot.tag,
+            dirty: slot.dirty,
+            seq: slot.seq,
+            data,
+        }
+    }
+
+    /// 锁内：若槽位自快照以来未被改动，则把 `block` 装进去。
+    ///
+    /// 返回是否安装成功。失败意味着槽位已被他人改动，调用方必须**重试**
+    /// 而不是覆盖——覆盖会丢掉他人的写（S21 顺序显式化）。
+    #[inline]
+    fn install_if_unchanged(
+        slot: &mut Slot,
+        occ: &Option<Occupant>,
+        block: u64,
+        data: &[u8; CACHE_BLOCK_BYTES],
+        dirty: bool,
+    ) -> bool {
+        let unchanged = match occ {
+            None => slot.tag == EMPTY_TAG,
+            Some(o) => slot.tag == o.tag && slot.seq == o.seq,
+        };
+        if unchanged {
+            slot.tag = block;
+            slot.dirty = dirty;
+            slot.seq = slot.seq.wrapping_add(1);
+            slot.data.copy_from_slice(data);
+        }
+        unchanged
+    }
+
+    /// **锁外**：把一个块的内容写回底层设备。
+    ///
+    /// 短写计入 `writeback_errors` 并返回 false——调用方必须**保持脏标志**，
+    /// 使数据在后续淘汰或显式冲刷时再次尝试，绝不静默丢弃（S09）。
+    fn writeback_block(&self, block: u64, data: &[u8; CACHE_BLOCK_BYTES]) -> bool {
+        let n = self.inner.write_bytes(Self::offset_of(block), data);
+        if n == CACHE_BLOCK_BYTES {
+            self.stats.writebacks.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            self.stats.writeback_errors.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
     /// 取一个完整缓存块到 `buf`，返回真实读到的字节数（短读如实返回）。
     ///
     /// **锁纪律（S21）**：锁只覆盖查表与拷贝；未命中时在**锁外**读设备。
@@ -163,63 +274,142 @@ impl CachingByteDevice {
     /// 由于 ATA PIO 下一次块读可能耗时数百微秒甚至更久，这条纪律是硬要求。
     fn fetch_block(&self, block: u64, buf: &mut [u8; CACHE_BLOCK_BYTES]) -> usize {
         let idx = Self::index_of(block);
-        // 快路径：命中。锁仅覆盖比较 + memcpy，随即释放。
-        let hit = {
-            let table = self.table.lock();
-            let slot = &table.slots[idx];
-            if slot.tag == block {
-                buf.copy_from_slice(&slot.data[..]);
-                true
-            } else {
-                false
+        let mut miss_counted = false;
+        for _ in 0..SLOT_RETRIES {
+            let occ: Option<Occupant> = {
+                let table = self.table.lock();
+                let slot = &table.slots[idx];
+                if slot.tag == block {
+                    buf.copy_from_slice(&slot.data[..]);
+                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                    return CACHE_BLOCK_BYTES;
+                }
+                if !miss_counted {
+                    miss_counted = true;
+                    self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                }
+                if slot.tag == EMPTY_TAG {
+                    None
+                } else {
+                    Some(Self::snapshot(slot))
+                }
+            };
+            // 锁外读设备。
+            let got = self.inner.read_bytes(Self::offset_of(block), buf);
+            // 锁外回写被淘汰的脏块（不变式 1：淘汰必回写）。
+            if let Some(o) = &occ {
+                if o.dirty {
+                    self.writeback_block(o.tag, &o.data);
+                }
             }
-        };
-        if hit {
-            self.stats.hits.fetch_add(1, Ordering::Relaxed);
-            return CACHE_BLOCK_BYTES;
-        }
-        self.stats.misses.fetch_add(1, Ordering::Relaxed);
-        // 锁外做设备 I/O。
-        let off = block * CACHE_BLOCK_BYTES as u64;
-        let got = self.inner.read_bytes(off, buf);
-        // 只有整块读全才缓存。短读的块若缓存下去，会把"设备末端数据不完整"
-        // 固化成一个看起来正常的满块，后续读再也看不到真实长度（S19/S09）。
-        if got == CACHE_BLOCK_BYTES {
+            // 只有整块读全才缓存。短读的块若缓存下去，会把"设备末端数据不完整"
+            // 固化成一个看起来正常的满块，后续读再也看不到真实长度（S19/S09）。
+            if got != CACHE_BLOCK_BYTES {
+                return got;
+            }
             let mut table = self.table.lock();
-            let slot = &mut table.slots[idx];
-            // 仅在槽为空或仍是同块时写入。若锁外期间已被他人换成**不同**块，
-            // 那属于更新的内容，丢弃自己这份，绝不用旧副本覆盖新数据。
-            if slot.tag == EMPTY_TAG || slot.tag == block {
-                slot.tag = block;
-                slot.data.copy_from_slice(&buf[..]);
+            if Self::install_if_unchanged(&mut table.slots[idx], &occ, block, buf, false) {
+                return got;
             }
+            // 槽位被他人改动：重试，绝不覆盖更新的内容。
         }
-        got
+        // 重试耗尽：不缓存，但如实返回设备真值（正确性优先于缓存收益）。
+        self.inner.read_bytes(Self::offset_of(block), buf)
     }
 
-    /// 写直通后更新缓存（仅更新**已存在且同块**的副本）。
+    /// 把块内一段字节写入缓存（写回语义）。返回是否**已进缓存**。
     ///
-    /// 不插入新块：写大文件时若逐块插入，会把整个文件内容灌进缓存，
-    /// 逐出掉真正有用的元数据块（污染），得不偿失。
-    fn apply_write(&self, offset: u64, data: &[u8]) {
-        let bs = CACHE_BLOCK_BYTES as u64;
-        let mut pos = 0usize;
-        while pos < data.len() {
-            let abs = offset + pos as u64;
-            let block = abs / bs;
-            let in_block = (abs % bs) as usize;
-            let take = core::cmp::min(data.len() - pos, CACHE_BLOCK_BYTES - in_block);
-            let idx = Self::index_of(block);
-            let mut table = self.table.lock();
-            let slot = &mut table.slots[idx];
-            if slot.tag == block {
-                slot.data[in_block..in_block + take]
-                    .copy_from_slice(&data[pos..pos + take]);
-                self.stats.write_touches.fetch_add(1, Ordering::Relaxed);
+    /// 未命中时必须先把整块读进来（不变式 2：保留未覆盖字节），否则回写会把
+    /// 未写到的部分变成 0——那是伪造数据（S09）。返回 false 表示无法缓存
+    /// （设备末端短块，或槽位竞争重试耗尽），调用方必须直接落盘。
+    fn write_block_part(&self, block: u64, in_block: usize, src: &[u8]) -> bool {
+        let idx = Self::index_of(block);
+        for _ in 0..SLOT_RETRIES {
+            let occ: Option<Occupant> = {
+                let mut table = self.table.lock();
+                let slot = &mut table.slots[idx];
+                if slot.tag == block {
+                    // 命中：原地更新并标脏，不落盘（写回的全部收益在此）。
+                    slot.data[in_block..in_block + src.len()].copy_from_slice(src);
+                    slot.dirty = true;
+                    slot.seq = slot.seq.wrapping_add(1);
+                    self.stats.write_touches.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                if slot.tag == EMPTY_TAG {
+                    None
+                } else {
+                    Some(Self::snapshot(slot))
+                }
+            };
+            // 锁外读入本块旧内容（保留未覆盖字节）。
+            let mut buf = [0u8; CACHE_BLOCK_BYTES];
+            let got = self.inner.read_bytes(Self::offset_of(block), &mut buf);
+            if got != CACHE_BLOCK_BYTES {
+                // 设备末端短块：整块化会伪造尾部数据，交给直接写路径。
+                return false;
             }
-            drop(table);
-            pos += take;
+            buf[in_block..in_block + src.len()].copy_from_slice(src);
+            if let Some(o) = &occ {
+                if o.dirty {
+                    self.writeback_block(o.tag, &o.data);
+                }
+            }
+            let mut table = self.table.lock();
+            if Self::install_if_unchanged(&mut table.slots[idx], &occ, block, &buf, true) {
+                self.stats.write_touches.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
         }
+        false
+    }
+
+    /// 把所有脏块落盘。返回 (成功落盘数, 调用结束时仍脏的块数)。
+    ///
+    /// **失败绝不静默**：写回失败的块保持脏标志（后续淘汰或再次冲刷会重试），
+    /// 并计入 `writeback_errors`；调用方应据返回值判断是否真的全部持久化。
+    ///
+    /// **生产前提**：卸载/关机路径必须调用本方法，否则脏数据随缓存实例消失
+    /// ——那是静默丢数据。
+    pub fn flush_dirty(&self) -> (usize, usize) {
+        let mut flushed = 0usize;
+        for idx in 0..CACHE_BLOCK_COUNT {
+            for _ in 0..SLOT_RETRIES {
+                let occ = {
+                    let table = self.table.lock();
+                    let slot = &table.slots[idx];
+                    if slot.dirty && slot.tag != EMPTY_TAG {
+                        Some(Self::snapshot(slot))
+                    } else {
+                        None
+                    }
+                };
+                let Some(o) = occ else { break };
+                if !self.writeback_block(o.tag, &o.data) {
+                    // 保持脏：不静默丢弃。
+                    break;
+                }
+                let mut table = self.table.lock();
+                let slot = &mut table.slots[idx];
+                if slot.tag == o.tag && slot.seq == o.seq {
+                    slot.dirty = false;
+                    flushed += 1;
+                    break;
+                }
+                // 期间被改写：保持脏，重试。
+            }
+        }
+        (flushed, self.dirty_count())
+    }
+
+    /// 当前脏块数（尚未落盘的块）。用于观测与验收，不做修饰。
+    pub fn dirty_count(&self) -> usize {
+        let table = self.table.lock();
+        table
+            .slots
+            .iter()
+            .filter(|s| s.dirty && s.tag != EMPTY_TAG)
+            .count()
     }
 }
 
@@ -237,9 +427,7 @@ impl ByteDevice for CachingByteDevice {
         let bs = CACHE_BLOCK_BYTES as u64;
         // 设备长度（若有）：用于**提前截断请求**，避免发出注定读不到数据的
         // 命令。这不是微优化：ATA PIO 下一条注定失败的读命令仍要走完整流程
-        // （256 次 inw 的数据相位 + wait_not_busy 轮询），代价与成功命令同量级。
-        // ext2 的超级块（偏移 1024）、inode 表尾等读很容易触到盘末端。
-        // 无长度能力（None）时退化为按实际短读停止，语义不变（S09 不猜长度）。
+        // （数据相位 + wait_not_busy 轮询），代价与成功命令同量级。
         let dev_len = self.inner.byte_len();
         let mut done = 0usize;
         let mut block = offset / bs;
@@ -247,7 +435,7 @@ impl ByteDevice for CachingByteDevice {
         let mut buf = [0u8; CACHE_BLOCK_BYTES];
         while done < out.len() {
             if let Some(len) = dev_len {
-                if block * bs >= len {
+                if Self::offset_of(block) >= len {
                     break;
                 }
             }
@@ -265,19 +453,40 @@ impl ByteDevice for CachingByteDevice {
         done
     }
 
-    /// 写直通（write-through）。
+    /// 写回（write-back）。
     ///
-    /// 顺序很关键（S21）：**先落盘、成功后才更新缓存**。
-    /// 若先更新缓存再落盘而落盘失败，缓存里就会留下一个设备上没有的值，
-    /// 后续读会拿到从未真正持久化的数据——那是典型的"伪造成功"。
+    /// 写入进缓存并标脏，**不立即落盘**；数据在三种时机落盘：
+    /// 1. 槽位被另一个块淘汰时（`fetch_block` / `write_block_part`）；
+    /// 2. 显式 [`CachingByteDevice::flush_dirty`]（卸载/关机路径必须调用）；
+    /// 3. 无法缓存时直接落盘（设备末端短块、槽位竞争重试耗尽）。
     ///
-    /// 返回底层真实写入的字节数（短写如实返回，不伪装全量成功）。
+    /// 返回请求写入的字节数——按 POSIX 语义，写成功不等于已持久化，
+    /// 持久化由 flush 保证；本方法**不**把"进了缓存"伪装成"已落盘"。
+    /// 只有底层直接写路径真的短写时才如实返回短计数。
     fn write_bytes(&self, offset: u64, data: &[u8]) -> usize {
-        let n = self.inner.write_bytes(offset, data);
-        if n > 0 {
-            self.apply_write(offset, &data[..n]);
+        let bs = CACHE_BLOCK_BYTES as u64;
+        let mut pos = 0usize;
+        while pos < data.len() {
+            let abs = offset + pos as u64;
+            let block = abs / bs;
+            let in_block = (abs % bs) as usize;
+            let take = core::cmp::min(data.len() - pos, CACHE_BLOCK_BYTES - in_block);
+            if self.write_block_part(block, in_block, &data[pos..pos + take]) {
+                pos += take;
+                continue;
+            }
+            // 兜底：无法缓存 ⇒ 直接落盘（如实、且可观测），绝不假装进了缓存。
+            let n = self.inner.write_bytes(abs, &data[pos..pos + take]);
+            self.stats.direct_writes.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                return pos;
+            }
+            pos += n;
+            if n < take {
+                return pos;
+            }
         }
-        n
+        pos
     }
 
     fn byte_len(&self) -> Option<u64> {

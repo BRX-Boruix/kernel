@@ -114,7 +114,11 @@ pub fn unmark_device_by_path(path: &str) {
 /// **热插拔（S20 失败模式优先）**：设备拔除后若同名设备重新插入，复用旧缓存
 /// 会把**旧设备的数据**当作新设备的数据返回。故卸载路径必须同时释放该设备的
 /// 缓存条目，使重新挂载时拿到干净实例。
-static DEVICE_CACHES: Mutex<Vec<(String, Arc<dyn fs::ByteDevice>)>> = Mutex::new(Vec::new());
+/// 注册表存**具体类型** `Arc<CachingByteDevice>` 而非 `Arc<dyn ByteDevice>`：
+/// 写回（write-back）下卸载/关机前必须调用 `flush_dirty`，而 trait 对象上
+/// 没有这个方法。存具体类型使"冲刷"成为可执行的强制步骤，而不是一句注释。
+static DEVICE_CACHES: Mutex<Vec<(String, Arc<fs::block_cache::CachingByteDevice>)>> =
+    Mutex::new(Vec::new());
 
 /// 取（必要时建立）设备 name 的唯一缓存实例。
 ///
@@ -126,17 +130,71 @@ fn cached_bridge_for(name: &str, ops: &'static dyn driver::Device) -> Arc<dyn fs
         return dev.clone();
     }
     let raw: Arc<dyn fs::ByteDevice> = Arc::new(DrvByteBridge(ops));
-    let cached: Arc<dyn fs::ByteDevice> = Arc::new(fs::block_cache::CachingByteDevice::new(raw));
+    let cached: Arc<fs::block_cache::CachingByteDevice> =
+        Arc::new(fs::block_cache::CachingByteDevice::new(raw));
     reg.push((String::from(name), cached.clone()));
     cached
+}
+
+/// 冲刷一个缓存实例并如实报告结果。
+///
+/// **写回的生产前提（S09 不静默丢数据）**：脏数据只活在内存里，任何"丢弃
+/// 缓存实例"的路径都必须先冲刷，否则数据随实例一起消失，而调用方一无所知。
+/// 冲刷失败（底层短写）不重试掩盖，也不吞掉——以 `error` 级日志 + 非零
+/// 返回值暴露。
+fn flush_cache_or_report(name: &str, cache: &Arc<fs::block_cache::CachingByteDevice>) -> (usize, usize) {
+    let (flushed, dirty) = cache.flush_dirty();
+    let errors = cache.stats().writeback_errors();
+    if dirty > 0 || errors > 0 {
+        klib::error!(
+            "[blkcache] flush incomplete on '{}': flushed={} still_dirty={} writeback_errors={}",
+            name,
+            flushed,
+            dirty,
+            errors
+        );
+    } else if flushed > 0 {
+        klib::info!("[blkcache] flushed {} dirty block(s) on '{}'", flushed, name);
+    }
+    (flushed, dirty)
 }
 
 /// 释放设备 name 的缓存实例（设备卸载/拔除时调用）。
 ///
 /// 与 DEVICE_CACHES 的插入成对（S18）。释放后该设备若再次挂载，
 /// 会建立全新缓存，绝不复用属于旧设备的数据。
+///
+/// **释放前必须先冲刷**：写回下不冲刷就丢弃实例 = 静默丢数据。本函数是该
+/// 前提在生产代码里的落点（宿主测试无法覆盖"忘了冲刷"这类遗漏，只能靠
+/// 结构保证：缓存实例的持有者与释放者都在这一个文件里）。
 pub fn release_device_cache(name: &str) {
-    DEVICE_CACHES.lock().retain(|(n, _)| n != name);
+    let removed = {
+        let mut reg = DEVICE_CACHES.lock();
+        let pos = reg.iter().position(|(n, _)| n == name);
+        pos.map(|p| reg.remove(p))
+    };
+    if let Some((name, cache)) = removed {
+        let _ = flush_cache_or_report(&name, &cache);
+    }
+}
+
+/// 冲刷**所有**设备缓存（关机/重启前调用）。
+///
+/// 返回 (成功落盘块数, 仍脏块数)。仍脏 > 0 时调用方必须如实报告——那意味着
+/// 有数据尚未持久化，不能当作关机成功。
+pub fn flush_all_device_caches() -> (usize, usize) {
+    let caches: alloc::vec::Vec<(String, Arc<fs::block_cache::CachingByteDevice>)> = {
+        let reg = DEVICE_CACHES.lock();
+        reg.iter().map(|(n, c)| (n.clone(), c.clone())).collect()
+    };
+    let mut flushed = 0usize;
+    let mut dirty = 0usize;
+    for (name, cache) in caches {
+        let (f, d) = flush_cache_or_report(&name, &cache);
+        flushed += f;
+        dirty += d;
+    }
+    (flushed, dirty)
 }
 
 /// 获取全局 VFS 挂载表。

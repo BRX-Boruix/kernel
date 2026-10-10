@@ -2685,6 +2685,45 @@ mod tests {
         }
     }
 
+    /// **写回 + 缓存实例更替**：机内失败形态（大小对、内容全 0）的宿主模型。
+    ///
+    /// 为什么"同一缓存内读写往返"不够：那种测试里写进去的脏块一直待在缓存里，
+    /// 读者必然命中，掩盖了"写进了 A 实例、读者看的是 B 实例/底层设备"这一类
+    /// 缺陷。本测试显式建模真实生命周期：经缓存 A 建文件写数据 → 冲刷
+    /// （生产前提）→ **丢弃 A** → 用同一底层设备建缓存 B → 重新挂载读回，
+    /// 内容必须逐字节完好。
+    #[test]
+    fn test_ext2_write_back_survives_cache_instance_replacement() {
+        use vfs::inode::FileSystem;
+        let img = build_writable_image();
+        let raw: Arc<MockByteDevice> = Arc::new(MockByteDevice::new(img));
+        let payload: Vec<u8> = (0..1500usize).map(|i| (i % 251) as u8).collect();
+        {
+            let cache_a = Arc::new(crate::block_cache::CachingByteDevice::new(raw.clone()));
+            let fs = Ext2Fs::open(cache_a.clone(), PART_START_LBA * SECTOR).expect("open via cache A");
+            let root = FileSystem::root(&fs);
+            let f = root.create("payload.bin", 0o644, (0u32, 0u32)).expect("create");
+            assert_eq!(f.write_at(0, &payload).expect("write"), payload.len());
+            // 同一缓存内自读一致（写回的基本不变式）。
+            let mut back = alloc::vec![0u8; payload.len()];
+            assert_eq!(f.read_at(0, &mut back).expect("read"), payload.len());
+            assert_eq!(back, payload, "cache A must be self-consistent");
+            // 生产前提：丢弃实例前必须冲刷，否则脏数据随之消失。
+            let (n, dirty) = cache_a.flush_dirty();
+            assert_eq!(dirty, 0, "flush must persist everything before the instance is dropped");
+            assert!(n > 0, "there must have been dirty blocks to flush");
+        }
+        // 缓存 A 已随作用域结束被丢弃（引用计数归零）。
+        let cache_b = Arc::new(crate::block_cache::CachingByteDevice::new(raw.clone()));
+        let fs_b = Ext2Fs::open(cache_b, PART_START_LBA * SECTOR).expect("open via cache B");
+        let root_b = FileSystem::root(&fs_b);
+        let f_b = root_b.lookup("payload.bin").expect("payload.bin survives instance swap");
+        let mut back = alloc::vec![0u8; payload.len()];
+        let n = f_b.read_at(0, &mut back).expect("read after instance swap");
+        assert_eq!(n, payload.len());
+        assert_eq!(back, payload, "数据必须经底层设备存活到新缓存实例");
+    }
+
     /// M3：create/mkdir/unlink/symlink 的目录项增删与 inode/块分配释放记账。
     ///
     /// 空闲计数以**重挂（重开设备）读回的盘上真值**为准——写路径把记账

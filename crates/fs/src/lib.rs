@@ -118,7 +118,14 @@ mod tests {
     /// 计数设备：记录 read_bytes/write_bytes 被调用的**真实**次数，
     /// 用于断言缓存确实减少了设备访问（而不是只看结果对不对）。
     struct CountingDevice {
-        data: alloc::vec::Vec<u8>,
+        /// 内部可变性必须用 `spin::Mutex`（与 MockByteDevice 一致）。
+        ///
+        /// **曾经的缺陷（本轮实测）**：这里原本是裸 `Vec<u8>`，写入经
+        /// `self.data.as_ptr() as *mut u8` 的裸指针完成——在 Rust 别名规则下
+        /// 是 UB（`&self` 不提供可变性保证），编译器**可以正当地**把后续的
+        /// 设备读提升到写之前，于是"写回后设备上是新值"的断言会随机假失败。
+        /// 这类假失败会污染对缓存本身的判断，必须消除。
+        data: spin::Mutex<alloc::vec::Vec<u8>>,
         reads: core::sync::atomic::AtomicUsize,
         writes: core::sync::atomic::AtomicUsize,
     }
@@ -128,7 +135,7 @@ mod tests {
             // 内容取可辨识模式：byte i = (i * 7 + 3) as u8。
             let data = (0..len).map(|i| ((i * 7 + 3) & 0xFF) as u8).collect();
             Self {
-                data,
+                data: spin::Mutex::new(data),
                 reads: core::sync::atomic::AtomicUsize::new(0),
                 writes: core::sync::atomic::AtomicUsize::new(0),
             }
@@ -144,24 +151,24 @@ mod tests {
     impl ByteDevice for CountingDevice {
         fn read_bytes(&self, offset: u64, out: &mut [u8]) -> usize {
             self.reads.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let data = self.data.lock();
             let Ok(off) = usize::try_from(offset) else { return 0 };
-            if off >= self.data.len() { return 0; }
-            let n = core::cmp::min(out.len(), self.data.len() - off);
-            out[..n].copy_from_slice(&self.data[off..off + n]);
+            if off >= data.len() { return 0; }
+            let n = core::cmp::min(out.len(), data.len() - off);
+            out[..n].copy_from_slice(&data[off..off + n]);
             n
         }
         fn write_bytes(&self, offset: u64, src: &[u8]) -> usize {
             self.writes.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let mut data = self.data.lock();
             let Ok(off) = usize::try_from(offset) else { return 0 };
-            if off >= self.data.len() { return 0; }
-            let n = core::cmp::min(src.len(), self.data.len() - off);
-            // 测试专用：设备代表可写介质，经裸指针写入（不引入 Cell 包装）。
-            let base = self.data.as_ptr() as *mut u8;
-            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), base.add(off), n) };
+            if off >= data.len() { return 0; }
+            let n = core::cmp::min(src.len(), data.len() - off);
+            data[off..off + n].copy_from_slice(&src[..n]);
             n
         }
         fn byte_len(&self) -> Option<u64> {
-            Some(self.data.len() as u64)
+            Some(self.data.lock().len() as u64)
         }
     }
 
@@ -210,31 +217,56 @@ mod tests {
         assert_eq!(dev.reads(), 6, "cache must fetch exactly 5 blocks");
     }
 
-    /// 写到**命中**的块必须使缓存反映新值（write-through 的自读一致性）。
+    /// 写到**命中**的块：缓存立刻反映新值，且**不落盘**（write-back 的核心收益）。
+    /// 显式 flush 后才落盘一次，设备真值与缓存一致。
     #[test]
-    fn test_cache_write_through_visible_to_cache() {
+    fn test_cache_write_back_visible_to_cache() {
         let dev = Arc::new(CountingDevice::new(64 * 1024));
         let cache = block_cache::CachingByteDevice::new(dev.clone());
         let mut buf = [0u8; 512];
         cache.read_bytes(0, &mut buf); // 填充块 0
         let n = cache.write_bytes(100, b"HELLO");
         assert_eq!(n, 5);
-        assert_eq!(dev.writes(), 1, "write must reach the device (write-through)");
+        assert_eq!(dev.writes(), 0, "write-back must not touch the device yet");
         let mut back = [0u8; 5];
         cache.read_bytes(100, &mut back);
         assert_eq!(&back, b"HELLO", "cache must reflect own write");
+        assert_eq!(cache.dirty_count(), 1);
+        let (flushed, dirty) = cache.flush_dirty();
+        assert_eq!((flushed, dirty), (1, 0));
+        assert_eq!(dev.writes(), 1, "flush must persist exactly once");
+        let mut on_dev = [0u8; 5];
+        dev.read_bytes(100, &mut on_dev);
+        assert_eq!(&on_dev, b"HELLO", "flushed bytes must be on the device");
     }
 
-    /// 写到**未命中**的块不得把它拉进缓存（避免大文件写入污染元数据工作集）。
+    /// 写**未命中**的块：必须先把整块读进来再改（否则回写会把未覆盖的字节
+    /// 写成 0——伪造数据，S09）。断言未覆盖部分仍是设备真值。
     #[test]
-    fn test_cache_write_miss_does_not_allocate() {
+    fn test_cache_write_miss_fetches_block_and_is_readback_consistent() {
         let dev = Arc::new(CountingDevice::new(64 * 1024));
         let cache = block_cache::CachingByteDevice::new(dev.clone());
-        cache.write_bytes(32 * 1024, &[0xAB; 512]);
+        let truth: alloc::vec::Vec<u8> =
+            (0..64 * 1024).map(|i| ((i * 7 + 3) & 0xFF) as u8).collect();
+        let off = 32 * 1024 + 16;
+        let payload = [0xABu8; 16];
+        let n = cache.write_bytes(off as u64, &payload);
+        assert_eq!(n, 16);
+        assert_eq!(dev.writes(), 0, "write-back must not touch the device yet");
         let mut b = [0u8; 512];
-        cache.read_bytes(32 * 1024, &mut b);
-        assert_eq!(dev.reads(), 1, "write must not pre-populate the cache");
-        assert_eq!(cache.stats().misses(), 1);
+        assert_eq!(cache.read_bytes((32 * 1024) as u64, &mut b), 512);
+        // 期望值 = 设备原内容（同一公式）+ 覆盖的那 16 字节。
+        let mut expect = truth[32 * 1024..32 * 1024 + 512].to_vec();
+        expect[16..32].copy_from_slice(&payload);
+        assert_eq!(
+            &b[..],
+            &expect[..],
+            "read-modify-write must preserve untouched bytes"
+        );
+        assert_eq!(cache.flush_dirty().1, 0);
+        let mut on_dev = [0u8; 512];
+        assert_eq!(dev.read_bytes((32 * 1024) as u64, &mut on_dev), 512);
+        assert_eq!(&on_dev[..], &expect[..], "flushed block must match device");
     }
 
     /// 短读（设备末端）绝不能被缓存成"看似完整的满块"（S19/S09）。
@@ -305,5 +337,128 @@ mod tests {
         }
         let cache = block_cache::CachingByteDevice::new(Arc::new(NoLen));
         assert_eq!(cache.byte_len(), None);
+    }
+
+    // ---------- write-back 不变式（淘汰必回写 / 冲刷持久化 / 对抗性交错）----------
+
+    /// 不变式 1（**写触发**淘汰）：脏块被同槽的另一个块挤出前必须先回写设备。
+    /// 不回写 = 数据永久丢失（这正是本轮 host 测试抓到的第一个真实缺陷）。
+    #[test]
+    fn test_write_back_survives_eviction() {
+        let dev = Arc::new(CountingDevice::new(8 * 1024 * 1024));
+        let cache = block_cache::CachingByteDevice::new(dev.clone());
+        // 写块 0 的前 8 字节（未命中 ⇒ 先读整块再改）。
+        let payload = [0xA5u8; 8];
+        assert_eq!(cache.write_bytes(0, &payload), 8);
+        // 用 4096 个不同块填满所有槽位：块 4096 与块 0 同槽，必淘汰块 0。
+        let filler = [0x11u8; 512];
+        for b in 1..=4096u64 {
+            assert_eq!(cache.write_bytes(b * 512, &filler), 512);
+        }
+        let mut on_dev = [0u8; 8];
+        dev.read_bytes(0, &mut on_dev);
+        assert_eq!(on_dev, payload, "淘汰脏块必须先回写，否则数据永久丢失");
+    }
+
+    /// 不变式 1（**读触发**淘汰）：覆盖另一条淘汰路径（读未命中挤掉脏块）。
+    #[test]
+    fn test_write_back_survives_read_triggered_eviction() {
+        let dev = Arc::new(CountingDevice::new(8 * 1024 * 1024));
+        let cache = block_cache::CachingByteDevice::new(dev.clone());
+        let payload = [0x5Au8; 8];
+        assert_eq!(cache.write_bytes(0, &payload), 8);
+        let mut sink = [0u8; 512];
+        for b in 1..=4096u64 {
+            assert_eq!(cache.read_bytes(b * 512, &mut sink), 512);
+        }
+        let mut on_dev = [0u8; 8];
+        dev.read_bytes(0, &mut on_dev);
+        assert_eq!(on_dev, payload, "读触发淘汰同样必须先回写");
+    }
+
+    /// 显式冲刷：所有脏块必须整体落盘，返回 (成功数, 仍脏数)，仍脏必须为 0。
+    #[test]
+    fn test_write_back_flush_persists_every_dirty_block() {
+        let dev = Arc::new(CountingDevice::new(8 * 1024 * 1024));
+        let cache = block_cache::CachingByteDevice::new(dev.clone());
+        let mut expect: alloc::vec::Vec<(u64, [u8; 512])> = alloc::vec::Vec::new();
+        for b in 0..64u64 {
+            let payload = [b as u8; 512];
+            assert_eq!(cache.write_bytes(b * 512, &payload), 512);
+            expect.push((b, payload));
+        }
+        assert_eq!(dev.writes(), 0, "write-back must not touch the device yet");
+        assert_eq!(cache.dirty_count(), 64);
+        let (flushed, dirty) = cache.flush_dirty();
+        assert_eq!((flushed, dirty), (64, 0));
+        for (b, payload) in expect {
+            let mut on_dev = [0u8; 512];
+            dev.read_bytes(b * 512, &mut on_dev);
+            assert_eq!(on_dev, payload, "块 {} 冲刷后必须持久化", b);
+        }
+    }
+
+    /// **对抗性测试**（本轮方法学更正的核心）：随机但确定的读/写/冲刷交错，
+    /// 在 8 MiB 设备上制造大量同槽冲突与淘汰；缓存读必须始终等于影子真值，
+    /// 冲刷后设备对应区域必须等于影子真值，最后整体比对。
+    ///
+    /// 为什么必须有它：机内实测的失败形态（写回下文件大小对、内容全 0）
+    /// 既有的单点测试都没覆盖——它们不制造"写 → 淘汰 → 再读"的交错。
+    #[test]
+    fn test_write_back_adversarial_interleaved_matches_shadow() {
+        const LEN: usize = 8 * 1024 * 1024;
+        let mut shadow: alloc::vec::Vec<u8> =
+            (0..LEN).map(|i| ((i * 7 + 3) & 0xFF) as u8).collect();
+        let dev = Arc::new(MockByteDevice::new(shadow.clone()));
+        let cache = block_cache::CachingByteDevice::new(dev.clone());
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let mut rbuf = [0u8; 2048];
+        let mut full = alloc::vec![0u8; LEN];
+        for step in 0..20_000usize {
+            let op = next() % 4;
+            let off = next() % (LEN - 4096);
+            let len = 1 + next() % 1500;
+            match op {
+                0 | 1 => {
+                    let payload: alloc::vec::Vec<u8> =
+                        (0..len).map(|k| ((off + k + step) & 0xFF) as u8).collect();
+                    let n = cache.write_bytes(off as u64, &payload);
+                    assert_eq!(n, len, "step {}: 写必须被整段接受", step);
+                    shadow[off..off + len].copy_from_slice(&payload);
+                }
+                2 => {
+                    let n = cache.read_bytes(off as u64, &mut rbuf[..len]);
+                    assert_eq!(n, len, "step {}: 读必须整段服务", step);
+                    assert_eq!(
+                        &rbuf[..len],
+                        &shadow[off..off + len],
+                        "step {}: 缓存读与影子真值分叉",
+                        step
+                    );
+                }
+                _ => {
+                    let (_flushed, dirty) = cache.flush_dirty();
+                    assert_eq!(dirty, 0, "step {}: 冲刷后仍有脏块", step);
+                    let n = dev.read_bytes(off as u64, &mut rbuf[..len]);
+                    assert_eq!(n, len);
+                    assert_eq!(
+                        &rbuf[..len],
+                        &shadow[off..off + len],
+                        "step {}: 冲刷后设备与影子真值分叉",
+                        step
+                    );
+                }
+            }
+        }
+        let (_f, dirty) = cache.flush_dirty();
+        assert_eq!(dirty, 0, "最终冲刷后不得残留脏块");
+        dev.read_bytes(0, &mut full);
+        assert_eq!(full, shadow, "最终设备内容必须整体等于影子真值");
     }
 }

@@ -4341,6 +4341,16 @@ fn sys_power_off(_frame: &mut SyscallFrame) -> DispatchResult {
     }
     let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
     klib::info!("[syscall] power_off by pid {}: halting CPUs then S5", pid);
+    // 写回前提（S09）：设备缓存里的脏块必须先落盘，否则断电即静默丢数据。
+    // 未冲刷完必须如实报告，不得当作正常关机。
+    let (flushed, dirty) = crate::vfs_init::flush_all_device_caches();
+    if dirty > 0 {
+        klib::error!(
+            "[syscall] power_off: block cache flush incomplete (flushed={} still_dirty={})",
+            flushed,
+            dirty
+        );
+    }
     power_prepare_terminal();
     // power_off 写 PM1 后永久空转等待断电；不会正常返回。
     let _ = arch_x86_64::acpi::power_off();
@@ -4362,6 +4372,15 @@ fn sys_reboot(_frame: &mut SyscallFrame) -> DispatchResult {
     }
     let pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
     klib::info!("[syscall] reboot by pid {}: halting CPUs then reset", pid);
+    // 同 power_off：复位前必须把设备缓存的脏块落盘。
+    let (flushed, dirty) = crate::vfs_init::flush_all_device_caches();
+    if dirty > 0 {
+        klib::error!(
+            "[syscall] reboot: block cache flush incomplete (flushed={} still_dirty={})",
+            flushed,
+            dirty
+        );
+    }
     power_prepare_terminal();
     arch_x86_64::acpi::reboot();
     // 不可达：复位后 CPU 重启。
