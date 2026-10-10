@@ -5103,16 +5103,46 @@ fn irq_wait_blocking(frame: &mut SyscallFrame, pid: usize, irq: u8, timeout_ns: 
         }
         driver::irq_owner::irq_timer_clear(irq);
     };
-    // [临时诊断] block_for_irq **不打**：audiod 会在忙循环里反复调它（实测 38257 次），
-    // 打了会淹没串口、并改变时序。该缺陷另案处理。
-    match task::block_for_irq(arch_frame(frame), irq) {
-        task::SwitchOutcome::Switched => DispatchResult::Switched,
-        task::SwitchOutcome::NotSwitched => {
-            // 未入睡（闩锁已置 / 无同伴可切）：交付结果。若闩锁置位 → 1；否则
-            // （无可切同伴的退化）返回 0。取消超时定时器并清 IRQ 槽。
-            let fired = driver::irq_owner::irq_pending_consume(irq);
+    // 本等待的**绝对到期时刻**（与 `sleep_blocking` 同款口径）。
+    let deadline = klib::time::now_nanos()
+        .expect("clock_ready checked")
+        .saturating_add(timeout_ns);
+    // **重试阻塞**——与 `sleep_blocking` 的 §6.12.5 / §6.12.6 修法**同一手法、同一理由**。
+    //
+    // 本轮实测的真缺陷：就绪队列空时 `block_for_irq` 返回 `NotSwitched`，而本处原先
+    // **立即返回 `pack_ok(0)`**，于是「100 ms 定时阻塞」退化成**忙重试**——实测 intel-hda
+    // 的等待循环跑到 ≈10³ 次/秒（设计上应 ≤10 次/秒），`timeouts` 与 `iters` 几乎 1:1。
+    //
+    // 为什么 IPC 的「无可切同伴就返回 WouldBlock」纪律**不适用于本处**：那条纪律的前提是
+    // 「没有唤醒源，睡下去就死锁」；而本等待**刚注册了超时定时器**，定时器就是唤醒源，
+    // 故阻塞是安全的。把「定时阻塞」降级成「忙重试」正是本条要修的东西。
+    //
+    // NotSwitched 时用 `sti; hlt; cli` **开中断睡等**到下一个中断再回循环顶复检：
+    // `sti` 从下一条指令边界生效（硬件保证不丢中断窗），`hlt` 让核睡到任一中断
+    // （IRQ0 tick / 设备 IRQ 都能唤醒），**`cli` 立刻把 IF 关回 0**——理由与
+    // `sleep_blocking` 处逐字相同：syscall 经 `IA32_FMASK` 进入时 IF=0，内核整段建立在
+    // 这条不变量上；只 sti 不 cli 会在持 `RUN`/`PROCESSES` 锁的临界区里放进 IRQ0，
+    // tick 链再进调度器取同一把锁 → 单核自旋死锁。
+    loop {
+        // 闩锁已置（含驱动忙于服务期间到达的边沿）：立即交付。
+        if driver::irq_owner::irq_pending_consume(irq) {
             cancel_timer(registered_timer);
-            done(if fired { pack_ok(1) } else { pack_ok(0) })
+            return done(pack_ok(1));
+        }
+        // 到期：如实返回「超时无中断」。
+        if !klib::time::now_nanos().map_or(false, |n| n < deadline) {
+            cancel_timer(registered_timer);
+            return done(pack_ok(0));
+        }
+        match task::block_for_irq(arch_frame(frame), irq) {
+            task::SwitchOutcome::Switched => return DispatchResult::Switched,
+            task::SwitchOutcome::NotSwitched => {
+                // SAFETY: sti/hlt/cli 恒在 Ring0；sti-hlt 不丢中断窗由硬件保证。
+                // `cli` 必须在 hlt 返回后立刻恢复 IF=0（同 `sleep_blocking`）。
+                unsafe {
+                    core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack, preserves_flags));
+                }
+            }
         }
     }
 }
