@@ -2045,18 +2045,16 @@ where
         let mut core = self.core.lock();
 
         // 先完整验证所有权和边界，任何非法请求均在修改页表/记账前失败。
-        let (area_idx, area) = {
+        //
+        // **区间语义**：目标区间可以由多个 `AnonymousMmap` 区域拼成——`protect_user`
+        // 会把一个 mmap 区域按权限切成多片（同一对象不同段权限不同），而 POSIX 的
+        // munmap 认的是**地址区间**。旧实现只找"单个完整覆盖的区域"，于是
+        // 「整段 mmap → 按段 mprotect → 整段 munmap」这条最自然的用法必然 NotFound
+        // （实测：rtld 的 dlclose 对 12288 字节的 .so 整段 munmap 得到 NotFound）。
+        let plan = {
             let areas = self.areas.lock();
-            let Some((idx, area)) = areas.iter().copied().enumerate().find(|(_, area)| {
-                area.kind == UserAreaKind::AnonymousMmap
-                    && start >= area.start.as_u64()
-                    && end <= area.end.as_u64()
-            }) else {
-                return Err(Error::NotFound.into());
-            };
-            (idx, area)
+            plan_anonymous_unmap(&areas, start, end)?
         };
-        debug_assert_eq!(area.size, PageSize::Size4K);
 
         // PTE 与数据帧始终成对释放。translate 为 None 的页是尚未 demand-fault 的
         // 预留页；它没有任何资源可回收，但仍必须从区域范围中移除。
@@ -2085,22 +2083,15 @@ where
             .lock()
             .retain(|cow| cow.vaddr < start || cow.vaddr >= end);
 
-        // 区间可以从匿名区域中部切除；保留左右两侧的原属性和匿名所有权。先 remove
-        // 再插入，保证同一匿名区域不出现重叠的重复记录。
+        // 区间记账：整段命中的区域全部移除，部分重叠的由 plan 给出剩余片段。
+        // **按索引降序移除**——否则前面的 remove 会让后面的索引漂移。先全部移除、
+        // 再推回剩余片段，保证同一匿名区间不出现重叠的重复记录。
         let mut areas = self.areas.lock();
-        let removed = areas.remove(area_idx);
-        debug_assert_eq!(removed.start.as_u64(), area.start.as_u64());
-        if area.start.as_u64() < start {
-            areas.push(UserArea {
-                end: VirtAddr::new(start),
-                ..area
-            });
+        for &i in plan.remove.iter().rev() {
+            areas.remove(i);
         }
-        if end < area.end.as_u64() {
-            areas.push(UserArea {
-                start: VirtAddr::new(end),
-                ..area
-            });
+        for a in plan.keep {
+            areas.push(a);
         }
         drop(areas);
 
@@ -2442,6 +2433,74 @@ pub(crate) fn fault_plan(start: u64, len: u64) -> Option<(u64, u64)> {
     Some((aligned, end))
 }
 
+/// 一次匿名 `munmap` 的**区域记账计划**（纯函数产出：不碰页表、不取锁）。
+pub(crate) struct UnmapPlan {
+    /// 需要整段移除的区域索引（**升序**；调用方须**降序** remove，否则索引漂移）。
+    pub remove: Vec<usize>,
+    /// 与目标区间部分重叠的区域在移除后需要重推的剩余片段（左片/右片）。
+    pub keep: Vec<UserArea>,
+}
+
+/// 为匿名 `munmap` 的 `[start, end)` 规划区域记账（**纯函数，可宿主测试**）。
+///
+/// 语义（POSIX munmap 是**区间**语义，不是"一个区域"语义）：
+/// - 区间必须逐字节由 `AnonymousMmap` 区域覆盖且**无空洞**，否则 `NotFound`；
+///   跨到别的区域类型（Fixed/Reserved/Stack/DeviceMmap/DmaBuffer）同样是
+///   `NotFound`——那些区域不归匿名 munmap 管，生命周期由各自 API 负责；
+/// - 完整落在区间内的区域整段移除；
+/// - 部分重叠的区域按区间**外**的剩余部分重推（左片、右片，可同时存在）。
+///
+/// 抽出纯函数的理由：这是"跨区域 / 空洞 / 所有权"三类边界条件的**唯一落点**，
+/// 而它依赖的 `areas` 只是纯数据。放在可宿主测试的函数里，边界条件能逐条钉住，
+/// 而不是只在 QEMU 里靠一次真实 dlclose 间接暴露。
+fn plan_anonymous_unmap(areas: &[UserArea], start: u64, end: u64) -> Result<UnmapPlan, Error> {
+    let mut hit: Vec<usize> = Vec::new();
+    for (i, a) in areas.iter().enumerate() {
+        if a.end.as_u64() <= start || a.start.as_u64() >= end {
+            continue;
+        }
+        if a.kind != UserAreaKind::AnonymousMmap || a.size != PageSize::Size4K {
+            return Err(Error::NotFound);
+        }
+        hit.push(i);
+    }
+    if hit.is_empty() {
+        return Err(Error::NotFound);
+    }
+    // 按起点排序后必须首尾相接并恰好覆盖 [start, end)：任何空洞都说明区间里混进了
+    // 不属于本调用方的地址，如实拒绝，而不是"尽力释放能释放的那部分"。
+    hit.sort_by_key(|&i| areas[i].start.as_u64());
+    let mut cursor = start;
+    for &i in &hit {
+        if areas[i].start.as_u64() > cursor {
+            return Err(Error::NotFound);
+        }
+        if areas[i].end.as_u64() > cursor {
+            cursor = areas[i].end.as_u64();
+        }
+    }
+    if cursor < end {
+        return Err(Error::NotFound);
+    }
+    let mut keep = Vec::new();
+    for &i in &hit {
+        let a = areas[i];
+        if a.start.as_u64() < start {
+            keep.push(UserArea {
+                end: VirtAddr::new(start),
+                ..a
+            });
+        }
+        if a.end.as_u64() > end {
+            keep.push(UserArea {
+                start: VirtAddr::new(end),
+                ..a
+            });
+        }
+    }
+    Ok(UnmapPlan { remove: hit, keep })
+}
+
 #[cfg(test)]
 mod fault_plan_tests {
     use super::*;
@@ -2583,6 +2642,130 @@ mod stack_growth_tests {
         assert_eq!(new_start % PAGE, 0);
         assert_eq!(grow % PAGE, 0);
         assert_eq!(new_start, TOP - 4 * PAGE);
+    }
+}
+
+#[cfg(test)]
+mod anonymous_unmap_plan_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn rw() -> PageFlags {
+        map_flags_from_prot(PROT_READ | PROT_WRITE).expect("rw")
+    }
+    fn rx() -> PageFlags {
+        map_flags_from_prot(PROT_READ | PROT_EXEC).expect("rx")
+    }
+    fn anon(start: u64, end: u64, flags: PageFlags) -> UserArea {
+        UserArea {
+            start: VirtAddr::new(start),
+            end: VirtAddr::new(end),
+            size: PageSize::Size4K,
+            flags,
+            demand_paging: true,
+            kind: UserAreaKind::AnonymousMmap,
+        }
+    }
+
+    #[test]
+    fn whole_single_area_removes_it() {
+        let a = [anon(0x1000, 0x3000, rw())];
+        let p = plan_anonymous_unmap(&a, 0x1000, 0x3000).expect("整段命中");
+        assert_eq!(p.remove, vec![0]);
+        assert!(p.keep.is_empty());
+    }
+
+    #[test]
+    fn middle_of_single_area_keeps_both_sides() {
+        let a = [anon(0x1000, 0x5000, rw())];
+        let p = plan_anonymous_unmap(&a, 0x2000, 0x3000).expect("中段切除");
+        assert_eq!(p.remove, vec![0]);
+        assert_eq!(p.keep.len(), 2);
+        assert_eq!(p.keep[0].start.as_u64(), 0x1000);
+        assert_eq!(p.keep[0].end.as_u64(), 0x2000);
+        assert_eq!(p.keep[1].start.as_u64(), 0x3000);
+        assert_eq!(p.keep[1].end.as_u64(), 0x5000);
+    }
+
+    #[test]
+    fn range_spanning_areas_split_by_mprotect_is_accepted() {
+        // 这是本轮实测撞到的形态：一个 mmap 区域被 protect_user 按段权限切成多片
+        // （RW / RX / RW），随后**整段** munmap。旧实现只认"单个完整覆盖的区域"，
+        // 这一条必红；POSIX 的 munmap 是区间语义，必须接受。
+        let a = [
+            anon(0x1000, 0x2000, rw()),
+            anon(0x2000, 0x3000, rx()),
+            anon(0x3000, 0x4000, rw()),
+        ];
+        let p = plan_anonymous_unmap(&a, 0x1000, 0x4000).expect("跨区域整段");
+        assert_eq!(p.remove, vec![0, 1, 2]);
+        assert!(p.keep.is_empty());
+    }
+
+    #[test]
+    fn spanning_areas_with_partial_ends_keeps_only_the_outside() {
+        let a = [
+            anon(0x1000, 0x2000, rw()),
+            anon(0x2000, 0x3000, rx()),
+            anon(0x3000, 0x5000, rw()),
+        ];
+        let p = plan_anonymous_unmap(&a, 0x1800, 0x4000).expect("两端各留一片");
+        assert_eq!(p.remove, vec![0, 1, 2]);
+        assert_eq!(p.keep.len(), 2);
+        assert_eq!(p.keep[0].start.as_u64(), 0x1000);
+        assert_eq!(p.keep[0].end.as_u64(), 0x1800);
+        assert_eq!(p.keep[1].start.as_u64(), 0x4000);
+        assert_eq!(p.keep[1].end.as_u64(), 0x5000);
+    }
+
+    #[test]
+    fn hole_inside_the_range_is_rejected() {
+        // 区间里混进未声明的空洞 -> 那些地址不归本调用方，如实拒绝而不是"尽力释放"。
+        let a = [anon(0x1000, 0x2000, rw()), anon(0x3000, 0x4000, rw())];
+        assert!(matches!(
+            plan_anonymous_unmap(&a, 0x1000, 0x4000),
+            Err(Error::NotFound)
+        ));
+    }
+
+    #[test]
+    fn crossing_into_a_non_anonymous_area_is_rejected() {
+        // 跨到别的区域类型：其生命周期由各自 API 负责，匿名 munmap 不得染指。
+        let a = [
+            anon(0x1000, 0x2000, rw()),
+            UserArea {
+                start: VirtAddr::new(0x2000),
+                end: VirtAddr::new(0x3000),
+                size: PageSize::Size4K,
+                flags: rw(),
+                demand_paging: true,
+                kind: UserAreaKind::Stack {
+                    limit_bottom: VirtAddr::new(0x1000),
+                },
+            },
+        ];
+        assert!(matches!(
+            plan_anonymous_unmap(&a, 0x1000, 0x3000),
+            Err(Error::NotFound)
+        ));
+    }
+
+    #[test]
+    fn range_reaching_past_the_coverage_is_rejected() {
+        let a = [anon(0x1000, 0x2000, rw())];
+        assert!(matches!(
+            plan_anonymous_unmap(&a, 0x1000, 0x3000),
+            Err(Error::NotFound)
+        ));
+    }
+
+    #[test]
+    fn no_overlap_at_all_is_rejected() {
+        let a = [anon(0x1000, 0x2000, rw())];
+        assert!(matches!(
+            plan_anonymous_unmap(&a, 0x5000, 0x6000),
+            Err(Error::NotFound)
+        ));
     }
 }
 
