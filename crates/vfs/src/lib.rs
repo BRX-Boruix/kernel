@@ -626,7 +626,52 @@ mod tests {
         );
     }
 
-    struct EmptyDeviceProvider;
+    /// **回归（裸索引扫描的产物）**：`/devices/serial-com1` 的 `read_at` 收到**空缓冲**时
+/// 必须如实返回 0，不得把空切片交给 provider。
+///
+/// 为什么这不是「防御性冗余」：真内核 provider 的 `serial_read` 实现是 `buf[0] = b`
+/// （`vfs_init.rs:482`）——它**假定缓冲非空**。今天这条路径靠 `sys_read` 的 `len == 0`
+/// 早退挡着（`syscall.rs:2344`），但那是**跨层的、未成文的不变量**：任何新的 `read_at`
+/// 调用点（内核内部、测试、未来的 ioctl）只要传空缓冲就是一次内核 panic。
+/// 本测试用一个「空缓冲即 panic」的 provider 把这条不变量**钉死**。
+#[test]
+fn test_devfs_serial_read_empty_buffer_returns_zero() {
+    struct StrictSerial;
+    impl DeviceInfoProvider for StrictSerial {
+        fn list_devices(&self) -> Vec<DeviceInfo> {
+            Vec::new()
+        }
+        fn serial_read(&self, buf: &mut [u8]) -> Result<usize, Error> {
+            // 真内核 provider 的形态：直接写 buf[0]（空缓冲即 panic）。
+            buf[0] = b'X';
+            Ok(1)
+        }
+        fn serial_write(&self, buf: &[u8]) -> Result<usize, Error> {
+            Ok(buf.len())
+        }
+        fn get_serial_baudrate(&self) -> Result<u32, Error> {
+            Ok(115200)
+        }
+        fn set_serial_baudrate(&self, _b: u32) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let mount_table = MountTable::new(Arc::new(RamFS::new()));
+    mount_table.mkdir("/devices", 0o777, (0, 0)).unwrap();
+    let devfs = Arc::new(DevFS::new(Arc::new(StrictSerial)));
+    mount_table.mount("/devices", devfs).unwrap();
+    let node = mount_table
+        .resolve("/devices/serial-com1", true)
+        .expect("resolve serial node");
+    let mut empty: [u8; 0] = [];
+    assert_eq!(
+        node.read_at(0, &mut empty).unwrap(),
+        0,
+        "空缓冲必须如实返回 0，不得把它交给 provider（那是一次内核 panic）"
+    );
+}
+
+struct EmptyDeviceProvider;
     impl DeviceInfoProvider for EmptyDeviceProvider {
         fn list_devices(&self) -> Vec<DeviceInfo> {
             Vec::new()

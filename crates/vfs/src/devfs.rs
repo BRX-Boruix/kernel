@@ -280,6 +280,14 @@ impl SerialDeviceNode {
 
 impl INode for SerialDeviceNode {
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        // **空缓冲不得进 provider**（裸索引扫描的产物）：真内核 provider 的
+        // `serial_read` 实现是 `buf[0] = b`（`vfs_init.rs:482`），收到空切片就是一次
+        // 内核 panic（实测 `index out of bounds: the len is 0 but the index is 0`）。
+        // 今天这条路径靠 `sys_read` 的 `len == 0` 早退挡着（`syscall.rs:2344`），
+        // 但那是**跨层的、未成文的不变量**——本层自己保证，不靠上游。
+        if buf.is_empty() {
+            return Ok(0);
+        }
         self.provider.serial_read(buf)
     }
 
