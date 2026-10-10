@@ -1981,9 +1981,25 @@ where
                 .unmap(VirtAddr::new(vaddr))
                 .map_err(|_| Error::NotFound)?;
             PT::shootdown_one(vaddr);
+            // **COW 共享页绝不能按请求权限直接重映射**：那会让父子拿到同一物理帧的
+            // 双写窗口，COW 语义整体击穿（`cow_fault_locked` 的注释写明了这个后果，
+            // 但本函数此前**根本没查 `cow_pages`**）。
+            //
+            // 正确语义：硬件 PTE 保持**写保护**，把「期望权限」记进 COW 记账；
+            // 首次写故障由 `cow_fault_locked` 复制出私有帧并按期望权限映射。
+            // 于是 `mprotect(PROT_WRITE)` 的语义仍然生效，而父子隔离不被破坏。
+            let cow_idx = self.cow_pages.lock().iter().position(|c| c.vaddr == vaddr);
+            let map_flags = if cow_idx.is_some() {
+                readonly_flags(flags)
+            } else {
+                flags
+            };
             core.pt
-                .map(VirtAddr::new(vaddr), phys, PageSize::Size4K, flags)
+                .map(VirtAddr::new(vaddr), phys, PageSize::Size4K, map_flags)
                 .map_err(|_| Error::NoSpace)?;
+            if let Some(i) = cow_idx {
+                self.cow_pages.lock()[i].flags = flags;
+            }
             vaddr += PAGE_SIZE;
         }
 

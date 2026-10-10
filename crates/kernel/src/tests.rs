@@ -1552,6 +1552,82 @@ pub fn test_cow_clone() {
 /// 2. 子侧对应页同样全部可翻译，且与父**共享同一物理帧**；
 /// 3. 覆盖区首/中/尾抽样点内容经子侧 #PF 写复制后保持（数据未丢）；
 /// 4. 全部共享帧引用计数由 2 归位到 1（无泄漏、无重复归还）。
+/// **回归（本轮修）**：`mprotect` 在 **COW 共享页**上请求可写时，**绝不能**把共享帧
+/// 直接重映射为可写——那会让父子拿到同一物理帧的双写窗口，COW 语义整体击穿。
+///
+/// 这个后果 `cow_fault_locked` 的注释早已写明（"父子进程获得同一物理帧的双写窗口，
+/// COW 语义整体击穿"），但 `protect_user` 此前**根本没查 `cow_pages`**：它只是
+/// `unmap` → `map(同一 phys, 调用方给的 flags)`。
+///
+/// 正确语义（本测试锁定）：共享帧保持**硬件写保护**（PTE 只读），把"期望可写"记进
+/// COW 记账，由**首次写故障**去复制帧——`mprotect(PROT_WRITE)` 的语义仍然生效，
+/// 而父子隔离不被破坏。
+#[cfg(feature = "kernel-test-m5")]
+pub fn test_mprotect_write_on_cow_page_keeps_cow() {
+    use mm::user_space::UserAddressSpace;
+    info!("[cow-mprotect-test] === mprotect(PROT_WRITE) on a COW-shared page ===");
+
+    const DATA: u64 = 0x0000_0000_1000_0000;
+    let mut parent = UserAddressSpace::<X86PageTable>::new().expect("parent space");
+    let data_frame = mm::allocate_frame().expect("data frame").start_paddr();
+    unsafe {
+        core::ptr::write_volatile(arch::phys_to_virt(data_frame) as *mut u64, 0xCAFE_F00Du64)
+    };
+    parent
+        .map_user(
+            VirtAddr::new(DATA),
+            VirtAddr::new(DATA + 0x1000),
+            PageSize::Size4K,
+            PageFlags::empty().writable().user(),
+            &[data_frame],
+        )
+        .expect("map parent data");
+
+    let mut child = parent.clone_cow().expect("clone cow");
+    assert_eq!(
+        child.translate(VirtAddr::new(DATA)).expect("child translate").as_u64(),
+        data_frame,
+        "precondition: child shares the parent frame"
+    );
+
+    // 关键一步：mprotect(PROT_WRITE)。共享帧**不得**被重映射为可写。
+    child
+        .protect_user(DATA, 0x1000, PageFlags::empty().writable().user())
+        .expect("mprotect on cow page");
+
+    let (phys_after, flags_after) = child
+        .translate_with_flags(VirtAddr::new(DATA))
+        .expect("child translate after mprotect");
+    assert_eq!(
+        phys_after.as_u64(),
+        data_frame,
+        "mprotect must not silently copy the frame (the copy happens on the first write fault)"
+    );
+    assert!(
+        !flags_after.is_writable(),
+        "COW 共享帧必须保持硬件写保护：可写 PTE 会让父子同帧双写，COW 击穿"
+    );
+
+    // 首次写故障仍须由 COW 路径处理，并真的分离出私有帧、内容不变。
+    let handled = child.handle_page_fault(
+        DATA,
+        arch_x86_64::paging::PageFaultCode::new(arch_x86_64::paging::PF_EC_WRITE),
+    );
+    assert!(handled, "first write fault after mprotect must be handled by COW");
+    let child_new = child
+        .translate(VirtAddr::new(DATA))
+        .expect("child after cow")
+        .as_u64();
+    assert_ne!(child_new, data_frame, "child must now own a private frame");
+    assert_eq!(
+        unsafe { core::ptr::read_volatile(arch::phys_to_virt(child_new) as *const u64) },
+        0xCAFE_F00Du64,
+        "COW copy must preserve content"
+    );
+    assert_eq!(mm::frame_refcount(data_frame), 1, "parent keeps the shared frame alone");
+    info!("[cow-mprotect-test] OK: shared frame stayed write-protected; COW fired on write");
+}
+
 #[cfg(feature = "kernel-test-m5")]
 pub fn test_cow_clone_huge_page() {
     use alloc::vec::Vec;

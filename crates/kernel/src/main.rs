@@ -583,6 +583,11 @@ unsafe fn kmain_body() -> ! {
     // `test_cow_clone` 只覆盖 4K 叶，从未触及此路径。
     #[cfg(feature = "kernel-test-m5")]
     tests::test_cow_clone_huge_page();
+    // 本轮回归：mprotect(PROT_WRITE) 打在 **COW 共享页**上时不得把共享帧重映射为
+    // 可写（那会让父子同帧双写、COW 击穿）；正确语义是保持硬件写保护 + 记下期望
+    // 权限，由首次写故障去复制帧。
+    #[cfg(feature = "kernel-test-m5")]
+    tests::test_mprotect_write_on_cow_page_keeps_cow();
     #[cfg(feature = "kernel-test-m5")]
     tests::test_ipc();
     // ADR-038 T6：SYS_TASK_DERIVE 端到端验收（真实 syscall 路径，含 COW 共享、
