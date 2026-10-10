@@ -1411,6 +1411,13 @@ impl Ext2Fs {
         let mut cur = 0usize;
         while cur + 8 <= data.len() {
             let rec_len_cur = le_u16(&data, cur + 4) as usize;
+            // **这条守卫是必需的，不是防御性冗余**：rec_len 是**盘上数据**，
+            // 目录被写坏时它可能是 0，而下面的 `cur += rec_len_cur` 在 0 上
+            // **永不前进 ⇒ 内核死循环**（发生在持 fs 锁的建文件路径上，整机卡住）。
+            // 判据与 read_dir_raw 同源：rec_len < 8 或越出目录尾即为结构损坏。
+            if rec_len_cur < 8 || cur + rec_len_cur > data.len() {
+                return Err(Ext2Error::CorruptDirEntry);
+            }
             let name_len = data[cur + 6] as usize;
             let min_need = 8 + name_len;
             let is_last = cur + rec_len_cur >= data.len();
@@ -1435,14 +1442,28 @@ impl Ext2Fs {
             }
             cur += rec_len_cur;
         }
-        // 目录无空隙：扩展一个块并追加到末尾。
+        // 目录无空隙：扩展到**块对齐**的新尺寸，并把新末项追加到末尾。
+        //
+        // 两处都不是风格问题，是缺陷根因（2026-10 机内实测 EUCLEAN 的成因）：
+        //
+        // 1. **顺序**：`grow_inode_blocks` 以 `inode.size` 为"当前已占块数"的
+        //    基准。**先**把 `dir.size` 提到 `new_size` 再调用它，它会算出
+        //    `cur_blocks == new_blocks` 而判定"无需扩展"、**一块都不分配**；
+        //    随后的 `write_dir_data` 在未映射的逻辑块上拿到 `phys == 0`
+        //    ⇒ `BlockOutOfRange` ⇒ 用户态看到 **EUCLEAN（Structure needs
+        //    cleaning）**，而盘上其实只是目录需要长大。symlink 路径的
+        //    `先 grow 再设 size` 注释记着同一条教训，此处此前没照做。
+        // 2. **块对齐**：EXT2 目录数据以块为单位，末项的 `rec_len` 必须**延到
+        //    块尾**。若按 `old_size + rec_len` 只长 12 字节，目录尺寸就落在
+        //    块中间，后续扫描在块内剩余字节上读到 `rec_len = 0` 的残段。
         let old_size = data.len();
-        let new_size = old_size + rec_len;
+        let bs = self.superblock().block_size as usize;
+        let new_size = (old_size + rec_len).div_ceil(bs) * bs;
         data.resize(new_size, 0);
-        // 增长目录 size 并分配块。
-        dir.size = new_size as u32;
         self.grow_inode_blocks(dir, new_size as u64)?;
-        self.write_dir_entry_at(&mut data, old_size, ino, name, ft, rec_len)?;
+        // 新末项的 rec_len = 到新块尾的全部剩余空间（EXT2 末项约定）。
+        let tail_rec = new_size - old_size;
+        self.write_dir_entry_at(&mut data, old_size, ino, name, ft, tail_rec)?;
         self.write_dir_data(dir, &data)?;
         let now = now_timestamp_secs();
         dir.mtime = now;
@@ -1523,6 +1544,10 @@ impl Ext2Fs {
         while cur + 8 <= data.len() {
             let ino = le_u32(&data, cur);
             let rec_len = le_u16(&data, cur + 4) as usize;
+            // 同 add_dir_entry：rec_len 为 0 会让 `cur += rec_len` 死循环。
+            if rec_len < 8 || cur + rec_len > data.len() {
+                return Err(Ext2Error::CorruptDirEntry);
+            }
             let name_len = data[cur + 6] as usize;
             if ino != 0 && &data[cur + 8..cur + 8 + name_len] == name.as_bytes() {
                 let removed_ino = ino;
@@ -2528,7 +2553,13 @@ mod tests {
         img.w32(sb, 256); // s_inodes_count
         img.w32(sb + 4, 2048); // s_blocks_count
         img.w32(sb + 8, 0); // s_r_blocks_count
-        img.w32(sb + 12, 2048 - 8); // s_free_blocks_count（块 0..7 已占）
+        // 块占用必须与 bg_inode_table 自洽：256 个 128 B inode = 32768 B = **32 块**
+        // （块 5..36）。此前夹具只把 0..7 标为已占，于是 inode 表与"空闲块"重叠，
+        // 且根目录数据块 7 **落在 inode 表区间内**——建到第 15 个文件时
+        // write_inode 写 inode 17（表内偏移 2048 → 块 7）直接覆盖根目录数据，
+        // 目录读回来全是 0。这是**夹具缺陷**（不是内核缺陷），但它会让任何
+        // "多建几个文件"的测试悄悄测到垃圾数据。现：0..36 已占 + 根数据块 40。
+        img.w32(sb + 12, 2048 - 38); // s_free_blocks_count（块 0..36 + 40 已占）
         img.w32(sb + 16, 256 - 2); // s_free_inodes_count（inode 1..2 已占）
         img.w32(sb + 20, 1); // s_first_data_block
         img.w32(sb + 24, 0); // s_log_block_size
@@ -2544,29 +2575,35 @@ mod tests {
         img.w32(img.part + 2 * BS, 3); // bg_block_bitmap
         img.w32(img.part + 2 * BS + 4, 4); // bg_inode_bitmap
         img.w32(img.part + 2 * BS + 8, 5); // bg_inode_table
-        img.w16(img.part + 2 * BS + 12, (2048 - 8) as u16); // bg_free_blocks_count
+        img.w16(img.part + 2 * BS + 12, (2048 - 38) as u16); // bg_free_blocks_count
         img.w16(img.part + 2 * BS + 14, (256 - 2) as u16); // bg_free_inodes_count
         img.w16(img.part + 2 * BS + 16, 1); // bg_used_dirs_count
-        // 块位图 @3：块 0..7 已占（字节 0 = 0xFF，其余空闲）。
+        // 块位图 @3：块 0..36 已占（inode 表 5..36）+ 块 40（根目录数据）。
+        // 字节 i 覆盖块 8i..8i+7：0..31 = 0xFF；32..36 = 0x1F；40 = 0x01。
         let mut blk_bmp = [0u8; BS];
         blk_bmp[0] = 0xFF;
+        blk_bmp[1] = 0xFF;
+        blk_bmp[2] = 0xFF;
+        blk_bmp[3] = 0xFF;
+        blk_bmp[4] = 0x1F;
+        blk_bmp[5] = 0x01;
         img.write_block(3, &blk_bmp);
         // inode 位图 @4：inode 1..2 已占（0x03）。
         let mut ino_bmp = [0u8; BS];
         ino_bmp[0] = 0x03;
         img.write_block(4, &ino_bmp);
-        // inode 表 @5：根 ino2 目录，block[0]=7，size=块大小。
+        // inode 表 @5：根 ino2 目录，block[0]=40（inode 表之外），size=块大小。
         let itab = img.part + 5 * BS;
         img.w16(itab + 128, 0x4000 | 0o755);
         img.w32(itab + 128 + 4, BS as u32);
         img.w32(itab + 128 + 26, 2); // i_links_count
         img.w32(itab + 128 + 28, 2); // i_blocks
-        img.w32(itab + 128 + 40, 7); // i_block[0] = block 7
-        // 根目录数据块 @7：`.` 与 `..`。
+        img.w32(itab + 128 + 40, 40); // i_block[0] = block 40
+        // 根目录数据块 @40：`.` 与 `..`。
         let mut d = [0u8; BS];
         put_de(&mut d, 0, 2, ".", 2, 12);
         put_de(&mut d, 12, 2, "..", 2, BS - 12);
-        img.write_block(7, &d);
+        img.write_block(40, &d);
         img.data
     }
 
@@ -2722,6 +2759,55 @@ mod tests {
         let n = f_b.read_at(0, &mut back).expect("read after instance swap");
         assert_eq!(n, payload.len());
         assert_eq!(back, payload, "数据必须经底层设备存活到新缓存实例");
+    }
+
+    /// **回归（本轮修）**：目录数据越过一个块后仍能继续建条目。
+    ///
+    /// 机内实测（3P6-3 轮）：`3p/` 到 43 个条目时目录数据越过 1024 字节块，
+    /// 之后 `cc1` 写文件报 `Structure needs cleaning`（EUCLEAN）——那本应是
+    /// 一次**正常的目录扩展**，不是"盘上结构损坏"。用 Corrupt 报告会把排查
+    /// 引向完全错误的方向（数据其实完好）。
+    #[test]
+    fn test_dir_growth_across_block_boundary_keeps_creating_entries() {
+        use vfs::inode::FileSystem;
+        let mode = 0o644u32;
+        let owner = (0u32, 0u32);
+        let img = build_writable_image();
+        let dev: Arc<MockByteDevice> = Arc::new(MockByteDevice::new(img));
+        {
+            let fs = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("open");
+            let root = FileSystem::root(&fs);
+            // 根目录初始只有 . 与 ..，数据 1024 B；每项 12 B ⇒ 约 84 项后越块。
+            for i in 0..120u32 {
+                let name = alloc::format!("f{:03}", i);
+                match root.create(&name, mode, owner) {
+                    Ok(_) => {}
+                    Err(e) => panic!("创建 {} 失败（第 {} 项）：{:?}", name, i, e),
+                }
+                assert!(root.lookup(&name).is_ok(), "刚建的 {} 查不回来", name);
+            }
+            // 盘上不变量：目录 size 必须**块对齐**，且确实跨过了第一个块。
+            let dir_inode = fs.read_inode(2).expect("root inode");
+            assert_eq!(
+                dir_inode.size as usize % BS,
+                0,
+                "目录 size 必须块对齐（否则末项 rec_len 无法延到块尾）"
+            );
+            assert!(dir_inode.size > BS as u32, "目录应已跨过第一个块");
+        }
+        // 重挂（重新打开同一设备）：盘上布局必须能被**独立解析**——这一条才真正
+        // 锁住"末项 rec_len 延到块尾"这个 EXT2 约定（同一进程内的缓存会掩盖它）。
+        let fs2 = Ext2Fs::open(dev.clone(), PART_START_LBA * SECTOR).expect("remount");
+        let root2 = FileSystem::root(&fs2);
+        for i in 0..120u32 {
+            let name = alloc::format!("f{:03}", i);
+            assert!(root2.lookup(&name).is_ok(), "重挂后 {} 丢失", name);
+        }
+        assert_eq!(
+            root2.list_dir().expect("list_dir").len(),
+            120,
+            "重挂后目录项数应为 120（list_dir 不含 . 与 ..）"
+        );
     }
 
     /// M3：create/mkdir/unlink/symlink 的目录项增删与 inode/块分配释放记账。
