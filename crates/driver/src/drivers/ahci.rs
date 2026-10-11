@@ -212,6 +212,94 @@ const DMA_DATA_GUARD_BYTES: usize = 512;
 
 /// 哨兵填充值：任何一次写（含全 0 写）都会破坏它。
 const DMA_DATA_GUARD_PATTERN: u8 = 0xA5;
+
+// ===========================================================================
+// 延后诊断（把日志移出 I/O 等待路径）
+// ===========================================================================
+
+/// 待打印诊断的种类。
+const PEND_IRQ_SLOW_IF_ON: u32 = 1;
+const PEND_IRQ_SLOW_IF_OFF: u32 = 2;
+const PEND_CMD_NOT_RETIRED: u32 = 3;
+
+/// 待打印诊断：在 I/O 等待路径内部**只记录、不格式化、不打日志**。
+///
+/// 为什么：`wait_command` 深在「块缓存 → 驱动」调用链里，而一条日志会再叠上
+/// `klib::log::_log → RingBuffer::push → 控制台 → 终端逐字符绘制` 一整棵子树。
+/// 机内实测（2026-10）该叠加正是**系统调用栈高水位的峰值来源**（见 docs/TODO/3p.md 的
+/// 逐帧构成）：把日志挪到浅处，峰值深度下降约 2.5 KiB。
+///
+/// 顺带修掉一处锁序风险：原实现在 `wait_command` 内**持端口锁**打日志，于是控制台/终端的锁
+/// 嵌在端口锁里面；现在日志在**取端口锁之前**输出（见 `read_at` / `write_at` 的入口）。
+///
+/// 约束（S09：延后不等于丢弃）：
+/// - 只保留**第一条**待打印消息；其后到来的只累加计数，flush 时如实报出被抑制的条数；
+/// - 输出时机 = 下一次进入本驱动的 I/O 入口（`read_at`/`write_at`，那时栈很浅、且未持端口锁）；
+/// - 若此后 I/O 永久停止，消息会一直待打印——这是刻意的取舍，在此成文。
+///
+/// 并发（S21）：写入用 CAS 只让第一条落座；flush 先读值再 `swap` 清标志。两者之间若有新的
+/// 记录到来，可能打印出「旧种类 + 新值」的组合——诊断信息，影响仅为可读性，不会误报故障。
+static PENDING_CODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static PENDING_A: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PENDING_B: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PENDING_C: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PENDING_D: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PENDING_SUPPRESSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 记录一条待打印诊断（可在深栈 / 持锁处调用：不分配、不格式化、不打日志）。
+fn record_pending(code: u32, a: u64, b: u64, c: u64, d: u64) {
+    use core::sync::atomic::Ordering;
+    if PENDING_CODE
+        .compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        PENDING_A.store(a, Ordering::Relaxed);
+        PENDING_B.store(b, Ordering::Relaxed);
+        PENDING_C.store(c, Ordering::Relaxed);
+        PENDING_D.store(d, Ordering::Relaxed);
+    } else {
+        PENDING_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 打印并清空待打印诊断。**只能在浅栈且不持端口锁处调用**（见 `record_pending` 的说明）。
+pub fn flush_pending_diagnostics() {
+    use core::sync::atomic::Ordering;
+    // 先读值、后清标志：这样读到的是与已记录种类配套的一组值（见上方并发说明）。
+    let a = PENDING_A.load(Ordering::Relaxed);
+    let b = PENDING_B.load(Ordering::Relaxed);
+    let c = PENDING_C.load(Ordering::Relaxed);
+    let d = PENDING_D.load(Ordering::Relaxed);
+    let code = PENDING_CODE.swap(0, Ordering::AcqRel);
+    if code == 0 {
+        return;
+    }
+    match code {
+        PEND_IRQ_SLOW_IF_ON => info!(
+            "[ahci] IRQ {} slower than the {} -spin window on this command; \
+             completed via bounded polling (path stays enabled)",
+            a, b
+        ),
+        PEND_IRQ_SLOW_IF_OFF => info!(
+            "[ahci] IRQ {} pending: interrupts not yet enabled at this stage; \
+             bounded polling until re-arm after sti",
+            a
+        ),
+        // 字段与原来在 wait_command 内直接打印时**逐字相同**（S09：延后不改内容）。
+        PEND_CMD_NOT_RETIRED => warn!(
+            "[ahci] port {}: command did not retire (PxCI={:#x} PxIS={:#x} PxTFD={:#x})",
+            a, b, c, d
+        ),
+        _ => {},
+    }
+    let extra = PENDING_SUPPRESSED.swap(0, Ordering::AcqRel);
+    if extra > 0 {
+        info!(
+            "[ahci] (+{} further diagnostics were suppressed while one was pending)",
+            extra
+        );
+    }
+}
 // ===========================================================================
 // 命令表内存布局（AHCI 1.3.1 §3.3.2 / §3.3.3）
 // ===========================================================================
@@ -752,17 +840,11 @@ impl Port {
                                 // 控制器/中断路径已冷，首条命令的中断延迟超出窗口；随后
                                 // 命令照常完成（走有界轮询），下一批命令又能命中闩锁。
                                 // 故这里报 info 而非 warn：它是**延迟偏高**，不是「中断不可用」。
-                                info!(
-                                    "[ahci] IRQ {} slower than the {} -spin window on this \
-                                     command; completed via bounded polling (path stays enabled)",
-                                    irq, IRQ_WAIT_SPINS
-                                );
+                                // 延后输出（见 record_pending 的说明）：此处深在 I/O 等待路径里，
+                                // 直接打日志会把「日志 + 控制台 + 终端绘制」整棵子树叠在峰值深度上。
+                                record_pending(PEND_IRQ_SLOW_IF_ON, irq as u64, IRQ_WAIT_SPINS as u64, 0, 0);
                             } else {
-                                info!(
-                                    "[ahci] IRQ {} pending: interrupts not yet enabled at this \
-                                     stage; bounded polling until re-arm after sti",
-                                    irq
-                                );
+                                record_pending(PEND_IRQ_SLOW_IF_OFF, irq as u64, 0, 0, 0);
                             }
                         }
                         // **退让而非永久停用**：只跳过接下来的 IRQ_BACKOFF_COMMANDS
@@ -807,12 +889,13 @@ impl Port {
         if !cleared {
             // PxCI 位始终不落：命令真的挂死了（不是"太快"）。
             if log_failure {
-                warn!(
-                    "[ahci] port {}: command did not retire (PxCI={:#x} PxIS={:#x} PxTFD={:#x})",
-                    self.index,
-                    self.read32(PX_CI),
-                    self.read32(PX_IS),
-                    self.read32(PX_TFD)
+                // 现场值在这里读（MMIO 便宜且要的是**此刻**的值），只有格式化与输出被延后。
+                record_pending(
+                    PEND_CMD_NOT_RETIRED,
+                    self.index as u64,
+                    self.read32(PX_CI) as u64,
+                    self.read32(PX_IS) as u64,
+                    self.read32(PX_TFD) as u64,
                 );
             }
             return Err(Error::Io);
@@ -1191,6 +1274,8 @@ fn write_sectors(port: &Port, offset: u64, data_in: &[u8]) -> usize {
 }
 impl IoDevice for AhciDevice {
     fn read_at(&self, offset: u64, out: &mut [u8]) -> usize {
+        // 延后诊断在此输出：栈浅，且**尚未取端口锁**（见 record_pending 的锁序说明）。
+        flush_pending_diagnostics();
         let port = match self.port.as_ref() {
             Some(p) => p,
             None => return 0,
@@ -1205,6 +1290,7 @@ impl IoDevice for AhciDevice {
     }
 
     fn write_at(&self, offset: u64, data_in: &[u8]) -> usize {
+        flush_pending_diagnostics();
         let port = match self.port.as_ref() {
             Some(p) => p,
             None => return 0,
