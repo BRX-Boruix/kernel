@@ -2084,10 +2084,10 @@ where
             .retain(|cow| cow.vaddr < start || cow.vaddr >= end);
 
         // 区间记账：整段命中的区域全部移除，部分重叠的由 plan 给出剩余片段。
-        // **按索引降序移除**——否则前面的 remove 会让后面的索引漂移。先全部移除、
-        // 再推回剩余片段，保证同一匿名区间不出现重叠的重复记录。
+        // `plan.remove` **已按下标降序**（见 UnmapPlan 的说明），按序 remove 即安全。
+        // 先全部移除、再推回剩余片段，保证同一匿名区间不出现重叠的重复记录。
         let mut areas = self.areas.lock();
-        for &i in plan.remove.iter().rev() {
+        for i in plan.remove {
             areas.remove(i);
         }
         for a in plan.keep {
@@ -2435,7 +2435,12 @@ pub(crate) fn fault_plan(start: u64, len: u64) -> Option<(u64, u64)> {
 
 /// 一次匿名 `munmap` 的**区域记账计划**（纯函数产出：不碰页表、不取锁）。
 pub(crate) struct UnmapPlan {
-    /// 需要整段移除的区域索引（**升序**；调用方须**降序** remove，否则索引漂移）。
+    /// 需要整段移除的区域索引，**已按下标降序**——调用方按此顺序 `remove` 即安全。
+    ///
+    /// 为什么不是按地址序：`protect_user` 切分区域后 `areas` 的**下标顺序不再与
+    /// 地址顺序一致**（切分出的碎片被 push 到表尾；而 munmap 会把 `next_mmap` 回退，
+    /// 后续 mmap 可能落在低地址）。照地址序 `remove` 会删错元素——那是**静默的记账
+    /// 破坏**，下游任何一次分配都可能踩到它。
     pub remove: Vec<usize>,
     /// 与目标区间部分重叠的区域在移除后需要重推的剩余片段（左片/右片）。
     pub keep: Vec<UserArea>,
@@ -2498,7 +2503,11 @@ fn plan_anonymous_unmap(areas: &[UserArea], start: u64, end: u64) -> Result<Unma
             });
         }
     }
-    Ok(UnmapPlan { remove: hit, keep })
+    // 覆盖检查需要**按地址**排序（上面的 `hit.sort_by_key`），而移除必须**按下标降序**。
+    // 两者不可混用，故这里再排一次——顺序是契约的一部分，不是实现细节。
+    let mut remove = hit;
+    remove.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(UnmapPlan { remove, keep })
 }
 
 #[cfg(test)]
@@ -2698,7 +2707,7 @@ mod anonymous_unmap_plan_tests {
             anon(0x3000, 0x4000, rw()),
         ];
         let p = plan_anonymous_unmap(&a, 0x1000, 0x4000).expect("跨区域整段");
-        assert_eq!(p.remove, vec![0, 1, 2]);
+        assert_eq!(p.remove, vec![2, 1, 0], "按下标降序（与地址序一致时也是降序）");
         assert!(p.keep.is_empty());
     }
 
@@ -2710,7 +2719,7 @@ mod anonymous_unmap_plan_tests {
             anon(0x3000, 0x5000, rw()),
         ];
         let p = plan_anonymous_unmap(&a, 0x1800, 0x4000).expect("两端各留一片");
-        assert_eq!(p.remove, vec![0, 1, 2]);
+        assert_eq!(p.remove, vec![2, 1, 0]);
         assert_eq!(p.keep.len(), 2);
         assert_eq!(p.keep[0].start.as_u64(), 0x1000);
         assert_eq!(p.keep[0].end.as_u64(), 0x1800);
@@ -2757,6 +2766,27 @@ mod anonymous_unmap_plan_tests {
             plan_anonymous_unmap(&a, 0x1000, 0x3000),
             Err(Error::NotFound)
         ));
+    }
+
+    /// **移除顺序必须按下标降序**，而不是按地址序：`protect_user` 切分区域后
+    /// `areas` 的下标顺序不再与地址顺序一致（碎片被 push 到表尾；munmap 又会把
+    /// `next_mmap` 回退，后续 mmap 可能落在低地址）。照地址序 remove 会**删错元素**
+    /// ——静默的记账破坏。
+    #[test]
+    fn removal_order_is_descending_by_index_not_by_address() {
+        let a = [
+            anon(0x3000, 0x4000, rw()), // idx 0，地址最大
+            anon(0x1000, 0x2000, rw()), // idx 1，地址最小
+            anon(0x2000, 0x3000, rw()), // idx 2，地址居中
+        ];
+        let p = plan_anonymous_unmap(&a, 0x1000, 0x4000).expect("三块拼成完整区间");
+        assert_eq!(p.remove, vec![2, 1, 0], "必须按下标降序（地址序是 1,2,0）");
+        // 按返回顺序移除，剩下的必须恰好是空集。
+        let mut areas = a.to_vec();
+        for i in p.remove {
+            areas.remove(i);
+        }
+        assert!(areas.is_empty(), "按返回顺序移除后不应有残留");
     }
 
     #[test]
