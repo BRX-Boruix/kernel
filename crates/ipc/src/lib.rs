@@ -623,7 +623,14 @@ fn write_registrant<'a>(
     }
 }
 
-/// 构造读方向的同款回调（IA2a；复检条件为"缓冲非空"）。
+/// 构造读方向的同款回调（IA2a；复检条件为「缓冲非空 **或 EOF 已成立**」）。
+///
+/// **为什么必须含 EOF**：主循环顶部那一支（`avail == 0 && writer_refs == 0` ⇒ 返回 0）
+/// 只在**进入循环时**判定一次。若读者是在**最后一个写端已关之后**才走到登记点，复检若只
+/// 看「缓冲非空」就会判定「还不能读」并如实入睡——而唤醒方（最后一个写端的 `pipe_ref_dec`）
+/// **已经执行过了**，再也不会有人来叫醒它。实测症状：`selftest fs` 第 3 节（CLOEXEC 管道
+/// EOF）里子进程 read 永久挂住、父进程收尸也挂住——即**lost-EOF**。
+/// 与 write 侧同款：登记点复检必须覆盖**所有能让本次调用不再需要等待**的条件。
 fn read_registrant<'a>(id: u64, pid: usize, ready: &'a mut bool) -> impl FnMut() -> bool + 'a {
     move || {
         let mut table = PIPE_TABLE.lock();
@@ -631,7 +638,7 @@ fn read_registrant<'a>(id: u64, pid: usize, ready: &'a mut bool) -> impl FnMut()
             Some(pipe) => register_waiter(
                 &mut pipe.read_waiters,
                 pid,
-                !pipe.buf.is_empty(),
+                !pipe.buf.is_empty() || pipe.writer_refs == 0,
                 ready,
             ),
             None => false,
