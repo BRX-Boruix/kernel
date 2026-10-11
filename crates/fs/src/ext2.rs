@@ -1288,6 +1288,15 @@ impl Ext2Fs {
         }
         // 三重间接区：rem2 in [per_block², per_block³)。链：blocks[14]→L2→L1→数据。
         let rem3 = rem2 - l2_span;
+        // **本层索引必须自己守卫**：`t2_idx` 直接用来切 `tri[t2_idx*4..+4]`，而它由 `logical`
+        // 推出、此前**没有上界**。今天到不了这里——`size` 是 u32，故 1 KiB 块下块数上限
+        // 4,194,303 低于三重表溢出点 16,843,020——但那是**两个远处事实的联合推论**
+        // （u32 的 size + bs ≥ 1024），不是本函数能保证的。加本地守卫，把推论变成机器可查的
+        // 不变量。用 u64 算：64 KiB 块下 `l2_span * per_block` 会溢出 u32。
+        let triple_span = (l2_span as u64) * (per_block as u64);
+        if rem3 as u64 >= triple_span {
+            return Err(Ext2Error::BlockOutOfRange);
+        }
         let t2_idx = rem3 / l2_span as u32; // blocks[14] 表中索引
         let t2_off = rem3 % l2_span as u32;
         let l1_idx = t2_off / per_block; // L2 表中索引
@@ -2502,6 +2511,32 @@ mod tests {
         assert!(
             r.is_err(),
             "记录装不下 name_len 时必须判 CorruptDirEntry，而不是越界 panic"
+        );
+    }
+
+
+    /// **红→绿锚点**：`set_inode_block` 的三重间接区用 `t2_idx = rem3 / l2_span` 直接切
+    /// `tri[t2_idx*4..+4]`，而 `t2_idx` 由 `logical` 推出、**没有上界**。
+    ///
+    /// 今天到不了这里（`size` 是 u32 ⇒ 1 KiB 块时块数上限 4,194,303 < 三重表溢出点 16,843,020），
+    /// 但那是**两个远处事实的联合推论**，不是本函数能保证的。本测试用越界 `logical` 直接触发。
+    #[test]
+    fn test_ext2_set_inode_block_rejects_logical_beyond_triple_table() {
+        let (fs, _, _) = open_fs();
+        let bs = fs.superblock().block_size as u32;
+        let per_block = bs / 4;
+        // 三重间接表覆盖 12 + per_block + per_block² 个块；再往后就是 L2 表自身的索引区，
+        // 最多 per_block 个。越过 per_block³ 即越出 tri 表。
+        let first_overflow = 12 + per_block + per_block * per_block + per_block * per_block * per_block;
+        let mut ino = fs.read_inode(11).expect("hello.txt inode");
+        // **必须预置 blocks[14]**：否则函数会先 `alloc_block()`，而 2 MiB 的测试盘装不下
+        // 三重间接所需的块 ⇒ 它会以「分配失败」返回 Err——那是**假绿**（第一版就踩了）。
+        // 预置一个真实存在的表块，代码才会真的走到 `tri[t2_idx*4]`。
+        ino.blocks[14] = 60;
+        let r = fs.set_inode_block(&mut ino, first_overflow, 4242);
+        assert!(
+            r.is_err(),
+            "越出三重间接表的 logical 必须判 BlockOutOfRange，而不是越界 panic"
         );
     }
 
