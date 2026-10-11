@@ -189,6 +189,15 @@ impl IsoFs {
             if o + len > raw.len() {
                 return Err(IsoError::Corrupt);
             }
+            // **记录长度守卫必须在取任何字段之前**：`len` 是**盘上字节**（本函数第一行读的
+            // `raw[o]`），而下面要读 `rec[25]`（flags）与 `rec[32]`（名字长度）。ECMA-119 9.1 的
+            // 定长部分恰好 33 字节（0 长度 / 1 扩展属性 / 2-9 extent / 10-17 size / 18-24 日期 /
+            // 25 flags / 26 单元 / 27 间隔 / 28-31 卷序 / 32 名字长度），故 `len < 33` 的记录
+            // **不可能合法**——不先挡住就是一次越界 panic（实测：len=20 时 panic at :195）。
+            // 原先的 `33 + name_len > len` 检查在**读完之后**，挡不住这一步。
+            if len < 33 {
+                return Err(IsoError::Corrupt);
+            }
             let rec = &raw[o..o + len];
             let lba2 = read_both_u32(rec, 2)?;
             let size2 = read_both_u32(rec, 10)?;
@@ -313,6 +322,83 @@ fn read_both_u32(rec: &[u8], at: usize) -> IsoResult<u64> {
         return Err(IsoError::Corrupt);
     }
     Ok(le as u64)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MockByteDevice;
+    use alloc::sync::Arc;
+
+    /// 造一个**最小可挂载**的 ISO：PVD 合法，根目录 extent 的第一条记录长度
+    /// 由参数决定（用来构造「记录短于它自己声明的字段」这种坏盘）。
+    ///
+    /// 记录布局（ECMA-119 9.1 的前 18 字节，够 read_both_u32(rec,10) 通过）：
+    ///   [0]=len  [2..6]=LBA(LE) [6..10]=LBA(BE) [10..14]=size(LE) [14..18]=size(BE)
+    fn image_with_dir_record_len(len: u8) -> alloc::vec::Vec<u8> {
+        const BLK: usize = ISO_BLOCK_SIZE as usize;
+        const ROOT_LBA: u64 = 20;
+        let mut img = alloc::vec![0u8; BLK * 22];
+
+        // --- PVD（扇区 16）---
+        let pvd = PVD_LBA as usize * BLK;
+        img[pvd] = 1; // type = 主卷描述符
+        img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        img[pvd + 6] = 1; // version
+        // 逻辑块大小：both-endian u16 = 2048
+        img[pvd + 128..pvd + 130].copy_from_slice(&(BLK as u16).to_le_bytes());
+        img[pvd + 130..pvd + 132].copy_from_slice(&(BLK as u16).to_be_bytes());
+        // 卷标识（+40..72）
+        img[pvd + 40..pvd + 43].copy_from_slice(b"TST");
+        // 根目录记录（+156，34 字节）
+        let rr = pvd + 156;
+        img[rr] = 34;
+        img[rr + 2..rr + 6].copy_from_slice(&(ROOT_LBA as u32).to_le_bytes());
+        img[rr + 6..rr + 10].copy_from_slice(&(ROOT_LBA as u32).to_be_bytes());
+        img[rr + 10..rr + 14].copy_from_slice(&(BLK as u32).to_le_bytes());
+        img[rr + 14..rr + 18].copy_from_slice(&(BLK as u32).to_be_bytes());
+
+        // --- 根目录 extent（扇区 20）：第一条记录 ---
+        let d = ROOT_LBA as usize * BLK;
+        img[d] = len;
+        img[d + 2..d + 6].copy_from_slice(&(ROOT_LBA as u32).to_le_bytes());
+        img[d + 6..d + 10].copy_from_slice(&(ROOT_LBA as u32).to_be_bytes());
+        img[d + 10..d + 14].copy_from_slice(&(BLK as u32).to_le_bytes());
+        img[d + 14..d + 18].copy_from_slice(&(BLK as u32).to_be_bytes());
+        img
+    }
+
+    /// **红→绿锚点**：目录记录自己声明的长度 `len` 来自**盘上字节**，而解析器在读完
+    /// 前 18 字节之后就直接取 `rec[25]`/`rec[32]`——若 `len < 26`，那两个索引越界。
+    /// 正确行为是**如实报 Corrupt**，而不是 panic。
+    #[test]
+    fn short_dir_record_is_corrupt_not_panic() {
+        // 20 字节：足以让 read_both_u32(rec, 2) 与 (rec, 10) 通过，但不足以取 rec[25]。
+        let img = image_with_dir_record_len(20);
+        let dev = Arc::new(MockByteDevice::new(img));
+        let r = IsoFs::open_subroot(dev, &["probe"]);
+        assert!(r.is_err(), "短记录必须被判为 Corrupt，而不是 panic 或误判成功");
+    }
+
+    /// 对照组：合法的最小记录（34 字节，`.` 项）不应被误判为 Corrupt。
+    #[test]
+    fn minimal_wellformed_record_is_not_corrupt() {
+        let mut img = image_with_dir_record_len(34);
+        const BLK: usize = ISO_BLOCK_SIZE as usize;
+        let d = 20 * BLK;
+        // 名字长度 1、名字 = 0x00（`.` 自身），符合 9.1 的最小合法形态。
+        img[d + 32] = 1;
+        img[d + 33] = 0;
+        let dev = Arc::new(MockByteDevice::new(img));
+        // 名字对不上 ⇒ 应该是 NotFound 之类，而不是 Corrupt（解析本身成功）。
+        let r = IsoFs::open_subroot(dev, &["probe"]);
+        assert!(r.is_err());
+        assert!(
+            !matches!(r, Err(IsoError::Corrupt)),
+            "合法记录不该被判 Corrupt"
+        );
+    }
 }
 
 /// ISO9660 节点。

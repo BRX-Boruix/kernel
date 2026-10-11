@@ -1636,6 +1636,13 @@ impl Ext2Fs {
                 return Err(Ext2Error::CorruptDirEntry);
             }
             let name_len = data[cur + 6] as usize;
+            // **名字长度必须与本条记录的 rec_len 交叉校验**（与 read_dir_raw:716 同源）：
+            // `name_len` 是**盘上单字节**，而下面要用它切 `data[cur+8..cur+8+name_len]`。
+            // 只校验 `cur + rec_len <= data.len()` 不够——rec_len=8 而 name_len=255 时，
+            // 切片右端会越过目录数据末尾 ⇒ 越界 panic（实测 panic at :1639）。
+            if 8 + name_len > rec_len {
+                return Err(Ext2Error::CorruptDirEntry);
+            }
             if ino != 0 && &data[cur + 8..cur + 8 + name_len] == name.as_bytes() {
                 let removed_ino = ino;
                 // 清零 inode（标记为空闲项），并把 rec_len 合并给前一项。
@@ -2469,6 +2476,33 @@ mod tests {
             hello,
             big,
         )
+    }
+
+
+    /// **红→绿锚点**：`remove_dir_entry` 用 `data[cur+8..cur+8+name_len]` 做名字比较，
+    /// 而 `name_len` 来自**盘上字节**；它**没有**像 `read_dir_raw`（:716）那样交叉校验
+    /// `8 + name_len <= rec_len`。只要记录靠近目录数据末尾，`cur + 8 + name_len` 就越界。
+    ///
+    /// 构造：根 inode 的 size 缩到 16 字节，首条记录 `rec_len=8`、`name_len=255`。
+    /// 正确行为是**如实报 CorruptDirEntry**，而不是 panic。
+    #[test]
+    fn test_ext2_remove_dir_entry_short_record_large_name_len_is_corrupt() {
+        let (mut img, _, _) = build_image();
+        let itab = (PART_START_LBA * SECTOR) as usize + 5 * BS;
+        // 根 inode（ino2，128 字节/项 ⇒ 偏移 128）：size 字段在 +4。
+        img[itab + 128 + 4..itab + 128 + 8].copy_from_slice(&16u32.to_le_bytes());
+        // 根目录块 20 的首条记录：rec_len=8（最小合法）、name_len=255（单字节最大）。
+        let root_off = (PART_START_LBA * SECTOR) as usize + 20 * BS;
+        img[root_off + 4..root_off + 6].copy_from_slice(&8u16.to_le_bytes());
+        img[root_off + 6] = 255;
+        let dev = Arc::new(MockByteDevice::new(img));
+        let fs = Ext2Fs::open(dev, PART_START_LBA * SECTOR).expect("fixture must open");
+        let mut root = fs.read_inode(2).expect("root inode");
+        let r = fs.remove_dir_entry(&mut root, "hello.txt");
+        assert!(
+            r.is_err(),
+            "记录装不下 name_len 时必须判 CorruptDirEntry，而不是越界 panic"
+        );
     }
 
     #[test]
