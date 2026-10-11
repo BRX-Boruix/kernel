@@ -1193,6 +1193,29 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             // 未注册/未处理/内核态：打印 CR2 并停机
             raw_serial_fmt(format_args!("  cr2:    {:#x}\n", cr2));
             raw_serial_fmt(format_args!("  error:  P={:#x}\n", frame.error_code));
+            // 内核态 #PF 的**栈现场**：本向量最常见的两个成因是「跳到了野地址」与
+            // 「栈写穿后返回地址被覆盖」，而 rip/cr2 只能回答前者。只打 rip 会让定位停在
+            // 「知道跳飞了、不知道从哪来」——本轮实测正是卡在这里（转储里 rip 落在镜像
+            // 之外，无法反解）。故把 rsp/rbp 与栈顶若干 qword 一并打出：内核开了 frame
+            // pointer，栈上这些槽位里的**内核镜像地址**就是候选返回地址，可用
+            // `python tools/main.py where <addr>` 反解成符号。
+            // 成本只发生在本就致命的路径上（随后 halt_forever），且走裸串口（AM7）。
+            raw_serial_fmt(format_args!("  rsp:    {:#x}\n", frame.rsp));
+            raw_serial_fmt(format_args!("  rbp:    {:#x}\n", frame.rbp));
+            if frame.cs & 3 == 0 && frame.rsp != 0 {
+                // SAFETY：仅在内核已致命停机前的诊断路径上读；frame.rsp 是内核栈地址，
+                // 该栈在本次异常发生前一直有效，读操作不改变任何状态，也不解引用其内容。
+                unsafe {
+                    let p = frame.rsp as *const u64;
+                    for i in 0..8u64 {
+                        raw_serial_fmt(format_args!(
+                            "  [rsp+{}] {:#018x}\n",
+                            i * 8,
+                            core::ptr::read_volatile(p.add(i as usize))
+                        ));
+                    }
+                }
+            }
         }
         if vector == VECTOR_DOUBLE_FAULT {
             // Double Fault：打印错误码（0 表示外部中断/软件引起的 DF）
