@@ -279,8 +279,14 @@ global_asm!(
     "#
 );
 
-/// 中断号 0~31 的异常名称。
-fn exception_name(vector: u8) -> &'static str {
+/// 中断号 0~31 的异常名称；**越界向量不得 panic**。
+///
+/// 为什么必须全函数：本函数只在**致命诊断路径**上被调用（异常转储），而「收到一个预期之外的
+/// 向量」恰恰是最需要把报告打出来的时刻——报告器自己挂掉会把真异常彻底淹没。
+/// 2026-10 实测撞到：某次异常带 vector = 74，此处 NAMES[74] 越界 panic，转储里只剩下 panic 的
+/// 次生垃圾（rip 是些 0x01 填充的值），**真正的异常向量与寄存器从未被打出**。
+/// 故用 get() 取值，越界返回固定字符串。
+pub fn exception_name(vector: u8) -> &'static str {
     const NAMES: [&str; 32] = [
         "Divide-by-zero",
         "Debug",
@@ -315,7 +321,7 @@ fn exception_name(vector: u8) -> &'static str {
         "Security Exception",
         "Reserved",
     ];
-    NAMES[vector as usize]
+    NAMES.get(vector as usize).copied().unwrap_or("Unknown")
 }
 
 /// CPU 压栈形成的帧（保存的寄存器 + 中断号 + 错误码 + 处理器状态）。
@@ -1222,7 +1228,11 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
                         raw_serial_fmt(format_args!(
                             "  [rsp+{}] {:#018x}\n",
                             i * 8,
-                            core::ptr::read_volatile(p.add(i as usize))
+                            // read_unaligned：frame.rsp 不保证 8 字节对齐（异常帧由 CPU 压栈，
+                            // 进入内核前的栈对齐未知）。用 read_volatile 会触发 UB 前置条件检查并
+                            // **panic**，把正在打的转储截断——实测撞到，代价是整份现场丢失。
+                            // 诊断路径宁可多一条指令，也不能有能失败的前置条件。
+                            core::ptr::read_unaligned(p.add(i as usize))
                         ));
                     }
                 }
@@ -1261,13 +1271,14 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             // SAFETY：仅在内核已致命停机前诊断路径上读；frame.rsp 是内核栈地址，
             // 该栈在本次异常发生前一直有效，读操作不改变任何状态，也不解引用其内容。
             unsafe {
+                // 同 #PF 分支：用 read_unaligned，frame.rsp 的对齐无保证（见那里的说明）。
                 let p = frame.rsp as *const u64;
-                raw_serial_fmt(format_args!("  [rsp+0]  {:#018x}  (iretq RIP )\n", core::ptr::read_volatile(p)));
-                raw_serial_fmt(format_args!("  [rsp+8]  {:#018x}  (iretq CS  )\n", core::ptr::read_volatile(p.add(1))));
-                raw_serial_fmt(format_args!("  [rsp+16] {:#018x}  (iretq FLAG)\n", core::ptr::read_volatile(p.add(2))));
-                raw_serial_fmt(format_args!("  [rsp+24] {:#018x}  (iretq RSP )\n", core::ptr::read_volatile(p.add(3))));
-                raw_serial_fmt(format_args!("  [rsp+32] {:#018x}  (iretq SS  )\n", core::ptr::read_volatile(p.add(4))));
-                raw_serial_fmt(format_args!("  [rsp+40] {:#018x}  (beyond    )\n", core::ptr::read_volatile(p.add(5))));
+                raw_serial_fmt(format_args!("  [rsp+0]  {:#018x}  (iretq RIP )\n", core::ptr::read_unaligned(p)));
+                raw_serial_fmt(format_args!("  [rsp+8]  {:#018x}  (iretq CS  )\n", core::ptr::read_unaligned(p.add(1))));
+                raw_serial_fmt(format_args!("  [rsp+16] {:#018x}  (iretq FLAG)\n", core::ptr::read_unaligned(p.add(2))));
+                raw_serial_fmt(format_args!("  [rsp+24] {:#018x}  (iretq RSP )\n", core::ptr::read_unaligned(p.add(3))));
+                raw_serial_fmt(format_args!("  [rsp+32] {:#018x}  (iretq SS  )\n", core::ptr::read_unaligned(p.add(4))));
+                raw_serial_fmt(format_args!("  [rsp+40] {:#018x}  (beyond    )\n", core::ptr::read_unaligned(p.add(5))));
             }
             raw_serial_fmt(format_args!("  rax:    {:#x}\n", frame.rax));
             raw_serial_fmt(format_args!("  rbx:    {:#x}\n", frame.rbx));

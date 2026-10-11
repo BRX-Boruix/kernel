@@ -13816,6 +13816,54 @@ pub fn test_storage_ahci4_pio_vs_ahci_benchmark() {
     info!("[test-ahci4] PASS (measurement valid; cross-path comparison is done across two runs)");
 }
 
+/// 诊断路径回归：`exception_name` 必须对**任意** `u8` 向量是全函数。
+///
+/// ## 回归对象（2026-10 实测，不是假想）
+///
+/// 机内一次异常带 `vector = 74`，`exception_name` 里 `NAMES[74]` 越界 panic：
+///
+/// ```text
+/// ========== KERNEL PANIC ==========
+/// cpu:  1
+/// message: index out of bounds: the len is 32 but the index is 74
+/// location: crates\arch\arch-x86_64\src\interrupts.rs:318:5
+///   #03  arch_x86_64::interrupts::exception_name+0x89
+///   #04  interrupt_dispatch+0xd4d
+/// ```
+///
+/// 后果不是「少打一行」：**真正的异常向量与寄存器从未被打出**，转储里只剩 panic 的次生垃圾
+/// （实测 `rip` 是些 `0x01` 填充的值），整条追查因此被误导。诊断路径是内核里**最不能失败**的
+/// 代码——它失败时你连「发生了什么」都拿不到。
+///
+/// ## 断言
+///
+/// - 0..=255 **全部**不得 panic；
+/// - 0..=31 是具名异常（抽两个边界：13 与 31）；
+/// - 32..=255 一律落到固定字符串 `Unknown`（32 项表的表外向量）。
+pub fn test_exception_name_is_total_for_every_vector() {
+    info!("[test-excname] === exception_name must be total for every u8 vector ===");
+
+    let mut unknown = 0usize;
+    let mut v = 0u16;
+    while v <= u8::MAX as u16 {
+        // 本次调用本身不得 panic——这正是回归对象。
+        if arch_x86_64::interrupts::exception_name(v as u8) == "Unknown" {
+            unknown += 1;
+        }
+        v += 1;
+    }
+
+    assert_eq!(unknown, 256 - 32, "every vector >= 32 must be reported as Unknown");
+    assert_eq!(
+        arch_x86_64::interrupts::exception_name(13),
+        "General Protection Fault",
+        "#GP name must stay stable"
+    );
+    assert_eq!(arch_x86_64::interrupts::exception_name(30), "Security Exception");
+    assert_eq!(arch_x86_64::interrupts::exception_name(32), "Unknown");
+    assert_eq!(arch_x86_64::interrupts::exception_name(255), "Unknown");
+    info!("[test-excname] PASS (256/256 vectors total, {} Unknown)", unknown);
+}
 /// STORAGE-AHCI-7：**读命令粒度**同启动交错 A/B ——「8 次 512B 命令」对「1 次 4KiB 命令」。
 ///
 /// ## 与 test-ahci4 的分工（不是重复）

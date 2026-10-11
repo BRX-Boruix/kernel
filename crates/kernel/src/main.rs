@@ -939,6 +939,10 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_storage_ahci7_read_granularity_ab();
 
+    // 诊断路径回归：exception_name 对任意 u8 向量必须全函数（越界向量不得 panic）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_exception_name_is_total_for_every_vector();
+
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
     tests::test_init_contract();
