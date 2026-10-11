@@ -70,8 +70,31 @@ SECTIONS
        "max(常量下界, __kernel_image_end − 链接基址)" 计算帧分配器要保留的区间，
        使"保留量估小 → 内核代码被当空闲帧发出去"这一灾难性失败结构上不可能发生
        （常量只是下界；真实镜像更大时以真实值为准）。 */
+    /* PIC 调用经 ~.got~（内核按 PIC 目标编译：~callq *GOT[n]~）。本脚本此前**没有
+       提及 ~.got~**，链接器便把它作为**孤儿节**放到脚本末尾——正好落在
+       ~__kernel_image_end~ **之后**（实测：~__kernel_image_end == ADDR(.got)~，
+       .got 40 KiB 全在符号之上）。后果不是"多一个段"，而是灾难性的：
+       ~mm::kernel_image_range~ 用 ~__kernel_image_end − 链接基址~ 算出帧分配器
+       要**保留**的内核镜像区间，~.got~ 不在其中 ⇒ PMM 可以把 GOT 所在的物理帧
+       分给页表/堆/DMA 并覆盖它 ⇒ 此后每次 ~callq *GOT[n]~ 都跳到垃圾地址。
+       症状：**内核态取指 #PF / #GP**（~rip~ 落在镜像之外、无法反解；实测还出现过
+       ~rip~ 等于日志文本的 ASCII 字节），且异常转储自身（~raw_serial_fmt~ →
+       ~serial::write_str~ 也经 GOT）会跟着花掉——2026-10 由机内 readbench 崩溃现场
+       （~rip~ 反解到 ~serial::write_str+0x85~ 的 ~movb (%rax), %al~，而 ~%rax~ 是
+       GOT 取回的垃圾）定位到此处。
+       故这里**显式安置** ~.got~，让它落在符号之前。 */
+    .got : ALIGN(8) {
+        *(.got .got.plt)
+    } :data
+
     . = ALIGN(CONSTANT(MAXPAGESIZE));
     __kernel_image_end = .;
+
+    /* 把上面的不变式变成**链接期可检查**的事实：内核镜像保留区必须覆盖 .got。
+       缺了它，任何"新增一个没写进本脚本的段"的改动都会重新引入同一个灾难，
+       而症状（随机内核态取指异常）与原因相隔极远。 */
+    ASSERT(__kernel_image_end >= ADDR(.got) + SIZEOF(.got),
+           "__kernel_image_end must cover .got: mm reserves [base, __kernel_image_end) as the kernel image, so a GOT outside it gets handed out by the frame allocator and overwritten")
 
     /DISCARD/ : {
         *(.eh_frame*)
