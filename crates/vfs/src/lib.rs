@@ -9,6 +9,17 @@ extern crate std;
 
 extern crate alloc;
 
+/// 宿主测试二进制的链接期符号占位。
+///
+/// 本 crate 直接依赖 `mm`，而 `mm::kernel_image_range` 引用内核链接脚本提供的
+/// `__kernel_image_end`。该函数在宿主上从不被调用，但符号必须可解析——否则整个 vfs
+/// 宿主测试套件**链接失败**（实测：`cargo test -p vfs` 报
+/// `LNK2019: 无法解析的外部符号 __kernel_image_end`）。这里提供一个**测试专用**定义；
+/// 裸机镜像用的始终是 `kernel/linker.ld` 的真值。`fs` crate 里有同一处占位（同因）。
+#[cfg(test)]
+#[unsafe(no_mangle)]
+static __kernel_image_end: u8 = 0;
+
 pub mod audio;
 pub mod console;
 pub mod devfs;

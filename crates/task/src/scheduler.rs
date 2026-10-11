@@ -4259,7 +4259,12 @@ pub fn active_user_snapshots() -> vfs::ActiveUserView {
         }
     }
     // 稳定输出：按 uid 升序，便于消费方与测试比对（不依赖表遍历顺序）。
-    out.sort_by_key(|u| u.uid);
+    // 用 sort_unstable_by_key（ipnsort，就地）而不是 sort_by_key：后者走 driftsort，
+    // 实测栈帧 8,408 B。本函数由 procfs 读取路径调用，跑在 **16 KiB 专用 syscall 栈**上
+    // （arch percpu.rs 的 SYSCALL_STACKS），8.4 KiB 的排序缓冲会写穿该池。
+    // **等价性**：out 已按 uid 去重（上面的线性查重），键唯一 ⇒ 稳定/不稳定排序结果相同，
+    // 上面「不依赖表遍历顺序」的确定性因此不受影响。
+    out.sort_unstable_by_key(|u| u.uid);
     // 截断**如实上报**（S09）：放进返回值而非仅打日志——日志不可断言，
     // 而消费方必须能区分"活跃用户就这么多"与"视图被上限截断了"。
     vfs::ActiveUserView { users: out, truncated }

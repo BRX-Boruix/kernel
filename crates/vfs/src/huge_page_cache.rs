@@ -314,7 +314,10 @@ impl HugePageDirectCache {
                 })
                 .collect()
         };
-        candidates.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        // 同 page_cache::evict_pages：稳定排序（driftsort）实测栈帧 8,408 B，而本函数
+        // 在 read() 路径上被调用、跑在 16 KiB 的 syscall 栈上——改用就地排序（ipnsort）。
+        // 排序键是完整元组，稳定与否不影响 LRU 受害者选择。
+        candidates.sort_unstable_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
 
         let mut evicted = 0usize;
         let mut drop: Vec<(usize, u64)> = Vec::new();

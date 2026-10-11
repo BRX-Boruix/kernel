@@ -399,7 +399,12 @@ impl PageCache {
                 ));
             }
         }
-        candidates.sort_by(|a, b| (a.0, a.1, a.2, a.3).cmp(&(b.0, b.1, b.2, b.3)));
+        // 必须用 **sort_unstable**（ipnsort：就地、栈开销 O(1)），不能用 sort_by：
+        // 稳定排序走 driftsort，实测栈帧 **8,408 B**。本函数在 read() 路径上被调用，
+        // 而那条链跑在 **16 KiB 专用 syscall 栈**（arch percpu.rs 的 SYSCALL_STACKS），
+        // 8.4 KiB 的排序缓冲会写穿该池、覆盖返回地址（症状：内核态取指 Page Fault）。
+        // 排序键是**完整元组**，稳定与否不影响受害者选择的正确性。
+        candidates.sort_unstable_by(|a, b| (a.0, a.1, a.2, a.3).cmp(&(b.0, b.1, b.2, b.3)));
 
         let mut drop4k: Vec<PageKey> = Vec::new();
         let mut drop_huge: Vec<PageKey> = Vec::new();

@@ -2474,7 +2474,9 @@ fn plan_anonymous_unmap(areas: &[UserArea], start: u64, end: u64) -> Result<Unma
     }
     // 按起点排序后必须首尾相接并恰好覆盖 [start, end)：任何空洞都说明区间里混进了
     // 不属于本调用方的地址，如实拒绝，而不是"尽力释放能释放的那部分"。
-    hit.sort_by_key(|&i| areas[i].start.as_u64());
+    // 用 sort_unstable_by_key（ipnsort，就地）而不是 sort_by_key：后者走 driftsort，
+    // 实测栈帧 8,408 B；本函数由 munmap 系统调用调用，跑在 16 KiB 的 syscall 栈上。
+    hit.sort_unstable_by_key(|&i| areas[i].start.as_u64());
     let mut cursor = start;
     for &i in &hit {
         if areas[i].start.as_u64() > cursor {
