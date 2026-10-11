@@ -13816,6 +13816,27 @@ pub fn test_storage_ahci4_pio_vs_ahci_benchmark() {
     info!("[test-ahci4] PASS (measurement valid; cross-path comparison is done across two runs)");
 }
 
+/// 系统调用栈守卫页的**红测试**：故意越过栈底，期望守卫页 #PF 并报出槽号。
+///
+/// 为什么用专用 feature 而不是普通 `--test`：本测试**以停机收尾**（守卫页命中的处置就是
+/// 停机报告），把它放进常规自检会让整套自检永远跑不完。仓库已有同款纪律（`signal_halt`
+/// 系列：停机验收互斥、各自独立 build+QEMU 运行、跑完即停）。
+///
+/// 期望的串口输出：`========== SYSCALL STACK OVERFLOW ==========` + `slot = N`。
+#[cfg(feature = "kernel-test-sstack-guard")]
+pub fn test_syscall_stack_guard_fires() {
+    info!("[test-sguard] === deliberate syscall-stack overflow: guard page must fire ===");
+    let slot = arch_x86_64::percpu::current_slot();
+    let base = arch_x86_64::percpu::syscall_stack_base(slot)
+        .expect("current slot must have a syscall stack");
+    info!("[test-sguard] slot {} stack base {:#x}; writing one byte below it", slot, base);
+    // SAFETY（**故意违反**）：这正是被测行为——越界写必须当场 #PF。守卫页已解映射，
+    // 故这行不会「成功」，而是立刻触发内核态 #PF 并进入 kernel_fault_inspect 的停机报告。
+    unsafe { core::ptr::write_volatile((base - 1) as *mut u8, 0xEE) };
+    // 走到这里说明守卫页**没有**生效——这是失败，如实报出。
+    info!("[test-sguard] FAIL: overflow did NOT fault (guard page missing)");
+}
+
 /// 诊断路径回归：`exception_name` 必须对**任意** `u8` 向量是全函数。
 ///
 /// ## 回归对象（2026-10 实测，不是假想）

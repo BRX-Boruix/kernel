@@ -150,14 +150,22 @@ pub static GS_READY_FLAG: core::sync::atomic::AtomicU64 =
 /// 内核堆分配器内部异常，以及更早的整体静默停机。
 ///
 /// 专用栈把 syscall 现场与任何内核栈彻底隔离（S23：不共享可变状态）。
-#[repr(C, align(64))]
+/// **对齐必须是 4096（整页），不能只是 64**：守卫区会被 `unmap` 解映射，而 `unmap` 清的是
+/// **整个 4 KiB 页**——若守卫区只按 64 字节对齐，解映射会连带抹掉同一页里**前面的邻居内核数据**
+/// （2026-10 实测：这样做的第一版在启动时就把 `SYSCALL_STACKS` 之前 1,758 字节处的数据页抹掉，
+/// 之后任何读该页的代码都 #PF）。内核主栈的守卫页没有这个问题，因为 `linker.ld` 显式
+/// `ALIGN(MAXPAGESIZE)`。
+#[repr(C, align(4096))]
 pub struct SyscallStack {
-    /// 溢出哨兵区：位于本槽**栈底之下**。
+    /// 守卫区：位于本槽**栈底之下**，启动后被**解映射**。
     ///
     /// 为什么必须有：槽位在数组里**连续**，栈向下增长，所以「越过栈底」的写会直接落进
     /// **前一个槽**——那是另一个 CPU 正在用的栈。后果是**跨核**破坏控制流（两个 CPU 同时
     /// 跑飞、GOT 完好而 `rip` 落进数据），而现场里没有任何东西指向真正的原因。
-    /// 有了这段哨兵，同样的溢出先落在**本槽自己的**区域里，并且可被检测。
+    ///
+    /// 为什么是**解映射**而不是「填哨兵」：哨兵只能发现「越过栈底 4 KiB 以内」的写，而且要
+    /// 事后主动去读才知道；解映射让**任意**越界写当场 #PF，`cr2` 落在守卫区里即确证溢出，
+    /// 还能指出是哪个槽（见 kernel 侧 `kernel_fault_inspect`）。与内核主栈的守卫页同一机制。
     guard: [u8; SYSCALL_STACK_GUARD_BYTES],
     stack: [u8; SYSCALL_STACK_SIZE],
 }
@@ -190,20 +198,61 @@ impl SyscallStack {
         self.stack.as_ptr() as usize
     }
 
-    /// 哨兵区是否完好（全部仍为 `SYSCALL_STACK_PAINT`）。
-    ///
-    /// 返回 false 即**确证发生过栈溢出**——这是本结构存在的意义。
-    pub fn guard_intact(&self) -> bool {
-        for i in 0..SYSCALL_STACK_GUARD_BYTES {
-            // SAFETY：i 严格在 guard 区内；只读。
-            if unsafe { core::ptr::read_volatile(self.guard.as_ptr().add(i)) }
-                != SYSCALL_STACK_PAINT
-            {
-                return false;
-            }
-        }
-        true
+    /// 本槽守卫区的基址（低地址端）。**装好之后不可访问**：越界写立即 #PF。
+    pub fn guard_base(&self) -> usize {
+        self.guard.as_ptr() as usize
     }
+}
+
+/// 当前 CPU 的紧凑槽位（GS 路径，无需 MMIO）。
+pub fn current_slot() -> usize {
+    crate::cpu::my_cpu_slot_gs_path()
+}
+
+/// 槽位 `slot` 的 syscall 栈区基址（低地址端）。`None` = 槽位越界。
+pub fn syscall_stack_base(slot: usize) -> Option<usize> {
+    SYSCALL_STACKS.get(slot).map(|s| s.base())
+}
+
+/// `addr` 落在哪个系统调用栈的**守卫区**里（即确证该槽发生了向下溢出）。
+///
+/// 供 kernel 侧的内核态 #PF 检查器使用：命中即报出**槽号**——这是「哪个 CPU 的 syscall 链
+/// 越界」这个问题的直接答案。
+pub fn syscall_guard_hit_slot(addr: usize) -> Option<usize> {
+    for (slot, s) in SYSCALL_STACKS.iter().enumerate() {
+        let b = s.guard_base();
+        if addr >= b && addr < b + SYSCALL_STACK_GUARD_BYTES {
+            return Some(slot);
+        }
+    }
+    None
+}
+
+/// 给全部系统调用栈装上**不可映射的守卫页**。
+///
+/// 必须在 `paging::init` 之后调用：Limine 以 2 MiB 大页映射内核映像，解映射单页需要
+/// **大页拆分**，而拆分要分配页表页帧。
+///
+/// 返回解映射的页数；任一槽失败即返回 `Err(槽号)`——守卫页失效等价于放弃溢出检测面，
+/// 宁可不带病运行。
+pub fn arm_syscall_stack_guards(slots: usize) -> Result<usize, usize> {
+    use arch::{ActivePageTable, PageTable, VirtAddr};
+    let mut pt = <crate::paging::X86PageTable as ActivePageTable>::current();
+    let mut n = 0usize;
+    // 只装**实际在用的槽位**：未上线的槽位不可能发生溢出，给它们解映射只是多付页表拆分的
+    // 代价（而 256 页解映射在机内实测会撞上启动崩溃，见 3p.md 的记录）。上限仍按 MAX_CPUS 截断。
+    for (slot, s) in SYSCALL_STACKS.iter().enumerate().take(slots.min(MAX_CPUS)) {
+        if pt.unmap(VirtAddr::new(s.guard_base() as u64)).is_err() {
+            return Err(slot);
+        }
+        // **机器校验的证明**：解映射之后必须翻译不到。否则「装好了守卫页」只是一句声称——
+        // 而这条不变式一旦不成立，溢出会重新变成静默的跨核破坏（本结构存在的全部理由）。
+        if pt.translate(VirtAddr::new(s.guard_base() as u64)).is_some() {
+            return Err(slot);
+        }
+        n += 1;
+    }
+    Ok(n)
 }
 
 /// 每 CPU 一张专用 syscall 栈。
@@ -228,12 +277,7 @@ pub fn paint_syscall_stacks() {
         // SAFETY：每个元素独占且不重叠；调用点保证此刻没有任何 CPU 在这些栈上运行
         // （本函数在启动期、第一个 syscall 之前调用）。
         unsafe {
-            // 哨兵区与栈区都填：哨兵区被写过即「溢出过」，栈区的破坏则用来算高水位。
-            core::ptr::write_bytes(
-                s.guard.as_ptr() as *mut u8,
-                SYSCALL_STACK_PAINT,
-                SYSCALL_STACK_GUARD_BYTES,
-            );
+            // 只填栈区：守卫区稍后会被**解映射**，往里写没有意义；栈区的图案用来算高水位。
             core::ptr::write_bytes(s.stack.as_ptr() as *mut u8, SYSCALL_STACK_PAINT, SYSCALL_STACK_SIZE)
         };
     }
@@ -275,13 +319,6 @@ pub fn text_range() -> (usize, usize) {
             &__text_end as *const u8 as usize,
         )
     }
-}
-
-/// 槽位 `slot` 的溢出哨兵区是否完好。
-///
-/// `false` = **确证发生过栈溢出**（该槽的调用链越过了栈底）。
-pub fn syscall_stack_guard_intact(slot: usize) -> bool {
-    SYSCALL_STACKS.get(slot).map(|s| s.guard_intact()).unwrap_or(true)
 }
 
 /// 当前 CPU 的 syscall 栈高水位：`(slot, 用过的字节数, 最深处的地址)`。

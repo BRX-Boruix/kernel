@@ -300,6 +300,16 @@ unsafe fn kmain_body() -> ! {
         // 解映射失败即启动失败：守护页失效等价于放弃溢出检测面，宁可不带病运行。
         pt.unmap(arch::VirtAddr::new(guard_base))
             .expect("failed to unmap kernel stack guard page");
+        // 系统调用栈的守卫页：同一机制、同一前置条件（必须在大页拆分可用之后）。
+        // 装不上即启动失败——守卫页失效等价于放弃溢出检测面（S20）。
+        match arch_x86_64::percpu::arm_syscall_stack_guards(mm::cpu_count()) {
+            Ok(n) => klib::info!("[kmain] syscall stack guard pages armed: {} slots", n),
+            Err(slot) => panic!("failed to unmap syscall stack guard page (slot {})", slot),
+        }
+        // 守卫页红测试：必须紧贴布防之后——它以停机收尾，放在测试列表后面就永远跑不到
+        // （而「跑了整套所以大概没问题」不是证据）。专用 feature，独立 build+QEMU 运行。
+        #[cfg(feature = "kernel-test-sstack-guard")]
+        tests::test_syscall_stack_guard_fires();
         klib::info!(
             "[kmain] kernel stack guard armed at {:#x}..{:#x}",
             guard_base,
@@ -947,6 +957,7 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-tests")]
     tests::test_exception_name_is_total_for_every_vector();
 
+
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
     tests::test_init_contract();
@@ -1184,6 +1195,18 @@ fn kernel_fault_inspect(cr2: u64) -> bool {
         );
         arch_x86_64::serial::write_str("kernel main stack guard page hit (downward overflow)\n");
         arch_x86_64::serial::write_str("===========================================\n");
+        CurrentArch::halt();
+    }
+    // 系统调用栈守卫页：命中即**确证**该槽的调用链越过了栈底，并直接给出槽号。
+    // 与内核主栈同机制（解映射），但报的是「哪个 CPU」——这是跨核栈破坏最难拿到的信息。
+    if let Some(slot) = arch_x86_64::percpu::syscall_guard_hit_slot(cr2 as usize) {
+        arch_x86_64::serial::write_str(
+            "\n========== SYSCALL STACK OVERFLOW ==========\n",
+        );
+        arch_x86_64::serial::write_str("syscall stack guard page hit (downward overflow)\n");
+        arch_x86_64::serial::write_str("slot = ");
+        arch_x86_64::serial::write_byte(b'0' + (slot % 10) as u8);
+        arch_x86_64::serial::write_str("\n============================================\n");
         CurrentArch::halt();
     }
     false

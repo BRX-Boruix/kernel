@@ -305,14 +305,8 @@ fn sstack_watchdog(frame_rbp: u64, frame_cs: u64) {
     let Some((slot, used, deepest)) = crate::percpu::syscall_stack_usage() else {
         return;
     };
-    // 溢出哨兵：本槽栈底之下 4 KiB 是否被动过。**这是唯一能确证「发生过溢出」的判据**，
-    // 且它不依赖是否出故障——修复之后溢出仍可能发生（只是不再踩到邻居），必须照样报出来。
-    if !crate::percpu::syscall_stack_guard_intact(slot) {
-        raw_serial_fmt(format_args!(
-            "[sstack] slot {} GUARD DAMAGED -- a syscall chain overflowed this stack\n",
-            slot
-        ));
-    }
+    // 溢出判据已改为**不可映射的守卫页**：越界写会当场 #PF，由 kernel 侧的
+    // `kernel_fault_inspect` 报出槽号。此处不再读守卫区——它已经被解映射，读它会自己触发 #PF。
     if used <= MAX_SEEN.load(Ordering::Relaxed) {
         return;
     }
@@ -1311,13 +1305,6 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
             ));
             // 对照：同一偏移探测**另一个槽位**。零字节在正常栈帧里是零散的，只有长零串
             // 才指向批量清零；没有对照就无法判断「这么长的零串是否正常」。
-            // 溢出哨兵：本槽栈底之下的 4 KiB 是否被动过。**动过 = 确证溢出过**。
-            if !crate::percpu::syscall_stack_guard_intact(pr.slot) {
-                raw_serial_fmt(format_args!(
-                    "  sstack-guard: slot {} GUARD DAMAGED -- a syscall chain overflowed this stack\n",
-                    pr.slot
-                ));
-            }
             if let Some(ct) = crate::percpu::probe_syscall_stack_at_slot(
                 (pr.slot + 1) % crate::percpu::MAX_CPUS,
                 pr.offset,
