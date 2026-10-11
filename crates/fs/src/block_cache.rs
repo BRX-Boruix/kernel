@@ -72,6 +72,15 @@ pub const CACHE_BLOCK_BYTES: usize = 512;
 /// 0.4%，内存代价可忽略。取 2 的幂以便用位掩码取模（避免除法与魔法数）。
 pub const CACHE_BLOCK_COUNT: usize = 4096;
 
+/// 组预取宽度（缓存块数）：8 × 512 B = 4 KiB。
+///
+/// 取值理由（S17）：ext2 默认块大小 4096，上层一次块读正好落在这 8 个缓存块上；
+/// 而设备层**每命令成本几乎与长度无关**（内核 `test-ahci7` 同启动实测：AHCI
+/// 1 扇区 1,010,208 cycles/命令 vs 8 扇区 1,135,967 cycles/命令）——逐块取块
+/// 把这份固定开销按 512 B 反复支付，4 KiB 读要付 8 次。上限远小于
+/// `CACHE_BLOCK_COUNT`，不会与直接映射的槽位回绕撞车。
+const FETCH_GROUP_BLOCKS: usize = 8;
+
 /// 空槽哨兵。设备块号不可能取该值：u64::MAX 个 512 B 块 = 8 ZiB，
 /// 远超 ATA LBA28 的 2^28 与任何真实设备。
 const EMPTY_TAG: u64 = u64::MAX;
@@ -227,6 +236,36 @@ impl CachingByteDevice {
         }
     }
 
+    /// 同 [`Self::install_if_unchanged`]，但只用 `(prev_tag, prev_seq)` 描述"快照时的
+    /// 槽位状态"，**不携带块内容**。
+    ///
+    /// 为什么需要这个更轻的形态：组预取要一次校验 8 个槽位，而 `Occupant` 含
+    /// `[u8; 512]` ⇒ `[Option<Occupant>; 8]` 本身就是一个 **~4 KiB 的栈对象**，
+    /// 在 16 KiB 的 syscall 栈上会写穿 `SYSCALL_STACKS` 池（详见 `fetch_group` 的说明）。
+    /// `(u64, u64)` × 8 只要 128 B。
+    #[inline]
+    fn install_if_unchanged_raw(
+        slot: &mut Slot,
+        prev_tag: u64,
+        prev_seq: u64,
+        block: u64,
+        data: &[u8; CACHE_BLOCK_BYTES],
+        dirty: bool,
+    ) -> bool {
+        let unchanged = if prev_tag == EMPTY_TAG {
+            slot.tag == EMPTY_TAG
+        } else {
+            slot.tag == prev_tag && slot.seq == prev_seq
+        };
+        if unchanged {
+            slot.tag = block;
+            slot.dirty = dirty;
+            slot.seq = slot.seq.wrapping_add(1);
+            slot.data.copy_from_slice(data);
+        }
+        unchanged
+    }
+
     /// 锁内：若槽位自快照以来未被改动，则把 `block` 装进去。
     ///
     /// 返回是否安装成功。失败意味着槽位已被他人改动，调用方必须**重试**
@@ -239,17 +278,10 @@ impl CachingByteDevice {
         data: &[u8; CACHE_BLOCK_BYTES],
         dirty: bool,
     ) -> bool {
-        let unchanged = match occ {
-            None => slot.tag == EMPTY_TAG,
-            Some(o) => slot.tag == o.tag && slot.seq == o.seq,
-        };
-        if unchanged {
-            slot.tag = block;
-            slot.dirty = dirty;
-            slot.seq = slot.seq.wrapping_add(1);
-            slot.data.copy_from_slice(data);
+        match occ {
+            None => Self::install_if_unchanged_raw(slot, EMPTY_TAG, 0, block, data, dirty),
+            Some(o) => Self::install_if_unchanged_raw(slot, o.tag, o.seq, block, data, dirty),
         }
-        unchanged
     }
 
     /// **锁外**：把一个块的内容写回底层设备。
@@ -315,6 +347,112 @@ impl CachingByteDevice {
         }
         // 重试耗尽：不缓存，但如实返回设备真值（正确性优先于缓存收益）。
         self.inner.read_bytes(Self::offset_of(block), buf)
+    }
+
+    /// 组预取：一条设备命令把 `FETCH_GROUP_BLOCKS` 个**连续**块读进缓存。
+    ///
+    /// 返回 `Some(首块真实读到的字节数)` = 走了批量路径；`None` = 条件不满足，
+    /// 调用方必须退回单块 [`Self::fetch_block`]。两条路径都返回"首块真实读到的
+    /// 字节数"，调用方无需区分。
+    ///
+    /// ## 前提（保守，但理由不是性能）
+    ///
+    /// 组内只要**有一块已在缓存里**，或**有任何脏块**会被这次批量安装淘汰，就退回
+    /// 逐块路径。前者是"不必重复取"；后者是**正确性**：批量路径若淘汰脏块，就必须
+    /// 先把它的内容写回设备（不变式 1），而"为 8 个槽位各留一份 512 B 快照"本身就是
+    /// 一个 ~4 KiB 的**栈**对象——正是本函数第一版踩过的坑（见下方 S33 说明）。
+    /// 这里选择**根本不让脏块进入批量路径**：批量路径只淘汰**干净**块、无需回写，
+    /// 快照于是退化成 `(tag, seq)` 两个 u64（共 128 B）。
+    ///
+    /// 代价可控：本优化唯一的目标场景是**顺序流式读**，那些组本来就全是未命中、
+    /// 淘汰的也是刚读进来的干净块；重复读时逐块路径全是命中，根本不碰设备。
+    fn fetch_group(
+        &self,
+        block: u64,
+        dev_len: Option<u64>,
+        buf: &mut [u8; CACHE_BLOCK_BYTES],
+    ) -> Option<usize> {
+        const G: usize = FETCH_GROUP_BLOCKS;
+        // 组宽先按设备长度截断：越过设备末端的命令在 ATA PIO 下**仍要走完整流程**
+        // （代价与成功命令同量级），所以绝不为了预取而发出注定读不到数据的命令。
+        // 不足 2 块时直接交给逐块路径——那里已被充分验证，不必在这里再写一遍。
+        //
+        // 设备长度**由调用方传入**而不是在这里现查：`byte_len()` 在真实设备上是
+        // 一次 `IoDevice::size()`（取设备锁）。每次 read 查一次就够；按块查会让
+        // 同一段读的设备长度在循环中途可能变化，与 `read_bytes` 顶部的判断不一致。
+        let want = match dev_len {
+            Some(len) => {
+                let remain = len.saturating_sub(Self::offset_of(block));
+                core::cmp::min(G as u64, remain / CACHE_BLOCK_BYTES as u64) as usize
+            }
+            None => G,
+        };
+        if want < 2 {
+            return None;
+        }
+        // 锁内：确认组内每一块都**不在缓存里**，且**没有任何脏块**会被淘汰。
+        // 只留判等所需的 `(tag, seq)`——不留 512 B 内容，见上面的前提说明。
+        let mut prev: [(u64, u64); G] = [(EMPTY_TAG, 0u64); G];
+        {
+            let table = self.table.lock();
+            for i in 0..want {
+                let b = block + i as u64;
+                let slot = &table.slots[Self::index_of(b)];
+                if slot.tag == b || slot.dirty {
+                    return None;
+                }
+                prev[i] = (slot.tag, slot.seq);
+            }
+        }
+        // 锁外做设备 I/O（锁纪律同 fetch_block：持锁做 I/O 会让缓存自己变成串行点）。
+        //
+        // **组缓冲必须在堆上（S33）**：本路径运行在 **16 KiB 专用 syscall 栈**上
+        // （arch percpu.rs 的 `SYSCALL_STACKS`，不是 64 KiB 的任务内核栈），
+        // 4 KiB 栈数组会写穿该池、覆盖返回地址，症状是**内核态取指 Page Fault**
+        // （error 带 I/D 位）。本轮实测撞到：AHCI 下 `tcc readbench.c` 期间内核转储
+        // `rip=0x0 / error P=0x10`；改为堆分配后不再出现。
+        // 本仓库此前已在 atapi_cdrom、percpu(B3)、exec 命令行三处踩过**同型**坑，
+        // 结论一致：栈上大对象一律入堆。
+        let mut group: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if group.try_reserve_exact(want * CACHE_BLOCK_BYTES).is_err() {
+            // 分配失败：退回**逐块路径**（结果完全正确，只是慢）。逐块路径本身就是
+            // 本函数的完整正确实现，故这不是降级语义、也不新增计数器。
+            return None;
+        }
+        group.resize(want * CACHE_BLOCK_BYTES, 0);
+        let got = self.inner.read_bytes(Self::offset_of(block), &mut group);
+        // 无需回写：上面的前提已排除"淘汰脏块"这一情形。
+        // 只有**整块读全**的块才安装：短读的尾部块若缓存下去，会把"设备末端数据
+        // 不完整"固化成看起来正常的满块（与 fetch_block 同一纪律，S19/S09）。
+        let full = core::cmp::min(got / CACHE_BLOCK_BYTES, want);
+        if full > 0 {
+            let mut table = self.table.lock();
+            for i in 0..full {
+                let b = block + i as u64;
+                let mut one = [0u8; CACHE_BLOCK_BYTES];
+                one.copy_from_slice(&group[i * CACHE_BLOCK_BYTES..(i + 1) * CACHE_BLOCK_BYTES]);
+                // 装不上（槽位在锁外被改动）就**不装**，绝不覆盖更新的内容；
+                // 该块下次读会重新取。数据照常返回给调用方。
+                let (pt, ps) = prev[i];
+                let _ = Self::install_if_unchanged_raw(
+                    &mut table.slots[Self::index_of(b)],
+                    pt,
+                    ps,
+                    b,
+                    &one,
+                    false,
+                );
+            }
+        }
+        // 统计口径：`misses` = **从设备取回的块数**（批量路径一次取 `full` 块）。
+        // 与逐块路径同一定义（那里每取一块记一次），故两条路径的命中率可比。
+        // 代价是"预取但本次未被请求"的块也计入 misses——那是事实：它们确实不在
+        // 缓存里，也确实占用了设备带宽（S10：不美化计数）。
+        self.stats.misses.fetch_add(full as u64, Ordering::Relaxed);
+        buf.copy_from_slice(&group[..CACHE_BLOCK_BYTES]);
+        // 返回**首块**可用的字节数（调用方的 `buf` 只有一块大）。整组读到多少
+        // 不影响这个返回值——后续块由调用方逐块推进，那时它们已在缓存里（命中）。
+        Some(core::cmp::min(got, CACHE_BLOCK_BYTES))
     }
 
     /// 把块内一段字节写入缓存（写回语义）。返回是否**已进缓存**。
@@ -462,7 +600,12 @@ impl ByteDevice for CachingByteDevice {
                     break;
                 }
             }
-            let got = self.fetch_block(block, &mut buf);
+            // 先试**组预取**（一条设备命令覆盖 8 个块，即 4 KiB）；条件不满足时
+            // 退回单块路径。两条路径都返回"首块真实读到的字节数"，此处无需区分。
+            let got = match self.fetch_group(block, dev_len, &mut buf) {
+                Some(n) => n,
+                None => self.fetch_block(block, &mut buf),
+            };
             if got <= in_block {
                 // 该块在此偏移处已无数据（设备末端/短读）：如实停止。
                 break;

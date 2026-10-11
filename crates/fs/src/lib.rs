@@ -11,6 +11,18 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+/// 宿主测试二进制的链接期符号占位。
+///
+/// 本 crate 经 `vfs` → `mm` **传递**链接到 `mm::kernel_image_range`，它引用内核
+/// 链接脚本提供的 `__kernel_image_end`。该函数在宿主上从不被调用，但符号必须可解析
+/// ——否则整个 fs 宿主测试套件**链接失败**（实测：`cargo test -p fs` 报
+/// `LNK2019: 无法解析的外部符号 __kernel_image_end`，与本 crate 的内容无关）。
+/// 这里提供一个**测试专用**定义；裸机镜像用的始终是 `kernel/linker.ld` 的真值。
+/// 同类占位在其它「传递依赖 mm 且带宿主测试」的 crate 里同样需要。
+#[cfg(test)]
+#[unsafe(no_mangle)]
+static __kernel_image_end: u8 = 0;
+
 pub mod block_cache;
 pub mod ext2;
 pub mod iso9660;
@@ -182,9 +194,13 @@ mod tests {
         cache.read_bytes(8192, &mut a);
         cache.read_bytes(8192, &mut b);
         assert_eq!(a, b, "same offset must return same bytes");
-        // 第一次 4096/512 = 8 块；第二次应全部命中。
-        assert_eq!(dev.reads(), 8, "second read must be fully cached");
-        assert_eq!(cache.stats().hits(), 8);
+        // 组预取：4 KiB = 8 块由**一条**设备命令取回（见
+        // `test_cache_sequential_read_uses_one_device_command`）；第二次读全部命中，
+        // 设备访问不再增加。
+        assert_eq!(dev.reads(), 1, "group prefetch must touch the device exactly once");
+        // 统计口径：misses = **从设备取回的块数**（批量路径一次记 full = 8 块）；
+        // hits = **被请求且命中**的块数（首轮余下 7 个 + 第二轮 8 个 = 15）。
+        assert_eq!(cache.stats().hits(), 15);
         assert_eq!(cache.stats().misses(), 8);
     }
 
@@ -213,8 +229,34 @@ mod tests {
         let n = cache.read_bytes(400, &mut via);
         assert_eq!(n, 2000);
         assert_eq!(direct, via);
-        // 400..2400 覆盖块 0..=4 -> 5 块（另加 1 次直接读）。
-        assert_eq!(dev.reads(), 6, "cache must fetch exactly 5 blocks");
+        // 400..2400 覆盖块 0..=4：块 0 触发一次组预取（8 块并成一条命令），
+        // 余下 4 个块命中。设备总访问 = 组预取 1 次 + 上面那次对照直读 1 次。
+        assert_eq!(dev.reads(), 2, "one group prefetch + one direct reference read");
+    }
+
+    /// **组预取（⑤b）**：4 KiB 顺序读 = 8 个缓存块，必须合并成**一条**设备命令。
+    ///
+    /// 为什么这是硬要求而不是优化偏好：块设备每命令的成本几乎与传输长度无关
+    /// （内核 test-ahci7 同启动实测：AHCI 1 扇区 1,010,208 cycles/命令 vs 8 扇区
+    /// 1,135,967 cycles/命令）。逐块取块把「每命令固定开销」按 512 B 反复支付，
+    /// 4 KiB 读就要付 8 次——这正是 ext2 每个块读取的常态。
+    #[test]
+    fn test_cache_sequential_read_uses_one_device_command() {
+        let dev = Arc::new(CountingDevice::new(64 * 1024));
+        let cache = block_cache::CachingByteDevice::new(dev.clone());
+        let mut via_cache = [0u8; 4096];
+        let n = cache.read_bytes(8192, &mut via_cache);
+        assert_eq!(n, 4096);
+        // 先记下缓存自己发起的设备访问次数，再读设备做内容对照——否则对照那次
+        // 也会被算进来，断言就变成"在数两个不同的东西"。
+        let reads_for_cache = dev.reads();
+        let mut direct = [0u8; 4096];
+        dev.read_bytes(8192, &mut direct);
+        assert_eq!(via_cache, direct, "预取后的内容必须与设备一致");
+        assert_eq!(
+            reads_for_cache, 1,
+            "4 KiB 顺序读必须合并成一条设备命令（逐块取块会发 8 条）"
+        );
     }
 
     /// 写到**命中**的块：缓存立刻反映新值，且**不落盘**（write-back 的核心收益）。
