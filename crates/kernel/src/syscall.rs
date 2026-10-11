@@ -5599,15 +5599,6 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
 ///
 /// 返回 `true` 让 `iretq` 把（可能的）新现场带回目标用户态。
 pub extern "C" fn syscall_entry(frame: &mut SyscallFrame) -> bool {
-    // **延后冲刷点（浅栈）**：把终端队列里攒下的行在这里真正绘制。
-    //
-    // 为什么选这里：syscall 入口的栈深是**固定且浅**的（入口 stub 只压了一帧），而日志路径
-    // 原本把「console → 终端逐字符绘制」整棵子树叠在**调用方**的深度上（实测深链里是块缓存/
-    // AHCI/日志那些帧）。移到此处后，绘制子树不再出现在深链上。
-    //
-    // 队列空时只是一次加锁 + 判空，代价可忽略；串口**不经过**这里（它同步输出，是诊断的原始
-    // 证据，见 DESIGN-console-deferred-flush.md §3）。
-    klib::console::flush_deferred();
     let nr = frame.nr;
     // ADR-051：**系统调用入口清除"被打断"标记**——它只对**被打断的那一次**调用有意义。
     // 配合"投递即置位"，既不会漏掉阻塞期间的投递（tick 触发点），也不会把上一次调用

@@ -62,32 +62,6 @@ pub trait Console {
         self.write_str(&s);
     }
 
-    /// 输出**原始字节流**，允许实现**延后**（默认 = 立即，即 [`Console::write_bytes`]）。
-    ///
-    /// 为什么要有这个能力位：日志路径会把「console 转发 → 终端逐字符绘制」整棵子树叠在
-    /// **调用方的栈深**上，而某些调用方深在系统调用链里（实测深链上出现的是
-    /// `plot_char_unscaled_uncanvas`/`Range::next`，**不是**串口帧）。
-    ///
-    /// **分界由实现自述**（同 `INode::interactive_input()` 的范式）：**串口**是诊断的原始证据
-    /// （AM7：停机前必有诊断，靠的就是这条最短依赖路径），故它**保持同步**；**终端**是视觉
-    /// 介质，可以滞后。调用方**不得**按设备名特判（S11）。
-    fn write_bytes_deferred(&self, bytes: &[u8]) {
-        self.write_bytes(bytes)
-    }
-
-    /// 把 [`Console::write_bytes_deferred`] 攒下的内容真正输出（默认空操作）。
-    ///
-    /// 冲刷点必须在**浅栈**上（见 `console::flush_deferred` 的调用方）。
-    fn flush_deferred(&self) {}
-
-    /// [`Console::write_bytes_deferred`] 累计**丢弃**的行数（默认 0 = 不丢）。
-    ///
-    /// 为什么必须能报：延后通道有容量上限，满了必然丢；**丢了却不报**就违反 S09/S10。
-    /// 终端是视觉介质，丢行不是诊断损失，但必须可观测。
-    fn deferred_dropped(&self) -> u64 {
-        0
-    }
-
     /// 冲刷（对带缓冲设备有用；默认空操作）。
     fn flush(&self) {}
 }
@@ -219,59 +193,6 @@ pub fn write_bytes(bytes: &[u8]) {
             c.write_bytes(bytes);
         }
     }
-}
-
-/// 把**原始字节流**交给各 sink 的**可延后**通道（默认实现即 [`write_bytes`]，见 trait 说明）。
-///
-/// 转发纪律与 [`write_bytes`] 一致：只转发、不跨 sink 持锁。
-pub fn write_bytes_deferred(bytes: &[u8]) {
-    let n = SINK_COUNT.load(Ordering::Acquire);
-    for i in 0..n {
-        let data = SINKS[i].data.load(Ordering::Acquire);
-        if data != 0 {
-            let vtable = SINKS[i].vtable.load(Ordering::Acquire);
-            // 仅初始化期写入了真实指针，此处读取安全。
-            let c: &'static dyn Console = unsafe {
-                core::mem::transmute::<(usize, usize), &'static dyn Console>((data, vtable))
-            };
-            c.write_bytes_deferred(bytes);
-        }
-    }
-}
-
-/// 请各 sink 把**可延后**通道攒下的内容真正输出（默认空操作）。
-///
-/// **只能在浅栈上调用**：本函数会让终端真正绘制，而绘制是一棵不浅的子树（见 trait 说明）。
-/// 调用点：syscall 入口（非嵌套）、交互 stdin 阻塞读之前、定时器 tick 且**不在 syscall 中**。
-pub fn flush_deferred() {
-    let n = SINK_COUNT.load(Ordering::Acquire);
-    for i in 0..n {
-        let data = SINKS[i].data.load(Ordering::Acquire);
-        if data != 0 {
-            let vtable = SINKS[i].vtable.load(Ordering::Acquire);
-            let c: &'static dyn Console = unsafe {
-                core::mem::transmute::<(usize, usize), &'static dyn Console>((data, vtable))
-            };
-            c.flush_deferred();
-        }
-    }
-}
-
-/// 全部 sink 的**延后通道累计丢弃行数**之和（验收读它，见 DESIGN 文档 §6 绿③）。
-pub fn deferred_dropped_total() -> u64 {
-    let n = SINK_COUNT.load(Ordering::Acquire);
-    let mut total = 0u64;
-    for i in 0..n {
-        let data = SINKS[i].data.load(Ordering::Acquire);
-        if data != 0 {
-            let vtable = SINKS[i].vtable.load(Ordering::Acquire);
-            let c: &'static dyn Console = unsafe {
-                core::mem::transmute::<(usize, usize), &'static dyn Console>((data, vtable))
-            };
-            total += c.deferred_dropped();
-        }
-    }
-    total
 }
 
 /// stdout **行缓冲**写入：攒到换行（或缓冲将满）才整体提交给所有 sink。

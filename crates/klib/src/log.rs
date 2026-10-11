@@ -144,9 +144,7 @@ pub fn __log(level: LogLevel, args: fmt::Arguments) {
         // 避免二次格式化（T2 回归教训）。经原始字节路径下发——收尾已保证
         // 字符边界完整，文本 sink 的 lossy 转换走零分配 Borrowed 分支；
         // 此前 from_utf8().unwrap_or("") 在切点落进多字节字符时会整行蒸发。
-        // 走**可延后**通道：默认实现 = 立即（串口保持同步），只有终端 sink 覆写为入队。
-        // 这样「console → 终端逐字符绘制」那棵子树不再叠在调用方的栈深上（见 DESIGN 文档）。
-        crate::console::write_bytes_deferred(&buf[..=n]);
+        crate::console::write_bytes(&buf[..=n]);
     }
 }
 
