@@ -172,6 +172,71 @@ impl SyscallStack {
 pub static SYSCALL_STACKS: [SyscallStack; MAX_CPUS] =
     [const { SyscallStack([0; SYSCALL_STACK_SIZE]) }; MAX_CPUS];
 
+/// 系统调用栈的哨兵填充值。
+///
+/// 非零是**要点**：`SYSCALL_STACKS` 在 `.bss` 里，开机即全零，于是「栈上某段全零」既可能是
+/// 「被野写清零」也可能是「从未用过」，两者分不开。填成非零图案后：读到本值 = 从未用过
+/// （⇒ `rsp` 自身被写坏），读到 0 = **被清零**（⇒ 野写）。
+pub const SYSCALL_STACK_PAINT: u8 = 0xA5;
+
+/// 用哨兵填充全部系统调用栈。**必须在任何 syscall 发生之前调用一次**。
+pub fn paint_syscall_stacks() {
+    for s in SYSCALL_STACKS.iter() {
+        // SAFETY：每个元素独占且不重叠；调用点保证此刻没有任何 CPU 在这些栈上运行
+        // （本函数在启动期、第一个 syscall 之前调用）。
+        unsafe {
+            core::ptr::write_bytes(s.0.as_ptr() as *mut u8, SYSCALL_STACK_PAINT, SYSCALL_STACK_SIZE)
+        };
+    }
+}
+
+/// 一次系统调用栈探测的结果。
+pub struct SStackProbe {
+    /// 槽位号。
+    pub slot: usize,
+    /// 探测地址相对该槽基址的偏移。
+    pub offset: usize,
+    /// 实际探测的字节数（窗口在槽内截断）。
+    pub total: usize,
+    /// 仍为哨兵值的字节数。
+    pub paint: usize,
+    /// 为 0 的字节数。
+    pub zero: usize,
+    /// 既非哨兵也非 0 的字节数（被写过真实数据）。
+    pub other: usize,
+}
+
+/// 探测 `addr` 落在哪个系统调用栈槽，并统计其附近 64 字节的哨兵状态。
+///
+/// 供异常转储调用：只读、不加锁、不分配，可在致命路径上运行。
+pub fn probe_syscall_stack(addr: usize) -> Option<SStackProbe> {
+    const WINDOW: usize = 64;
+    for (slot, s) in SYSCALL_STACKS.iter().enumerate() {
+        let base = s.0.as_ptr() as usize;
+        let end = base + SYSCALL_STACK_SIZE;
+        if addr >= base && addr < end {
+            let offset = addr - base;
+            let total = core::cmp::min(WINDOW, SYSCALL_STACK_SIZE - offset);
+            let mut paint = 0usize;
+            let mut zero = 0usize;
+            let mut other = 0usize;
+            for i in 0..total {
+                // SAFETY：窗口完全落在该槽内（上方已按 SYSCALL_STACK_SIZE 截断），只读。
+                let b = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+                if b == SYSCALL_STACK_PAINT {
+                    paint += 1;
+                } else if b == 0 {
+                    zero += 1;
+                } else {
+                    other += 1;
+                }
+            }
+            return Some(SStackProbe { slot, offset, total, paint, zero, other });
+        }
+    }
+    None
+}
+
 /// 读 `IA32_KERNEL_GS_BASE`（0xC000_0102）。`swapgs` 的另一半。
 #[inline]
 pub fn read_kernel_gs_base() -> u64 {

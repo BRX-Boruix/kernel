@@ -193,6 +193,10 @@ unsafe fn kmain_body() -> ! {
     // 初始化架构（串口等）
     CurrentArch::init();
 
+    // 系统调用栈哨兵：必须在**任何 syscall 之前**填一次。理由见 percpu::paint_syscall_stacks
+    // 与 SYSCALL_STACK_PAINT —— .bss 的零初始化让「被野写清零」与「从未用过」无法区分。
+    arch_x86_64::percpu::paint_syscall_stacks();
+
     // GOT 审计（诊断基线）：内核是 PIE，跨 CGU 调用经 `callq *GOT[n]`，GOT 槽靠加载期
     // `R_X86_64_RELATIVE` 重定位填成真实地址（ELF 文件里是 0）。这里记下**启动期的
     // 零值槽数**；异常转储里会再记一次，两者一比即可判定 GOT 是否被运行期改写——

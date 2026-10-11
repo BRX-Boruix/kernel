@@ -1205,6 +1205,15 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
                 g.zero_slots, g.total_slots, g.first_zero
             ));
         }
+        // 系统调用栈哨兵探测：区分「栈被野写清零」与「rsp 自身被写坏指进从未用过的区」。
+        // 开机时整池已填 SYSCALL_STACK_PAINT（非零），故窗口里 paint=N 表示从未用过、
+        // zero=N 表示被清零。只读、不加锁、不分配。
+        if let Some(pr) = crate::percpu::probe_syscall_stack(frame.rsp as usize) {
+            raw_serial_fmt(format_args!(
+                "  sstack: slot {} off {:#x} | {}B window: paint={} zero={} other={}\n",
+                pr.slot, pr.offset, pr.total, pr.paint, pr.zero, pr.other
+            ));
+        }
         if vector == VECTOR_PAGE_FAULT {
             let cr2 = crate::mmio::cr2();
             // 未注册/未处理/内核态：打印 CR2 并停机
