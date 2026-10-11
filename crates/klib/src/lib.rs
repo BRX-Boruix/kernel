@@ -3,6 +3,9 @@
 //! 提供串口输出、日志、boot 堆分配器等内核基础设施。
 
 #![no_std]
+// 诊断用：日志入口需要 `core::intrinsics::return_address()` 记录调用点（见 log.rs 的
+// LAST_LOG_SITE 说明）。仅用于只读诊断，不改变任何控制流。
+#![feature(core_intrinsics)]
 
 // A3（定时器动态表）：klib 需要 alloc 容器（Vec）。no_std crate 无条件引
 // alloc：内核目标由 #[global_allocator]（本 crate allocator 模块）供给，

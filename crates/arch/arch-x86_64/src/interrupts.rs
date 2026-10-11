@@ -311,6 +311,12 @@ fn sstack_watchdog(frame_rbp: u64, frame_cs: u64) {
         return;
     }
     MAX_SEEN.store(used, Ordering::Relaxed);
+    // 最近一条日志的调用点：深链上的「日志 + 控制台 + 终端绘制」子树是峰值栈深的主要来源，
+    // 这条地址直接指出是哪一条日志（符号反解在内联下会指错）。
+    raw_serial_fmt(format_args!(
+        "[sstack] last log call site: {:#018x}\n",
+        klib::log::last_log_site()
+    ));
     raw_serial_fmt(format_args!(
         "[sstack] slot {} high-water {} B of {} (deepest {:#x})\n",
         slot,

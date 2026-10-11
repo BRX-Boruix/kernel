@@ -88,11 +88,32 @@ pub const LINE_CAP: usize = 512;
 static LOG_RING: IrqSpinLock<RingBuffer<[u8; LINE_CAP], RING_LINES>> =
     IrqSpinLock::new(RingBuffer::new());
 
+/// 最近一次日志的**调用点返回地址**（诊断用；0 = 还没有日志）。
+///
+/// 为什么需要：有些日志发生在**很深**的调用链里，而「日志 + 控制台 + 终端逐字符绘制」是一整棵
+/// 子树，会直接抬高峰值栈深。要按「延后输出」的技法把它挪走，先得知道**是哪一条**——而符号
+/// 反解在内联下会把调用者归到别的函数上（实测：把日志的调用者归到 `fpu_template_snapshot`，
+/// 而那个函数根本不打日志）。直接记调用点返回地址，看门狗刷新高水位时打出来即可定位。
+static LAST_LOG_SITE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 最近一次日志的调用点返回地址（0 = 还没有日志）。
+pub fn last_log_site() -> usize {
+    LAST_LOG_SITE.load(Ordering::Relaxed)
+}
+
 /// 所有级别宏的统一入口。
 ///
 /// 1. 无论是否达到输出阈值，先把格式化结果记录进环形缓冲（崩溃回读需要）；
 /// 2. 达到阈值才转发到统一 console。
+#[inline(never)]
 pub fn __log(level: LogLevel, args: fmt::Arguments) {
+    // 记录调用点：`return_address()` 取的是**本函数**的返回地址，即调用点。`#[inline(never)]`
+    // 保证它真的是调用点而不是被内联后的某个中间位置。
+    // SAFETY：只读取返回地址，不改变控制流、不解引用。
+    LAST_LOG_SITE.store(
+        unsafe { core::intrinsics::return_address() } as usize,
+        Ordering::Relaxed,
+    );
     // 格式化进栈缓冲；超长时由 truncate_finish 回退到字符边界并追加
     // 截断标记（KM1/KM3：截断必须可见、可观测，且绝不产生非法 UTF-8）。
     let mut buf = [0u8; LINE_CAP];
