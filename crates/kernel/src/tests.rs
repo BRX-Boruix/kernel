@@ -3541,8 +3541,12 @@ pub fn test_hpet() {
     // 1. 计数器推进 + 换算合理性：忙等 1ms（HPET 自身）。
     //    注意 TCG（无 KVM 加速）下 QEMU 虚拟时钟会**快进**：忙等期间若
     //    LAPIC tick 中断触发，QEMU 一次模拟整段时间，HPET counter 随之
-    //    跳跃，实际 n_delta 可能远超 1ms（实测 7.7ms）。故忙等断言放宽
-    //    到 [0.5ms, 50ms]，核心验证是 counter 确实推进且换算频率合理。
+    //    跳跃，实际 n_delta 可能远超 1ms。
+    //
+    //    **时长判据见 `klib::timing::classify_busy_wait`**：下界（now_nanos 没推进）
+    //    是内核缺陷，硬报错；**上界超限是环境**（TCG 快进 / 宿主负载），如实 WARN 并打印
+    //    真实数字。2026-10 实测：宿主负载下 n_delta 达 499,986,700 ns，而原实现对此硬
+    //    panic——同一个成因在本文件末尾的「反推频率越界」处早已是 warn，两处纪律不一致。
     let c0 = hpet::counter();
     let n0 = hpet::now_nanos();
     let deadline = n0 + 1_000_000;
@@ -3563,11 +3567,19 @@ pub fn test_hpet() {
         c_delta, n_delta, est_hz
     );
     assert!(c_delta > 0, "HPET counter must advance");
-    assert!(
-        n_delta >= 500_000 && n_delta <= 50_000_000,
-        "1ms HPET busy-wait advanced {} ns (expected ~1ms, TCG may overrun)",
-        n_delta
-    );
+    // 时长判据见 klib::timing（纯函数，宿主单测覆盖）：下界是内核缺陷，上界是环境。
+    match klib::timing::classify_busy_wait(n_delta) {
+        klib::timing::BusyWaitVerdict::Ok => {}
+        klib::timing::BusyWaitVerdict::TooShort => panic!(
+            "1ms HPET busy-wait advanced only {} ns: now_nanos is not advancing",
+            n_delta
+        ),
+        klib::timing::BusyWaitVerdict::Overrun => klib::warn!(
+            "[hpet] 1ms busy-wait advanced {} ns (> {} ns): TCG fast-forward or host load, not a defect",
+            n_delta,
+            klib::timing::BUSY_WAIT_MAX_NS
+        ),
+    }
     // 反推的 counter 频率仅在真实硬件 / QEMU 下可预期（真实 HPET ≈14.31818MHz、
     // QEMU ≈100MHz）。TCG（无 KVM 加速）+ release 优化下，忙等期间 QEMU 虚拟
     // 时钟快进会使 HPET counter 跳跃，反推频率可能远超硬件频率（实测 560MHz）。

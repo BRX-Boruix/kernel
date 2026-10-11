@@ -27,6 +27,7 @@ extern crate std;
 #[cfg(any(test, target_os = "none"))]
 pub mod allocator;
 pub mod collections;
+pub mod timing;
 pub mod console;
 pub mod error;
 pub mod json;
