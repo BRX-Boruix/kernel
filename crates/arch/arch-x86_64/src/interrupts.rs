@@ -279,7 +279,80 @@ global_asm!(
     "#
 );
 
-/// 中断号 0~31 的异常名称；**越界向量不得 panic**。
+/// syscall 栈深度看门狗（诊断）：在 IRQ0 上节流扫描当前槽的哨兵，报告**高水位**与
+/// 最深处的候选返回地址。
+///
+/// 为什么需要：`SYSCALL_STACKS` 的槽位在数组里**连续**，一个槽的调用链超过预算就会写进
+/// **相邻槽**（另一个 CPU 正在用的栈）——症状是两个 CPU 同时跑飞、GOT 完好而控制流跳进
+/// 数据，极难从现场倒推。这里直接测「用过多少」，并把「哪条链吃掉的」用栈上的返回地址
+/// 指出来（可用 `python tools/main.py where <addr>` 反解）。
+///
+/// 只在刷新历史最大值时输出；走裸串口，不分配、不加锁。
+fn sstack_watchdog(frame_rbp: u64, frame_cs: u64) {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    const THROTTLE: usize = 64;
+    const QWORDS: usize = 12;
+    const CHAIN_MAX: usize = 28;
+    static TICKS: AtomicUsize = AtomicUsize::new(0);
+    static MAX_SEEN: AtomicUsize = AtomicUsize::new(0);
+    if TICKS.fetch_add(1, Ordering::Relaxed) % THROTTLE != 0 {
+        return;
+    }
+    let Some((slot, used, deepest)) = crate::percpu::syscall_stack_usage() else {
+        return;
+    };
+    // 溢出哨兵：本槽栈底之下 4 KiB 是否被动过。**这是唯一能确证「发生过溢出」的判据**，
+    // 且它不依赖是否出故障——修复之后溢出仍可能发生（只是不再踩到邻居），必须照样报出来。
+    if !crate::percpu::syscall_stack_guard_intact(slot) {
+        raw_serial_fmt(format_args!(
+            "[sstack] slot {} GUARD DAMAGED -- a syscall chain overflowed this stack\n",
+            slot
+        ));
+    }
+    if used <= MAX_SEEN.load(Ordering::Relaxed) {
+        return;
+    }
+    MAX_SEEN.store(used, Ordering::Relaxed);
+    raw_serial_fmt(format_args!(
+        "[sstack] slot {} high-water {} B of {} (deepest {:#x})\n",
+        slot,
+        used,
+        crate::percpu::SYSCALL_STACK_SIZE,
+        deepest
+    ));
+    for i in 0..QWORDS {
+        // SAFETY：deepest 落在该槽内（由 syscall_stack_usage 保证），只读；
+        // 用 read_unaligned 因为不保证 8 字节对齐。
+        let v = unsafe { core::ptr::read_unaligned((deepest as *const u64).add(i)) };
+        raw_serial_fmt(format_args!("[sstack]   deep+{}: {:#018x}\n", i * 8, v));
+    }
+    // 从**被中断现场**的 rbp 起走帧链，把「哪条链吃掉了栈」直接打出来。
+    // 帧布局由 -C force-frame-pointers=yes 保证：[rbp] = 上一层 rbp，[rbp+8] = 返回地址。
+    //
+    // **只在被中断的是内核态时走**（cs 低 2 位 = CPL）：用户态被中断时 rbp 是**用户地址**，
+    // 解引用它会触发权限 #PF——本函数第一版就踩了这个，转储里多出一条
+    // `cr2 = 0x7ffe... / P=0x1` 的假故障，`rip` 正落在本函数内。
+    // 上界用**栈顶**而不是最深点：帧链向高地址走，next > deepest 是正常的。
+    if frame_cs & 3 == 0 {
+        let top = (deepest as u64).saturating_add(used as u64);
+        let mut rbp = frame_rbp;
+        for i in 0..CHAIN_MAX {
+            if rbp == 0 || rbp >= top {
+                break;
+            }
+            // SAFETY：只读被中断现场的内核栈；不保证对齐，故用 read_unaligned。
+            let next = unsafe { core::ptr::read_unaligned(rbp as *const u64) };
+            let ret = unsafe { core::ptr::read_unaligned((rbp + 8) as *const u64) };
+            raw_serial_fmt(format_args!("[sstack]   chain[{}] ret={:#018x}\n", i, ret));
+            if next <= rbp || next >= top {
+                break;
+            }
+            rbp = next;
+        }
+    }
+}
+
+/// 中断号 0`31 的异常名称；**越界向量不得 panic**。
 ///
 /// 为什么必须全函数：本函数只在**致命诊断路径**上被调用（异常转储），而「收到一个预期之外的
 /// 向量」恰恰是最需要把报告打出来的时刻——报告器自己挂掉会把真异常彻底淹没。
@@ -1210,9 +1283,27 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         // zero=N 表示被清零。只读、不加锁、不分配。
         if let Some(pr) = crate::percpu::probe_syscall_stack(frame.rsp as usize) {
             raw_serial_fmt(format_args!(
-                "  sstack: slot {} off {:#x} | {}B window: paint={} zero={} other={}\n",
-                pr.slot, pr.offset, pr.total, pr.paint, pr.zero, pr.other
+                "  sstack: slot {} off {:#x} | {}B: paint={} zero={} other={} maxzero={}\n",
+                pr.slot, pr.offset, pr.total, pr.paint, pr.zero, pr.other, pr.maxzero
             ));
+            // 对照：同一偏移探测**另一个槽位**。零字节在正常栈帧里是零散的，只有长零串
+            // 才指向批量清零；没有对照就无法判断「这么长的零串是否正常」。
+            // 溢出哨兵：本槽栈底之下的 4 KiB 是否被动过。**动过 = 确证溢出过**。
+            if !crate::percpu::syscall_stack_guard_intact(pr.slot) {
+                raw_serial_fmt(format_args!(
+                    "  sstack-guard: slot {} GUARD DAMAGED -- a syscall chain overflowed this stack\n",
+                    pr.slot
+                ));
+            }
+            if let Some(ct) = crate::percpu::probe_syscall_stack_at_slot(
+                (pr.slot + 1) % crate::percpu::MAX_CPUS,
+                pr.offset,
+            ) {
+                raw_serial_fmt(format_args!(
+                    "  sstack-ctl: slot {} off {:#x} | {}B: paint={} zero={} other={} maxzero={}\n",
+                    ct.slot, ct.offset, ct.total, ct.paint, ct.zero, ct.other, ct.maxzero
+                ));
+            }
         }
         if vector == VECTOR_PAGE_FAULT {
             let cr2 = crate::mmio::cr2();
@@ -1359,6 +1450,8 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         // M4.2：IRQ0（LAPIC 定时器）之后调用调度器 tick，允许在中断帧上做
         // 进程切换（改写 frame → 返回时 iretq 到目标进程）。仅 BSP 调度。
         if irq == 0 {
+            // syscall 栈深度看门狗（诊断）：定时器 tick 是本核唯一稳定的周期钩子。
+            sstack_watchdog(frame.rbp, frame.cs);
             let f = SCHEDULER_TICK.load(Ordering::Acquire);
             if f != 0 {
                 let h: SchedulerTickHandler =

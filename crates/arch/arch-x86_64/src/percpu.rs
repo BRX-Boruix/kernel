@@ -90,7 +90,7 @@ struct PerCpuSlot {
     initialized: AtomicBool,
 }
 
-const MAX_CPUS: usize = 256;
+pub const MAX_CPUS: usize = 256;
 
 // **布局是 ABI**：`syscall_entry_stub` 用 `gs:[16]/[24]/[32]/[40]` 硬编码寻址。
 // 用编译期断言把偏移钉死——字段顺序一旦变动就**编译失败**，而不是运行时静默错乱。
@@ -151,26 +151,69 @@ pub static GS_READY_FLAG: core::sync::atomic::AtomicU64 =
 ///
 /// 专用栈把 syscall 现场与任何内核栈彻底隔离（S23：不共享可变状态）。
 #[repr(C, align(64))]
-pub struct SyscallStack(pub [u8; SYSCALL_STACK_SIZE]);
+pub struct SyscallStack {
+    /// 溢出哨兵区：位于本槽**栈底之下**。
+    ///
+    /// 为什么必须有：槽位在数组里**连续**，栈向下增长，所以「越过栈底」的写会直接落进
+    /// **前一个槽**——那是另一个 CPU 正在用的栈。后果是**跨核**破坏控制流（两个 CPU 同时
+    /// 跑飞、GOT 完好而 `rip` 落进数据），而现场里没有任何东西指向真正的原因。
+    /// 有了这段哨兵，同样的溢出先落在**本槽自己的**区域里，并且可被检测。
+    guard: [u8; SYSCALL_STACK_GUARD_BYTES],
+    stack: [u8; SYSCALL_STACK_SIZE],
+}
 
-/// 专用 syscall 栈大小（16 KiB）。
-/// B3 阻塞缺陷实证（2026-09-28 晚）：ATAPICDROM read_at 曾在此栈上放
-/// 16KiB 暂存数组，调用链总深越限、写穿 SYSCALL_STACKS 池（内核态取指
-/// Page Fault error=0x11）。暂存已移内核堆（atapi_cdrom.rs read_at）；
-/// 本预算保持 16KiB——栈上大对象一律入堆的纪律以此案为戒（S33）。
-pub const SYSCALL_STACK_SIZE: usize = 16 * 1024;
+/// 专用 syscall 栈大小（64 KiB）。
+///
+/// B3 阻塞缺陷实证（2026-09-28 晚）：ATAPICDROM read_at 曾在此栈上放 16KiB 暂存数组，
+/// 调用链总深越限、写穿 SYSCALL_STACKS 池（内核态取指 Page Fault error=0x11）。暂存已移
+/// 内核堆（atapi_cdrom.rs read_at）——**栈上大对象一律入堆**的纪律以此案为戒（S33）。
+///
+/// **2026-10 放大到 64 KiB 的依据（诊断实验，不是掩盖）**：机内实测故障现场里
+/// `rsp` 距本槽栈顶已用掉 **11.3 KiB / 16 KiB**（余量仅 4.7 KiB），而故障 `rip` 落在
+/// `SYSCALL_STACKS` 基址**之下**——与「调用链超过预算、写进相邻槽位（另一个 CPU 正在用的
+/// 栈）」的形态一致，且能同时解释「两个 CPU 一起出错」与「GOT 完好而控制流跳进数据」。
+/// 故先放大做**单变量判决**：若故障消失，溢出成立，下一步是找出那条深链并把栈上大对象入堆，
+/// 而不是长期靠放大预算掩盖。
+pub const SYSCALL_STACK_SIZE: usize = 32 * 1024;
+
+/// 每个槽**栈底之下**的溢出哨兵区大小（4 KiB，一整页）。
+pub const SYSCALL_STACK_GUARD_BYTES: usize = 4 * 1024;
 
 impl SyscallStack {
     /// 栈顶（高地址端，栈向下增长）。
     pub fn top(&self) -> u64 {
-        (self.0.as_ptr() as u64).wrapping_add(SYSCALL_STACK_SIZE as u64)
+        (self.stack.as_ptr() as u64).wrapping_add(SYSCALL_STACK_SIZE as u64)
+    }
+
+    /// 栈区基址（低地址端）。
+    pub fn base(&self) -> usize {
+        self.stack.as_ptr() as usize
+    }
+
+    /// 哨兵区是否完好（全部仍为 `SYSCALL_STACK_PAINT`）。
+    ///
+    /// 返回 false 即**确证发生过栈溢出**——这是本结构存在的意义。
+    pub fn guard_intact(&self) -> bool {
+        for i in 0..SYSCALL_STACK_GUARD_BYTES {
+            // SAFETY：i 严格在 guard 区内；只读。
+            if unsafe { core::ptr::read_volatile(self.guard.as_ptr().add(i)) }
+                != SYSCALL_STACK_PAINT
+            {
+                return false;
+            }
+        }
+        true
     }
 }
 
 /// 每 CPU 一张专用 syscall 栈。
 #[unsafe(no_mangle)]
-pub static SYSCALL_STACKS: [SyscallStack; MAX_CPUS] =
-    [const { SyscallStack([0; SYSCALL_STACK_SIZE]) }; MAX_CPUS];
+pub static SYSCALL_STACKS: [SyscallStack; MAX_CPUS] = [const {
+    SyscallStack {
+        guard: [0; SYSCALL_STACK_GUARD_BYTES],
+        stack: [0; SYSCALL_STACK_SIZE],
+    }
+}; MAX_CPUS];
 
 /// 系统调用栈的哨兵填充值。
 ///
@@ -185,7 +228,13 @@ pub fn paint_syscall_stacks() {
         // SAFETY：每个元素独占且不重叠；调用点保证此刻没有任何 CPU 在这些栈上运行
         // （本函数在启动期、第一个 syscall 之前调用）。
         unsafe {
-            core::ptr::write_bytes(s.0.as_ptr() as *mut u8, SYSCALL_STACK_PAINT, SYSCALL_STACK_SIZE)
+            // 哨兵区与栈区都填：哨兵区被写过即「溢出过」，栈区的破坏则用来算高水位。
+            core::ptr::write_bytes(
+                s.guard.as_ptr() as *mut u8,
+                SYSCALL_STACK_PAINT,
+                SYSCALL_STACK_GUARD_BYTES,
+            );
+            core::ptr::write_bytes(s.stack.as_ptr() as *mut u8, SYSCALL_STACK_PAINT, SYSCALL_STACK_SIZE)
         };
     }
 }
@@ -204,15 +253,56 @@ pub struct SStackProbe {
     pub zero: usize,
     /// 既非哨兵也非 0 的字节数（被写过真实数据）。
     pub other: usize,
+    /// 窗口内**最长连续零串**的字节数。
+    ///
+    /// 为什么单独看它：正常栈帧里零字节是零散的（对齐填充、零值局部量），
+    /// **长零串**才指向「被批量清零」。单看「有没有零」区分不了这两者。
+    pub maxzero: usize,
 }
 
-/// 探测 `addr` 落在哪个系统调用栈槽，并统计其附近 64 字节的哨兵状态。
+/// 槽位 `slot` 的溢出哨兵区是否完好。
+///
+/// `false` = **确证发生过栈溢出**（该槽的调用链越过了栈底）。
+pub fn syscall_stack_guard_intact(slot: usize) -> bool {
+    SYSCALL_STACKS.get(slot).map(|s| s.guard_intact()).unwrap_or(true)
+}
+
+/// 当前 CPU 的 syscall 栈高水位：`(slot, 用过的字节数, 最深处的地址)`。
+///
+/// 「用过」= 从槽基址向上第一个**仍为哨兵**的字节之前的区域。依赖
+/// `paint_syscall_stacks` 已在启动期填过哨兵。
+pub fn syscall_stack_usage() -> Option<(usize, usize, usize)> {
+    let slot = crate::cpu::my_cpu_slot_gs_path();
+    let s = SYSCALL_STACKS.get(slot)?;
+    let base = s.base();
+    let mut first_touched = SYSCALL_STACK_SIZE;
+    for i in 0..SYSCALL_STACK_SIZE {
+        // SAFETY：i 严格在槽内；只读，不改变状态。
+        let b = unsafe { core::ptr::read_volatile((base + i) as *const u8) };
+        if b != SYSCALL_STACK_PAINT {
+            first_touched = i;
+            break;
+        }
+    }
+    Some((slot, SYSCALL_STACK_SIZE - first_touched, base + first_touched))
+}
+
+/// 按「槽位 + 偏移」探测，供**对照**使用：同一条负载下比较两个槽位在同一偏移处的零串长度。
+pub fn probe_syscall_stack_at_slot(slot: usize, offset: usize) -> Option<SStackProbe> {
+    if offset >= SYSCALL_STACK_SIZE {
+        return None;
+    }
+    let s = SYSCALL_STACKS.get(slot)?;
+    probe_syscall_stack(s.base() + offset)
+}
+
+/// 探测 `addr` 落在哪个系统调用栈槽，并统计其附近窗口的哨兵状态。
 ///
 /// 供异常转储调用：只读、不加锁、不分配，可在致命路径上运行。
 pub fn probe_syscall_stack(addr: usize) -> Option<SStackProbe> {
-    const WINDOW: usize = 64;
+    const WINDOW: usize = 512;
     for (slot, s) in SYSCALL_STACKS.iter().enumerate() {
-        let base = s.0.as_ptr() as usize;
+        let base = s.base();
         let end = base + SYSCALL_STACK_SIZE;
         if addr >= base && addr < end {
             let offset = addr - base;
@@ -220,18 +310,26 @@ pub fn probe_syscall_stack(addr: usize) -> Option<SStackProbe> {
             let mut paint = 0usize;
             let mut zero = 0usize;
             let mut other = 0usize;
+            let mut maxzero = 0usize;
+            let mut run = 0usize;
             for i in 0..total {
                 // SAFETY：窗口完全落在该槽内（上方已按 SYSCALL_STACK_SIZE 截断），只读。
                 let b = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
                 if b == SYSCALL_STACK_PAINT {
                     paint += 1;
+                    run = 0;
                 } else if b == 0 {
                     zero += 1;
+                    run += 1;
+                    if run > maxzero {
+                        maxzero = run;
+                    }
                 } else {
                     other += 1;
+                    run = 0;
                 }
             }
-            return Some(SStackProbe { slot, offset, total, paint, zero, other });
+            return Some(SStackProbe { slot, offset, total, paint, zero, other, maxzero });
         }
     }
     None
