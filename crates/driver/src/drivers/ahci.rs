@@ -190,12 +190,28 @@ const PRDT_MAX_ENTRIES: usize = 32;
 /// 本驱动单次命令使用第一个槽位（同步读写不排队）。
 const CMD_SLOT: usize = 0;
 
-/// 单次 AHCI 命令最大搬运扇区数 = PRDT 项数 × 每项扇区数。
+/// 单次 AHCI 命令最大搬运扇区数。
 ///
-/// 每 PRDT 项描述一段物理连续缓冲；本驱动每项搬 1 个扇区（512B），
-/// 故单命令上限 32 扇区 = 16 KiB。这与 `ata_pio` 的逐扇区循环不同——
+/// 取值 = PRDT 表项数：本驱动把**整段传输放在一个 PRDT 项**里（数据缓冲是 buddy 分配的
+/// 物理连续块，见 `mm::dma::KernelDmaBuffer`），单命令上限 32 扇区 = 16 KiB 是
+/// **驱动自设**的上界，不是 PRDT 项数耗尽的结果。这与 `ata_pio` 的逐扇区循环不同——
 /// 单命令内由**硬件**连续搬运，CPU 不再逐字搬运。
 const MAX_SECTORS_PER_CMD: usize = PRDT_MAX_ENTRIES;
+
+/// 单次命令的数据区字节数（= 上限扇区数 × 512）。
+const DMA_DATA_BYTES: usize = MAX_SECTORS_PER_CMD * 512;
+
+/// 数据区**尾后、同一个分配内**的哨兵区字节数。
+///
+/// 为什么需要：设备若把数据写到请求长度**之外**，写的是内核物理内存，症状可能出现在任意
+/// 远处的结构上（2026-10 实测到内核态取指异常，现场指向一次 GOT 间接调用返回垃圾）。这类
+/// 越界写**无法从软件算术上排除**——只能证明自己算对了，不能证明设备只写了那么多；必须实测
+/// 设备到底写了多少。哨兵与数据区在同一个 ~KernelDmaBuffer~ 内（容量 = 数据区 + 哨兵），
+/// 故校验既不会越界读，也不会踩到别的对象。
+const DMA_DATA_GUARD_BYTES: usize = 512;
+
+/// 哨兵填充值：任何一次写（含全 0 写）都会破坏它。
+const DMA_DATA_GUARD_PATTERN: u8 = 0xA5;
 // ===========================================================================
 // 命令表内存布局（AHCI 1.3.1 §3.3.2 / §3.3.3）
 // ===========================================================================
@@ -821,6 +837,24 @@ impl Port {
     ///
     /// `write` 为 true 表示主机到设备（写盘）。`sectors` 必须 ≤
     /// [`MAX_SECTORS_PER_CMD`]（由调用方保证，PRDT 项数上限）。
+    /// 校验数据区尾后的哨兵是否被设备写坏。
+    ///
+    /// 返回 ~Some(首个被改写的字节相对哨兵起点的偏移)~；全部完好返回 ~None~。
+    /// 只读、不加锁：数据缓冲本端口独占（见 ~Port~ 的所有权说明）。
+    fn dma_guard_violation(&self) -> Option<usize> {
+        let data = self.data.as_ref()?;
+        let base = data.virt_addr() as *const u8;
+        for i in 0..DMA_DATA_GUARD_BYTES {
+            // SAFETY：哨兵区在本缓冲分配内（容量 >= 数据区 + 哨兵），只读访问，
+            // 不改变任何状态。
+            let b = unsafe { core::ptr::read_volatile(base.add(DMA_DATA_BYTES + i)) };
+            if b != DMA_DATA_GUARD_PATTERN {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     fn issue_dma(&self, lba: u64, sectors: usize, write: bool) -> Result<(), Error> {
         self.issue_dma_inner(lba, sectors, write, true)
     }
@@ -942,7 +976,22 @@ impl Port {
         self.dma_commands
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         match self.wait_command(log_failure) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // 设备自报之外的第二重证据：数据区尾后的哨兵是否被动过。命令「成功」
+                // 只说明状态位对，不说明设备写的**范围**对——后者只能实测。
+                if let Some(off) = self.dma_guard_violation() {
+                    error!(
+                        "[ahci] port {}: {} LBA {} x{} succeeded but the device wrote past the requested {} bytes (first guard byte changed at guard offset {}) -- memory outside the DMA buffer may be corrupted",
+                        self.index,
+                        if write { "WRITE" } else { "READ" },
+                        lba,
+                        sectors,
+                        sectors * 512,
+                        off
+                    );
+                }
+                Ok(())
+            }
             Err(e) => {
                 // 失败时留下完整端口现场：没有这些寄存器值，现场只剩
                 // 「命令超时」一句，无法区分是链路断、FIS 错还是 PRDT 错。
@@ -1697,12 +1746,22 @@ fn init_port(abar: &u64, index: u8) -> Result<bool, Error> {
     let rx_fis = alloc_dma(4096, "received FIS")?;
     let cmd_table = alloc_dma(4096, "command table")?;
     // 数据缓冲：一次命令最多 32 扇区 = 16 KiB。
-    let data = alloc_dma((MAX_SECTORS_PER_CMD * 512) as u64, "data buffer")?;
+    // 数据区 + 尾后哨兵（同一个分配，见 DMA_DATA_GUARD_BYTES 的说明）。
+    let data = alloc_dma((DMA_DATA_BYTES + DMA_DATA_GUARD_BYTES) as u64, "data buffer")?;
     // 命令列表与 FIS 区必须清零：控制器按 PxCI 位读命令头，未清零的
     // 随机内容会被当作有效命令（含野物理地址）从而 DMA 到任意内存。
     zero_buffer(&cmd_list);
     zero_buffer(&rx_fis);
     zero_buffer(&data);
+    // 数据区尾后填哨兵（zero_buffer 已把整块清零，这里再盖上可检测的图案）。
+    {
+        let base = data.virt_addr() as *mut u8;
+        for i in 0..DMA_DATA_GUARD_BYTES {
+            // SAFETY：哨兵区在本缓冲的分配范围内（容量 >= 数据区 + 哨兵），
+            // 由上方 alloc_dma 的 order 保证；本对象独占，无别名写。
+            unsafe { core::ptr::write_volatile(base.add(DMA_DATA_BYTES + i), DMA_DATA_GUARD_PATTERN) };
+        }
+    }
 
     port.cmd_list = Some(cmd_list);
     port.rx_fis = Some(rx_fis);
