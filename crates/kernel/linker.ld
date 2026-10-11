@@ -84,7 +84,9 @@ SECTIONS
        GOT 取回的垃圾）定位到此处。
        故这里**显式安置** ~.got~，让它落在符号之前。 */
     .got : ALIGN(8) {
+        __got_start = .;
         *(.got .got.plt)
+        __got_end = .;
     } :data
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));

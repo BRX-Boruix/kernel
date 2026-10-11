@@ -192,6 +192,19 @@ unsafe fn kmain_body() -> ! {
 
     // 初始化架构（串口等）
     CurrentArch::init();
+
+    // GOT 审计（诊断基线）：内核是 PIE，跨 CGU 调用经 `callq *GOT[n]`，GOT 槽靠加载期
+    // `R_X86_64_RELATIVE` 重定位填成真实地址（ELF 文件里是 0）。这里记下**启动期的
+    // 零值槽数**；异常转储里会再记一次，两者一比即可判定 GOT 是否被运行期改写——
+    // 这是定位「内核态取指异常」的关键判据（见 arch_x86_64::got 的说明）。
+    {
+        let g = arch_x86_64::got::audit();
+        let msg = alloc::format!(
+            "[got] boot audit: {} / {} slots are zero (first {:#x})\n",
+            g.zero_slots, g.total_slots, g.first_zero
+        );
+        arch_x86_64::serial::write_str(&msg);
+    }
     // 注入 panic 平台辅助：回退串口（独立于 klib console 层，确保早期 panic 可见）、
     // CPU id（LAPIC 未映射时返回 0，避免读未映射寄存器二次 #PF）、屏幕输出，
     // 以及 panic 入口的静默动作（本 CPU 关中断，KA1）。

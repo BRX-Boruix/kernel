@@ -10,6 +10,7 @@ pub mod acpi;
 pub mod cpu;
 pub mod fpu;
 pub mod gdt;
+pub mod got;
 pub mod hpet;
 pub mod imcr;
 pub mod interrupt;

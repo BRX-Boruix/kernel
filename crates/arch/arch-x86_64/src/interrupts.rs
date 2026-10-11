@@ -1188,6 +1188,17 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
         raw_serial_fmt(format_args!("exception: {}\n", exception_name(vector as u8)));
         raw_serial_fmt(format_args!("  vector: {:#x}\n", vector));
         raw_serial_fmt(format_args!("  rip:    {:#x}\n", frame.rip));
+        // GOT 审计（诊断）：内核是 PIE，跨 CGU 调用经 `callq *GOT[n]`。启动期 GOT 必然
+        // 已由加载期重定位填好（否则第一行串口输出就会炸），故「此刻有多少零值槽」
+        // 是判定 GOT 是否被**运行期改写**的直接判据——启动时记一次、这里记一次，
+        // 两者一比即知。只读扫描，不分配、不加锁、不经 console。
+        {
+            let g = crate::got::audit();
+            raw_serial_fmt(format_args!(
+                "  got:    {} / {} slots zero (first {:#x})\n",
+                g.zero_slots, g.total_slots, g.first_zero
+            ));
+        }
         if vector == VECTOR_PAGE_FAULT {
             let cr2 = crate::mmio::cr2();
             // 未注册/未处理/内核态：打印 CR2 并停机
