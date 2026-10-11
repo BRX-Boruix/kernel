@@ -14,7 +14,11 @@ SECTIONS
     . = 0xffffffff80000000;
 
     .text : {
+        /* 代码段边界：运行期要判定「栈上某个 qword 是不是返回地址」只能靠它。
+           硬编码地址会在每次重链后失效（本仓库的布局随两遍编译漂移），故由链接器给出。 */
+        __text_start = .;
         *(.text .text.*)
+        __text_end = .;
     } :text
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));

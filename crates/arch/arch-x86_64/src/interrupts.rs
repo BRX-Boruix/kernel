@@ -293,6 +293,10 @@ fn sstack_watchdog(frame_rbp: u64, frame_cs: u64) {
     const THROTTLE: usize = 64;
     const QWORDS: usize = 12;
     const CHAIN_MAX: usize = 28;
+    /// 从最深点向上扫描的窗口。8 KiB 覆盖深链的最内层，足以判定「一个大对象」还是「很多小帧」。
+    const DEEP_WINDOW: usize = 8 * 1024;
+    /// 窗口内最多打印多少个返回地址（避免刷屏）。
+    const DEEP_MAX: usize = 48;
     static TICKS: AtomicUsize = AtomicUsize::new(0);
     static MAX_SEEN: AtomicUsize = AtomicUsize::new(0);
     if TICKS.fetch_add(1, Ordering::Relaxed) % THROTTLE != 0 {
@@ -326,6 +330,25 @@ fn sstack_watchdog(frame_rbp: u64, frame_cs: u64) {
         let v = unsafe { core::ptr::read_unaligned((deepest as *const u64).add(i)) };
         raw_serial_fmt(format_args!("[sstack]   deep+{}: {:#018x}\n", i * 8, v));
     }
+    // 深窗口扫描：从最深点向上 8 KiB，挑出所有落在 `.text` 里的 qword——它们就是那条深链的
+    // **返回地址**。关键：这**不依赖「中断恰好落在最深处」**——最深点一旦被写过就永久留在
+    // 栈上（除非被更深的调用覆盖），任何时刻都能读出来。这才是能精确定位的仪器。
+    let (text_lo, text_hi) = crate::percpu::text_range();
+    let start = deepest & !7usize;
+    let end = (deepest + DEEP_WINDOW).min(deepest + used);
+    let mut p = start;
+    let mut printed = 0usize;
+    while p + 8 <= end && printed < DEEP_MAX {
+        // SAFETY：p 落在该槽已用区间内（上界按 deepest+used 截断），只读；
+        // 用 read_unaligned 因为不保证 8 字节对齐。
+        let v = unsafe { core::ptr::read_unaligned(p as *const u64) };
+        if v >= text_lo as u64 && v < text_hi as u64 {
+            raw_serial_fmt(format_args!("[sstack]   ret+{:#x}: {:#018x}\n", p - deepest, v));
+            printed += 1;
+        }
+        p += 8;
+    }
+
     // 从**被中断现场**的 rbp 起走帧链，把「哪条链吃掉了栈」直接打出来。
     // 帧布局由 -C force-frame-pointers=yes 保证：[rbp] = 上一层 rbp，[rbp+8] = 返回地址。
     //

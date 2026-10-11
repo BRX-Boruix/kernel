@@ -260,6 +260,23 @@ pub struct SStackProbe {
     pub maxzero: usize,
 }
 
+/// 内核代码段（`.text`）的地址区间，由 kernel 的链接脚本提供。
+///
+/// 用途：判定栈上某个 qword 是不是**返回地址**（只有落在本区间内的才可能是）。
+pub fn text_range() -> (usize, usize) {
+    unsafe extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+    }
+    // SAFETY：两个符号由链接脚本在 .text 输出段内定义，取地址不读写其内容。
+    unsafe {
+        (
+            &__text_start as *const u8 as usize,
+            &__text_end as *const u8 as usize,
+        )
+    }
+}
+
 /// 槽位 `slot` 的溢出哨兵区是否完好。
 ///
 /// `false` = **确证发生过栈溢出**（该槽的调用链越过了栈底）。
