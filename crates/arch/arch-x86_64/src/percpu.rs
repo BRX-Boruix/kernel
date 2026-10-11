@@ -214,6 +214,16 @@ pub fn syscall_stack_base(slot: usize) -> Option<usize> {
     SYSCALL_STACKS.get(slot).map(|s| s.base())
 }
 
+/// `addr` 是否落在**系统调用栈池**内（池是连续数组，故只需一次范围检查）。
+///
+/// 用途：定时器 tick 据此判断「此刻是否正在 syscall 里」——若是，则**不做**延后冲刷：
+/// 冲刷会让终端绘制，而那正是要移出深链的子树（见 DESIGN-console-deferred-flush.md）。
+pub fn on_syscall_stack(addr: usize) -> bool {
+    let base = SYSCALL_STACKS.as_ptr() as usize;
+    let end = base + core::mem::size_of::<[SyscallStack; MAX_CPUS]>();
+    addr >= base && addr < end
+}
+
 /// `addr` 落在哪个系统调用栈的**守卫区**里（即确证该槽发生了向下溢出）。
 ///
 /// 供 kernel 侧的内核态 #PF 检查器使用：命中即报出**槽号**——这是「哪个 CPU 的 syscall 链

@@ -21,6 +21,7 @@ use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use flanterm_rust::FlantermContext;
+use klib::collections::ring::RingBuffer;
 use klib::error::Error;
 use klib::sync::irq::IrqSpinLock;
 use klib::{error, info};
@@ -423,6 +424,27 @@ pub struct TerminalConsole;
 /// 全局终端控制台实例（供 `klib::console::register_console` 注册）。
 pub static TERMINAL_CONSOLE: TerminalConsole = TerminalConsole;
 
+/// 延后绘制队列的**单行容量**（与 `klib::log::LINE_CAP` 同值：日志行在入环前已被截断到它）。
+const DEFER_LINE_CAP: usize = 512;
+/// 延后绘制队列的**行数**。256 行 × 512 B = 128 KiB（.bss）。
+///
+/// 取值理由：日志环形缓冲是 64 行（崩溃回读用），而终端要覆盖**一次启动**的可见量；
+/// 启动期会打数百行，故取 256。满则丢最旧并计数——终端是视觉介质，丢行不是诊断损失，
+/// 但**必须可观测**。
+const DEFER_LINES: usize = 256;
+
+/// 延后绘制队列：日志路径只入队，由浅栈点 `flush_deferred` 统一绘制。
+static DEFER_Q: IrqSpinLock<RingBuffer<[u8; DEFER_LINE_CAP], DEFER_LINES>> =
+    IrqSpinLock::new(RingBuffer::new());
+
+/// 因队列满/行超长而丢弃的行数（**如实计数**，供验收读；绝不静默丢）。
+static DEFER_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 延后绘制队列累计丢弃的行数。
+pub fn deferred_dropped() -> u64 {
+    DEFER_DROPPED.load(Ordering::Relaxed)
+}
+
 impl klib::console::Console for TerminalConsole {
     fn name(&self) -> &'static str {
         "framebuffer"
@@ -432,6 +454,63 @@ impl klib::console::Console for TerminalConsole {
     }
     // write_byte 不覆写：trait 默认实现即「单字节自足文本」语义，
     // 契约成文见 klib::console::Console::write_byte（term1 T5 去重）。
+    /// 终端是**视觉介质**，可以滞后：日志路径把内容攒进本队列，由**浅栈点**统一绘制。
+    ///
+    /// 为什么终端可以滞后而**串口不行**：串口是诊断的原始证据（AM7「停机前必有诊断」靠的
+    /// 就是这条最短依赖路径），终端只是给人看的。分界由本实现自述，调用方不按设备名特判。
+    /// 见 docs/DESIGN/DESIGN-console-deferred-flush.md。
+    fn write_bytes_deferred(&self, bytes: &[u8]) {
+        // 超长行：如实计数丢弃，绝不静默（S09/S10）。本系统的日志行由 LINE_CAP=512 截断，
+        // 故正常路径不会走到这里；留着是为了不假设调用方一定按行、一定不超长。
+        if bytes.len() > DEFER_LINE_CAP {
+            DEFER_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut q = DEFER_Q.lock();
+        if q.is_full() {
+            // 满则丢**最旧**（与日志环形缓冲同款语义），并计数。
+            let _ = q.pop();
+            DEFER_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut line = [0u8; DEFER_LINE_CAP];
+        line[..bytes.len()].copy_from_slice(bytes);
+        let _ = q.push(line);
+    }
+
+    /// 把队列里的行真正绘制出来。**只能在浅栈上调用**（绘制是一棵不浅的子树）。
+    ///
+    /// 锁序：**不**持队列锁做绘制（绘制要取 TERM_LOCK）——逐行「取一行、放锁、再绘制」。
+    fn flush_deferred(&self) {
+        loop {
+            let line = {
+                let mut q = DEFER_Q.lock();
+                q.pop()
+            };
+            let Some(line) = line else { break };
+            let n = line.iter().position(|&b| b == 0).unwrap_or(line.len());
+            // **不得分配**：本函数会在**中断上下文**（定时器 tick）里被调用，而分配器有自己的
+            // 锁——被 tick 打断的上下文若正持那把锁，`String::from_utf8_lossy`（trait 缺省的
+            // `write_bytes` 会做）即**死锁**。实测教训：第一版直接走缺省 `write_bytes`，机内
+            // 在 SMP 起完 AP 之后即挂住。
+            //
+            // 日志行由 `klib::console::truncate_finish` 保证落在 UTF-8 字符边界上，故
+            // `from_utf8` 必成功；万一不成功，按**单字节**降级（trait 的 `write_byte` 缺省
+            // 实现同样不分配），既不静默丢、也不引入分配。
+            match core::str::from_utf8(&line[..n]) {
+                Ok(s) => write_str(s),
+                Err(_) => {
+                    for &b in &line[..n] {
+                        <Self as klib::console::Console>::write_byte(self, b);
+                    }
+                }
+            }
+        }
+    }
+
+    fn deferred_dropped(&self) -> u64 {
+        deferred_dropped()
+    }
+
     fn flush(&self) {
         // audit-r4 F1：强制落笔跨调用悬挂的孤立 CR（锁内禁日志，见 TERM_LOCK）。
         let p = TERMINAL_PTR.load(Ordering::Acquire);
