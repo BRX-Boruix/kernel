@@ -2249,6 +2249,24 @@ fn test_audio_dsp_backpressure() {
         let p2 = AccessPolicy::from_classic(0o640);
         assert_eq!(p2.classic_mode(), 0o640, "classic 构造往返");
     }
+
+    /// **红→绿锚点**：`from_wire` 对 `bits <= 0o7` 的**披露位**形态（注释写明 bit0=r /
+    /// bit1=w / bit2=x、三段同权）必须按**披露位**解释。此前它经
+    /// `PermBits::from_classic_segment` 转换，而那个函数期望的是 **classic 段**
+    /// （bit0=x / bit1=w / bit2=r）——两者在 **r 与 x 两位上相反**，w 恰好同位置。
+    ///
+    /// 实测后果（机内）：`libsys::Permissions::readonly().to_bits() == 1` 被解成
+    /// **execute-only**（`0o111`）；`read_write().to_bits() == 3` 被解成 **x|w**（`0o333`，
+    /// 丢了 r）——后者正是 `open(..., 0600)` 记出的 `st_mode` 里 `S_IRUSR` 缺失、
+    /// `S_IWUSR|S_IXUSR` 存在的原因。
+    #[test]
+    fn test_access_policy_from_wire_disclosure_bits_bit_order() {
+        assert_eq!(AccessPolicy::from_wire(1).classic_mode(), 0o444, "披露位 1 = 只读");
+        assert_eq!(AccessPolicy::from_wire(2).classic_mode(), 0o222, "披露位 2 = 只写");
+        assert_eq!(AccessPolicy::from_wire(4).classic_mode(), 0o111, "披露位 4 = 只执行");
+        assert_eq!(AccessPolicy::from_wire(3).classic_mode(), 0o666, "披露位 3 = 读写");
+        assert_eq!(AccessPolicy::from_wire(7).classic_mode(), 0o777, "披露位 7 = 全权");
+    }
 }
 
     // ------------------------------------------------------------------

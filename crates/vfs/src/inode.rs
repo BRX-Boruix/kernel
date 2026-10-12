@@ -383,7 +383,16 @@ impl AccessPolicy {
     pub fn from_wire(bits: u32) -> Self {
         let gate = bits & GATE_SYSTEM_BIT != 0;
         let mode = if bits <= 0o7 {
-            let seg = PermBits::from_classic_segment(bits).to_classic_segment();
+            // **披露位**形态（bit0=r / bit1=w / bit2=x，三段同权）：按披露位**直接**构造
+            // `PermBits`。
+            //
+            // 此前这里调 `PermBits::from_classic_segment(bits)`——那个函数期望的是 **classic 段**
+            // （bit0=x / bit1=w / bit2=r），两者在 **r 与 x 两位上相反**（w 恰好同位置）。
+            // 后果（2026-10 机内实测 + 宿主红测）：`readonly().to_bits()==1` 被解成 **execute-only**、
+            // `read_write().to_bits()==3` 被解成 **x|w**（丢 r）——后者正是 `open(...,0600)` 记出的
+            // `st_mode` 里 S_IRUSR 缺失、S_IWUSR|S_IXUSR 存在（0o333）的原因。
+            // `from_classic_segment` 仍用于它本来的用途（解析 classic 段），不改。
+            let seg = PermBits { bits: (bits & 0o7) as u8 }.to_classic_segment();
             seg << 6 | seg << 3 | seg
         } else {
             bits & 0o777
