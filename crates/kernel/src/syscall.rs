@@ -199,6 +199,21 @@ pub const SYS_STREAM_FTRUNCATE: u32 = nr(domain::STREAM, 0x09); // 0x19
 /// **不要求写权限**：POSIX 允许对只读打开的 fd 调 `fsync`（Linux 亦然），故只校验 fd 本身。
 pub const SYS_STREAM_FSYNC: u32 = nr(domain::STREAM, 0x0A); // 0x1A
 
+/// `SYS_STREAM_FCHMOD`（STREAM 域扩展动词 0x0B = 0x1B）：按 fd 改 classic 9 位 mode。
+///
+/// 参数：`a1` = fd、`a2` = mode_bits（classic 9 位 + 门禁 bit9）。判定面**与路径版
+/// `ENTRY_UPDATE_CHMOD` 完全一致**（属主或 `CAP_OWNER`；门禁不适用）——**唯一**差别是不做
+/// 目录遍历检查：fd 已经解析完毕，不存在「逐级父目录求 x」这一步。
+///
+/// **不新增判定**：两处都调 [`check_chmod_access`] 与 `with_classic_mode` 单点派生（S13）。
+pub const SYS_STREAM_FCHMOD: u32 = nr(domain::STREAM, 0x0B); // 0x1B
+
+/// `SYS_STREAM_FCHOWN`（STREAM 域扩展动词 0x0C = 0x1C）：按 fd 改属主。
+///
+/// 参数：`a1` = fd、`a2` = uid、`a3` = gid。判定面与路径版 `ENTRY_UPDATE_CHOWN` 一致：
+/// 属主或 `CAP_OWNER` 可发；**易他主**（新 uid ≠ 现属主）另需 `CAP_SYSTEM`（防权限赠予）。
+pub const SYS_STREAM_FCHOWN: u32 = nr(domain::STREAM, 0x0C); // 0x1C
+
 /// STREAM read/write 的顺序 I/O 哨兵值。
 ///
 /// 仅此值表示使用并推进 FD 的当前位置；`0` 与其他所有偏移都表示定位
@@ -959,6 +974,76 @@ fn sys_fsync(frame: &mut SyscallFrame) -> u64 {
         return pack_err(Error::Io);
     }
     pack_ok(0)
+}
+
+/// 从 fd 取文件节点（管道端/缺失 fd 一律拒绝）。`fchmod`/`fchown` 共用。
+fn fd_file_inode(fd: usize) -> Result<alloc::sync::Arc<dyn vfs::inode::INode>, Error> {
+    let Some(proc) = current_proc_mut() else {
+        return Err(Error::NotFound);
+    };
+    match proc.get_fd(fd) {
+        None => Err(Error::NotFound),
+        // 管道端没有 mode/属主语义（POSIX 对应 EINVAL），不假装成功。
+        Some(vfs::file_handle::OpenHandle::Pipe { .. }) => Err(Error::InvalidParam),
+        Some(vfs::file_handle::OpenHandle::File(fh)) => Ok(fh.inode.clone()),
+    }
+}
+
+/// `fchmod(fd, mode)`：按 fd 改 classic 9 位 mode（见 [`SYS_STREAM_FCHMOD`] 的契约）。
+fn sys_fchmod(frame: &mut SyscallFrame) -> u64 {
+    let fd = frame.a1 as usize;
+    let mode_bits = frame.a2 as u32;
+    let inode = match fd_file_inode(fd) {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    let identity = current_proc_mut()
+        .map(|p| p.identity())
+        .unwrap_or_else(ProcessIdentity::default_user);
+    let meta = match inode.metadata() {
+        Ok(m) => m,
+        Err(e) => return pack_err(e),
+    };
+    if let Err(e) = check_chmod_access(&identity, &meta.permissions) {
+        return pack_err(e);
+    }
+    // A1-5 / A2-6：只换 classic mode，属主/显式 ACE/门禁位原样保留（与路径版同一纪律）。
+    let policy = meta.permissions.with_classic_mode(mode_bits);
+    match inode.set_permissions(&policy) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `fchown(fd, uid, gid)`：按 fd 改属主（见 [`SYS_STREAM_FCHOWN`] 的契约）。
+fn sys_fchown(frame: &mut SyscallFrame) -> u64 {
+    let fd = frame.a1 as usize;
+    let new_uid = frame.a2 as u32;
+    let new_gid = frame.a3 as u32;
+    let inode = match fd_file_inode(fd) {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
+    };
+    let identity = current_proc_mut()
+        .map(|p| p.identity())
+        .unwrap_or_else(ProcessIdentity::default_user);
+    let meta = match inode.metadata() {
+        Ok(m) => m,
+        Err(e) => return pack_err(e),
+    };
+    if let Err(e) = check_chmod_access(&identity, &meta.permissions) {
+        return pack_err(e);
+    }
+    // 易他主需 CAP_SYSTEM（POSIX chown 限制面，与路径版同一判据）。
+    if new_uid != meta.permissions.owner_uid() && !identity.caps.contains(Caps::SYSTEM) {
+        return pack_err(Error::PermissionDenied);
+    }
+    // 从现有策略派生（不得经 from_wire 重建——那会静默清空全部显式 ACE）。
+    let policy = meta.permissions.with_owner(new_uid, new_gid);
+    match inode.set_permissions(&policy) {
+        Ok(()) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
 }
 
 /// A1-2 / ADR-040 §2.3：系统门禁强制（承 ADR-033 的 system_only 语义）。
@@ -5570,6 +5655,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_STREAM_FSTAT => done(sys_fstat(frame)),
         SYS_STREAM_FTRUNCATE => done(sys_ftruncate(frame)),
         SYS_STREAM_FSYNC => done(sys_fsync(frame)),
+        SYS_STREAM_FCHMOD => done(sys_fchmod(frame)),
+        SYS_STREAM_FCHOWN => done(sys_fchown(frame)),
         SYS_STREAM_FOCUS_SET => done(sys_stream_focus_set(frame)),
 
         // MEMORY Domain (0x20)
