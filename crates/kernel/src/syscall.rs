@@ -328,6 +328,20 @@ pub const GROUPS_SET_REPLACE: u64 = 0;
 /// `SYS_TASK_GROUPS_SET` 的 `a4`：清空补充组（此时 `a1`/`a2` 必须为 0）。
 pub const GROUPS_SET_CLEAR: u64 = 1;
 
+/// `SYS_TASK_GROUPS_GET`（TASK 域扩展动词 0x0E = 0x3E）：查询调用进程组的**补充组集合**。
+///
+/// **为什么需要它**：`GROUPS_SET` 只回传「设置后生效的集合」，没有独立查询入口 ⇒
+/// 用户态**无法知道自己当前的补充组**（POSIX `getgroups` 的语义）。此前 libc 侧因此
+/// 只能把 `getgroups` 登记为整项缺失。
+///
+/// 与 `GROUPS_SET` 对称的两段式（ADR-018）：`a1`=用户缓冲（`u32` 定长元素）、`a2`=容量
+/// （元素个数）。写入 `min(a2, 实际条数)` 个，**返回实际条数**（可能 > `a2`）。
+///
+/// **为什么返回条数而不是 0/错误**：POSIX `getgroups(0, NULL)` 的语义就是「只问条数」；
+/// 「缓冲不足」的判定属调用方契约（libc 层据此返回 -1/EINVAL）。内核只提供**真值**，
+/// 不在两处各判一次（S13）。`a1 == 0` 仅当 `a2 == 0` 合法（纯探测）。
+pub const SYS_TASK_GROUPS_GET: u32 = nr(domain::TASK, 0x0E); // 0x3E
+
 /// `SYS_TASK_GROUPS_SET` 的 ABI 结果结构（A2-4）：回传**实际生效**的补充组，
 /// 使调用方无需再次查询即可确知结果（超限时也能看清发生了如实拒绝）。
 ///
@@ -3976,6 +3990,39 @@ fn sys_identity_set(frame: &mut SyscallFrame) -> u64 {
 /// 截断会让调用方以为自己加入了某个组，而实际没有，属能力谎言。
 ///
 /// 参数：`a1`=组数组指针、`a2`=个数、`a3`=保留（必须 0）、`a4`=方向。
+/// 查询调用进程组的补充组集合（见 [`SYS_TASK_GROUPS_GET`] 的契约）。
+fn sys_task_groups_get(frame: &mut SyscallFrame) -> u64 {
+    let ptr = frame.a1;
+    let cap = frame.a2;
+
+    if cap > task::Groups::MAX as u64 {
+        return pack_err(Error::OutOfRange);
+    }
+    // 纯探测（a2 == 0）才允许空指针；其余必须给出可写缓冲。
+    if ptr == 0 && cap != 0 {
+        return pack_err(Error::InvalidParam);
+    }
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::PermissionDenied);
+    };
+    let identity = proc.identity();
+    // 先整段校验（ADR-018 三层校验）：最多会写 cap 个元素。
+    if cap > 0 {
+        if let Err(e) = validate_user_range(ptr, cap * 4, UserAccess::Write) {
+            return pack_err(e);
+        }
+    }
+    let mut total = 0u64;
+    for (i, gid) in identity.groups.iter().enumerate() {
+        if (i as u64) < cap {
+            let raw = gid.to_le_bytes();
+            unsafe { arch_x86_64::mmio::copy_to_user(ptr + (i as u64) * 4, raw.as_ptr(), 4) };
+        }
+        total += 1;
+    }
+    pack_ok(total)
+}
+
 fn sys_task_groups_set(frame: &mut SyscallFrame) -> u64 {
     let ptr = frame.a1;
     let count = frame.a2;
@@ -5520,6 +5567,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_TASK_IDENTITY_QUERY => done(sys_identity_query(frame)),
         SYS_TASK_IDENTITY_SET => done(sys_identity_set(frame)),
         SYS_TASK_GROUPS_SET => done(sys_task_groups_set(frame)),
+        SYS_TASK_GROUPS_GET => done(sys_task_groups_get(frame)),
         // derive：COW 派生子进程（ADR-038 / 0x3A）。非阻塞、返回两次语义
         // （父 rax=pid、子 rax=0），不切换——故返回 done。
         SYS_TASK_DERIVE => done(sys_task_derive(frame)),
