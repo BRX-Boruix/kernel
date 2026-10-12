@@ -369,6 +369,32 @@ pub const GROUPS_SET_CLEAR: u64 = 1;
 /// 不在两处各判一次（S13）。`a1 == 0` 仅当 `a2 == 0` 合法（纯探测）。
 pub const SYS_TASK_GROUPS_GET: u32 = nr(domain::TASK, 0x0E); // 0x3E
 
+/// `SYS_TASK_NICE`（TASK 域扩展动词 0x0F = 0x3F）：查询/设置进程 nice 值。
+///
+/// 参数：`a1` = 方向（[`NICE_GET`] / [`NICE_SET`]）、`a2` = 目标 pid（**0 = 自身**，POSIX 约定）、
+/// `a3` = 新 nice（仅 SET 用）。返回**实际生效**的 nice。
+///
+/// **返回值编码为 `nice + 20`（0..=39）**：nice 可为负，而 syscall 的错误编码占用 bit63
+/// （见 `syscall::call`）⇒ 直接返回 `i32` 会让负 nice 被读成错误。偏移编码把值域压到非负。
+///
+/// **授权（S13 单点）**：改**自身**自由；改**他人**需 `CAP_SYSTEM`——调度器层的 `set_nice`
+/// 只做钳制、不做授权，若在此不加门禁，任何进程都能把别的进程调成最低优先级（DoS 面）。
+///
+/// **越界钳制而非报错**：与调度器 `set_nice` 的既有语义一致（nice 来自用户态，越界不应能
+/// 打挂内核），本 syscall 不另造判定。
+pub const SYS_TASK_NICE: u32 = nr(domain::TASK, 0x0F); // 0x3F
+
+/// [`SYS_TASK_NICE`] 的 `a1`：查询。
+pub const NICE_GET: u64 = 0;
+/// [`SYS_TASK_NICE`] 的 `a1`：设置。
+pub const NICE_SET: u64 = 1;
+/// nice 值域下界（与 `sched_eevdf` 的权重表一致）。
+pub const NICE_MIN: i32 = -20;
+/// nice 值域上界。
+pub const NICE_MAX: i32 = 19;
+/// 返回编码偏移：`nice + NICE_BIAS` ⇒ 0..=39（见 [`SYS_TASK_NICE`] 的说明）。
+pub const NICE_BIAS: i32 = 20;
+
 /// `SYS_TASK_GROUPS_SET` 的 ABI 结果结构（A2-4）：回传**实际生效**的补充组，
 /// 使调用方无需再次查询即可确知结果（超限时也能看清发生了如实拒绝）。
 ///
@@ -4846,6 +4872,33 @@ fn sys_signal_mask(frame: &mut SyscallFrame) -> u64 {
         Err(e) => pack_err(e),
     }
 }
+/// `nice(how, pid, value)`：查询/设置进程 nice（见 [`SYS_TASK_NICE`] 的契约）。
+fn sys_task_nice(frame: &mut SyscallFrame) -> u64 {
+    let how = frame.a1;
+    let pid_arg = frame.a2 as usize;
+    // a3 是 u64，负 nice 以二进制补码传入 ⇒ 取低 32 位再按 i32 解释。
+    let value = frame.a3 as u32 as i32;
+    let Some(cur) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let self_pid = cur.tgid();
+    // pid 0 = 自身（POSIX）。
+    let pid = if pid_arg == 0 { self_pid } else { pid_arg };
+    // 授权：改他人需 CAP_SYSTEM（见 SYS_TASK_NICE 的说明）。
+    if pid != self_pid && !cur.identity().caps.contains(Caps::SYSTEM) {
+        return pack_err(Error::PermissionDenied);
+    }
+    let got = match how {
+        NICE_GET => task::scheduler::nice_of(pid),
+        NICE_SET => task::scheduler::set_nice(pid, value),
+        _ => return pack_err(Error::InvalidParam),
+    };
+    match got {
+        Some(n) => pack_ok((n + NICE_BIAS) as u64),
+        None => pack_err(Error::NotFound),
+    }
+}
+
 /// `signal_pending() -> 待决集位图`（见 [`SYS_SIGNAL_PENDING`]）。
 fn sys_signal_pending(_frame: &mut SyscallFrame) -> u64 {
     match task::current_proc_mut() {
@@ -5763,6 +5816,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_TASK_IDENTITY_SET => done(sys_identity_set(frame)),
         SYS_TASK_GROUPS_SET => done(sys_task_groups_set(frame)),
         SYS_TASK_GROUPS_GET => done(sys_task_groups_get(frame)),
+        SYS_TASK_NICE => done(sys_task_nice(frame)),
         // derive：COW 派生子进程（ADR-038 / 0x3A）。非阻塞、返回两次语义
         // （父 rax=pid、子 rax=0），不切换——故返回 done。
         SYS_TASK_DERIVE => done(sys_task_derive(frame)),
