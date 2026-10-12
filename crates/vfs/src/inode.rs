@@ -662,6 +662,16 @@ pub struct StatInfo {
     /// 不得虚报，故默认 0；真值由 syscall 层拿到 inode 后补写。
     /// 这堵死了「0 被误读成 init 持有控制台」这一错误解释。
     pub console_owner: u64,
+    /// **稳定文件身份**（`INode::stable_id`）——POSIX `st_ino` 的真值。
+    ///
+    /// **尾部追加**（与 `owner_uid`/`is_terminal`/`console_owner` 同一纪律）。
+    /// `0` 兼作「未知」：`from_metadata` 无节点身份，不得虚报；真值由 syscall 层补写。
+    pub ino: u64,
+    /// 硬链接计数（`INode::nlink`）——POSIX `st_nlink` 的真值。
+    ///
+    /// **尾部追加**。`0` 兼作「未知」（同上）；真值由 syscall 层补写。
+    /// **此前 `st_nlink` 在 libc 侧硬编码 0**：硬链接没有内核出口，也就没有真值可填。
+    pub nlink: u32,
 }
 
 impl StatInfo {
@@ -702,6 +712,17 @@ impl StatInfo {
         si
     }
 
+    /// 补写**文件身份**（`st_ino`）与**硬链接计数**（`st_nlink`）。
+    ///
+    /// 与 [`with_terminal`](Self::with_terminal) 同一拆法、同一理由：两者都是**节点的
+    /// 自我描述**（不在 `FileMetadata` 里），而 `from_metadata` 的契约是「元数据有什么
+    /// 就报什么」。混进去会让那条安全性质变模糊。
+    pub fn with_link_identity(mut si: Self, ino: u64, nlink: u32) -> Self {
+        si.ino = ino;
+        si.nlink = nlink;
+        si
+    }
+
     /// 从元数据构造 ABI 结果。
     ///
     /// A1-4：属主字段取自节点 [`AccessPolicy`] 本体（A1-1 起策略即存储
@@ -724,6 +745,10 @@ impl StatInfo {
             // 同理：owner 也由**节点**自述，本函数只看得见 `FileMetadata`，
             // 故统一为 0（无主/未知），绝不虚报。
             console_owner: 0,
+            // 同理：文件身份与链接计数也由**节点**自述，本函数只看得见 `FileMetadata`，
+            // 故统一为 0（未知），绝不虚报。真值由 syscall 层拿到 inode 后补写。
+            ino: 0,
+            nlink: 0,
         }
     }
 }
@@ -1053,6 +1078,32 @@ pub trait INode: Send + Sync {
         Err(Error::NotDirectory)
     }
 
+    // ---- 硬链接（POSIX `link(2)`）----
+
+    /// 硬链接计数（POSIX `st_nlink`）。
+    ///
+    /// **默认 1 是正确值，不是占位**：不追踪计数的节点（devfs/procfs 等视图节点、
+    /// iso9660 只读节点）确实只有一个目录项指向它。真正可能有多个链接的文件系统
+    /// （ramfs/ext2）覆盖本方法给出真值。
+    fn nlink(&self) -> u32 {
+        1
+    }
+
+    /// 增加链接计数。默认空操作：能走到这里的只有实现了 [`Self::link`] 的文件系统，
+    /// 而它必然也覆盖了本方法（S13：计数与链接操作同源）。
+    fn inc_nlink(&self) {}
+
+    /// 减少链接计数。语义同 [`Self::inc_nlink`]。
+    fn dec_nlink(&self) {}
+
+    /// 在本目录下为 `target` 创建一个硬链接 `name`（POSIX `link(2)`）。
+    ///
+    /// 默认 `NotSupported`：只有真正能「把**同一个节点**挂到第二个目录项下」的文件系统
+    /// 才实现。**不接受近似**——复制一份内容不是硬链接（两条路径会各自演化）。
+    fn link(&self, _name: &str, _target: &Arc<dyn INode>) -> Result<(), Error> {
+        Err(Error::NotSupported)
+    }
+
     /// **稳定文件身份**：同一个文件在不同时间、不同路径解析下必须给出相同的值。
     ///
     /// # 为什么需要它（而不是用 `Arc` 地址）
@@ -1109,7 +1160,7 @@ pub trait FileSystem: Send + Sync {
 pub const STAT_INFO_SIZE: usize = core::mem::size_of::<StatInfo>();
 
 const _: () = {
-    assert!(STAT_INFO_SIZE == 72, "StatInfo layout drifted: sync libsys mirror");
+    assert!(STAT_INFO_SIZE == 88, "StatInfo layout drifted: sync libsys mirror");
     assert!(core::mem::offset_of!(StatInfo, owner_uid) == 48);
     assert!(core::mem::offset_of!(StatInfo, owner_gid) == 52);
     // J-TOKEN-A：终端真值尾部追加，偏移钉死。

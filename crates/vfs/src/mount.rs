@@ -397,6 +397,19 @@ impl MountTable {
         parent_node.rename(&old_name, &new_name)
     }
 
+    /// 创建**硬链接**（POSIX `link(2)`）：为 `target_path` 在 `link_path` 处再加一个目录项。
+    ///
+    /// 与 [`Self::symlink`] 的区别是本质的：软链接造**新节点**，硬链接让**同一个节点**
+    /// 多一个名字。故这里解析 `target_path` 拿到节点本身，交给父目录的 `INode::link`。
+    /// 目标文件系统未实现该原语 → `NotSupported`（如实，不近似）。
+    pub fn link(&self, target_path: &str, link_path: &str) -> Result<(), Error> {
+        let (parent_path, name) = Self::split_entry(link_path)?;
+        validate_name(&name)?;
+        let target = self.resolve(target_path, true)?;
+        let parent_node = self.resolve(&parent_path, true)?;
+        parent_node.link(&name, &target)
+    }
+
     /// 创建软链接。
     pub fn symlink(&self, target: &str, link_path: &str) -> Result<Arc<dyn INode>, Error> {
         let (parent_path, name) = Self::split_entry(link_path)?;

@@ -430,6 +430,17 @@ pub const SYS_ENTRY_GETCWD: u32 = nr(domain::VFS, 0x06); // 0x46
 /// 3P4-8：ext2 的落盘实现（fast symlink、`INode::symlink`）与 vfs 的
 /// `Mount::symlink` 都已存在，本项**纯接线**。
 pub const SYS_ENTRY_SYMLINK: u32 = nr(domain::VFS, 0x07); // 0x47
+
+/// `link(target, link_path)`：为 `target` 在 `link_path` 处创建**硬链接**（POSIX `link(2)`）。
+///
+/// 与 `symlink` 的区别是本质的：软链接是**新节点**（内容是目标路径串），硬链接是**同一个
+/// 节点**多一个目录项 ⇒ 两条路径共享内容、`st_ino` 相同、`st_nlink` 计数。
+///
+/// 拒绝面：目标不存在 → `NotFound`；`link_path` 已存在 → `AlreadyExists`；目标或父目录
+/// 所在文件系统未实现 `INode::link` → `NotSupported`（**不接受近似**：复制内容不是硬链接）；
+/// 目标是目录 → `PermissionDenied`（POSIX 禁止，防目录环）。
+/// VFS 域扩展动词 0x09。双侧镜像（S13）：与 libsys `nr.rs::SYS_ENTRY_LINK` 同值、注释互指。
+pub const SYS_ENTRY_LINK: u32 = nr(domain::VFS, 0x09); // 0x49
 /// `readlink(path, buf, cap)`：读软链接目标（VFS 域扩展，0x48）。
 ///
 /// 写入**不含**终止 NUL（POSIX `readlink` 语义）；缓冲不足如实 `NoSpace`，绝不截断。
@@ -892,6 +903,43 @@ fn sys_symlink(frame: &mut SyscallFrame) -> u64 {
     let root = crate::vfs_init::root();
     match root.symlink(&target, &abs) {
         Ok(_) => pack_ok(0),
+        Err(e) => pack_err(e),
+    }
+}
+
+/// `link(target, link_path)`：创建硬链接（见 [`SYS_ENTRY_LINK`] 的契约）。
+fn sys_link(frame: &mut SyscallFrame) -> u64 {
+    let target = match copy_path_from_user(frame.a1, MAX_USER_PATH_BYTES) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    let link_path = match copy_path_from_user(frame.a2, MAX_USER_PATH_BYTES) {
+        Ok(p) => p,
+        Err(e) => return pack_err(e),
+    };
+    let abs_target = match absolute_path(&target) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
+    let abs_link = match absolute_path(&link_path) {
+        Ok(a) => a,
+        Err(e) => return pack_err(e),
+    };
+    // 遍历检查对**两条路径**都做：既要能走到目标，也要能走到新链接的父目录。
+    {
+        let identity = current_proc_mut()
+            .map(|p| p.identity())
+            .unwrap_or_else(ProcessIdentity::default_user);
+        if let Err(e) = check_traverse_access(&identity, &abs_target) {
+            return pack_err(e);
+        }
+        if let Err(e) = check_traverse_access(&identity, &abs_link) {
+            return pack_err(e);
+        }
+    }
+    let root = crate::vfs_init::root();
+    match root.link(&abs_target, &abs_link) {
+        Ok(()) => pack_ok(0),
         Err(e) => pack_err(e),
     }
 }
@@ -1637,12 +1685,16 @@ fn sys_fstat(frame: &mut SyscallFrame) -> u64 {
     // J-TOKEN-A / ADR-044 §1.2：终端真值由**节点**自述（`is_terminal()`）。
     // 本函数是唯一能看到 inode 的地方，故在此补写；`from_metadata` 只看得见
     // `FileMetadata`（无节点身份），故它本身不得虚报。
-    let info = vfs::inode::StatInfo::with_console_owner(
-        vfs::inode::StatInfo::with_terminal(
-            vfs::inode::StatInfo::from_metadata(&meta),
-            fh.inode.is_terminal(),
+    let info = vfs::inode::StatInfo::with_link_identity(
+        vfs::inode::StatInfo::with_console_owner(
+            vfs::inode::StatInfo::with_terminal(
+                vfs::inode::StatInfo::from_metadata(&meta),
+                fh.inode.is_terminal(),
+            ),
+            fh.inode.console_owner(),
         ),
-        fh.inode.console_owner(),
+        fh.inode.stable_id(),
+        fh.inode.nlink(),
     );
     let bytes = core::mem::size_of::<vfs::inode::StatInfo>();
     if let Err(e) = validate_user_range(buf_ptr, bytes as u64, UserAccess::Write) {
@@ -2204,12 +2256,16 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
         // 同 `sys_fstat`：终端真值取自节点自述（J-TOKEN-A）。
         // `stat(path)` 与 `fstat(fd)` 对同一节点必须给出相同答案，
         // 否则两条查询通道会互相矛盾。
-        let info = vfs::inode::StatInfo::with_console_owner(
-            vfs::inode::StatInfo::with_terminal(
-                vfs::inode::StatInfo::from_metadata(&meta),
-                node.is_terminal(),
+        let info = vfs::inode::StatInfo::with_link_identity(
+            vfs::inode::StatInfo::with_console_owner(
+                vfs::inode::StatInfo::with_terminal(
+                    vfs::inode::StatInfo::from_metadata(&meta),
+                    node.is_terminal(),
+                ),
+                node.console_owner(),
             ),
-            node.console_owner(),
+            node.stable_id(),
+            node.nlink(),
         );
         let bytes = core::mem::size_of::<vfs::inode::StatInfo>();
         if max_bytes < bytes {
@@ -5719,6 +5775,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_ENTRY_CHDIR => done(sys_chdir(frame)),
         SYS_ENTRY_GETCWD => done(sys_getcwd(frame)),
         SYS_ENTRY_SYMLINK => done(sys_symlink(frame)),
+        SYS_ENTRY_LINK => done(sys_link(frame)),
         SYS_ENTRY_READLINK => done(sys_readlink(frame)),
 
         // DEVICE Domain (0x50)

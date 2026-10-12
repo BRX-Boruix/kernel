@@ -94,7 +94,11 @@ enum RamNodeData {
         content: RwLock<Vec<u8>>,
     },
     Directory {
-        children: RwLock<BTreeMap<String, Arc<RamINode>>>,
+        // `Arc<dyn INode>`（而非具体 `Arc<RamINode>`）：硬链接要求把**同一个节点**挂到
+        // 另一个目录项下，而 `INode::link` 只能拿到 `Arc<dyn INode>`。具体类型存不进去，
+        // 存进去也只是副本而非硬链接。`Arc<RamINode>` → `Arc<dyn INode>` 是自动 unsizing，
+        // 各插入点无需改写。
+        children: RwLock<BTreeMap<String, Arc<dyn INode>>>,
     },
     Symlink {
         target: String,
@@ -112,6 +116,11 @@ pub struct RamINode {
     /// 重新解析路径等）就会静默破坏文件锁。显式 id 把这条契约写进数据本身，
     /// 不再依赖内存布局（S15 单点定义）。
     id: u64,
+    /// 硬链接计数（POSIX `st_nlink`）：`link(2)` 增、`unlink(2)` 减，归零即不再可达。
+    ///
+    /// 初值 1（创建即有一个目录项指向它）。用原子量而非并入 `meta` 的 `RwLock`：
+    /// 链接计数是**节点身份**的一部分，读写都在目录临界区里，不该再争一把锁。
+    nlink: core::sync::atomic::AtomicU32,
 }
 
 impl RamINode {
@@ -122,6 +131,7 @@ impl RamINode {
         let now = now_ms();
         Arc::new(Self {
             id: alloc_node_id(),
+            nlink: core::sync::atomic::AtomicU32::new(1),
             meta: RwLock::new(FileMetadata {
                 node_type: INodeType::RegularFile,
                 size: 0,
@@ -140,6 +150,7 @@ impl RamINode {
         let now = now_ms();
         Arc::new(Self {
             id: alloc_node_id(),
+            nlink: core::sync::atomic::AtomicU32::new(1),
             meta: RwLock::new(FileMetadata {
                 node_type: INodeType::Directory,
                 size: 0,
@@ -158,6 +169,7 @@ impl RamINode {
         let now = now_ms();
         Arc::new(Self {
             id: alloc_node_id(),
+            nlink: core::sync::atomic::AtomicU32::new(1),
             meta: RwLock::new(FileMetadata {
                 node_type: INodeType::Symlink,
                 size: target.len() as u64,
@@ -342,11 +354,15 @@ impl INode for RamINode {
             RamNodeData::Directory { children } => {
                 let mut c = children.write();
                 if let Some(child) = c.get(name) {
-                    if let RamNodeData::Directory { children: sub_c } = &child.data {
-                        if !sub_c.read().is_empty() {
-                            return Err(Error::NotEmpty);
-                        }
+                    // 判空改用 trait 的 `list_dir`：硬链接后子项是 `Arc<dyn INode>`，
+                    // 具体类型（及其 `data` 字段）不再可依赖。
+                    let is_nonempty_dir = child.node_type() == Ok(INodeType::Directory)
+                        && child.list_dir().map(|e| !e.is_empty()).unwrap_or(false);
+                    if is_nonempty_dir {
+                        return Err(Error::NotEmpty);
                     }
+                    // 硬链接计数减一（归零即不再可达；节点本身随最后一个 Arc 释放）。
+                    child.dec_nlink();
                     c.remove(name);
                     drop(c);
                     self.touch_dir_meta();
@@ -423,6 +439,51 @@ impl INode for RamINode {
         match &self.data {
             RamNodeData::Symlink { target } => Ok(target.clone()),
             _ => Err(Error::NotSupported),
+        }
+    }
+
+    fn nlink(&self) -> u32 {
+        self.nlink.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    fn inc_nlink(&self) {
+        self.nlink.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn dec_nlink(&self) {
+        // 饱和递减：计数不该被减到 0 以下（那是实现缺陷，不该变成静默回绕）。
+        let _ = self.nlink.fetch_update(
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+            |v| Some(v.saturating_sub(1)),
+        );
+    }
+
+    /// 硬链接：把**同一个节点**挂到本目录的 `name` 下（POSIX `link(2)`）。
+    ///
+    /// 关键在「同一个」：存的是 `target` 这个 `Arc` 本身，不是副本 ⇒ 两条路径看到的是
+    /// 同一份内容、同一个 `stable_id`、同一个链接计数。
+    fn link(&self, name: &str, target: &Arc<dyn INode>) -> Result<(), Error> {
+        match &self.data {
+            RamNodeData::Directory { children } => {
+                let mut c = children.write();
+                if c.contains_key(name) {
+                    return Err(Error::AlreadyExists);
+                }
+                if c.len() >= RAMFS_MAX_ENTRIES_PER_DIR {
+                    return Err(Error::NoSpace);
+                }
+                // 目录不得硬链接（POSIX 禁止，防目录环）。
+                if target.node_type() == Ok(INodeType::Directory) {
+                    return Err(Error::PermissionDenied);
+                }
+                target.inc_nlink();
+                c.insert(name.to_string(), target.clone());
+                drop(c);
+                self.touch_dir_meta();
+                Ok(())
+            }
+            _ => Err(Error::NotDirectory),
         }
     }
 
