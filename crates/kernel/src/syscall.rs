@@ -595,6 +595,17 @@ pub const SYS_SIGNAL_RETURN: u32 = nr(domain::SIGNAL, op::DELETE); // 0x84
 /// 双侧镜像（S13）：与 libsys `nr.rs::SYS_SIGNAL_PENDING` 同值、注释互指。
 pub const SYS_SIGNAL_PENDING: u32 = nr(domain::SIGNAL, 0x05); // 0x85
 
+/// `SYS_SIGNAL_SUSPEND`（SIGNAL 域扩展动词 0x06 = 0x86）：`sigsuspend`。
+///
+/// 参数：`a1` = 新的屏蔽集位图。语义（POSIX）：**原子地**换屏蔽集并挂起，直到有信号
+/// 被投递；返回 -1 置 `EINTR`（无论该信号处置为何）。
+///
+/// **屏蔽集的还原点不在本 syscall 里**：`block_current_with` 阻塞后，被唤醒的进程
+/// **直接返回用户态**，syscall 内没有「唤醒后继续」的代码路径 ⇒ 还原只能落在**投递点**
+/// （`deliver_on_return` 取到信号后调 `restore_suspend`）。这也正是 POSIX 的规定：
+/// 屏蔽集在信号被投递时还原。
+pub const SYS_SIGNAL_SUSPEND: u32 = nr(domain::SIGNAL, 0x06); // 0x86
+
 // ---------- 9. POWER Domain (0x90, ADR-036) ----------
 /// `power_off()`：请求 ACPI S5 软关机（断电）。双侧镜像（S13）：与 libsys
 /// `nr.rs::SYS_POWER_OFF` 同值、注释互指。
@@ -4872,6 +4883,40 @@ fn sys_signal_mask(frame: &mut SyscallFrame) -> u64 {
         Err(e) => pack_err(e),
     }
 }
+/// `sigsuspend(mask)`：原子换屏蔽集并睡到有信号（见 [`SYS_SIGNAL_SUSPEND`] 的契约）。
+fn sys_sigsuspend(frame: &mut SyscallFrame) -> DispatchResult {
+    let mask_bits = frame.a1;
+    let set = task::signal_set::SignalSet(mask_bits);
+    {
+        let Some(cur) = task::current_proc_mut() else {
+            return done(pack_err(Error::NotSupported));
+        };
+        // 原子换屏蔽集（原值暂存在任务里，还原在投递点）。
+        let _ = cur.signal_mut().enter_suspend(set);
+    }
+    // 复检**只在 register 里做一次**（它在调度锁内运行，天然是原子判定）：
+    // 若拆成「预检 + register」两处，`take_interrupted` 会被消费两次——预检消费后 register
+    // 必为假，进程反而睡回去（正是 ADR-051 记录的那类丢唤醒）。
+    //
+    // 判据用 `has_handler_pending`（只认会进 handler 的信号）：POSIX 规定 `sigsuspend`
+    // 只在「执行信号处理函数或终止进程」时返回——**被忽略的信号不算**。
+    // 再叠加 ADR-051 的「被打断」标记：投递可能已发生在调度 tick（pending 位已消费、
+    // handler 已进），那时只有该标记能说明「信号已经来过」。
+    let mut register = || match task::current_proc_mut() {
+        Some(p) => {
+            if p.signal().has_handler_pending() {
+                return false;
+            }
+            !p.signal_mut().take_interrupted()
+        }
+        None => false,
+    };
+    match task::block_current_with(arch_frame(frame), &mut register) {
+        task::SwitchOutcome::Switched => DispatchResult::Switched,
+        task::SwitchOutcome::NotSwitched => done(pack_err(Error::Interrupted)),
+    }
+}
+
 /// `nice(how, pid, value)`：查询/设置进程 nice（见 [`SYS_TASK_NICE`] 的契约）。
 fn sys_task_nice(frame: &mut SyscallFrame) -> u64 {
     let how = frame.a1;
@@ -5866,6 +5911,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_SIGNAL_MASK => done(sys_signal_mask(frame)),
         SYS_SIGNAL_RETURN => done(sys_signal_return(frame)),
         SYS_SIGNAL_PENDING => done(sys_signal_pending(frame)),
+        // sigsuspend 会阻塞切换（等信号投递），自带 DispatchResult 语义。
+        SYS_SIGNAL_SUSPEND => sys_sigsuspend(frame),
 
         // POWER Domain (0x90, ADR-036): 终结路径（断电/复位后 CPU 不再返回用户态）
         SYS_POWER_OFF => sys_power_off(frame),

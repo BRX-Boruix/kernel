@@ -105,6 +105,13 @@ pub struct SignalState {
     /// 不能只看 pending——投递（尤其调度 tick 那条）会消费 pending 位。
     interrupted: bool,
     trampoline: u64,
+    /// `sigsuspend` 期间暂存的**原屏蔽集**（POSIX `sigsuspend` 语义）。
+    ///
+    /// **为什么必须存在任务里、而不是在 syscall 里还**：`block_current_with` 阻塞后，
+    /// 唤醒的进程**直接返回用户态**，syscall 内没有「唤醒后继续」的代码路径 ⇒ 还原点
+    /// 只能在**投递点**（`deliver_on_return`）——这也正是 POSIX 的规定：屏蔽集在
+    /// **信号被投递时**还原（无论该信号的处置是 handler、ignore 还是 default）。
+    suspend_saved: Option<SignalSet>,
 }
 
 impl SignalState {
@@ -117,6 +124,7 @@ impl SignalState {
             signal_depth: 0,
         interrupted: false,
             trampoline: 0,
+            suspend_saved: None,
         }
     }
 
@@ -148,6 +156,34 @@ impl SignalState {
     /// 当前未决集。
     pub fn pending(&self) -> SignalSet {
         self.pending
+    }
+
+    /// 进入 `sigsuspend`：把屏蔽集换成 `new_mask`，并暂存原屏蔽集（返回旧值）。
+    ///
+    /// 用 [`Self::mask`] 的 `how` 取值 0 = SET（与 `sys_signal_mask` 的约定同一事实，
+    /// 见该函数的文档；此处用具名常量而非裸 0）。
+    ///
+    /// 复用 [`Self::mask`] 的 `SIGNAL_SET` 语义（SIGKILL/SIGSTOP 不变量由那里单点维护，
+    /// 本方法不另造判定）。
+    pub fn enter_suspend(&mut self, new_mask: SignalSet) -> SignalSet {
+        // `SignalState::mask` 的 `how`：整体替换（与 `sys_signal_mask` 的 0 同一事实）。
+        const MASK_HOW_SET: u32 = 0;
+        let old = self.blocked;
+        let _ = self.mask(MASK_HOW_SET, new_mask);
+        self.suspend_saved = Some(old);
+        old
+    }
+
+    /// 还原 `sigsuspend` 暂存的屏蔽集（若不在 suspend 中则无操作）。
+    pub fn restore_suspend(&mut self) {
+        if let Some(old) = self.suspend_saved.take() {
+            self.blocked = old;
+        }
+    }
+
+    /// 是否处于 `sigsuspend` 中（诊断/测试用）。
+    pub fn in_suspend(&self) -> bool {
+        self.suspend_saved.is_some()
     }
 
     /// 是否正在 handler 中（重入守卫；嵌套深度 > 0）。
@@ -249,6 +285,20 @@ impl SignalState {
             }
             None => None,
         }
+    }
+
+    /// 是否存在**未屏蔽的未决信号**（`take_unblocked` 的谓词，但**不消费**）。
+    ///
+    /// `sigsuspend` 的复检用它：已有可投递信号时不该睡（睡下去就错过了）。
+    /// 与 `take_unblocked` 共用同一判据（S13），不另写一份。
+    pub fn has_unblocked_pending(&self) -> bool {
+        if self.pending.contains(SIGKILL) {
+            return true;
+        }
+        self.pending
+            .intersection(self.blocked.complement())
+            .lowest_pending()
+            .is_some()
     }
 
     /// 记录"本进程有一次异步信号投递打断了系统调用"（ADR-051）。
@@ -441,7 +491,13 @@ pub fn deliver_on_return<PT: arch::PageTable>(
     use crate::signals::SIGSTOP;
     loop {
         let sig = match proc.signal_mut().take_unblocked() {
-            Some(s) => s,
+            Some(s) => {
+                // `sigsuspend` 的屏蔽集**还原点**：POSIX 规定在信号被投递时还原，
+                // 与处置（handler/ignore/default）无关。放在这里而不是 syscall 里——
+                // 阻塞的 syscall 唤醒后直接返回用户态，没有「唤醒后继续」的路径。
+                proc.signal_mut().restore_suspend();
+                s
+            }
             None => return DeliveryOutcome::Continue,
         };
         match proc.signal().disposition(sig) {
