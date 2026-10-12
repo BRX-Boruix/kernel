@@ -548,6 +548,16 @@ pub const SYS_SIGNAL_ACTION: u32 = nr(domain::SIGNAL, op::WRITE); // 0x83
 /// `signal_return()`：handler 返回后恢复原帧（rt_sigreturn）。
 pub const SYS_SIGNAL_RETURN: u32 = nr(domain::SIGNAL, op::DELETE); // 0x84
 
+/// `SYS_SIGNAL_PENDING`（SIGNAL 域扩展动词 0x05 = 0x85）：查询当前进程的**待决信号集**
+/// （POSIX `sigpending`）。无参数，返回 u64 位图。
+///
+/// **与屏蔽集的区别**（两者是不同的集合，别混）：屏蔽集决定「哪些信号被挡住」，
+/// 待决集是「挡住之后积压了哪些」。此前内核只有 `SIGNAL_MASK`（屏蔽集读写）与
+/// `SignalState::pending()`（内部访问器），**没有把待决集暴露给用户态的调用号** ⇒
+/// libc 的 `sigpending` 只能登记为整项缺失。
+/// 双侧镜像（S13）：与 libsys `nr.rs::SYS_SIGNAL_PENDING` 同值、注释互指。
+pub const SYS_SIGNAL_PENDING: u32 = nr(domain::SIGNAL, 0x05); // 0x85
+
 // ---------- 9. POWER Domain (0x90, ADR-036) ----------
 /// `power_off()`：请求 ACPI S5 软关机（断电）。双侧镜像（S13）：与 libsys
 /// `nr.rs::SYS_POWER_OFF` 同值、注释互指。
@@ -4780,6 +4790,14 @@ fn sys_signal_mask(frame: &mut SyscallFrame) -> u64 {
         Err(e) => pack_err(e),
     }
 }
+/// `signal_pending() -> 待决集位图`（见 [`SYS_SIGNAL_PENDING`]）。
+fn sys_signal_pending(_frame: &mut SyscallFrame) -> u64 {
+    match task::current_proc_mut() {
+        Some(p) => pack_ok(p.signal().pending().bits()),
+        None => pack_err(Error::NotSupported),
+    }
+}
+
 /// 特权门禁单点（A1-2 / ADR-040 §2.3，承 ADR-037 决策 5）：当前进程是否持有
 /// 指定能力位。
 ///
@@ -5736,6 +5754,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_SIGNAL_ACTION => done(sys_signal_action(frame)),
         SYS_SIGNAL_MASK => done(sys_signal_mask(frame)),
         SYS_SIGNAL_RETURN => done(sys_signal_return(frame)),
+        SYS_SIGNAL_PENDING => done(sys_signal_pending(frame)),
 
         // POWER Domain (0x90, ADR-036): 终结路径（断电/复位后 CPU 不再返回用户态）
         SYS_POWER_OFF => sys_power_off(frame),
