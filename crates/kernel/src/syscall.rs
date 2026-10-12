@@ -620,6 +620,20 @@ pub const SYS_SIGNAL_SUSPEND: u32 = nr(domain::SIGNAL, 0x06); // 0x86
 /// `setitimer` 的周期语义与三种计时器（ITIMER_REAL/VIRTUAL/PROF）**未实现**，如实缺。
 pub const SYS_SIGNAL_ALARM: u32 = nr(domain::SIGNAL, 0x07); // 0x87
 
+/// `SYS_SIGNAL_ALTSTACK`（SIGNAL 域扩展动词 0x08 = 0x88）：`sigaltstack`。
+///
+/// 参数：`a1` = 备用栈基址、`a2` = 大小（**两者皆 0 = `SS_DISABLE`**）、
+/// `a3` = 旧值出参指针（16 字节：`base` u64 + `size` u64；**0 = 不要旧值**）、
+/// `a4` = 模式（**0 = 设置、1 = 纯查询**；查询不改状态——`(0,0)` 在设置模式下是 `SS_DISABLE`，
+/// 与「查询」语义相反，故必须分开编码）。返回 0。
+///
+/// 与 `sigaction` 的 `SA_ONSTACK` 配合：置该位且本项已设栈时，handler 在**备用栈**上跑。
+///
+/// **诚实边界**：POSIX 的 `sigaltstack` 是**每线程**的，本实现与 `SignalState` 同域
+/// （即**每进程**）——单线程进程下相同。`SS_ONSTACK` 查询（当前是否正跑在备用栈上）
+/// **未实现**，如实缺。
+pub const SYS_SIGNAL_ALTSTACK: u32 = nr(domain::SIGNAL, 0x08); // 0x88
+
 // ---------- 9. POWER Domain (0x90, ADR-036) ----------
 /// `power_off()`：请求 ACPI S5 软关机（断电）。双侧镜像（S13）：与 libsys
 /// `nr.rs::SYS_POWER_OFF` 同值、注释互指。
@@ -4716,8 +4730,10 @@ fn sys_signal_action(frame: &mut SyscallFrame) -> u64 {
     use task::signal::SigDisposition;
     let sig = frame.a1 as u32;
     let handler = frame.a2;
-    // flags 当前仅 0 接受（S2-1 sigaltstack 预留位）。
-    if frame.a3 != 0 {
+    // flags：只接受 `SA_ONSTACK`（备用栈执行）。其余位如实 `InvalidParam`——
+    // 不假装支持未实现的语义（SA_RESTART/SA_SIGINFO 等）。
+    let flags = frame.a3 as u32;
+    if flags & !task::signal::SA_ONSTACK != 0 {
         return pack_err(Error::InvalidParam);
     }
     let disp = match handler {
@@ -4730,7 +4746,14 @@ fn sys_signal_action(frame: &mut SyscallFrame) -> u64 {
         None => return pack_err(Error::NotSupported),
     };
     match cur.signal_mut().set_disposition(sig, disp) {
-        Ok(Some(old)) => pack_ok(encode_disposition(old)),
+        Ok(Some(old)) => {
+            // **必须记录 flags**：`deliver_handler` 只看得到处置，而 `SigDisposition::Handler(f)`
+            // 不带 flags ⇒ 没有这张表就无从知道该不该切备用栈。
+            // （实测教训：只改校验、不落库，`SA_ONSTACK` 就是一条静默失效的位——
+            //   机内用例「handler 是否真的跑在备用栈上」当场抓出。）
+            cur.signal_mut().set_handler_flags(sig, flags);
+            pack_ok(encode_disposition(old))
+        }
         Ok(None) => pack_err(Error::InvalidParam), // 越界（不应达，validate 已拒）
         Err(e) => pack_err(e),
     }
@@ -4897,6 +4920,43 @@ fn sys_signal_mask(frame: &mut SyscallFrame) -> u64 {
         Err(e) => pack_err(e),
     }
 }
+/// `sigaltstack(base, size, old_out)`：设置/查询备用信号栈（见 [`SYS_SIGNAL_ALTSTACK`]）。
+fn sys_signal_altstack(frame: &mut SyscallFrame) -> u64 {
+    let base = frame.a1;
+    let size = frame.a2;
+    let old_out = frame.a3;
+    let mode = frame.a4;
+    // 模式：0 = 设置、1 = **纯查询**。
+    //
+    // 为什么要显式模式位而不是「(0,0) 兼作查询」：POSIX 里 `(0,0)` 是 `SS_DISABLE`
+    // （**禁用**），而查询必须**不改动**状态。两者语义相反，不能共用一个编码——
+    // 否则「查一下当前备用栈」会把栈清掉。
+    if mode > 1 {
+        return pack_err(Error::InvalidParam);
+    }
+    let query_only = mode == 1;
+    if !query_only && (base == 0) != (size == 0) {
+        // 只给一半是非法请求（如实拒绝，不猜意图）。
+        return pack_err(Error::InvalidParam);
+    }
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotSupported);
+    };
+    let old = proc.signal().alt_stack();
+    if !query_only {
+        let new = if base == 0 { None } else { Some((base, size)) };
+        proc.signal_mut().set_alt_stack(new);
+    }
+    if old_out != 0 {
+        let (b, s) = old.unwrap_or((0, 0));
+        let mut raw = [0u8; 16];
+        raw[..8].copy_from_slice(&b.to_le_bytes());
+        raw[8..].copy_from_slice(&s.to_le_bytes());
+        unsafe { arch_x86_64::mmio::copy_to_user(old_out, raw.as_ptr(), 16) };
+    }
+    pack_ok(0)
+}
+
 /// `alarm(seconds)`：设置/取消一次性闹钟（见 [`SYS_SIGNAL_ALARM`] 的契约）。
 fn sys_signal_alarm(frame: &mut SyscallFrame) -> u64 {
     let secs = frame.a1 as u32;
@@ -5940,6 +6000,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         // sigsuspend 会阻塞切换（等信号投递），自带 DispatchResult 语义。
         SYS_SIGNAL_SUSPEND => sys_sigsuspend(frame),
         SYS_SIGNAL_ALARM => done(sys_signal_alarm(frame)),
+        SYS_SIGNAL_ALTSTACK => done(sys_signal_altstack(frame)),
 
         // POWER Domain (0x90, ADR-036): 终结路径（断电/复位后 CPU 不再返回用户态）
         SYS_POWER_OFF => sys_power_off(frame),

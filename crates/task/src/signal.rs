@@ -112,6 +112,17 @@ pub struct SignalState {
     /// 只能在**投递点**（`deliver_on_return`）——这也正是 POSIX 的规定：屏蔽集在
     /// **信号被投递时**还原（无论该信号的处置是 handler、ignore 还是 default）。
     suspend_saved: Option<SignalSet>,
+    /// 每个信号的 `sa_flags`（当前只用 [`SA_ONSTACK`]）。
+    ///
+    /// **为什么必须按信号存**：`SigDisposition::Handler(f)` 只带指针，`SA_ONSTACK` 决定
+    /// 「在备用栈上跑 handler」，而投递点（`deliver_handler`）只看得到处置 ⇒ 没有这张表
+    /// 就无从知道该切栈。
+    handler_flags: [u32; NSIG as usize],
+    /// 备用信号栈 `(base, size)`；`None` = 未设置（`SS_DISABLE`）。
+    ///
+    /// **诚实边界**：POSIX 的 `sigaltstack` 是**每线程**的，本实现与 `SignalState` 同域
+    /// （即**每进程**）——单线程进程下相同，多线程下不成立。
+    alt_stack: Option<(u64, u64)>,
 }
 
 impl SignalState {
@@ -125,6 +136,33 @@ impl SignalState {
         interrupted: false,
             trampoline: 0,
             suspend_saved: None,
+            handler_flags: [0; NSIG as usize],
+            alt_stack: None,
+        }
+    }
+
+    /// 设置/查询备用信号栈（`sigaltstack`）。`None` = 未设置。
+    pub fn alt_stack(&self) -> Option<(u64, u64)> {
+        self.alt_stack
+    }
+
+    /// 设置备用信号栈；`None` 表示 `SS_DISABLE`。
+    pub fn set_alt_stack(&mut self, v: Option<(u64, u64)>) {
+        self.alt_stack = v;
+    }
+
+    /// 查某信号的 `sa_flags`。
+    pub fn handler_flags(&self, sig: u32) -> u32 {
+        if sig >= NSIG {
+            return 0;
+        }
+        self.handler_flags[sig as usize]
+    }
+
+    /// 记录某信号的 `sa_flags`（由 `sigaction` 路径写入）。
+    pub fn set_handler_flags(&mut self, sig: u32, flags: u32) {
+        if sig < NSIG {
+            self.handler_flags[sig as usize] = flags;
         }
     }
 
@@ -418,6 +456,12 @@ fn user_range_writable<PT: arch::PageTable>(
     true
 }
 
+/// `SA_ONSTACK`：在备用信号栈上执行 handler（POSIX `sigaction` 的 `sa_flags` 位）。
+///
+/// 取值与 Linux 一致（`0x08000000`），便于对照既有资料；本系统只支持这一位，
+/// 其余 flags 如实 `InvalidParam`（不假装支持）。
+pub const SA_ONSTACK: u32 = 0x0800_0000;
+
 /// 投递结果：通知调用方当前进程是否已被默认动作终止（切换由调度接管）。
 pub enum DeliveryOutcome {
     /// 未终止（投递了 handler 或无事发生），照常 iretq 回用户态。
@@ -441,9 +485,26 @@ pub fn deliver_handler<PT: arch::PageTable>(
     siginfo: SigInfo,
     restorer: u64,
 ) -> bool {
-    // 计算新栈顶：当前 rsp 之下压整帧，8 字节对齐。
+    // 计算新栈顶：默认在当前用户栈之下压整帧，8 字节对齐。
+    //
+    // `SA_ONSTACK` 且已设置备用栈 ⇒ 改在**备用栈**顶部压帧。这正是 `sigaltstack` 的用途：
+    //
+    // **调用方要求**：备用栈必须是**已经落地**的可写内存（与普通用户栈一样）。
+    // `deliver_handler` 会先做 `user_range_writable` 预校验，而 `mmap` 给的是按需分页——
+    // 页面尚未触碰时校验不过 ⇒ 投递失败 ⇒ 调用方按契约终止进程（实测：进程直接死于
+    // SIGUSR2 的默认动作，退出码 12）。**这不是内核缺陷**：预校验存在的意义就是
+    // 「不能安全投递时不要半途炸在用户态」。用户程序设 `sigaltstack` 前应先把栈触碰一遍。
+    // 栈溢出类信号（SIGSEGV）不能在已经溢出的栈上跑 handler，否则投递必然再次出错。
+    // 未设备用栈时**回落到当前栈**（POSIX：此时等价于没设 `SA_ONSTACK`）——不拒绝投递。
     let frame_bytes = SignalFrame::size() as u64;
-    let new_rsp = frame.rsp - frame_bytes;
+    let stack_top = match (
+        proc.signal().handler_flags(sig) & SA_ONSTACK != 0,
+        proc.signal().alt_stack(),
+    ) {
+        (true, Some((base, size))) => base.saturating_add(size),
+        _ => frame.rsp,
+    };
+    let new_rsp = stack_top - frame_bytes;
     let sframe = SignalFrame {
         restorer_return: restorer,
         magic: SIGNAL_FRAME_MAGIC,
