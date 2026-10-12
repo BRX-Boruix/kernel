@@ -606,6 +606,20 @@ pub const SYS_SIGNAL_PENDING: u32 = nr(domain::SIGNAL, 0x05); // 0x85
 /// 屏蔽集在信号被投递时还原。
 pub const SYS_SIGNAL_SUSPEND: u32 = nr(domain::SIGNAL, 0x06); // 0x86
 
+/// `SYS_SIGNAL_ALARM`（SIGNAL 域扩展动词 0x07 = 0x87）：`alarm(seconds)`。
+///
+/// 参数 `a1` = 秒数（**0 = 取消**）。返回**上一个**闹钟的剩余秒数（POSIX，向上取整）。
+///
+/// **实现**：`klib::time` 的一次性定时器，到期回调 `task::scheduler::raise_to(pid, SIGALRM)`
+/// ——内核**自己**投递，故不需要 `InterruptFrame`（那时没有「调用者的帧」可写，也不该写）。
+/// 这与 `kill_pid` 的非终止尾段是同一纪律（S13）：置 pending、Blocked 时把 EINTR 写进
+/// 目标自己保存的帧、桶锁之外唤醒。
+///
+/// **诚实边界**：本项实现的是**每线程**闹钟（用调用者的 pid），POSIX 规定 `alarm` 是
+/// **每进程**的——单线程进程下二者相同；多线程下本实现不会把闹钟算到整个进程上。
+/// `setitimer` 的周期语义与三种计时器（ITIMER_REAL/VIRTUAL/PROF）**未实现**，如实缺。
+pub const SYS_SIGNAL_ALARM: u32 = nr(domain::SIGNAL, 0x07); // 0x87
+
 // ---------- 9. POWER Domain (0x90, ADR-036) ----------
 /// `power_off()`：请求 ACPI S5 软关机（断电）。双侧镜像（S13）：与 libsys
 /// `nr.rs::SYS_POWER_OFF` 同值、注释互指。
@@ -4883,6 +4897,18 @@ fn sys_signal_mask(frame: &mut SyscallFrame) -> u64 {
         Err(e) => pack_err(e),
     }
 }
+/// `alarm(seconds)`：设置/取消一次性闹钟（见 [`SYS_SIGNAL_ALARM`] 的契约）。
+fn sys_signal_alarm(frame: &mut SyscallFrame) -> u64 {
+    let secs = frame.a1 as u32;
+    let Some(pid) = current_proc_mut().map(|p| p.pid()) else {
+        return pack_err(Error::NotSupported);
+    };
+    match task::scheduler::alarm_set(pid, secs) {
+        Some(rem) => pack_ok(rem),
+        None => pack_err(Error::NotFound),
+    }
+}
+
 /// `sigsuspend(mask)`：原子换屏蔽集并睡到有信号（见 [`SYS_SIGNAL_SUSPEND`] 的契约）。
 fn sys_sigsuspend(frame: &mut SyscallFrame) -> DispatchResult {
     let mask_bits = frame.a1;
@@ -5913,6 +5939,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_SIGNAL_PENDING => done(sys_signal_pending(frame)),
         // sigsuspend 会阻塞切换（等信号投递），自带 DispatchResult 语义。
         SYS_SIGNAL_SUSPEND => sys_sigsuspend(frame),
+        SYS_SIGNAL_ALARM => done(sys_signal_alarm(frame)),
 
         // POWER Domain (0x90, ADR-036): 终结路径（断电/复位后 CPU 不再返回用户态）
         SYS_POWER_OFF => sys_power_off(frame),

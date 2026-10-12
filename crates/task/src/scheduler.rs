@@ -136,6 +136,13 @@ struct ProcEntry {
     /// 完全一致——**引入 nice 不改变既有进程的调度行为**，这是可回归的前提）。
     /// 越界输入由 `nice_to_weight` 钳制，故此处不假设取值一定合法。
     nice: i32,
+    /// `alarm` 的到期时刻（`now_nanos` 时基；**0 = 无未到期闹钟**）。
+    ///
+    /// 保护：与 `vruntime`/`nice` 同域（per-pid 桶锁）。存**绝对时刻**而不是剩余时长——
+    /// `alarm(sec)` 要返回「上一个闹钟还剩几秒」，那必须能对时（POSIX）。
+    alarm_deadline_ns: u64,
+    /// 已注册的定时器 id（供 `alarm(0)`/重设时**取消**；`None` = 无）。
+    alarm_timer: Option<u64>,
 }
 
 /// 已退出进程的内核栈帧延迟回收队列（task1 K3，S18 释放路径的单点实现）。
@@ -610,6 +617,8 @@ pub fn spawn_with_ppid_fds(
         vruntime: 0,
         // EEVDF-3：默认 nice 0 = 同权，既有进程行为不变。
         nice: 0,
+        alarm_deadline_ns: 0,
+        alarm_timer: None,
     });
     // 分桶化：把入口按 pid 写入其所在桶（堆分配 Box，地址稳定）；桶锁随即释放
     // 再入队 home 核（pid 桶 → RUN 锁序：桶锁释放后再取 RUN，不同时持有）。
@@ -704,6 +713,8 @@ pub fn spawn_thread_with(
         fs_base: member_fs_base,
         vruntime: 0,
         nice: 0,
+        alarm_deadline_ns: 0,
+        alarm_timer: None,
     });
     proc_bucket_lock(pid).insert(pid, entry);
     // EEVDF：首次入队走统一入队口（vruntime 取当前最小基准，非 0）。
@@ -852,6 +863,8 @@ pub fn spawn_derived(
         fs_base: 0,
         vruntime: 0,
         nice: 0,
+        alarm_deadline_ns: 0,
+        alarm_timer: None,
     });
     proc_bucket_lock(pid).insert(pid, entry);
     enqueue_ready(&mut run_mut(home_cpu), pid, true);
@@ -4490,6 +4503,84 @@ pub fn kill_pid(target: usize, sig: u32, frame: &mut InterruptFrame) -> Result<u
     Ok(0)
 }
 
+/// 把信号投给 `pid` 的未决集并唤醒它（**不需要 `InterruptFrame`**）。
+///
+/// 用途：**内核自身**按进程先前的请求投递信号（`alarm` 到期投 SIGALRM）——那时没有
+/// 「调用者的帧」可写，也不该写。与 `kill_pid` 的非终止尾段**同一纪律**（S13）：
+/// 置 pending、目标 Blocked 时把 `EINTR` 写进**目标自己保存的帧**、桶锁**之外**唤醒。
+///
+/// 返回 false = 目标不存在（已回收）：如实返回，不 panic、不伪造成功。
+pub fn raise_to(pid: usize, sig: u32) -> bool {
+    let mut found = false;
+    {
+        let mut g = proc_bucket_lock(pid);
+        if let Some(slot) = g.get_mut(&pid) {
+            slot.proc.signal_mut().raise(sig);
+            if slot.proc.state() == TaskState::Blocked {
+                slot.saved.rax = klib::error::Error::Interrupted.packed();
+            }
+            found = true;
+        }
+    }
+    if found {
+        wake(pid);
+    }
+    found
+}
+
+/// `alarm` 到期回调（定时器上下文，**不持任何 pid 桶锁**进入）。
+///
+/// 先清该进程的闹钟状态，再投递 SIGALRM。目标已消失时静默返回——进程都没了，
+/// 闹钟没有收件人，这是**正确**语义而不是吞错。
+fn alarm_fire(pid: usize) {
+    {
+        let mut g = proc_bucket_lock(pid);
+        if let Some(slot) = g.get_mut(&pid) {
+            slot.alarm_deadline_ns = 0;
+            slot.alarm_timer = None;
+        }
+    }
+    let _ = raise_to(pid, crate::signals::SIGALRM);
+}
+
+/// `alarm(secs)`：设置/取消该进程的一次性闹钟，返回**上一个**闹钟的剩余秒数（POSIX）。
+///
+/// `secs == 0` 取消。剩余秒数**向上取整**（POSIX：`alarm(2)` 后立刻再调应得 2 而非 1）。
+/// 返回 `None` = 进程不存在。
+///
+/// **诚实边界**：定时器表满时如实**不注册**（闹钟不生效），此时返回值仍是旧剩余秒数——
+/// POSIX 的 `alarm` 没有失败返回通道，这里不伪造一个。表满是瞬时状态（poll 持续回收）。
+pub fn alarm_set(pid: usize, secs: u32) -> Option<u64> {
+    let now = klib::time::now_nanos().unwrap_or(0);
+    let old_remaining_secs = {
+        let mut g = proc_bucket_lock(pid);
+        let slot = g.get_mut(&pid)?;
+        let old = if slot.alarm_deadline_ns > now {
+            // 向上取整：(剩余 + 1s - 1) / 1s
+            (slot.alarm_deadline_ns - now).div_ceil(1_000_000_000)
+        } else {
+            0
+        };
+        if let Some(id) = slot.alarm_timer.take() {
+            let _ = klib::time::cancel_timeout(id);
+        }
+        slot.alarm_deadline_ns = 0;
+        old
+    };
+    if secs == 0 {
+        return Some(old_remaining_secs);
+    }
+    let delay_ns = (secs as u64).saturating_mul(1_000_000_000);
+    if let Some(id) = klib::time::set_timeout(delay_ns, alarm_fire, pid) {
+        let mut g = proc_bucket_lock(pid);
+        if let Some(slot) = g.get_mut(&pid) {
+            slot.alarm_deadline_ns = now.saturating_add(delay_ns);
+            slot.alarm_timer = Some(id);
+        }
+    }
+    Some(old_remaining_secs)
+}
+
 /// 唤醒一个阻塞的进程（IPC 写/读端完成时调用）：置 `Ready` 并入就绪队列。
 ///
 /// 仅当目标进程处于 `Blocked` 时才生效（已就绪/运行中进程忽略，避免重复入队）。
@@ -4742,6 +4833,8 @@ pub mod test_hooks {
             fs_base: 0,
             vruntime: 0,
             nice: 0,
+        alarm_deadline_ns: 0,
+        alarm_timer: None,
         });
         // 不 `enqueue_ready`：本入口仅作表内存在（供父校验/fd 快照），绝不入就绪
         // 队列——否则 tick 会把它调度执行，摧毁测试现场（KM16 纪律）。
@@ -4787,6 +4880,8 @@ pub mod test_hooks {
             fs_base: 0,
             vruntime: 0,
             nice: 0,
+        alarm_deadline_ns: 0,
+        alarm_timer: None,
         });
         proc_bucket_lock(pid).insert(pid, entry).is_none()
     }
