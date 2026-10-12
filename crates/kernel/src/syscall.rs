@@ -187,6 +187,18 @@ pub const SYS_STREAM_FOCUS_SET: u32 = nr(domain::STREAM, 0x08); // 0x18
 /// 全失败 → 用户态堆 OOM → panic）。构建时必须确认 `unreachable_patterns` 警告为零。
 pub const SYS_STREAM_FTRUNCATE: u32 = nr(domain::STREAM, 0x09); // 0x19
 
+/// `SYS_STREAM_FSYNC`（STREAM 域扩展动词 0x0A = 0x1A）：把数据冲刷到稳定存储。
+///
+/// 参数：`a1` = fd。成功返回 0；fd 不存在 → `NotFound`；fd 是管道端 → `InvalidParam`
+/// （无持久化语义，POSIX 对应 EINVAL）；**仍有脏块未落盘 → `Io`**。
+///
+/// **诚实边界（S09）**：本内核的块缓存是**每设备**一份、不是每文件一份 ⇒ 无法只冲刷
+/// 「该 fd 所在设备」。故本实现冲刷**全部**设备缓存——语义上是 POSIX 要求的**超集**
+/// （fsync 的承诺是「数据已在稳定存储上」，多冲不违反），代价是粒度粗。这不是近似。
+///
+/// **不要求写权限**：POSIX 允许对只读打开的 fd 调 `fsync`（Linux 亦然），故只校验 fd 本身。
+pub const SYS_STREAM_FSYNC: u32 = nr(domain::STREAM, 0x0A); // 0x1A
+
 /// STREAM read/write 的顺序 I/O 哨兵值。
 ///
 /// 仅此值表示使用并推进 FD 的当前位置；`0` 与其他所有偏移都表示定位
@@ -926,6 +938,27 @@ fn sys_ftruncate(frame: &mut SyscallFrame) -> u64 {
         Ok(()) => pack_ok(0),
         Err(e) => pack_err(e),
     }
+}
+
+/// `fsync(fd)`：把数据冲刷到稳定存储（见 [`SYS_STREAM_FSYNC`] 的契约）。
+fn sys_fsync(frame: &mut SyscallFrame) -> u64 {
+    let fd = frame.a1 as usize;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    match proc.get_fd(fd) {
+        // fd 缺失。
+        None => return pack_err(Error::NotFound),
+        // 管道端没有持久化语义（POSIX 对应 EINVAL），不假装成功。
+        Some(vfs::file_handle::OpenHandle::Pipe { .. }) => return pack_err(Error::InvalidParam),
+        Some(vfs::file_handle::OpenHandle::File(_)) => {}
+    }
+    let (_flushed, dirty) = crate::vfs_init::flush_all_device_caches();
+    if dirty > 0 {
+        // 与关机路径同一条判据（那里明写「不能当作关机成功」）：仍脏即如实失败。
+        return pack_err(Error::Io);
+    }
+    pack_ok(0)
 }
 
 /// A1-2 / ADR-040 §2.3：系统门禁强制（承 ADR-033 的 system_only 语义）。
@@ -5536,6 +5569,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_STREAM_LOCK => done(sys_flock(frame)),
         SYS_STREAM_FSTAT => done(sys_fstat(frame)),
         SYS_STREAM_FTRUNCATE => done(sys_ftruncate(frame)),
+        SYS_STREAM_FSYNC => done(sys_fsync(frame)),
         SYS_STREAM_FOCUS_SET => done(sys_stream_focus_set(frame)),
 
         // MEMORY Domain (0x20)
