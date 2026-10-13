@@ -79,6 +79,29 @@ mod tests {
     use alloc::vec::Vec;
     use klib::error::Error;
 
+    /// NAME_MAX 契约（S23 契约先行）：VFS 单点拒绝超过 `MAX_NAME_BYTES` 的末段名。
+    ///
+    /// 为什么要有这条：libc 的 `pathconf(_PC_NAME_MAX)` 报 255、`struct dirent.d_name`
+    /// 是 256 字节，而 VFS 此前**没有**长度契约——ext2 自己拦 255、RamFS 不拦，
+    /// 于是在 RamFS 上可以建出 256 字节以上的名字，随后 `readdir` 会**静默截断**它
+    /// （名字不可寻址，文件删不掉）。真值必须在 VFS 这一层，而不是散在各文件系统里。
+    #[test]
+    fn test_name_at_and_over_max() {
+        let ramfs = Arc::new(RamFS::new());
+        let mt = MountTable::new(ramfs);
+        let at_max = alloc::format!("/{}", "a".repeat(crate::mount::MAX_NAME_BYTES));
+        let over_max = alloc::format!("/{}", "a".repeat(crate::mount::MAX_NAME_BYTES + 1));
+        mt.create_file(&at_max, AccessPolicy::read_write().classic_mode(), (0, 0))
+            .expect("a name exactly at NAME_MAX must be accepted");
+        assert!(
+            matches!(
+                mt.create_file(&over_max, AccessPolicy::read_write().classic_mode(), (0, 0)),
+                Err(Error::NameTooLong)
+            ),
+            "a name over NAME_MAX must be rejected, not silently accepted"
+        );
+    }
+
     #[test]
     fn test_path_canonicalize() {
         assert_eq!(Path::canonicalize("/"), "/");

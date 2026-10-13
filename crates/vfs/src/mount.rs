@@ -5,7 +5,8 @@
 //! - 只接受**绝对路径**；相对路径显式 [`Error::InvalidParam`]，绝不静默
 //!   当作绝对路径解析（ADR-023 §2）；
 //! - 变更类操作（create/mkdir/symlink/unlink）对末段名字统一执行
-//!   [`validate_name`]：拒绝空名、内嵌 `/`、C0 控制字符与 DEL——名字是
+//!   [`validate_name`]：拒绝空名、超过 [`MAX_NAME_BYTES`] 的名字、内嵌 `/`、
+//!   C0 控制字符与 DEL——名字是
 //!   JSON/日志的第一公民注入面（POSIX 名字域 = 除 `/` 与 NUL 外任意字节，
 //!   本表取其严格子集并成文；U+202E 等可打印 Unicode 不在拒绝之列，
 //!   欺骗风险由展示层转义承担）；
@@ -29,14 +30,27 @@ use crate::path::Path;
 /// 最大符号链接跳转深度（防死循环）。
 pub const MAX_SYMLINK_DEPTH: usize = 64;
 
+/// 单个路径分量的字节上限（POSIX `NAME_MAX`）。
+///
+/// **为什么真值必须在这一层**：libc 侧 `pathconf(_PC_NAME_MAX)` 要报一个数、
+/// `struct dirent.d_name` 是 256 字节定长缓冲（255 + NUL）——这两处的依据都只能是
+/// VFS 的契约。此前没有本契约：ext2 自己拦 255、RamFS 不拦，于是在 RamFS 上能建出
+/// 256 字节以上的名字，随后 `readdir` 会**静默截断**它（名字不可寻址、文件删不掉）。
+/// 取值 255 = ext2 的 `name_len`（u8）上限，是各文件系统里最紧的一个。
+pub const MAX_NAME_BYTES: usize = 255;
+
 /// 未命名卷自动降级的短标识序号源（ADR-012 §3.2.2）：无硬件提示时生成
 /// 确定性 `storage-{seq}`，seq 单调递增，结合同名自增消解保证唯一。
 static UNNAMED_SEQ: AtomicUsize = AtomicUsize::new(1);
 
-/// 校验路径末段文件名（ADR-023 §2）：非空、不含 `/`、不含 C0 控制字符与 DEL。
+/// 校验路径末段文件名（ADR-023 §2）：非空、不超过 [`MAX_NAME_BYTES`]、
+/// 不含 `/`、不含 C0 控制字符与 DEL。
 fn validate_name(name: &str) -> Result<(), Error> {
     if name.is_empty() {
         return Err(Error::InvalidParam);
+    }
+    if name.len() > MAX_NAME_BYTES {
+        return Err(Error::NameTooLong);
     }
     for &b in name.as_bytes() {
         if b == b'/' || b <= 0x1F || b == 0x7F {

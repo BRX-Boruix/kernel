@@ -154,7 +154,9 @@ impl Ext2Superblock {
 }
 
 /// EXT2 目录项文件名最大长度（规范硬约束：`name_len` 字段仅 1 字节）。
-const EXT2_NAME_LEN_MAX: usize = 255;
+/// ext2 目录项名字上限 = VFS 的 `NAME_MAX`（单点）：`name_len` 只有 1 字节，
+/// 两者必须是同一个数，故直接引用而不是各写一份。
+const EXT2_NAME_LEN_MAX: usize = vfs::mount::MAX_NAME_BYTES;
 
 /// 校验一个 EXT2 目录项组件名（写入侧统一入口）。
 ///
