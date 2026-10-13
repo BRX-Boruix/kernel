@@ -163,8 +163,18 @@ pub const SYS_STREAM_CLOSE: u32 = nr(domain::STREAM, op::DELETE); // 0x14
 /// 本路径同步 `ipc::pipe_ref_inc`。
 pub const SYS_STREAM_DUP: u32 = nr(domain::STREAM, 0x05); // 0x15
 /// STREAM 域扩展动词：flock 文件锁（ADR-014 / ADR-033 A2-1 R6）。
-/// a1=fd, a2=cmd（0=LOCK_SH, 1=LOCK_EX, 2=UNLOCK）。
+/// a1=fd, a2=cmd（见下方 FLOCK_CMD_*）。
 pub const SYS_STREAM_LOCK: u32 = nr(domain::STREAM, 0x06); // 0x16
+
+/// `SYS_STREAM_LOCK` 的 `a2` 命令字：取共享锁。
+///
+/// **双侧镜像（S13）**：与 `libsys::nr::FLOCK_CMD_SHARED` 同值、注释互指；两侧取值由
+/// tools/checks/dist/abi_mirrors_agree.py 钉住。
+pub const FLOCK_CMD_SHARED: u64 = 0;
+/// `SYS_STREAM_LOCK` 的 `a2` 命令字：取独占锁（与任何锁冲突）。
+pub const FLOCK_CMD_EXCLUSIVE: u64 = 1;
+/// `SYS_STREAM_LOCK` 的 `a2` 命令字：释放本 owner 在该 inode 上的锁。
+pub const FLOCK_CMD_UNLOCK: u64 = 2;
 /// STREAM 域扩展动词：fstat（按 fd 读元数据，ADR-014 第二原语）。
 /// a1=fd, a2=out_buf_ptr（收 `vfs::inode::StatInfo` 完整定长结构）。
 pub const SYS_STREAM_FSTAT: u32 = nr(domain::STREAM, 0x07); // 0x17
@@ -1681,9 +1691,13 @@ fn sys_flock(frame: &mut SyscallFrame) -> u64 {
     };
     let owner = vfs::flock::LockOwner { uid };
     match cmd {
-        0 => vfs::flock::flock_lock(&fh.inode, owner, false).map_or_else(pack_err, |_| pack_ok(0)),
-        1 => vfs::flock::flock_lock(&fh.inode, owner, true).map_or_else(pack_err, |_| pack_ok(0)),
-        2 => {
+        FLOCK_CMD_SHARED => {
+            vfs::flock::flock_lock(&fh.inode, owner, false).map_or_else(pack_err, |_| pack_ok(0))
+        }
+        FLOCK_CMD_EXCLUSIVE => {
+            vfs::flock::flock_lock(&fh.inode, owner, true).map_or_else(pack_err, |_| pack_ok(0))
+        }
+        FLOCK_CMD_UNLOCK => {
             vfs::flock::flock_unlock(&fh.inode, owner);
             pack_ok(0)
         }
