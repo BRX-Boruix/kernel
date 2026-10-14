@@ -5,6 +5,8 @@ extern crate alloc;
 
 // B2 载体迁移：liveCD 内置 payload（binaries_payload，ADR-017）已退役——
 // /programs 现在是 ISO 介质上的真目录（iso9660 挂载，零复制拖入即装）。
+// 跨边界常量的**生成物**（源：tools/abi/constants.json）。数值勿手改——门禁会比对。
+mod abi_generated;
 mod acpi;
 mod drivers;
 mod ipc_init;

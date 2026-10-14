@@ -102,13 +102,12 @@ pub mod op {
     pub const EVENT: u32 = 0x07;
 }
 
-const fn nr(d: u32, o: u32) -> u32 {
-    d | o
-}
+// 旧的手写 nr(d, o) 已随数值一起移到 tools/abi/constants.json —— 生成物直接写
+// domain::X | op::Y，本文件不再需要这个辅助函数。
 
 // ---------- 1. STREAM Domain (0x10) ----------
-pub const SYS_STREAM_CREATE: u32 = nr(domain::STREAM, op::CREATE); // 0x11
-pub const SYS_STREAM_READ: u32 = nr(domain::STREAM, op::READ); // 0x12
+pub const SYS_STREAM_CREATE: u32 = crate::abi_generated::SYS_STREAM_CREATE;
+pub const SYS_STREAM_READ: u32 = crate::abi_generated::SYS_STREAM_READ;
 
 /// `SYS_STREAM_READ` 的 `a5` 标志位：**非阻塞读**（§6.12.5，所有者裁决甲）。
 ///
@@ -156,15 +155,15 @@ pub const fn read_is_peek(flags: u64) -> bool {
 pub const fn read_is_nonblock(flags: u64) -> bool {
     flags & STREAM_READ_NONBLOCK != 0
 }
-pub const SYS_STREAM_WRITE: u32 = nr(domain::STREAM, op::WRITE); // 0x13
-pub const SYS_STREAM_CLOSE: u32 = nr(domain::STREAM, op::DELETE); // 0x14
+pub const SYS_STREAM_WRITE: u32 = crate::abi_generated::SYS_STREAM_WRITE;
+pub const SYS_STREAM_CLOSE: u32 = crate::abi_generated::SYS_STREAM_CLOSE;
 /// SYS_STREAM_DUP（0x15，dup2）：把 `old_fd` 句柄复制到 `new_fd`（pipe-features
 /// 方案 A，fd 重定向）。副本与原句柄共享文件描述/管道端；管道端引用计数由
 /// 本路径同步 `ipc::pipe_ref_inc`。
-pub const SYS_STREAM_DUP: u32 = nr(domain::STREAM, 0x05); // 0x15
+pub const SYS_STREAM_DUP: u32 = crate::abi_generated::SYS_STREAM_DUP;
 /// STREAM 域扩展动词：flock 文件锁（ADR-014 / ADR-033 A2-1 R6）。
 /// a1=fd, a2=cmd（见下方 FLOCK_CMD_*）。
-pub const SYS_STREAM_LOCK: u32 = nr(domain::STREAM, 0x06); // 0x16
+pub const SYS_STREAM_LOCK: u32 = crate::abi_generated::SYS_STREAM_LOCK;
 
 /// `SYS_STREAM_LOCK` 的 `a2` 命令字：取共享锁。
 ///
@@ -177,7 +176,7 @@ pub const FLOCK_CMD_EXCLUSIVE: u64 = 1;
 pub const FLOCK_CMD_UNLOCK: u64 = 2;
 /// STREAM 域扩展动词：fstat（按 fd 读元数据，ADR-014 第二原语）。
 /// a1=fd, a2=out_buf_ptr（收 `vfs::inode::StatInfo` 完整定长结构）。
-pub const SYS_STREAM_FSTAT: u32 = nr(domain::STREAM, 0x07); // 0x17
+pub const SYS_STREAM_FSTAT: u32 = crate::abi_generated::SYS_STREAM_FSTAT;
 /// STREAM 域扩展动词：焦点实例切换（ADR-048 T3，owner 裁决 α 2026-09-27：
 /// 受控例外形状 = audio attach 同款「独立域动词 + 能力门禁」；ADR-044
 /// 「不新增 syscall」红线按本意澄清——防的是无序动词蔓延破坏单径事件链，
@@ -186,7 +185,7 @@ pub const SYS_STREAM_FSTAT: u32 = nr(domain::STREAM, 0x07); // 0x17
 /// VFS 节点层 `write_at` 无调用者身份，焦点切换若落在节点层 = 任意进程
 /// 终端劫持面（S17/S20）；语义 = tcsetpgrp/TIOCSPGRP 的本域同构（权限
 /// 判定在有 caller 身份的内核边界，机制内核、策略用户态）。
-pub const SYS_STREAM_FOCUS_SET: u32 = nr(domain::STREAM, 0x08); // 0x18
+pub const SYS_STREAM_FOCUS_SET: u32 = crate::abi_generated::SYS_STREAM_FOCUS_SET;
 /// STREAM 域扩展动词：`ftruncate`（按 **fd** 截断/扩展，3P4-8）。
 /// a1=fd, a2=新长度。fd 基（C `ftruncate` 语义）；路径基的 `truncate` 另议。
 ///
@@ -195,7 +194,7 @@ pub const SYS_STREAM_FOCUS_SET: u32 = nr(domain::STREAM, 0x08); // 0x18
 /// **全部** syscall，且只是 warning 不是 error。本项首版即如此：内核里漏定义该常量，
 /// 导致 MEMORY/后续域的 syscall 全被路由进 `sys_ftruncate`（实测 init 的 brk/yield/open
 /// 全失败 → 用户态堆 OOM → panic）。构建时必须确认 `unreachable_patterns` 警告为零。
-pub const SYS_STREAM_FTRUNCATE: u32 = nr(domain::STREAM, 0x09); // 0x19
+pub const SYS_STREAM_FTRUNCATE: u32 = crate::abi_generated::SYS_STREAM_FTRUNCATE;
 
 /// `SYS_STREAM_FSYNC`（STREAM 域扩展动词 0x0A = 0x1A）：把数据冲刷到稳定存储。
 ///
@@ -207,7 +206,7 @@ pub const SYS_STREAM_FTRUNCATE: u32 = nr(domain::STREAM, 0x09); // 0x19
 /// （fsync 的承诺是「数据已在稳定存储上」，多冲不违反），代价是粒度粗。这不是近似。
 ///
 /// **不要求写权限**：POSIX 允许对只读打开的 fd 调 `fsync`（Linux 亦然），故只校验 fd 本身。
-pub const SYS_STREAM_FSYNC: u32 = nr(domain::STREAM, 0x0A); // 0x1A
+pub const SYS_STREAM_FSYNC: u32 = crate::abi_generated::SYS_STREAM_FSYNC;
 
 /// `SYS_STREAM_FCHMOD`（STREAM 域扩展动词 0x0B = 0x1B）：按 fd 改 classic 9 位 mode。
 ///
@@ -216,13 +215,13 @@ pub const SYS_STREAM_FSYNC: u32 = nr(domain::STREAM, 0x0A); // 0x1A
 /// 目录遍历检查：fd 已经解析完毕，不存在「逐级父目录求 x」这一步。
 ///
 /// **不新增判定**：两处都调 [`check_chmod_access`] 与 `with_classic_mode` 单点派生（S13）。
-pub const SYS_STREAM_FCHMOD: u32 = nr(domain::STREAM, 0x0B); // 0x1B
+pub const SYS_STREAM_FCHMOD: u32 = crate::abi_generated::SYS_STREAM_FCHMOD;
 
 /// `SYS_STREAM_FCHOWN`（STREAM 域扩展动词 0x0C = 0x1C）：按 fd 改属主。
 ///
 /// 参数：`a1` = fd、`a2` = uid、`a3` = gid。判定面与路径版 `ENTRY_UPDATE_CHOWN` 一致：
 /// 属主或 `CAP_OWNER` 可发；**易他主**（新 uid ≠ 现属主）另需 `CAP_SYSTEM`（防权限赠予）。
-pub const SYS_STREAM_FCHOWN: u32 = nr(domain::STREAM, 0x0C); // 0x1C
+pub const SYS_STREAM_FCHOWN: u32 = crate::abi_generated::SYS_STREAM_FCHOWN;
 
 /// STREAM read/write 的顺序 I/O 哨兵值。
 ///
@@ -231,7 +230,7 @@ pub const SYS_STREAM_FCHOWN: u32 = nr(domain::STREAM, 0x0C); // 0x1C
 const STREAM_OFFSET_CURRENT: u64 = u64::MAX;
 
 // ---------- 2. MEMORY Domain (0x20) ----------
-pub const SYS_MEMORY_MAP: u32 = nr(domain::MEMORY, op::CREATE); // 0x21
+pub const SYS_MEMORY_MAP: u32 = crate::abi_generated::SYS_MEMORY_MAP;
 
 /// SYS_MEMORY_MAP `flags` 位：新建共享内存对象并映射（ADR-014 §4.2，旧
 /// SYS_SHM_CREATE 合并路径；`shared_id` 参数置 0 走本路径）。
@@ -249,29 +248,29 @@ pub const USER_PIE_BASE: u64 = 0x0010_0000_0000;
 /// 与 `USER_PIE_BASE` **分开**：解释器与可执行文件同时在地址空间里，两者基址必须
 /// 不重叠。这是**策略常量**（而非从镜像推导），故调用方先定、由 loader 写进 `AT_BASE`。
 pub const USER_INTERP_BASE: u64 = 0x0020_0000_0000;
-pub const SYS_MEMORY_QUERY: u32 = nr(domain::MEMORY, op::READ); // 0x22
-pub const SYS_MEMORY_GROW: u32 = nr(domain::MEMORY, op::WRITE); // 0x23
-pub const SYS_MEMORY_UNMAP: u32 = nr(domain::MEMORY, op::DELETE); // 0x24
+pub const SYS_MEMORY_QUERY: u32 = crate::abi_generated::SYS_MEMORY_QUERY;
+pub const SYS_MEMORY_GROW: u32 = crate::abi_generated::SYS_MEMORY_GROW;
+pub const SYS_MEMORY_UNMAP: u32 = crate::abi_generated::SYS_MEMORY_UNMAP;
 /// mprotect(addr, len, prot)：修改一段**已映射**内存的权限（MEMORY 域扩展 0x05 / 号 0x25，
 /// 3P4-5）。用途是 W^X 型 JIT 的「先写后切执行」（RW → RX）与「执行后切回写」（RX → RW）。
 /// **W^X 门禁复用 3P4-4 的同一单点**（mm 层 map_flags_from_prot）——否则 mprotect 就是
 /// 绕过 W^X 的后门。
-pub const SYS_MEMORY_PROTECT: u32 = nr(domain::MEMORY, 0x05); // 0x25
+pub const SYS_MEMORY_PROTECT: u32 = crate::abi_generated::SYS_MEMORY_PROTECT;
 
 // ---------- 3. TASK Domain (0x30) ----------
-pub const SYS_TASK_SPAWN: u32 = nr(domain::TASK, op::CREATE); // 0x31
-pub const SYS_TASK_WAIT: u32 = nr(domain::TASK, op::READ); // 0x32
-pub const SYS_TASK_SIGNAL: u32 = nr(domain::TASK, op::WRITE); // 0x33
-pub const SYS_TASK_EXIT: u32 = nr(domain::TASK, op::DELETE); // 0x34
+pub const SYS_TASK_SPAWN: u32 = crate::abi_generated::SYS_TASK_SPAWN;
+pub const SYS_TASK_WAIT: u32 = crate::abi_generated::SYS_TASK_WAIT;
+pub const SYS_TASK_SIGNAL: u32 = crate::abi_generated::SYS_TASK_SIGNAL;
+pub const SYS_TASK_EXIT: u32 = crate::abi_generated::SYS_TASK_EXIT;
 /// `thread_spawn(entry, user_stack_top) -> tid`：在调用方线程组（组长 = 调用方
 /// 自身进程）内派生一个**同组新调度单元**（T1-7 / ADR-035 D1 / PRE-6）。共享组长
 /// 地址空间/fd/cwd/identity，装配各自 entry + user_stack。TASK 域扩展动词 0x05；
 /// 双侧镜像（S13）：与 libsys `nr.rs::SYS_TASK_THREAD_SPAWN` 同值、注释互指。
-pub const SYS_TASK_THREAD_SPAWN: u32 = nr(domain::TASK, 0x05); // 0x35
+pub const SYS_TASK_THREAD_SPAWN: u32 = crate::abi_generated::SYS_TASK_THREAD_SPAWN;
 /// `thread_join(tid) -> code`：等价组长对**具体组员 pid** 的 waitpid 收尸取退出码
 /// （T1-3 单目标 join 交付）。TASK 域扩展动词 0x06；双侧镜像（S13）：与 libsys
 /// `nr.rs::SYS_TASK_THREAD_JOIN` 同值、注释互指。
-pub const SYS_TASK_THREAD_JOIN: u32 = nr(domain::TASK, 0x06); // 0x36
+pub const SYS_TASK_THREAD_JOIN: u32 = crate::abi_generated::SYS_TASK_THREAD_JOIN;
 /// `set_fs_base(base) -> 0`：把调用线程的 `IA32_FS_BASE`（x86-64 MSR 0xC0000100）设为 `base`
 /// （threads.md T2-1 / ADR-035 D6）。RDMSR/WRMSR 是 CPL0 特权指令，用户态直写会 #GP，故写侧
 /// 走本内核 syscall（内核在 CPL0 经 wrmsr）。读侧用户态用 `fs:[0]` 段相对寻址（免 MSR）。
@@ -280,18 +279,18 @@ pub const SYS_TASK_THREAD_JOIN: u32 = nr(domain::TASK, 0x06); // 0x36
 /// 典型用途：线程引导装配其 `Tcb`（errno/TLS 段基址）。参数 `a1`=新 FS base（用户虚拟地址，
 /// 通常是本线程 mmap 的 `Tcb`）。返回 0。TASK 域扩展动词 0x07；双侧镜像（S13）：与 libsys
 /// `nr.rs::SYS_TASK_SET_FS_BASE` 同值、注释互指。
-pub const SYS_TASK_SET_FS_BASE: u32 = nr(domain::TASK, 0x07); // 0x37
+pub const SYS_TASK_SET_FS_BASE: u32 = crate::abi_generated::SYS_TASK_SET_FS_BASE;
 
 /// `gettid() -> tid`：返回调用线程自己的 pid（= 线程 id，threads.md T2-6）。在 BORUIX 中每线程
 /// = 一个 ProcEntry/pid；组长 pid == tgid、组员 pid == 其线程 id。POSIX 线程要经 gettid 查本线程 id；
 /// 组长/组员都可用。TASK 域扩展动词 0x08；双侧镜像（S13）：与 libsys `nr.rs::SYS_TASK_GETTID` 同值。
-pub const SYS_TASK_GETTID: u32 = nr(domain::TASK, 0x08); // 0x38
+pub const SYS_TASK_GETTID: u32 = crate::abi_generated::SYS_TASK_GETTID;
 
 /// `getpid() -> pid`：返回调用线程所在进程（线程组）的组长 pid（= POSIX 进程 id / tgid）。
 /// BORUIX 每进程一个组长（leader）；所有线程共享同一 tgid。替代 libc 读 `/processes/list` 扫
 /// Running 进程的脆弱启发（SMP/多线程下会挑错成员）。TASK 域扩展动词 0x09；双侧镜像（S13）：
 /// 与 libsys `nr.rs::SYS_TASK_GETPID` 同值。
-pub const SYS_TASK_GETPID: u32 = nr(domain::TASK, 0x09); // 0x39
+pub const SYS_TASK_GETPID: u32 = crate::abi_generated::SYS_TASK_GETPID;
 
 /// `derive(flags, entry_rsp, entry_rip) -> pid`：**COW 派生子进程**（ADR-038）。
 ///
@@ -309,7 +308,7 @@ pub const SYS_TASK_GETPID: u32 = nr(domain::TASK, 0x09); // 0x39
 /// TASK 域的 object-verb 原语，符合 ADR-014 编码规则；POSIX 兼容层的 `fork()`
 /// 由 libc 包装本调用提供。TASK 域扩展动词 0x0A；双侧镜像（S13）：与 libsys
 /// `nr.rs::SYS_TASK_DERIVE` 同值、注释互指。
-pub const SYS_TASK_DERIVE: u32 = nr(domain::TASK, 0x0A); // 0x3A
+pub const SYS_TASK_DERIVE: u32 = crate::abi_generated::SYS_TASK_DERIVE;
 
 /// `identity_query(out_ptr) -> 0`：把调用进程的**真实** uid/gid/caps 写入用户缓冲
 /// （[`IdentityInfo`]，12 字节）。
@@ -318,7 +317,7 @@ pub const SYS_TASK_DERIVE: u32 = nr(domain::TASK, 0x0A); // 0x3A
 /// 查自己的身份不构成越权；不提供"查任意 pid"形态（那需要额外的授权语义，本项
 /// 不做，避免开出未被裁定的越权面）。TASK 域扩展动词 0x0B；双侧镜像（S13）：
 /// 与 libsys `nr.rs::SYS_TASK_IDENTITY_QUERY` 同值、注释互指。
-pub const SYS_TASK_IDENTITY_QUERY: u32 = nr(domain::TASK, 0x0B); // 0x3B
+pub const SYS_TASK_IDENTITY_QUERY: u32 = crate::abi_generated::SYS_TASK_IDENTITY_QUERY;
 
 /// `identity_set(uid, gid, reserved, caps) -> 0`：变更调用进程组的身份。
 ///
@@ -334,7 +333,7 @@ pub const SYS_TASK_IDENTITY_QUERY: u32 = nr(domain::TASK, 0x0B); // 0x3B
 /// 参数只用定长数字（ADR-018 三层校验零改动 / ADR-040 §2.10）；
 /// TASK 域扩展动词 0x0C；双侧镜像（S13）：与 libsys
 /// `nr.rs::SYS_TASK_IDENTITY_SET` 同值、注释互指。
-pub const SYS_TASK_IDENTITY_SET: u32 = nr(domain::TASK, 0x0C); // 0x3C
+pub const SYS_TASK_IDENTITY_SET: u32 = crate::abi_generated::SYS_TASK_IDENTITY_SET;
 
 /// `SYS_TASK_IDENTITY_SET` 的保留参数（`a3`）唯一合法取值。
 /// 用命名常量而非字面量 0，使"保留位"是一处成文语义而非魔法值（S13）。
@@ -354,7 +353,7 @@ pub const IDENTITY_SET_RESERVED_NONE: u64 = 0;
 ///
 /// 参数：`a1`=调用方组数组指针（`u32` 定长元素）、`a2`=元素个数、
 /// `a3`=保留（必须 0）、`a4`=方向（`GROUPS_SET_REPLACE` / `GROUPS_SET_CLEAR`）。
-pub const SYS_TASK_GROUPS_SET: u32 = nr(domain::TASK, 0x0D); // 0x3D
+pub const SYS_TASK_GROUPS_SET: u32 = crate::abi_generated::SYS_TASK_GROUPS_SET;
 
 /// `SYS_TASK_GROUPS_SET` 的保留参数（`a3`）唯一合法取值。
 pub const GROUPS_SET_RESERVED_NONE: u64 = 0;
@@ -377,7 +376,7 @@ pub const GROUPS_SET_CLEAR: u64 = 1;
 /// **为什么返回条数而不是 0/错误**：POSIX `getgroups(0, NULL)` 的语义就是「只问条数」；
 /// 「缓冲不足」的判定属调用方契约（libc 层据此返回 -1/EINVAL）。内核只提供**真值**，
 /// 不在两处各判一次（S13）。`a1 == 0` 仅当 `a2 == 0` 合法（纯探测）。
-pub const SYS_TASK_GROUPS_GET: u32 = nr(domain::TASK, 0x0E); // 0x3E
+pub const SYS_TASK_GROUPS_GET: u32 = crate::abi_generated::SYS_TASK_GROUPS_GET;
 
 /// `SYS_TASK_NICE`（TASK 域扩展动词 0x0F = 0x3F）：查询/设置进程 nice 值。
 ///
@@ -392,7 +391,7 @@ pub const SYS_TASK_GROUPS_GET: u32 = nr(domain::TASK, 0x0E); // 0x3E
 ///
 /// **越界钳制而非报错**：与调度器 `set_nice` 的既有语义一致（nice 来自用户态，越界不应能
 /// 打挂内核），本 syscall 不另造判定。
-pub const SYS_TASK_NICE: u32 = nr(domain::TASK, 0x0F); // 0x3F
+pub const SYS_TASK_NICE: u32 = crate::abi_generated::SYS_TASK_NICE;
 
 /// [`SYS_TASK_NICE`] 的 `a1`：查询。
 pub const NICE_GET: u64 = 0;
@@ -449,23 +448,23 @@ const _: () = {
 /// 用命名常量而非字面量 0，使「保留位」是一处成文的语义而非魔法值（S13）。
 pub const DERIVE_FLAGS_NONE: u64 = 0;
 
-pub const SYS_ENTRY_CREATE: u32 = nr(domain::VFS, op::CREATE); // 0x41
-pub const SYS_ENTRY_READ: u32 = nr(domain::VFS, op::READ); // 0x42
-pub const SYS_ENTRY_UPDATE: u32 = nr(domain::VFS, op::WRITE); // 0x43
-pub const SYS_ENTRY_DELETE: u32 = nr(domain::VFS, op::DELETE); // 0x44
+pub const SYS_ENTRY_CREATE: u32 = crate::abi_generated::SYS_ENTRY_CREATE;
+pub const SYS_ENTRY_READ: u32 = crate::abi_generated::SYS_ENTRY_READ;
+pub const SYS_ENTRY_UPDATE: u32 = crate::abi_generated::SYS_ENTRY_UPDATE;
+pub const SYS_ENTRY_DELETE: u32 = crate::abi_generated::SYS_ENTRY_DELETE;
 
 /// `chdir(path)`：切换当前进程工作目录（VFS 域扩展，0x45）。
 ///
 /// VFS 层仍只接受绝对路径（ADR-011 M1 契约不变）；本 syscall 与其余路径
 /// syscall 在 syscall 层把相对路径与进程 cwd 拼接成绝对路径。
-pub const SYS_ENTRY_CHDIR: u32 = nr(domain::VFS, 0x05); // 0x45
+pub const SYS_ENTRY_CHDIR: u32 = crate::abi_generated::SYS_ENTRY_CHDIR;
 /// `getcwd()`：读当前进程工作目录（VFS 域扩展，0x46）。
-pub const SYS_ENTRY_GETCWD: u32 = nr(domain::VFS, 0x06); // 0x46
+pub const SYS_ENTRY_GETCWD: u32 = crate::abi_generated::SYS_ENTRY_GETCWD;
 /// `symlink(target, link_path)`：创建软链接（VFS 域扩展，0x47）。
 ///
 /// 3P4-8：ext2 的落盘实现（fast symlink、`INode::symlink`）与 vfs 的
 /// `Mount::symlink` 都已存在，本项**纯接线**。
-pub const SYS_ENTRY_SYMLINK: u32 = nr(domain::VFS, 0x07); // 0x47
+pub const SYS_ENTRY_SYMLINK: u32 = crate::abi_generated::SYS_ENTRY_SYMLINK;
 
 /// `link(target, link_path)`：为 `target` 在 `link_path` 处创建**硬链接**（POSIX `link(2)`）。
 ///
@@ -476,11 +475,11 @@ pub const SYS_ENTRY_SYMLINK: u32 = nr(domain::VFS, 0x07); // 0x47
 /// 所在文件系统未实现 `INode::link` → `NotSupported`（**不接受近似**：复制内容不是硬链接）；
 /// 目标是目录 → `PermissionDenied`（POSIX 禁止，防目录环）。
 /// VFS 域扩展动词 0x09。双侧镜像（S13）：与 libsys `nr.rs::SYS_ENTRY_LINK` 同值、注释互指。
-pub const SYS_ENTRY_LINK: u32 = nr(domain::VFS, 0x09); // 0x49
+pub const SYS_ENTRY_LINK: u32 = crate::abi_generated::SYS_ENTRY_LINK;
 /// `readlink(path, buf, cap)`：读软链接目标（VFS 域扩展，0x48）。
 ///
 /// 写入**不含**终止 NUL（POSIX `readlink` 语义）；缓冲不足如实 `NoSpace`，绝不截断。
-pub const SYS_ENTRY_READLINK: u32 = nr(domain::VFS, 0x08); // 0x48
+pub const SYS_ENTRY_READLINK: u32 = crate::abi_generated::SYS_ENTRY_READLINK;
 
 // ---------- SYS_ENTRY_READ kind 编码（stat 技术报告）----------
 /// readdir 模式（默认）：a4=0，输出 JSON 目录项列表。
@@ -530,70 +529,70 @@ pub const ENTRY_KIND_BLOCKDEV: u64 = 5;
 pub const ENTRY_KIND_SOCKET: u64 = 6;
 
 // ---------- 5. DEVICE Domain (0x50, UIO Sandboxing) ----------
-pub const SYS_DRIVER_REGISTER: u32 = nr(domain::DEVICE, op::CREATE); // 0x51
-pub const SYS_DRIVER_QUERY: u32 = nr(domain::DEVICE, op::READ); // 0x52
-pub const SYS_DRIVER_CLAIM: u32 = nr(domain::DEVICE, op::WRITE); // 0x53
-pub const SYS_DRIVER_UNREGISTER: u32 = nr(domain::DEVICE, op::DELETE); // 0x54
+pub const SYS_DRIVER_REGISTER: u32 = crate::abi_generated::SYS_DRIVER_REGISTER;
+pub const SYS_DRIVER_QUERY: u32 = crate::abi_generated::SYS_DRIVER_QUERY;
+pub const SYS_DRIVER_CLAIM: u32 = crate::abi_generated::SYS_DRIVER_CLAIM;
+pub const SYS_DRIVER_UNREGISTER: u32 = crate::abi_generated::SYS_DRIVER_UNREGISTER;
 /// 消费下一条硬件拓扑事件（P2-2，DEVICE 域 op::EVENT=0x07 → 0x57）。
-pub const SYS_DRIVER_EVENT_NEXT: u32 = nr(domain::DEVICE, op::EVENT); // 0x57
+pub const SYS_DRIVER_EVENT_NEXT: u32 = crate::abi_generated::SYS_DRIVER_EVENT_NEXT;
 /// 对指定块设备做缓存穿透探测读（DEVICE 域 0x08 → 0x58）：volumed 低频对账
 /// 用它兜底发现"拔除但无事件"的空闲卷。返回 `ProbeStatus`（alive=0/gone=1/
 /// notfound=2/notio=3）。
-pub const SYS_DEVICE_PROBE: u32 = nr(domain::DEVICE, 0x08); // 0x58
+pub const SYS_DEVICE_PROBE: u32 = crate::abi_generated::SYS_DEVICE_PROBE;
 /// `driver_irq_wait(uio_id, timeout_ns) -> 1/0`（DEVICE 域 0x09 → 0x59）：阻塞
 /// 等待当前进程认领设备的中断触发（有中断待服务）或超时。返回 1 = 该设备
 /// 的 IRQ 已触发（驱动应读设备状态寄存器服务）；0 = 超时。用户态驱动借此
 /// 中断驱动而非轮询（阶段一：PCI IRQ → 认领它的用户驱动）。
-pub const SYS_DRIVER_IRQ_WAIT: u32 = nr(domain::DEVICE, 0x09); // 0x59
+pub const SYS_DRIVER_IRQ_WAIT: u32 = crate::abi_generated::SYS_DRIVER_IRQ_WAIT;
 
 // ---------- 6b. AUDIO Domain (0xA0，plan_audio_vfs.md 批次二) ----------
 /// 附加为音频管道消费者（独占）。`a1 = timeout_ns`（预留）。
 /// 已有消费者 → `Busy`（EBUSY，结构性占用，重试不会成功）。
-pub const SYS_AUDIO_ATTACH: u32 = nr(domain::AUDIO, 0x01); // 0xA1
+pub const SYS_AUDIO_ATTACH: u32 = crate::abi_generated::SYS_AUDIO_ATTACH;
 /// 注销消费者（仅属主）。非属主 → `PermissionDenied`。
-pub const SYS_AUDIO_DETACH: u32 = nr(domain::AUDIO, 0x02); // 0xA2
+pub const SYS_AUDIO_DETACH: u32 = crate::abi_generated::SYS_AUDIO_DETACH;
 /// 取 PCM 数据。`a1 = buf_ptr`、`a2 = len`。无数据且已附加 → 阻塞等待
 /// （有限超时）；无消费者 → `NotSupported`（诚实性红线）。
-pub const SYS_AUDIO_FETCH: u32 = nr(domain::AUDIO, 0x03); // 0xA3
+pub const SYS_AUDIO_FETCH: u32 = crate::abi_generated::SYS_AUDIO_FETCH;
 /// 提交已消费的 n 字节（推进读指针）。`a1 = n`。越界 → `InvalidParam`。
-pub const SYS_AUDIO_COMMIT: u32 = nr(domain::AUDIO, 0x04); // 0xA4
+pub const SYS_AUDIO_COMMIT: u32 = crate::abi_generated::SYS_AUDIO_COMMIT;
 /// `driver_dma_alloc(bytes) -> vaddr`（DEVICE 域 0x0A → 0x5A，阶段二）：分配一块
 /// 物理连续、以不可缓存(PCD)映射到调用进程的 DMA 一致性缓冲并返回其用户起始
 /// 虚拟地址；驱动写满后用 [`SYS_DRIVER_DMA_PHYS`] 取物理地址编程设备、服务完用
 /// [`SYS_DRIVER_DMA_FREE`] 释放。仅 System 进程。缓冲随进程退出自动回收。
-pub const SYS_DRIVER_DMA_ALLOC: u32 = nr(domain::DEVICE, 0x0A); // 0x5A
+pub const SYS_DRIVER_DMA_ALLOC: u32 = crate::abi_generated::SYS_DRIVER_DMA_ALLOC;
 /// `driver_dma_phys(vaddr) -> phys`（DEVICE 域 0x0C → 0x5C，阶段二）：返回某块
 /// DMA 缓冲（vaddr 为其起始）的基物理地址，供驱动编程设备 DMA 描述符。
-pub const SYS_DRIVER_DMA_PHYS: u32 = nr(domain::DEVICE, 0x0C); // 0x5C
+pub const SYS_DRIVER_DMA_PHYS: u32 = crate::abi_generated::SYS_DRIVER_DMA_PHYS;
 /// `driver_dma_free(vaddr) -> ()`（DEVICE 域 0x0B → 0x5B，阶段二）：释放一块 DMA
 /// 一致性缓冲（unmap + 归还物理帧）。非 DMA 缓冲区如实 NotFound。
-pub const SYS_DRIVER_DMA_FREE: u32 = nr(domain::DEVICE, 0x0B); // 0x5B
+pub const SYS_DRIVER_DMA_FREE: u32 = crate::abi_generated::SYS_DRIVER_DMA_FREE;
 
 // ---------- 6. VOLUME Domain (0x60, ADR-030) ----------
-pub const SYS_VOLUME_MOUNT: u32 = nr(domain::VOLUME, op::CREATE); // 0x61
-pub const SYS_VOLUME_LIST: u32 = nr(domain::VOLUME, op::READ); // 0x62
-pub const SYS_VOLUME_UPDATE: u32 = nr(domain::VOLUME, op::WRITE); // 0x63
-pub const SYS_VOLUME_FORMAT: u32 = nr(domain::VOLUME, op::FORMAT); // 0x65
-pub const SYS_VOLUME_UNMOUNT: u32 = nr(domain::VOLUME, op::UNMOUNT); // 0x66
+pub const SYS_VOLUME_MOUNT: u32 = crate::abi_generated::SYS_VOLUME_MOUNT;
+pub const SYS_VOLUME_LIST: u32 = crate::abi_generated::SYS_VOLUME_LIST;
+pub const SYS_VOLUME_UPDATE: u32 = crate::abi_generated::SYS_VOLUME_UPDATE;
+pub const SYS_VOLUME_FORMAT: u32 = crate::abi_generated::SYS_VOLUME_FORMAT;
+pub const SYS_VOLUME_UNMOUNT: u32 = crate::abi_generated::SYS_VOLUME_UNMOUNT;
 
 // ---------- 7. SYNC Domain (0x70, ADR-032 ACCEPTED) ----------
 /// `sync_create(init_value) -> sync_id`：创建内核同步字对象，初值 `init_value`。
-pub const SYS_SYNC_CREATE: u32 = nr(domain::SYNC, op::CREATE); // 0x71
+pub const SYS_SYNC_CREATE: u32 = crate::abi_generated::SYS_SYNC_CREATE;
 /// `sync_wait(sync_id, expected, timeout_ns)`：值 `== expected` 则阻塞；否则立即
 /// 返回当前值。唤醒/超时返回唤醒时当前值（ADR-032 §4.2）。
-pub const SYS_SYNC_WAIT: u32 = nr(domain::SYNC, op::READ); // 0x72
+pub const SYS_SYNC_WAIT: u32 = crate::abi_generated::SYS_SYNC_WAIT;
 /// `sync_wake(sync_id, value, n)`：设值为 `value`，唤醒至多 `n` 个等待者，返回实际唤醒数。
-pub const SYS_SYNC_WAKE: u32 = nr(domain::SYNC, op::WRITE); // 0x73
+pub const SYS_SYNC_WAKE: u32 = crate::abi_generated::SYS_SYNC_WAKE;
 /// `sync_delete(sync_id)`：销毁对象；仍有等待者返回 `Busy`。
-pub const SYS_SYNC_DELETE: u32 = nr(domain::SYNC, op::DELETE); // 0x74
+pub const SYS_SYNC_DELETE: u32 = crate::abi_generated::SYS_SYNC_DELETE;
 
 // ---------- 8. SIGNAL Domain (0x80, ADR-034 PROPOSED) ----------
 /// `signal_mask(how, set) -> old_set`：查/改屏蔽集（sigprocmask）。
-pub const SYS_SIGNAL_MASK: u32 = nr(domain::SIGNAL, op::READ); // 0x82
+pub const SYS_SIGNAL_MASK: u32 = crate::abi_generated::SYS_SIGNAL_MASK;
 /// `signal_action(sig, handler, flags) -> old_disposition`：查/设处置（sigaction）。
-pub const SYS_SIGNAL_ACTION: u32 = nr(domain::SIGNAL, op::WRITE); // 0x83
+pub const SYS_SIGNAL_ACTION: u32 = crate::abi_generated::SYS_SIGNAL_ACTION;
 /// `signal_return()`：handler 返回后恢复原帧（rt_sigreturn）。
-pub const SYS_SIGNAL_RETURN: u32 = nr(domain::SIGNAL, op::DELETE); // 0x84
+pub const SYS_SIGNAL_RETURN: u32 = crate::abi_generated::SYS_SIGNAL_RETURN;
 
 /// `SYS_SIGNAL_PENDING`（SIGNAL 域扩展动词 0x05 = 0x85）：查询当前进程的**待决信号集**
 /// （POSIX `sigpending`）。无参数，返回 u64 位图。
@@ -603,7 +602,7 @@ pub const SYS_SIGNAL_RETURN: u32 = nr(domain::SIGNAL, op::DELETE); // 0x84
 /// `SignalState::pending()`（内部访问器），**没有把待决集暴露给用户态的调用号** ⇒
 /// libc 的 `sigpending` 只能登记为整项缺失。
 /// 双侧镜像（S13）：与 libsys `nr.rs::SYS_SIGNAL_PENDING` 同值、注释互指。
-pub const SYS_SIGNAL_PENDING: u32 = nr(domain::SIGNAL, 0x05); // 0x85
+pub const SYS_SIGNAL_PENDING: u32 = crate::abi_generated::SYS_SIGNAL_PENDING;
 
 /// `SYS_SIGNAL_SUSPEND`（SIGNAL 域扩展动词 0x06 = 0x86）：`sigsuspend`。
 ///
@@ -614,7 +613,7 @@ pub const SYS_SIGNAL_PENDING: u32 = nr(domain::SIGNAL, 0x05); // 0x85
 /// **直接返回用户态**，syscall 内没有「唤醒后继续」的代码路径 ⇒ 还原只能落在**投递点**
 /// （`deliver_on_return` 取到信号后调 `restore_suspend`）。这也正是 POSIX 的规定：
 /// 屏蔽集在信号被投递时还原。
-pub const SYS_SIGNAL_SUSPEND: u32 = nr(domain::SIGNAL, 0x06); // 0x86
+pub const SYS_SIGNAL_SUSPEND: u32 = crate::abi_generated::SYS_SIGNAL_SUSPEND;
 
 /// `SYS_SIGNAL_ALARM`（SIGNAL 域扩展动词 0x07 = 0x87）：`alarm(seconds)`。
 ///
@@ -628,7 +627,7 @@ pub const SYS_SIGNAL_SUSPEND: u32 = nr(domain::SIGNAL, 0x06); // 0x86
 /// **诚实边界**：本项实现的是**每线程**闹钟（用调用者的 pid），POSIX 规定 `alarm` 是
 /// **每进程**的——单线程进程下二者相同；多线程下本实现不会把闹钟算到整个进程上。
 /// `setitimer` 的周期语义与三种计时器（ITIMER_REAL/VIRTUAL/PROF）**未实现**，如实缺。
-pub const SYS_SIGNAL_ALARM: u32 = nr(domain::SIGNAL, 0x07); // 0x87
+pub const SYS_SIGNAL_ALARM: u32 = crate::abi_generated::SYS_SIGNAL_ALARM;
 
 /// `SYS_SIGNAL_ALTSTACK`（SIGNAL 域扩展动词 0x08 = 0x88）：`sigaltstack`。
 ///
@@ -642,15 +641,15 @@ pub const SYS_SIGNAL_ALARM: u32 = nr(domain::SIGNAL, 0x07); // 0x87
 /// **诚实边界**：POSIX 的 `sigaltstack` 是**每线程**的，本实现与 `SignalState` 同域
 /// （即**每进程**）——单线程进程下相同。`SS_ONSTACK` 查询（当前是否正跑在备用栈上）
 /// **未实现**，如实缺。
-pub const SYS_SIGNAL_ALTSTACK: u32 = nr(domain::SIGNAL, 0x08); // 0x88
+pub const SYS_SIGNAL_ALTSTACK: u32 = crate::abi_generated::SYS_SIGNAL_ALTSTACK;
 
 // ---------- 9. POWER Domain (0x90, ADR-036) ----------
 /// `power_off()`：请求 ACPI S5 软关机（断电）。双侧镜像（S13）：与 libsys
 /// `nr.rs::SYS_POWER_OFF` 同值、注释互指。
-pub const SYS_POWER_OFF: u32 = nr(domain::POWER, 0x01); // 0x91
+pub const SYS_POWER_OFF: u32 = crate::abi_generated::SYS_POWER_OFF;
 /// `reboot()`：请求系统重启（ACPI reset / 8042）。双侧镜像（S13）：与 libsys
 /// `nr.rs::SYS_POWER_REBOOT` 同值、注释互指。
-pub const SYS_POWER_REBOOT: u32 = nr(domain::POWER, 0x02); // 0x92
+pub const SYS_POWER_REBOOT: u32 = crate::abi_generated::SYS_POWER_REBOOT;
 
 // ---------- ABI 打包（成功 / 错误） ----------
 
