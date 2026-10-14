@@ -20,6 +20,8 @@ extern crate alloc;
 #[unsafe(no_mangle)]
 static __kernel_image_end: u8 = 0;
 
+// 跨边界常量的**生成物**（源：tools/abi/constants.json）。数值勿手改——门禁会比对。
+mod abi_generated;
 pub mod audio;
 pub mod console;
 pub mod devfs;

@@ -44,7 +44,7 @@ const SYSCALL_COPY_CHUNK_BYTES: u64 = 1024 * 1024;
 ///   与静默截断，不是"存在显式边界"本身；
 /// - 与 PATH_PARAM_MAX 旧名的关系：更名以表达"用户输入上限"语义，
 ///   内核内部路径不受此约束。
-const MAX_USER_PATH_BYTES: usize = 4096;
+const MAX_USER_PATH_BYTES: usize = crate::abi_generated::PATH_MAX;
 
 /// 从可移植 `SyscallFrame` 取回底层架构中断帧（Switched 路径专用）。
 ///
@@ -169,11 +169,11 @@ pub const SYS_STREAM_LOCK: u32 = crate::abi_generated::SYS_STREAM_LOCK;
 ///
 /// **双侧镜像（S13）**：与 `libsys::nr::FLOCK_CMD_SHARED` 同值、注释互指；两侧取值由
 /// tools/checks/dist/abi_mirrors_agree.py 钉住。
-pub const FLOCK_CMD_SHARED: u64 = 0;
+pub const FLOCK_CMD_SHARED: u64 = crate::abi_generated::FLOCK_CMD_SHARED;
 /// `SYS_STREAM_LOCK` 的 `a2` 命令字：取独占锁（与任何锁冲突）。
-pub const FLOCK_CMD_EXCLUSIVE: u64 = 1;
+pub const FLOCK_CMD_EXCLUSIVE: u64 = crate::abi_generated::FLOCK_CMD_EXCLUSIVE;
 /// `SYS_STREAM_LOCK` 的 `a2` 命令字：释放本 owner 在该 inode 上的锁。
-pub const FLOCK_CMD_UNLOCK: u64 = 2;
+pub const FLOCK_CMD_UNLOCK: u64 = crate::abi_generated::FLOCK_CMD_UNLOCK;
 /// STREAM 域扩展动词：fstat（按 fd 读元数据，ADR-014 第二原语）。
 /// a1=fd, a2=out_buf_ptr（收 `vfs::inode::StatInfo` 完整定长结构）。
 pub const SYS_STREAM_FSTAT: u32 = crate::abi_generated::SYS_STREAM_FSTAT;

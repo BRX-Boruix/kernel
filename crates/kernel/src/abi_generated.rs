@@ -81,3 +81,10 @@ pub const SYS_VOLUME_LIST: u32 = crate::syscall::domain::VOLUME | crate::syscall
 pub const SYS_VOLUME_MOUNT: u32 = crate::syscall::domain::VOLUME | crate::syscall::op::CREATE; // 0x61
 pub const SYS_VOLUME_UNMOUNT: u32 = crate::syscall::domain::VOLUME | crate::syscall::op::UNMOUNT; // 0x66
 pub const SYS_VOLUME_UPDATE: u32 = crate::syscall::domain::VOLUME | crate::syscall::op::WRITE; // 0x63
+
+// ---------- 跨 crate 数值（同一数值只在这里写一次） ----------
+
+pub const PATH_MAX: usize = 4096;
+pub const FLOCK_CMD_SHARED: u64 = 0;
+pub const FLOCK_CMD_EXCLUSIVE: u64 = 1;
+pub const FLOCK_CMD_UNLOCK: u64 = 2;

@@ -37,7 +37,7 @@ pub const MAX_SYMLINK_DEPTH: usize = 64;
 /// VFS 的契约。此前没有本契约：ext2 自己拦 255、RamFS 不拦，于是在 RamFS 上能建出
 /// 256 字节以上的名字，随后 `readdir` 会**静默截断**它（名字不可寻址、文件删不掉）。
 /// 取值 255 = ext2 的 `name_len`（u8）上限，是各文件系统里最紧的一个。
-pub const MAX_NAME_BYTES: usize = 255;
+pub const MAX_NAME_BYTES: usize = crate::abi_generated::NAME_MAX;
 
 /// 未命名卷自动降级的短标识序号源（ADR-012 §3.2.2）：无硬件提示时生成
 /// 确定性 `storage-{seq}`，seq 单调递增，结合同名自增消解保证唯一。

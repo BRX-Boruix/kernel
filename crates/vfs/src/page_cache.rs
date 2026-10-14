@@ -34,7 +34,7 @@ use crate::inode::INode;
 /// 以免与既有 API 使用方断裂；语义见上——它是**缓存块粒度**，不是物理页）。
 pub const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 /// 4KB 标准缓存页粒度。
-pub const PAGE_SIZE: usize = 4096;
+pub const PAGE_SIZE: usize = crate::abi_generated::PAGE_SIZE;
 
 /// 连续读启用整块预载的最小缓冲字节数（M6 命名化）。
 ///

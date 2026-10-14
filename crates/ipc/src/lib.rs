@@ -34,6 +34,8 @@
 
 #![no_std]
 
+// 跨边界常量的**生成物**（源：tools/abi/constants.json）。数值勿手改——门禁会比对。
+mod abi_generated;
 mod sync;
 pub use sync::*;
 
@@ -58,7 +60,7 @@ use klib::sync::irq::IrqSpinLock;
 /// 写者绝不因"缓冲满"阻塞——彻底移除顺序管道模型下中间段写满 4096B 即
 /// 死锁的限制（shell `A | B | C` 可流通任意大中间数据）。单轮 staging 拷贝仍
 /// 以 4096B 为界（B2 有界上限纪律），故本常量保留为每轮切块上限。
-pub const PIPE_CAPACITY: usize = 4096;
+pub const PIPE_CAPACITY: usize = crate::abi_generated::PIPE_BUF;
 
 /// 单次用户范围校验的字节上限（S13：抽取散落魔法字面量）。与 syscall 层
 /// `MAX_SYSCALL_BUF_BYTES` 同值同源——64 MiB 是"一用户拷贝请求"的合理
