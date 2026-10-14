@@ -2743,12 +2743,12 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
                     // 可能刚写过**无换行**的部分行——不冲刷则输出滞留行缓冲，
                     // 用户在进程停车的整个期间什么都看不到（r8 实测缺陷）。
                     klib::console::flush_all_line_buffers();
-                    // **常驻低噪声留痕**：即将停在"读控制台 fd"上时打一行（含 pid）。
-                    // 理由与安全性与 input_event_blocking 那处**逐字相同**（见其注释：
-                    // 打点在阻塞**之前**，进程仍 Running、帧未被替换）。
+                    // **每 pid 一次**的留痕（见 blk_trace_once）：即将停在"读控制台 fd"
+                    // 上时打一行（含 pid）。打点在阻塞**之前**——进程仍 Running、帧未被替换，
+                    // 故不会碰到"切换路径上打印"的冻结问题。
                     {
                         let p = current_proc_mut().map(|q| q.pid()).unwrap_or(0);
-                        klib::info!("[blk] pid={} console_blocking (read fd)", p);
+                        blk_trace_once(p, "console_blocking (read fd)");
                     }
                     match console_blocking(frame, &handle.inode) {
                         // 已挂起切走 / 已如实交付（并发等待者被占时的 0 字节）：
@@ -2779,7 +2779,8 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
                     // （如 demo 的 `[CHAR a]`）——不冲刷则输出滞留行缓冲，用户
                     // 在进程停车的整个期间什么都看不到（r8 实测缺陷）。
                     klib::console::flush_all_line_buffers();
-                    // **常驻低噪声留痕**：进程即将停在"读输入事件流"上时打一行（含 pid）。
+                    // **每 pid 一次**的留痕（见 blk_trace_once）：进程首次停在"读输入
+                    // 事件流"上时打一行（含 pid）。
                     //
                     // 为什么必须有：BLOCKED_ON_EVENTS 计数只回答"阻塞了几次"，回答不了
                     // "**是哪个进程**卡在输入上"——而"某个程序零输出且永不退出"这类现象，
@@ -2790,10 +2791,12 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
                     // 会冻结"指的是 Switched 分支**之后**（帧已被整体替换、控制台锁可能
                     // 随被切走的帧悬挂）。两者是不同位置，不可混为一谈。
                     //
-                    // 噪声量级（实测）：每次真正的阻塞 1 行；正常运行时近乎为零。
+                    // 噪声量级（实测，所有者指出后已修）：**每个 pid 首次 1 行**，之后静默。
+                    // 此前是"每次进入阻塞路径 1 行"——被唤醒后复检发现数据已到会再进入、
+                    // 再打一行，4 个 consoled + 登录在提示符处刷屏。
                     {
                         let p = current_proc_mut().map(|q| q.pid()).unwrap_or(0);
-                        klib::info!("[blk] pid={} input_event_blocking", p);
+                        blk_trace_once(p, "input_event_blocking");
                     }
                     match input_event_blocking(frame, probe) {
                         // 已挂起切走（`Switched`）或已如实交付（等待者被占
@@ -2960,6 +2963,37 @@ pub static STREAM_READS: core::sync::atomic::AtomicU64 =
 /// 测量工具本身没接电）。转正时在 `sys_read` 补上单点自增（S13）。
 pub static STREAM_READS_NONBLOCK: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// 已留痕过的 pid 位图（仅 pid < 64）。**[blk] 每个 pid 只打一行**。
+///
+/// **为什么必须有这个上界**：打点在调用阻塞**之前**（切换路径上不能打——见
+/// input_event_blocking 的注释：实测加日志后 evdemo 固定在第 6 轮冻结）。
+/// 于是它按**进入次数**而非**真实阻塞次数**打印：进程被唤醒后锁内复检发现数据
+/// 已到（None 分支）会**再次进入**并再打一行。
+///
+/// **实测缺陷（所有者指出）**：4 个 consoled 实例（pid 7-10）各自读输入事件流、
+/// 登录读控制台，在 username: 提示符处刷出多行，把提示符淹没。而同一段代码的
+/// 注释却声称「每次真正的阻塞 1 行；正常运行时近乎为零」——**那句话是假的**。
+///
+/// 上界 = 进程数。pid ≥ 64 不再留痕（这是诊断用途，系统进程数远小于 64；
+/// 如实写明这个边界，不假装覆盖所有 pid）。
+static BLK_TRACED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 某个 pid **首次**停在输入/控制台上时留一行；之后静默。
+///
+/// 保留诊断价值：要回答的是「**是哪个进程**停在输入上」（BLOCKED_ON_EVENTS
+/// 只回答「阻塞了几次」），每 pid 一行足够；重复进入不再重复打。
+fn blk_trace_once(pid: usize, what: &str) {
+    use core::sync::atomic::Ordering;
+    if pid >= 64 {
+        return;
+    }
+    let bit = 1u64 << pid;
+    if BLK_TRACED.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    klib::info!("[blk] pid={} {}", pid, what);
+}
 
 fn input_event_blocking(
     frame: &mut SyscallFrame,
