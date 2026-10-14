@@ -654,7 +654,7 @@ impl DevFS {
         // 用户态 keymap 转换的字节。SPSC 环单例；status 如实披露水位与
         // 丢弃计数。切换（P4）前无任何既有读者/写者，纯新增、零回归面。
         let console_node = Arc::new(crate::console::ConsoleNode::new());
-        root.add_child("console", console_node.clone());
+        root.add_child(crate::abi_generated::CONSOLE_NODE_NAME, console_node.clone());
 
         // 4.55.6 /devices/consoles/N（ADR-048 决策 1，T1：实例族挂载；
         // B3-C4 语义迁移：CONSOLES_N = **开机预创建数**（BORUIX_CONSOLES_N，
@@ -698,7 +698,7 @@ impl DevFS {
         // 挂载点（节点挂载 + 环登记同事务，S20）。启动期只此一次。
         // 先 attach 再 add_child（后者 move consoles_dir）。
         crate::console::attach_consoles_dir(consoles_dir.clone());
-        root.add_child("consoles", consoles_dir);
+        root.add_child(crate::abi_generated::CONSOLES_DIR_NAME, consoles_dir);
 
         // 4.6 /devices/audio/dsp（plan_audio_vfs.md 批次一 A1）
         // 音频 PCM 哑管道：内核对音频零知识，只搬字节。写者与音频驱动

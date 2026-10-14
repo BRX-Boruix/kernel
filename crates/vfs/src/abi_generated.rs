@@ -11,3 +11,8 @@
 
 pub const PAGE_SIZE: usize = 4096;
 pub const NAME_MAX: usize = 255;
+
+// ---------- devfs 段名（由完整路径派生，勿手改） ----------
+
+pub const CONSOLE_NODE_NAME: &str = "console";
+pub const CONSOLES_DIR_NAME: &str = "consoles";
