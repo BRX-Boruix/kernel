@@ -111,31 +111,8 @@ impl Error {
     }
 
     pub const fn to_errno(self) -> i32 {
-        match self {
-            Error::OutOfMemory => 12,      // ENOMEM
-            Error::InvalidParam => 22,     // EINVAL
-            Error::OutOfRange => 34,       // ERANGE
-            Error::NotFound => 2,          // ENOENT
-            Error::AlreadyExists => 17,    // EEXIST
-            Error::NotSupported => 95,     // ENOTSUP
-            Error::WouldBlock => 11,       // EAGAIN
-        Error::Interrupted => 4,       // EINTR（ADR-051）
-            Error::NoSpace => 28,          // ENOSPC
-            Error::Io => 5,                // EIO
-            Error::NotDirectory => 20,     // ENOTDIR
-            Error::IsDirectory => 21,      // EISDIR
-            Error::PermissionDenied => 13, // EACCES
-            Error::BadAddress => 14,       // EFAULT
-            Error::NotEmpty => 39,         // ENOTEMPTY
-            Error::NameTooLong => 36,      // ENAMETOOLONG
-            Error::ArgListTooLong => 7,    // E2BIG
-            Error::TooManySymlinks => 40,  // ELOOP
-            Error::IllegalSeek => 29,      // ESPIPE
-            Error::ExecFormat => 8,        // ENOEXEC
-            Error::ReadOnly => 30,         // EROFS
-            Error::Corrupt => 117,         // EUCLEAN (EFSCORRUPTED)
-            Error::Busy => 16,             // EBUSY
-        }
+        // 数值的唯一事实源：tools/abi/constants.json（本函数只做委托）。
+        crate::abi_generated::to_errno(self)
     }
 }
 

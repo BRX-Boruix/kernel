@@ -6,6 +6,8 @@
 //!
 //! 手改本文件会被门禁发现；要改数值请改 JSON 再重新生成。
 
+// ---------- syscall 号 ----------
+
 pub const SYS_AUDIO_ATTACH: u32 = crate::syscall::domain::AUDIO | 0x01; // 0xA1
 pub const SYS_AUDIO_COMMIT: u32 = crate::syscall::domain::AUDIO | 0x04; // 0xA4
 pub const SYS_AUDIO_DETACH: u32 = crate::syscall::domain::AUDIO | 0x02; // 0xA2
