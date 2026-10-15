@@ -4780,6 +4780,33 @@ fn sys_signal_action(frame: &mut SyscallFrame) -> u64 {
     // flags：只接受 `SA_ONSTACK`（备用栈执行）。其余位如实 `InvalidParam`——
     // 不假装支持未实现的语义（SA_RESTART/SA_SIGINFO 等）。
     let flags = frame.a3 as u32;
+    // **查询模式**（`a4`：0 = 设新返回旧、1 = **纯查询**）。
+    //
+    // 为什么必须有它：POSIX 的 `sigaction(sig, NULL, &old)` 是**只读查询**，不得改动状态。
+    // 在此之前内核只有"设新返回旧"一种语义，libc 只能用「设 SIG_DFL 读旧值、再设回去」
+    // 来近似——那是**两次 syscall**，中间那一段该信号的处置**真的是 SIG_DFL**：此时若投递到
+    // 本进程，走的不是原 handler 而是**默认动作**（对 SIGTERM/SIGINT 即终止）。而
+    // `deliver_on_return` 恰好在 syscall 返回处投递，窗口不是理论上的。
+    // libc 侧原先的注释称"单进程 toy 内核下无竞争"——**那句话在当前系统里是假的**
+    // （SMP 4 + 线程，且信号正是投递在这个边界上）。
+    //
+    // 与 `SYS_SIGNAL_ALTSTACK` 的 `a4` 模式位同款（同一手法第二次使用，S13）：
+    // 查询与设置的语义相反，不能共用一个编码。
+    let mode = frame.a4;
+    if mode > 1 {
+        return pack_err(Error::InvalidParam);
+    }
+    let cur = match task::current_proc_mut() {
+        Some(p) => p,
+        None => return pack_err(Error::NotSupported),
+    };
+    if mode == 1 {
+        // 纯查询：**不写任何状态**（连 handler_flags 都不碰）。
+        return match cur.signal().disposition(sig) {
+            Some(d) => pack_ok(encode_disposition(d)),
+            None => pack_err(Error::InvalidParam),
+        };
+    }
     if flags & !task::signal::SA_ONSTACK != 0 {
         return pack_err(Error::InvalidParam);
     }
@@ -4787,10 +4814,6 @@ fn sys_signal_action(frame: &mut SyscallFrame) -> u64 {
         0 => SigDisposition::Default,
         1 => SigDisposition::Ignore,
         p => SigDisposition::Handler(p),
-    };
-    let cur = match task::current_proc_mut() {
-        Some(p) => p,
-        None => return pack_err(Error::NotSupported),
     };
     match cur.signal_mut().set_disposition(sig, disp) {
         Ok(Some(old)) => {
