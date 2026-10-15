@@ -26,7 +26,7 @@ extern crate std;
 //   `#[global_allocator]` 与引导堆。
 #[cfg(any(test, target_os = "none"))]
 // 跨边界常量的**生成物**（源：tools/abi/constants.json）。数值勿手改——门禁会比对。
-mod abi_generated;
+pub mod abi_generated;
 pub mod allocator;
 pub mod collections;
 pub mod timing;

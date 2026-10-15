@@ -156,19 +156,19 @@ fn notify_event() {
 /// | 2 | 2 | code | scancode set 1 键码（不含 bit7；释放语义在 kind） |
 /// | 4 | 4 | value | 键事件恒 0（指针/滚轮字段预留） |
 /// | 8 | 8 | timestamp | HPET ns；不可得时恒 0 且 flags.bit1=1（S09） |
-pub const EVENT_RECORD_SIZE: usize = 16;
+pub const EVENT_RECORD_SIZE: usize = klib::abi_generated::EVENT_RECORD_SIZE;
 
 /// 事件 kind：键按下（ADR-047 §2.1）。
-pub const EVENT_KIND_KEY_DOWN: u8 = 1;
+pub const EVENT_KIND_KEY_DOWN: u8 = klib::abi_generated::EVENT_KIND_KEY_DOWN;
 /// 事件 kind：键释放。字节流形态下被丢弃的释放事件自此保留
 /// （组合键/修饰键语义需要两侧——ADR-047 §2.2）。
-pub const EVENT_KIND_KEY_UP: u8 = 2;
+pub const EVENT_KIND_KEY_UP: u8 = klib::abi_generated::EVENT_KIND_KEY_UP;
 
 /// flags bit0：`0xE0` 扩展前缀标志（右 Ctrl/Alt、方向键/编辑键区）。
-pub const EVENT_FLAG_E0: u8 = 1 << 0;
+pub const EVENT_FLAG_E0: u8 = klib::abi_generated::EVENT_FLAG_E0;
 /// flags bit1：时间戳不可得（`now_nanos()` 返回 `None`）——timestamp 恒 0 且带此标注，
 /// 不伪装成真实时间（S09/S17：0 是合法 HPET 值，单独的 0 有歧义）。
-pub const EVENT_FLAG_NO_TIME: u8 = 1 << 1;
+pub const EVENT_FLAG_NO_TIME: u8 = klib::abi_generated::EVENT_FLAG_NO_TIME;
 
 /// 事件环形缓冲容量（**记录数**，非字节数）。
 ///

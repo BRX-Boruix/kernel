@@ -340,7 +340,7 @@ pub(crate) mod raw {
     ///
     /// 取值依据：GCC/tcc 调用 `cc1` 的参数长度必撞旧的 511 上限（3P4-2 依据）；4096 与
     /// 内核单次拷贝缓冲同量级，且远小于用户栈预算（字符串区 + 参数块 < 0x2000）。
-    pub const MAX_CMDLINE_BYTES: usize = 4096;
+    pub const MAX_CMDLINE_BYTES: usize = klib::abi_generated::MAX_CMDLINE_BYTES;
 
     /// 环境块容量上限（字节：所有 env 串长度 + 各自 NUL 之和）——**单点定义**。
     ///
@@ -348,7 +348,7 @@ pub(crate) mod raw {
     pub const MAX_ENV_BYTES: usize = 4096;
 
     /// 环境变量条数上限（envp 槽位数）——单点定义。
-    pub const MAX_ENV_COUNT: usize = 64;
+    pub const MAX_ENV_COUNT: usize = klib::abi_generated::MAX_ENV_COUNT;
 
     /// 程序名（`AT_EXECFN` 槽的值来源）长度上限（字节，**不含** NUL）——单点定义。
     ///
@@ -357,10 +357,10 @@ pub(crate) mod raw {
     pub const MAX_PROG_NAME_BYTES: usize = 256;
 
     /// auxv 槽类型：可执行文件名（与 Linux 的 `AT_EXECFN` 同值 31）。
-    pub const AT_EXECFN: u64 = 31;
+    pub const AT_EXECFN: u64 = klib::abi_generated::AT_EXECFN;
 
     /// auxv 终结槽类型（值恒 0）。
-    pub const AT_NULL: u64 = 0;
+    pub const AT_NULL: u64 = klib::abi_generated::AT_NULL;
 
     // ---------- 动态链接所需的 auxv 槽（阶段 5 / 3P5-1）----------
     //

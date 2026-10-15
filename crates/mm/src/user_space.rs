@@ -2362,12 +2362,12 @@ where
 }
 
 /// `mmap` 的 `prot` 位（3P4-4）。**单点定义**：内核 syscall 层与 libsys 共用同一编号。
-pub const PROT_READ: u64 = 1 << 0;
-pub const PROT_WRITE: u64 = 1 << 1;
-pub const PROT_EXEC: u64 = 1 << 2;
+pub const PROT_READ: u64 = klib::abi_generated::PROT_READ;
+pub const PROT_WRITE: u64 = klib::abi_generated::PROT_WRITE;
+pub const PROT_EXEC: u64 = klib::abi_generated::PROT_EXEC;
 /// `prot == 0` 的历史语义：早期 wire 未使用该参数，调用方一律传 0 → 解释为 RW
 /// （保持既有调用方行为不变；新代码应显式传 PROT_READ|PROT_WRITE）。
-pub const PROT_DEFAULT: u64 = PROT_READ | PROT_WRITE;
+pub const PROT_DEFAULT: u64 = klib::abi_generated::PROT_DEFAULT;
 
 /// 由 `prot` 位构造映射权限，并在**唯一入口**拒绝 W+X（3P4-4）。
 ///

@@ -152,20 +152,20 @@ pub struct AceWire {
 }
 
 /// 单条 wire ACE 的字节大小（双侧断言用）。
-pub const ACE_WIRE_SIZE: usize = 24;
+pub const ACE_WIRE_SIZE: usize = klib::abi_generated::ACE_WIRE_SIZE;
 
 /// 一次 ACE 传输允许的**最大条数**（定长数组上界）。
 ///
 /// 取值理由：ACE 是「按主体授权」的精细表达，实际策略规模在个位数～十几条；
 /// 64 条（1536 字节）已远超真实需要，同时把单次系统调用拷贝量钉在可控范围
 /// （ADR-018 用户缓冲上限之内），避免用户态以「超大 ACE 表」制造资源压力。
-pub const ACE_WIRE_MAX: usize = 64;
+pub const ACE_WIRE_MAX: usize = klib::abi_generated::ACE_WIRE_MAX;
 
 /// wire 主体类别编码（与 `AceWire::principal_kind` 同点定义，S13）。
-pub const ACE_PRINCIPAL_OWNER: u32 = 0;
-pub const ACE_PRINCIPAL_NAMED_UID: u32 = 1;
-pub const ACE_PRINCIPAL_NAMED_GID: u32 = 2;
-pub const ACE_PRINCIPAL_OTHER: u32 = 3;
+pub const ACE_PRINCIPAL_OWNER: u32 = klib::abi_generated::ACE_PRINCIPAL_OWNER;
+pub const ACE_PRINCIPAL_NAMED_UID: u32 = klib::abi_generated::ACE_PRINCIPAL_NAMED_UID;
+pub const ACE_PRINCIPAL_NAMED_GID: u32 = klib::abi_generated::ACE_PRINCIPAL_NAMED_GID;
+pub const ACE_PRINCIPAL_OTHER: u32 = klib::abi_generated::ACE_PRINCIPAL_OTHER;
 
 impl AceWire {
     /// wire → [`Ace`]。**严格校验**：未知主体类别 / 越界权限位 / 非 0 保留位 /
@@ -248,7 +248,7 @@ impl AceWire {
 /// 三段（bit0..8）冲突。A1-1 起门禁位迁至 bit9；旧 bit3 在 >`0o7` 输入下
 /// 按 classic group 段位解读（现网无发送方——libsys `system_only` 恒
 /// `false`，见各调用点）。门禁语义与强制点不变（open/exec）。
-pub const GATE_SYSTEM_BIT: u32 = 1 << 9;
+pub const GATE_SYSTEM_BIT: u32 = klib::abi_generated::GATE_SYSTEM_BIT;
 
 /// 访问主体视图（vfs 侧借用形态）。
 ///

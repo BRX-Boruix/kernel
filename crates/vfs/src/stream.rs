@@ -40,7 +40,7 @@ use spin::RwLock;
 
 /// 事件记录定长（ADR-047 §2.1 布局；与 `arch_x86_64::keyboard` 侧一致，
 /// 相等性由 kernel 自检断言——vfs 看不见 arch，单点重述 + 测试闭合）。
-pub const EVENT_RECORD_SIZE: usize = 16;
+pub const EVENT_RECORD_SIZE: usize = klib::abi_generated::EVENT_RECORD_SIZE;
 
 /// 游标：单调递增的记录序号（wrapping），与内核环 EVQ_WRITE/READ 同语义。
 type Cursor = u64;

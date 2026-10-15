@@ -126,7 +126,7 @@ pub const SYS_STREAM_READ: u32 = crate::abi_generated::SYS_STREAM_READ;
 ///
 /// `a5` 此前**恒为 0**（`libsys::read`/`pread` 都传 0），故 `0` 保持既有
 /// **阻塞**语义逐位不变——即「安全侧默认」（S17）。
-pub const STREAM_READ_NONBLOCK: u64 = 1;
+pub const STREAM_READ_NONBLOCK: u64 = klib::abi_generated::STREAM_READ_NONBLOCK;
 
 /// `SYS_STREAM_READ` 的 `a5` 标志位：**预览（不消费）**（§6.12.5）。
 ///
@@ -137,7 +137,7 @@ pub const STREAM_READ_NONBLOCK: u64 = 1;
 /// 探键只想知道「下一个是不是 `^C`」。若只能取走才能看，
 /// 那么属于子进程的普通按键就会被静默丢弃。
 /// 实测：`/programs/spinburn.elf` 变成 `/prams/spinburn.elf`（`o`/`g` 丢失）。
-pub const STREAM_READ_PEEK: u64 = 2;
+pub const STREAM_READ_PEEK: u64 = klib::abi_generated::STREAM_READ_PEEK;
 
 /// `SYS_STREAM_READ` 的 `a5` 是否要求**预览**（S13 单点判定）。
 #[inline]
@@ -234,7 +234,7 @@ pub const SYS_MEMORY_MAP: u32 = crate::abi_generated::SYS_MEMORY_MAP;
 
 /// SYS_MEMORY_MAP `flags` 位：新建共享内存对象并映射（ADR-014 §4.2，旧
 /// SYS_SHM_CREATE 合并路径；`shared_id` 参数置 0 走本路径）。
-pub const MEM_MAP_SHARED: u64 = 1 << 0;
+pub const MEM_MAP_SHARED: u64 = klib::abi_generated::MEM_MAP_SHARED;
 
 /// PIE（ET_DYN）程序的装载基址（3P4-6）。
 ///
@@ -337,7 +337,7 @@ pub const SYS_TASK_IDENTITY_SET: u32 = crate::abi_generated::SYS_TASK_IDENTITY_S
 
 /// `SYS_TASK_IDENTITY_SET` 的保留参数（`a3`）唯一合法取值。
 /// 用命名常量而非字面量 0，使"保留位"是一处成文语义而非魔法值（S13）。
-pub const IDENTITY_SET_RESERVED_NONE: u64 = 0;
+pub const IDENTITY_SET_RESERVED_NONE: u64 = klib::abi_generated::IDENTITY_SET_RESERVED_NONE;
 
 /// `SYS_TASK_GROUPS_SET`（A2-4 / TASK 域扩展动词 0x0D = 0x3D）：设置调用进程组的
 /// **补充组集合**。
@@ -356,13 +356,13 @@ pub const IDENTITY_SET_RESERVED_NONE: u64 = 0;
 pub const SYS_TASK_GROUPS_SET: u32 = crate::abi_generated::SYS_TASK_GROUPS_SET;
 
 /// `SYS_TASK_GROUPS_SET` 的保留参数（`a3`）唯一合法取值。
-pub const GROUPS_SET_RESERVED_NONE: u64 = 0;
+pub const GROUPS_SET_RESERVED_NONE: u64 = klib::abi_generated::GROUPS_SET_RESERVED_NONE;
 
 /// `SYS_TASK_GROUPS_SET` 的 `a4`：以 `a1`/`a2` 给定的集合**整体替换**当前补充组。
-pub const GROUPS_SET_REPLACE: u64 = 0;
+pub const GROUPS_SET_REPLACE: u64 = klib::abi_generated::GROUPS_SET_REPLACE;
 
 /// `SYS_TASK_GROUPS_SET` 的 `a4`：清空补充组（此时 `a1`/`a2` 必须为 0）。
-pub const GROUPS_SET_CLEAR: u64 = 1;
+pub const GROUPS_SET_CLEAR: u64 = klib::abi_generated::GROUPS_SET_CLEAR;
 
 /// `SYS_TASK_GROUPS_GET`（TASK 域扩展动词 0x0E = 0x3E）：查询调用进程组的**补充组集合**。
 ///
@@ -394,15 +394,15 @@ pub const SYS_TASK_GROUPS_GET: u32 = crate::abi_generated::SYS_TASK_GROUPS_GET;
 pub const SYS_TASK_NICE: u32 = crate::abi_generated::SYS_TASK_NICE;
 
 /// [`SYS_TASK_NICE`] 的 `a1`：查询。
-pub const NICE_GET: u64 = 0;
+pub const NICE_GET: u64 = klib::abi_generated::NICE_GET;
 /// [`SYS_TASK_NICE`] 的 `a1`：设置。
-pub const NICE_SET: u64 = 1;
+pub const NICE_SET: u64 = klib::abi_generated::NICE_SET;
 /// nice 值域下界（与 `sched_eevdf` 的权重表一致）。
 pub const NICE_MIN: i32 = -20;
 /// nice 值域上界。
 pub const NICE_MAX: i32 = 19;
 /// 返回编码偏移：`nice + NICE_BIAS` ⇒ 0..=39（见 [`SYS_TASK_NICE`] 的说明）。
-pub const NICE_BIAS: i32 = 20;
+pub const NICE_BIAS: i32 = klib::abi_generated::NICE_BIAS;
 
 /// `SYS_TASK_GROUPS_SET` 的 ABI 结果结构（A2-4）：回传**实际生效**的补充组，
 /// 使调用方无需再次查询即可确知结果（超限时也能看清发生了如实拒绝）。
@@ -446,7 +446,7 @@ const _: () = {
 ///
 /// 首期只接受 [`DERIVE_FLAGS_NONE`]；任何其它位如实 `InvalidParam`。
 /// 用命名常量而非字面量 0，使「保留位」是一处成文的语义而非魔法值（S13）。
-pub const DERIVE_FLAGS_NONE: u64 = 0;
+pub const DERIVE_FLAGS_NONE: u64 = klib::abi_generated::DERIVE_FLAGS_NONE;
 
 pub const SYS_ENTRY_CREATE: u32 = crate::abi_generated::SYS_ENTRY_CREATE;
 pub const SYS_ENTRY_READ: u32 = crate::abi_generated::SYS_ENTRY_READ;
@@ -484,17 +484,17 @@ pub const SYS_ENTRY_READLINK: u32 = crate::abi_generated::SYS_ENTRY_READLINK;
 // ---------- SYS_ENTRY_READ kind 编码（stat 技术报告）----------
 /// readdir 模式（默认）：a4=0，输出 JSON 目录项列表。
 #[allow(dead_code)] // 默认值 0，与 libsys 同名常量保持对齐（读取目录模式隐式）
-pub const ENTRY_READ_READDIR: u64 = 0;
+pub const ENTRY_READ_READDIR: u64 = klib::abi_generated::ENTRY_READ_READDIR;
 /// stat 模式：a4=1，解析路径后把节点元数据以 `StatInfo` 定长结构写入用户缓冲（a2）。
-pub const ENTRY_READ_STAT: u64 = 1;
+pub const ENTRY_READ_STAT: u64 = klib::abi_generated::ENTRY_READ_STAT;
 
 // ---------- SYS_ENTRY_UPDATE 动作编码（a4 区分 rename/chmod/chown）----------
 /// rename（默认）：a4=0，a1=old_path, a2=new_path。
-pub const ENTRY_UPDATE_RENAME: u64 = 0;
+pub const ENTRY_UPDATE_RENAME: u64 = klib::abi_generated::ENTRY_UPDATE_RENAME;
 /// chmod：a4=1，a1=path, a2=mode_bits（classic 9 位 + 门禁 bit9 编码）。
-pub const ENTRY_UPDATE_CHMOD: u64 = 1;
+pub const ENTRY_UPDATE_CHMOD: u64 = klib::abi_generated::ENTRY_UPDATE_CHMOD;
 /// chown（A1-7 / ADR-014「更新节点元数据」）：a4=2，a1=path, a2=uid, a3=gid。
-pub const ENTRY_UPDATE_CHOWN: u64 = 2;
+pub const ENTRY_UPDATE_CHOWN: u64 = klib::abi_generated::ENTRY_UPDATE_CHOWN;
 /// A2-6 / ADR-040 §3.5.1 G4：`ENTRY_UPDATE` 动作 3 —— **设置显式 ACE 列表**。
 ///
 /// 参数：`a1=path_ptr`、`a2=aces_ptr`（指向用户态 `[AceWire; n]` 定长数组）、
@@ -502,7 +502,7 @@ pub const ENTRY_UPDATE_CHOWN: u64 = 2;
 /// 整表替换语义（与 chmod 的"写门径"同类）：`count=0` 即清空。
 /// **不**改 classic 三段、**不**改属主、**不**改门禁位——与 `with_classic_mode`
 /// 同一纪律（只改本动作负责的那一维）。
-pub const ENTRY_UPDATE_SET_ACES: u64 = 3;
+pub const ENTRY_UPDATE_SET_ACES: u64 = klib::abi_generated::ENTRY_UPDATE_SET_ACES;
 
 /// A2-6：`ENTRY_READ` 子动作 —— **读取节点显式 ACE 列表**。
 ///
@@ -510,13 +510,13 @@ pub const ENTRY_UPDATE_SET_ACES: u64 = 3;
 /// （调用方容量，0 合法——用于**探测条数**）、`a4=ENTRY_READ_ACES`。
 /// 返回：成功时为**写入的条数**（`<= cap`）；若节点 ACE 数 > `cap` 则
 /// 返回 `Error::NoSpace`（**不**截断——截断会让用户态误以为拿到了全部策略）。
-pub const ENTRY_READ_ACES: u64 = 2;
+pub const ENTRY_READ_ACES: u64 = klib::abi_generated::ENTRY_READ_ACES;
 
 // ---------- SYS_ENTRY_CREATE kind 编码（ADR-014 §4.4，与 INodeType 对齐）----------
 /// 创建普通文件（kind=REG/FILE）。
-pub const ENTRY_KIND_FILE: u64 = 1;
+pub const ENTRY_KIND_FILE: u64 = klib::abi_generated::ENTRY_KIND_FILE;
 /// 创建目录（kind=DIR/DIRECTORY）。
-pub const ENTRY_KIND_DIRECTORY: u64 = 0;
+pub const ENTRY_KIND_DIRECTORY: u64 = klib::abi_generated::ENTRY_KIND_DIRECTORY;
 /// 创建符号链接（kind=LINK/SYMLINK）。
 pub const ENTRY_KIND_SYMLINK: u64 = 2;
 /// 创建命名管道（kind=FIFO）。
