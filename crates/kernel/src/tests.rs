@@ -8923,7 +8923,7 @@ pub fn test_driver_dma_buf() {
     fn frame(nr: u32, a1: u64) -> SyscallFrame {
         SyscallFrame {
             nr: nr as u64,
-            a1, a2: 0, a3: 0, a4: 0, a5: 0,
+            a1, a2: 0, a3: 0, a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0, aux_pid: 0,
         }
     }
@@ -10369,7 +10369,7 @@ pub fn test_identity_set_and_query() {
     fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
         SyscallFrame {
             nr: nr as u64,
-            a1, a2, a3, a4: 0, a5: 0,
+            a1, a2, a3, a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0, aux_pid: 0,
         }
     }
@@ -10516,7 +10516,7 @@ pub fn test_volume_domain_cap_gate() {
     fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
         SyscallFrame {
             nr: nr as u64,
-            a1, a2, a3, a4: 0, a5: 0,
+            a1, a2, a3, a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0, aux_pid: 0,
         }
     }
@@ -10628,7 +10628,7 @@ pub fn test_ace_inheritance_e2e() {
     fn frame(nr: u32, a1: u64, a2: u64, a3: u64) -> SyscallFrame {
         SyscallFrame {
             nr: nr as u64,
-            a1, a2, a3, a4: 0, a5: 0,
+            a1, a2, a3, a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0, aux_pid: 0,
         }
     }
