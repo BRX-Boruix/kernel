@@ -4177,11 +4177,11 @@ pub fn test_vfs_m61() {
     root.create_file("/scratch/trash/item1", AccessPolicy::all().classic_mode(), (0, 0))
         .expect("create trash item");
     assert!(
-        root.unlink("/scratch/trash").is_err(),
+        root.unlink("/scratch/trash", vfs::inode::DeleteMode::Any).is_err(),
         "non-empty dir cannot be unlinked"
     );
-    root.unlink("/scratch/trash/item1").expect("unlink item");
-    root.unlink("/scratch/trash").expect("unlink empty dir");
+    root.unlink("/scratch/trash/item1", vfs::inode::DeleteMode::Any).expect("unlink item");
+    root.unlink("/scratch/trash", vfs::inode::DeleteMode::Any).expect("unlink empty dir");
 
     info!("[test-vfs-m61] PASS");
 }
@@ -5286,7 +5286,7 @@ pub fn test_syscall_seq_large_io() {
     }
     {
         let root = crate::vfs_init::root();
-        root.unlink("/scratch/large_seq.bin")
+        root.unlink("/scratch/large_seq.bin", vfs::inode::DeleteMode::Any)
             .expect("[test-syscall-seq-large] cleanup unlink");
     }
 
@@ -7336,7 +7336,7 @@ pub fn test_vfs_m65() {
         .expect("ramfs handle metadata is infallible");
 
     // 删除路径条目
-    root.unlink(unlinked_path).expect("unlink open file");
+    root.unlink(unlinked_path, vfs::inode::DeleteMode::Any).expect("unlink open file");
     assert!(
         root.resolve(unlinked_path, true).is_err(),
         "path must no longer resolve"
@@ -10649,8 +10649,8 @@ pub fn test_ace_inheritance_e2e() {
 
     let root = crate::vfs_init::root();
     // 清理可能残留（测试可能重跑）。
-    let _ = root.unlink("/scratch/a2_8_dir/a2_8_f.txt");
-    let _ = root.unlink("/scratch/a2_8_dir");
+    let _ = root.unlink("/scratch/a2_8_dir/a2_8_f.txt", vfs::inode::DeleteMode::Any);
+    let _ = root.unlink("/scratch/a2_8_dir", vfs::inode::DeleteMode::Any);
 
     // ---- 1. 建父目录，并植入"带 inherit 的 deny ACE" ----
     let parent = root
@@ -10742,8 +10742,8 @@ pub fn test_ace_inheritance_e2e() {
     info!("[test-ace-inherit] parent policy untouched OK");
 
     // 清理
-    let _ = root.unlink("/scratch/a2_8_dir/a2_8_f.txt");
-    let _ = root.unlink("/scratch/a2_8_dir");
+    let _ = root.unlink("/scratch/a2_8_dir/a2_8_f.txt", vfs::inode::DeleteMode::Any);
+    let _ = root.unlink("/scratch/a2_8_dir", vfs::inode::DeleteMode::Any);
 
     task::clear_current_proc();
     arch_x86_64::mmio::write_cr3(saved_cr3);
@@ -10795,7 +10795,7 @@ pub fn test_chown_preserves_explicit_aces() {
     task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
 
     let root = crate::vfs_init::root();
-    let _ = root.unlink("/scratch/a2_6_chown.txt");
+    let _ = root.unlink("/scratch/a2_6_chown.txt", vfs::inode::DeleteMode::Any);
     let node = root
         .create_file("/scratch/a2_6_chown.txt", 0o644, (1, 1))
         .expect("create fixture");
@@ -10891,7 +10891,7 @@ pub fn test_chown_preserves_explicit_aces() {
     );
     info!("[test-chown-ace] explicit ACE preserved across chmod OK");
 
-    let _ = root.unlink("/scratch/a2_6_chown.txt");
+    let _ = root.unlink("/scratch/a2_6_chown.txt", vfs::inode::DeleteMode::Any);
     task::clear_current_proc();
     arch_x86_64::mmio::write_cr3(saved_cr3);
     arch_x86_64::interrupts::irq_restore(irq_flags);
@@ -10942,7 +10942,7 @@ pub fn test_ace_abi_roundtrip() {
     task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
 
     let root = crate::vfs_init::root();
-    let _ = root.unlink("/scratch/a2_6_abi.txt");
+    let _ = root.unlink("/scratch/a2_6_abi.txt", vfs::inode::DeleteMode::Any);
     let _ = root.create_file("/scratch/a2_6_abi.txt", 0o644, (1, 1)).expect("fixture");
 
     // 两块用户缓冲：路径 + ACE 数组。
@@ -11058,7 +11058,7 @@ pub fn test_ace_abi_roundtrip() {
     assert_eq!(over.result, (-(klib::error::Error::InvalidParam.to_errno() as i64)) as u64, "count > ACE_WIRE_MAX must be rejected");
     info!("[test-ace-abi] oversized count rejected OK");
 
-    let _ = root.unlink("/scratch/a2_6_abi.txt");
+    let _ = root.unlink("/scratch/a2_6_abi.txt", vfs::inode::DeleteMode::Any);
     task::clear_current_proc();
     arch_x86_64::mmio::write_cr3(saved_cr3);
     arch_x86_64::interrupts::irq_restore(irq_flags);
@@ -11232,8 +11232,8 @@ pub fn test_dir_traverse_execute_check() {
     task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
 
     let root = crate::vfs_init::root();
-    let _ = root.unlink("/scratch/a2_3_dir/a2_3_f.txt");
-    let _ = root.unlink("/scratch/a2_3_dir");
+    let _ = root.unlink("/scratch/a2_3_dir/a2_3_f.txt", vfs::inode::DeleteMode::Any);
+    let _ = root.unlink("/scratch/a2_3_dir", vfs::inode::DeleteMode::Any);
     // 目录 mode 0700（属主 rwx，**other 无 x**）——用于验证非属主无法穿越。
     let dir = root.mkdir("/scratch/a2_3_dir", 0o700, (1, 1)).expect("mk dir");
     root.create_file("/scratch/a2_3_dir/a2_3_f.txt", 0o644, (1, 1)).expect("mk file");
@@ -11294,9 +11294,9 @@ pub fn test_dir_traverse_execute_check() {
     // ---- 4. 多级路径：**中间**目录缺 x 即拦（证明逐级生效，非只看直接父目录）----
     //   结构：/scratch/a2_3_out(0755, 有 x) / a2_3_in(0700 无 other-x) / f2(0644)。
     //   非属主应被中间的 a2_3_in 拦住——即使直接父目录 a2_3_out 有 x。
-    let _ = root.unlink("/scratch/a2_3_out/a2_3_in/a2_3_f2.txt");
-    let _ = root.unlink("/scratch/a2_3_out/a2_3_in");
-    let _ = root.unlink("/scratch/a2_3_out");
+    let _ = root.unlink("/scratch/a2_3_out/a2_3_in/a2_3_f2.txt", vfs::inode::DeleteMode::Any);
+    let _ = root.unlink("/scratch/a2_3_out/a2_3_in", vfs::inode::DeleteMode::Any);
+    let _ = root.unlink("/scratch/a2_3_out", vfs::inode::DeleteMode::Any);
     let _out2 = root.mkdir("/scratch/a2_3_out", 0o755, (1, 1)).expect("mk out");
     let _in2 = root.mkdir("/scratch/a2_3_out/a2_3_in", 0o700, (1, 1)).expect("mk in");
     root.create_file("/scratch/a2_3_out/a2_3_in/a2_3_f2.txt", 0o644, (1, 1)).expect("mk f2");
@@ -11328,11 +11328,11 @@ pub fn test_dir_traverse_execute_check() {
 
     // 清理
     task::current_proc_mut().expect("proc").set_identity(ProcessIdentity::system(1));
-    let _ = root.unlink("/scratch/a2_3_out/a2_3_in/a2_3_f2.txt");
-    let _ = root.unlink("/scratch/a2_3_out/a2_3_in");
-    let _ = root.unlink("/scratch/a2_3_out");
-    let _ = root.unlink("/scratch/a2_3_dir/a2_3_f.txt");
-    let _ = root.unlink("/scratch/a2_3_dir");
+    let _ = root.unlink("/scratch/a2_3_out/a2_3_in/a2_3_f2.txt", vfs::inode::DeleteMode::Any);
+    let _ = root.unlink("/scratch/a2_3_out/a2_3_in", vfs::inode::DeleteMode::Any);
+    let _ = root.unlink("/scratch/a2_3_out", vfs::inode::DeleteMode::Any);
+    let _ = root.unlink("/scratch/a2_3_dir/a2_3_f.txt", vfs::inode::DeleteMode::Any);
+    let _ = root.unlink("/scratch/a2_3_dir", vfs::inode::DeleteMode::Any);
     task::clear_current_proc();
     arch_x86_64::mmio::write_cr3(saved_cr3);
     arch_x86_64::interrupts::irq_restore(irq_flags);
@@ -15937,13 +15937,13 @@ pub fn test_cap_system_gate() {
     }
     {
         let root = crate::vfs_init::root();
-        root.unlink("/scratch/perm_sysonly.txt").expect("cleanup unlink sysonly");
-        root.unlink("/scratch/perm_normal.txt").expect("cleanup unlink normal");
+        root.unlink("/scratch/perm_sysonly.txt", vfs::inode::DeleteMode::Any).expect("cleanup unlink sysonly");
+        root.unlink("/scratch/perm_normal.txt", vfs::inode::DeleteMode::Any).expect("cleanup unlink normal");
         // A1-1 测试 4：创建通道不再拒绝，节点真实存在——如实清理。
-        root.unlink("/scratch/perm_user_create_sysonly.txt")
+        root.unlink("/scratch/perm_user_create_sysonly.txt", vfs::inode::DeleteMode::Any)
             .expect("cleanup unlink user-created node");
         // A1-6 步骤 2b 的属主门禁夹具。
-        root.unlink("/scratch/perm_gate_ownonly.txt")
+        root.unlink("/scratch/perm_gate_ownonly.txt", vfs::inode::DeleteMode::Any)
             .expect("cleanup unlink owner-gate fixture");
     }
 
@@ -16288,10 +16288,10 @@ pub fn test_access_enforcement_matrix() {
     // ---- 清理：直接 VFS（CAP 通道，不经 syscall 强制面）----
     {
         let root = crate::vfs_init::root();
-        let _ = root.unlink("/scratch/a3_f0644.txt");
-        let _ = root.unlink("/scratch/a3_f0400.txt");
-        let _ = root.unlink("/scratch/a3_d0700");
-        let _ = root.unlink("/scratch/a3_nox.elf");
+        let _ = root.unlink("/scratch/a3_f0644.txt", vfs::inode::DeleteMode::Any);
+        let _ = root.unlink("/scratch/a3_f0400.txt", vfs::inode::DeleteMode::Any);
+        let _ = root.unlink("/scratch/a3_d0700", vfs::inode::DeleteMode::Any);
+        let _ = root.unlink("/scratch/a3_nox.elf", vfs::inode::DeleteMode::Any);
     }
 
     arch_x86_64::mmio::write_cr3(saved_cr3);
@@ -16545,8 +16545,8 @@ pub fn test_stat_owner_fields() {
     // 清理（CAP 通道）。
     {
         let root = crate::vfs_init::root();
-        let _ = root.unlink("/scratch/a4_owner.txt");
-        let _ = root.unlink("/scratch/a4_zero.txt");
+        let _ = root.unlink("/scratch/a4_owner.txt", vfs::inode::DeleteMode::Any);
+        let _ = root.unlink("/scratch/a4_zero.txt", vfs::inode::DeleteMode::Any);
     }
 
     arch_x86_64::mmio::write_cr3(saved_cr3);
@@ -16702,7 +16702,7 @@ pub fn test_chown_e2e() {
     info!("[test-chown-e2e] CAP_SYSTEM chown then stat reads real owner OK");
 
     // 清理（CAP 通道）。
-    let _ = root.unlink("/scratch/a7_node.txt");
+    let _ = root.unlink("/scratch/a7_node.txt", vfs::inode::DeleteMode::Any);
 
     arch_x86_64::mmio::write_cr3(saved_cr3);
     task::clear_current_proc();
@@ -16920,7 +16920,7 @@ pub fn test_ace_e2e() {
     );
 
     // 清理（CAP 通道）。
-    let _ = root.unlink("/scratch/a9_home.txt");
+    let _ = root.unlink("/scratch/a9_home.txt", vfs::inode::DeleteMode::Any);
 
     arch_x86_64::mmio::write_cr3(saved_cr3);
     task::clear_current_proc();
@@ -18085,7 +18085,7 @@ pub fn test_groups_and_named_gid() {
     //   → 未加入 4242：NamedGid 不命中，落到 Other deny → 拒绝；
     //   → 加入 4242 后：NamedGid 命中 allow → 通过。
     let root = crate::vfs_init::root();
-    let _ = root.unlink("/scratch/a2_4_gfile");
+    let _ = root.unlink("/scratch/a2_4_gfile", vfs::inode::DeleteMode::Any);
     let node = root.create_file("/scratch/a2_4_gfile", 0o000, (1000, 1000))
         .expect("create A2-4 fixture file");
     let aces = alloc::vec![
@@ -18107,7 +18107,7 @@ pub fn test_groups_and_named_gid() {
     info!("[test-groups] NamedGid(4242): non-member denied / member allowed (real effect) OK");
 
     // 清理与还原。
-    let _ = root.unlink("/scratch/a2_4_gfile");
+    let _ = root.unlink("/scratch/a2_4_gfile", vfs::inode::DeleteMode::Any);
     task::clear_current_proc();
     arch_x86_64::mmio::write_cr3(saved_cr3);
     arch_x86_64::interrupts::irq_restore(irq_flags);
@@ -18153,7 +18153,7 @@ pub fn test_shadow_file_separation() {
     // 夹具：shadow 式文件 —— 0600、属主 (0,0)。
     let root = crate::vfs_init::root();
     let shadow_path = "/config/shadow.json";
-    let _ = root.unlink(shadow_path);
+    let _ = root.unlink(shadow_path, vfs::inode::DeleteMode::Any);
     let node = root
         .create_file(shadow_path, 0o600, (0, 0))
         .expect("create shadow fixture");
@@ -18261,7 +18261,7 @@ pub fn test_shadow_file_separation() {
     );
 
     // 清理与还原。
-    let _ = root.unlink(shadow_path);
+    let _ = root.unlink(shadow_path, vfs::inode::DeleteMode::Any);
     task::clear_current_proc();
     arch_x86_64::mmio::write_cr3(saved_cr3);
     arch_x86_64::interrupts::irq_restore(irq_flags);
@@ -18316,7 +18316,7 @@ pub fn test_login_capability_set() {
     // 夹具：shadow 文件（0600 / 属主 0,0）。
     let root = crate::vfs_init::root();
     let shadow_path = "/config/shadow.json";
-    let _ = root.unlink(shadow_path);
+    let _ = root.unlink(shadow_path, vfs::inode::DeleteMode::Any);
     let node = root
         .create_file(shadow_path, 0o600, (0, 0))
         .expect("create shadow fixture");
@@ -18417,7 +18417,7 @@ pub fn test_login_capability_set() {
     info!("[test-login-cap] DECISION: login = uid 0, gid 0, caps = CAP_KILL");
     info!("[test-login-cap]   reads shadow via owner match; holds no bypass; unkillable by users");
 
-    let _ = root.unlink(shadow_path);
+    let _ = root.unlink(shadow_path, vfs::inode::DeleteMode::Any);
     task::clear_current_proc();
     arch_x86_64::mmio::write_cr3(saved_cr3);
     arch_x86_64::interrupts::irq_restore(irq_flags);
@@ -18476,7 +18476,7 @@ pub fn test_login_downgrade_path() {
 
     let root = crate::vfs_init::root();
     let shadow_path = "/config/shadow.json";
-    let _ = root.unlink(shadow_path);
+    let _ = root.unlink(shadow_path, vfs::inode::DeleteMode::Any);
     let node = root
         .create_file(shadow_path, 0o600, (0, 0))
         .expect("create shadow fixture");
@@ -18590,7 +18590,7 @@ pub fn test_login_downgrade_path() {
     assert_eq!(now().uid, 1000, "A2-7: unprivileged identity must be unchanged");
     info!("[test-login-drop] (4) verified: no escalation without CAP_SYSTEM OK");
 
-    let _ = root.unlink(shadow_path);
+    let _ = root.unlink(shadow_path, vfs::inode::DeleteMode::Any);
     task::clear_current_proc();
     arch_x86_64::mmio::write_cr3(saved_cr3);
     arch_x86_64::interrupts::irq_restore(irq_flags);

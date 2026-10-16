@@ -1982,18 +1982,19 @@ where
             a
         };
 
-        // 第一遍：**先完整校验**所有页都已映射，任何未映射页在动页表前失败。
+        // **不再要求「每页都已映射」**（语义忠实性审查：POSIX 的 mprotect 改的是**映射的
+        // 权限**，与页是否已驻留无关）。此前这里先扫一遍、任何未映射页直接 NotFound ⇒
+        // 「对从未触碰过的 mmap 区 mprotect」在本该成功时报 ENOENT。
+        //
+        // 未驻留页的**新权限由函数末尾的区域记账生效**（区间被切成三段，中段带新 flags）
+        // ⇒ 该页首次触碰时按新权限提交。故下面逐页只处理**已驻留**的页。
         let mut vaddr = start;
         while vaddr < end {
+            // 未驻留：跳过（不是错误）。
             if core.pt.translate(VirtAddr::new(vaddr)).is_none() {
-                return Err(Error::NotFound.into());
+                vaddr += PAGE_SIZE;
+                continue;
             }
-            vaddr += PAGE_SIZE;
-        }
-
-        // 第二遍：逐页同帧 remap（unmap → 跨核失效 → map 新权限）。
-        vaddr = start;
-        while vaddr < end {
             let phys = core
                 .pt
                 .unmap(VirtAddr::new(vaddr))

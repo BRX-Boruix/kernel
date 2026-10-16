@@ -827,6 +827,18 @@ pub fn spawn_derived(
     // cwd + 默认身份），随后逐项注入从父快照来的 fd/cwd/identity —— 这正是
     // 「新组 + 深拷贝共享态」与线程「同组 + Arc 共享」的关键区别：子进程改 cwd
     // 或关 fd **不影响父**（POSIX fork 语义），而线程会互相影响。
+    //
+    // **子进程将继承的 pipe 端**（3P4-3b）：必须在 `fd_table` 被 move 进子进程**之前**
+    // 列出来，增记动作放在「子进程确实在册」之后（见函数末尾），这样前面任何失败路径
+    // 都不必回滚。
+    let inherited_pipes: alloc::vec::Vec<(u64, bool)> = fd_table
+        .iter()
+        .flatten()
+        .filter_map(|h| match h {
+            vfs::file_handle::OpenHandle::Pipe { id, writer, .. } => Some((*id, *writer)),
+            _ => None,
+        })
+        .collect();
     let mut proc = Box::new(Process::<X86PageTable>::new(
         pid,
         first_run_frame.rip,
@@ -843,9 +855,8 @@ pub fn spawn_derived(
     proc.set_cwd(cwd);
     proc.set_identity(identity);
     // 信号（登记项⑩）：**整体继承**父的处置与屏蔽集（POSIX fork），未决/嵌套/备用栈清空
-    // ——见 `inherit_for_child`。
-    // MUTATION: 退回旧行为——只继承 restorer 地址，处置/屏蔽集全丢
-    proc.signal_mut().set_trampoline(inherited_signal.trampoline());
+    // ——见 `inherit_for_child` 的文档。
+    *proc.signal_mut() = inherited_signal;
     let home_cpu = spawn_home_cpu();
     let entry = Box::new(ProcEntry {
         proc,
@@ -872,6 +883,19 @@ pub fn spawn_derived(
     });
     proc_bucket_lock(pid).insert(pid, entry);
     enqueue_ready(&mut run_mut(home_cpu), pid, true);
+    // **同步 pipe 端引用计数**（3P4-3b / POSIX fork 语义）：`clone_fd_table` 只做结构性克隆，
+    // ipc 层的账目不在 task 层维护。**此前这条只在注释里承诺过**（「由 kernel syscall 层在
+    // 本函数返回后对每个 `Pipe { id }` 调 `ipc::pipe_ref_inc`」），而 syscall 层**从未实现** ⇒
+    // 缺口：子进程退出时对每个 pipe 端 `pipe_ref_dec` 会把**父进程仍持有**的管道减到 0
+    // ⇒ 管道被销毁（实测：[ipc] pipe id=4 refcount-destroyed，父进程随后的 read/write
+    // 作用在已销毁对象上）。放在这里是因为账目必须与「子进程在册」同一处（S13 单点：
+    // 拷贝与增记成对），且此后再无失败路径（无需回滚）。
+    for (id, writer) in inherited_pipes {
+        if ipc::pipe_ref_inc(id, writer).is_err() {
+            // 管道已不存在（理论上不可达：父进程持有它的 fd）：如实告警，不 panic。
+            klib::warn!("[derive] inherited pipe id={} vanished on ref_inc", id);
+        }
+    }
     Ok(pid)
 }
 
