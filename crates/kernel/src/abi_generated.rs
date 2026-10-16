@@ -57,6 +57,7 @@ pub const SYS_STREAM_FTRUNCATE: u32 = crate::syscall::domain::STREAM | 0x09; // 
 pub const SYS_STREAM_LOCK: u32 = crate::syscall::domain::STREAM | 0x06; // 0x16
 pub const SYS_STREAM_READ: u32 = crate::syscall::domain::STREAM | crate::syscall::op::READ; // 0x12
 pub const SYS_STREAM_SEEK: u32 = crate::syscall::domain::STREAM | 0x0D; // 0x1D
+pub const SYS_STREAM_FLAGS: u32 = crate::syscall::domain::STREAM | 0x0E; // 0x1E
 pub const SYS_STREAM_WRITE: u32 = crate::syscall::domain::STREAM | crate::syscall::op::WRITE; // 0x13
 pub const SYS_SYNC_CREATE: u32 = crate::syscall::domain::SYNC | crate::syscall::op::CREATE; // 0x71
 pub const SYS_SYNC_DELETE: u32 = crate::syscall::domain::SYNC | crate::syscall::op::DELETE; // 0x74

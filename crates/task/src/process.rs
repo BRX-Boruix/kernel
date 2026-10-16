@@ -598,6 +598,28 @@ impl<PT: PageTable> Process<PT> {
         self.group.fd_table.lock().get(fd)?.clone()
     }
 
+    /// 就地设置指定 fd 的 **CLOEXEC 位**，返回旧值（登记项③：`fcntl(F_SETFD)` 的原语）。
+    ///
+    /// **为什么需要它而不是「`get_fd` → 改 → `set_fd`」**：那三步之间有一把锁的窗口——
+    /// 另一线程可能在此期间关掉或替换该槽位，于是我们会把**一个已失效的句柄**装回去
+    /// （复活一个已关闭的 fd，或覆盖别人刚装上的句柄）。本方法在**同一把 fd 表锁内**
+    /// 完成读-改-写，窗口不存在。
+    ///
+    /// 返回 `Some(旧 cloexec)`；fd 不在册 ⇒ `None`（调用方报 EBADF）。
+    pub fn set_fd_cloexec(&self, fd: usize, cloexec: bool) -> Option<bool> {
+        let mut table = self.group.fd_table.lock();
+        let slot = table.get_mut(fd)?.as_mut()?;
+        let old = match slot {
+            vfs::file_handle::OpenHandle::File(fh) => fh.flags.cloexec,
+            vfs::file_handle::OpenHandle::Pipe { flags, .. } => flags.cloexec,
+        };
+        match slot {
+            vfs::file_handle::OpenHandle::File(fh) => fh.flags.cloexec = cloexec,
+            vfs::file_handle::OpenHandle::Pipe { flags, .. } => flags.cloexec = cloexec,
+        }
+        Some(old)
+    }
+
     /// 关闭并移除指定 fd 句柄（返回被移除的 owned 句柄）。
     ///
     /// S21 闭合（T1-8）：方法改 `&self`。先短持 `fd_table` 锁 `take` 出槽位值并释放

@@ -258,6 +258,14 @@ pub const SYS_MEMORY_GROW: u32 = crate::abi_generated::SYS_MEMORY_GROW;
 /// 实测（2026-10-16）：init 的 `brk`(0x23)` 被派发到 `sys_lseek` ⇒ 返回 0 ⇒ 堆长不大 ⇒ `heap OOM`。
 /// 编译器只给了一条 `unreachable pattern` 警告（淹没在既有 70+ 条警告里）。
 pub const SYS_STREAM_SEEK: u32 = crate::abi_generated::SYS_STREAM_SEEK;
+/// `SYS_STREAM_FLAGS`：查询/设置**每-fd 标志**（登记项③，`fcntl(F_GETFD/F_SETFD)` 的原语）。
+///
+/// **同样必须 re-export**：理由与上一条逐字相同——少了它，match 臂里的同名标识符会变成
+/// 捕获一切的新绑定（`unreachable pattern` 警告是唯一路标）。
+pub const SYS_STREAM_FLAGS: u32 = crate::abi_generated::SYS_STREAM_FLAGS;
+/// `wire.FD_CLOEXEC`：`fcntl(F_GETFD/F_SETFD)` 目前**唯一**的标志位（登记项③）。
+/// 值与 libc 的 C `#define FD_CLOEXEC` 同源（都在 `tools/abi/constants.json`）。
+pub const FD_CLOEXEC: u64 = klib::abi_generated::FD_CLOEXEC;
 pub const SYS_MEMORY_UNMAP: u32 = crate::abi_generated::SYS_MEMORY_UNMAP;
 /// mprotect(addr, len, prot)：修改一段**已映射**内存的权限（MEMORY 域扩展 0x05 / 号 0x25，
 /// 3P4-5）。用途是 W^X 型 JIT 的「先写后切执行」（RW → RX）与「执行后切回写」（RX → RW）。
@@ -1082,6 +1090,46 @@ fn sys_readlink(frame: &mut SyscallFrame) -> u64 {
 ///
 /// 不可定位的 fd（管道端）⇒ `IllegalSeek`（libc 映射 ESPIPE），**且不改变任何状态**——
 /// 一个探测性的 lseek 绝不能把管道用坏。
+/// `stream_flags(fd, mode, flags)`：查询/设置**每-fd 标志**（STREAM 域 op 14，登记项③）。
+///
+/// POSIX `fcntl(F_GETFD/F_SETFD)` 的原语。当前唯一的标志位是 **CLOEXEC**
+/// （值取自 `wire.FD_CLOEXEC`，与 libc 的 C `#define FD_CLOEXEC` 同源）。
+///
+/// 语义归属：**fork 继承、dup/dup2 清除**（后者已在 `sys_dup2` 里实现）——本原语只负责
+/// 「就这个 fd 现在这一份标志」的读与写。
+///
+/// `mode`：0 = 查询（返回标志位），1 = 设置（`flags` 只认 CLOEXEC 位；
+/// 未知位 ⇒ `InvalidParam`，**不静默丢弃**——与 `prot` 的处理同一纪律）。
+fn sys_stream_flags(frame: &mut SyscallFrame) -> u64 {
+    let fd = frame.a1 as usize;
+    let mode = frame.a2;
+    let want = frame.a3;
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    let cloexec_of = |h: &vfs::file_handle::OpenHandle| match h {
+        vfs::file_handle::OpenHandle::File(fh) => fh.flags.cloexec,
+        vfs::file_handle::OpenHandle::Pipe { flags, .. } => flags.cloexec,
+    };
+    match mode {
+        0 => match proc.get_fd(fd) {
+            Some(h) => pack_ok(if cloexec_of(&h) { FD_CLOEXEC } else { 0 }),
+            // 坏 fd ⇒ EBADF（登记项①）。
+            None => pack_err(Error::BadFd),
+        },
+        1 => {
+            if want & !FD_CLOEXEC != 0 {
+                return pack_err(Error::InvalidParam);
+            }
+            match proc.set_fd_cloexec(fd, want & FD_CLOEXEC != 0) {
+                Some(_) => pack_ok(0),
+                None => pack_err(Error::BadFd),
+            }
+        }
+        _ => pack_err(Error::InvalidParam),
+    }
+}
+
 fn sys_lseek(frame: &mut SyscallFrame) -> u64 {
     let fd = frame.a1 as usize;
     let offset = frame.a2 as i64;
@@ -6097,6 +6145,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_STREAM_WRITE => done(sys_write(frame)),
         // 登记项⑨：把「设置位置」变成内核原语（此前 libc 只能在用户态维护位置表）。
         SYS_STREAM_SEEK => done(sys_lseek(frame)),
+        // 登记项③：每-fd 标志（CLOEXEC）的查询/设置原语。
+        SYS_STREAM_FLAGS => done(sys_stream_flags(frame)),
         SYS_STREAM_CLOSE => done(sys_close(frame)),
         SYS_STREAM_DUP => done(sys_dup2(frame)),
         SYS_STREAM_LOCK => done(sys_flock(frame)),

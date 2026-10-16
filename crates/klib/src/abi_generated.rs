@@ -70,6 +70,7 @@ pub const GROUPS_SET_REPLACE: u64 = 0;
 pub const GROUPS_SET_RESERVED_NONE: u64 = 0;
 pub const IDENTITY_SET_RESERVED_NONE: u64 = 0;
 pub const MAX_CMDLINE_BYTES: usize = 4096;
+pub const FD_CLOEXEC: u64 = 1;
 pub const MAX_FDS: usize = 1024;
 pub const MAX_ENV_COUNT: usize = 64;
 pub const MEM_MAP_SHARED: u64 = 1 << 0;
