@@ -933,6 +933,17 @@ where
         let areas = self.areas.lock();
         let area = areas[idx];
 
+        // **PROT_NONE（登记项⑥）：区域不带 user 位 = 「存在但不可访问」，任何访问都必须
+        // 如实拒绝**（返回 false ⇒ 上层投递 SIGSEGV）。
+        //
+        // 为什么必须先判这一条：PROT_NONE 的页在页表里是 present 但不带 user 位，CPU 每次都
+        // 投保护性 #PF；若这里继续往下走「按需提交」，就会**提交 → iretq 重试 → 再 #PF →
+        // 再提交**地死循环（实测：子进程读 PROT_NONE 页后永不返回，只能被 SIGKILL 收场）。
+        // 「不可访问」不是「还没提交」——两者必须分开处置。
+        if !area.flags.is_user() {
+            return false;
+        }
+
         // 校验访问权限：写访问落在不可写区域一律拒绝（语义查询走抽象层
         // PageFlags，不手解位编码——MM6 前半已立的规矩同样适用于本处），
         // 避免"映射出不可写页 → CPU 重试仍写失败 → 再次 #PF → 再分配
@@ -2365,8 +2376,8 @@ where
 pub const PROT_READ: u64 = klib::abi_generated::PROT_READ;
 pub const PROT_WRITE: u64 = klib::abi_generated::PROT_WRITE;
 pub const PROT_EXEC: u64 = klib::abi_generated::PROT_EXEC;
-/// `prot == 0` 的历史语义：早期 wire 未使用该参数，调用方一律传 0 → 解释为 RW
-/// （保持既有调用方行为不变；新代码应显式传 PROT_READ|PROT_WRITE）。
+/// 显式请求「读 + 写」（3 = READ|WRITE）。**要 RW 就传它**——
+/// `prot == 0` 现在是 POSIX 的 **PROT_NONE**，不再是「默认 RW」（见下）。
 pub const PROT_DEFAULT: u64 = klib::abi_generated::PROT_DEFAULT;
 
 /// 由 `prot` 位构造映射权限，并在**唯一入口**拒绝 W+X（3P4-4）。
@@ -2376,9 +2387,21 @@ pub const PROT_DEFAULT: u64 = klib::abi_generated::PROT_DEFAULT;
 /// 则会让调用方以为写成功。两者都是"把失败伪装成成功"（S09），故此处响亮
 /// `InvalidParam`，由调用方如实上抛；未知位同样不静默忽略。
 pub fn map_flags_from_prot(prot: u64) -> Result<PageFlags, Error> {
-    let prot = if prot == 0 { PROT_DEFAULT } else { prot };
     if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return Err(Error::InvalidParam);
+    }
+    // `prot == 0` = POSIX **PROT_NONE**：映射**存在但不可访问**（语义忠实性审查登记项⑥）。
+    //
+    // 表示法：映射保持 present（页表项在册），但**不带 user 位** ⇒ 用户态任何访问都触发
+    // 保护性 #PF（SIGSEGV），而内核仍看得到这段映射（不会被当成「未映射」去走栈增长等路径）。
+    // `PageFlags::empty()` 正是这个意思——present 由映射路径统一置位。
+    //
+    // **历史语义已改**：此前 `prot == 0` 被解释成 `PROT_DEFAULT`（RW），于是
+    // `mmap(len, 0)` 的调用方**拿到一段可写内存**——它要的是「不可访问」（典型用法：guard page），
+    // 却得到了可读可写页。这是把「拒绝访问」伪装成「可以访问」，比不实现更糟（S09）。
+    // 需要 RW 的调用方传 `PROT_DEFAULT`（`libsys::mmap` 已改为显式传它）。
+    if prot == 0 {
+        return Ok(PageFlags::empty());
     }
     let writable = prot & PROT_WRITE != 0;
     let executable = prot & PROT_EXEC != 0;
@@ -2563,9 +2586,20 @@ mod mmap_prot_tests {
     use super::*;
 
     #[test]
-    fn default_prot_is_read_write() {
-        // prot == 0 保持历史语义 = RW（既有调用方一律传 0）。
-        let pf = map_flags_from_prot(0).expect("default");
+    fn prot_none_is_present_but_inaccessible() {
+        // `prot == 0` = POSIX **PROT_NONE**（登记项⑥）：present 但**不带 user 位**
+        // ⇒ 用户态任何访问都触发保护性 #PF。此前这条断言写的是「prot==0 = RW」，
+        // 那正是缺陷本身（要 guard page 的调用方拿到可写内存）。
+        let pf = map_flags_from_prot(0).expect("prot none");
+        assert!(!pf.is_user());
+        assert!(!pf.is_writable());
+        assert!(!pf.is_executable());
+    }
+
+    #[test]
+    fn prot_default_is_read_write() {
+        // 要 RW 就显式传 `PROT_DEFAULT`。
+        let pf = map_flags_from_prot(PROT_DEFAULT).expect("default");
         assert!(pf.is_writable());
         assert!(pf.is_user());
     }

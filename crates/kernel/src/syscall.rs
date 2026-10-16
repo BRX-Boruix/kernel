@@ -3908,8 +3908,8 @@ fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
     let flags = frame.a2;
     let shared_id = frame.a3;
     // 3P4-4：a4 = prot 位。**W^X 单点门禁在 mm 层**（map_flags_from_prot）——
-    // 此处只做一次解码，绝不重复实现策略（S13/S15）。历史调用方一律传 0 →
-    // 由 mm 层解释为 RW（既有行为不变）。
+    // 此处只做一次解码，绝不重复实现策略（S13/S15）。
+    // 登记项⑥ 起 `prot == 0` = POSIX **PROT_NONE**（存在但不可访问）；要 RW 传 `PROT_DEFAULT`。
     let prot = frame.a4;
     let pf = match mm::user_space::map_flags_from_prot(prot) {
         Ok(p) => p,
@@ -3924,10 +3924,9 @@ fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
     // 不再把 shared_id 静默忽略成匿名映射。
     // 共享内存映射的权限目前**固定**为创建时的 RW（shm 对象未记录 prot）——
     // 显式请求非默认权限时如实拒绝，绝不静默忽略（宁缺毋假，S09）。
-    if (shared_id != 0 || flags & MEM_MAP_SHARED != 0)
-        && prot != 0
-        && prot != mm::user_space::PROT_DEFAULT
-    {
+    // **`prot == 0`（PROT_NONE，登记项⑥）同样拒绝**：shm 给不出「不可访问」的映射，
+    // 静默给它 RW 就是伪造（此前 `prot == 0` 在这里被当成「默认」而放行）。
+    if (shared_id != 0 || flags & MEM_MAP_SHARED != 0) && prot != mm::user_space::PROT_DEFAULT {
         return pack_err(Error::NotSupported);
     }
     if shared_id != 0 {
@@ -3969,15 +3968,13 @@ fn sys_mmap(frame: &mut SyscallFrame) -> u64 {
 /// 权限解码与 W^X 门禁**复用 3P4-4 的 mm 层单点**（map_flags_from_prot）——若此处另写
 /// 一份判定，mprotect 就会成为绕过 W^X 的后门（S13：策略只一处）。
 ///
-/// prot == 0（POSIX PROT_NONE）如实 NotSupported：抽象层没有"存在但不可访问"的权限
-/// 表示（PageFlags 只有可写/可执行/用户位，无"不可读"位），拒绝而不是假装成只读。
+/// prot == 0（POSIX **PROT_NONE**）**已支持**（语义忠实性审查登记项⑥）：映射保留为
+/// present 但**不带 user 位** ⇒ 用户态任何访问都触发保护性 #PF（SIGSEGV），而映射本身
+/// 仍在册（可再 mprotect 回去、可 munmap）。此前如实 NotSupported（抽象层当时没有这个表示）。
 fn sys_mprotect(frame: &mut SyscallFrame) -> u64 {
     let addr = frame.a1;
     let len = frame.a2;
     let prot = frame.a3;
-    if prot == 0 {
-        return pack_err(Error::NotSupported);
-    }
     let flags = match mm::user_space::map_flags_from_prot(prot) {
         Ok(f) => f,
         Err(e) => return pack_err(e),
