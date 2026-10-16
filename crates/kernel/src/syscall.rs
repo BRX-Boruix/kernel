@@ -2000,9 +2000,20 @@ fn sys_entry_create(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
-/// `unlink(path_ptr)`：删除文件或空目录。
+/// `unlink(path_ptr, mode)`：删除目录项，**类型判定内建**（语义忠实性审查登记项⑤）。
+///
+/// `a2` = 模式（0 = 任意/`remove`、1 = 只能删非目录/`unlink`、2 = 只能删目录/`rmdir`）：
+/// POSIX 的三个入口在**类型约束**上不同，而这层判定必须与删除在同一临界区完成——
+/// 否则调用方只能「先 lstat 再删」，中间有 TOCTOU 窗口。模式经 `MountTable::unlink` 下推到
+/// `INode::unlink`，由节点实现在自己的目录锁内判定。
 fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
     let path_ptr = frame.a1;
+    let mode = match frame.a2 {
+        0 => vfs::inode::DeleteMode::Any,
+        1 => vfs::inode::DeleteMode::FileOnly,
+        2 => vfs::inode::DeleteMode::DirOnly,
+        _ => return pack_err(Error::InvalidParam),
+    };
     let path = match copy_path_from_user(path_ptr, MAX_USER_PATH_BYTES) {
         Ok(p) => p,
         Err(e) => return pack_err(e),
@@ -2068,7 +2079,7 @@ fn sys_unlink(frame: &mut SyscallFrame) -> u64 {
             return pack_err(Error::PermissionDenied);
         }
     }
-    match root.unlink(&path) {
+    match root.unlink(&path, mode) {
         Ok(()) => pack_ok(0),
         Err(e) => pack_err(e),
     }

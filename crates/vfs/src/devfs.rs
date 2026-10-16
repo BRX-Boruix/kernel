@@ -28,7 +28,7 @@ use klib::error::Error;
 use klib::json::{JsonWriter, VecTarget};
 
 use crate::dynamic::{DynamicDirNode, DynamicFileNode};
-use crate::inode::{AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
+use crate::inode::{DeleteMode, AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
 
 /// 总线名"PCI"（S13：devfs 按总线名划分子树，字面量集中定义，避免散落漂移
 /// 静默漏设备；与 driver crate 的 `BusType::Pci` 语义对应，此处是字符串投影）。
@@ -329,7 +329,7 @@ impl INode for SerialDeviceNode {
         Err(Error::PermissionDenied)
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), Error> {
+    fn unlink(&self, _name: &str, _mode: DeleteMode) -> Result<(), Error> {
         Err(Error::PermissionDenied)
     }
 
@@ -412,7 +412,7 @@ impl INode for RandomDeviceNode {
         Err(Error::PermissionDenied)
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), Error> {
+    fn unlink(&self, _name: &str, _mode: DeleteMode) -> Result<(), Error> {
         Err(Error::PermissionDenied)
     }
 
@@ -559,7 +559,7 @@ impl INode for InputEventsNode {
         Err(Error::PermissionDenied)
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), Error> {
+    fn unlink(&self, _name: &str, _mode: DeleteMode) -> Result<(), Error> {
         Err(Error::PermissionDenied)
     }
 

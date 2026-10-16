@@ -1391,7 +1391,8 @@ fn clear_scratch(mount_table: &Arc<vfs::mount::MountTable>, path: &str) {
             // `unlink` 对非空目录返回 NotEmpty（与 rmdir 同语义）。
             clear_scratch(mount_table, &child);
         }
-        match mount_table.unlink(&child) {
+        // 内部清理：文件/目录都删（它已经先递归清空了子目录）⇒ 模式 = Any。
+        match mount_table.unlink(&child, vfs::inode::DeleteMode::Any) {
             Ok(_) => removed += 1,
             Err(e) => klib::warn!("[vfs] clear {}: unlink {} failed: {:?}", path, child, e),
         }

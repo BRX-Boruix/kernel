@@ -25,7 +25,7 @@ use klib::error::Error;
 use klib::json::{JsonWriter, VecTarget};
 
 use crate::dynamic::{DynamicDirNode, DynamicFileNode};
-use crate::inode::{AccessPolicy, DirEntry, FileMetadata, INode, INodeType};
+use crate::inode::{DeleteMode, AccessPolicy, DirEntry, FileMetadata, INode, INodeType};
 
 /// PCM ring 缓冲容量（字节）。
 ///
@@ -770,7 +770,7 @@ impl INode for DspNode {
         Err(Error::PermissionDenied)
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), Error> {
+    fn unlink(&self, _name: &str, _mode: DeleteMode) -> Result<(), Error> {
         Err(Error::PermissionDenied)
     }
 

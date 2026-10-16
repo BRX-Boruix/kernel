@@ -113,6 +113,13 @@ pub enum Error {
     /// 而不是把它当成路径写错。此前内核只有 NotFound，于是 `wait` 循环拿到的 ENOENT
     /// 与「文件不存在」同码，用户态无法按 POSIX 处置。
     NoChild,
+    /// **操作不允许**（EPERM）。与 [`Error::PermissionDenied`]（EACCES，文件访问语义）的分界：
+    /// EACCES 是「你没有这个权限」，EPERM 是「**有这个权限也不许这么做**」——
+    /// 典型是 POSIX 对 `unlink(<目录>)` 的规定码（语义忠实性审查登记项⑤）。
+    ///
+    /// 此前内核**没有任何错误映射到 EPERM**（libc 侧一直如实登记着这条边界），于是
+    /// `unlink(<目录>)` 只能报 EACCES。现在补上。
+    NotPermitted,
 }
 
 impl Error {
@@ -159,6 +166,7 @@ impl core::fmt::Display for Error {
             Error::Busy => f.write_str("resource busy"),
             Error::BadFd => f.write_str("bad file descriptor"),
             Error::NoChild => f.write_str("no child processes"),
+            Error::NotPermitted => f.write_str("operation not permitted"),
             Error::ReadOnly => f.write_str("read-only file system"),
             Error::Corrupt => f.write_str("structure needs cleaning"),
         }

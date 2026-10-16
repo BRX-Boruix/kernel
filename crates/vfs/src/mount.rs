@@ -24,7 +24,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use klib::error::Error;
 use spin::RwLock;
 
-use crate::inode::{AccessPolicy, FileSystem, INode, INodeType};
+use crate::inode::{DeleteMode, AccessPolicy, FileSystem, INode, INodeType};
 use crate::path::Path;
 
 /// 最大符号链接跳转深度（防死循环）。
@@ -370,7 +370,7 @@ impl MountTable {
     /// A7：目标路径若是活动挂载点本身，或位于某个活动挂载点之下（即某
     /// 挂载键以 `目标/` 为前缀），必须先 unmount——否则注册表里留下永远
     /// 不可达的孤儿挂载，且重建同名目录后旧挂载原地复活。
-    pub fn unlink(&self, path_str: &str) -> Result<(), Error> {
+    pub fn unlink(&self, path_str: &str, mode: DeleteMode) -> Result<(), Error> {
         let (parent_path, name) = Self::split_entry(path_str)?;
         validate_name(&name)?;
         let canon = Path::canonicalize(path_str);
@@ -383,7 +383,8 @@ impl MountTable {
             }
         }
         let parent_node = self.resolve(&parent_path, true)?;
-        parent_node.unlink(&name)
+        // 登记项⑤：类型判定**下推到节点实现**（ramfs 在目录锁内判），本层只透传模式。
+        parent_node.unlink(&name, mode)
     }
 
     /// 重命名/移动节点（ADR-014 SYS_ENTRY_UPDATE 0x43 / vfs1 M1）。

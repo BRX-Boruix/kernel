@@ -1986,7 +1986,7 @@ fn now_timestamp_secs() -> u32 {
 // ---- VFS 集成 ----
 
 use alloc::string::String;
-use vfs::inode::{AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
+use vfs::inode::{DeleteMode, AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
 
 /// EXT2 的 VFS 目录/文件节点。
 pub struct Ext2Node {
@@ -2141,12 +2141,26 @@ impl INode for Ext2Node {
         }))
     }
 
-    /// M3：删除子项并释放 inode/数据块。
-    fn unlink(&self, name: &str) -> Result<(), Error> {
+    /// M3：删除子项并释放 inode/数据块。**类型判定内建**（语义忠实性审查登记项⑤）。
+    fn unlink(&self, name: &str, mode: DeleteMode) -> Result<(), Error> {
         if !self.inode.is_dir() {
             return Err(Error::NotDirectory);
         }
         let mut dir = self.fs.read_inode(self.inode.ino).map_err(ext2_to_klib)?;
+        // 类型判定用**盘上的真实 mode**（`lookup_in_dir` 取回的 inode）。
+        //
+        // **诚实边界**：这里是一次**独立解析**，故 EXT2 上仍存在「判定 → 删除」之间的
+        // 窗口（ramfs 那侧是原子的——判定与删除同处目录锁内）。要彻底原子化需把 mode
+        // 传进 `Ext2Fs::unlink`（它自己只解析一次），并给它两个语义错误变体；本轮未做，
+        // 如实登记（本项门禁锚在 ramfs 上）。
+        if let Ok((_, child)) = self.fs.lookup_in_dir(&dir, name) {
+            let is_dir = child.is_dir();
+            match mode {
+                DeleteMode::FileOnly if is_dir => return Err(Error::NotPermitted), // POSIX: EPERM
+                DeleteMode::DirOnly if !is_dir => return Err(Error::NotDirectory),
+                _ => {}
+            }
+        }
         self.fs.unlink(&mut dir, name).map_err(ext2_to_klib)
     }
 

@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use klib::error::Error;
 use spin::RwLock;
 
-use crate::inode::{AccessPolicy, DirEntry, FileMetadata, INode, INodeType};
+use crate::inode::{DeleteMode, AccessPolicy, DirEntry, FileMetadata, INode, INodeType};
 
 /// 动态内容生成器类型（返回生成的字节数据）。
 pub type ContentGenerator = Box<dyn Fn() -> Vec<u8> + Send + Sync>;
@@ -151,7 +151,7 @@ impl INode for DynamicFileNode {
         Err(Error::NotDirectory)
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), Error> {
+    fn unlink(&self, _name: &str, _mode: DeleteMode) -> Result<(), Error> {
         Err(Error::NotDirectory)
     }
 
@@ -264,7 +264,7 @@ impl INode for DynamicDirNode {
         Err(Error::PermissionDenied)
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), Error> {
+    fn unlink(&self, _name: &str, _mode: DeleteMode) -> Result<(), Error> {
         Err(Error::PermissionDenied)
     }
 

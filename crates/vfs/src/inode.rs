@@ -762,6 +762,21 @@ impl StatInfo {
     }
 }
 
+/// 删除原语的**类型判定模式**（语义忠实性审查登记项⑤）。
+///
+/// POSIX 把「删什么」分成三个入口，而**类型判定必须内建在删除原语里**（与删除同一临界区）：
+/// 否则调用方只能「先 `lstat` 再删」，两次调用之间有 TOCTOU 窗口——
+/// 把文件换成目录（或反之），判定结论与删除对象就不是同一个东西了。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteMode {
+    /// 任意类型：是目录就按目录删（还要判空），否则按文件删。POSIX `remove` 用它。
+    Any,
+    /// **只能删非目录**（POSIX `unlink`）。目标是目录 ⇒ `PermissionDenied`（EPERM）。
+    FileOnly,
+    /// **只能删目录**（POSIX `rmdir`）。目标非目录 ⇒ `NotDirectory`（ENOTDIR）。
+    DirOnly,
+}
+
 /// 核心文件节点抽象。
 pub trait INode: Send + Sync {
     /// 读数据（从指定 offset 开始）。
@@ -1036,8 +1051,12 @@ pub trait INode: Send + Sync {
         Err(Error::NotDirectory)
     }
 
-    /// 删除子项。
-    fn unlink(&self, _name: &str) -> Result<(), Error> {
+    /// 删除子项，**类型判定内建**（语义忠实性审查登记项⑤）。
+    ///
+    /// `mode` 决定允许删什么类型；判定必须与删除在**同一临界区**内完成
+    /// （实现里就在持有目录锁的那一段），否则调用方只能「先 stat 再删」，两次调用之间
+    /// 有 TOCTOU 窗口（把文件换成目录、或反之）。
+    fn unlink(&self, _name: &str, _mode: DeleteMode) -> Result<(), Error> {
         Err(Error::NotDirectory)
     }
 

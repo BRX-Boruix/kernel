@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use klib::error::Error;
 use spin::RwLock;
 
-use crate::inode::{AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
+use crate::inode::{DeleteMode, AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
 
 /// 单文件最大字节数（A8 放大 8MiB → 64MiB，owner 指令 2026-09-27）。
 /// 保留闸门的理由（S17）：RamFS 内容驻留内核堆，无 per-process 记账时
@@ -349,15 +349,23 @@ impl INode for RamINode {
         }
     }
 
-    fn unlink(&self, name: &str) -> Result<(), Error> {
+    fn unlink(&self, name: &str, mode: DeleteMode) -> Result<(), Error> {
         match &self.data {
             RamNodeData::Directory { children } => {
                 let mut c = children.write();
                 if let Some(child) = c.get(name) {
                     // 判空改用 trait 的 `list_dir`：硬链接后子项是 `Arc<dyn INode>`，
                     // 具体类型（及其 `data` 字段）不再可依赖。
-                    let is_nonempty_dir = child.node_type() == Ok(INodeType::Directory)
-                        && child.list_dir().map(|e| !e.is_empty()).unwrap_or(false);
+                    let is_dir = child.node_type() == Ok(INodeType::Directory);
+                    // **登记项⑤：类型判定内建在这里**——与删除同处 `children.write()` 临界区，
+                    // 故不存在「判定完再删」之间的 TOCTOU 窗口（此前这层判定在 libc 用 lstat 做）。
+                    match mode {
+                        DeleteMode::FileOnly if is_dir => return Err(Error::NotPermitted), // POSIX: EPERM
+                        DeleteMode::DirOnly if !is_dir => return Err(Error::NotDirectory),
+                        _ => {}
+                    }
+                    let is_nonempty_dir =
+                        is_dir && child.list_dir().map(|e| !e.is_empty()).unwrap_or(false);
                     if is_nonempty_dir {
                         return Err(Error::NotEmpty);
                     }

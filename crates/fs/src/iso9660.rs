@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use klib::error::Error;
-use vfs::inode::{AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
+use vfs::inode::{DeleteMode, AccessPolicy, DirEntry, FileMetadata, FileSystem, INode, INodeType};
 
 use crate::ByteDevice;
 
@@ -487,7 +487,7 @@ impl INode for IsoNode {
         Err(Error::ReadOnly)
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), Error> {
+    fn unlink(&self, _name: &str, _mode: DeleteMode) -> Result<(), Error> {
         Err(Error::ReadOnly)
     }
 
