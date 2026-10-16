@@ -4642,6 +4642,18 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
         if !register() {
             return done(pack_ok(0));
         }
+        // POSIX：睡眠期间到达的**可捕获**信号必须**打断**睡眠（-1/EINTR），不是等睡满。
+        //
+        // 为什么必须在这里显式查（实测缺陷，2026-10-16）：信号对 Blocked 目标的 EINTR
+        // 只写在**保存帧**上（ADR-052），而本函数是「复检 deadline 再阻塞」的**重试循环**
+        // ——被唤醒后会回到循环顶**再次阻塞**，最终用 `done(pack_ok(0))` 覆盖掉那个 EINTR。
+        // 实测（机内）：`alarm(1)` + `nanosleep(3s)` 返回 **0**、`rem` 未写；同一路径还
+        // 观察到过一次**永久挂起**（唤醒后再次阻塞、此后再无唤醒）。
+        // 判据复用 ADR-051 的单点 `has_handler_pending()`：只认会进 handler 的未屏蔽信号
+        // （`Ignore` 不打断阻塞；`Default` 的终止动作由返回路径的 deliver_on_return 处置）。
+        if task::current_proc_mut().map_or(false, |p| p.signal().has_handler_pending()) {
+            return done(pack_err(Error::Interrupted));
+        }
         match task::block_current_with(arch_frame(frame), register) {
             task::SwitchOutcome::Switched => return DispatchResult::Switched,
             task::SwitchOutcome::NotSwitched => {
@@ -4874,14 +4886,22 @@ fn sys_signal_action(frame: &mut SyscallFrame) -> u64 {
 
 /// `signal_return()`（rt_sigreturn，ADR-034 §2.5）：handler 返回后恢复原帧。
 ///
-/// 从用户栈读回 SignalFrame（经 task::signal::sigreturn），恢复被打断的现场；
-/// 成功后调用方照常 iretq 回原 RIP。帧损坏/越界 → `InvalidParam`。
-fn sys_signal_return(frame: &mut SyscallFrame) -> u64 {
+/// 从用户栈读回 SignalFrame（经 task::signal::sigreturn），恢复被打断的现场。
+/// 帧损坏/越界 → `InvalidParam`。
+///
+/// **必须返回 [`DispatchResult::Switched`]，不能返回 `Done(0)`**（实测缺陷，2026-10-16）：
+/// 本调用已经把 `arch` **整体恢复**成「被打断的那次 syscall 的现场」——其 `rax` 就是
+/// 那次调用的返回值（例如被信号打断的 `nanosleep` 的 `-EINTR`）。若按普通 syscall 收尾，
+/// 入口会把本次 `sigreturn` 的返回值（0）写进 `rax`，**覆盖掉刚恢复的返回值**。
+/// 实测：内核确实返回了 `-EINTR`（临时 trace 可见），用户态拿到的却是 **0**——
+/// `libsys::sleep` 返回 `Ok`，POSIX 的 EINTR 语义在这一步被静默吞掉。
+/// `Switched` 的语义正是「帧已被替换，入口不得回写 result」，与此处完全吻合。
+fn sys_signal_return(frame: &mut SyscallFrame) -> DispatchResult {
     let arch: &mut arch_x86_64::interrupts::InterruptFrame = arch_frame(frame);
     let cur = task::current_proc_mut();
     match task::signal::sigreturn(cur, arch) {
-        Ok(()) => pack_ok(0),
-        Err(e) => pack_err(e),
+        Ok(()) => DispatchResult::Switched,
+        Err(e) => done(pack_err(e)),
     }
 }
 
@@ -6108,7 +6128,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         // SIGNAL Domain (0x80, ADR-034 PROPOSED)
         SYS_SIGNAL_ACTION => done(sys_signal_action(frame)),
         SYS_SIGNAL_MASK => done(sys_signal_mask(frame)),
-        SYS_SIGNAL_RETURN => done(sys_signal_return(frame)),
+        // sigreturn 已整体恢复帧 ⇒ 自带 DispatchResult 语义（不得回写 result）。
+        SYS_SIGNAL_RETURN => sys_signal_return(frame),
         SYS_SIGNAL_PENDING => done(sys_signal_pending(frame)),
         // sigsuspend 会阻塞切换（等信号投递），自带 DispatchResult 语义。
         SYS_SIGNAL_SUSPEND => sys_sigsuspend(frame),
