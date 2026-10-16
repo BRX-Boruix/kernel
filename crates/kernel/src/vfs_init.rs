@@ -314,6 +314,10 @@ impl SystemInfoProvider for KernelSystemProvider {
                 o.field_str("git_commit", commit)?;
                 o.field_u64("build_timestamp", BUILD_TIMESTAMP_MS)?;
                 o.field_u64("uptime_ms", uptime_ms)?;
+                // 语义忠实性审查登记项⑪：sysconf(_SC_CLK_TCK) 的真值出口。
+                // **是调度 tick 频率（每核周期定时器），不是时钟计数器频率**——
+                // 后者在有 HPET 时是 1e9，答的是另一个问题（见报告）。
+                o.field_u64("sched_tick_hz", arch_x86_64::lapic::SCHED_TICK_HZ)?;
                 o.end()
             })
             .expect("Vec-backed kernel JSON serialization cannot fail");

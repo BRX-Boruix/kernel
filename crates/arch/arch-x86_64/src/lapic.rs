@@ -74,6 +74,14 @@ const LAPIC_ID: usize = 0x20;
 /// `calibrate_bus_freq` 用 PIT 实测，不再依赖此硬编码。
 pub const DEFAULT_BUS_FREQ_HZ: u64 = 1_000_000_000;
 
+/// 调度器周期定时器的频率（Hz）——**`sysconf(_SC_CLK_TCK)` 的真值**（登记项⑪）。
+///
+/// POSIX 的 `_SC_CLK_TCK` 是「每秒时钟滴答数」（`times()` 的时基），**不是**时钟源
+/// 计数器的频率——`klib::time` 的 `TICK_HZ` 在有 HPET 时是 1e9，那是**另一个量**
+/// （本审查第一版就答错了这个问题，见报告）。本内核每核 LAPIC 周期定时器
+/// （到期即 IRQ0 → 调度 tick）的频率就是本值。
+pub const SCHED_TICK_HZ: u64 = 100;
+
 /// **per-CPU** tick 计数，按紧凑 CPU 槽位（0..n，见 smp.rs）索引。
 ///
 /// 阶段 1（多核地基）：LAPIC 定时器是每核一份硬件资源——BSP 与每个 AP 都运行
@@ -380,13 +388,13 @@ pub fn init() {
     // 4. 注入 klib 全局单调时钟源。HPET 优先：纳秒计数（1GHz），不受多核
     //    叠加影响（HPET 是全局硬件，天然一致）；无 HPET 时回退到 system_ticks
     //    （BSP 槽 0 计数，同样不被 AP 定时器叠加）。
-    const TARGET_HZ: u64 = 100;
     if crate::hpet::is_ready() {
         klib::time::set_clock_source(crate::hpet::now_nanos, 1_000_000_000);
         klib::info!("[lapic] clock source: HPET (1 GHz ns clock)");
     } else {
-        klib::time::set_clock_source(system_ticks, TARGET_HZ);
-        klib::info!("[lapic] clock source: LAPIC tick ({} Hz)", TARGET_HZ);
+        // 无 HPET 时以本核定时器计数为时钟源——其频率就是定时器频率。
+        klib::time::set_clock_source(system_ticks, SCHED_TICK_HZ);
+        klib::info!("[lapic] clock source: LAPIC tick ({} Hz)", SCHED_TICK_HZ);
     }
 
     // 标记 LAPIC 已可用（串口锁依赖 LAPIC id 做多核 owner 判断）
@@ -435,9 +443,8 @@ pub fn init_timer_self() {
 
     // 设置初始计数：期望 100Hz。本核定时器到期即 IRQ0 → 共享 handler，
     // handler 把本核槽位 tick +1。
-    const TARGET_HZ: u64 = 100;
-    let init_count = bus_freq / TARGET_HZ;
+    let init_count = bus_freq / SCHED_TICK_HZ;
     lapic_write(LAPIC_TIMER_INIT, init_count as u32);
 
-    klib::info!("[lapic] per-core timer started (slot {} @ ~{} Hz)", my_slot(), TARGET_HZ);
+    klib::info!("[lapic] per-core timer started (slot {} @ ~{} Hz)", my_slot(), SCHED_TICK_HZ);
 }

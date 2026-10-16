@@ -551,7 +551,9 @@ impl<PT: PageTable> Process<PT> {
     /// 为什么全局闸门而非 per-process：本内核尚无 per-process 内存记账
     ///（B 档），全局闸门以最小机制守住同一 DoS 面；未来记账体系落地时
     /// 本闸门自然并入记账（演进路径成文于此，S13）。
-    pub const MAX_FDS: usize = 1024;
+    /// 数值的**单一事实源**：`tools/abi/constants.json` 的 `wire.MAX_FDS`
+    /// （语义忠实性审查登记项⑪：用户态 `sysconf(_SC_OPEN_MAX)` 要报同一个数）。
+    pub const MAX_FDS: usize = klib::abi_generated::MAX_FDS;
 
     /// 分配新的文件描述符（返回分配的 fd 编号）。
     ///
