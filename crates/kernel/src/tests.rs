@@ -12147,17 +12147,17 @@ pub fn test_waitpid_core() {
     info!("[test-waitpid-core] C1.1 name boundary (empty/64/63) OK");
     assert!(th::probe(child).is_some(), "child must be registered");
     assert!(
-        matches!(th::try_reap(root, 999_999), Err(Error::NotFound)),
-        "unknown pid must be NotFound"
+        matches!(th::try_reap(root, 999_999), Err(Error::NoChild)),
+        "unknown pid must be ECHILD (NoChild)"
     );
     let outsider = th::spawn_named_child_of(0, "t.elf").expect("spawn outsider");
     assert!(
-        matches!(th::try_reap(root, outsider), Err(Error::NotFound)),
-        "non-child pid must be NotFound"
+        matches!(th::try_reap(root, outsider), Err(Error::NoChild)),
+        "non-child pid must be ECHILD (NoChild)"
     );
     assert!(
-        matches!(th::try_reap(child, root), Err(Error::NotFound)),
-        "reverse parent-child must be NotFound"
+        matches!(th::try_reap(child, root), Err(Error::NoChild)),
+        "reverse parent-child must be ECHILD (NoChild)"
     );
 
     // ---- 2. 子仍在运行 → WouldBlock ----
@@ -12183,8 +12183,8 @@ pub fn test_waitpid_core() {
     );
     assert!(th::probe(child).is_none(), "reaped slot must be freed");
     assert!(
-        matches!(th::try_reap(root, child), Err(Error::NotFound)),
-        "double reap must be NotFound"
+        matches!(th::try_reap(root, child), Err(Error::NoChild)),
+        "double reap must be ECHILD (NoChild)"
     );
     info!("[test-waitpid-core] zombie keep/reap/double-reap OK");
 
@@ -14479,14 +14479,14 @@ pub fn test_init_contract() {
     assert_eq!(rax2, 99, "exit code in parent saved rax");
     info!("[test-init-contract] 2. WAIT_ANY block+deliver OK");
 
-    // ---- 3. WAIT_ANY: 无子进程 → NotFound（ECHILD） ----
+    // ---- 3. WAIT_ANY: 无子进程 → **NoChild（ECHILD）**（登记项⑧） ----
     th::reset_all();
     let solo = th::spawn_named_child_of(0, "solo.elf").expect("spawn solo");
     assert!(
-        matches!(th::wait_any(solo), Err(Error::NotFound)),
-        "WAIT_ANY with no children must be NotFound"
+        matches!(th::wait_any(solo), Err(Error::NoChild)),
+        "WAIT_ANY with no children must be ECHILD (NoChild)"
     );
-    info!("[test-init-contract] 3. WAIT_ANY no-child NotFound OK");
+    info!("[test-init-contract] 3. WAIT_ANY no-child ECHILD OK");
 
     // ---- 4. PID 1 防护：kill_pid 拒绝 ----
     th::reset_all();

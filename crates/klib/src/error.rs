@@ -105,6 +105,14 @@ pub enum Error {
     /// ——在本变体存在之前，内核只有前者可用，于是坏 fd 被报成 EINVAL/ENOENT/EACCES
     /// 三种不同的码（libc 无法按 POSIX 处置，只能各自近似）。
     BadFd,
+    /// **没有可等待的子进程**（ECHILD）：`wait`/`waitpid` 在「无子进程」「指定 pid 不是
+    /// 本进程的子进程」「该子进程已被收尸」三种情形下的 POSIX 规定码。
+    ///
+    /// 与 [`Error::NotFound`] 的分界：NotFound 表达「目标对象不存在」（换个名字/路径）；
+    /// NoChild 表达「**从等待的角度看**没有可收的子进程」——调用方据此停止等待循环，
+    /// 而不是把它当成路径写错。此前内核只有 NotFound，于是 `wait` 循环拿到的 ENOENT
+    /// 与「文件不存在」同码，用户态无法按 POSIX 处置。
+    NoChild,
 }
 
 impl Error {
@@ -150,6 +158,7 @@ impl core::fmt::Display for Error {
             Error::ExecFormat => f.write_str("exec format error"),
             Error::Busy => f.write_str("resource busy"),
             Error::BadFd => f.write_str("bad file descriptor"),
+            Error::NoChild => f.write_str("no child processes"),
             Error::ReadOnly => f.write_str("read-only file system"),
             Error::Corrupt => f.write_str("structure needs cleaning"),
         }

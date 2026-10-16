@@ -34,6 +34,7 @@ pub const fn to_errno(e: crate::error::Error) -> i32 {
         crate::error::Error::Corrupt => 117, // EUCLEAN
         crate::error::Error::Busy => 16, // EBUSY
         crate::error::Error::BadFd => 9, // EBADF
+        crate::error::Error::NoChild => 10, // ECHILD
     }
 }
 

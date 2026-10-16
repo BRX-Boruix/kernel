@@ -3358,7 +3358,7 @@ fn waitpid_probe(cur: usize, target_pid: usize) -> Result<Waited, Error> {
                 return Ok(Waited::Reaped { pid, code });
             }
         }
-        // 无 zombie：有子进程 → WouldBlock（等）；无子进程 → NotFound（ECHILD）。
+        // 无 zombie：有子进程 → WouldBlock（等）；无子进程 → **NoChild（ECHILD，登记项⑧）**。
         let has_children = {
             let mut found = false;
             for bucket in PROCESSES.iter() {
@@ -3371,20 +3371,22 @@ fn waitpid_probe(cur: usize, target_pid: usize) -> Result<Waited, Error> {
             found
         };
         if !has_children {
-            return Err(Error::NotFound);
+            return Err(Error::NoChild);
         }
         return Err(Error::WouldBlock);
     }
     // ---- 单目标 ----
     if target_pid == 0 {
-        return Err(Error::NotFound);
+        // 无进程组 ⇒ 没有可等的组成员（用户态在更外层就拒成 ENOTSUP）。
+        return Err(Error::NoChild);
     }
     let is_mine = {
         let gi = proc_bucket_lock(target_pid);
         matches!(gi.get(&target_pid), Some(e) if e.ppid == cur)
     };
     if !is_mine {
-        return Err(Error::NotFound);
+        // POSIX：pid 不存在或不是本进程的子进程 ⇒ **ECHILD**（登记项⑧）。
+        return Err(Error::NoChild);
     }
     if let Some((pid, code)) = reap_child_locked(cur, target_pid) {
         return Ok(Waited::Reaped { pid, code });
@@ -3682,13 +3684,17 @@ fn waitpid_inner(
             found
         };
         if !has_children {
-            return Err(Error::NotFound); // 无子进程 = ECHILD 等价
+            // 无子进程 ⇒ POSIX 的 **ECHILD**（登记项⑧）：此前用 NotFound 会变成 ENOENT，
+            // 与「文件不存在」同码，wait 循环无法按 POSIX 处置。
+            return Err(Error::NoChild);
         }
         // 3. 有子进程但无 zombie → 走阻塞路径（哨兵标记 WAIT_ANY）。
     } else {
         // ---- 单目标（既有）分支 ----
         if target_pid == 0 {
-            return Err(Error::NotFound);
+            // pid==0 是「同进程组」语义：本系统无进程组 ⇒ 没有可等的组成员。
+            // 用户态（libc）在更外层就会把它如实拒成 ENOTSUP，这里是防御路径。
+            return Err(Error::NoChild);
         }
         // 只能等待自己的直接子进程（无界 pid：存在性以目标是否在册为准）。
         let is_mine = {
@@ -3696,7 +3702,8 @@ fn waitpid_inner(
             matches!(gi.get(&target_pid), Some(e) if e.ppid == cur)
         };
         if !is_mine {
-            return Err(Error::NotFound);
+            // POSIX：pid 不存在或不是本进程的子进程 ⇒ **ECHILD**（登记项⑧）。
+            return Err(Error::NoChild);
         }
         if let Some((pid, code)) = reap_child_locked(cur, target_pid) {
             return Ok(Waited::Reaped { pid, code }); // zombie 同步收尸
@@ -5019,14 +5026,15 @@ pub mod test_hooks {
             .map(|e| e.ppid == parent)
             .unwrap_or(false);
         if !is_mine {
-            return Err(Error::NotFound);
+            // 与生产路径同语义：不是亲生子 ⇒ ECHILD（登记项⑧）。
+            return Err(Error::NoChild);
         }
         reap_child_locked(parent, target).ok_or(Error::WouldBlock)
     }
 
     /// 表级阻塞登记（真实 `waitpid_inner`，frame=None 不做物理切换）：
     /// 返回 Ok(Waited::Blocked) 表示已登记+Blocked+表级切换到下一就绪进程；
-    /// Err(WouldBlock) 表示无可切进程已回滚；Err(NotFound) 同生产语义。
+    /// Err(WouldBlock) 表示无可切进程已回滚；Err(NoChild) 同生产语义（登记项⑧）。
     pub fn block_on_child(parent: usize, target: usize) -> Result<Waited, Error> {
         // per-pid（a）：只取本核 RUN 域。
         let mut run = run_mut(my_cpu_slot());
@@ -5470,8 +5478,9 @@ pub mod test_hooks {
             if s_l == TaskState::Exit { return false; } // 组长不得随组员退出
             let (s_m, _, _, _, ppid_m) = probe(m).expect("member zombie in table");
             if s_m != TaskState::Exit || ppid_m != l { return false; } // zombie 保留且属组长
-            // R1：组长 WAIT_ANY 不得把组员当进程子收走（此时组长无真实进程子 → NotFound）。
-            if !matches!(wait_any(l), Err(super::Error::NotFound)) { return false; }
+            // R1：组长 WAIT_ANY 不得把组员当进程子收走（此时组长无真实进程子
+            // ⇒ **NoChild（ECHILD）**——登记项⑧ 之后不再用 NotFound）。
+            if !matches!(wait_any(l), Err(super::Error::NoChild)) { return false; }
             if probe(m).is_none() { return false; } // WAIT_ANY 后组员仍须在表（未被误收）
             // C4：组长显式 waitpid(组员 pid)（join）可收尸取码。
             match block_on_child(l, m) {
