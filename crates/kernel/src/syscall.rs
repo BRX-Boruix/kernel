@@ -1740,40 +1740,69 @@ fn sys_stream_focus_set(frame: &mut SyscallFrame) -> u64 {
 ///
 /// 从 fd 的文件句柄取 inode，调用 `INode::metadata` 后以
 /// `vfs::inode::StatInfo` 定长结构写入用户缓冲（a2），返回结构
-/// 字节数。只支持文件句柄（OpenHandle::File）；pipe 端如实
-/// NotFound（与 flock 同政策）。
+/// 字节数。
+///
+/// **管道端也必须成功**（语义忠实性审查登记项②，本轮补齐）：POSIX 的 `fstat`
+/// 对**任何**已打开的 fd 都成立，管道给 `S_IFIFO`。此前只处理 `OpenHandle::File`，
+/// 管道端与"fd 不存在"一样返回 `NotFound` ⇒ 用户态**分不清**"这个 fd 是管道"
+/// 与"这个 fd 不存在"（libc 的 `isatty`/`fstat` 因此都把管道报成 ENOENT）。
+///
+/// 只有 `fd 不存在` 才是 `NotFound`。
 fn sys_fstat(frame: &mut SyscallFrame) -> u64 {
     let fd = frame.a1 as usize;
     let buf_ptr = frame.a2;
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
-    let Some(vfs::file_handle::OpenHandle::File(fh)) = proc.get_fd(fd) else {
-        return pack_err(Error::NotFound); // fd 缺失或 pipe 端（fstat 仅文件）
+    let info = match proc.get_fd(fd) {
+        Some(vfs::file_handle::OpenHandle::File(fh)) => {
+            // A1-3 / §2.6：元数据读随 readdir 归 Read 语义——fstat 也强制。
+            let identity = proc.identity();
+            if let Err(e) = check_access(&identity, fh.inode.as_ref(), vfs::inode::PermBits::READ) {
+                return pack_err(e);
+            }
+            let meta = match fh.inode.metadata() {
+                Ok(m) => m,
+                Err(e) => return pack_err(e),
+            };
+            // J-TOKEN-A / ADR-044 §1.2：终端真值由**节点**自述（`is_terminal()`）。
+            // 本函数是唯一能看到 inode 的地方，故在此补写；`from_metadata` 只看得见
+            // `FileMetadata`（无节点身份），故它本身不得虚报。
+            vfs::inode::StatInfo::with_link_identity(
+                vfs::inode::StatInfo::with_console_owner(
+                    vfs::inode::StatInfo::with_terminal(
+                        vfs::inode::StatInfo::from_metadata(&meta),
+                        fh.inode.is_terminal(),
+                    ),
+                    fh.inode.console_owner(),
+                ),
+                fh.inode.stable_id(),
+                fh.inode.nlink(),
+            )
+        }
+        // 管道端（POSIX：`fstat` 必须成功，类型位 `S_IFIFO`）。
+        //
+        // 管道不是 inode ⇒ 没有 `FileMetadata` 可投影；POSIX 对管道的
+        // `st_uid`/`st_gid`/`st_size`/`st_*time` **未作规定**，而内核也没有记录
+        // 创建者 ⇒ 这些字段**如实填 0（未知）**，绝不拿调用者身份冒充创建者。
+        // 规定的是**类型位**与"能成功"：`ino` 用管道稳定 id，故**同一管道的两端
+        // 拿到同一个 ino**（与"同一对象"一致）。
+        Some(vfs::file_handle::OpenHandle::Pipe { id, .. }) => vfs::inode::StatInfo {
+            node_type: vfs::inode::StatInfo::type_tag(vfs::inode::INodeType::Fifo),
+            size: 0,
+            perms: 0o600,
+            created_time: 0,
+            modified_time: 0,
+            changed_time: 0,
+            owner_uid: 0,
+            owner_gid: 0,
+            is_terminal: 0,
+            console_owner: 0,
+            ino: id,
+            nlink: 1,
+        },
+        None => return pack_err(Error::NotFound),
     };
-    // A1-3 / §2.6：元数据读随 readdir 归 Read 语义——fstat 也强制。
-    let identity = proc.identity();
-    if let Err(e) = check_access(&identity, fh.inode.as_ref(), vfs::inode::PermBits::READ) {
-        return pack_err(e);
-    }
-    let meta = match fh.inode.metadata() {
-        Ok(m) => m,
-        Err(e) => return pack_err(e),
-    };
-    // J-TOKEN-A / ADR-044 §1.2：终端真值由**节点**自述（`is_terminal()`）。
-    // 本函数是唯一能看到 inode 的地方，故在此补写；`from_metadata` 只看得见
-    // `FileMetadata`（无节点身份），故它本身不得虚报。
-    let info = vfs::inode::StatInfo::with_link_identity(
-        vfs::inode::StatInfo::with_console_owner(
-            vfs::inode::StatInfo::with_terminal(
-                vfs::inode::StatInfo::from_metadata(&meta),
-                fh.inode.is_terminal(),
-            ),
-            fh.inode.console_owner(),
-        ),
-        fh.inode.stable_id(),
-        fh.inode.nlink(),
-    );
     let bytes = core::mem::size_of::<vfs::inode::StatInfo>();
     if let Err(e) = validate_user_range(buf_ptr, bytes as u64, UserAccess::Write) {
         return pack_err(e);
