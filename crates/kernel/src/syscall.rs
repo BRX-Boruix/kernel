@@ -4972,7 +4972,11 @@ fn sys_signal_action(frame: &mut SyscallFrame) -> u64 {
         1 => SigDisposition::Ignore,
         p => SigDisposition::Handler(p),
     };
-    match cur.signal_mut().set_disposition(sig, disp) {
+    // **先把结果取成值再 match**：`signal_mut()` 现在返回锁守卫（登记项⑩ 把状态收进组容器），
+    // 而 match 的**被匹配临时量活到整个 match 结束**——臂内再调 `signal_mut()` 就是同一把
+    // 自旋锁**同核重入**（实测当场 PANIC：`SpinMutex 同核重入死锁`）。
+    let set = cur.signal_mut().set_disposition(sig, disp);
+    match set {
         Ok(Some(old)) => {
             // **必须记录 flags**：`deliver_handler` 只看得到处置，而 `SigDisposition::Handler(f)`
             // 不带 flags ⇒ 没有这张表就无从知道该不该切备用栈。
@@ -5102,7 +5106,10 @@ pub extern "C" fn user_exception_signal_handler(
         return false;
     };
     // SIGKILL/SIGSTOP 等硬信号不会到达 Handler 处置（validate 保证恒 Default）。
-    match cur.signal().disposition(sig) {
+    // 处置**取成值**再 match：`signal()` 现返回锁守卫（登记项⑩），守卫活到 match 结束
+    // 会与下方 `deliver_handler(cur, …)` 的 `&mut cur` 冲突；`SigDisposition` 是 `Copy`。
+    let disp = cur.signal().disposition(sig);
+    match disp {
         Some(SigDisposition::Handler(f)) => {
             let restorer = cur.signal().trampoline();
             if restorer == 0 {

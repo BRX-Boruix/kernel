@@ -778,7 +778,7 @@ pub fn spawn_derived(
     // 死锁（单核下表现为整机静默挂起）。故成员数必须在**取任何桶锁之前**求得。
     // 含组长自身，故单线程父 == 1。
     let member_count = group_members(ppid).len();
-    let (fd_table, cwd, identity, trampoline) = {
+    let (fd_table, cwd, identity, inherited_signal) = {
         let g = proc_bucket_lock(ppid);
         let Some(leader) = g.get(&ppid) else {
             return Err(Error::NotFound);
@@ -790,7 +790,10 @@ pub fn spawn_derived(
             leader.proc.clone_fd_table(),
             leader.proc.cwd(),
             leader.proc.identity(),
-            leader.proc.signal().trampoline(),
+            // 登记项⑩：POSIX fork 继承**处置与屏蔽集**（清空未决/嵌套/备用栈，
+            // trampoline 随共享地址空间一起继承）——见 `inherit_for_child` 的文档。
+            // 此前这里只搬 trampoline ⇒ 子进程会把父装好的 handler 全忘掉。
+            leader.proc.signal().inherit_for_child(),
         )
     };
     // ADR-038 决策 4：多线程父进程如实拒绝（见函数文档）。
@@ -839,9 +842,10 @@ pub fn spawn_derived(
     proc.set_inherited_fd_table(fd_table);
     proc.set_cwd(cwd);
     proc.set_identity(identity);
-    // 信号：子进程继承父已装进**共享地址空间保留区**的 restorer 地址（地址同，
-    // 因 COW 子空间与父共享该页）。同样与线程路径一致。
-    proc.signal_mut().set_trampoline(trampoline);
+    // 信号（登记项⑩）：**整体继承**父的处置与屏蔽集（POSIX fork），未决/嵌套/备用栈清空
+    // ——见 `inherit_for_child`。
+    // MUTATION: 退回旧行为——只继承 restorer 地址，处置/屏蔽集全丢
+    proc.signal_mut().set_trampoline(inherited_signal.trampoline());
     let home_cpu = spawn_home_cpu();
     let entry = Box::new(ProcEntry {
         proc,

@@ -126,6 +126,28 @@ pub struct SignalState {
 }
 
 impl SignalState {
+    /// 为 **fork 出来的子进程**构造继承态（登记项⑩ 的语义配套）。
+    ///
+    /// POSIX `fork`：子进程**继承**父的处置（`sigaction`）与**屏蔽集**；但
+    /// **未决信号被清空**（信号不会跟着子进程走）、备用栈与 handler 嵌套/中断标记都不继承
+    /// （子进程从干净状态开始）。
+    ///
+    /// `trampoline` **继承**：它是**共享地址空间**里的 restorer 地址（COW 子空间与父
+    /// 共享该页），地址同故语义同。
+    pub fn inherit_for_child(&self) -> Self {
+        SignalState {
+            handlers: self.handlers,
+            blocked: self.blocked,
+            pending: SignalSet::empty(),
+            signal_depth: 0,
+            interrupted: false,
+            trampoline: self.trampoline,
+            suspend_saved: None,
+            handler_flags: self.handler_flags,
+            alt_stack: None,
+        }
+    }
+
     /// 新建：全部信号 Default 处置、空屏蔽/未决、未在 handler 中、无 trampoline。
     pub fn new() -> Self {
         SignalState {
@@ -497,10 +519,12 @@ pub fn deliver_handler<PT: arch::PageTable>(
     // 栈溢出类信号（SIGSEGV）不能在已经溢出的栈上跑 handler，否则投递必然再次出错。
     // 未设备用栈时**回落到当前栈**（POSIX：此时等价于没设 `SA_ONSTACK`）——不拒绝投递。
     let frame_bytes = SignalFrame::size() as u64;
-    let stack_top = match (
-        proc.signal().handler_flags(sig) & SA_ONSTACK != 0,
-        proc.signal().alt_stack(),
-    ) {
+    // **先取值再 match**（登记项⑩ 的守卫纪律）：match 的被匹配临时量活到整个 match 结束，
+    // 而这里要取两次信号状态——把两次 `signal()` 直接写在元组里，第一次的守卫会活到
+    // 第二次调用 ⇒ **同核重入同一把自旋锁**（实测 PANIC 就在这里）。
+    let on_stack = proc.signal().handler_flags(sig) & SA_ONSTACK != 0;
+    let alt = proc.signal().alt_stack();
+    let stack_top = match (on_stack, alt) {
         (true, Some((base, size))) => base.saturating_add(size),
         _ => frame.rsp,
     };
@@ -551,7 +575,10 @@ pub fn deliver_on_return<PT: arch::PageTable>(
 ) -> DeliveryOutcome {
     use crate::signals::SIGSTOP;
     loop {
-        let sig = match proc.signal_mut().take_unblocked() {
+        // **先取值再 match**：`signal_mut()` 返回锁守卫（登记项⑩），而 match 的被匹配临时量
+        // 活到整个 match 结束——臂内再调 `signal_mut()` 会**同核重入同一把自旋锁**（实测 PANIC）。
+        let taken = proc.signal_mut().take_unblocked();
+        let sig = match taken {
             Some(s) => {
                 // `sigsuspend` 的屏蔽集**还原点**：POSIX 规定在信号被投递时还原，
                 // 与处置（handler/ignore/default）无关。放在这里而不是 syscall 里——
@@ -561,7 +588,11 @@ pub fn deliver_on_return<PT: arch::PageTable>(
             }
             None => return DeliveryOutcome::Continue,
         };
-        match proc.signal().disposition(sig) {
+        // 先把处置**取成值**再 match：`signal()` 现在返回锁守卫（登记项⑩ 把状态收进组容器），
+        // 守卫活到 match 结束会与下方 `deliver_handler(proc, …)` 需要的 `&mut proc` 冲突。
+        // `SigDisposition` 是 `Copy`，取出来即可（守卫在语句末即释放）。
+        let disp = proc.signal().disposition(sig);
+        match disp {
             Some(SigDisposition::Ignore) => {
                 // 忽略：继续下一个。同步异常的 Ignore 防风暴由异常路径（S1-11）
                 // 特判等价 Default 终止，不在此处理。

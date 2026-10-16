@@ -387,6 +387,12 @@ pub(crate) struct ThreadGroup<PT: PageTable> {
     identity: klib::sync::spin::SpinMutex<ProcessIdentity>,
     /// 组共享用户地址空间（`Arc` 共享 + 内部粗锁，T1-4；不重复包装）。
     addr_space: Arc<UserAddressSpace<PT>>,
+    /// **进程级**信号状态（登记项⑩）：处置/屏蔽/未决/重入守卫/restorer。
+    ///
+    /// POSIX 的信号**处置与屏蔽是进程级**的（一个线程 `sigaction` 之后，同进程其它线程
+    /// 都看得到；`pthread_sigmask` 才是每线程的）。此前它挂在 `Process` 上 ⇒ 每线程一份 ⇒
+    /// 组员各自 `sigaction` 互不可见。现收进组容器，与 fd_table/cwd/identity 同一层。
+    signal: klib::sync::spin::SpinMutex<crate::signal::SignalState>,
 }
 
 impl<PT: PageTable> ThreadGroup<PT> {
@@ -409,6 +415,8 @@ impl<PT: PageTable> ThreadGroup<PT> {
             cwd: klib::sync::spin::SpinMutex::new(alloc::string::String::from("/")),
             identity: klib::sync::spin::SpinMutex::new(ProcessIdentity::default_user()),
             addr_space,
+            // 新组：全部信号 Default 处置、空屏蔽/未决（登记项⑩ 之后由**组**持有）。
+            signal: klib::sync::spin::SpinMutex::new(crate::signal::SignalState::new()),
         }
     }
 }
@@ -470,11 +478,6 @@ pub struct Process<PT: PageTable> {
     /// 各持一份 clone 指向同一 [`ThreadGroup`]，经它访问共享的 fd_table/cwd/
     /// identity/addr_space。组长 spawn 时自建组并持有；组员线程派生时 clone。
     group: Arc<ThreadGroup<PT>>,
-    /// 每进程信号状态（ADR-034 §2.2）：处置/屏蔽/未决/重入守卫/restorer。
-    ///
-    /// PRE-5（T1-1 阶段）：**信号保持每进程独立**，不随组共享——逐线程信号全套
-    /// 留 libpthread；致命信号整组终止是 T1-3 的事。本阶段不动 signal 语义。
-    signal: crate::signal::SignalState,
 }
 
 impl<PT: PageTable> Process<PT> {
@@ -508,8 +511,8 @@ impl<PT: PageTable> Process<PT> {
     ///
     /// `pid` 为本调度单元（组长/组员线程）的独立 pid；`tgid` 为组长 pid（组长
     /// 传自身 pid，组员线程传组长 pid）。`group` 为组长已持有的 `Arc<ThreadGroup>`，
-    /// 此处直接 clone/move 进来，**不重建**组内共享态（fd_table/cwd/identity/addr_space）
-    /// ——共享经 Arc 成立。每线程的 `signal` 仍独立新建（PRE-5）。调用方负责配
+    /// 此处直接 clone/move 进来，**不重建**组内共享态（fd_table/cwd/identity/addr_space/signal）
+    /// ——共享经 Arc 成立（登记项⑩ 之后 signal 也在其中：组内线程共享同一份处置）。调用方负责配
     /// 好本 PCB 的独立 `kernel_stack_top`/`entry_rip`/`user_stack_top`（线程各自）。
     ///
     /// crate 可见：线程派生只在 task crate 内部（scheduler::spawn_thread_with），且参数
@@ -531,7 +534,6 @@ impl<PT: PageTable> Process<PT> {
             user_stack_top,
             tgid,
             group,
-            signal: crate::signal::SignalState::new(),
         }
     }
 
@@ -759,13 +761,19 @@ impl<PT: PageTable> Process<PT> {
     pub fn set_identity(&self, identity: ProcessIdentity) {
         *self.group.identity.lock() = identity;
     }
-    /// 每进程信号状态（ADR-034 §2.2）可变访问（派发/投递/sigaction 用）。
-    pub fn signal_mut(&mut self) -> &mut crate::signal::SignalState {
-        &mut self.signal
+    /// **进程级**信号状态的可变访问（派发/投递/sigaction 用；登记项⑩）。
+    ///
+    /// 返回**锁守卫**（`SpinMutexGuard`，实现 `Deref`/`DerefMut`）——调用点原有的
+    /// `p.signal_mut().raise(sig)` 这类链式写法**无需改动**（自动解引用）。
+    ///
+    /// 方法由 `&mut self` 放宽为 `&self`：状态在组容器的内部锁里，不再需要独占借用。
+    /// **锁序**：本锁是**叶子锁**（守卫存活期间不得再取桶锁/调度锁）——与 `identity` 同层。
+    pub fn signal_mut(&self) -> klib::sync::spin::SpinMutexGuard<'_, crate::signal::SignalState> {
+        self.group.signal.lock()
     }
-    /// 每进程信号状态只读访问。
-    pub fn signal(&self) -> &crate::signal::SignalState {
-        &self.signal
+    /// **进程级**信号状态的只读访问（同上）。
+    pub fn signal(&self) -> klib::sync::spin::SpinMutexGuard<'_, crate::signal::SignalState> {
+        self.group.signal.lock()
     }
     /// 当前工作目录（规范绝对路径），返回 owned `String`。
     ///
