@@ -250,6 +250,14 @@ pub const USER_PIE_BASE: u64 = 0x0010_0000_0000;
 pub const USER_INTERP_BASE: u64 = 0x0020_0000_0000;
 pub const SYS_MEMORY_QUERY: u32 = crate::abi_generated::SYS_MEMORY_QUERY;
 pub const SYS_MEMORY_GROW: u32 = crate::abi_generated::SYS_MEMORY_GROW;
+/// `SYS_STREAM_SEEK`：调整打开文件描述的位置（登记项⑨）。
+///
+/// **必须在这里 re-export**：本文件的 `dispatch` 用的是这些**具体名字**（不是 glob 导入）。
+/// 少了这一行，match 臂里的 `SYS_STREAM_SEEK` 就**不是一个常量模式**，而是一个新绑定 ——
+/// 即**捕获一切的通配臂**：它之后的每一条臂都变成 unreachable，**0x1D 起的所有系统调用都被它吃掉**。
+/// 实测（2026-10-16）：init 的 `brk`(0x23)` 被派发到 `sys_lseek` ⇒ 返回 0 ⇒ 堆长不大 ⇒ `heap OOM`。
+/// 编译器只给了一条 `unreachable pattern` 警告（淹没在既有 70+ 条警告里）。
+pub const SYS_STREAM_SEEK: u32 = crate::abi_generated::SYS_STREAM_SEEK;
 pub const SYS_MEMORY_UNMAP: u32 = crate::abi_generated::SYS_MEMORY_UNMAP;
 /// mprotect(addr, len, prot)：修改一段**已映射**内存的权限（MEMORY 域扩展 0x05 / 号 0x25，
 /// 3P4-5）。用途是 W^X 型 JIT 的「先写后切执行」（RW → RX）与「执行后切回写」（RX → RW）。
@@ -1061,6 +1069,41 @@ fn sys_readlink(frame: &mut SyscallFrame) -> u64 {
         arch_x86_64::mmio::copy_to_user(buf_ptr, target.as_ptr(), target.len());
     }
     pack_ok(target.len() as u64)
+}
+
+/// `lseek(fd, offset, whence)`：调整**打开文件描述**的读写位置（STREAM 域 op 13）。
+///
+/// **这是登记项⑨ 缺的那条「设置位置」原语**：此前内核不暴露 seek，libc 只能在**用户态**
+/// 维护一张 per-fd 的位置表 ⇒ (a) `dup2` 只能**拷贝**位置、不能共享（POSIX 要求 dup 出来的
+/// fd 与原来那个**共享同一个打开文件描述**的位置）；(b) `fork` 后父子同样不共享。
+///
+/// 现在位置由内核的 `OpenHandle` 持有——它本就是 `Arc<AtomicU64>`（`dup2` 共享同一游标 ✓），
+/// 故共享语义**自动成立**，libc 侧那张表整体退场。
+///
+/// 不可定位的 fd（管道端）⇒ `IllegalSeek`（libc 映射 ESPIPE），**且不改变任何状态**——
+/// 一个探测性的 lseek 绝不能把管道用坏。
+fn sys_lseek(frame: &mut SyscallFrame) -> u64 {
+    let fd = frame.a1 as usize;
+    let offset = frame.a2 as i64;
+    let whence = match frame.a3 {
+        0 => vfs::file_handle::SeekWhence::Set,
+        1 => vfs::file_handle::SeekWhence::Current,
+        2 => vfs::file_handle::SeekWhence::End,
+        _ => return pack_err(Error::InvalidParam),
+    };
+    let Some(proc) = current_proc_mut() else {
+        return pack_err(Error::NotFound);
+    };
+    match proc.get_fd(fd) {
+        Some(vfs::file_handle::OpenHandle::File(fh)) => match fh.seek(offset, whence) {
+            Ok(pos) => pack_ok(pos),
+            Err(e) => pack_err(e),
+        },
+        // POSIX：不可定位 ⇒ ESPIPE（管道/FIFO 端）。
+        Some(vfs::file_handle::OpenHandle::Pipe { .. }) => pack_err(Error::IllegalSeek),
+        // 登记项①：坏 fd 是 EBADF。
+        None => pack_err(Error::BadFd),
+    }
 }
 
 /// `ftruncate(fd, len)`：按 fd 截断/扩展文件（STREAM 域 0x19，3P4-8）。
@@ -6044,6 +6087,7 @@ fn done(v: u64) -> DispatchResult {
 }
 
 /// 按系统调用号分发到具体实现。
+
 fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
     match nr as u32 {
         // STREAM Domain (0x10)
@@ -6051,6 +6095,8 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         // read 可能阻塞切换（stdin），自带 DispatchResult 语义（K1a）。
         SYS_STREAM_READ => sys_read(frame),
         SYS_STREAM_WRITE => done(sys_write(frame)),
+        // 登记项⑨：把「设置位置」变成内核原语（此前 libc 只能在用户态维护位置表）。
+        SYS_STREAM_SEEK => done(sys_lseek(frame)),
         SYS_STREAM_CLOSE => done(sys_close(frame)),
         SYS_STREAM_DUP => done(sys_dup2(frame)),
         SYS_STREAM_LOCK => done(sys_flock(frame)),

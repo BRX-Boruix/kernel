@@ -933,14 +933,21 @@ where
         let areas = self.areas.lock();
         let area = areas[idx];
 
-        // **PROT_NONE（登记项⑥）：区域不带 user 位 = 「存在但不可访问」，任何访问都必须
+        // **PROT_NONE（登记项⑥）：区域「三位全无」= 「存在但不可访问」，任何访问都必须
         // 如实拒绝**（返回 false ⇒ 上层投递 SIGSEGV）。
         //
         // 为什么必须先判这一条：PROT_NONE 的页在页表里是 present 但不带 user 位，CPU 每次都
         // 投保护性 #PF；若这里继续往下走「按需提交」，就会**提交 → iretq 重试 → 再 #PF →
         // 再提交**地死循环（实测：子进程读 PROT_NONE 页后永不返回，只能被 SIGKILL 收场）。
         // 「不可访问」不是「还没提交」——两者必须分开处置。
-        if !area.flags.is_user() {
+        //
+        // **判据是「三位全无」而不是 `!is_user()`**：普通用户区在 `flags` 里**未必**带 user 位——
+        // 提交路径（下方 commit 点）本来就写 `area.flags.user()` 来补这个位，故若干创建点（堆区首建、
+        // TLS 区、栈区）存的是 `empty().writable()`。只判 user 会把它们一并否掉（实测回归：
+        // 堆区补页被拒 ⇒ init 的 `brk` 永远长不大 ⇒ `heap OOM`，整轮 libccheck 死在第一条断言之前）。
+        // 三位全无只有 PROT_NONE 一种来源，故它既准确又不会误伤。
+        let af = area.flags;
+        if !af.is_user() && !af.is_writable() && !af.is_executable() {
             return false;
         }
 
