@@ -277,6 +277,8 @@ impl INode for DynamicDirNode {
                 name: name.clone(),
                 node_type: meta.node_type,
                 size: meta.size,
+                // 登记项④：与 stat 的 st_ino 同源。
+                ino: node.stable_id(),
             });
         }
         Ok(list)

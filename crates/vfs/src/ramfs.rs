@@ -427,6 +427,8 @@ impl INode for RamINode {
                         name: name.clone(),
                         node_type: meta.node_type,
                         size: meta.size,
+                        // 登记项④：与 stat 的 st_ino 同源（同一文件恒等）。
+                        ino: node.stable_id(),
                     });
                 }
                 Ok(list)

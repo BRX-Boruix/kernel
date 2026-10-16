@@ -197,12 +197,20 @@ impl INode for ProcRootNode {
             name: String::from("list"),
             node_type: INodeType::RegularFile,
             size: 0,
+            // 登记项④：本条目是**合成项**（`list` 不对应可 lookup 的节点），故用固定的
+            // 合成号 1（非 0——0 保留给「无身份」）。procfs 的每 pid 条目用 pid（见下）。
+            ino: 1,
         });
         for proc in self.provider.list_processes() {
             list.push(DirEntry {
                 name: proc.pid.to_string(),
                 node_type: INodeType::Directory,
                 size: 0,
+                // 登记项④：pid 是这些视图节点唯一**稳定**的身份（进程生命周期内恒等）。
+                // 注意：`stat("/system/processes/<pid>")` 的 st_ino 目前走 INode 的默认
+                // `stable_id`（self 地址，每次 lookup 都变），故两者此处**不一致**——
+                // 根因在默认实现，已在报告里登记（不在本轮范围内）。
+                ino: proc.pid as u64,
             });
         }
         Ok(list)

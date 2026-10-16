@@ -2230,6 +2230,8 @@ impl INode for Ext2Node {
                     name,
                     node_type,
                     size: e.size as u64,
+                    // 登记项④：与 Ext2Node::stable_id **同一算式**（盘上 ino+1，避 0）。
+                    ino: e.inode as u64 + 1,
                 })
             })
             .collect()

@@ -510,6 +510,8 @@ impl INode for IsoNode {
                     INodeType::RegularFile
                 },
                 size: r.size,
+                // 登记项④：与 IsoNode::stable_id **同一算式**（extent LBA*2+1，避 0）。
+                ino: r.lba.wrapping_mul(2).wrapping_add(1),
             })
             .collect())
     }

@@ -2422,7 +2422,7 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
     };
 
     // 标准紧凑 JSON 数组输出（ADR-014 §4.1 / ADR-013 对象视图一致约定）：
-    //   [{"name":"...","type":"file","size":123}, ...]
+    //   [{"name":"...","type":"file","size":123,"ino":42}, ...]
     // 经 klib::json 的 JsonWriter 逐字段转义（S09 宁缺毋假：名字含引号/反斜杠
     // 等控制符均正确转义，绝不裸拼破坏成帧）。KM5：只交付**完整数组**——放
     // 不下整条时尾部条目整体省略，绝不把半截 `{"name":"...` 交给调用方；返回
@@ -2461,6 +2461,9 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
             .field_str("type", type_tag(e.node_type))
             .expect("Vec-backed JSON cannot fail")
             .field_u64("size", e.size)
+            .expect("Vec-backed JSON cannot fail")
+            // 登记项④：POSIX `d_ino` 的真值出口（与 `stat` 的 `st_ino` 同源）。
+            .field_u64("ino", e.ino)
             .expect("Vec-backed JSON cannot fail");
         let _ = obj.end();
         let item_bytes = item.as_bytes();

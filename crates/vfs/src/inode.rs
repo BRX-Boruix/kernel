@@ -613,6 +613,15 @@ pub struct DirEntry {
     pub name: String,
     pub node_type: INodeType,
     pub size: u64,
+    /// **文件序号**（POSIX `readdir` 的 `d_ino`；语义忠实性审查登记项④）。
+    ///
+    /// 真值来自该条目对应节点的 [`INode::stable_id`]——与 `stat` 的 `st_ino` **同一个源**
+    /// （`sys_fstat` 也是取它），故「同一个文件」在两个接口下报同一个号。
+    ///
+    /// 视图型节点（procfs 等）没有可加锁的真实文件身份，其 `stable_id` 默认实现是
+    /// `self` 地址（见该方法的文档）；那类条目的 `ino` 由各自的 `list_dir` 如实给出
+    /// （procfs 用 pid），并在报告里登记了与 `st_ino` 的这处不一致。
+    pub ino: u64,
 }
 
 /// stat 系统调用的 ABI 结果结构（内核→用户，经 syscall 整块拷出）。
