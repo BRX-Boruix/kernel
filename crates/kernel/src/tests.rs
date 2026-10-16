@@ -2070,7 +2070,7 @@ pub fn test_task_derive_e2e() {
         a1,
         a2,
         a3,
-        a4: 0,
+        a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
         a5: 0,
         result: 0,
         switched: false,
@@ -2453,7 +2453,7 @@ pub fn test_derive_multithreaded_parent_rejected() {
         a1,
         a2,
         a3,
-        a4: 0,
+        a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
         a5: 0,
         result: 0,
         switched: false,
@@ -4755,7 +4755,7 @@ pub fn test_syscall_munmap() {
             a1: addr,
             a2: size,
             a3: 0,
-            a4: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
             a5: 0,
             result: 0,
             switched: false,
@@ -4900,7 +4900,7 @@ pub fn test_syscall_usercopy_faults() {
             a1,
             a2,
             a3,
-            a4: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
             a5: 0,
             result: 0,
             switched: false,
@@ -5194,7 +5194,7 @@ pub fn test_syscall_seq_large_io() {
             a1,
             a2,
             a3,
-            a4: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
             a5: 0,
             result: 0,
             switched: false,
@@ -5322,7 +5322,7 @@ pub fn test_syscall_entry_update() {
             a1,
             a2,
             a3,
-            a4: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
             a5: 0,
             result: 0,
             switched: false,
@@ -5573,7 +5573,7 @@ pub fn test_syscall_pipe() {
     let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
 
     // 映射两页并驻留：路径串区（buf）与数据缓冲（buf2）。
-    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0, 0);
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0, mm::user_space::PROT_DEFAULT);
     assert!(crate::syscall::syscall_entry(&mut map));
     assert!(map.result < 0x8000_0000_0000_0000, "mmap must succeed");
     let base = map.result;
@@ -5816,7 +5816,7 @@ pub fn test_syscall_entry_read_json() {
             a1,
             a2,
             a3,
-            a4: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
             a5: 0,
             result: 0,
             switched: false,
@@ -6091,7 +6091,7 @@ pub fn test_syscall_entry_create_kind() {
             a1,
             a2,
             a3,
-            a4: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
             a5: 0,
             result: 0,
             switched: false,
@@ -6255,7 +6255,7 @@ pub fn test_syscall_driver_query_unregister() {
             a1,
             a2,
             a3,
-            a4: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
             a5: 0,
             result: 0,
             switched: false,
@@ -6486,7 +6486,7 @@ pub fn test_syscall_memory_map_shared() {
             a1,
             a2,
             a3,
-            a4: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
             a5: 0,
             result: 0,
             switched: false,
@@ -6599,7 +6599,7 @@ pub fn test_syscall_memquery_and_stdin_busy() {
             a1,
             a2,
             a3,
-            a4: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
             a5: 0,
             result: 0,
             switched: false,
@@ -10812,7 +10812,7 @@ pub fn test_chown_preserves_explicit_aces() {
     assert_eq!(seeded.explicit_aces().count(), 1, "fixture has 1 explicit ACE");
 
     // 经**真实 syscall** 发 chown（改 gid，uid 不变以免动易主门禁）。
-    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, mm::user_space::PROT_DEFAULT);
     assert!(crate::syscall::syscall_entry(&mut map));
     let buf = map.result;
     {
@@ -10946,7 +10946,7 @@ pub fn test_ace_abi_roundtrip() {
     let _ = root.create_file("/scratch/a2_6_abi.txt", 0o644, (1, 1)).expect("fixture");
 
     // 两块用户缓冲：路径 + ACE 数组。
-    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0, 0);
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x2000, 0, 0, mm::user_space::PROT_DEFAULT);
     assert!(crate::syscall::syscall_entry(&mut map));
     let buf = map.result;
     {
@@ -11240,7 +11240,7 @@ pub fn test_dir_traverse_execute_check() {
     info!("[test-traverse] fixture: /scratch/a2_3_dir(0700) + file(0644) OK");
 
     // 用户缓冲：路径。
-    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, mm::user_space::PROT_DEFAULT);
     assert!(crate::syscall::syscall_entry(&mut map));
     let buf = map.result;
     {
@@ -11975,7 +11975,7 @@ pub fn test_read_telemetry_counters() {
             a1: 0,   // fd —— len==0 早退，不触达 fd 查找
             a2: 0,   // buf
             a3: 0,   // len == 0：保证纯 Done 路径，无真实 IO
-            a4: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
             a5,
             result: 0,
             switched: false,
@@ -15471,7 +15471,7 @@ pub fn test_sync_syscalls() {
             a1,
             a2,
             a3,
-            a4: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
             a5: 0,
             result: 0,
             switched: false,
@@ -15725,7 +15725,7 @@ pub fn test_cap_system_gate() {
         SyscallFrame {
             nr: nr as u64,
             a1, a2, a3,
-            a4: 0, a5: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0,
             aux_pid: 0,
         }
@@ -15979,7 +15979,7 @@ pub fn test_access_enforcement_matrix() {
         SyscallFrame {
             nr: nr as u64,
             a1, a2, a3,
-            a4: 0, a5: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0,
             aux_pid: 0,
         }
@@ -16319,7 +16319,7 @@ pub fn test_stat_owner_fields() {
         SyscallFrame {
             nr: nr as u64,
             a1, a2, a3,
-            a4: 0, a5: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0,
             aux_pid: 0,
         }
@@ -16576,7 +16576,7 @@ pub fn test_chown_e2e() {
         SyscallFrame {
             nr: nr as u64,
             a1, a2, a3,
-            a4: 0, a5: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0,
             aux_pid: 0,
         }
@@ -16812,7 +16812,7 @@ pub fn test_ace_e2e() {
         SyscallFrame {
             nr: nr as u64,
             a1, a2, a3,
-            a4: 0, a5: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0,
             aux_pid: 0,
         }
@@ -17009,7 +17009,7 @@ pub fn test_driver_uio_privilege_gate() {
         SyscallFrame {
             nr: nr as u64,
             a1, a2, a3,
-            a4: 0, a5: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0,
             aux_pid: 0,
         }
@@ -17100,7 +17100,7 @@ pub fn test_audio_attach_privilege_gate() {
         SyscallFrame {
             nr: nr as u64,
             a1, a2, a3,
-            a4: 0, a5: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0,
             aux_pid: 0,
         }
@@ -17424,7 +17424,7 @@ pub fn test_flock_syscall() {
         SyscallFrame {
             nr: nr as u64,
             a1, a2, a3,
-            a4: 0, a5: 0,
+            a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 }, a5: 0,
             result: 0, switched: false, arch_frame: 0,
             aux_pid: 0,
         }
@@ -18015,7 +18015,7 @@ pub fn test_groups_and_named_gid() {
     }
 
     // 用户缓冲：一个 0x1000 页，用于组数组。
-    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, mm::user_space::PROT_DEFAULT);
     assert!(crate::syscall::syscall_entry(&mut map));
     let buf = map.result;
     {
@@ -18173,7 +18173,7 @@ pub fn test_shadow_file_separation() {
     info!("[test-shadow] fixture 0600 owner(0,0) OK");
 
     // 用户缓冲：路径（含 NUL 结尾）。
-    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, mm::user_space::PROT_DEFAULT);
     assert!(crate::syscall::syscall_entry(&mut map));
     let buf = map.result;
     {
@@ -18324,7 +18324,7 @@ pub fn test_login_capability_set() {
     node.write_at(0, body).expect("seed shadow");
 
     // 用户缓冲：路径。
-    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, mm::user_space::PROT_DEFAULT);
     assert!(crate::syscall::syscall_entry(&mut map));
     let buf = map.result;
     {
@@ -18482,7 +18482,7 @@ pub fn test_login_downgrade_path() {
         .expect("create shadow fixture");
     node.write_at(0, b"{\"accounts\":[]}").expect("seed");
 
-    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, 0);
+    let mut map = frame(crate::syscall::SYS_MEMORY_MAP, 0x1000, 0, 0, mm::user_space::PROT_DEFAULT);
     assert!(crate::syscall::syscall_entry(&mut map));
     let buf = map.result;
     {
