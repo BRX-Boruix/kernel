@@ -312,8 +312,11 @@ impl FileHandle {
     /// 本读者游标处暂无新记录（syscall 层按节点真值接阻塞/非阻塞语义）。
     /// 其余句柄逐位保持原语义。
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        // POSIX：对**未以读方式打开**的 fd 读 ⇒ **EBADF**（不是 EACCES）。
+        // EACCES 留给「节点权限不足」（由 syscall 层的 check_access 给出）——
+        // 两者在语义忠实性审查登记项① 之前共用 PermissionDenied，用户态无法区分。
         if !self.flags.read {
-            return Err(Error::PermissionDenied);
+            return Err(Error::BadFd);
         }
         if let Some(tok) = &self.stream_token {
             // 整环填满（与 read_at 的 backlog 形态同款「读走尽可能多的整条」）：
@@ -343,8 +346,9 @@ impl FileHandle {
     /// 并作废受影响缓存块（失效一致性策略的唯一合法写通道）；未注入时
     /// 直写 inode。
     pub fn write(&self, buf: &[u8]) -> Result<usize, Error> {
+        // POSIX：对**未以写方式打开**的 fd 写 ⇒ **EBADF**（理由同 read）。
         if !self.flags.write {
-            return Err(Error::PermissionDenied);
+            return Err(Error::BadFd);
         }
         let cur = if self.flags.append {
             // S21：append 的"读 size + 写"非原子——两个并发 append 可能读到
@@ -365,16 +369,18 @@ impl FileHandle {
 
     /// 无状态定位读（pread，不影响句柄内部 offset）。
     pub fn pread(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        // 同 read：方向不符 ⇒ EBADF。
         if !self.flags.read {
-            return Err(Error::PermissionDenied);
+            return Err(Error::BadFd);
         }
         self.inode.read_at(offset, buf)
     }
 
     /// 无状态定位写（pwrite，不影响句柄内部 offset）。一致性语义同 [`Self::write`]。
     pub fn pwrite(&self, offset: u64, buf: &[u8]) -> Result<usize, Error> {
+        // 同 write：方向不符 ⇒ EBADF。
         if !self.flags.write {
-            return Err(Error::PermissionDenied);
+            return Err(Error::BadFd);
         }
         self.write_coordinated(offset, buf)
     }

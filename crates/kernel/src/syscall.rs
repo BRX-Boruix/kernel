@@ -1074,8 +1074,12 @@ fn sys_ftruncate(frame: &mut SyscallFrame) -> u64 {
     let Some(proc) = current_proc_mut() else {
         return pack_err(Error::NotFound);
     };
-    let Some(vfs::file_handle::OpenHandle::File(fh)) = proc.get_fd(fd) else {
-        return pack_err(Error::NotFound); // fd 缺失或管道端
+    let fh = match proc.get_fd(fd) {
+        Some(vfs::file_handle::OpenHandle::File(fh)) => fh,
+        // POSIX：ftruncate 对**管道**是 EINVAL（对象不可截断），不是 EBADF。
+        Some(vfs::file_handle::OpenHandle::Pipe { .. }) => return pack_err(Error::InvalidParam),
+        // 语义忠实性审查登记项①：坏 fd 是 **EBADF**，不是 ENOENT。
+        None => return pack_err(Error::BadFd),
     };
     let identity = proc.identity();
     if let Err(e) = check_access(&identity, fh.inode.as_ref(), vfs::inode::PermBits::WRITE) {
@@ -1094,8 +1098,8 @@ fn sys_fsync(frame: &mut SyscallFrame) -> u64 {
         return pack_err(Error::NotFound);
     };
     match proc.get_fd(fd) {
-        // fd 缺失。
-        None => return pack_err(Error::NotFound),
+        // fd 缺失 ⇒ POSIX 的 EBADF（审查登记项①）。
+        None => return pack_err(Error::BadFd),
         // 管道端没有持久化语义（POSIX 对应 EINVAL），不假装成功。
         Some(vfs::file_handle::OpenHandle::Pipe { .. }) => return pack_err(Error::InvalidParam),
         Some(vfs::file_handle::OpenHandle::File(_)) => {}
@@ -1114,7 +1118,7 @@ fn fd_file_inode(fd: usize) -> Result<alloc::sync::Arc<dyn vfs::inode::INode>, E
         return Err(Error::NotFound);
     };
     match proc.get_fd(fd) {
-        None => Err(Error::NotFound),
+        None => Err(Error::BadFd),
         // 管道端没有 mode/属主语义（POSIX 对应 EINVAL），不假装成功。
         Some(vfs::file_handle::OpenHandle::Pipe { .. }) => Err(Error::InvalidParam),
         Some(vfs::file_handle::OpenHandle::File(fh)) => Ok(fh.inode.clone()),
@@ -1669,7 +1673,9 @@ fn sys_close(frame: &mut SyscallFrame) -> u64 {
             }
         }
         Some(vfs::file_handle::OpenHandle::File(_)) => pack_ok(0),
-        None => pack_err(Error::NotFound),
+        // 坏 fd ⇒ EBADF（审查登记项①）。注意关闭 stdin/stdout/stderr 走上面的 `fd < 3`
+        // 分支（NotSupported）——那是另一条已登记的边界，不在本轮改。
+        None => pack_err(Error::BadFd),
     }
 }
 
@@ -1685,8 +1691,12 @@ fn sys_flock(frame: &mut SyscallFrame) -> u64 {
         return pack_err(Error::NotFound);
     };
     let uid = proc.identity().uid;
-    let Some(vfs::file_handle::OpenHandle::File(fh)) = proc.get_fd(fd) else {
-        return pack_err(Error::NotFound); // fd 缺失或 pipe 端（flock 仅文件）
+    let fh = match proc.get_fd(fd) {
+        Some(vfs::file_handle::OpenHandle::File(fh)) => fh,
+        // 管道端没有文件锁语义（POSIX 对应 EINVAL），不假装成功。
+        Some(vfs::file_handle::OpenHandle::Pipe { .. }) => return pack_err(Error::InvalidParam),
+        // 坏 fd ⇒ EBADF（审查登记项①）。
+        None => return pack_err(Error::BadFd),
     };
     let owner = vfs::flock::LockOwner { uid };
     match cmd {
@@ -1801,7 +1811,8 @@ fn sys_fstat(frame: &mut SyscallFrame) -> u64 {
             ino: id,
             nlink: 1,
         },
-        None => return pack_err(Error::NotFound),
+        // 坏 fd ⇒ POSIX 的 EBADF（审查登记项①；管道已在上一臂处理，这里只会是「不存在」）。
+        None => return pack_err(Error::BadFd),
     };
     let bytes = core::mem::size_of::<vfs::inode::StatInfo>();
     if let Err(e) = validate_user_range(buf_ptr, bytes as u64, UserAccess::Write) {
@@ -1835,7 +1846,8 @@ fn sys_dup2(frame: &mut SyscallFrame) -> u64 {
         };
         match proc.get_fd(old_fd) {
             Some(h) => h,
-            None => return pack_err(Error::NotFound),
+            // 坏 fd ⇒ EBADF（审查登记项①）。
+            None => return pack_err(Error::BadFd),
         }
     };
     if old_fd == new_fd {
@@ -2510,7 +2522,8 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
     let pipe_id = match proc.get_fd(fd as usize) {
         Some(vfs::file_handle::OpenHandle::Pipe { id, .. }) => Some(id),
         Some(vfs::file_handle::OpenHandle::File(_)) => None,
-        None => return pack_err(Error::InvalidParam),
+        // 坏 fd ⇒ EBADF（审查登记项①）。
+        None => return pack_err(Error::BadFd),
     };
     if pipe_id.is_none() {
         // A1-3 / ADR-040 §2.6：**每次** write 调用都强制（非仅 open）——
@@ -2539,7 +2552,7 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
     let handle = match proc.get_fd(fd as usize) {
         Some(vfs::file_handle::OpenHandle::File(h)) => h,
         Some(vfs::file_handle::OpenHandle::Pipe { .. }) => unreachable!("handled above"),
-        None => return pack_err(Error::InvalidParam),
+        None => return pack_err(Error::BadFd),
     };
     // KM1：无 fd 号特判——1/2 与普通句柄走同一条路，stdout/stderr 节点在
     // write_at 内直发字节（K5 完全体：串口 sink 字节透明，文本 sink 自行
@@ -2660,7 +2673,8 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
     let pipe_id = match proc.get_fd(fd as usize) {
         Some(vfs::file_handle::OpenHandle::Pipe { id, .. }) => Some(id),
         Some(vfs::file_handle::OpenHandle::File(_)) => None,
-        None => return done(pack_err(Error::InvalidParam)),
+        // 坏 fd ⇒ EBADF（审查登记项①）。
+        None => return done(pack_err(Error::BadFd)),
     };
     if pipe_id.is_none() {
         // A1-3 / ADR-040 §2.6：**每次** read 调用都强制（非仅 open）——
@@ -2687,7 +2701,7 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
     let handle = match proc.get_fd(fd as usize) {
         Some(vfs::file_handle::OpenHandle::File(h)) => h,
         Some(vfs::file_handle::OpenHandle::Pipe { .. }) => unreachable!("handled above"),
-        None => return done(pack_err(Error::InvalidParam)),
+        None => return done(pack_err(Error::BadFd)),
     };
     // KM1：无 fd 号特判——0 与普通句柄走同一条路。stdin 节点空读返回
     // WouldBlock，下方按节点真值（interactive_input）翻译为阻塞切换。

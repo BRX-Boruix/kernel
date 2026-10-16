@@ -5771,7 +5771,8 @@ pub fn test_syscall_pipe() {
     let mut c2 = pipe_frame(crate::syscall::SYS_STREAM_CLOSE, read_fd as u64, 0, 0, 0);
     assert!(crate::syscall::syscall_entry(&mut c2));
     assert!(c2.result < 0x8000_0000_0000_0000, "close read end");
-    // 管道已销毁：对已关闭 fd 读 → InvalidParam（fd 表已移除）。
+    // 管道已销毁：对已关闭 fd 读 → **BadFd**（POSIX：坏 fd 是 EBADF）。
+    // 语义忠实性审查登记项① 之前内核错误集里没有 EBADF，故这里曾断言 InvalidParam。
     let mut ghost = pipe_frame(
         crate::syscall::SYS_STREAM_READ,
         read_fd as u64,
@@ -5782,8 +5783,8 @@ pub fn test_syscall_pipe() {
     assert!(crate::syscall::syscall_entry(&mut ghost));
     assert_eq!(
         ghost.result,
-        (-(klib::error::Error::InvalidParam.to_errno() as i64)) as u64,
-        "read on closed fd must be InvalidParam"
+        (-(klib::error::Error::BadFd.to_errno() as i64)) as u64,
+        "read on closed fd must be BadFd (EBADF)"
     );
 
     arch_x86_64::mmio::write_cr3(saved_cr3);
@@ -16391,10 +16392,13 @@ pub fn test_stat_owner_fields() {
     let mut st = frame4(crate::syscall::SYS_ENTRY_READ, buf, out_buf, 0x100, crate::syscall::ENTRY_READ_STAT);
     assert!(crate::syscall::syscall_entry(&mut st));
     assert!(st.result & ERR_FLAG == 0, "stat must succeed");
-        // J-TOKEN-B：ABI 尾部追加 console_owner（u64）后 sizeof 64 → 72。
-    // 同时钉**字面量**与 size_of：字面量捕“无意的布局漂移”，
-    // size_of 捕“两侧定义不一致”（S06 跨边界数据契约）。
-    assert_eq!(core::mem::size_of::<vfs::inode::StatInfo>(), 72, "StatInfo sizeof must be 72 (J-TOKEN-B)");
+        // J-TOKEN-B 追加 console_owner 后 64 → 72；此后又尾部追加 ino(u64)+nlink(u32)
+    // → **88**（libsys 侧 `io.rs` 的同名断言也钉 88，两侧必须同值）。
+    //
+    // **这条断言曾长期是红的**（仍写 72）：内核自检测试**不在离线套件里**
+    // （`tools/checks/run_all.py` 的 HARDWARE_CHECKS 为空），没人跑就不会被发现。
+    // 语义忠实性审查「内核缺口收口」跑 `--test` 时抓到，顺手修正。
+    assert_eq!(core::mem::size_of::<vfs::inode::StatInfo>(), 88, "StatInfo sizeof must be 88 (J-TOKEN-B + ino/nlink)");
     assert_eq!(st.result as usize, core::mem::size_of::<vfs::inode::StatInfo>(), "stat must return the compiled StatInfo size (J-TOKEN-B)");
     unsafe {
         let pa = task::current_proc_mut()

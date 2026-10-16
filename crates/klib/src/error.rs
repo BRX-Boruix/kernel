@@ -96,6 +96,15 @@ pub enum Error {
     /// 自愈，必须先解除占用方（如删除一个仍是活动挂载点的目录：
     /// vfs1 A7，先 unmount 才能删）。klib1 预置变体，vfs1 整改接线。
     Busy,
+    /// **坏文件描述符**（EBADF）：`fd` 不存在，或该 fd 的**打开方向**不支持本次操作
+    /// （对只读 fd 写、对只写 fd 读）。
+    ///
+    /// 与 [`Error::PermissionDenied`] 的分界（语义忠实性审查登记项①）：PermissionDenied
+    /// 是**节点权限**不足（EACCES，换个身份或改权限即可）；BadFd 是**这个 fd 本身**
+    /// 不适用于本次操作（换 fd 才行）。POSIX 给前者的规定码是 EACCES、给后者的是 EBADF
+    /// ——在本变体存在之前，内核只有前者可用，于是坏 fd 被报成 EINVAL/ENOENT/EACCES
+    /// 三种不同的码（libc 无法按 POSIX 处置，只能各自近似）。
+    BadFd,
 }
 
 impl Error {
@@ -140,6 +149,7 @@ impl core::fmt::Display for Error {
             Error::IllegalSeek => f.write_str("illegal seek"),
             Error::ExecFormat => f.write_str("exec format error"),
             Error::Busy => f.write_str("resource busy"),
+            Error::BadFd => f.write_str("bad file descriptor"),
             Error::ReadOnly => f.write_str("read-only file system"),
             Error::Corrupt => f.write_str("structure needs cleaning"),
         }
