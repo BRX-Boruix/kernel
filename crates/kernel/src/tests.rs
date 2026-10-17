@@ -9647,12 +9647,12 @@ pub fn test_loader_adversarial() {
         // **3P4-2 引导环境合成锚点**：PATH 必须是 ADR-028 的单源程序目录；PWD 必须
         // 由内核权威 cwd 拼出（此处喂入合成 cwd，验证拼接与条目形态）。
         let mut env_out: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
-        crate::syscall::build_boot_env("/volumes/BORUIX_DATA/3p", &mut env_out)
+        crate::syscall::build_boot_env("/volumes/voltest/3p", &mut env_out)
             .expect("[test-loader] build_boot_env");
         let has = |needle: &[u8]| env_out.iter().any(|e| e.as_slice() == needle);
         assert!(has(b"PATH=/programs"), "PATH 必须是 ADR-028 单源程序目录");
         assert!(
-            has(b"PWD=/volumes/BORUIX_DATA/3p"),
+            has(b"PWD=/volumes/voltest/3p"),
             "PWD 必须由内核权威 cwd 拼出"
         );
         assert_eq!(env_out.len(), 2, "当前只合成 PATH 与 PWD（其余属后续项）");
@@ -10055,7 +10055,7 @@ pub fn test_signal_foundation() {
             "fresh PCB must default to /"
         );
         assert!(
-            task::scheduler::test_hooks::set_test_cwd(CWD_DAD, "/volumes/BORUIX_DATA/3p"),
+            task::scheduler::test_hooks::set_test_cwd(CWD_DAD, "/volumes/voltest/3p"),
             "set cwd-dad cwd"
         );
         let child_us = UserAddressSpace::<X86PageTable>::new().expect("new cwd-child user space");
@@ -10072,7 +10072,7 @@ pub fn test_signal_foundation() {
         .expect("spawn child of cwd-dad");
         assert_eq!(
             task::scheduler::test_hooks::probe_cwd(cwd_child).as_deref(),
-            Some("/volumes/BORUIX_DATA/3p"),
+            Some("/volumes/voltest/3p"),
             "exec path must inherit the parent's cwd (POSIX)"
         );
         info!(

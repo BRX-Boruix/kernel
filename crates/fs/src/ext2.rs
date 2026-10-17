@@ -2429,7 +2429,7 @@ mod tests {
         img.w16(sb + 88, 128); // s_inode_size
         // 卷标 @120（16B）与 FS UUID @104（16B）：M0.1 解析锚点。
         img.write_bytes(sb + 104, &[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C]);
-        img.write_bytes(sb + 120, b"BORUIX_DATA");
+        img.write_bytes(sb + 120, b"TESTVOL1");
         // GDT @block2: inode_table = block 5
         img.w32(img.part + 2 * BS + 8, 5);
         // Inode 表 @block5
@@ -3248,8 +3248,8 @@ mod tests {
         let (img, _, _) = build_image();
         let sb = img[(PART_START_LBA * SECTOR) as usize + 1024..][..1024].try_into().unwrap();
         let sb = parse_superblock(sb).expect("fixture sb parses");
-        // 卷标 "BORUIX_DATA"（11 字节）后接 NUL，截断到首个 NUL 得完整标签。
-        assert_eq!(sb.volume_name_str(), Some("BORUIX_DATA"));
+        // 卷标 "TESTVOL1"（8 字节）后接 NUL，截断到首个 NUL 得完整标签。
+        assert_eq!(sb.volume_name_str(), Some("TESTVOL1"));
         // 无卷标（首字节 0）→ 空串（不是 None，也不是伪造名）。
         let mut bare = build_image().0;
         let base = (PART_START_LBA * SECTOR) as usize;
