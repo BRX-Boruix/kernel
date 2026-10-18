@@ -823,6 +823,62 @@ impl<PT: PageTable> Process<PT> {
         &self.group.addr_space
     }
 
+    /// exec：把线程组的地址空间换成 `new`，**返回旧空间**。
+    ///
+    /// 返回旧空间即交出所有权：调用方必须先把本核 CR3 切离旧表，再让它自然析构——
+    /// [`UserAddressSpace::destroy`] 的跨核切离门以「本核不在该表上」为前提。
+    ///
+    /// 仅当本进程是该线程组的**唯一**持有者时成功。POSIX 的 exec 会终止同组其它
+    /// 线程；本实现如实拒绝（`NotSupported`）而不是假装做到，`Arc::get_mut` 正是
+    /// 「无同组其它成员」这一不变式的直接判据。
+    pub fn replace_addr_space(
+        &mut self,
+        new: Arc<UserAddressSpace<PT>>,
+    ) -> Result<Arc<UserAddressSpace<PT>>, klib::error::Error> {
+        match Arc::get_mut(&mut self.group) {
+            Some(g) => Ok(core::mem::replace(&mut g.addr_space, new)),
+            None => Err(klib::error::Error::NotSupported),
+        }
+    }
+
+    /// exec：更新 PCB 记录的映像入口与用户栈顶（地址空间已另行替换）。
+    pub fn set_image(&mut self, entry_rip: u64, user_stack_top: u64) {
+        self.entry_rip = entry_rip;
+        self.user_stack_top = user_stack_top;
+    }
+
+    /// exec：剔除 fd 表中打了 `CLOEXEC` 的槽，返回被取出的句柄。
+    ///
+    /// 只在**换映像确定成功之后**调用：POSIX 规定 exec 失败时 fd 一律不动。
+    /// pipe 端引用计数由调用方（syscall 层）逐个 `ipc::pipe_ref_dec`——task 不依赖
+    /// ipc，与 [`Self::close_fd`] 同一分工。
+    ///
+    /// 账目与 [`Self::close_fd`] 对偶：每个被取出的占用槽归还全局 fd 额度。
+    pub fn take_cloexec_fds(&self) -> Vec<vfs::file_handle::OpenHandle> {
+        let mut taken: Vec<vfs::file_handle::OpenHandle> = Vec::new();
+        {
+            let mut table = self.group.fd_table.lock();
+            for slot in table.iter_mut() {
+                if slot.as_ref().is_some_and(|h| h.flags().cloexec) {
+                    if let Some(h) = slot.take() {
+                        taken.push(h);
+                    }
+                }
+            }
+        }
+        if !taken.is_empty() {
+            fd_gate_release(taken.len());
+        }
+        // flock 解锁放在 fd 锁之外（「fd 锁内不做 vfs 操作」的锁序纪律，同 close_fd）。
+        let uid = self.group.identity.lock().uid;
+        for h in taken.iter() {
+            if let vfs::file_handle::OpenHandle::File(fh) = h {
+                vfs::flock::flock_unlock(&fh.inode, vfs::flock::LockOwner { uid });
+            }
+        }
+        taken
+    }
+
     /// 启动进程：设置状态为 Running，并从内核 `iretq` 进入用户态。
     ///
     /// `enter_usermode` 会先装载本进程页表（`cr3`），再 iretq 进用户态；

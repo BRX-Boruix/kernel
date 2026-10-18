@@ -18597,3 +18597,272 @@ pub fn test_login_downgrade_path() {
     unsafe { drop(Box::from_raw(proc_raw)); }
     info!("[test-login-drop] === A2-7 prerequisite 3 done ===");
 }
+
+/// 3P4-12：`SYS_TASK_EXEC`（0x30）——**同一进程换映像**的端到端验收。
+///
+/// 走完整 syscall 路径：把一个真实进程登记进分桶表 → 让它成为 CURRENT_PROC →
+/// 构造真实 `arch_frame` → `syscall_entry(SYS_TASK_EXEC)` → 检查内核真实装配出的新映像。
+///
+/// 断言（全部可证伪）：
+/// 1. **pid 不变**（POSIX 铁律）；
+/// 2. **帧被换成新入口**：rip == ELF entry、rsp == 新用户栈顶、GPR 清零——
+///    新映像不得看到旧映像的寄存器内容；
+/// 3. **`switched` 置位**：架构层不得把 syscall 返回值写回 rax（成功不返回）；
+/// 4. **地址空间真的换了**：CR3 == 新空间页表且 ≠ 旧页表；
+/// 5. **PCB 名换成新程序名**；
+/// 6. **CLOEXEC 剔除、其余 fd 保留**；
+/// 7. **信号处置复位**：被捕获的→Default、被忽略的保持 Ignore、未决清空、restorer 换新；
+///    **FPU 现场**同样回到模板（旧映像的 x87/SSE 不得泄漏给新映像）；
+/// 8. **失败不改动调用者**：不存在的路径 → `-ENOENT`，CR3/名/帧/`switched` 全部原样；
+/// 9. **内建索引如实拒绝**（`exec(init)` 没有意义）；
+/// 10. **线程组仍有别的成员 → 如实拒绝**（`-ENOTSUP`），且不做任何改动。
+#[cfg(feature = "kernel-tests")]
+pub fn test_task_exec() {
+    use arch::syscall::SyscallFrame;
+    use arch_x86_64::interrupts::InterruptFrame;
+    use task::signals::{SIGCHLD, SIGUSR1, SIGUSR2};
+    use task::SigDisposition;
+    use vfs::file_handle::{FileHandle, OpenFlags, OpenHandle};
+
+    info!("[test-exec] === 3P4-12: SYS_TASK_EXEC (same-pid image replacement) ===");
+
+    const PID: usize = 0x4E0;
+    // 两条路径串放在**同一页**里：夹具只需 reserve + 触碰一页（与 test_task_derive_e2e
+    // 的已知可用形态一致，避免在"多页预触碰"上引入与本项无关的失败面）。
+    const PATH_VADDR: u64 = 0x0000_0000_0050_0000;
+    const MISSING_VADDR: u64 = 0x0000_0000_0050_0100;
+    const OLD_STACK_TOP: u64 = 0x5000;
+    const OLD_RIP: u64 = 0x0000_0000_0040_1234;
+    const ELF_ENTRY: u64 = 0x40_0000;
+    const ENOENT_U64: u64 = (-2i64) as u64;
+    const EINVAL_U64: u64 = (-22i64) as u64;
+    const ENOTSUP_U64: u64 = (-95i64) as u64;
+
+    // KM16 纪律（同 test_task_derive_e2e）：本测试安装伪当前进程并直接派发 syscall，
+    // LAPIC tick 中途到来会把别的进程的保存帧 iretq 进用户态、摧毁测试现场。全程关中断。
+    let irq_flags = arch_x86_64::interrupts::irq_save();
+    let saved_cr3 = arch_x86_64::mmio::cr3();
+    let saved_fs_base = arch_x86_64::gdt::read_fs_base();
+
+    // ---- 用户内存：两条路径串（exec 会从用户态拷它们）----
+    let mut space =
+        mm::user_space::UserAddressSpace::<X86PageTable>::new().expect("exec test address space");
+    space
+        .reserve_user(
+            VirtAddr::new(PATH_VADDR),
+            VirtAddr::new(PATH_VADDR + 0x1000),
+            PageSize::Size4K,
+            PageFlags::empty().writable().user(),
+        )
+        .expect("reserve path page");
+    assert!(
+        space.handle_page_fault(
+            PATH_VADDR,
+            arch_x86_64::paging::PageFaultCode::new(arch_x86_64::paging::PF_EC_WRITE)
+        ),
+        "touch path page"
+    );
+    let off = arch::PHYS_OFFSET.get().copied().unwrap_or(0);
+    let write_user = |vaddr: u64, bytes: &[u8]| {
+        let pa = space.translate(VirtAddr::new(vaddr)).expect("translate path page").as_u64();
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), (pa + off) as *mut u8, bytes.len())
+        };
+    };
+    write_user(PATH_VADDR, b"/scratch/exec_prog.elf\x00");
+    write_user(MISSING_VADDR, b"/scratch/exec_absent.elf\x00");
+
+    // ---- 夹具：VFS 里的合法 ELF + 两个 fd 用的节点 ----
+    let root = crate::vfs_init::root();
+    let elf = build_loader_elf(&LoaderElfSpec::BASE);
+    let prog = root
+        .create_file("/scratch/exec_prog.elf", 0o755, (0, 0))
+        .expect("create exec fixture program");
+    {
+        let h = FileHandle::new(prog.clone(), OpenFlags::READ_WRITE).expect("fixture handle");
+        assert_eq!(h.write(&elf).expect("write fixture"), elf.len());
+    }
+    let node_a = root
+        .create_file("/scratch/exec_fd_a.txt", 0o644, (0, 0))
+        .expect("fd fixture a");
+    let node_b = root
+        .create_file("/scratch/exec_fd_b.txt", 0o644, (0, 0))
+        .expect("fd fixture b");
+
+    // ---- 登记进程 + 设为当前（登记进表才能被 exec_replace_image 找到）----
+    assert!(
+        task::test_hooks::register_test_entry_with_space(PID, 0, "exec-test", space),
+        "register exec test entry with its real address space"
+    );
+    assert!(task::test_hooks::set_current(PID), "make exec test entry current");
+    let old_cr3 = task::current_proc_mut()
+        .expect("current proc")
+        .addr_space()
+        .page_table_paddr();
+    arch_x86_64::mmio::write_cr3(old_cr3);
+
+    // ---- exec 前状态：两个 fd（一个 CLOEXEC）+ 三个信号处置 + 一个未决 ----
+    let (fd_clo, fd_keep) = {
+        let p = task::current_proc_mut().expect("current proc");
+        let hc = FileHandle::new(node_a.clone(), OpenFlags::READ_ONLY).expect("handle a");
+        let fc = p.alloc_fd(OpenHandle::File(hc)).expect("alloc cloexec fd");
+        assert_eq!(p.set_fd_cloexec(fc, true), Some(false), "fd starts without CLOEXEC");
+        let hk = FileHandle::new(node_b.clone(), OpenFlags::READ_ONLY).expect("handle b");
+        let fk = p.alloc_fd(OpenHandle::File(hk)).expect("alloc plain fd");
+        (fc, fk)
+    };
+    {
+        let p = task::current_proc_mut().expect("current proc");
+        let mut sig = p.signal_mut();
+        assert!(
+            sig.set_disposition(SIGUSR1, SigDisposition::Handler(0xDEAD_BEEF)).is_ok(),
+            "install a caught handler"
+        );
+        assert!(
+            sig.set_disposition(SIGUSR2, SigDisposition::Ignore).is_ok(),
+            "install an ignored disposition"
+        );
+        sig.raise(SIGCHLD);
+    }
+
+    // 真实用户态现场：exec 会把它整体换成新映像的初始帧。
+    let mut ifr = InterruptFrame {
+        r15: 0x15, r14: 0x14, r13: 0x13, r12: 0x12,
+        r11: 0x11, r10: 0x10, r9: 0x09, r8: 0x08,
+        rbp: 0xB0, rdi: 0xD1, rsi: 0x51, rdx: 0xD2,
+        rcx: 0xC1, rbx: 0xB1,
+        // rax 非 0：证伪「新映像继承了旧 syscall 返回值」。
+        rax: 0xAA,
+        vector: 0,
+        error_code: 0,
+        rip: OLD_RIP,
+        cs: task::process::user_code_selector() as u64,
+        rflags: 0x202,
+        rsp: OLD_STACK_TOP,
+        ss: task::process::user_data_selector() as u64,
+    };
+    let mut mkframe = |nr: u32, a1: u64, ifr: &mut InterruptFrame| SyscallFrame {
+        nr: nr as u64,
+        a1,
+        a2: 0,
+        a3: 0,
+        a4: 0,
+        a5: 0,
+        result: 0,
+        switched: false,
+        aux_pid: 0,
+        arch_frame: (ifr as *mut InterruptFrame) as usize,
+    };
+
+    // ---- 失败路径 1：路径不存在 → -ENOENT，调用者不受任何影响 ----
+    let mut f = mkframe(crate::syscall::SYS_TASK_EXEC, MISSING_VADDR, &mut ifr);
+    assert!(crate::syscall::syscall_entry(&mut f));
+    assert_eq!(f.result, ENOENT_U64, "exec of a missing path must report ENOENT");
+    assert!(!f.switched, "failed exec must not hand over the frame");
+    assert_eq!(arch_x86_64::mmio::cr3(), old_cr3, "failed exec must not change CR3");
+    assert_eq!(ifr.rip, OLD_RIP, "failed exec must not rewrite the frame");
+    assert_eq!(ifr.rsp, OLD_STACK_TOP, "failed exec must not rewrite the frame");
+    assert_eq!(
+        task::test_hooks::probe(PID).map(|t| t.1),
+        Some(alloc::string::String::from("exec-test")),
+        "failed exec must not rename the process"
+    );
+    info!("[test-exec] missing path -> ENOENT, caller untouched OK");
+
+    // ---- 失败路径 2：内建索引（exec(init) 没有意义）→ -EINVAL ----
+    let mut f = mkframe(
+        crate::syscall::SYS_TASK_EXEC,
+        crate::syscall::BUILTIN_INDEX_INIT,
+        &mut ifr,
+    );
+    assert!(crate::syscall::syscall_entry(&mut f));
+    assert_eq!(f.result, EINVAL_U64, "exec of a builtin index must be refused");
+    assert!(!f.switched, "refused exec must not hand over the frame");
+    assert_eq!(arch_x86_64::mmio::cr3(), old_cr3, "refused exec must not change CR3");
+    info!("[test-exec] builtin index -> EINVAL OK");
+
+    // ---- 失败路径 3：线程组仍有别的成员 → -ENOTSUP，且不做任何改动 ----
+    // **必须排在成功 exec 之前**：成功那次会把地址空间换掉，之后 PATH_VADDR 指向的
+    // 用户页已不存在，再拿它当路径指针只会得到 EFAULT（实测踩到）。
+    let tid = task::test_hooks::spawn_thread_of(PID, "exec-sibling").expect("spawn sibling thread");
+    let before_cr3 = arch_x86_64::mmio::cr3();
+    let mut f = mkframe(crate::syscall::SYS_TASK_EXEC, PATH_VADDR, &mut ifr);
+    assert!(crate::syscall::syscall_entry(&mut f));
+    assert_eq!(
+        f.result, ENOTSUP_U64,
+        "exec must be refused while the thread group has another member"
+    );
+    assert!(!f.switched, "refused exec must not hand over the frame");
+    assert_eq!(arch_x86_64::mmio::cr3(), before_cr3, "refused exec must not change CR3");
+    assert!(task::test_hooks::reclaim_entry(tid), "reclaim sibling thread entry");
+    info!("[test-exec] multi-thread group -> ENOTSUP OK");
+
+    // FPU 现场也属于旧映像：先塞一个可辨识标记，exec 之后它必须消失（否则旧映像的
+    // x87/SSE 内容会泄漏给新映像）。
+    assert!(
+        task::test_hooks::debug_fpu_save(PID, 0x1234_5678_9ABC_DEF0),
+        "seed a recognisable FPU marker"
+    );
+
+    // ---- 成功路径：真的换映像 ----
+    let mut f = mkframe(crate::syscall::SYS_TASK_EXEC, PATH_VADDR, &mut ifr);
+    assert!(crate::syscall::syscall_entry(&mut f));
+    assert!(f.switched, "successful exec must hand the frame to the new image");
+    assert_eq!(ifr.rip, ELF_ENTRY, "frame rip must be the new image entry");
+    assert_ne!(ifr.rsp, OLD_STACK_TOP, "frame rsp must be the new image stack");
+    assert_eq!(ifr.rax, 0, "new image must start with rax=0 (no stale syscall result)");
+    assert_eq!(ifr.r15, 0, "new image must start with cleared GPRs");
+    assert_eq!(ifr.rdi, 0, "new image must start with cleared GPRs");
+    assert_eq!(
+        task::current_proc_mut().expect("current proc").pid(),
+        PID,
+        "exec must keep the pid"
+    );
+    let new_cr3 = task::current_proc_mut()
+        .expect("current proc")
+        .addr_space()
+        .page_table_paddr();
+    assert_ne!(new_cr3, old_cr3, "exec must install a fresh address space");
+    assert_eq!(arch_x86_64::mmio::cr3(), new_cr3, "CR3 must point at the new address space");
+    assert_eq!(
+        task::test_hooks::probe(PID).map(|t| t.1),
+        Some(alloc::string::String::from("exec_prog.elf")),
+        "PCB name must follow the new image"
+    );
+    {
+        let p = task::current_proc_mut().expect("current proc");
+        assert!(p.get_fd(fd_clo).is_none(), "CLOEXEC fd must be closed by exec");
+        assert!(p.get_fd(fd_keep).is_some(), "non-CLOEXEC fd must survive exec");
+        let sig = p.signal();
+        assert_eq!(
+            sig.disposition(SIGUSR1),
+            Some(SigDisposition::Default),
+            "a caught handler must reset to default on exec"
+        );
+        assert_eq!(
+            sig.disposition(SIGUSR2),
+            Some(SigDisposition::Ignore),
+            "an ignored disposition must survive exec"
+        );
+    }
+    assert_ne!(
+        task::test_hooks::debug_fpu_restore(PID),
+        Some(0x1234_5678_9ABC_DEF0),
+        "exec must reset the saved FPU state (no old-image register leak)"
+    );
+    assert_eq!(task::test_hooks::pending_of(PID), 0, "exec must clear pending signals");
+    assert_eq!(
+        task::test_hooks::probe_trampoline(PID).map(|v| v != 0),
+        Some(true),
+        "exec must re-install the signal restorer in the new address space"
+    );
+    info!("[test-exec] image replaced: same pid, new entry/stack/CR3/name OK");
+
+    // ---- 收尾（S18：帧与登记项都要还回去）----
+    arch_x86_64::mmio::write_cr3(saved_cr3);
+    arch_x86_64::gdt::write_fs_base(saved_fs_base);
+    task::test_hooks::clear_current();
+    assert!(task::test_hooks::reclaim_entry(PID), "reclaim exec test entry");
+    arch_x86_64::interrupts::irq_restore(irq_flags);
+    info!("[test-exec] PASS");
+}

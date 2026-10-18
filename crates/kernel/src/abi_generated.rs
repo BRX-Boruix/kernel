@@ -64,6 +64,7 @@ pub const SYS_SYNC_DELETE: u32 = crate::syscall::domain::SYNC | crate::syscall::
 pub const SYS_SYNC_WAIT: u32 = crate::syscall::domain::SYNC | crate::syscall::op::READ; // 0x72
 pub const SYS_SYNC_WAKE: u32 = crate::syscall::domain::SYNC | crate::syscall::op::WRITE; // 0x73
 pub const SYS_TASK_DERIVE: u32 = crate::syscall::domain::TASK | 0x0A; // 0x3A
+pub const SYS_TASK_EXEC: u32 = crate::syscall::domain::TASK | 0x00; // 0x30
 pub const SYS_TASK_EXIT: u32 = crate::syscall::domain::TASK | crate::syscall::op::DELETE; // 0x34
 pub const SYS_TASK_GETPID: u32 = crate::syscall::domain::TASK | 0x09; // 0x39
 pub const SYS_TASK_GETTID: u32 = crate::syscall::domain::TASK | 0x08; // 0x38

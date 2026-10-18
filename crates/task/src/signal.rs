@@ -148,6 +148,32 @@ impl SignalState {
         }
     }
 
+    /// **exec 换映像**时的信号态重置（POSIX `execve` 语义）。
+    ///
+    /// 与 [`Self::inherit_for_child`] 的三处差别都是 POSIX 明文规定的，不是取舍：
+    /// - **处置**：被捕获的回到 `Default`，被**忽略的保持忽略**——`SIG_IGN` 是进程属性，
+    ///   一律清零会让 `nohup` 类程序在 exec 后恢复 `SIGHUP` 的默认动作（终止）；
+    /// - **未决信号清空**（新映像从干净状态开始）；
+    /// - **备用信号栈禁用**（POSIX：exec 后 `SS_DISABLE`）。
+    ///
+    /// **屏蔽集不变**（POSIX 明确规定 exec 保留信号屏蔽），故本函数不动 `blocked`。
+    /// `trampoline` 换成**新地址空间**里 restorer 的地址——旧地址在新映像里已不存在。
+    pub fn reset_for_exec(&mut self, trampoline: u64) {
+        for i in 0..NSIG as usize {
+            if self.handlers[i] != SigDisposition::Ignore {
+                self.handlers[i] = SigDisposition::Default;
+            }
+            // 处置已不是 Handler，对应 sa_flags 一并作废（留着就是陈旧标志）。
+            self.handler_flags[i] = 0;
+        }
+        self.pending = SignalSet::empty();
+        self.signal_depth = 0;
+        self.interrupted = false;
+        self.suspend_saved = None;
+        self.alt_stack = None;
+        self.trampoline = trampoline;
+    }
+
     /// 新建：全部信号 Default 处置、空屏蔽/未决、未在 handler 中、无 trampoline。
     pub fn new() -> Self {
         SignalState {

@@ -1296,6 +1296,71 @@ fn switch_apply_next(
     set_current_proc(proc_ptr);
 }
 
+/// exec：把进程 `pid` 的映像整体换掉（3P4-12）。
+///
+/// 与 [`spawn_with_ppid_fds`] 的分工：spawn **新建**进程（新 pid、新内核栈、新 PCB）；
+/// 本函数在**同一进程**上换映像——pid / 内核栈 / 父子关系 / cwd / 身份都不动，
+/// 换的是地址空间、入口、用户栈、TLS 基址、FPU 现场与保存帧。
+///
+/// `frame` 必须是**当前 syscall 的真实架构帧**：新映像的初始帧会写进 `*frame` 与
+/// `slot.saved`，返回后由 syscall 尾部的 `iretq` 进入新映像。
+///
+/// **原子性**：全部可能失败的动作（名字校验、地址空间替换的前置检查）都排在第一批
+/// 修改之前——[Process::replace_addr_space] 失败时本函数尚未改动任何状态，调用者的
+/// 旧映像完好（POSIX：exec 失败不得破坏调用者）。
+///
+/// 返回**旧地址空间**。它的所有权交给调用方：必须先让本核 CR3 切离旧表再让其析构
+/// （[`UserAddressSpace::destroy`] 的跨核切离门以此为前提）。
+///
+/// **CLOEXEC 的 fd 不在这里剔除**：剔除路径要动 flock（vfs 锁），而本函数全程持
+/// per-pid 桶锁——在桶锁里取 vfs 锁就是一条新的锁序边。故由调用方在**本函数返回之后**
+/// 调 [`Process::take_cloexec_fds`]；换映像已成功，该步不会失败，晚一步不可观测。
+///
+/// CR3 时序：先 `record_current_cr3` 再 `write_cr3`（与 [`switch_apply_next`] 同序，
+/// 理由见该函数——先记录可杜绝"硬件未切、记录说没有"这个危险方向）。
+pub fn exec_replace_image(
+    pid: usize,
+    new_space: Arc<UserAddressSpace<X86PageTable>>,
+    name: &str,
+    entry_rip: u64,
+    user_stack_top: u64,
+    fs_base: u64,
+    trampoline: u64,
+    frame: &mut InterruptFrame,
+) -> Result<Arc<UserAddressSpace<X86PageTable>>, Error> {
+    // 名字校验最先：它是纯输入检查，失败时不留任何痕迹。
+    let (name_buf, name_len) = store_name(name)?;
+    let new_cr3 = new_space.page_table_paddr();
+    let init = initial_frame(entry_rip, user_stack_top, 0);
+    let old = {
+        let mut g = proc_bucket_lock(pid);
+        let slot = g.get_mut(&pid).ok_or(Error::NotFound)?;
+        // 第一个可能失败的修改点。它失败时上面只做了本地计算，旧映像未被触碰。
+        let old = slot.proc.replace_addr_space(new_space)?;
+        // ——以下不再有失败点，故无需回滚——
+        slot.proc.set_image(entry_rip, user_stack_top);
+        slot.name = name_buf;
+        slot.name_len = name_len;
+        slot.fs_base = fs_base;
+        // FPU 现场属于旧映像：**PCB 与活动寄存器都要**回到模板，否则旧映像的 x87/SSE
+        // 内容会泄漏给新映像（PCB 只影响下次切入，当下这次是直接 iretq 进新入口）。
+        slot.fpu = fpu_template_snapshot();
+        fpu::restore(&slot.fpu);
+        // 信号处置复位（被捕获的→Default、被忽略的保持忽略、未决清空、备用栈禁用）
+        // 与 restorer 换址是同一件事的两半，故在同一处完成。
+        slot.proc.signal_mut().reset_for_exec(trampoline);
+        slot.saved = init;
+        old
+    };
+    *frame = init;
+    // FS 基址必须与选择子成对设置（空选择子下任何 fs: 访问即 #GP，与基址无关）。
+    gdt::set_fs_user_selector(fs_base != 0);
+    gdt::write_fs_base(fs_base);
+    arch_x86_64::paging::record_current_cr3(my_cpu_slot(), new_cr3);
+    arch_x86_64::mmio::write_cr3(new_cr3);
+    Ok(old)
+}
+
 /// 单候选提交结果（[`commit_next`]）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CommitNext {

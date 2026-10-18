@@ -274,6 +274,11 @@ pub const SYS_MEMORY_UNMAP: u32 = crate::abi_generated::SYS_MEMORY_UNMAP;
 pub const SYS_MEMORY_PROTECT: u32 = crate::abi_generated::SYS_MEMORY_PROTECT;
 
 // ---------- 3. TASK Domain (0x30) ----------
+/// `exec(path, cmd, len)`：**替换当前进程的映像**（3P4-12）。TASK 域第 0 号动词
+/// （`0x30`）——该域的 1..15 已被既有动词占满，0 是唯一空槽；语义上与 `CREATE`
+/// （`SYS_TASK_SPAWN` 造新进程）正交，故不复用 spawn 的子动作编码。
+/// 双侧镜像（S13）：与 libsys `nr.rs::SYS_TASK_EXEC` 同值、注释互指。
+pub const SYS_TASK_EXEC: u32 = crate::abi_generated::SYS_TASK_EXEC;
 pub const SYS_TASK_SPAWN: u32 = crate::abi_generated::SYS_TASK_SPAWN;
 pub const SYS_TASK_WAIT: u32 = crate::abi_generated::SYS_TASK_WAIT;
 pub const SYS_TASK_SIGNAL: u32 = crate::abi_generated::SYS_TASK_SIGNAL;
@@ -3569,107 +3574,117 @@ fn sys_exec(frame: &mut SyscallFrame) -> u64 {
     let arg_ptr = frame.a2;
     let arg_len = frame.a3;
 
-    let root = crate::vfs_init::root();
-
-    // 1. 取得镜像数据来源（3P4-7：两条通道）
-    //
-    // - 内建小程序（init/shell）：保持**整读**——体积已知且很小，且验收要求本通道
-    //   **零回归**，故不动其形状；
-    // - 文件程序：**分段装载**——分块流进 shm，加载器按偏移分块读回。
-    enum Image {
-        Slice(alloc::vec::Vec<u8>),
-        Shm { id: u64, len: u64 },
+    let image = match resolve_exec_image(arg1) {
+        Ok(i) => i,
+        Err(e) => return pack_err(e),
+    };
+    let r = match &image {
+        ExecImage::Slice(bytes) => spawn_elf_image(&bytes[..], arg_ptr, arg_len, arg1),
+        ExecImage::Shm { id, len } => {
+            let src = ShmImage {
+                id: *id,
+                len: *len,
+            };
+            spawn_elf_image(&src, arg_ptr, arg_len, arg1)
+        }
+    };
+    // 镜像已拷进新进程的段帧，staging 对象使命完成——当场销毁（引用归零即回收帧）。
+    if let ExecImage::Shm { id, .. } = image {
+        let _ = ipc::shm_destroy(id);
     }
-    let image: Image = match arg1 {
+    r
+}
+
+/// 一次 spawn/exec 的镜像数据来源（3P4-7 的两条通道）。
+enum ExecImage {
+    /// 内建小程序（init/shell）：**整读**进内核堆——体积已知且很小，且验收要求该
+    /// 通道零回归，故不动其形状。
+    Slice(alloc::vec::Vec<u8>),
+    /// 文件程序：**分段装载**——分块流进 shm，加载器按偏移分块读回。
+    Shm { id: u64, len: u64 },
+}
+
+/// 解析程序来源并取得镜像数据（[`sys_exec`] 与 [`sys_task_exec`] 共用）。
+fn resolve_exec_image(idx_or_tag: u64) -> Result<ExecImage, Error> {
+    let root = crate::vfs_init::root();
+    match idx_or_tag {
         BUILTIN_INDEX_INIT | BUILTIN_INDEX_SHELL => {
             // 内建索引走统一单源读取（ADR-028）：`/programs` 只由内置
             // liveCD payload 填充，外部盘不再遮蔽（盘优先双源已废除）。
             // 与 KM3 无冲突——这里删去的是 read_binary_dual_source 的
             // 磁盘优先回退分支，单源即 /programs。
-            let name = if arg1 == BUILTIN_INDEX_INIT {
+            let name = if idx_or_tag == BUILTIN_INDEX_INIT {
                 "init.elf"
             } else {
                 "shell.elf"
             };
             match crate::read_binary_from_programs(name) {
-                Some(v) => Image::Slice(v),
-                None => return pack_err(Error::NotFound),
+                Some(v) => Ok(ExecImage::Slice(v)),
+                None => Err(Error::NotFound),
             }
         }
-        // 路径字符串模式：arg1 即用户态路径指针
+        // 路径字符串模式：idx_or_tag 即用户态路径指针
         _ => {
-            let path = match copy_path_from_user(arg1, MAX_USER_PATH_BYTES) {
-                Ok(p) => p,
-                Err(e) => return pack_err(e),
-            };
+            let path = copy_path_from_user(idx_or_tag, MAX_USER_PATH_BYTES)?;
             // 相对路径与进程 cwd 拼接（VFS 只接受绝对路径）。
-            let path = match absolute_path(&path) {
-                Ok(a) => a,
-                Err(e) => return pack_err(e),
-            };
-    // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
-    {
-        let identity = current_proc_mut()
-            .map(|p| p.identity())
-            .unwrap_or_else(ProcessIdentity::default_user);
-        if let Err(e) = check_traverse_access(&identity, &path) {
-            return pack_err(e);
-        }
-    }
-            match root.resolve(&path, true) {
-                Ok(inode) => {
-                    // A1-1 / ADR-040：执行前强制——门禁位（原 system_only）
-                    // + CAP_OWNER 豁免 + 策略求值（required = Execute）。
-                    let identity = current_proc_mut()
-                        .map(|p| p.identity())
-                        .unwrap_or_else(ProcessIdentity::default_user);
-                    if let Err(e) = enforce_open_permission(
-                        identity,
-                        &inode,
-                        vfs::inode::PermBits::EXECUTE,
-                    ) {
-                        return pack_err(e);
-                    }
-                    let meta = match inode.metadata() {
-                        Ok(m) => m,
-                        Err(e) => return pack_err(e),
-                    };
-                    // 3P4-7：**分段装载**。旧形状是「按 meta.size 整读进内核堆」并由
-                    // MAX_SYSCALL_BUF_BYTES（64MiB，单次 IO 有界性设计，Linux
-                    // MAX_RW_COUNT 同型）设门——那让程序体积上限 = 单次拷贝上限。
-                    // 现在改为分块流进 shm：常量不动，形状变了，程序体积不再受它约束。
-                    //
-                    // 上界仍在，但语义不同：MAX_EXEC_IMAGE_BYTES 是**资源防护**
-                    // （避免一次 exec 就把帧池抽干），不是能力上限。
-                    if meta.size > MAX_EXEC_IMAGE_BYTES {
-                        return pack_err(Error::ExecFormat);
-                    }
-                    let id = match stream_inode_to_shm(inode.as_ref(), meta.size) {
-                        Ok(i) => i,
-                        Err(e) => return pack_err(e),
-                    };
-                    Image::Shm {
-                        id,
-                        len: meta.size,
-                    }
-                }
-                Err(e) => return pack_err(e),
+            let path = absolute_path(&path)?;
+            // A2-3 / §3.4：目录遍历检查（每级父目录要求 x 位）——在任何解析/操作之前。
+            {
+                let identity = current_proc_mut()
+                    .map(|p| p.identity())
+                    .unwrap_or_else(ProcessIdentity::default_user);
+                check_traverse_access(&identity, &path)?;
             }
+            let inode = root.resolve(&path, true)?;
+            // A1-1 / ADR-040：执行前强制——门禁位（原 system_only）
+            // + CAP_OWNER 豁免 + 策略求值（required = Execute）。
+            let identity = current_proc_mut()
+                .map(|p| p.identity())
+                .unwrap_or_else(ProcessIdentity::default_user);
+            enforce_open_permission(identity, &inode, vfs::inode::PermBits::EXECUTE)?;
+            let meta = inode.metadata()?;
+            // 3P4-7：**分段装载**。旧形状是「按 meta.size 整读进内核堆」并由
+            // MAX_SYSCALL_BUF_BYTES（64MiB，单次 IO 有界性设计，Linux
+            // MAX_RW_COUNT 同型）设门——那让程序体积上限 = 单次拷贝上限。
+            // 现在改为分块流进 shm：常量不动，形状变了，程序体积不再受它约束。
+            //
+            // 上界仍在，但语义不同：MAX_EXEC_IMAGE_BYTES 是**资源防护**
+            // （避免一次 exec 就把帧池抽干），不是能力上限。
+            if meta.size > MAX_EXEC_IMAGE_BYTES {
+                return Err(Error::ExecFormat);
+            }
+            let id = stream_inode_to_shm(inode.as_ref(), meta.size)?;
+            Ok(ExecImage::Shm {
+                id,
+                len: meta.size,
+            })
         }
-    };
-
-    let r = match &image {
-        Image::Slice(bytes) => spawn_elf_image(&bytes[..], arg_ptr, arg_len, arg1),
-        Image::Shm { id, len } => {
-            let src = ShmImage { id: *id, len: *len };
-            spawn_elf_image(&src, arg_ptr, arg_len, arg1)
-        }
-    };
-    // 镜像已拷进新进程的段帧，staging 对象使命完成——当场销毁（引用归零即回收帧）。
-    if let Image::Shm { id, .. } = image {
-        let _ = ipc::shm_destroy(id);
     }
-    r
+}
+
+/// 程序名（VFS 路径末段，或内建索引对应的文件名）。
+///
+/// PCB 名与入口 `AT_EXECFN` 槽的**单一来源**；spawn 与 exec 共用。
+fn program_name_of(idx_or_tag: u64) -> Result<alloc::string::String, Error> {
+    /// 末段长度上限（超长拒绝，防注册表/日志被撑爆）。
+    const PROG_NAME_MAX_LEN: usize = 63;
+    match idx_or_tag {
+        BUILTIN_INDEX_INIT => Ok(alloc::string::String::from("init.elf")),
+        BUILTIN_INDEX_SHELL => Ok(alloc::string::String::from("shell.elf")),
+        // 路径字符串模式：idx_or_tag 即用户态路径指针。
+        _ => {
+            let path = copy_path_from_user(idx_or_tag, MAX_USER_PATH_BYTES)?;
+            let trimmed = path.trim_end_matches('\0');
+            let last = trimmed
+                .rsplit('/')
+                .find(|seg| !seg.is_empty())
+                .unwrap_or(trimmed);
+            if last.is_empty() || last.len() > PROG_NAME_MAX_LEN {
+                return Err(Error::InvalidParam);
+            }
+            Ok(alloc::string::String::from(last))
+        }
+    }
 }
 
 /// 内建程序索引：init（与 libsys nr::PROG_* 约定同源；内核不依赖
@@ -3803,8 +3818,6 @@ fn spawn_elf_image<S: loader::ImageSource + ?Sized>(
     arg_len: u64,
     idx_or_tag: u64,
 ) -> u64 {
-    /// prog_name 末段长度上限（超长拒绝，防注册表/日志被撑爆）。
-    const PROG_NAME_MAX_LEN: usize = 63;
     /// 命令行缓冲容量。KM5：超出即 E2BIG 显式失败——静默截断会把被裁剪的
     /// 命令行伪装成完整交付。A11（owner 指令 2026-09-27）：512 → 4096。
     ///
@@ -3852,25 +3865,9 @@ fn spawn_elf_image<S: loader::ImageSource + ?Sized>(
     };
     let cmd = &cmd[..cmd_len];
     // C1.1：程序名取自真实加载来源（VFS 路径末段或内建索引名），非 pid 推断。
-    let prog_name: alloc::string::String = match idx_or_tag {
-        BUILTIN_INDEX_INIT => alloc::string::String::from("init.elf"),
-        BUILTIN_INDEX_SHELL => alloc::string::String::from("shell.elf"),
-        // 路径字符串模式：idx_or_tag 即用户态路径指针。
-        _ => {
-            let path = match copy_path_from_user(idx_or_tag, MAX_USER_PATH_BYTES) {
-                Ok(p) => p,
-                Err(e) => return pack_err(e),
-            };
-            let trimmed = path.trim_end_matches('\0');
-            let last = trimmed
-                .rsplit('/')
-                .find(|seg| !seg.is_empty())
-                .unwrap_or(trimmed);
-            if last.is_empty() || last.len() > PROG_NAME_MAX_LEN {
-                return pack_err(Error::InvalidParam);
-            }
-            alloc::string::String::from(last)
-        }
+    let prog_name = match program_name_of(idx_or_tag) {
+        Ok(n) => n,
+        Err(e) => return pack_err(e),
     };
     let Ok(mut us) = mm::user_space::UserAddressSpace::<arch_x86_64::paging::X86PageTable>::new()
     else {
@@ -3971,6 +3968,164 @@ fn spawn_elf_image<S: loader::ImageSource + ?Sized>(
         }
         Err(e) => pack_err(e),
     }
+}
+
+/// `exec(path, cmd, len)`：用新映像**替换当前进程的映像**（POSIX `execve` 语义）。
+///
+/// 与 [`sys_exec`]（`SYS_TASK_SPAWN`）的区别是**同一进程换映像**而不是造新进程：
+/// pid / 内核栈 / 父子关系 / cwd / 身份 / fd 表全部保留，用户态地址空间、入口、
+/// 用户栈、TLS 基址、信号处置整体换掉。
+///
+/// 参数与 `SYS_TASK_SPAWN` 同形（`a1` 路径指针、`a2/a3` 命令行），但 `a1` **只接受
+/// 路径指针**：内建索引（0/1）在 exec 下没有意义——`exec(init)` 只是把 init 的映像
+/// 再装一遍却要绕 pid 1 的特权路径，故如实拒绝而不是给它开一条特例。
+///
+/// **成功时本函数不让调用者回到旧映像**：新映像的初始帧写进当前 syscall 帧并置
+/// `Switched`，由 syscall 尾部的 `iretq` 进入新映像。失败时返回 `-errno`，旧映像
+/// **原样继续运行**——这一点由"新地址空间先建好、最后一步才换"保证，不靠回滚。
+fn sys_task_exec(frame: &mut SyscallFrame) -> DispatchResult {
+    let path_ptr = frame.a1;
+    let cmd_ptr = frame.a2;
+    let cmd_len = frame.a3;
+
+    if path_ptr == BUILTIN_INDEX_INIT || path_ptr == BUILTIN_INDEX_SHELL {
+        return done(pack_err(Error::InvalidParam));
+    }
+    // 命令行门限与 spawn 同源（loader::MAX_CMDLINE_BYTES，单点定义）。
+    const CMD_BUF_BYTES: usize = loader::MAX_CMDLINE_BYTES;
+    if cmd_len as usize > CMD_BUF_BYTES {
+        return done(pack_err(Error::ArgListTooLong));
+    }
+    // 缓冲在堆上（与 spawn 同因：本函数运行在 16 KiB 专用 syscall 栈上）。
+    let mut cmd: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if cmd.try_reserve_exact(CMD_BUF_BYTES).is_err() {
+        return done(pack_err(Error::OutOfMemory));
+    }
+    cmd.resize(CMD_BUF_BYTES, 0);
+    let cmd_len = if cmd_len == 0 {
+        0
+    } else {
+        let l = cmd_len as usize;
+        // 野指针在此如实 EFAULT，绝不放进 STAC 拷贝（内核态 #PF = 整机死机）。
+        if let Err(e) = validate_user_range(cmd_ptr, l as u64, UserAccess::Read) {
+            return done(pack_err(e));
+        }
+        unsafe {
+            arch_x86_64::mmio::copy_from_user(cmd.as_mut_ptr(), cmd_ptr, l);
+        }
+        l
+    };
+
+    let prog_name = match program_name_of(path_ptr) {
+        Ok(n) => n,
+        Err(e) => return done(pack_err(e)),
+    };
+    let image = match resolve_exec_image(path_ptr) {
+        Ok(i) => i,
+        Err(e) => return done(pack_err(e)),
+    };
+    let r = exec_into_current_process(frame, &image, &cmd[..cmd_len], &prog_name);
+    // staging 对象使命完成：成功换映像后新段帧已自带内容，失败时也没有别的持有者。
+    if let ExecImage::Shm { id, .. } = image {
+        let _ = ipc::shm_destroy(id);
+    }
+    match r {
+        Ok(()) => DispatchResult::Switched,
+        Err(e) => done(pack_err(e)),
+    }
+}
+
+/// [`sys_task_exec`] 的主体：把 `image` 装进**新**地址空间并换掉当前进程的映像。
+///
+/// 拆出来的理由：镜像解析与 staging 销毁是 spawn/exec 共用的，而"换映像"只有 exec
+/// 有；把它留在这里可以让 staging 对象的销毁点只有一处（[`sys_task_exec`] 尾部）。
+///
+/// **失败不改动调用者**：地址空间在本地建好，全部可能失败的步骤（建空间 / 装载 /
+/// PT_INTERP 拒绝 / restorer 安装 / 换映像的前置检查）都排在"真正换"之前。
+fn exec_into_current_process(
+    frame: &mut SyscallFrame,
+    image: &ExecImage,
+    cmd: &[u8],
+    prog_name: &str,
+) -> Result<(), Error> {
+    let Ok(mut us) = mm::user_space::UserAddressSpace::<arch_x86_64::paging::X86PageTable>::new()
+    else {
+        return Err(Error::OutOfMemory);
+    };
+    // 引导环境与 spawn 同源（内核权威状态合成，见 build_boot_env）。
+    let cwd = current_proc_mut()
+        .map(|p| p.cwd())
+        .unwrap_or_else(|| alloc::string::String::from("/"));
+    let mut env_buf: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    build_boot_env(&cwd, &mut env_buf)?;
+    let env_refs: alloc::vec::Vec<&[u8]> = env_buf.iter().map(|v| v.as_slice()).collect();
+
+    let loaded = match image {
+        ExecImage::Slice(bytes) => loader::load(
+            &bytes[..],
+            &mut us,
+            cmd,
+            Some(prog_name.as_bytes()),
+            &env_refs,
+            USER_PIE_BASE,
+            USER_INTERP_BASE,
+        )?,
+        ExecImage::Shm { id, len } => {
+            let src = ShmImage {
+                id: *id,
+                len: *len,
+            };
+            loader::load(
+                &src,
+                &mut us,
+                cmd,
+                Some(prog_name.as_bytes()),
+                &env_refs,
+                USER_PIE_BASE,
+                USER_INTERP_BASE,
+            )?
+        }
+    };
+    // 与 spawn 同一判定：loader 能解析 PT_INTERP，但"把解释器装进同一地址空间并转交
+    // 入口"尚未接线，放行等于让程序带着未重定位的指针跑起来（S09）。
+    if loaded.interp.is_some() {
+        klib::warn!("[exec] 动态可执行文件（PT_INTERP）暂不支持：解释器装载尚未接线");
+        return Err(Error::NotSupported);
+    }
+    let trampoline = us.install_signal_restorer().map_err(|_| Error::OutOfMemory)?;
+    // 主线程 TLS 基址由 loader 写进**地址空间**（不是 LoadedElf 的字段），与 spawn 同源。
+    let fs_base = us.tls_fs_base();
+
+    let pid = current_proc_mut()
+        .map(|p| p.pid())
+        .ok_or(Error::InvalidParam)?;
+    let af = arch_frame(frame);
+    let old = task::exec_replace_image(
+        pid,
+        alloc::sync::Arc::new(us),
+        prog_name,
+        loaded.entry,
+        loaded.user_stack_top,
+        fs_base,
+        trampoline,
+        af,
+    )?;
+    // CLOEXEC：POSIX 在 exec **成功**时关闭这些 fd。放在换映像之后、**桶锁之外**——
+    // 剔除路径要动 flock（vfs 锁），排在 per-pid 桶锁里就是一条新的锁序边。
+    // 失败路径上 fd 原样保留（本函数在此之前已返回）。
+    let closed = match current_proc_mut() {
+        Some(p) => p.take_cloexec_fds(),
+        None => alloc::vec::Vec::new(),
+    };
+    for h in closed.iter() {
+        if let vfs::file_handle::OpenHandle::Pipe { id, writer, .. } = h {
+            let _ = ipc::pipe_ref_dec(*id, *writer);
+        }
+    }
+    // 旧空间此刻已不在任何 CR3 上（exec_replace_image 内已切离），析构即回收其帧。
+    drop(old);
+    frame.switched = true;
+    Ok(())
 }
 
 /// 克隆当前进程 fd 表供子进程继承，并对每个 `Pipe { id }` 端递增引用计数。
@@ -6172,6 +6327,9 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_MEMORY_PROTECT => done(sys_mprotect(frame)),
 
         // TASK Domain (0x30)
+        // exec 成功时不让调用者回到旧映像：处理函数已把新映像的初始帧写进本帧并
+        // 置 Switched，由 syscall 尾部的 iretq 进入新映像。
+        SYS_TASK_EXEC => sys_task_exec(frame),
         SYS_TASK_SPAWN => done(sys_exec(frame)),
         SYS_TASK_WAIT => sys_task_wait(frame),
         // kill 可能自杀切换（exit_current → Switched），自带 DispatchResult 语义。

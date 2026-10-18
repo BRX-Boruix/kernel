@@ -737,6 +737,10 @@ unsafe fn kmain_body() -> ! {
     // A1-3 / ADR-040 §2.6：统一强制矩阵停机级验收（§3.2 #4/#5/#6）。
     #[cfg(feature = "kernel-tests")]
     tests::test_access_enforcement_matrix();
+    // 3P4-12：exec —— 同一进程换映像（pid 不变、帧换新入口、CLOEXEC/信号复位、
+    // 失败不改动调用者、多线程组如实拒绝）。
+    #[cfg(feature = "kernel-tests")]
+    tests::test_task_exec();
     // A1-4 / ADR-040 §2.4：StatInfo 属主字段真值投影（stat/fstat 通道）。
     #[cfg(feature = "kernel-tests")]
     tests::test_stat_owner_fields();
