@@ -756,13 +756,23 @@ fn validate_user_range(buf: u64, len: u64, access: UserAccess) -> Result<(), Err
 /// 静默截断**。静默截断会把一条超长的路径伪装成完整交付，调用方无从得知
 /// 真值被丢弃。
 fn copy_path_from_user(path_ptr: u64, max_len: usize) -> Result<alloc::string::String, Error> {
-    if path_ptr < USER_BASE || path_ptr >= USER_TOP {
+    let bytes = copy_cstr_bytes_from_user(path_ptr, max_len)?;
+    alloc::string::String::from_utf8(bytes).map_err(|_| Error::InvalidParam)
+}
+
+/// 从用户空间拷贝以 NUL 结尾的**字节串**（不含 NUL），逐字节读、跨页时预校验。
+///
+/// 上限语义同 [`copy_path_from_user`]：`max_len` 内必须出现 NUL，否则 `InvalidParam`，
+/// **绝不静默截断**。路径与环境值共用本函数——「有界读用户 C 串」只写一份（S15），
+/// 否则环境那条迟早会漏掉「逐页预校验」这一层，变成内核态 #PF。
+fn copy_cstr_bytes_from_user(ptr: u64, max_len: usize) -> Result<alloc::vec::Vec<u8>, Error> {
+    if ptr < USER_BASE || ptr >= USER_TOP {
         return Err(Error::OutOfRange);
     }
     const PAGE_SIZE: u64 = 0x1000;
-    let mut validated_page_end = path_ptr & !(PAGE_SIZE - 1);
+    let mut validated_page_end = ptr & !(PAGE_SIZE - 1);
     let mut bytes = alloc::vec::Vec::new();
-    let mut cur = path_ptr;
+    let mut cur = ptr;
     let mut terminated = false;
     while bytes.len() < max_len {
         if cur >= USER_TOP {
@@ -784,11 +794,11 @@ fn copy_path_from_user(path_ptr: u64, max_len: usize) -> Result<alloc::string::S
         bytes.push(byte[0]);
         cur += 1;
     }
-    // 耗尽 max_len 仍未遇 NUL：路径超长或缺失终止符，显式拒绝，绝不静默截断。
+    // 耗尽 max_len 仍未遇 NUL：超长或缺失终止符，显式拒绝，绝不静默截断。
     if !terminated {
         return Err(Error::InvalidParam);
     }
-    alloc::string::String::from_utf8(bytes).map_err(|_| Error::InvalidParam)
+    Ok(bytes)
 }
 
 /// 把用户提供的路径规范化为**绝对路径**（ADR-011 M1：VFS 只接受绝对路径，
@@ -3573,19 +3583,22 @@ fn sys_exec(frame: &mut SyscallFrame) -> u64 {
     let arg1 = frame.a1;
     let arg_ptr = frame.a2;
     let arg_len = frame.a3;
+    // 3P4-2b：`a4/a5` = 显式 envp 的指针与条数；`0/0` = 不传（零回归）。
+    let env_ptr = frame.a4;
+    let env_count = frame.a5;
 
     let image = match resolve_exec_image(arg1) {
         Ok(i) => i,
         Err(e) => return pack_err(e),
     };
     let r = match &image {
-        ExecImage::Slice(bytes) => spawn_elf_image(&bytes[..], arg_ptr, arg_len, arg1),
+        ExecImage::Slice(bytes) => spawn_elf_image(&bytes[..], arg_ptr, arg_len, env_ptr, env_count, arg1),
         ExecImage::Shm { id, len } => {
             let src = ShmImage {
                 id: *id,
                 len: *len,
             };
-            spawn_elf_image(&src, arg_ptr, arg_len, arg1)
+            spawn_elf_image(&src, arg_ptr, arg_len, env_ptr, env_count, arg1)
         }
     };
     // 镜像已拷进新进程的段帧，staging 对象使命完成——当场销毁（引用归零即回收帧）。
@@ -3742,6 +3755,103 @@ pub(crate) fn build_boot_env(
     Ok(())
 }
 
+/// 环境里由**内核权威单源**提供的键（ADR-028 / ABI §4 引导环境）。
+///
+/// 3P4-2b 裁定（owner，2026-10-18）：显式 `envp` **接受**，但这几个键**拒绝**——调用方在
+/// `envp` 里设了它们就 `EINVAL`。理由：`PATH` 是程序来源的单一事实源，放开它等于给任何程序
+/// 一条「让子进程去别处找程序」的路，正是 ADR-028 要堵的。
+///
+/// **libc 侧有一份同源清单**（`libc/src/exec.rs`）：它必须先把这些键滤掉再交给内核，否则
+/// `execve(path, argv, environ)` 恒 `EINVAL`（`environ` 里本来就有 `PATH`）。内核这一层保留
+/// **拒绝**而不是静默覆盖——绕过 libc 直调 syscall 的人应当收到明确的错。
+const RESERVED_ENV_KEYS: [&[u8]; 2] = [b"PATH", b"PWD"];
+
+/// 判定一条 `KEY=VALUE` 的键是否落在保留清单里（没有 `=` 时返回 false，由调用方另行报错）。
+fn env_key_is_reserved(entry: &[u8]) -> bool {
+    match entry.iter().position(|&b| b == b'=') {
+        Some(i) => RESERVED_ENV_KEYS.iter().any(|k| *k == &entry[..i]),
+        None => false,
+    }
+}
+
+/// 从用户态读取显式环境数组（`char *const envp[]` 形态），返回 `KEY=VALUE` 条目。
+///
+/// `count == 0` ⇒ 没有显式环境（内核只给权威引导环境）——这是**零回归**路径：此前所有调用方
+/// 都不传环境。
+///
+/// 校验（全部如实报错，绝不静默裁剪）：
+/// - 指针数组本身经 `validate_user_range` 预校验（野指针 → `BadAddress`，不放进 STAC 拷贝）；
+/// - 条数 > `loader::MAX_ENV_COUNT` ⇒ `ArgListTooLong`；
+/// - 总字节 > `loader::MAX_ENV_BYTES` ⇒ `ArgListTooLong`（与 loader 同一门限，S15）；
+/// - 单条没有 `=` ⇒ `InvalidParam`；
+/// - 键落在 [`RESERVED_ENV_KEYS`] ⇒ `InvalidParam`。
+fn read_user_envp(ptr: u64, count: u64) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, Error> {
+    let mut out: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    if count == 0 {
+        return Ok(out);
+    }
+    if count as usize > loader::MAX_ENV_COUNT {
+        return Err(Error::ArgListTooLong);
+    }
+    let n = count as usize;
+    validate_user_range(
+        ptr,
+        (n * core::mem::size_of::<u64>()) as u64,
+        UserAccess::Read,
+    )?;
+    if out.try_reserve(n).is_err() {
+        return Err(Error::OutOfMemory);
+    }
+    let mut total = 0usize;
+    for i in 0..n {
+        // **必须经 STAC 窗口拷出指针本身**，不能直接解引用用户地址：内核态读用户页会撞
+        // SMAP，表现为 #PF（P=1、cr2=数组地址）而不是优雅的 EFAULT——实测踩到，整机停机。
+        // `validate_user_range` 只保证"可访问"，不解除 SMAP；拷贝才是真正的读取手段。
+        let mut raw = [0u8; 8];
+        unsafe {
+            arch_x86_64::mmio::copy_from_user(raw.as_mut_ptr(), ptr + (i * 8) as u64, 8);
+        }
+        let ep = u64::from_le_bytes(raw);
+        if ep == 0 {
+            return Err(Error::InvalidParam);
+        }
+        // 预算里留 1 字节给 NUL：copy 的 max_len 是"允许的字符数"。
+        let remaining = loader::MAX_ENV_BYTES.saturating_sub(total);
+        if remaining < 2 {
+            return Err(Error::ArgListTooLong);
+        }
+        let entry = copy_cstr_bytes_from_user(ep, remaining - 1)?;
+        if entry.is_empty() || !entry.contains(&b'=') {
+            return Err(Error::InvalidParam);
+        }
+        if env_key_is_reserved(&entry) {
+            return Err(Error::InvalidParam);
+        }
+        total += entry.len() + 1;
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+/// 合成一次 exec/spawn 的完整环境：**权威引导环境**（[`build_boot_env`]）+ 调用方显式条目。
+///
+/// 顺序：先内核权威条目、再用户条目。同一键出现在两处只可能是非保留键（保留键已在
+/// [`read_user_envp`] 拒绝），此时「后者覆盖前者」是常规语义。
+fn build_exec_env(
+    cwd: &str,
+    envp_ptr: u64,
+    envp_count: u64,
+    out: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
+) -> Result<(), Error> {
+    build_boot_env(cwd, out)?;
+    let user = read_user_envp(envp_ptr, envp_count)?;
+    if !user.is_empty() {
+        out.try_reserve(user.len()).map_err(|_| Error::OutOfMemory)?;
+        out.extend(user);
+    }
+    Ok(())
+}
+
 /// 3P4-7：一次 exec 允许的镜像体积上界。
 ///
 /// **语义与 MAX_SYSCALL_BUF_BYTES 不同**：后者是"单次用户拷贝请求"的有界性设计
@@ -3816,6 +3926,8 @@ fn spawn_elf_image<S: loader::ImageSource + ?Sized>(
     image: &S,
     arg_ptr: u64,
     arg_len: u64,
+    env_ptr: u64,
+    env_count: u64,
     idx_or_tag: u64,
 ) -> u64 {
     /// 命令行缓冲容量。KM5：超出即 E2BIG 显式失败——静默截断会把被裁剪的
@@ -3877,16 +3989,15 @@ fn spawn_elf_image<S: loader::ImageSource + ?Sized>(
     // 入口参数块 mini-ABI（argc/argv 语义、字符串区容量、无命令行形态）见
     // docs/abi/syscall-abi.md §4；布局算术的单点定义与行为锚点在
     // `loader::raw::entry_block()`（由 loader 侧 host 单测锚定）。
-    // ABI v2（3P4-2）：第 4 参是 envp。本步先交付**空环境**（布局与传递链路已就位，
-    // 内核侧环境合成与继承属 3P4-2 下一步）；空环境同样以 NULL 终结，语义自洽。
-    // 3P4-2（ABI v2）：合成**引导环境**并随入口参数块交付（envp 位于 argv 之后）。
-    // 数据取自内核权威状态（见 build_boot_env 文档）；cwd 在此读成自有 String，
-    // 借用不跨越后续的调度调用（KA3）。
+    // ABI v2（3P4-2）：环境随入口参数块交付（envp 位于 argv 之后）。
+    // 3P4-2b（2026-10-18 裁定）：`a4/a5` = 显式 envp 的指针与条数；`0/0` 表示不传，
+    // 内核只给权威引导环境（**零回归**路径）。保留键（PATH/PWD）由 build_exec_env 拒绝。
+    // cwd 在此读成自有 String，借用不跨越后续的调度调用（KA3）。
     let cwd = current_proc_mut()
         .map(|p| p.cwd())
         .unwrap_or_else(|| alloc::string::String::from("/"));
     let mut env_buf: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
-    if let Err(e) = build_boot_env(&cwd, &mut env_buf) {
+    if let Err(e) = build_exec_env(&cwd, env_ptr, env_count, &mut env_buf) {
         return pack_err(e);
     }
     let env_refs: alloc::vec::Vec<&[u8]> = env_buf.iter().map(|v| v.as_slice()).collect();
@@ -4024,7 +4135,14 @@ fn sys_task_exec(frame: &mut SyscallFrame) -> DispatchResult {
         Ok(i) => i,
         Err(e) => return done(pack_err(e)),
     };
-    let r = exec_into_current_process(frame, &image, &cmd[..cmd_len], &prog_name);
+    let r = exec_into_current_process(
+        frame,
+        &image,
+        &cmd[..cmd_len],
+        &prog_name,
+        frame.a4,
+        frame.a5,
+    );
     // staging 对象使命完成：成功换映像后新段帧已自带内容，失败时也没有别的持有者。
     if let ExecImage::Shm { id, .. } = image {
         let _ = ipc::shm_destroy(id);
@@ -4047,17 +4165,19 @@ fn exec_into_current_process(
     image: &ExecImage,
     cmd: &[u8],
     prog_name: &str,
+    env_ptr: u64,
+    env_count: u64,
 ) -> Result<(), Error> {
     let Ok(mut us) = mm::user_space::UserAddressSpace::<arch_x86_64::paging::X86PageTable>::new()
     else {
         return Err(Error::OutOfMemory);
     };
-    // 引导环境与 spawn 同源（内核权威状态合成，见 build_boot_env）。
+    // 环境与 spawn 同源（权威引导环境 + 调用方显式条目，见 build_exec_env）。
     let cwd = current_proc_mut()
         .map(|p| p.cwd())
         .unwrap_or_else(|| alloc::string::String::from("/"));
     let mut env_buf: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
-    build_boot_env(&cwd, &mut env_buf)?;
+    build_exec_env(&cwd, env_ptr, env_count, &mut env_buf)?;
     let env_refs: alloc::vec::Vec<&[u8]> = env_buf.iter().map(|v| v.as_slice()).collect();
 
     let loaded = match image {

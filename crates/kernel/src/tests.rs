@@ -18631,6 +18631,11 @@ pub fn test_task_exec() {
     // 的已知可用形态一致，避免在"多页预触碰"上引入与本项无关的失败面）。
     const PATH_VADDR: u64 = 0x0000_0000_0050_0000;
     const MISSING_VADDR: u64 = 0x0000_0000_0050_0100;
+    // 3P4-2b：显式环境的字符串与指针数组（同一页内，省一次 reserve）。
+    const ENV_FOO_VADDR: u64 = 0x0000_0000_0050_0200;
+    const ENV_PATH_VADDR: u64 = 0x0000_0000_0050_0220;
+    const ENV_FOO_ARR: u64 = 0x0000_0000_0050_0300;
+    const ENV_PATH_ARR: u64 = 0x0000_0000_0050_0310;
     const OLD_STACK_TOP: u64 = 0x5000;
     const OLD_RIP: u64 = 0x0000_0000_0040_1234;
     const ELF_ENTRY: u64 = 0x40_0000;
@@ -18671,6 +18676,11 @@ pub fn test_task_exec() {
     };
     write_user(PATH_VADDR, b"/scratch/exec_prog.elf\x00");
     write_user(MISSING_VADDR, b"/scratch/exec_absent.elf\x00");
+    write_user(ENV_FOO_VADDR, b"FOO=bar\x00");
+    write_user(ENV_PATH_VADDR, b"PATH=/evil\x00");
+    // 指针数组：内核按**条数**读，不要求 NULL 终结（与 envp 的 ABI 一致）。
+    write_user(ENV_FOO_ARR, &ENV_FOO_VADDR.to_le_bytes());
+    write_user(ENV_PATH_ARR, &ENV_PATH_VADDR.to_le_bytes());
 
     // ---- 夹具：VFS 里的合法 ELF + 两个 fd 用的节点 ----
     let root = crate::vfs_init::root();
@@ -18741,13 +18751,13 @@ pub fn test_task_exec() {
         rsp: OLD_STACK_TOP,
         ss: task::process::user_data_selector() as u64,
     };
-    let mut mkframe = |nr: u32, a1: u64, ifr: &mut InterruptFrame| SyscallFrame {
+    let mut mkframe = |nr: u32, a1: u64, a4: u64, a5: u64, ifr: &mut InterruptFrame| SyscallFrame {
         nr: nr as u64,
         a1,
         a2: 0,
         a3: 0,
-        a4: 0,
-        a5: 0,
+        a4,
+        a5,
         result: 0,
         switched: false,
         aux_pid: 0,
@@ -18755,7 +18765,7 @@ pub fn test_task_exec() {
     };
 
     // ---- 失败路径 1：路径不存在 → -ENOENT，调用者不受任何影响 ----
-    let mut f = mkframe(crate::syscall::SYS_TASK_EXEC, MISSING_VADDR, &mut ifr);
+    let mut f = mkframe(crate::syscall::SYS_TASK_EXEC, MISSING_VADDR, 0, 0, &mut ifr);
     assert!(crate::syscall::syscall_entry(&mut f));
     assert_eq!(f.result, ENOENT_U64, "exec of a missing path must report ENOENT");
     assert!(!f.switched, "failed exec must not hand over the frame");
@@ -18773,6 +18783,8 @@ pub fn test_task_exec() {
     let mut f = mkframe(
         crate::syscall::SYS_TASK_EXEC,
         crate::syscall::BUILTIN_INDEX_INIT,
+        0,
+        0,
         &mut ifr,
     );
     assert!(crate::syscall::syscall_entry(&mut f));
@@ -18786,7 +18798,7 @@ pub fn test_task_exec() {
     // 用户页已不存在，再拿它当路径指针只会得到 EFAULT（实测踩到）。
     let tid = task::test_hooks::spawn_thread_of(PID, "exec-sibling").expect("spawn sibling thread");
     let before_cr3 = arch_x86_64::mmio::cr3();
-    let mut f = mkframe(crate::syscall::SYS_TASK_EXEC, PATH_VADDR, &mut ifr);
+    let mut f = mkframe(crate::syscall::SYS_TASK_EXEC, PATH_VADDR, 0, 0, &mut ifr);
     assert!(crate::syscall::syscall_entry(&mut f));
     assert_eq!(
         f.result, ENOTSUP_U64,
@@ -18804,8 +18816,19 @@ pub fn test_task_exec() {
         "seed a recognisable FPU marker"
     );
 
-    // ---- 成功路径：真的换映像 ----
-    let mut f = mkframe(crate::syscall::SYS_TASK_EXEC, PATH_VADDR, &mut ifr);
+    // ---- 失败路径 4：envp 里出现保留键（PATH）→ -EINVAL，且不做任何改动 ----
+    let mut f = mkframe(crate::syscall::SYS_TASK_EXEC, PATH_VADDR, ENV_PATH_ARR, 1, &mut ifr);
+    assert!(crate::syscall::syscall_entry(&mut f));
+    assert_eq!(
+        f.result, EINVAL_U64,
+        "an envp entry overriding PATH must be refused (ADR-028 single source)"
+    );
+    assert!(!f.switched, "refused exec must not hand over the frame");
+    assert_eq!(arch_x86_64::mmio::cr3(), old_cr3, "refused exec must not change CR3");
+    info!("[test-exec] reserved env key -> EINVAL OK");
+
+    // ---- 成功路径：真的换映像（带一条显式环境）----
+    let mut f = mkframe(crate::syscall::SYS_TASK_EXEC, PATH_VADDR, ENV_FOO_ARR, 1, &mut ifr);
     assert!(crate::syscall::syscall_entry(&mut f));
     assert!(f.switched, "successful exec must hand the frame to the new image");
     assert_eq!(ifr.rip, ELF_ENTRY, "frame rip must be the new image entry");
@@ -18857,6 +18880,73 @@ pub fn test_task_exec() {
         "exec must re-install the signal restorer in the new address space"
     );
     info!("[test-exec] image replaced: same pid, new entry/stack/CR3/name OK");
+
+    // ---- 3P4-2b：环境真的交付到了新映像的入口栈上 ----
+    // 按 loader 的入口参数块布局走一遍（`loader::raw::entry_block` 是那份布局的单点定义）：
+    //   rsp -> argc, argv[0..argc], NULL, envp[0..], NULL, auxv...
+    {
+        let p = task::current_proc_mut().expect("current proc");
+        let read_u64 = |va: u64| -> u64 {
+            let pa = p
+                .addr_space()
+                .translate(VirtAddr::new(va))
+                .expect("translate entry block")
+                .as_u64();
+            unsafe { core::ptr::read_unaligned((pa + off) as *const u64) }
+        };
+        let read_cstr = |va: u64| -> alloc::vec::Vec<u8> {
+            let mut v = alloc::vec::Vec::new();
+            let mut cur = va;
+            loop {
+                let pa = p
+                    .addr_space()
+                    .translate(VirtAddr::new(cur))
+                    .expect("translate env string")
+                    .as_u64();
+                let b = unsafe { core::ptr::read_volatile((pa + off) as *const u8) };
+                if b == 0 {
+                    break;
+                }
+                v.push(b);
+                cur += 1;
+            }
+            v
+        };
+        let mut cur = ifr.rsp;
+        assert_eq!(read_u64(cur), 0, "empty command line -> argc 0");
+        cur += 8;
+        assert_eq!(read_u64(cur), 0, "argv must be NULL-terminated");
+        cur += 8;
+        let mut envs: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+        loop {
+            let ep = read_u64(cur);
+            if ep == 0 {
+                break;
+            }
+            envs.push(read_cstr(ep));
+            cur += 8;
+        }
+        assert!(
+            envs.iter().any(|e| e.as_slice() == b"PATH=/programs"),
+            "the authoritative PATH must be present"
+        );
+        assert!(
+            envs.iter().any(|e| e.as_slice() == b"PWD=/"),
+            "the authoritative PWD must be present"
+        );
+        assert!(
+            envs.iter().any(|e| e.as_slice() == b"FOO=bar"),
+            "an explicit envp entry must reach the new image"
+        );
+        assert!(
+            !envs.iter().any(|e| e.as_slice() == b"PATH=/evil"),
+            "the refused PATH override must not appear"
+        );
+        info!(
+            "[test-exec] explicit envp reached the new image ({} entries) OK",
+            envs.len()
+        );
+    }
 
     // ---- 收尾（S18：帧与登记项都要还回去）----
     arch_x86_64::mmio::write_cr3(saved_cr3);
