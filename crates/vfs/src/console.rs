@@ -385,6 +385,18 @@ pub fn input_peek() -> Option<u8> {
 /// `ring: Arc<AudioRing>` 同构，S28）。P3（consoled）写、P4 切换后 fd 0
 /// 读者读——在切换落地前本节点无任何既有读者，属纯新增（回归零风险）。
 /// `status` 子文件如实披露环水位与丢弃计数。
+/// console 节点的**稳定身份基数**（`st_ino` 真值，`3P4-13`）。
+///
+/// 为什么需要：`ttyname` 靠「`fstat(fd).st_ino` == `stat(候选路径).st_ino`」认身份
+/// （仿 Linux 比对 `/dev` 条目）。而 `INode::stable_id` 的默认实现是 `self` **地址**，
+/// 视图节点每次 `lookup` 可能新建实例 ⇒ 身份必然不等。本节点**不是**无状态视图节点：
+/// 实例 id 构造后不变，它就是同一个文件 ⇒ **覆写 `stable_id` 才是对契约的忠实实现**
+/// （契约要求「相等 ⇔ 同一个文件」，地址实现只是无状态节点的默认兜底）。
+///
+/// 取值：ASCII `CONS` 作高 32 位，避开 ramfs 的自增计数、ext2 的 `ino+1`、iso9660 的
+/// `LBA*2+1` 三个低位区间。
+pub const CONSOLE_STABLE_ID_BASE: u64 = 0x434F_4E53_0000_0000;
+
 pub struct ConsoleNode {
     ring: Arc<ConsoleRing>,
     children: DynamicDirNode,
@@ -448,6 +460,16 @@ impl ConsoleNode {
 }
 
 impl INode for ConsoleNode {
+    /// 稳定身份 = [`CONSOLE_STABLE_ID_BASE`] + 实例 id（见该常量的文档）。
+    ///
+    /// `stdio` 的三个匿名节点覆写成**实例 0 的同一个值**——它们确实指向同一个 console
+    /// （`StdoutNode` 写的就是这个环），故「同一文件同一身份」在这里是**事实**，
+    /// 不是近似。stdout 被重定向后 fd 背后是文件的 inode，身份自然不同 ⇒ `ttyname`
+    /// 如实返回 `ENOTTY`。
+    fn stable_id(&self) -> u64 {
+        CONSOLE_STABLE_ID_BASE + self.instance_id as u64
+    }
+
     /// 从环取走至多 `buf.len()` 字节；空环 `Ok(0)`（终端语义「此刻无字节」，
     /// 非阻塞形态；阻塞由 syscall 层经 `console_stream` 真值接管）。
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, Error> {

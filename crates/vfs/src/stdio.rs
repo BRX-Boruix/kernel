@@ -190,6 +190,16 @@ impl INode for StdinNode {
     fn is_terminal(&self) -> bool {
         true
     }
+    /// 稳定身份 = console **实例 0** 的身份（`3P4-13`）：本节点就是那个 console 的匿名句柄，
+    /// 与 `/devices/console` 指向同一个环（见 `as_console_ring`），故「同一文件同一身份」是事实。
+    ///
+    /// 为什么必须覆写：`stable_id` 的默认实现是 `self` 地址，而本节点每次 `default_stdio_table`
+    /// 都新建 ⇒ `fstat(0)` 与 `stat("/devices/console")` 的身份**永远不等**，`ttyname` 也就
+    /// 永远无法忠实回答。覆写后 fd 0/1/2 与 console 节点同号；重定向后 fd 背后是别的节点，
+    /// 身份自然不同 ⇒ `ttyname` 如实 `ENOTTY`。
+    fn stable_id(&self) -> u64 {
+        crate::console::CONSOLE_STABLE_ID_BASE
+    }
 
     /// I-EVENTS P4 单径切换（§6.15）：stdin 的字节源**就是** console 环——
     /// 节点自述 console_stream 为真，syscall 层据此把空读阻塞接
@@ -279,6 +289,11 @@ impl INode for StdoutNode {
     /// 终端性跟着**节点**走，不跟着 fd 号走）。
     fn is_terminal(&self) -> bool {
         true
+    }
+    /// 稳定身份 = console **实例 0** 的身份（`3P4-13`）。理由同 [`StdinNode::stable_id`]：
+    /// fd 1/2 背后就是这个 console 的匿名写端，与 `/devices/console` 同一个环。
+    fn stable_id(&self) -> u64 {
+        crate::console::CONSOLE_STABLE_ID_BASE
     }
     /// ADR-044 §1.3（J-TOKEN-B）：本 console 输出令牌的持有者（节点自述）。
     fn console_owner(&self) -> u64 {
