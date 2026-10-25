@@ -27,6 +27,76 @@ use limine::{BaseRevision, FramebufferRequest};
 
 use arch_x86_64::X86_64Arch as CurrentArch;
 
+
+// ---------- 内核自测的「分片 / 定位」选择器（2026-10-26） ----------
+//
+// 为什么需要：全量 kernel-tests 在本机单次 QEMU 会话里跑不完（会在某处卡死，
+// 见 docs/evidence/2026-10-25-kerneltests-partial.log）。没有选择器时，排查只能在
+// 「跑整个套件（~1 小时，且卡死）」和「什么都不知道」之间二选一。有了它，
+// 复现单条挂死是分钟级的事。
+//
+// 两个通道都在**编译期**读入（`option_env!`）：本内核没有"运行时环境变量"这回事，
+// 而 `br` 是把 cargo 当子进程跑的，环境变量天然就是构建期输入。
+//
+// - `BORUIX_KT_ONLY=<name>`：只跑这一条；
+// - `BORUIX_KT_SHARD=<k>/<N>`：只跑 `序号 % N == k` 的那些（把全量拆成 N 片）。
+#[cfg(feature = "kernel-tests")]
+const KT_ONLY: Option<&str> = option_env!("BORUIX_KT_ONLY");
+#[cfg(feature = "kernel-tests")]
+const KT_SHARD: Option<&str> = option_env!("BORUIX_KT_SHARD");
+
+#[cfg(feature = "kernel-tests")]
+static KT_INDEX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// 真正执行过的条数（与 `KT_INDEX` 的差 = 被选择器过滤掉的条数）。
+#[cfg(feature = "kernel-tests")]
+static KT_EXECUTED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 序号 `idx` 的测试该不该跑。**解析失败时如实全跑**（宁可多跑，绝不静默少跑）。
+#[cfg(feature = "kernel-tests")]
+fn kt_selected(idx: usize, name: &str) -> bool {
+    if let Some(only) = KT_ONLY {
+        return only == name;
+    }
+    match KT_SHARD {
+        None => true,
+        Some(s) => {
+            let mut it = s.split('/');
+            let k = it.next().and_then(|x| x.trim().parse::<usize>().ok());
+            let n = it.next().and_then(|x| x.trim().parse::<usize>().ok());
+            match (k, n) {
+                (Some(k), Some(n)) if n > 0 && k < n => idx % n == k,
+                _ => true,
+            }
+        }
+    }
+}
+
+/// 套件开头打印一次选择器状态——让日志自己说明"这次跑了什么"。
+#[cfg(feature = "kernel-tests")]
+fn kt_banner() {
+    klib::info!(
+        "[kt] filter: only={} shard={}",
+        KT_ONLY.unwrap_or("<none>"),
+        KT_SHARD.unwrap_or("<none>")
+    );
+}
+
+/// 内核自测的统一入口：打印 `[kt] >>` / `[kt] <<` 标记并按选择器过滤。
+///
+/// 标记的价值：套件卡死时，日志里**最后一条没有配对的 `>>`** 就是卡住的那条测试——
+/// 这比"整体无输出"有用得多。
+#[cfg(feature = "kernel-tests")]
+macro_rules! kt {
+    ($name:ident) => {{
+        let idx = KT_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if kt_selected(idx, stringify!($name)) {
+            KT_EXECUTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            klib::info!("[kt] >> #{} {}", idx, stringify!($name));
+            tests::$name();
+            klib::info!("[kt] << #{} {}", idx, stringify!($name));
+        }
+    }};
+}
 // 声明 BaseRevision。用 limine_tag 放入 .limine_reqs 段，确保 Limine 完整识别请求。
 #[limine::limine_tag]
 static BASE_REVISION: BaseRevision = BaseRevision::new(6);
@@ -278,7 +348,9 @@ unsafe fn kmain_body() -> ! {
 
     // 验证物理页帧分配/释放
     #[cfg(feature = "kernel-tests")]
-    tests::test_frame_alloc();
+    kt_banner();
+    #[cfg(feature = "kernel-tests")]
+    kt!(test_frame_alloc);
 
     // 注入页表页分配器/释放器（KA5：HHDM 偏移不再经死参数传递——它由
     // mm::init 从 Limine HHDM response 写入 arch::PHYS_OFFSET，paging::init
@@ -311,7 +383,7 @@ unsafe fn kmain_body() -> ! {
         // 守卫页红测试：必须紧贴布防之后——它以停机收尾，放在测试列表后面就永远跑不到
         // （而「跑了整套所以大概没问题」不是证据）。专用 feature，独立 build+QEMU 运行。
         #[cfg(feature = "kernel-test-sstack-guard")]
-        tests::test_syscall_stack_guard_fires();
+        kt!(test_syscall_stack_guard_fires);
         klib::info!(
             "[kmain] kernel stack guard armed at {:#x}..{:#x}",
             guard_base,
@@ -352,32 +424,32 @@ unsafe fn kmain_body() -> ! {
     }
     // 验证虚拟内存页表映射
     #[cfg(feature = "kernel-tests")]
-    tests::test_paging();
+    kt!(test_paging);
     // M1：验证用户地址空间（独立页表 + 用户映射 + 切换）
     #[cfg(feature = "kernel-tests")]
-    tests::test_user_address_space();
+    kt!(test_user_address_space);
     // KA7 第二层（RLIMIT_AS 语义）：区域总量配额——超限 NoSpace、拒绝零副作用。
     #[cfg(feature = "kernel-tests")]
-    tests::test_user_addr_quota();
+    kt!(test_user_addr_quota);
     // M1.3：验证按需分页（demand paging：#PF → 补页）
     #[cfg(feature = "kernel-tests")]
-    tests::test_demand_paging();
+    kt!(test_demand_paging);
     // ADR-049：可增长栈——只提交被触碰的页（承诺账判据）
     #[cfg(feature = "kernel-tests")]
-    tests::test_stack_growth();
+    kt!(test_stack_growth);
     // M1.4：验证进程地址空间内部分配器（栈/mmap/brk）
     #[cfg(feature = "kernel-tests")]
-    tests::test_address_space_alloc();
+    kt!(test_address_space_alloc);
     // M2：验证 CPU 上下文切换（switch_to 交替执行）
     #[cfg(feature = "kernel-tests")]
-    tests::test_context_switch();
+    kt!(test_context_switch);
     // M3.1：验证进程结构与进程表（PCB + pid 分配/回收）
     #[cfg(feature = "kernel-tests")]
-    tests::test_process_table();
+    kt!(test_process_table);
 
     // 验证堆分配器（支持释放/重用）
     #[cfg(feature = "kernel-tests")]
-    tests::test_heap();
+    kt!(test_heap);
 
     // 初始化 Local APIC 定时器（Limine 已启用 LAPIC，硬件中断走 APIC）
     info!("[kmain] enabling interrupts (LAPIC timer ~100Hz)");
@@ -437,13 +509,13 @@ unsafe fn kmain_body() -> ! {
 
     // 短暂等待验证时钟中断确实触发
     #[cfg(feature = "kernel-tests")]
-    tests::test_timer();
+    kt!(test_timer);
 
     // T4：验证 CPU 特性探测（CPUID/vendor/brand）与熵池/PRNG（RDRAND/RDSEED）。
     // 不依赖 LAPIC tick（熵源与时钟垫底在 serial init 后已就绪），放在
     // time 测试之前，避免 QEMU/TCG 偶发的 LAPIC 校准偏差阻塞本梯队验收。
     #[cfg(feature = "kernel-tests")]
-    tests::test_cpu_entropy();
+    kt!(test_cpu_entropy);
 
     // 时钟源已注入：验证单调时钟换算 + 打印 RTC 墙钟（真实年月日时分秒）。
     let rtc = arch_x86_64::rtc::read_time();
@@ -469,40 +541,40 @@ unsafe fn kmain_body() -> ! {
     );
     // 验证 arch::Timer 抽象（now/sleep/set_timeout），依赖 LAPIC tick 驱动。
     #[cfg(feature = "kernel-tests")]
-    tests::test_time_abstraction();
+    kt!(test_time_abstraction);
 
     // 验证 sleep_nanos 真实阻塞（后台作业 sleep 正确性前提）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_sleep_accuracy();
+    kt!(test_sleep_accuracy);
 
     // T3：验证 HPET 高精度事件定时器（备选时钟源）：计数器推进/周期换算/
     // 单调性/与 LAPIC tick 对齐。HPET 已在 paging::init 后初始化。
     #[cfg(feature = "kernel-tests")]
-    tests::test_hpet();
+    kt!(test_hpet);
     // 审计 B25：ACPI 表解析（FADT 短表分级 + HPET 布局探测）真固件端到端断言。
     #[cfg(feature = "kernel-tests")]
-    tests::test_acpi_parse_tables();
+    kt!(test_acpi_parse_tables);
 
     // S33 量化验收（mm1.md benchmark 设施立项）：PMM 标准负载基准——
     // 结构断言定成败，时延/时钟换算指标如实打印供审阅。以 HPET 为测量钟，
     // 故排在 test_hpet 之后。
     #[cfg(feature = "kernel-tests")]
-    tests::test_pmm_bench();
+    kt!(test_pmm_bench);
 
     // T7 / ADR-007：验证 arch::InterruptController trait 与底层 IRQ 表/中断
     // 开关联动（同一份状态，不重复实现）。依赖中断已使能。
     #[cfg(feature = "kernel-tests")]
-    tests::test_arch_interrupt_controller_trait();
+    kt!(test_arch_interrupt_controller_trait);
 
     // T7：验证通用 IRQ 注册/分配（共享中断）：IRQ0 上已有 LAPIC 定时器 handler，
     // 再注册观察者共享同一 IRQ，验证多 handler 分发互不干扰。依赖 tick 运行。
     #[cfg(feature = "kernel-tests")]
-    tests::test_shared_irq();
+    kt!(test_shared_irq);
 
     // T7：验证嵌套控制与优先级：每 IRQ 软件优先级 + 全局嵌套开关，
     // 高优先级可打断低优先级处理、低优先级不能打断高优先级。依赖 tick 运行。
     #[cfg(feature = "kernel-tests")]
-    tests::test_nested_irq_priority();
+    kt!(test_nested_irq_priority);
 
     // M2.5.4：从内核 iretq 进入用户态（Ring 3）执行一段用户代码并返回内核。
     // 依赖中断使能（int 0x80 软中断）与用户段 GDT，故放在定时器验证之后。
@@ -511,12 +583,12 @@ unsafe fn kmain_body() -> ! {
     // M3.3 为停机验收（跑完即停、不返回主流程），故单独用 kernel-test-m33
     // feature 门控：仅 SDK `--test-m3.3` 显式启用时才执行。
     #[cfg(feature = "kernel-test-m33")]
-    tests::test_spawn_user_fault();
+    kt!(test_spawn_user_fault);
 
     // ADR-034 PRE-2：用户态 #PF 时 CR2 透传进 user_fault_handler（停机验收，
     // 跑完即停、不返回主流程，故单独 feature 门控）。
     #[cfg(feature = "kernel-test-pre2")]
-    tests::test_pre2_cr2_pass_through();
+    kt!(test_pre2_cr2_pass_through);
 
     // M4.1：注册 syscall 软中断入口（用户态 `int 0x80` → 内核 syscall 分发）。
     // 经 ADR-007 的 `arch::SyscallEntry` 抽象接入：x86-64 层把 `int 0x80`
@@ -527,7 +599,7 @@ unsafe fn kmain_body() -> ! {
     // M4.1 syscall 验收：用户代码经 `int 0x80` 调用 write/exit 等（停机验收，
     // 不返回主流程），故单独用 kernel-test-m41 feature 门控。
     #[cfg(feature = "kernel-test-m41")]
-    tests::test_syscall();
+    kt!(test_syscall);
 
     // ADR-034 S1-13/S1-11：真实用户态进程捕获信号 → handler → restorer →
     // rt_sigreturn 恢复现场（停机验收，跑完即停，单独 feature 门控）。
@@ -535,11 +607,11 @@ unsafe fn kmain_body() -> ! {
     // 停机验收互斥：一次 build 只编译并运行一个 halt 测试。由 sdk 的
     // `--test-signal --signal-halt nested|handler|fault` 选择启用哪个 feature。
     #[cfg(feature = "kernel-test-signal-handler")]
-    tests::test_signal_handler_called();
+    kt!(test_signal_handler_called);
     #[cfg(feature = "kernel-test-signal-fault")]
-    tests::test_signal_fault_to_handler();
+    kt!(test_signal_fault_to_handler);
     #[cfg(feature = "kernel-test-signal-nested")]
-    tests::test_signal_nested_handler();
+    kt!(test_signal_nested_handler);
 
     // 注册运行时用户进程的缺页处理函数（处理用户态按需分页与 COW）。
     mm::user_space::set_page_fault_handler(task::process_page_fault_handler);
@@ -562,7 +634,7 @@ unsafe fn kmain_body() -> ! {
 
     // M4.2 调度验收：多进程 RR 轮转（停机验收，不返回主流程），单独 gate。
     #[cfg(feature = "kernel-test-m42")]
-    tests::test_scheduler();
+    kt!(test_scheduler);
 
     // SCHED-EEVDF-1/2/3 与 SYSCALL-FAST-1/2/3：常规自检测试族（非停机验收，
     // 跑完返回主流程继续启动）。它们与 `tests` 模块同属 `kernel-tests` 门控——
@@ -573,70 +645,70 @@ unsafe fn kmain_body() -> ! {
     {
         // SCHED-EEVDF-1：vruntime 时间基准的实测取证（HPET 直读 vs per-CPU TSC）。
         // 放在调度测试之前：它只读时间源、不依赖调度状态，且结论是 2/3 的前提。
-        tests::test_sched_eevdf1_time_source_cost();
+        kt!(test_sched_eevdf1_time_source_cost);
 
         // SCHED-EEVDF-2：vruntime 有序就绪队列的契约（TDD 红先行的产物）。
-        tests::test_sched_eevdf2_vruntime_queue_contract();
+        kt!(test_sched_eevdf2_vruntime_queue_contract);
 
         // SCHED-EEVDF-3：nice 权重语义（纯函数方向 + 端到端接线）。
-        tests::test_sched_eevdf3_nice_weights();
-        tests::test_sched_eevdf3_nice_affects_scheduling();
-        tests::test_sched_eevdf3_interactive_latency();
+        kt!(test_sched_eevdf3_nice_weights);
+        kt!(test_sched_eevdf3_nice_affects_scheduling);
+        kt!(test_sched_eevdf3_interactive_latency);
 
         // SYSCALL-FAST-1：GS per-CPU 地基（一致性 / 配对性 / 嵌套纪律）。
-        tests::test_syscall_fast1_percpu_gs_contract();
+        kt!(test_syscall_fast1_percpu_gs_contract);
 
         // SYSCALL-FAST-2：syscall 帧布局与 InterruptFrame 的二进制兼容契约。
-        tests::test_syscall_fast2_frame_layout_contract();
+        kt!(test_syscall_fast2_frame_layout_contract);
 
         // SYSCALL-FAST-3：r10 捕获通道在两条 ABI 下的一致性（a4 为保留输出）。
-        tests::test_syscall_fast3_r10_capture_contract();
+        kt!(test_syscall_fast3_r10_capture_contract);
     }
 
     // M4.3 静态 ELF 加载验收：解析并加载 ELF 镜像到用户空间，spawn 运行
     // （停机验收，不返回主流程），单独 gate。
     #[cfg(feature = "kernel-test-m43")]
-    tests::test_elf_loader();
+    kt!(test_elf_loader);
 
     // M4.4 真实用户程序验收：加载 libsys+init 编译出的真实 ELF（停机验收，
     // 不返回主流程），单独 gate。
     #[cfg(feature = "kernel-test-m44")]
-    tests::test_userspace_elf();
+    kt!(test_userspace_elf);
 
     // M5 写时复制（COW）：`clone_cow` 派生共享用户区的子地址空间（纯内存
     // 逻辑验收，不进入用户态、不依赖 tick，返回主流程继续启动）。单独 gate。
     #[cfg(feature = "kernel-test-m5")]
-    tests::test_cow_clone();
+    kt!(test_cow_clone);
     // R7 验收：2M 大页区上的 COW 派生——覆盖 `clone_cow` 固定 4K 步进在遇到
     // 大页叶时会触及的 `unmap` 拆分路径（该路径可因无帧而失败）。既有
     // `test_cow_clone` 只覆盖 4K 叶，从未触及此路径。
     #[cfg(feature = "kernel-test-m5")]
-    tests::test_cow_clone_huge_page();
+    kt!(test_cow_clone_huge_page);
     // 本轮回归：mprotect(PROT_WRITE) 打在 **COW 共享页**上时不得把共享帧重映射为
     // 可写（那会让父子同帧双写、COW 击穿）；正确语义是保持硬件写保护 + 记下期望
     // 权限，由首次写故障去复制帧。
     #[cfg(feature = "kernel-test-m5")]
-    tests::test_mprotect_write_on_cow_page_keeps_cow();
+    kt!(test_mprotect_write_on_cow_page_keeps_cow);
     #[cfg(feature = "kernel-test-m5")]
-    tests::test_ipc();
+    kt!(test_ipc);
     // ADR-038 T6：SYS_TASK_DERIVE 端到端验收（真实 syscall 路径，含 COW 共享、
     // 新组语义、亲子关系、子首跑 rax=0 与写隔离）。
     #[cfg(feature = "kernel-test-m5")]
-    tests::test_task_derive_e2e();
+    kt!(test_task_derive_e2e);
     // ADR-038 D6：COW 派生每页成本的**基线**测量（先立尺再动刀；无基线则任何
     // 「优化了 X%」的声明不可证伪）。纯内存测量，返回主流程。
     #[cfg(feature = "kernel-test-m5")]
-    tests::test_cow_derive_bench();
+    kt!(test_cow_derive_bench);
     // ADR-038 决策 4：多线程父进程的 derive 必须被如实拒绝（拒绝类语义最容易在
     // 重构中无声退化，故钉在可证伪断言上）。
     #[cfg(feature = "kernel-test-m5")]
-    tests::test_derive_multithreaded_parent_rejected();
+    kt!(test_derive_multithreaded_parent_rejected);
     // ADR-038 D6：COW 成本**分解**测量（先立尺第二步——判断 >=20% 门槛是否存在
     // 优化空间，避免盲目改进）。
     #[cfg(feature = "kernel-test-m5")]
-    tests::test_cow_cost_breakdown();
+    kt!(test_cow_cost_breakdown);
     #[cfg(feature = "kernel-test-m5")]
-    tests::test_process_reclaim();
+    kt!(test_process_reclaim);
 
     // M6.1：初始化 VFS 根挂载表与 RESTful 目录骨架。
     vfs_init::init();
@@ -693,334 +765,334 @@ unsafe fn kmain_body() -> ! {
     // fd 表动态增长验证（A1：超 MAX_FDS 继续成功）。（必须在 stdio 接线之后：
     // B21 臂依赖真实的 stdin 源——接线前 StdinNode 读路径如实 NotSupported。）
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_memquery_and_stdin_busy();
+    kt!(test_syscall_memquery_and_stdin_busy);
 
     // 运行 M6.1 / M6.2 / M6.3 / M6.4 / M6.5 VFS 自检测试（在 kernel-tests feature 启用时）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_vfs_m61();
+    kt!(test_vfs_m61);
     // ADR-012 §3.2.1：卷重名冲突自动自增后缀（卷重名消解）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_vfs_volume_collision();
+    kt!(test_vfs_volume_collision);
     // 词法规范 v2（ADR-005）命名 linter：根命名空间词表契约。
     #[cfg(feature = "kernel-tests")]
-    tests::test_vfs_lexicon();
+    kt!(test_vfs_lexicon);
     // /system/licenses/flanterm_rust.txt 法律披露：内嵌许可证全文真实落盘
     // （逐字节比对 + 更旧长内容重写不留尾巴）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_licenses_vfs();
+    kt!(test_licenses_vfs);
     #[cfg(feature = "kernel-tests")]
-    tests::test_vfs_m62();
+    kt!(test_vfs_m62);
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_std_stream_close();
+    kt!(test_syscall_std_stream_close);
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_munmap();
+    kt!(test_syscall_munmap);
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_usercopy_faults();
+    kt!(test_syscall_usercopy_faults);
     // S19：顺序读写超过单块上限不得截断（>1MiB 顺序 write 回绕短交付回归）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_seq_large_io();
+    kt!(test_syscall_seq_large_io);
     // ADR-014 SYS_ENTRY_UPDATE (0x43)：move/rename 节点。
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_entry_update();
+    kt!(test_syscall_entry_update);
     // ADR-014 SYS_STREAM_CREATE FLAG_PIPE (0x11)：匿名管道端。
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_pipe();
+    kt!(test_syscall_pipe);
     // ADR-032 SYNC 域 (0x70)：通用 futex 等待/唤醒 syscall 验收。
     #[cfg(feature = "kernel-tests")]
-    tests::test_sync_syscalls();
+    kt!(test_sync_syscalls);
     // A1/ADR-033 进程身份模型：身份机制单测 + 系统门禁能力位停机级验收。
     #[cfg(feature = "kernel-tests")]
-    tests::test_identity_inherit();
+    kt!(test_identity_inherit);
     // A1-6 / ADR-040 §2.3：门禁能力位版（由 test_perm_system_only 改写，Q2 承诺）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_cap_system_gate();
+    kt!(test_cap_system_gate);
     // A1-3 / ADR-040 §2.6：统一强制矩阵停机级验收（§3.2 #4/#5/#6）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_access_enforcement_matrix();
+    kt!(test_access_enforcement_matrix);
     // 3P4-12：exec —— 同一进程换映像（pid 不变、帧换新入口、CLOEXEC/信号复位、
     // 失败不改动调用者、多线程组如实拒绝）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_task_exec();
+    kt!(test_task_exec);
     // A1-4 / ADR-040 §2.4：StatInfo 属主字段真值投影（stat/fstat 通道）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_stat_owner_fields();
+    kt!(test_stat_owner_fields);
     // A1-7 / §3.2 #11：chown/chmod 归真 E2E（真实 syscall 链路）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_chown_e2e();
+    kt!(test_chown_e2e);
     // A1-9 / §3.2 #9：ACE 三规则停机测试 + alice 家目录 E2E。
     #[cfg(feature = "kernel-tests")]
-    tests::test_ace_semantics();
+    kt!(test_ace_semantics);
     #[cfg(feature = "kernel-tests")]
-    tests::test_ace_e2e();
+    kt!(test_ace_e2e);
     // SMP per-CPU 用户态地基回归（syscall MSR + GS per-CPU 每核必备）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_smp_percpu_syscall_foundation();
+    kt!(test_smp_percpu_syscall_foundation);
     // PRE-1 / ADR-037 决策 5：UIO driver_register/driver_claim 特权门禁（System-only）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_driver_uio_privilege_gate();
+    kt!(test_driver_uio_privilege_gate);
     // 批次三：AUDIO_ATTACH 特权门禁（System-only，与 UIO 门禁同口径）。
     // 必须**单独**测：启动期测试跑在 init 线程上，而 init 是 System 身份，
     // 天然无法覆盖「非 System 被拒」这条路径（S29）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_audio_attach_privilege_gate();
+    kt!(test_audio_attach_privilege_gate);
     // 设备 DMA 前端探针：内核态写 BDL/PCM 起 HDA 流，隔离用户态变量。
     #[cfg(all(feature = "kernel-tests", feature = "hda-probe"))]
-    tests::test_hda_device_dma_probe();
+    kt!(test_hda_device_dma_probe);
     // R6 flock：冲突矩阵 + close 自动释放（ADR-014 承诺）。
     #[cfg(feature = "kernel-tests")]
     klib::info!("[boot] before test_flock_matrix");
     #[cfg(feature = "kernel-tests")]
-    tests::test_flock_matrix();
+    kt!(test_flock_matrix);
     #[cfg(feature = "kernel-tests")]
-    tests::test_flock_close_release();
+    kt!(test_flock_close_release);
     #[cfg(feature = "kernel-tests")]
-    tests::test_flock_syscall();
+    kt!(test_flock_syscall);
     // flock 锁身份必须与文件系统实现无关（RamFS 缓存 Arc / EXT2 每次新建）。
     // 须在 test_flock_syscall 之后：两者共用 /scratch 与 uid 空间。
     #[cfg(feature = "kernel-tests")]
-    tests::test_flock_identity_is_filesystem_independent();
+    kt!(test_flock_identity_is_filesystem_independent);
     // ADR-014 SYS_ENTRY_READ (0x42)：标准紧凑 JSON 输出。
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_entry_read_json();
+    kt!(test_syscall_entry_read_json);
     // ADR-043 支柱 1（J-TREE）：/processes/list 的 ppid 真值是用户态作业树的数据源。
     #[cfg(feature = "kernel-tests")]
-    tests::test_proc_list_ppid_truth();
+    kt!(test_proc_list_ppid_truth);
     // ADR-014 SYS_ENTRY_CREATE (0x41)：kind 参数解析。
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_entry_create_kind();
+    kt!(test_syscall_entry_create_kind);
     // ADR-014 DRIVER 域补全：0x52 driver_query + 0x54 driver_unregister。
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_driver_query_unregister();
+    kt!(test_syscall_driver_query_unregister);
     // ADR-014 §4.2 MEMORY_MAP 共享语义。
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_memory_map_shared();
+    kt!(test_syscall_memory_map_shared);
     #[cfg(feature = "kernel-tests")]
-    tests::test_vfs_m63();
+    kt!(test_vfs_m63);
     #[cfg(feature = "kernel-tests")]
-    tests::test_vfs_m64();
+    kt!(test_vfs_m64);
     #[cfg(feature = "kernel-tests")]
-    tests::test_vfs_m65();
+    kt!(test_vfs_m65);
     #[cfg(feature = "kernel-tests")]
-    tests::test_bench_ds32(); // D-S32: cycle-counter + page-cache hit-rate/throughput benchmark
+    kt!(test_bench_ds32); // D-S32: cycle-counter + page-cache hit-rate/throughput benchmark
     #[cfg(feature = "kernel-tests")]
-    tests::test_atapi_cdrom_block();
+    kt!(test_atapi_cdrom_block);
     #[cfg(feature = "kernel-tests")]
-    tests::test_iso9660_mount_read();
+    kt!(test_iso9660_mount_read);
     #[cfg(feature = "kernel-tests")]
-    tests::test_driver_hub_m72();
+    kt!(test_driver_hub_m72);
     // A2：音频管道 syscall 域（消费者注册表/两阶段 IO/退出清理）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_audio_pipe_a2();
+    kt!(test_audio_pipe_a2);
     // 阶段一：设备中断投递基础设施（IRQ 归属表/闩锁/冲突/PCI irq_line 捕获）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_driver_irq_owner();
+    kt!(test_driver_irq_owner);
 
     // STORAGE-AHCI-6a：内核态块驱动的有界中断等待原语。
     #[cfg(feature = "kernel-tests")]
-    tests::test_ahci6a_bounded_irq_wait();
+    kt!(test_ahci6a_bounded_irq_wait);
 
     // STORAGE-AHCI-6b：中断驱动完成路径（替代长自旋）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_ahci6b_interrupt_completion();
+    kt!(test_ahci6b_interrupt_completion);
 
     // STORAGE-AHCI-6d：中断 vs 轮询的同启动真 A/B 基准。
     #[cfg(feature = "kernel-tests")]
-    tests::test_storage_ahci6d_irq_vs_polling_benchmark();
+    kt!(test_storage_ahci6d_irq_vs_polling_benchmark);
     // 阶段二：用户态驱动 DMA 一致性物理缓冲原语。
     #[cfg(feature = "kernel-tests")]
-    tests::test_driver_dma_buf();
+    kt!(test_driver_dma_buf);
     #[cfg(feature = "kernel-tests")]
-    tests::test_ata_tail_probe();
+    kt!(test_ata_tail_probe);
 
     // ADR-034 前期工作：信号集 + 默认处置 + 硬信号强制（纯逻辑，返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_signal_foundation();
+    kt!(test_signal_foundation);
 
     // ADR-034 S1-13：屏蔽延迟投递 + SIGKILL 不可捕获/屏蔽（表级，返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_signal_block_defer();
+    kt!(test_signal_block_defer);
 
     // S1-9/S1-10：kill_pid 多信号扩展 + 权限强制（表级，返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_kill_extension_and_perm();
+    kt!(test_kill_extension_and_perm);
 
     // A2-0（ADR-040 §3.5 G2）：跨用户 kill 属主校验（表级，返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_kill_cross_user_owner_check();
+    kt!(test_kill_cross_user_owner_check);
 
     // A2-1（ADR-040 §3.5 G1）：身份查询/变更（表级+syscall，返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_identity_set_and_query();
+    kt!(test_identity_set_and_query);
 
     // A2-9（ADR-040 §3.5 G6）：资源域权限校验（表级+syscall，返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_volume_domain_cap_gate();
+    kt!(test_volume_domain_cap_gate);
 
     // A2-8（ADR-040 §3.5 G3）：ACE 继承端到端（真实 create 路径，返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_ace_inheritance_e2e();
+    kt!(test_ace_inheritance_e2e);
 
     // A2-6 前置（ADR-040 §3.5.3）：chown 不得静默清空显式 ACE（返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_chown_preserves_explicit_aces();
+    kt!(test_chown_preserves_explicit_aces);
 
     // A2-6（ADR-040 §3.5.1 G4）：显式 ACE ABI 读写往返（返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_ace_abi_roundtrip();
+    kt!(test_ace_abi_roundtrip);
 
     // A2-2（ADR-040 §3.5 G5 配套）：/system/info/users 活跃用户视图（返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_active_users_view();
+    kt!(test_active_users_view);
 
     // A2-4（ADR-040 §2.1 NamedGid / §3.5 G6）：补充组集合与 NamedGid 真实求值（返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_groups_and_named_gid();
+    kt!(test_groups_and_named_gid);
 
     // A2-7 前置：shadow 式口令文件分离是否可强制（返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_shadow_file_separation();
+    kt!(test_shadow_file_separation);
 
     // A2-7 前置之二：login 的精确能力集（返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_login_capability_set();
+    kt!(test_login_capability_set);
 
     // A2-7 前置之三：降权路径与 CAP_SYSTEM 真实语义。
     #[cfg(feature = "kernel-tests")]
-    tests::test_login_downgrade_path();
+    kt!(test_login_downgrade_path);
 
     // A2-3（ADR-040 §3.4）：目录遍历权限（父目录 Execute 位，返回主流程）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_dir_traverse_execute_check();
+    kt!(test_dir_traverse_execute_check);
 
     // C7.1/#7：waitpid 核心机制单测（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_waitpid_core();
+    kt!(test_waitpid_core);
     // §6.12.5（裁决甲）：STREAM_READ a5 标志位判定（纯函数，无副作用）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_read_nonblock_flag();
+    kt!(test_read_nonblock_flag);
     // §6.14.4n（裁决 Ⅰ 转正）：read 遥测计数器验收（分流自增 + status
     // schema，纯 Done 路径，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_read_telemetry_counters();
+    kt!(test_read_telemetry_counters);
     // I-EVENTS 阶段 1（ADR-047）：事件缓冲空态契约与布局常量（无副作用）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_event_buffer_empty_contract();
+    kt!(test_event_buffer_empty_contract);
     // I-EVENTS 阶段 1（ADR-047）：InputEventsNode::read_at 记录对齐契约（假 provider，无副作用）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_input_events_node_alignment();
+    kt!(test_input_events_node_alignment);
     // I-EVENTS P1（§6.15）：事件流多读者契约（仿真环，无副作用）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_event_multireader();
+    kt!(test_event_multireader);
     // I-EVENTS P2（§6.15）：console 字节环契约（节点自有环，无副作用）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_console_byte_ring();
+    kt!(test_console_byte_ring);
     // B3-C1：运行期动态 console 实例创建契约（attach/create/registry/对抗面）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_console_runtime_create();
+    kt!(test_console_runtime_create);
     // §6.12.6：RUN 域锁同核重入死锁复现（纯锁语义，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_run_lock_reentrancy_deadlock();
+    kt!(test_run_lock_reentrancy_deadlock);
 
     // 跨核收尸竞态（DESIGN §3.2/§9）：就绪进程被选中后被另一核收尸/置 Exit，
     // 切换路径丢弃重选不 panic（纯表级，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_cross_core_reap_safety();
+    kt!(test_cross_core_reap_safety);
 
 
     // SMP 审计 S2：地址空间销毁前必须能确认没有别的核仍持有其 CR3。
     // 红证：修复前只有本核视角的 `current_paddr()`，别的核悬着时中间页表页被
     // 提前归还 → 取指缺页 → #DF → 三重故障（纯值级，不切表、不依赖多核）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_s2_destroy_requires_no_active_cr3_holders();
+    kt!(test_s2_destroy_requires_no_active_cr3_holders);
 
     // SMP 审计 S1：跨核改页表后必须能请求全系统 TLB 失效。
     // 红证：`flush_tlb` 只发 `invlpg`（只作用本核），而线程已跨核分布；
     // 缺此能力则 munmap/mprotect 后别的核可能沿用陈旧翻译 → 静默内存破坏。
     #[cfg(feature = "kernel-tests")]
-    tests::test_s1_tlb_shootdown_capability();
+    kt!(test_s1_tlb_shootdown_capability);
 
     // SMP 审计 S3：DMA 缓冲分配阶数必须与释放阶数一致（分配-释放帧守恒）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_s3_dma_alloc_free_frame_conservation();
+    kt!(test_s3_dma_alloc_free_frame_conservation);
 
     // STORAGE-AHCI-1：内核态 DMA 缓冲的真实性（HHDM 对应 + 可写可读）与资源守恒。
     #[cfg(feature = "kernel-tests")]
-    tests::test_ahci1_kernel_dma_buffer_truth_and_conservation();
+    kt!(test_ahci1_kernel_dma_buffer_truth_and_conservation);
 
     // STORAGE-AHCI-2：AHCI 盘真读真写（DMA 读写回环 + MBR 签名独立证据）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_ahci2_real_read_write_roundtrip();
+    kt!(test_ahci2_real_read_write_roundtrip);
 
     // STORAGE-AHCI-4：PIO vs AHCI 量化对比（rdtsc 实测，不估算）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_storage_ahci4_pio_vs_ahci_benchmark();
+    kt!(test_storage_ahci4_pio_vs_ahci_benchmark);
 
     // STORAGE-AHCI-7：读命令粒度同启动交错 A/B（8x512B 对 1x4KiB，命令数实测）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_storage_ahci7_read_granularity_ab();
+    kt!(test_storage_ahci7_read_granularity_ab);
 
     // 诊断路径回归：exception_name 对任意 u8 向量必须全函数（越界向量不得 panic）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_exception_name_is_total_for_every_vector();
+    kt!(test_exception_name_is_total_for_every_vector);
 
 
     // PID 1 契约验收（WAIT_ANY / PID 1 防护 / 孤儿过继，纯表级）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_init_contract();
+    kt!(test_init_contract);
 
     // task1：K1 抢占门控（ADR-017）/ K3 内核栈回收 / K2 FPU 隔离
     // （纯表级 + 钩子驱动，返回主流程继续启动）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_task_tick_gate();
+    kt!(test_task_tick_gate);
     #[cfg(feature = "kernel-tests")]
-    tests::test_task_kstack_reclaim();
+    kt!(test_task_kstack_reclaim);
     #[cfg(feature = "kernel-tests")]
-    tests::test_task_fpu_isolation();
+    kt!(test_task_fpu_isolation);
     #[cfg(feature = "kernel-tests")]
-    tests::test_task_block_fpu_handoff();
+    kt!(test_task_block_fpu_handoff);
     #[cfg(feature = "kernel-tests")]
-    tests::test_event_wait_mechanism();
+    kt!(test_event_wait_mechanism);
     #[cfg(feature = "kernel-tests")]
-    tests::test_ipc1_semantics();
+    kt!(test_ipc1_semantics);
 
     // T1-1 线程派生结构验收（ADR-035 D1/D2 / threads.md T1-1）：组共享容器 +
     // 独立 pid/kstack/tgid 单核检查（表级，返回主流程；调度切换留 T1-8）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_thread_derive();
+    kt!(test_thread_derive);
 
     // T1-2 线程组成员关系查询（ADR-035 D2 / threads.md T1-2）：组内遍历 + 组长识别。
     #[cfg(feature = "kernel-tests")]
-    tests::test_t1_2_group();
+    kt!(test_t1_2_group);
 
     // T1-3 组退出语义（ADR-035 D3/P1 / threads.md T1-3）：组员单体 exit + 组长退整组
     // 随退并 notify 父。单核表级验收（表级自检，返回主流程；跨核脱机留 T1-8/SMP）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_t1_3();
+    kt!(test_t1_3);
 
     // S26 回归：block_current_with 登记点失败时已弹出的就绪进程必须重新入队。
     // KS1: 必须放在 test_task_kstack_reclaim 之后，否则该测试的帧计数
     // 对前序 spawn 敏感（顺序依赖）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_block_register_false_keeps_ready();
+    kt!(test_block_register_false_keeps_ready);
 
     // loader1/LA4：ELF 加载器恶意镜像拒绝面对抗自检（纯加载验证，不 spawn，
     // 返回主流程继续启动；放在 SMP 之前保持单核确定性）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_loader_adversarial();
+    kt!(test_loader_adversarial);
 
     // drv1 整改自检（ADR-022）：注册表契约/候选呈现/事件丢弃账目。
     // **必须位于测试序列末位**——驱动表填满验证不可逆（见函数文档）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_drv1_remediation();
+    kt!(test_drv1_remediation);
 
     // D-VFS1-R4 第一阶段：真·物理大页直通缓存。**置于测试序列末位**——
     // 本组测试大量分配/归还 ORDER_2M 物理大页并churn物理内存，会影响依赖
     // 特定物理内存可用性的早期测试（如 test-loader 的配额/帧账断言）；
     // 放在所有既有测试之后运行，避免扰动它们的记账假设。
     #[cfg(feature = "kernel-tests")]
-    tests::test_huge_page_direct_r4(); // R4-1/R4-2/R4-4: physical huge-page direct cache + evidence
+    kt!(test_huge_page_direct_r4); // R4-1/R4-2/R4-4: physical huge-page direct cache + evidence
     #[cfg(feature = "kernel-tests")]
-    tests::test_huge_page_bench_r43(); // R4-3: huge-page vs heap-cache cycle benchmark
+    kt!(test_huge_page_bench_r43); // R4-3: huge-page vs heap-cache cycle benchmark
 
     // 让 mm 的 per-CPU 缓存用紧凑 CPU 槽位（而非裸 LAPIC id）作为索引，
     // 避免真机上稀疏 LAPIC id 对固定数取模产生缓存槽冲突。
@@ -1067,20 +1139,20 @@ unsafe fn kmain_body() -> ! {
     // 必然失败。早期块只断言"尝试过"（机制），这里断言"真的送到"
     // （投递计数 0 -> 1）。
     #[cfg(feature = "kernel-tests")]
-    tests::test_s4_wake_enqueue_ipi_is_unconditional();
+    kt!(test_s4_wake_enqueue_ipi_is_unconditional);
     // SMP 审计 S6：LAPIC→槽位查表必须区分「已登记」与「未登记」。
     //
     // 同上："已登记"那半边（BSP -> 槽 0、各在线槽位往返）只有 `smp::init`
     // 之后才有意义。
     #[cfg(feature = "kernel-tests")]
-    tests::test_s6_lapic_slot_sentinel();
+    kt!(test_s6_lapic_slot_sentinel);
 
     // 阶段 0：SMP 冒烟测试——须在 smp::init + wait_all_online + IPI 接线
     // （mm::ipi_drain_current_cpu 已占向量 0x40 分发槽位）之后运行：测试需
     // 临时换装 IPI handler 做跨核往返并恢复原位。单核（无 -smp）下仅校验
     // 映射表自洽后跳过 IPI 往返，不报错。
     #[cfg(feature = "kernel-tests")]
-    tests::test_smp_smoke();
+    kt!(test_smp_smoke);
 
     // 内核全部组件加载完成、**非破坏性**测试全部通过：打印版本横幅。
     // （测试构建里真正的「终点」是下面的 FAST-4 测试——它自己调用
@@ -1106,8 +1178,20 @@ unsafe fn kmain_body() -> ! {
     // 本测试的**完成标记**：`[test-fast4] process N exit(code=0) -- 0 = all writes ok`
     // （sys_exit 在 kernel-tests 构建下以 info! 留痕；code 是用户程序自校验的
     // write 失败计数）。
+    // **套件的结论行**：非破坏性测试全部跑完。fast4 之后的代码不可达（它自己调
+    // `scheduler::start()` 接管机器），所以这行就是「本次 kernel-tests 结束」的唯一真值。
+    //
+    // 为什么必须有：没有它，`--test` 模式只能等超时，而「拿不到结论」会被读成「卡死」——
+    // 2026-10-25 我就这么误判过一次（见 docs/evidence/README.md 的订正）：那一轮其实早已
+    // 跑完全部测试并进入 userland，只是 harness 在等一个永远不出现的判决行。
     #[cfg(feature = "kernel-tests")]
-    tests::test_syscall_fast4_userspace_syscall_e2e();
+    klib::info!(
+        "[kt] DONE: executed={} declared={}",
+        KT_EXECUTED.load(core::sync::atomic::Ordering::Relaxed),
+        KT_INDEX.load(core::sync::atomic::Ordering::Relaxed)
+    );
+    #[cfg(feature = "kernel-tests")]
+    kt!(test_syscall_fast4_userspace_syscall_e2e);
     // KM13：符号表快照溯源。直连 cargo build 会使用 checked-in 快照——
     // .text 布局漂移后 panic 回溯给出错误函数名，比空表更有害；此处如实
     // 告警而非静默放行。SDK 构建路径两遍编译同纪元，不触发。
@@ -1163,7 +1247,7 @@ unsafe fn kmain_body() -> ! {
     // C7.1/#7：waitpid 真实父子链停机验收（kernel-test-waitpid 显式启用；
     // 验收后停机、不返回主流程，故必须放在 start_init 之前）。
     #[cfg(feature = "kernel-test-waitpid")]
-    tests::test_waitpid_e2e(); // 永不返回
+    kt!(test_waitpid_e2e); // 永不返回
 
     // 生产化：进入用户态 init（PID 1），而非内核 idle 停机。加载 init.elf →
     // spawn → `scheduler::start` 永不返回；init 经 syscall 与内核交互、退出。
