@@ -4001,7 +4001,10 @@ pub fn test_elf_loader() {
     info!("[elf-test] built test ELF ({} bytes)", elf_bytes.len());
 
     let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
-    let loaded = elf::load(&elf_bytes, &mut us, &[]).expect("load elf");
+    // loader::load 现在是 7 参（cmd/prog_name/env/pie_base/interp_base 是后加的）。
+    // 本 feature 从未被编译过（`kernel-test-m43`），故此处一直停在旧 3 参形态——
+    // 由 `chk.py test-features` 抓出（2026-10-25）。
+    let loaded = elf::load(&elf_bytes, &mut us, &[], None, &[], 0, 0).expect("load elf");
     info!(
         "[elf-test] loaded entry={:#x} stack_top={:#x}",
         loaded.entry, loaded.user_stack_top
@@ -4038,7 +4041,9 @@ pub fn test_userspace_elf() {
     info!("[userspace] embedded init.elf ({} bytes)", elf_bytes.len());
 
     let mut us = UserAddressSpace::<X86PageTable>::new().expect("new user space");
-    let loaded = elf::load(elf_bytes, &mut us, &[]).expect("load init.elf");
+    // `init.elf` 是 `[u8; N]`：`ImageSource` 实现在 `[u8]`/`Vec<u8>` 上，故取切片。
+    // 与 m43 同因（长期未编译的 feature），一并修。
+    let loaded = elf::load(&elf_bytes[..], &mut us, &[], None, &[], 0, 0).expect("load init.elf");
     info!(
         "[userspace] loaded entry={:#x} stack_top={:#x}",
         loaded.entry, loaded.user_stack_top

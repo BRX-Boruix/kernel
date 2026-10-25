@@ -4969,7 +4969,10 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
     };
     // 注册一次性定时器，到期以 `task::wake(cur_pid)` 唤醒本进程。
     // 回调在 tick 中断的 `poll_timeouts`（锁外）执行，取调度 per-pid 锁安全。
-    if klib::time::set_timeout(timeout_ns, task::wake, cur_pid).is_none() {
+    // 到期回调用 `wake_sleep`（不是普通 `wake`）：它会在同一把 pid 锁内判定「这次睡眠
+    // 有没有被信号打断」，据此预置 `-EINTR` 或 `0`。用普通 `wake` 只会留下进入阻塞时的
+    // 帧（rax=syscall 号），既让「被打断」丢失 EINTR，也用 syscall 号冒充了「睡满」的成功值。
+    if klib::time::set_timeout(timeout_ns, task::wake_sleep, cur_pid).is_none() {
         // 定时器表满（klib time.rs：有界静态槽位，MAX_TIMERS）：退化「开中断
         // 睡等」重试，不丢 sleep 语义。表满是**瞬时**状态（poll 持续回收到期
         // 槽），重试拿表位即可。
@@ -4980,7 +4983,12 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
             .expect("clock_ready checked")
             .saturating_add(timeout_ns);
         while klib::time::now_nanos().map_or(false, |n| n < deadline) {
-            if klib::time::set_timeout(timeout_ns, task::wake, cur_pid).is_some() {
+            // 与主循环同一条 POSIX 义务：忙等期间到达的可捕获信号必须**尽快**打断，
+            // 不是等睡满（本分支同样在 syscall 内继续执行，只有这里能看见 pending）。
+            if task::current_proc_mut().map_or(false, |p| p.signal().has_handler_pending()) {
+                return done(pack_err(Error::Interrupted));
+            }
+            if klib::time::set_timeout(timeout_ns, task::wake_sleep, cur_pid).is_some() {
                 // 拿到表位：到期由 wake 唤醒。但本进程此刻仍处 Running（未
                 // 阻塞），wake 对非 Blocked 进程是 no-op——继续走到 deadline，
                 // 拿到的表位到期后回调 no-op，无副作用；表位由 poll 正常回收。
@@ -4991,6 +4999,12 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
             unsafe {
                 core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack, preserves_flags));
             }
+        }
+        // 同一条 POSIX 义务：忙等期间到达的可捕获信号也必须打断睡眠（这段代码在
+        // syscall 内继续执行，故只能在这里判——与本函数主循环的顺序规则一致：先判信号、
+        // 再认「睡满」。）
+        if task::current_proc_mut().map_or(false, |p| p.signal().has_handler_pending()) {
+            return done(pack_err(Error::Interrupted));
         }
         return done(pack_ok(0));
     }
@@ -5029,11 +5043,11 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
     // 复检 deadline，未到就再睡——语义仍是「至多睡到 deadline」。
     let register = &mut || klib::time::now_nanos().map_or(false, |n| n < deadline);
     loop {
-        // deadline 已过：立即返回（sleep 语义已完成；定时器 no-op 无副作用）。
-        if !register() {
-            return done(pack_ok(0));
-        }
         // POSIX：睡眠期间到达的**可捕获**信号必须**打断**睡眠（-1/EINTR），不是等睡满。
+        //
+        // **顺序**：信号判定必须在 deadline 判定**之前**。反过来的话，信号与到期几乎同时
+        // 发生时就会走进「睡满」分支、把 EINTR 盖成 0——失败样本正是 `elapsed=3.017s/4.378s`、
+        // `rem` 未写（见 `docs/evidence/` 的 postmove / unmount3 两份日志）。
         //
         // 为什么必须在这里显式查（实测缺陷，2026-10-16）：信号对 Blocked 目标的 EINTR
         // 只写在**保存帧**上（ADR-052），而本函数是「复检 deadline 再阻塞」的**重试循环**
@@ -5045,7 +5059,11 @@ fn sleep_blocking(frame: &mut SyscallFrame, timeout_ns: u64) -> DispatchResult {
         if task::current_proc_mut().map_or(false, |p| p.signal().has_handler_pending()) {
             return done(pack_err(Error::Interrupted));
         }
-        match task::block_current_with(arch_frame(frame), register) {
+        // deadline 已过：立即返回（sleep 语义已完成；定时器 no-op 无副作用）。
+        if !register() {
+            return done(pack_ok(0));
+        }
+        match task::block_current_interruptible(arch_frame(frame), register) {
             task::SwitchOutcome::Switched => return DispatchResult::Switched,
             task::SwitchOutcome::NotSwitched => {
                 // 此刻无法安全切走（就绪队列空/仅自身）。**开中断睡等**：

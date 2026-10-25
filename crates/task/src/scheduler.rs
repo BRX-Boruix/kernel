@@ -1719,7 +1719,7 @@ pub fn block_current(frame: &mut InterruptFrame) -> SwitchOutcome {
             return SwitchOutcome::Switched;
         }
     }
-    let out = block_current_locked(&mut run, frame, &mut || true);
+    let out = block_current_locked(&mut run, frame, &mut || true, false);
     // 二次兜底：block_current_locked 内 cur 才被跨核 SIGKILL 成 Exit（A3 竞态）时返回
     // NotSwitched；此处持有 owned RUN，重查后经 deschedule_exit_current 正确脱机。
     if out == SwitchOutcome::NotSwitched {
@@ -1762,9 +1762,40 @@ pub fn block_current_with(
             return SwitchOutcome::Switched;
         }
     }
-    let out = block_current_locked(&mut run, frame, register);
+    let out = block_current_locked(&mut run, frame, register, false);
     // 二次兜底：block_current_locked 内 cur 才被跨核 SIGKILL 成 Exit（A3 竞态）时返回
     // NotSwitched；此处持有 owned RUN，重查后经 deschedule_exit_current 正确脱机。
+    if out == SwitchOutcome::NotSwitched {
+        if let Some(cp) = run.current {
+            if current_is_exit(cp) {
+                drop(run);
+                deschedule_exit_current(frame, cp);
+                return SwitchOutcome::Switched;
+            }
+        }
+    }
+    out
+}
+
+/// [block_current_with] 的**可中断**变体（ADR-051）。
+///
+/// 差别只有一处：在 cur 的 pid 锁内额外复检「有没有会被投递给 handler 的未决信号」，有则
+/// **拒绝入睡**并返回 NotSwitched。调用方**必须自带 EINTR 出口**——立刻回用户态报
+/// Error::Interrupted（sleep_blocking 就是），**不得**在内核里重试：否则 pending 信号
+/// 永远没有机会被投递（详见 block_current_locked 里 interruptible 参数的说明）。
+pub fn block_current_interruptible(
+    frame: &mut InterruptFrame,
+    register: &mut dyn FnMut() -> bool,
+) -> SwitchOutcome {
+    let mut run = run_mut(my_cpu_slot());
+    if let Some(cur_pid) = run.current {
+        if current_is_exit(cur_pid) {
+            drop(run);
+            deschedule_exit_current(frame, cur_pid);
+            return SwitchOutcome::Switched;
+        }
+    }
+    let out = block_current_locked(&mut run, frame, register, true);
     if out == SwitchOutcome::NotSwitched {
         if let Some(cp) = run.current {
             if current_is_exit(cp) {
@@ -1784,6 +1815,7 @@ fn block_current_locked(
     run: &mut PerCpuRun,
     frame: &mut InterruptFrame,
     register: &mut dyn FnMut() -> bool,
+    interruptible: bool,
 ) -> SwitchOutcome {
     let Some(cur_pid) = run.current else {
         return SwitchOutcome::NotSwitched; // 内核 idle/主线程不参与阻塞
@@ -1824,7 +1856,22 @@ fn block_current_locked(
             enqueue_ready_with_vruntime(run, peer, peer_vruntime);
             return SwitchOutcome::NotSwitched;
         }
-        if !register() {
+        // ADR-051 的**锁内**复检（2026-10-25）：只对**可中断**的等待启用（`interruptible`）。
+        //
+        // 调用方在进本函数前已预检过一次「有没有可投递的 handler 信号」，但那之后、本处置 Blocked
+        // 之前还有一个窗口——信号恰好落在窗口里时，`raise_to`/`kill_pid` 看到的目标仍是 Running，
+        // 于是**既不写 EINTR 也不唤醒**，进程入睡后只能等自己的超时。在 cur 的 pid 锁内看这一眼
+        // （与 `kill_pid` 的写入同一把锁）⇒ 窗口关闭。
+        //
+        // **为什么必须只给可中断等待用**：拒绝入睡后，调用方要么回用户态收 EINTR（sleep 就是），
+        // 要么在内核里「重读/重试」。后者若没有「先回用户态投递信号」的出口，就会在**同一个 syscall
+        // 里**空转，而 pending 信号永远没有机会被投递 ⇒ 整机挂死（实测：把它无条件接进所有阻塞
+        // 入口后，popen 段直接卡住）。故是否启用由调用方显式选择，且调用方必须自带 EINTR 出口。
+        let blocked_by_signal = interruptible
+            && gcur
+                .get(&cur_pid)
+                .is_some_and(|s| s.proc.signal().has_handler_pending());
+        if blocked_by_signal || !register() {
             // S26 回归：`peer` 已在上方被 `pop_ready` 弹出（仍为 Ready 态），
             // 若直接返回将永久丢失该就绪进程（无人重新入队 → 饿死）。
             // 必须把它放回就绪队列，保证"登记失败零副作用"成立。
@@ -4681,6 +4728,43 @@ pub fn alarm_set(pid: usize, secs: u32) -> Option<u64> {
     Some(old_remaining_secs)
 }
 
+/// 睡眠定时器到期的唤醒：按「这次睡眠**有没有被信号打断**」预置保存帧返回值。
+///
+/// - 目标仍有**会被投递给用户 handler** 的未决信号 ⇒ 预置 `-EINTR`（POSIX：睡眠被打断）；
+/// - 否则预置 `0`（睡满；不用 syscall 号冒充成功值）。
+///
+/// # 为什么必须在这个点判，而不是只在「阻塞前」判
+///
+/// `raise_to`/`kill_pid` 只对 **Blocked** 的目标把 EINTR 写进保存帧。若信号恰在
+/// 「睡眠者复检完 pending → 真正置 Blocked」之间到达，那次投递**不会**被写进任何帧
+/// （目标当时还是 Running），睡眠者于是睡满自己的 deadline，拿到「睡满」的 0。
+/// 实测症状：`alarm(1)` + `nanosleep(3s)` 返回 0、`elapsed≈3.0s`、`rem` 未写，
+/// 而 SIGALRM handler 在之后才跑（`docs/evidence/2026-10-18-libccheck-postmove.log`
+/// 与 `unmount3` 各留了一份，绿样本的 `elapsed` 是 1.6~2.05s）。
+///
+/// 在**到期唤醒的同一把 pid 锁内**看 pending，与 `raise_to` 的写入互斥 ⇒ 窗口关闭：
+/// 信号先到，这里必然看得见；信号后到，说明睡眠确实已经结束，返回 0 才是正确的。
+pub fn wake_sleep(pid: usize) {
+    let enqueue = {
+        let mut g = proc_bucket_lock(pid);
+        match g.get_mut(&pid) {
+            Some(slot) if slot.proc.state() == TaskState::Blocked && slot.waiting_for.is_none() => {
+                // 先取 pending 判定，guard 在本语句结束即释放（再做 saved 写入）。
+                let interrupted = slot.proc.signal().has_handler_pending();
+                slot.saved.rax = if interrupted {
+                    Error::Interrupted.packed()
+                } else {
+                    0
+                };
+                slot.proc.set_state(TaskState::Ready);
+                Some(slot.home_cpu)
+            }
+            _ => None,
+        }
+    };
+    if let Some(home) = enqueue { wake_enqueue(pid, home); }
+}
+
 /// 唤醒一个阻塞的进程（IPC 写/读端完成时调用）：置 `Ready` 并入就绪队列。
 ///
 /// 仅当目标进程处于 `Blocked` 时才生效（已就绪/运行中进程忽略，避免重复入队）。
@@ -5365,7 +5449,9 @@ pub mod test_hooks {
         run.ready.insert(peer, 0);
         run.current = Some(current);
         let mut frame = initial_frame(0x400000, 0x7ffefffff000, 0);
-        let outcome = block_current_locked(&mut run, &mut frame, &mut || false);
+        // 夹具用不可中断语义（interruptible=false）：它验证的是「登记失败也要把 peer 放回队列」，
+        // 与 ADR-051 的信号判据无关。
+        let outcome = block_current_locked(&mut run, &mut frame, &mut || false, false);
         outcome == SwitchOutcome::NotSwitched && run.ready.contains(peer)
     }
 
