@@ -227,7 +227,7 @@ pub const SYS_STREAM_FCHOWN: u32 = crate::abi_generated::SYS_STREAM_FCHOWN;
 ///
 /// 仅此值表示使用并推进 FD 的当前位置；`0` 与其他所有偏移都表示定位
 /// `pread`/`pwrite`，其中 `0` 即文件起始位置。
-const STREAM_OFFSET_CURRENT: u64 = u64::MAX;
+pub(crate) const STREAM_OFFSET_CURRENT: u64 = u64::MAX;
 
 // ---------- 2. MEMORY Domain (0x20) ----------
 pub const SYS_MEMORY_MAP: u32 = crate::abi_generated::SYS_MEMORY_MAP;

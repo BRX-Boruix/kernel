@@ -3904,6 +3904,19 @@ fn build_test_elf() -> alloc::vec::Vec<u8> {
     // mov rdx, msg.len()
     code.extend_from_slice(&[0x48, 0xBA]);
     code.extend_from_slice(&(msg.len() as u64).to_le_bytes());
+    // mov r10, STREAM_OFFSET_CURRENT（**顺序写哨兵**，a4 走 r10）
+    //
+    // 这一条是**必要**的、不是装饰：本 ABI 的 write 有四参（fd/buf/len/offset），
+    // 夹具此前只设了前三个，r10 是垃圾 ⇒ 内核按「定位写」处理并如实 ESPIPE
+    // （实测 `nr=0x13 -> 0xffffffffffffffe3` = -29）。补上哨兵后它才是普通的顺序写。
+    //
+    // **诚实边界**：本测试跑在启动早期，stdout sink 尚未接线，故这次 write 会如实返回
+    // ENOTSUP（`nr=0x13 -> 0xffffffffffffffa1` = -95），"Hello from ELF!" 打不出来。
+    // 这不是加载器缺陷——正是当年把 fast4 挪到序列末尾的同一个原因。本测试的真实证据是
+    // 加载结果 + 那条 syscall 的参数：`a1=1 a2=0x401000 a3=0x10` 证明 text 从 0x400000
+    // 起跑、data 段指针 0x401000 与长度 16 都对（段被正确装载并可寻址）。
+    code.extend_from_slice(&[0x49, 0xBA]);
+    code.extend_from_slice(&crate::syscall::STREAM_OFFSET_CURRENT.to_le_bytes());
     // int 0x80
     code.extend_from_slice(&[0xCD, 0x80]);
     // mov rax, SYS_TASK_EXIT (0x34)

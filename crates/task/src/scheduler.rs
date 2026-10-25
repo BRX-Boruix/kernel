@@ -5491,6 +5491,31 @@ pub mod test_hooks {
         true
     }
 
+    /// 把**未登记进调度器**的进程设为「当前运行进程」的 pid（只写 `run.current`）。
+    ///
+    /// # 为什么需要
+    ///
+    /// M3.3 / M4.1 的**单进程停机模型**走 `ProcessTable::run`：它把进程 `Box::leak` 成
+    /// `static`、设好 `CURRENT_PROC` 指针、然后直接 `enter_usermode` —— **不经调度器**，
+    /// 所以本核 RUN 的 `current` 一直是 `None`。而 `exit_current` 一开始就读它来判「谁在退出」：
+    ///
+    /// ```text
+    /// let cur_pid = run.current.expect("exit called outside process");
+    /// ```
+    ///
+    /// => 用户进程一旦调用 `exit`，**内核 panic**。
+    ///
+    /// 实测（2026-10-26，`--test-m4.1`）：M4.1 停机验收**一跑就 panic** ——
+    /// 它此前几个月没被运行过（`kernel-test-m41` 只在此类专项构建里编译），
+    /// 而这条路径上的 `expect` 是后来才加的。
+    ///
+    /// 只在这两个停机 feature 下编译；生产路径仍由调度器切换点成对更新 `run.current` 与
+    /// `CURRENT_PROC`（S15 单点，不新增第三条设置路径）。
+    #[cfg(any(feature = "kernel-test-m33", feature = "kernel-test-m41"))]
+    pub fn set_current_pid_unregistered(pid: usize) {
+        run_mut(my_cpu_slot()).current = Some(pid);
+    }
+
     /// 清除"当前运行进程"（与 `set_current` 对称）。
     pub fn clear_current() {
         // 纯 RUN（b）：只清本核 RUN current + 对应 CURRENT_PROC 别名。

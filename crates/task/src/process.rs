@@ -1054,6 +1054,10 @@ impl ProcessTable<X86PageTable> {
         // leak 为 'static：进程存活到内核结束（停机），syscall 经指针访问安全。
         let leaked: &'static mut Process<X86PageTable> = Box::leak(Box::new(proc));
         set_current_proc(leaked as *mut Process<X86PageTable>);
+        // **`run.current` 也必须设**：`exit_current` 一开始就 `run.current.expect(...)`
+        // 判「谁在退出」。只设指针不设它 ⇒ 用户进程一调 `exit` 就 panic
+        // （实测 2026-10-26：M4.1 停机验收因此一跑就 "exit called outside process"）。
+        crate::scheduler::test_hooks::set_current_pid_unregistered(pid);
         leaked.launch();
     }
 }

@@ -670,10 +670,6 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-test-m43")]
     kt!(test_elf_loader);
 
-    // M4.4 真实用户程序验收：加载 libsys+init 编译出的真实 ELF（停机验收，
-    // 不返回主流程），单独 gate。
-    #[cfg(feature = "kernel-test-m44")]
-    kt!(test_userspace_elf);
 
     // M5 写时复制（COW）：`clone_cow` 派生共享用户区的子地址空间（纯内存
     // 逻辑验收，不进入用户态、不依赖 tick，返回主流程继续启动）。单独 gate。
@@ -1184,6 +1180,14 @@ unsafe fn kmain_body() -> ! {
     // 为什么必须有：没有它，`--test` 模式只能等超时，而「拿不到结论」会被读成「卡死」——
     // 2026-10-25 我就这么误判过一次（见 docs/evidence/README.md 的订正）：那一轮其实早已
     // 跑完全部测试并进入 userland，只是 harness 在等一个永远不出现的判决行。
+    // M4.4 真实用户程序验收：加载 libsys+init 编译出的真实 ELF（停机验收，不返回主流程）。
+    //
+    // **必须在这里，不能和 m43 一起放早期测试块**（2026-10-26 实测）：`init.elf` 会走文件系统，
+    // 而早期测试块跑在 `vfs_init` 之前 ⇒ 内核 panic「VFS not initialized」
+    // （`vfses.rs:8916` 那次是 ahci6b；m44 这次是 `vfs_init::root()` 的 expect）。
+    // 与 fast4 挪到序列末尾是同一个理由：**用例依赖的底座必须已经接线**。
+    #[cfg(feature = "kernel-test-m44")]
+    kt!(test_userspace_elf);
     #[cfg(feature = "kernel-tests")]
     klib::info!(
         "[kt] DONE: executed={} declared={}",
