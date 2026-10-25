@@ -1761,6 +1761,27 @@ pub fn test_cow_clone_huge_page() {
     info!("[cow-huge] PASS (no page silently skipped; 1:1 sharing holds)");
 }
 
+/// 管道 I/O 的 kernel-tests 解包：Done ⇒ 字节数、Err ⇒ 错误。
+///
+/// Switched 在自测里**视为夹具缺陷**：kernel-tests 是单任务同步上下文，没有可切换
+/// 的同伴进程；真走到那条通路就说明被测代码把「切走」当成了普通返回（正是 3P4-14
+/// 复核定位的跨进程写 rax 缺陷的形态）——必须变红，不能被吞掉。
+fn pipe_done(r: ipc::PipeIoResult, what: &str) -> u64 {
+    match r {
+        ipc::PipeIoResult::Done(n) => n,
+        ipc::PipeIoResult::Err(e) => panic!("pipe_done: {} failed with {:?}", what, e),
+        ipc::PipeIoResult::Switched => panic!("pipe_done: {} unexpectedly switched", what),
+    }
+}
+
+fn pipe_err(r: ipc::PipeIoResult, what: &str) -> klib::error::Error {
+    match r {
+        ipc::PipeIoResult::Err(e) => e,
+        ipc::PipeIoResult::Done(n) => panic!("pipe_err: {} expected error, got Done({})", what, n),
+        ipc::PipeIoResult::Switched => panic!("pipe_err: {} unexpectedly switched", what),
+    }
+}
+
 /// M5：IPC 共享内存 + 管道。
 ///
 /// 验证点（纯内存逻辑，不经用户态/调度阻塞）：
@@ -1862,11 +1883,11 @@ pub fn test_ipc() {
     // 调用进程自己的活动地址空间内（syscall 入口已装载该进程 CR3）。既有
     // `test_user_space`（tests.rs:187/201）正是 `activate()` + 复原的同一套做法。
     user_buf.activate();
-    let n = ipc::pipe_write(&mut frame, pipe_id, &user_buf, buf_va, 5).expect("pipe_write");
+    let n = pipe_done(ipc::pipe_write(&mut frame, pipe_id, &user_buf, buf_va, 5), "pipe_write");
     assert_eq!(n, 5, "wrote 5 bytes");
     let mut dst_page = [0u8; 8];
     unsafe { core::ptr::copy_nonoverlapping(dst_page.as_ptr(), buf_kern as *mut u8, 8) };
-    let n = ipc::pipe_read(&mut frame, pipe_id, &user_buf, buf_va, 8).expect("pipe_read");
+    let n = pipe_done(ipc::pipe_read(&mut frame, pipe_id, &user_buf, buf_va, 8), "pipe_read");
     assert_eq!(n, 5, "read 5 bytes");
     unsafe { core::ptr::copy_nonoverlapping(buf_kern as *const u8, dst_page.as_mut_ptr(), 8) };
     assert_eq!(&dst_page[..5], b"hello", "pipe content preserved");
@@ -1881,7 +1902,7 @@ pub fn test_ipc() {
     // sys_open_pipe 成对增记；此处模拟「读者持读端、写者持写端」）。
     ipc::pipe_ref_inc(pipe_id, false).expect("reader ref");
     ipc::pipe_ref_inc(pipe_id, true).expect("writer ref");
-    let e = ipc::pipe_read(&mut frame, pipe_id, &user_buf, buf_va, 4).unwrap_err();
+    let e = pipe_err(ipc::pipe_read(&mut frame, pipe_id, &user_buf, buf_va, 4), "empty read");
     assert_eq!(
         e,
         klib::error::Error::WouldBlock,
@@ -1891,7 +1912,7 @@ pub fn test_ipc() {
     // 而不是继续 WouldBlock。这是「父关写端 → 子读 EOF」的内核侧对应物。
     // 注意：EOF 只在**读端仍持有引用**时可见——引用归零即销毁（那是 NotFound）。
     ipc::pipe_ref_dec(pipe_id, true).expect("writer ref dec");
-    let n = ipc::pipe_read(&mut frame, pipe_id, &user_buf, buf_va, 4).expect("EOF read");
+    let n = pipe_done(ipc::pipe_read(&mut frame, pipe_id, &user_buf, buf_va, 4), "EOF read");
     assert_eq!(n, 0, "last writer closed -> read returns 0 (EOF)");
     info!("[ipc-test] pipe EOF: last writer closed -> read 0 OK");
     // 读端引用归零即销毁对象（无需再 pipe_close——重复关闭会如实 NotFound）。
@@ -1926,10 +1947,10 @@ pub fn test_ipc1_semantics() {
 
     // IR1：内核态地址（.bss 数组，远超 USER_TOP）作源 → 必须被校验拦下。
     let kernel_buf = [0u8; 4];
-    let e = ipc::pipe_write(
-        &mut frame, pipe_id, &space, kernel_buf.as_ptr() as u64, 4,
-    )
-    .unwrap_err();
+    let e = pipe_err(
+        ipc::pipe_write(&mut frame, pipe_id, &space, kernel_buf.as_ptr() as u64, 4),
+        "IR1 kernel pointer",
+    );
     assert!(
         matches!(e, Error::BadAddress | Error::OutOfRange),
         "kernel pointer must be rejected by user-buffer validation, got {:?}",
@@ -1938,14 +1959,14 @@ pub fn test_ipc1_semantics() {
     info!("[test-ipc1] IR1 kernel-pointer rejection OK ({:?})", e);
 
     // IM4：len==0 与 id 存在性的对称语义。
-    let n = ipc::pipe_write(&mut frame, pipe_id, &space, 0x1000, 0).expect("write len0 existing");
+    let n = pipe_done(ipc::pipe_write(&mut frame, pipe_id, &space, 0x1000, 0), "write len0 existing");
     assert_eq!(n, 0, "len=0 write on live pipe is a no-op Ok(0)");
-    let e = ipc::pipe_read(&mut frame, pipe_id, &space, 0x1000, 0).expect("read len0 existing");
+    let e = pipe_done(ipc::pipe_read(&mut frame, pipe_id, &space, 0x1000, 0), "read len0 existing");
     assert_eq!(e, 0);
     let missing = u64::MAX - 7; // 不可能被分配到的哨兵 id
-    let e = ipc::pipe_read(&mut frame, missing, &space, 0x1000, 0).unwrap_err();
+    let e = pipe_err(ipc::pipe_read(&mut frame, missing, &space, 0x1000, 0), "missing id read");
     assert_eq!(e, Error::NotFound, "missing id must be NotFound even with len=0");
-    let e = ipc::pipe_write(&mut frame, missing, &space, 0x1000, 4).unwrap_err();
+    let e = pipe_err(ipc::pipe_write(&mut frame, missing, &space, 0x1000, 4), "missing id write");
     assert_eq!(e, Error::NotFound);
     info!("[test-ipc1] IM4 len0/NotFound parity OK");
 
@@ -2453,7 +2474,10 @@ pub fn test_derive_multithreaded_parent_rejected() {
         a1,
         a2,
         a3,
-        a4: if nr == crate::syscall::SYS_MEMORY_MAP { mm::user_space::PROT_DEFAULT } else { 0 },
+        // 顺带修掉一处**既有的编译中断**：本测试在 kernel-test-m5 feature 下从未编译过，
+        // 故长期无人发现——这一行是从 mmap 的夹具粘过来的，`nr` 在本作用域并不存在。
+        // derive 只用 a1..a3（a4..a6 保留），故 a4 取 0，不编造一个假参数。
+        a4: 0,
         a5: 0,
         result: 0,
         switched: false,

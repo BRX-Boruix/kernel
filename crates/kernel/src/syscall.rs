@@ -2623,18 +2623,22 @@ fn sys_readdir(frame: &mut SyscallFrame) -> u64 {
 ///
 /// ABI 约定：仅 [`STREAM_OFFSET_CURRENT`] 表示顺序写；`offset=0` 以及任意其他
 /// 偏移均为定位写（`pwrite`），不会推进句柄当前位置。
-fn sys_write(frame: &mut SyscallFrame) -> u64 {
+///
+/// 返回 [`DispatchResult`]（与 [`sys_read`] 同形状）：管道写一旦阻塞切换，`*frame`
+/// 已是下一进程现场，本入口**不得**再写 rax——切走必须作为独立通路上报。
+/// 写方向的管道无容量约束、实际不会阻塞，但契约不能靠「不会发生」省略。
+fn sys_write(frame: &mut SyscallFrame) -> DispatchResult {
     let fd = frame.a1;
     let buf = frame.a2;
     let len = frame.a3;
     let offset = frame.a4;
 
     if len == 0 {
-        return pack_ok(0);
+        return done(pack_ok(0));
     }
 
     let Some(proc) = current_proc_mut() else {
-        return pack_err(Error::NotFound);
+        return done(pack_err(Error::NotFound));
     };
 
     // ADR-014 FLAG_PIPE：管道端直接经 ipc::pipe_write 路由（环形缓冲 +
@@ -2643,7 +2647,7 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
         Some(vfs::file_handle::OpenHandle::Pipe { id, .. }) => Some(id),
         Some(vfs::file_handle::OpenHandle::File(_)) => None,
         // 坏 fd ⇒ EBADF（审查登记项①）。
-        None => return pack_err(Error::BadFd),
+        None => return done(pack_err(Error::BadFd)),
     };
     if pipe_id.is_none() {
         // A1-3 / ADR-040 §2.6：**每次** write 调用都强制（非仅 open）——
@@ -2654,25 +2658,29 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
             _ => unreachable!("pipe branch handled above"),
         };
         if let Err(e) = check_access(&identity, handle.inode.as_ref(), vfs::inode::PermBits::WRITE) {
-            return pack_err(e);
+            return done(pack_err(e));
         }
     }
     if let Some(id) = pipe_id {
         if offset != STREAM_OFFSET_CURRENT {
-            return pack_err(Error::IllegalSeek);
+            return done(pack_err(Error::IllegalSeek));
         }
-        // pipe_write 内部可能阻塞切走并等待唤醒后继续；进程回归后本帧即
-        // 当前进程现场（见 sys_read 阻塞契约），完成后可安全回写 result。
+        // **ADR-052 帧交换语义**：管道写若切走，*frame 已被换成下一进程现场，
+        // 本入口**不得**再写 rax——故切走是一条独立返回通路（下方 Switched 分支）。
+        // 写方向无容量约束（无界缓冲），正常情况下永不阻塞切换；但契约必须成立，
+        // 不能靠"不会发生"省掉这条通路（此前正是把 Switched 当"继续循环"处理，
+        // 于是把本次调用的结果写进了被切进来那个进程的帧）。
         let space = proc.addr_space();
         return match ipc::pipe_write(arch_frame(frame), id, space, buf, len) {
-            Ok(n) => pack_ok(n),
-            Err(e) => pack_err(e),
+            ipc::PipeIoResult::Done(n) => done(pack_ok(n)),
+            ipc::PipeIoResult::Switched => DispatchResult::Switched,
+            ipc::PipeIoResult::Err(e) => done(pack_err(e)),
         };
     }
     let handle = match proc.get_fd(fd as usize) {
         Some(vfs::file_handle::OpenHandle::File(h)) => h,
         Some(vfs::file_handle::OpenHandle::Pipe { .. }) => unreachable!("handled above"),
-        None => return pack_err(Error::BadFd),
+        None => return done(pack_err(Error::BadFd)),
     };
     // KM1：无 fd 号特判——1/2 与普通句柄走同一条路，stdout/stderr 节点在
     // write_at 内直发字节（K5 完全体：串口 sink 字节透明，文本 sink 自行
@@ -2680,13 +2688,13 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
     // KM17：字符流不可定位。可定位性来自节点真值（is_seekable），不再依赖
     // fd 号魔法数字；除顺序写哨兵外的任何偏移以 ESPIPE 如实拒绝。
     if !handle.inode.is_seekable() && offset != STREAM_OFFSET_CURRENT {
-        return pack_err(Error::IllegalSeek);
+        return done(pack_err(Error::IllegalSeek));
     }
 
     let want = core::cmp::min(len, SYSCALL_COPY_CHUNK_BYTES) as usize;
     let mut kbuf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     if kbuf.try_reserve_exact(want).is_err() {
-        return pack_err(Error::OutOfMemory);
+        return done(pack_err(Error::OutOfMemory));
     }
     kbuf.resize(want, 0);
     let chunk_cap = want as u64;
@@ -2699,9 +2707,9 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
         // 检查，裸加法回绕=错址写报成功）。
         let Some(ubuf) = buf.checked_add(total) else {
             if total == 0 {
-                return pack_err(Error::InvalidParam);
+                return done(pack_err(Error::InvalidParam));
             }
-            return pack_ok(total); // 已写部分有效，短写交付
+            return done(pack_ok(total)); // 已写部分有效，短写交付
         };
         // S19：fpos 仅**定位写**需要（offset != STREAM_OFFSET_CURRENT）。
         // 顺序写哨兵 STREAM_OFFSET_CURRENT == u64::MAX，对其做
@@ -2711,17 +2719,17 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
         if offset != STREAM_OFFSET_CURRENT {
             if offset.checked_add(total).is_none() {
                 if total == 0 {
-                    return pack_err(Error::InvalidParam);
+                    return done(pack_err(Error::InvalidParam));
                 }
-                return pack_ok(total); // 已写部分有效，短写交付
+                return done(pack_ok(total)); // 已写部分有效，短写交付
             }
         }
         if let Err(e) = validate_user_range(ubuf, n, UserAccess::Read) {
             if total == 0 {
-                return pack_err(e);
+                return done(pack_err(e));
             }
             // 已成功写出部分后校验失败：以短写语义交付已写字节数。
-            return pack_ok(total);
+            return done(pack_ok(total));
         }
         unsafe {
             arch_x86_64::mmio::copy_from_user(kbuf.as_mut_ptr(), ubuf, n as usize);
@@ -2742,13 +2750,13 @@ fn sys_write(frame: &mut SyscallFrame) -> u64 {
             }
             Err(e) => {
                 if total == 0 {
-                    return pack_err(e);
+                    return done(pack_err(e));
                 }
                 break; // 已写部分有效，按短写交付
             }
         }
     }
-    pack_ok(total)
+    done(pack_ok(total))
 }
 
 /// `read(fd, buf, len, offset)`：从 stdin 键盘或用户 FD 句柄读取。
@@ -2812,10 +2820,16 @@ fn sys_read(frame: &mut SyscallFrame) -> DispatchResult {
         if offset != STREAM_OFFSET_CURRENT {
             return done(pack_err(Error::IllegalSeek));
         }
+        // **ADR-052 帧交换语义**：管道读无数据时会真的切走（*frame 已换成下一进程
+        // 现场）。故 Switched 必须作为一条独立通路原样上报——此前它被当作
+        // 「继续循环」吞掉，循环最终返回的 Done/Err 被 syscall 尾部写进了**下一个
+        // 进程的帧**（实测：被切进来的 fork 子进程第一个用户态指令拿到伪造的 rax，
+        // 误判 fork 失败）。见 ipc::PipeIoResult 的文档。
         let space = proc.addr_space();
         return match ipc::pipe_read(arch_frame(frame), id, space, buf, len) {
-            Ok(n) => done(pack_ok(n)),
-            Err(e) => done(pack_err(e)),
+            ipc::PipeIoResult::Done(n) => done(pack_ok(n)),
+            ipc::PipeIoResult::Switched => DispatchResult::Switched,
+            ipc::PipeIoResult::Err(e) => done(pack_err(e)),
         };
     }
     let handle = match proc.get_fd(fd as usize) {
@@ -6424,7 +6438,7 @@ fn dispatch(nr: u64, frame: &mut SyscallFrame) -> DispatchResult {
         SYS_STREAM_CREATE => done(sys_open(frame)),
         // read 可能阻塞切换（stdin），自带 DispatchResult 语义（K1a）。
         SYS_STREAM_READ => sys_read(frame),
-        SYS_STREAM_WRITE => done(sys_write(frame)),
+        SYS_STREAM_WRITE => sys_write(frame),
         // 登记项⑨：把「设置位置」变成内核原语（此前 libc 只能在用户态维护位置表）。
         SYS_STREAM_SEEK => done(sys_lseek(frame)),
         // 登记项③：每-fd 标志（CLOEXEC）的查询/设置原语。

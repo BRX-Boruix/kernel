@@ -91,6 +91,34 @@ pub enum BlockOutcome {
     Interrupted,
 }
 
+/// 管道读写的返回形状（ADR-052 帧交换语义 + KA6 枚举化收口）。
+///
+/// # 为什么不能是 `Result<u64, Error>`
+///
+/// 管道读写**会真的切走**：无数据（读）/ 无空位（写）时经
+/// [`IpcTaskNotifier::block_with_registration`] 得到 [`BlockOutcome::Switched`]，
+/// 此刻 `*frame` 已被**整体替换成下一进程的保存现场**。若此时照常返回一个
+/// `Ok`/`Err`，syscall 层会把它当本次调用的结果写进 `arch_frame(frame).rax`
+/// ——而那已经是**下一个进程的帧**。
+///
+/// 实测症状（3P4-14 复核）：读者阻塞切走后，被切进来的新进程第一个用户态
+/// 指令就看到一个伪造的 `rax`（`-EAGAIN`）；fork 出的子进程据此判 `fork` 失败，
+/// `popen` 机内验收间歇性红。这不是"测试写法问题"，是**跨进程写入**。
+///
+/// 故切走必须是一条**独立返回通路**，由 syscall 层翻译成
+/// `DispatchResult::Switched`（与 `SyncWaitResult` / `ConsoleBlock` /
+/// `InputEventBlock` / `AudioBlock` 同款纪律，S13 单点：全部阻塞动词同一形状）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PipeIoResult {
+    /// 本次调用已完成，值为读/写的字节数。
+    Done(u64),
+    /// 已切走：`*frame` 是下一进程现场。调用方**必须**上报 Switched，
+    /// 绝不得再写 frame/rax（写入即跨进程篡改）。
+    Switched,
+    /// 本次调用如实失败。`WouldBlock` 表示"当下无法推进，请重试"。
+    Err(Error),
+}
+
 /// 调度器与进程回调 Provider（解耦 IPC 与 Task/Scheduler 的循环依赖）。
 ///
 /// 平台注记（ipc1 IM3 残余）：`block_with_registration` 的 frame 参数仍为
@@ -671,7 +699,7 @@ pub fn pipe_write<PT: arch::PageTable>(
     space: &mm::user_space::UserAddressSpace<PT>,
     src: u64,
     len: u64,
-) -> Result<u64, Error> {
+) -> PipeIoResult {
     let pid = current_pid();
     let len = len as usize;
     let mut written = 0usize;
@@ -680,10 +708,10 @@ pub fn pipe_write<PT: arch::PageTable>(
         {
             let mut table = PIPE_TABLE.lock();
             let Some(pipe) = table.get_mut(&id) else {
-                return Err(Error::NotFound);
+                return PipeIoResult::Err(Error::NotFound);
             };
             if len == 0 {
-                return Ok(0);
+                return PipeIoResult::Done(0);
             }
             // 无界缓冲（ipc1 同期修复）：chunk 仅受单轮 staging 大小
             // （PIPE_CAPACITY）约束，**总量不受缓冲容量限制**——顺序管道模型下
@@ -692,12 +720,15 @@ pub fn pipe_write<PT: arch::PageTable>(
             let remaining = len - written;
             let chunk = remaining.min(PIPE_CAPACITY);
             if chunk > 0 {
-                validate_user_range(
+                // 不可用 `?`：本函数返回 PipeIoResult（非 Result），见该枚举文档。
+                if let Err(e) = validate_user_range(
                     space,
                     src + written as u64,
                     chunk,
                     mm::user_space::UserAccess::Read,
-                )?;
+                ) {
+                    return PipeIoResult::Err(e);
+                }
                 let mut staging = [0u8; PIPE_CAPACITY];
                 unsafe {
                     arch_x86_64::mmio::copy_from_user(
@@ -720,7 +751,7 @@ pub fn pipe_write<PT: arch::PageTable>(
                 for w in wake_readers {
                     wake_proc(w);
                 }
-                return Ok(written as u64);
+                return PipeIoResult::Done(written as u64);
             }
         }
         for w in wake_readers {
@@ -744,12 +775,16 @@ pub fn pipe_write<PT: arch::PageTable>(
                 if ready {
                     continue;
                 }
-                return Err(Error::WouldBlock);
+                return PipeIoResult::Err(Error::WouldBlock);
             }
             // ADR-051：有可投递的 handler 信号 → 本次调用以 EINTR 收场。
             // 预检在入册**之前**，故此处没有等待者登记需要撤销。
-            BlockOutcome::Interrupted => return Err(Error::Interrupted),
-            BlockOutcome::Switched => {}
+            BlockOutcome::Interrupted => return PipeIoResult::Err(Error::Interrupted),
+            // **已切走**：`*frame` 现在是下一进程的保存现场。立即上报 Switched，
+            // 由 syscall 层翻译成 `DispatchResult::Switched`；**绝不继续循环、也绝不
+            // 返回 Ok/Err**——那会把本次调用的结果写进别人的帧（跨进程篡改，实测
+            // 症状见 `PipeIoResult` 文档）。
+            BlockOutcome::Switched => return PipeIoResult::Switched,
         }
     }
 }
@@ -766,7 +801,7 @@ pub fn pipe_read<PT: arch::PageTable>(
     space: &mm::user_space::UserAddressSpace<PT>,
     dst: u64,
     len: u64,
-) -> Result<u64, Error> {
+) -> PipeIoResult {
     let pid = current_pid();
     let len = len as usize;
     let mut total = 0usize;
@@ -778,12 +813,12 @@ pub fn pipe_read<PT: arch::PageTable>(
             let Some(pipe) = table.get_mut(&id) else {
                 // 管道已消失：若已读回部分数据则如实交付，否则 NotFound。
                 if total > 0 {
-                    return Ok(total as u64);
+                    return PipeIoResult::Done(total as u64);
                 }
-                return Err(Error::NotFound);
+                return PipeIoResult::Err(Error::NotFound);
             };
             if len == 0 {
-                return Ok(0);
+                return PipeIoResult::Done(0);
             }
             let avail = pipe.buf.len();
             if avail > 0 {
@@ -792,12 +827,15 @@ pub fn pipe_read<PT: arch::PageTable>(
                 // 循环搬运直到填满 len 或缓冲排空。
                 let chunk = avail.min(len - total).min(PIPE_CAPACITY);
                 // 校验先行：校验失败时缓冲零消费，语义与"读未发生"一致。
-                validate_user_range(
+                // 不可用 `?`：本函数返回 PipeIoResult（非 Result）。
+                if let Err(e) = validate_user_range(
                     space,
                     dst + total as u64,
                     chunk,
                     mm::user_space::UserAccess::Write,
-                )?;
+                ) {
+                    return PipeIoResult::Err(e);
+                }
                 // S20/S09：不得在交付证明前消费共享缓冲。锁内先做不可故障的拷贝
                 // （validate_user_range 已使目标页驻留，属"无内核态 #PF"契约路径），
                 // 成功后才 pop 消费——数据交付与消费原子，杜绝"已消费但拷贝失败"丢失。
@@ -825,14 +863,14 @@ pub fn pipe_read<PT: arch::PageTable>(
                     for w in writers {
                         wake_proc(w);
                     }
-                    return Ok(total as u64);
+                    return PipeIoResult::Done(total as u64);
                 }
             }
             // **POSIX EOF**（3P4-3a）：缓冲已空且**最后一个写端已关闭** → 如实交付 0。
             // 读端自身仍开着（这正是它与管道销毁返回 NotFound 的区别）；没有这一支，
             // 读者会永久阻塞（实测：父关写端后子进程 read 挂住，父进程收尸也挂住）。
             if avail == 0 && pipe.writer_refs == 0 {
-                return Ok(total as u64);
+                return PipeIoResult::Done(total as u64);
             }
         }
         for w in writers {
@@ -845,7 +883,7 @@ pub fn pipe_read<PT: arch::PageTable>(
         // 已读回部分数据但缓冲此刻排空：如实交付部分读（POSIX：read 返回
         // 当前可用量），绝不因等更多数据而悬挂——顺序模型下写端可能已关。
         if total > 0 {
-            return Ok(total as u64);
+            return PipeIoResult::Done(total as u64);
         }
         // R6-F2：同 write 侧——登记点复检"缓冲非空"，条件已真则重试不入睡。
         let mut ready = false;
@@ -858,12 +896,16 @@ pub fn pipe_read<PT: arch::PageTable>(
                 if ready {
                     continue;
                 }
-                return Err(Error::WouldBlock);
+                return PipeIoResult::Err(Error::WouldBlock);
             }
             // ADR-051：有可投递的 handler 信号 → 本次调用以 EINTR 收场。
             // 预检在入册**之前**，故此处没有等待者登记需要撤销。
-            BlockOutcome::Interrupted => return Err(Error::Interrupted),
-            BlockOutcome::Switched => {}
+            BlockOutcome::Interrupted => return PipeIoResult::Err(Error::Interrupted),
+            // **已切走**：`*frame` 现在是下一进程的保存现场。立即上报 Switched，
+            // 由 syscall 层翻译成 `DispatchResult::Switched`；**绝不继续循环、也绝不
+            // 返回 Ok/Err**——那会把本次调用的结果写进别人的帧（跨进程篡改，实测
+            // 症状见 `PipeIoResult` 文档）。
+            BlockOutcome::Switched => return PipeIoResult::Switched,
         }
     }
 }
