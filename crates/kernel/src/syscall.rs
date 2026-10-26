@@ -6599,9 +6599,21 @@ pub extern "C" fn syscall_entry(frame: &mut SyscallFrame) -> bool {
         let _ = cur.signal_mut().take_interrupted();
     }
     // 进入/返回 trace 仅在自检构建开启（避免每条 syscall 生产刷屏）。
+    //
+    // **trace 带 pid**：多进程用例（M4.2 RR 轮转、waitpid 前后台链）的判据是「多个进程
+    // 交替出现在 trace 里」。没有 pid 时，trace 只能看出「有 syscall 在跑」，看不出是谁——
+    // 2026-10-26 想给 m42 加显式判决行时才撞上这个缺口。
+    //
+    // 顺带纠正一处**我自己的误判**：我曾据此断言「A/B/C 标记字符走 framebuffer、不进串口」，
+    // 实测是错的——`--test-signal --signal-halt handler` 的日志里 A、B、C 三个字符都在串口
+    // 日志中（`C` 紧跟 `nr=0x13 -> 0x2`）。字符能不能看到取决于写入时 sink 是否已接线，
+    // 与"framebuffer vs 串口"无关。
+    #[cfg(feature = "kernel-tests")]
+    let kt_pid = current_proc_mut().map(|p| p.pid()).unwrap_or(0);
     #[cfg(feature = "kernel-tests")]
     klib::info!(
-        "[syscall] nr={:#x} a1={:#x} a2={:#x} a3={:#x}",
+        "[syscall] pid={} nr={:#x} a1={:#x} a2={:#x} a3={:#x}",
+        kt_pid,
         nr,
         frame.a1,
         frame.a2,
@@ -6610,7 +6622,7 @@ pub extern "C" fn syscall_entry(frame: &mut SyscallFrame) -> bool {
     match dispatch(nr, frame) {
         DispatchResult::Done(ret) => {
             #[cfg(feature = "kernel-tests")]
-            klib::info!("[syscall] nr={:#x} -> {:#x}", nr, ret);
+            klib::info!("[syscall] pid={} nr={:#x} -> {:#x}", kt_pid, nr, ret);
             // 非切换路径：返回用户态前派发待投递信号（ADR-034 §2.4 触发点 2）。
             // S1-8 接线：先回写 syscall 结果，再派发。`deliver_pending_signal` 内部
             // 用 `read_unaligned` 读 cs 判定是否真实用户态返回帧（合成测试帧的
@@ -6634,7 +6646,7 @@ pub extern "C" fn syscall_entry(frame: &mut SyscallFrame) -> bool {
         }
         DispatchResult::Switched => {
             #[cfg(feature = "kernel-tests")]
-            klib::info!("[syscall] nr={:#x} -> <switched>", nr);
+            klib::info!("[syscall] pid={} nr={:#x} -> <switched>", kt_pid, nr);
             // 现场已整体切换为下一进程，架构层不得回写 result。
             frame.switched = true;
         }

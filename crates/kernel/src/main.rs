@@ -601,17 +601,6 @@ unsafe fn kmain_body() -> ! {
     #[cfg(feature = "kernel-test-m41")]
     kt!(test_syscall);
 
-    // ADR-034 S1-13/S1-11：真实用户态进程捕获信号 → handler → restorer →
-    // rt_sigreturn 恢复现场（停机验收，跑完即停，单独 feature 门控）。
-    // 须在 syscall 入口注册之后执行（用户代码经 int 0x80 触发投递）。
-    // 停机验收互斥：一次 build 只编译并运行一个 halt 测试。由 sdk 的
-    // `--test-signal --signal-halt nested|handler|fault` 选择启用哪个 feature。
-    #[cfg(feature = "kernel-test-signal-handler")]
-    kt!(test_signal_handler_called);
-    #[cfg(feature = "kernel-test-signal-fault")]
-    kt!(test_signal_fault_to_handler);
-    #[cfg(feature = "kernel-test-signal-nested")]
-    kt!(test_signal_nested_handler);
 
     // 注册运行时用户进程的缺页处理函数（处理用户态按需分页与 COW）。
     mm::user_space::set_page_fault_handler(task::process_page_fault_handler);
@@ -631,10 +620,6 @@ unsafe fn kmain_body() -> ! {
     // 不可能正好落在里面。注册本回调后，每次 IRQ0 返回用户态前都会对**当前**
     // 进程（含刚被切入的那个）投递一次待决信号。
     arch_x86_64::interrupts::register_pending_deliver(task::deliver_pending_on_return);
-
-    // M4.2 调度验收：多进程 RR 轮转（停机验收，不返回主流程），单独 gate。
-    #[cfg(feature = "kernel-test-m42")]
-    kt!(test_scheduler);
 
     // SCHED-EEVDF-1/2/3 与 SYSCALL-FAST-1/2/3：常规自检测试族（非停机验收，
     // 跑完返回主流程继续启动）。它们与 `tests` 模块同属 `kernel-tests` 门控——
@@ -664,11 +649,6 @@ unsafe fn kmain_body() -> ! {
         // SYSCALL-FAST-3：r10 捕获通道在两条 ABI 下的一致性（a4 为保留输出）。
         kt!(test_syscall_fast3_r10_capture_contract);
     }
-
-    // M4.3 静态 ELF 加载验收：解析并加载 ELF 镜像到用户空间，spawn 运行
-    // （停机验收，不返回主流程），单独 gate。
-    #[cfg(feature = "kernel-test-m43")]
-    kt!(test_elf_loader);
 
 
     // M5 写时复制（COW）：`clone_cow` 派生共享用户区的子地址空间（纯内存
@@ -1180,14 +1160,32 @@ unsafe fn kmain_body() -> ! {
     // 为什么必须有：没有它，`--test` 模式只能等超时，而「拿不到结论」会被读成「卡死」——
     // 2026-10-25 我就这么误判过一次（见 docs/evidence/README.md 的订正）：那一轮其实早已
     // 跑完全部测试并进入 userland，只是 harness 在等一个永远不出现的判决行。
-    // M4.4 真实用户程序验收：加载 libsys+init 编译出的真实 ELF（停机验收，不返回主流程）。
+    // ===== 停机验收（破坏性：接管机器、永不返回）=====
     //
-    // **必须在这里，不能和 m43 一起放早期测试块**（2026-10-26 实测）：`init.elf` 会走文件系统，
-    // 而早期测试块跑在 `vfs_init` 之前 ⇒ 内核 panic「VFS not initialized」
-    // （`vfses.rs:8916` 那次是 ahci6b；m44 这次是 `vfs_init::root()` 的 expect）。
-    // 与 fast4 挪到序列末尾是同一个理由：**用例依赖的底座必须已经接线**。
+    // 这些用例**必须**排在结论行之后、并集中在序列末尾**唯一的**位置：
+    //
+    // 1. 它们各自 `scheduler::start()` 或死循环，**永不返回** —— 排在前面会让后面所有测试
+    //    跑不到（m43 曾经因此"跑完看起来什么也没发生"）；
+    // 2. 它们的判据是**用户态经 fd 1 打出的字符**（m43 的 "Hello from ELF!"、m42 的 A/B/C、
+    //    signal-* 的 A/B/C/D）—— 而 stdout sink 直到上面的 `vfs::stdio::set_stdout_sink` 才接线，
+    //    早期测试块里写 fd 1 会如实 ENOTSUP/ESPIPE，判据永远不成立。
+    //
+    // 一次 build 只编译并运行其中一个（互斥），由 `br --test-m4.3` / `--test-m4.4` /
+    // `--test-m4.2` / `--test-signal --signal-halt …` 选择。
     #[cfg(feature = "kernel-test-m44")]
     kt!(test_userspace_elf);
+    #[cfg(feature = "kernel-test-m43")]
+    kt!(test_elf_loader);
+    #[cfg(feature = "kernel-test-m42")]
+    kt!(test_scheduler);
+    #[cfg(feature = "kernel-test-signal-handler")]
+    kt!(test_signal_handler_called);
+    #[cfg(feature = "kernel-test-signal-fault")]
+    kt!(test_signal_fault_to_handler);
+    #[cfg(feature = "kernel-test-signal-nested")]
+    kt!(test_signal_nested_handler);
+    #[cfg(feature = "kernel-tests")]
+    kt!(test_syscall_fast4_userspace_syscall_e2e);
     #[cfg(feature = "kernel-tests")]
     klib::info!(
         "[kt] DONE: executed={} declared={}",

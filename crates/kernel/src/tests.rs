@@ -1333,6 +1333,16 @@ pub fn test_scheduler() {
         info!("[sched-test] spawned pid={} tag={}", pid, ch as char);
     }
 
+    // **判决判据（显式写出来，别让读日志的人猜）**：三个进程各自的 `write`/`TASK_WAIT`
+    // 应**交替**出现在 syscall trace 里。判据落在 trace 的 `pid=` 字段上，不是落在标记字符上。
+    //
+    // **为什么不落在 A/B/C 上（2026-10-26 实测）**：标记字符写的是 fd 1，而 fd 1 的 sink 是
+    // **控制台（framebuffer terminal）**，不进串口——所以「串口能看到 A/B/C」这个判据从来就
+    // 不成立（写本身是成功的：`nr=0x13 -> 0x1`）。判据必须落在日志真的有的东西上，
+    // 因此 syscall trace 加了 `pid=`（见 `syscall_entry` 里的注释）。
+    //
+    // 本用例 `start()` 后永不返回，判据只能事后从日志判；这行把它写成一句可核对的话。
+    info!("[sched-test] verdict: PASS iff 3 distinct pid= values interleave in the syscall trace");
     // 启动调度器（永不返回：进入用户态后由 tick 轮转）。
     scheduler::start();
 }
@@ -3007,12 +3017,14 @@ pub fn test_signal_handler_called() {
     emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);              // mov rdi, 1
     emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&MSG_ADDR.to_le_bytes()); i += 8; // mov rsi, MSG_ADDR
     emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;     // mov rdx, 2
+    emit_stream_offset_current(&mut main, &mut i);     // mov r10, STREAM_OFFSET_CURRENT
     emit!(0xCD, 0x80);                                 // int 0x80 → 投递发生
     // 恢复现场后从这继续：write("C")。
     emit!(0xB8, 0x13, 0, 0, 0);
     emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
     emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&(MSG_ADDR + 0x20).to_le_bytes()); i += 8;
     emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;
+    emit_stream_offset_current(&mut main, &mut i);     // mov r10, STREAM_OFFSET_CURRENT
     emit!(0xCD, 0x80);
     emit!(0xEB, 0xFE);                                 // jmp $ 无限循环（避免 hlt 特权指令 #GP）
 
@@ -3024,6 +3036,7 @@ pub fn test_signal_handler_called() {
     hem!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
     hem!(0x48, 0xBE); handler[j..j+8].copy_from_slice(&(MSG_ADDR + 0x10).to_le_bytes()); j += 8;
     hem!(0x48, 0xBA); handler[j..j+8].copy_from_slice(&2u64.to_le_bytes()); j += 8;
+    emit_stream_offset_current(&mut handler, &mut j);  // mov r10, STREAM_OFFSET_CURRENT
     hem!(0xCD, 0x80);
     hem!(0xC3);                                        // ret → restorer
     // 消费计数器，抑制 unused_assignments 警告（数组有尾部填充余量）。
@@ -3112,12 +3125,14 @@ pub fn test_signal_nested_handler() {
     emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
     emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&MSG_ADDR.to_le_bytes()); i += 8;
     emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;
+    emit_stream_offset_current(&mut main, &mut i); // mov r10, STREAM_OFFSET_CURRENT
     emit!(0xCD, 0x80);
     // sigreturn 后：write(1, MSG_D, 2)
     emit!(0xB8, 0x13, 0, 0, 0);
     emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
     emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&(MSG_ADDR + 0x30).to_le_bytes()); i += 8;
     emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;
+    emit_stream_offset_current(&mut main, &mut i); // mov r10, STREAM_OFFSET_CURRENT
     emit!(0xCD, 0x80);
     emit!(0xEB, 0xFE);
 
@@ -3129,6 +3144,7 @@ pub fn test_signal_nested_handler() {
     h1em!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
     h1em!(0x48, 0xBE); h1[j..j+8].copy_from_slice(&(MSG_ADDR + 0x10).to_le_bytes()); j += 8;
     h1em!(0x48, 0xBA); h1[j..j+8].copy_from_slice(&2u64.to_le_bytes()); j += 8;
+    emit_stream_offset_current(&mut h1, &mut j); // mov r10, STREAM_OFFSET_CURRENT
     h1em!(0xCD, 0x80);          // 返回时投递 SIGUSR2 → 内层 handler（嵌套）
     h1em!(0xC3);                // ret -> restorer -> sigreturn to main
 
@@ -3140,6 +3156,7 @@ pub fn test_signal_nested_handler() {
     h2em!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
     h2em!(0x48, 0xBE); h2[k..k+8].copy_from_slice(&(MSG_ADDR + 0x20).to_le_bytes()); k += 8;
     h2em!(0x48, 0xBA); h2[k..k+8].copy_from_slice(&2u64.to_le_bytes()); k += 8;
+    emit_stream_offset_current(&mut h2, &mut k); // mov r10, STREAM_OFFSET_CURRENT
     h2em!(0xCD, 0x80);
     h2em!(0xC3);
     let _ = (i, j, k);
@@ -3224,12 +3241,14 @@ pub fn test_signal_fault_to_handler() {
     emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
     emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&MSG_ADDR.to_le_bytes()); i += 8;
     emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;
+    emit_stream_offset_current(&mut main, &mut i);     // mov r10, STREAM_OFFSET_CURRENT
     emit!(0xCD, 0x80);                                 // write A
     emit!(0x0F, 0x0B);                                 // ud2 -> #UD -> SIGILL
     emit!(0xB8, 0x13, 0, 0, 0);
     emit!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
     emit!(0x48, 0xBE); main[i..i+8].copy_from_slice(&(MSG_ADDR + 0x20).to_le_bytes()); i += 8;
     emit!(0x48, 0xBA); main[i..i+8].copy_from_slice(&2u64.to_le_bytes()); i += 8;
+    emit_stream_offset_current(&mut main, &mut i);     // mov r10, STREAM_OFFSET_CURRENT
     emit!(0xCD, 0x80);                                 // write C (resumed)
     emit!(0xEB, 0xFE);
 
@@ -3246,6 +3265,7 @@ pub fn test_signal_fault_to_handler() {
     hem!(0x48, 0xC7, 0xC7, 1, 0, 0, 0);
     hem!(0x48, 0xBE); handler[j..j+8].copy_from_slice(&(MSG_ADDR + 0x10).to_le_bytes()); j += 8;
     hem!(0x48, 0xBA); handler[j..j+8].copy_from_slice(&2u64.to_le_bytes()); j += 8;
+    emit_stream_offset_current(&mut handler, &mut j); // mov r10, STREAM_OFFSET_CURRENT
     hem!(0xCD, 0x80);
     hem!(0xC3);
     let _ = (i, j);
@@ -3876,6 +3896,25 @@ pub fn test_nested_irq_priority() {
 }
 
 // ---- M4.3 静态 ELF 加载验收 ----
+
+/// 往用户态机器码缓冲区追加 `mov r10, STREAM_OFFSET_CURRENT`（10 字节）。
+///
+/// # 为什么每个写都要带它
+///
+/// 本 ABI 的 `write` 是**四参**（fd / buf / len / **offset**），第 4 参走 `r10`。夹具若只设
+/// 前三个，内核会按「定位写」处理并如实返回 `ESPIPE`（实测 `nr=0x13 -> 0xffffffffffffffe3`
+/// = -29），于是夹具用来**自证执行过**的那句 `write` 永远失败 —— A/B/C 一个都打不出来，
+/// 而"看到 A/B/C 按序出现"正是这几个验收用例的判据。
+///
+/// 用例放在验收位置上也不够：这些写还要求 stdout sink 已接线（早期测试块跑在 `vfs_init`
+/// 之前），故三个 signal 停止验收用例的注册点已挪到序列末尾。
+fn emit_stream_offset_current(buf: &mut [u8], off: &mut usize) {
+    buf[*off] = 0x49;
+    buf[*off + 1] = 0xBA; // mov r10, imm64
+    let v = crate::syscall::STREAM_OFFSET_CURRENT.to_le_bytes();
+    buf[*off + 2..*off + 10].copy_from_slice(&v);
+    *off += 10;
+}
 
 /// M4.3：构造一个最小的合法 ELF64 可执行文件（text + data 两段）。
 ///
