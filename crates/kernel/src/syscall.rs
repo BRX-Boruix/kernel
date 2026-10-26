@@ -5435,7 +5435,25 @@ pub extern "C" fn user_exception_signal_handler(
                 fault_addr,
                 pid: cur.pid() as u64,
             };
-            if task::signal::deliver_handler(cur, frame, sig, f, siginfo, restorer) {
+            // 投递前留痕（同步异常进 handler 是**少见且关键**的事件：不记下来，
+            // 事后只有"机器停住"可看——2026-10-26 排查 signal-fault 就卡在这里）。
+            klib::info!(
+                "[signal] user fault -> handler: vector={:#x} sig={} rip={:#x} rsp={:#x} handler={:#x} restorer={:#x}",
+                frame.vector,
+                sig,
+                frame.rip,
+                frame.rsp,
+                f,
+                restorer
+            );
+            let delivered = task::signal::deliver_handler(cur, frame, sig, f, siginfo, restorer);
+            klib::info!(
+                "[signal]   deliver_handler -> {} (new rip={:#x} rsp={:#x})",
+                delivered,
+                frame.rip,
+                frame.rsp
+            );
+            if delivered {
                 return true; // 已改写帧为 handler 入口，iretq 进用户 handler
             }
             // 用户栈写帧失败（越界/不可写）：无法安全投递，终止兜底。

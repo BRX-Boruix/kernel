@@ -1144,7 +1144,11 @@ pub const SPURIOUS_VECTOR: u16 = 0xFF;
 
 /// 裸串口格式化输出（AM7）：绕过 klib console sink 链与全部锁，供致命异常
 /// 诊断使用。栈上 128B 缓冲、零堆分配；截断优于死锁/丢诊断。
-fn raw_serial_fmt(args: core::fmt::Arguments) {
+///
+/// **公开**（2026-10-27）：它也是排查"卡在锁上"的第一把刀——在碰任何锁之前打一个
+/// 字节，就能把"没进去"和"进去了但死在锁里"分开。上层（kernel crate）自己再造一份
+/// 只会让诊断路径本身变成第二个故障源（S28）。
+pub fn raw_serial_fmt(args: core::fmt::Arguments) {
     use core::fmt::Write as _;
     /// 单行诊断缓冲上限：异常字段（名称/十六进制值）最长不超过此值。
     const RAW_DIAG_CAP: usize = 128;
@@ -1237,6 +1241,18 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
     if vector < 32 {
         // CPU 异常：先关中断，避免嵌套
         disable();
+        // **异常风暴留痕**（2026-10-27）：用户态故障如果反复触发（典型的"投递进 handler
+        // 失败后 rip 没前进"），现场会表现为"机器在转但一句日志都没有"——那是最难查的
+        // 一种形态。这里对**每条异常**留一行（异常本就罕见；定时器/软中断不走这条）。
+        // 只用 `cs/rip/vector` 三个已在帧里的值，不读内存、不加锁。
+        extern crate klib;
+        klib::info!(
+            "[exc] vector={:#x} cs={:#x} rip={:#x} err={:#x}",
+            vector,
+            frame.cs,
+            frame.rip,
+            frame.error_code
+        );
 
         if vector == VECTOR_PAGE_FAULT {
             // 页错误：仅**用户态**缺页交给已注册的 #PF 回调（按需分页 / COW）。
@@ -1264,6 +1280,18 @@ pub extern "C" fn interrupt_dispatch(frame: *mut InterruptFrame) {
                 // 返回 true：已处置（如投递到 handler），iretq 回用户态继续；
                 // 返回 false：未恢复（已终止/停机），兜底停机。
                 if h(cr2, frame) {
+                    // 留痕：`h` 说"已处置"后，**stub 即将用它 iretq 的那一帧**。
+                    // 这一行是关键分界线——「投递成功」与「真的跳进 handler」之间还有
+                    // stub 的 pop/iretq，只看前者会把"帧没改对"误读成"handler 跑了但没输出"。
+                    extern crate klib;
+                    klib::info!(
+                        "[exc] returning via iretq: rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x}",
+                        frame.rip,
+                        frame.cs,
+                        frame.rflags,
+                        frame.rsp,
+                        frame.ss
+                    );
                     return;
                 }
                 crate::halt_forever();

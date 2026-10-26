@@ -8952,27 +8952,63 @@ pub fn test_ahci6b_interrupt_completion() {
     }
 
     // ---- 2. 端口级：完成中断已使能 ----
+    //
+    // **先判前提，再判断言**（2026-10-27 定因）：`PxIE` 只在 `init_port` → `init_hardware`
+    // 里编程，而 `init_port` 只在 `PxSSTS.DET == 3`（真的有盘）时才被调用。所以「没插盘」
+    // 时 `ports_with_completion_ie` 必然是 0 —— 那是**没有盘**，不是"中断没使能"。
+    //
+    // 实测证据：同一个内核，`br --test`（不挂数据盘）时 `PxSSTS.DET=0`、`0/6`，本断言
+    // 直接 panic 且消息误导（读起来像中断路径坏了）；`br --test --redisk`（挂盘）时
+    // `1/6`、本用例通过。判据必须先看清前提，否则测出来的"缺陷"是环境。
+    if st.ports_with_device == 0 {
+        info!(
+            "[test-ahci6b] SKIP: no SATA device on any port (PxSSTS.DET!=3), so no port was ever",
+        );
+        info!(
+            "[test-ahci6b]   brought up and no PxIE can be set - attach a disk to run this test",
+        );
+        info!("[test-ahci6b] (0 device port(s), {} implemented port(s))", st.port_count);
+        return;
+    }
     assert!(
         st.ports_with_completion_ie > 0,
-        "at least one port must have completion interrupts enabled (PxIE)"
+        "at least one port WITH A DEVICE must have completion interrupts enabled (PxIE); \
+         saw {}/{} armed with {} device port(s) - this is a real interrupt-path defect",
+        st.ports_with_completion_ie,
+        st.port_count,
+        st.ports_with_device
     );
     info!(
-        "[test-ahci6b] ports with completion IRQ enabled: {} / {}",
-        st.ports_with_completion_ie, st.port_count
+        "[test-ahci6b] ports with completion IRQ enabled: {} / {} (device ports: {})",
+        st.ports_with_completion_ie, st.port_count, st.ports_with_device
     );
 
     // ---- 4. 中断缺失不致命：中断模式下仍能完成真实命令（有界轮询兜底）----
     // QEMU TCG 下 IRQ 投递与真实硬件不同，这条正是保证「不依赖中断也能跑」。
     match driver::DriverHub::driver_name_of("ata0") {
         Some("ahci") => {
+            // **耗时显式化**（2026-10-27）：这条 I/O 在中断优先模式下可能跑很久（驱动自己
+            // 记着"中断路径比纯轮询慢 69 倍"的实测）。不把耗时打出来，外部只能用"日志
+            // 静默"去猜它是不是死了——那次误判正是这么来的。
+            let t0 = klib::time::now_millis();
             let sectors = driver::drivers::ahci::probe_capacity_for_test(0);
+            let dt_ms = match (t0, klib::time::now_millis()) {
+                (Some(a), Some(b)) => Some(b.saturating_sub(a)),
+                _ => None,
+            };
             assert!(
                 sectors.is_some(),
                 "interrupt-mode driver must still complete real I/O (bounded poll fallback)"
             );
             let n = sectors.unwrap();
             assert!(n > 0, "probed capacity must be non-zero for a real disk");
-            info!("[test-ahci6b] real I/O under interrupt mode OK: {} sectors", n);
+            match dt_ms {
+                Some(ms) => info!(
+                    "[test-ahci6b] real I/O under interrupt mode OK: {} sectors in {} ms",
+                    n, ms
+                ),
+                None => info!("[test-ahci6b] real I/O under interrupt mode OK: {} sectors", n),
+            }
         }
         other => info!(
             "[test-ahci6b] ata0 served by {:?} (not ahci); skipping I/O check",

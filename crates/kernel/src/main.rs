@@ -81,10 +81,14 @@ fn kt_banner() {
     );
 }
 
-/// 内核自测的统一入口：打印 `[kt] >>` / `[kt] <<` 标记并按选择器过滤。
+/// 内核自测的统一入口：打印 `[kt] >>` / `[kt] <<`（带耗时）并按选择器过滤。
 ///
-/// 标记的价值：套件卡死时，日志里**最后一条没有配对的 `>>`** 就是卡住的那条测试——
-/// 这比"整体无输出"有用得多。
+/// 标记的价值有两个：
+///
+/// 1. **卡死定位**：最后一条没有配对的 `>>` 就是卡住的那条测试——比"整体无输出"有用得多；
+/// 2. **耗时可见**：`<<` 上带 `(N ms)`，于是"这条测试要跑多久"是日志里的一等事实，而不是
+///    靠外部秒表去猜。后者正是 2026-10-26 那次误判的土壤：一条中断驱动 I/O 的测试要跑几分钟，
+///    外部只看"静默"就把它读成了"卡死"。**时间预算必须显式化，判据不能靠沉默推断。**
 #[cfg(feature = "kernel-tests")]
 macro_rules! kt {
     ($name:ident) => {{
@@ -92,8 +96,14 @@ macro_rules! kt {
         if kt_selected(idx, stringify!($name)) {
             KT_EXECUTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             klib::info!("[kt] >> #{} {}", idx, stringify!($name));
+            let kt_t0 = klib::time::now_millis();
             tests::$name();
-            klib::info!("[kt] << #{} {}", idx, stringify!($name));
+            match (kt_t0, klib::time::now_millis()) {
+                (Some(a), Some(b)) => {
+                    klib::info!("[kt] << #{} {} ({} ms)", idx, stringify!($name), b.saturating_sub(a))
+                }
+                _ => klib::info!("[kt] << #{} {}", idx, stringify!($name)),
+            }
         }
     }};
 }

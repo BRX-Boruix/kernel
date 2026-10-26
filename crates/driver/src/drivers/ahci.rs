@@ -2099,6 +2099,13 @@ pub struct InterruptStatus {
     pub port_count: usize,
     /// 其中**已使能命令完成中断**（`PxIE` 含完成位）的端口数。
     pub ports_with_completion_ie: usize,
+    /// 其中**真的接了设备**（`PxSSTS.DET == 3`，链路已建立）的端口数。
+    ///
+    /// 为什么需要它（2026-10-27 定因）：`PxIE` **只在 `init_port` → `init_hardware`
+    /// 里编程**，而 `init_port` 只在 `PxSSTS.DET == 3` 时才被调用。所以"没有盘"这个
+    /// 前提一旦不成立，`ports_with_completion_ie` 必然是 0——那是**没有盘**，不是
+    /// "中断没使能"。自检必须能区分这两件事，否则会拿一句误导人的断言去报缺陷。
+    pub ports_with_device: usize,
     /// HBA 全局中断状态 `IS` 当前值：**控制器是否真的拉起过中断**的权威证据。
     ///
     /// 若端口 `PxIS` 有完成位而 `IS` 对应位为 0，说明中断在控制器内部就未能
@@ -2120,6 +2127,7 @@ pub fn interrupt_status() -> Option<InterruptStatus> {
     let pi = r.read32(HBA_PI);
     let mut port_count = 0usize;
     let mut armed = 0usize;
+    let mut with_device = 0usize;
     for p in 0..MAX_PORTS {
         if pi & (1u32 << p) == 0 {
             continue;
@@ -2132,6 +2140,10 @@ pub fn interrupt_status() -> Option<InterruptStatus> {
         if pr.read32(PX_IE) & PXIE_COMPLETION_BITS != 0 {
             armed += 1;
         }
+        // PxSSTS.DET(bit0..3) == 3：设备已连接且通信建立（AHCI 1.3.1 §3.3.9）。
+        if pr.read32(PX_SSTS) & 0xF == 3 {
+            with_device += 1;
+        }
     }
     Some(InterruptStatus {
         ghc,
@@ -2139,6 +2151,7 @@ pub fn interrupt_status() -> Option<InterruptStatus> {
         irq_line: CONTROLLER_IRQ_LINE.load(core::sync::atomic::Ordering::Relaxed),
         port_count,
         ports_with_completion_ie: armed,
+        ports_with_device: with_device,
         is: r.read32(HBA_IS),
     })
 }
