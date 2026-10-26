@@ -1154,12 +1154,21 @@ unsafe fn kmain_body() -> ! {
     // 本测试的**完成标记**：`[test-fast4] process N exit(code=0) -- 0 = all writes ok`
     // （sys_exit 在 kernel-tests 构建下以 info! 留痕；code 是用户程序自校验的
     // write 失败计数）。
-    // **套件的结论行**：非破坏性测试全部跑完。fast4 之后的代码不可达（它自己调
-    // `scheduler::start()` 接管机器），所以这行就是「本次 kernel-tests 结束」的唯一真值。
+    // ===== 套件结论行 =====
     //
-    // 为什么必须有：没有它，`--test` 模式只能等超时，而「拿不到结论」会被读成「卡死」——
-    // 2026-10-25 我就这么误判过一次（见 docs/evidence/README.md 的订正）：那一轮其实早已
-    // 跑完全部测试并进入 userland，只是 harness 在等一个永远不出现的判决行。
+    // 非破坏性测试全部跑完的真值。**必须排在停机验收之前**——那些用例永不返回，
+    // 一旦先跑，这行就永远打不出来（实测 2026-10-26 晚：我把停机验收块插到了它前面，
+    // 整轮完整套件跑完却没有任何判决行，harness 只能等超时）。
+    //
+    // 为什么需要有这行：没有它，`--test` 模式只能等超时，而「拿不到结论」会被读成「卡死」
+    // （2026-10-25 我就这么误判过一次，见 docs/evidence/README.md 的订正）。
+    #[cfg(feature = "kernel-tests")]
+    klib::info!(
+        "[kt] DONE: executed={} declared={}",
+        KT_EXECUTED.load(core::sync::atomic::Ordering::Relaxed),
+        KT_INDEX.load(core::sync::atomic::Ordering::Relaxed)
+    );
+
     // ===== 停机验收（破坏性：接管机器、永不返回）=====
     //
     // 这些用例**必须**排在结论行之后、并集中在序列末尾**唯一的**位置：
@@ -1184,14 +1193,6 @@ unsafe fn kmain_body() -> ! {
     kt!(test_signal_fault_to_handler);
     #[cfg(feature = "kernel-test-signal-nested")]
     kt!(test_signal_nested_handler);
-    #[cfg(feature = "kernel-tests")]
-    kt!(test_syscall_fast4_userspace_syscall_e2e);
-    #[cfg(feature = "kernel-tests")]
-    klib::info!(
-        "[kt] DONE: executed={} declared={}",
-        KT_EXECUTED.load(core::sync::atomic::Ordering::Relaxed),
-        KT_INDEX.load(core::sync::atomic::Ordering::Relaxed)
-    );
     #[cfg(feature = "kernel-tests")]
     kt!(test_syscall_fast4_userspace_syscall_e2e);
     // KM13：符号表快照溯源。直连 cargo build 会使用 checked-in 快照——
