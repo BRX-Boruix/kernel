@@ -1347,6 +1347,21 @@ pub fn test_scheduler() {
     scheduler::start();
 }
 
+/// 回归锁（2026-10-27）：`exit_current` 的 pid 解析必须容忍"只有 CURRENT_PROC"。
+///
+/// 锁的是**决策点**而不是现象：单进程停机模型（`ProcessTable::run`）的进程不在进程表里，
+/// 想让 `exit_current` 过关就只能伪造 `run.current`——而伪造会让 tick 的收尸守卫判定
+/// "current 不在表里 ⇒ 已收尸 ⇒ go_idle"，把整机永久停在 halt（实测：signal-fault 的
+/// handler 永远进不去、四核全部 HLT）。此用例保证那条"从指针兜底"的路径始终存在。
+pub fn test_exit_pid_resolution() {
+    info!("[test-exit-pid] === exit pid resolution (legacy single-process model) ===");
+    assert!(
+        task::scheduler::test_hooks::debug_exit_pid_resolution(),
+        "resolve_exiting_pid must fall back to CURRENT_PROC when run.current is None",
+    );
+    info!("[test-exit-pid] PASS");
+}
+
 /// M3.1：验证进程结构与进程表（PCB + pid 分配/回收）。
 ///
 /// 验证点：

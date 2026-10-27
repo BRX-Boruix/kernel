@@ -453,6 +453,9 @@ unsafe fn kmain_body() -> ! {
     // M2：验证 CPU 上下文切换（switch_to 交替执行）
     #[cfg(feature = "kernel-tests")]
     kt!(test_context_switch);
+    // 回归锁：单进程停机模型下 exit 的 pid 解析（不得依赖 run.current 必有值）
+    #[cfg(feature = "kernel-tests")]
+    kt!(test_exit_pid_resolution);
     // M3.1：验证进程结构与进程表（PCB + pid 分配/回收）
     #[cfg(feature = "kernel-tests")]
     kt!(test_process_table);

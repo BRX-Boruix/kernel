@@ -5437,22 +5437,29 @@ pub extern "C" fn user_exception_signal_handler(
             };
             // 投递前留痕（同步异常进 handler 是**少见且关键**的事件：不记下来，
             // 事后只有"机器停住"可看——2026-10-26 排查 signal-fault 就卡在这里）。
-            klib::info!(
-                "[signal] user fault -> handler: vector={:#x} sig={} rip={:#x} rsp={:#x} handler={:#x} restorer={:#x}",
+            //
+            // **必须走裸串口**（`raw_serial_fmt`，无锁、无分配、无控制台路径）：
+            // 此处处于异常上下文（IF=0、可能已持 mm/console 锁），`klib::info!` 的
+            // 输出链会取锁，一旦重入即是新的死锁/停机现场，会把故障现场污染成
+            // "查不出来的卡死"。同理这里不做任何格式化分配。
+            arch_x86_64::interrupts::raw_serial_fmt(format_args!(
+                "\n[signal] fault -> handler: vec={:#x} sig={} rip={:#x} rsp={:#x} handler={:#x} restorer={:#x}\n",
                 frame.vector,
                 sig,
                 frame.rip,
                 frame.rsp,
                 f,
                 restorer
-            );
+            ));
             let delivered = task::signal::deliver_handler(cur, frame, sig, f, siginfo, restorer);
-            klib::info!(
-                "[signal]   deliver_handler -> {} (new rip={:#x} rsp={:#x})",
+            // 同一个帧的两个值：投递成功则 `rip` 已改成 handler 入口、`rsp` 已降到信号帧之下。
+            // 「投递成功」与「真跳进 handler」之间还隔着 stub 的 pop/iretq，这一行是分界线。
+            arch_x86_64::interrupts::raw_serial_fmt(format_args!(
+                "\n[signal]   deliver -> {} (rip={:#x} rsp={:#x})\n",
                 delivered,
                 frame.rip,
                 frame.rsp
-            );
+            ));
             if delivered {
                 return true; // 已改写帧为 handler 入口，iretq 进用户 handler
             }

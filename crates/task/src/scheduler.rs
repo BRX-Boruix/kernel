@@ -4253,6 +4253,21 @@ unsafe extern "C" fn idle_loop_body() -> ! {
     }
 }
 
+/// 决定「谁在退出」的 pid：**优先调度器缓存，其次 `CURRENT_PROC` 指针**。
+///
+/// 两个来源都是真值，只是覆盖面不同：
+/// - `run_current`：调度器正常路径的缓存（几乎总是它）；
+/// - `cur_ptr_pid`：`CURRENT_PROC` 指向的进程。**单进程停机模型**
+///   （`ProcessTable::run`：M3.3/M4.1/signal-* 停机验收）不经过调度器，
+///   `run.current` 恒为 `None`，此时只有指针知道"谁在退出"。
+///
+/// 抽成**纯函数**是为了能给它上回归锁（`debug_exit_pid_resolution`）：
+/// 2026-10-27 的缺陷正是"为了绕过这里的 expect 而伪造 `run.current`"，
+/// 结果 tick 的收尸守卫把整机挂死。决策点被单独锁住，才不会再被绕过。
+pub(crate) fn resolve_exiting_pid(run_current: Option<usize>, cur_ptr_pid: Option<usize>) -> Option<usize> {
+    run_current.or(cur_ptr_pid)
+}
+
 /// 终止当前进程（`exit` syscall）：zombie 化并按父子关系分发退出码后切换。
 ///
 /// 当前进程经 [`terminate_locked`] 统一处理：有活父且父在等待则交付退出码
@@ -4265,9 +4280,19 @@ pub fn exit_current(frame: &mut InterruptFrame, code: u64) {
     let cpu_slot = my_cpu_slot();
     // 读 cur_pid 用短暂本核 RUN 域（terminate_locked 自持各 pid 锁 + 跨核 RUN[home]，
     // 故此处不持任何锁调用）。
-    let cur_pid = {
-        let run = run_mut(cpu_slot);
-        run.current.expect("exit called outside process")
+    // 「谁在退出」的真值有两个来源，按优先级取：
+    //
+    // 1. `run.current` —— 调度器正常路径的缓存（绝大多数情况）；
+    // 2. `CURRENT_PROC.pid()` —— **单进程停机模型**（`ProcessTable::run`：M3.3/M4.1/
+    //    signal-* 停机验收）不经过调度器，`run.current` 恒为 None，此时进程指针才是真值。
+    //
+    // 2026-10-27 定因：曾用 test hook 把 pid 塞进 `run.current` 来让这里过关，结果 tick 的
+    // 「current 不在进程表 ⇒ 已收尸 ⇒ go_idle」守卫把整机永久挂起。**不要在调度器里伪造
+    // 它管不着的 current**；在需要 pid 的地方从指针兜底才是对的。
+    let cur_run_pid = run_mut(cpu_slot).current;
+    let cur_ptr_pid = crate::process::current_proc_mut().map(|p| p.pid());
+    let Some(cur_pid) = resolve_exiting_pid(cur_run_pid, cur_ptr_pid) else {
+        panic!("exit called outside process (no run.current, no CURRENT_PROC)");
     };
     // PID 1 契约：init 不得退出（自杀即 panic）。
     if cur_pid == init_pid() {
@@ -5491,29 +5516,26 @@ pub mod test_hooks {
         true
     }
 
-    /// 把**未登记进调度器**的进程设为「当前运行进程」的 pid（只写 `run.current`）。
+    // 已删除（2026-10-27）：`set_current_pid_unregistered`。
+    //
+    // 它曾用来让 `exit_current` 的 `run.current.expect(...)` 过关（修 M4.1 的
+    // "exit called outside process" panic）。**但它把一台机器变成了僵尸**：
+    // 单进程停机模型里的进程被 `.take()` 出了进程表，而 tick 的时间片守卫有
+    // "current 不在进程表 ⇒ 已被收尸 ⇒ `go_idle_on_own_stack()`"，于是第一个
+    // 时间片边界就把整机永久停在 halt 里（实测 signal-fault：handler 永远进不去，
+    // 四核全部 HLT）。修法在 `exit_current` 一侧用 `CURRENT_PROC` 兜底取 pid ——
+    // **不要让调度器看到一个它管不着的 current**。
+
+    /// 回归锁（2026-10-27）：`resolve_exiting_pid` 必须在"只有指针知道"时也能给出 pid。
     ///
-    /// # 为什么需要
-    ///
-    /// M3.3 / M4.1 的**单进程停机模型**走 `ProcessTable::run`：它把进程 `Box::leak` 成
-    /// `static`、设好 `CURRENT_PROC` 指针、然后直接 `enter_usermode` —— **不经调度器**，
-    /// 所以本核 RUN 的 `current` 一直是 `None`。而 `exit_current` 一开始就读它来判「谁在退出」：
-    ///
-    /// ```text
-    /// let cur_pid = run.current.expect("exit called outside process");
-    /// ```
-    ///
-    /// => 用户进程一旦调用 `exit`，**内核 panic**。
-    ///
-    /// 实测（2026-10-26，`--test-m4.1`）：M4.1 停机验收**一跑就 panic** ——
-    /// 它此前几个月没被运行过（`kernel-test-m41` 只在此类专项构建里编译），
-    /// 而这条路径上的 `expect` 是后来才加的。
-    ///
-    /// 只在这两个停机 feature 下编译；生产路径仍由调度器切换点成对更新 `run.current` 与
-    /// `CURRENT_PROC`（S15 单点，不新增第三条设置路径）。
-    #[cfg(any(feature = "kernel-test-m33", feature = "kernel-test-m41"))]
-    pub fn set_current_pid_unregistered(pid: usize) {
-        run_mut(my_cpu_slot()).current = Some(pid);
+    /// 背景：单进程停机模型的进程不在进程表里，若为了让 `exit_current` 过关而把 pid 塞进
+    /// `run.current`，tick 的时间片守卫会判定它"已被收尸"并 `go_idle` ⇒ 整机挂死。
+    /// 本钩子锁住"决策点不依赖 run.current 必须有值"这条不变量：修复前该组合会 panic。
+    pub fn debug_exit_pid_resolution() -> bool {
+        let only_ptr = super::resolve_exiting_pid(None, Some(7)) == Some(7);
+        let both = super::resolve_exiting_pid(Some(3), Some(7)) == Some(3);
+        let neither = super::resolve_exiting_pid(None, None).is_none();
+        only_ptr && both && neither
     }
 
     /// 清除"当前运行进程"（与 `set_current` 对称）。
