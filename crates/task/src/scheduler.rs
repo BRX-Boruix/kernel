@@ -3201,10 +3201,25 @@ fn terminate_process_locked(pid: usize, code: u64) -> Termination {
     // 单点：只在本函数（组长完整终止）执行；组员走 terminate_member_locked，不触碰进程的
     // fd 表（fd 表组内共享，成员退出不关进程的 fd）。drain 后表为空，重复调用无副作用。
     // 句柄到具体资源的映射由 vfs 的释放钩子交付（kernel 侧装配 ipc 实现，见 ipc_init.rs）。
-    if let Some(e) = proc_bucket_lock(pid).get(&pid) {
-        for h in e.proc.drain_fd_table() {
-            vfs::file_handle::release_handle(&h);
+    // **必须在桶锁之外释放**：`release_handle` 会经由 vfs 释放钩子走到 ipc 的
+    // `pipe_ref_dec` → `wake_proc` → `scheduler::wake` → `wake_enqueue` →
+    // `enqueue_ready` → `min_vruntime_base`，而后者在就绪队列为空时会
+    // `proc_bucket_lock(current)`。若本处仍持有桶锁，同一核就会重入一把不可重入
+    // 自旋锁 —— 实测由此 **panic 内核**（`spin.rs:109` 的同核重入死锁断言）：
+    //   terminate_process_locked → release_handle → on_handle_released →
+    //   pipe_ref_dec → wake_proc → wake → wake_enqueue → enqueue_ready →
+    //   min_vruntime_base → proc_bucket_lock  ← 此时已持有 → panic
+    // 触发面很具体：`popen`/管道写端在**子进程退出、父进程被唤醒**、且父所在就绪
+    // 队列恰好为空时命中（libccheck 的 popen 30 轮里稳定复现）。
+    // 修法：先在锁内把 fd 表 **drain 成局部 Vec**，出锁后再逐个 release。
+    let drained: Vec<_> = {
+        match proc_bucket_lock(pid).get_mut(&pid) {
+            Some(e) => e.proc.drain_fd_table(),
+            None => alloc::vec::Vec::new(),
         }
+    };
+    for h in drained {
+        vfs::file_handle::release_handle(&h);
     }
 
     let outcome = if !reapable {
